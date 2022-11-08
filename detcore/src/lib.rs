@@ -395,6 +395,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         Ok(())
     }
+
+    fn display_syscall_finished<'a, M: MemoryAccess>(
+        syscall: &'a Syscall,
+        memory: &'a M,
+    ) -> reverie::syscalls::Display<'a, M, Syscall> {
+        match syscall {
+            Syscall::Fstat(_) => syscall.display(memory), //FIXME: T136880615 - fstat structure isn't fully deterministic yet
+            _ => syscall.display_with_outputs(memory),
+        }
+    }
 }
 
 #[reverie::tool]
@@ -1016,7 +1026,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             "[syscall][detcore, dtid {}] finish syscall #{}: {} = {:?}",
             dettid,
             new_count,
-            call.display(&guest.memory()),
+            Self::display_syscall_finished(&call, &guest.memory()),
             res
         );
 
