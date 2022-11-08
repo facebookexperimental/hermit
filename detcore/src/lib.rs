@@ -60,6 +60,7 @@ use reverie::Guest;
 use reverie::Pid;
 use reverie::Rdtsc;
 use reverie::RdtscResult;
+use reverie::RegDisplay;
 use reverie::Signal;
 use reverie::Subscription;
 use reverie::Tid;
@@ -199,10 +200,10 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         if guest.thread_state().guest_past_first_execve() {
             detlog_debug!(
-                "(pre) registers [dtid {}][rcbs {}]. {:?}",
+                "(pre) registers [dtid {}][rcbs {}]. {}",
                 dettid,
                 guest.thread_state().thread_logical_time.rcbs(),
-                guest.regs().await
+                guest.regs().await.display()
             );
         }
         trace!(
@@ -334,10 +335,10 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         if guest.thread_state().guest_past_first_execve() {
             detlog_debug!(
-                "(post) registers [dtid {}][rcbs {}]. {:?}",
+                "(post) registers [dtid {}][rcbs {}]. {}",
                 dettid,
                 guest.thread_state().thread_logical_time.rcbs(),
-                guest.regs().await
+                guest.regs().await.display(),
             );
         }
     }
