@@ -1,0 +1,29 @@
+// (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+
+#include <locale.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <sys/sysinfo.h>
+#include <unistd.h>
+
+/*
+  For some reason this triggers registry divergence under trace/replay usecase
+  in hermit-verify when detlogs are taken for consideration
+
+  The theory behind why "printf" is doing it is unclear but it looks to be
+  connected with jemalloc behavior as the divergence is happening on jemalloc
+  thread for 'gettimeofday' syscall
+*/
+
+void* thread1(void* vargp) {
+  printf("thread 1\n");
+  return NULL;
+}
+
+int main() {
+  pthread_t thread;
+  pthread_create(&thread, NULL, thread1, NULL);
+  pthread_join(thread, NULL);
+  return 0;
+}

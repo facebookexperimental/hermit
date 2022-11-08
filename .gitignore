@@ -1,0 +1,5 @@
+pkg
+.buckd
+.tmp*
+target/
+*.preempts

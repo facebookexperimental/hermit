@@ -1,0 +1,5 @@
+
+# This just to test a preemption-timeout without chaos mode.
+RUN: %hermit run --preemption-timeout=10000 -- hostname | FileCheck %s
+CHECK: hermetic-container.local
+CHECK-EMPTY:

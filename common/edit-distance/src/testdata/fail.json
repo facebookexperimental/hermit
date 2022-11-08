@@ -1,0 +1,3440 @@
+[
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 52,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000000520
+  },
+  {
+    "dettid": 3,
+    "op": "Rdtsc",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000010545
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 148,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000012025
+  },
+  {
+    "dettid": 3,
+    "op": "Rdtsc",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000012050
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 7372,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000085770
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 12
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000095770
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 2,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000095790
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000095815
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 4,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000095855
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000095880
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 2,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000095900
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000095925
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000095950
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000095960
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000095985
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 4,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000096025
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000096050
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000096060
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000096085
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000096095
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000096120
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000096130
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000096155
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 28,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000096435
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000096460
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 95,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000097410
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000097435
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 57,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000098005
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000098030
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 32,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000098350
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000098375
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 73,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000099105
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000099130
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 75,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000099880
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000099905
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 96,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000100865
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000100890
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 97,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000101860
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000101885
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 58,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000102465
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000102490
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 59,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000103080
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000103105
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 33,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000103435
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000103460
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 34,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000103800
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000103825
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 1217,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000115995
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 21
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000125995
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 3,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000126025
+  },
+  {
+    "dettid": 3,
+    "op": "Rdtsc",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000126050
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 102,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000127070
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 257
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000137070
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 23,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000137300
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 257
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000147300
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 6,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000147360
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 262
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000157360
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 12,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000157480
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 257
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000167480
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 6,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000167540
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 262
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000177540
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 12,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000177660
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 257
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000187660
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 6,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000187720
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 262
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000197720
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 13,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000197850
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 257
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000207850
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 6,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000207910
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 262
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000217910
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 12,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000218030
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 257
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000228030
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 6,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000228090
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 262
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000238090
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 13,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000238220
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 257
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000248220
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 6,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000248280
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 262
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000258280
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 13,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000258410
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 257
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000268410
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 6,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000268470
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 262
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000278470
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 15,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000278620
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 257
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000288620
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 2,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000288640
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 0
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000298640
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 66,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000299300
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 262
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000309300
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 27,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000309570
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000319570
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 123,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000320800
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000330800
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 12,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000330920
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000340920
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 9,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000341010
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000351010
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 9,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000351100
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000361100
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 163,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000362730
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 3
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000372730
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 210,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000374830
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 257
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000384830
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 2,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000384850
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 0
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000394850
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 15,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000395000
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 17
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000405000
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 22,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000405220
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 17
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000415220
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 10,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000415320
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 17
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000425320
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 27,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000425590
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 262
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000435590
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 66,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000436250
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 17
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000446250
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 95,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000447200
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000457200
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 3,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000457230
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 10
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000467230
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 9,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000467320
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000477320
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 9,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000477410
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000487410
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 9,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000487500
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000497500
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 56,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000498060
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000508060
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 158,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000509640
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 3
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000519640
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 294,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000522580
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 257
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000532580
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 2,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000532600
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 0
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000542600
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 68,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000543280
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 262
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000553280
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 157,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000554850
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000564850
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 12,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000564970
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000574970
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 9,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000575060
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000585060
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 9,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000585150
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000595150
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 72,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000595870
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000605870
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 152,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000607390
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 3
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000617390
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 714,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000624530
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 257
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000634530
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 2,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000634550
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 0
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000644550
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 62,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000645170
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 262
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000655170
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 153,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000656700
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000666700
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 12,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000666820
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000676820
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 9,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000676910
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000686910
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 9,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000687000
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000697000
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 167,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000698670
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 3
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000708670
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 737,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000716040
+  },
+  {
+    "dettid": 3,
+    "op": "Rdtsc",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000716065
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 3031,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000746375
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000756375
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 586,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000762235
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 158
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000772235
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000772245
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 218
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000782245
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 273
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000792245
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 34,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000792585
+  },
+  {
+    "dettid": 3,
+    "op": "Rdtsc",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799000792610
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 11519,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000907800
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 10
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000917800
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 2016,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000937960
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 10
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000947960
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 880,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799000956760
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 10
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799000966760
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 290120,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799003867960
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 10
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799003877960
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 23,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799003878190
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 10
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799003888190
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 6,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799003888250
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 10
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799003898250
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 8446,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799003982710
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 10
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799003992710
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 3,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799003992740
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 10
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004002740
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 5,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004002790
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 10
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004012790
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 7,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004012860
+  },
+  {
+    "dettid": 3,
+    "op": "Rdtsc",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799004012885
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 437,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004017255
+  },
+  {
+    "dettid": 3,
+    "op": "Rdtsc",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799004017280
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 519,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004022470
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 10
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004032470
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 2,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004032490
+  },
+  {
+    "dettid": 3,
+    "op": "Rdtsc",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799004032515
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 26,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004032775
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 302
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004042775
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 83,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004043605
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799004043630
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004043640
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799004043665
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004043675
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799004043700
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004043710
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799004043735
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 26,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004043995
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799004044020
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 30,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004044320
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799004044345
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 4,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004044385
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799004044410
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 4,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004044450
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799004044475
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004044485
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799004044510
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 13,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004044640
+  },
+  {
+    "dettid": 3,
+    "op": "Cpuid",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": null,
+    "end_time": 946684799004044665
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 667,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004051335
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 318
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004061335
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 102,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004062355
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 12
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004072355
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 5,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004072405
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 12
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004082405
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 192,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004084325
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 7
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004094325
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 11,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004094435
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 13
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004104435
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 7,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004104505
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 13
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004114505
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 7,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004114575
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 13
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004124575
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 5,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004124625
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 13
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004134625
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 7,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004134695
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 13
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004144695
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 3,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004144725
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 131
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004154725
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 17,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004154895
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004164895
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 14,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004165035
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 10
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004175035
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 14,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004175175
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 131
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004185175
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 77,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004185945
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 257
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004195945
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 13,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004196075
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 302
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004206075
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 57,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004206645
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 262
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004216645
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 41,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004217055
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 0
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004227055
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 2020,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004247255
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 0
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004257255
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 4822,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004305475
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 0
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004315475
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 4456,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004360035
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 0
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004370035
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 4972,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004419755
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 0
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004429755
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 3012,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004459875
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 3
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004469875
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 75,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004470625
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 204
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004480625
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 796,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004488585
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 13
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004498585
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 2,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004498605
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 14
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004508605
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 15,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004508755
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004518755
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 4,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004518795
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 10
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004528795
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 125,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004530045
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 14
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004540045
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 8,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004540125
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 435
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004550125
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 7,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004550195
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 14
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004560195
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 176,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004561955
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004571955
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 4,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004571995
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 10
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004581995
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 127,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004583265
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 14
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004593265
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 8,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004593345
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 435
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004603345
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 7,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004603415
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 14
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004613415
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 203,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004615445
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004625445
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 4,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004625485
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 10
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004635485
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 126,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004636745
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 14
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004646745
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 8,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004646825
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 435
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004656825
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 7,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004656895
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 14
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004666895
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 19,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004667085
+  },
+  {
+    "dettid": 9,
+    "op": "Branch",
+    "count": 3,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004656855
+  },
+  {
+    "dettid": 9,
+    "op": {
+      "Syscall": 273
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004666855
+  },
+  {
+    "dettid": 9,
+    "op": "Branch",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004666865
+  },
+  {
+    "dettid": 9,
+    "op": {
+      "Syscall": 14
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004676865
+  },
+  {
+    "dettid": 9,
+    "op": "Branch",
+    "count": 4,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004676905
+  },
+  {
+    "dettid": 9,
+    "op": {
+      "Syscall": 131
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004686905
+  },
+  {
+    "dettid": 9,
+    "op": "Branch",
+    "count": 17,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004687075
+  },
+  {
+    "dettid": 9,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004697075
+  },
+  {
+    "dettid": 9,
+    "op": "Branch",
+    "count": 14,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004697215
+  },
+  {
+    "dettid": 9,
+    "op": {
+      "Syscall": 10
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004707215
+  },
+  {
+    "dettid": 9,
+    "op": "Branch",
+    "count": 14,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004707355
+  },
+  {
+    "dettid": 9,
+    "op": {
+      "Syscall": 131
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004717355
+  },
+  {
+    "dettid": 9,
+    "op": "Branch",
+    "count": 33,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004717685
+  },
+  {
+    "dettid": 9,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004727685
+  },
+  {
+    "dettid": 9,
+    "op": "Branch",
+    "count": 3,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004727715
+  },
+  {
+    "dettid": 9,
+    "op": {
+      "Syscall": 11
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004737715
+  },
+  {
+    "dettid": 9,
+    "op": "Branch",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004737725
+  },
+  {
+    "dettid": 9,
+    "op": {
+      "Syscall": 11
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004747725
+  },
+  {
+    "dettid": 9,
+    "op": "Branch",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004747735
+  },
+  {
+    "dettid": 9,
+    "op": {
+      "Syscall": 10
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004757735
+  },
+  {
+    "dettid": 9,
+    "op": "Branch",
+    "count": 110,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004758835
+  },
+  {
+    "dettid": 9,
+    "op": {
+      "Syscall": 204
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004768835
+  },
+  {
+    "dettid": 9,
+    "op": "Branch",
+    "count": 30261,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799005071445
+  },
+  {
+    "dettid": 9,
+    "op": {
+      "Syscall": 131
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799005081445
+  },
+  {
+    "dettid": 9,
+    "op": "Branch",
+    "count": 25,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799005081695
+  },
+  {
+    "dettid": 9,
+    "op": {
+      "Syscall": 11
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799005091695
+  },
+  {
+    "dettid": 9,
+    "op": "Branch",
+    "count": 325,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799005094945
+  },
+  {
+    "dettid": 9,
+    "op": {
+      "Syscall": 28
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799005104945
+  },
+  {
+    "dettid": 9,
+    "op": "Branch",
+    "count": 3,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799005104975
+  },
+  {
+    "dettid": 7,
+    "op": "Branch",
+    "count": 3,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004603375
+  },
+  {
+    "dettid": 7,
+    "op": {
+      "Syscall": 273
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004613375
+  },
+  {
+    "dettid": 7,
+    "op": "Branch",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004613385
+  },
+  {
+    "dettid": 7,
+    "op": {
+      "Syscall": 14
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004623385
+  },
+  {
+    "dettid": 7,
+    "op": "Branch",
+    "count": 4,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004623425
+  },
+  {
+    "dettid": 7,
+    "op": {
+      "Syscall": 131
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004633425
+  },
+  {
+    "dettid": 7,
+    "op": "Branch",
+    "count": 17,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004633595
+  },
+  {
+    "dettid": 7,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004643595
+  },
+  {
+    "dettid": 7,
+    "op": "Branch",
+    "count": 14,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004643735
+  },
+  {
+    "dettid": 7,
+    "op": {
+      "Syscall": 10
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004653735
+  },
+  {
+    "dettid": 7,
+    "op": "Branch",
+    "count": 14,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004653875
+  },
+  {
+    "dettid": 7,
+    "op": {
+      "Syscall": 131
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004663875
+  },
+  {
+    "dettid": 7,
+    "op": "Branch",
+    "count": 128,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004665155
+  },
+  {
+    "dettid": 7,
+    "op": {
+      "Syscall": 204
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004675155
+  },
+  {
+    "dettid": 7,
+    "op": "Branch",
+    "count": 66781,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799005342965
+  },
+  {
+    "dettid": 5,
+    "op": "Branch",
+    "count": 3,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004550155
+  },
+  {
+    "dettid": 5,
+    "op": {
+      "Syscall": 273
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004560155
+  },
+  {
+    "dettid": 5,
+    "op": "Branch",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004560165
+  },
+  {
+    "dettid": 5,
+    "op": {
+      "Syscall": 14
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004570165
+  },
+  {
+    "dettid": 5,
+    "op": "Branch",
+    "count": 4,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004570205
+  },
+  {
+    "dettid": 5,
+    "op": {
+      "Syscall": 131
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004580205
+  },
+  {
+    "dettid": 5,
+    "op": "Branch",
+    "count": 17,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004580375
+  },
+  {
+    "dettid": 5,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004590375
+  },
+  {
+    "dettid": 5,
+    "op": "Branch",
+    "count": 14,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004590515
+  },
+  {
+    "dettid": 5,
+    "op": {
+      "Syscall": 10
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004600515
+  },
+  {
+    "dettid": 5,
+    "op": "Branch",
+    "count": 14,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004600655
+  },
+  {
+    "dettid": 5,
+    "op": {
+      "Syscall": 131
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004610655
+  },
+  {
+    "dettid": 5,
+    "op": "Branch",
+    "count": 33,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004610985
+  },
+  {
+    "dettid": 5,
+    "op": {
+      "Syscall": 9
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004620985
+  },
+  {
+    "dettid": 5,
+    "op": "Branch",
+    "count": 3,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004621015
+  },
+  {
+    "dettid": 5,
+    "op": {
+      "Syscall": 11
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004631015
+  },
+  {
+    "dettid": 5,
+    "op": "Branch",
+    "count": 1,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004631025
+  },
+  {
+    "dettid": 5,
+    "op": {
+      "Syscall": 10
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004641025
+  },
+  {
+    "dettid": 5,
+    "op": "Branch",
+    "count": 110,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004642125
+  },
+  {
+    "dettid": 5,
+    "op": {
+      "Syscall": 204
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004652125
+  },
+  {
+    "dettid": 5,
+    "op": "Branch",
+    "count": 10261,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004754735
+  },
+  {
+    "dettid": 5,
+    "op": {
+      "Syscall": 131
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004764735
+  },
+  {
+    "dettid": 5,
+    "op": "Branch",
+    "count": 25,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004764985
+  },
+  {
+    "dettid": 5,
+    "op": {
+      "Syscall": 11
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004774985
+  },
+  {
+    "dettid": 5,
+    "op": "Branch",
+    "count": 327,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004778255
+  },
+  {
+    "dettid": 5,
+    "op": {
+      "Syscall": 28
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004788255
+  },
+  {
+    "dettid": 5,
+    "op": "Branch",
+    "count": 3,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004788285
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 202
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004677085
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 65,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004677735
+  },
+  {
+    "dettid": 7,
+    "op": "Branch",
+    "count": 13463,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799005477595
+  },
+  {
+    "dettid": 7,
+    "op": {
+      "Syscall": 131
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799005487595
+  },
+  {
+    "dettid": 7,
+    "op": "Branch",
+    "count": 25,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799005487845
+  },
+  {
+    "dettid": 7,
+    "op": {
+      "Syscall": 11
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799005497845
+  },
+  {
+    "dettid": 7,
+    "op": "Branch",
+    "count": 348,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799005501325
+  },
+  {
+    "dettid": 7,
+    "op": {
+      "Syscall": 28
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799005511325
+  },
+  {
+    "dettid": 7,
+    "op": "Branch",
+    "count": 3,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799005511355
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 202
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004687735
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 224,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004689975
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 1
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004699975
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 55,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004700525
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 1
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004710525
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 65,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004711175
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 131
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004721175
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 25,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004721425
+  },
+  {
+    "dettid": 3,
+    "op": {
+      "Syscall": 11
+    },
+    "count": 1,
+    "start_rip": 999,
+    "end_rip": 1001,
+    "end_time": 946684799004731425
+  },
+  {
+    "dettid": 3,
+    "op": "Branch",
+    "count": 680,
+    "start_rip": null,
+    "end_rip": 999,
+    "end_time": 946684799004738225
+  }
+]

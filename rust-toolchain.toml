@@ -1,0 +1,2 @@
+[toolchain]
+path = "../../third-party-buck/platform010/build/rust"

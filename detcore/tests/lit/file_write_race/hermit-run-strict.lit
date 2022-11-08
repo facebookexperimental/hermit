@@ -1,0 +1,2 @@
+RUN: %hermit run -- %me | FileCheck %s
+CHECK: 22222222221111111111

@@ -1,0 +1,4 @@
+// We see a precise alternating behavior with round-robin scheduling:
+RUN: %hermit --log=error run -- %me | FileCheck %s
+CHECK: {{((ba){200})}}
+CHECK-EMPTY:
