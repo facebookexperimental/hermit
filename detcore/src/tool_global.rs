@@ -12,11 +12,14 @@
 use std::cmp::Ordering;
 use std::collections::btree_map::Entry;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fmt::Write;
+use std::fs;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU16;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -142,6 +145,18 @@ pub struct GlobalState {
     sched: Arc<Mutex<Scheduler>>,
 
     inodes: Arc<Mutex<InodePool>>,
+
+    // next port to use if input port is 0
+    next_port: AtomicU16,
+
+    // used ports
+    used_ports: Mutex<HashSet<u16>>,
+
+    // fd to port
+    fd_to_port: Mutex<HashMap<i32, u16>>,
+
+    port_start_range: AtomicU16,
+    port_end_range: AtomicU16,
 
     // False initially after fork, and true when we begin executing the guest binary.
     past_first_execve: AtomicBool,
@@ -352,8 +367,15 @@ impl GlobalTool for GlobalState {
             .as_ref()
             .map(|path| PreemptionReader::new(path));
 
+        let range = GlobalState::read_port_range();
+
         GlobalState {
             sched,
+            next_port: AtomicU16::new(range[0]),
+            used_ports: Mutex::new(HashSet::new()),
+            port_start_range: AtomicU16::new(range[0]),
+            port_end_range: AtomicU16::new(range[1]),
+            fd_to_port: Mutex::new(HashMap::new()),
             past_first_execve: AtomicBool::new(false),
             inodes: Arc::new(Mutex::new(InodePool::new())),
             sched_handle: handle,
@@ -436,6 +458,52 @@ impl GlobalTool for GlobalState {
             GlobalRequest::UnrecoverableShutdown => {
                 self.force_shutdown_with_error();
                 R::UnrecoverableShutdown(())
+            }
+            GlobalRequest::RequestPort(sock_fd) => {
+                let mut mut_used_ports = self.used_ports.lock().unwrap();
+                self.update_port_range();
+                let total_available =
+                    self.port_end_range.load(SeqCst) - self.port_start_range.load(SeqCst);
+                let mut index = 0;
+                while (*mut_used_ports).contains(&self.next_port.load(SeqCst))
+                    && index < total_available
+                {
+                    self.next_port.fetch_add(1, SeqCst);
+                    if self.next_port.load(SeqCst) > self.port_end_range.load(SeqCst) {
+                        self.next_port
+                            .store(self.port_start_range.load(SeqCst), SeqCst);
+                    }
+                    index += 1;
+                }
+                if index == total_available {
+                    R::PortFull
+                } else {
+                    (*mut_used_ports).insert(self.next_port.load(SeqCst));
+                    let mut mut_fd_to_port = self.fd_to_port.lock().unwrap();
+                    (*mut_fd_to_port).insert(sock_fd, self.next_port.load(SeqCst));
+                    R::RequestPort(self.next_port.load(SeqCst))
+                }
+            }
+            GlobalRequest::AddUsedPort(port, sock_fd) => {
+                let mut mut_used_ports = self.used_ports.lock().unwrap();
+                (*mut_used_ports).insert(port);
+                let mut mut_fd_to_port = self.fd_to_port.lock().unwrap();
+                (*mut_fd_to_port).insert(sock_fd, self.next_port.load(SeqCst));
+                R::AddUsedPort
+            }
+            GlobalRequest::FreePort(port) => {
+                let mut mut_used_ports = self.used_ports.lock().unwrap();
+                (*mut_used_ports).remove(&port);
+                R::FreePort
+            }
+            GlobalRequest::FreePortByFd(sock_fd) => {
+                let mut mut_fd_to_port = self.fd_to_port.lock().unwrap();
+                let port = (*mut_fd_to_port).remove(&sock_fd);
+                if let Some(x) = port {
+                    let mut mut_used_ports = self.used_ports.lock().unwrap();
+                    (*mut_used_ports).remove(&x);
+                }
+                R::FreePort
             }
         };
 
@@ -879,6 +947,26 @@ impl GlobalState {
             false
         }
     }
+
+    // Ephemeral port range is in file /proc/sys/net/ipv4/ip_local_port_range"
+    // This function reads from the file and returns the range
+    // Start of range is at index 0, end of range is at index 1.
+    fn read_port_range() -> Vec<u16> {
+        let contents = fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+            .expect("File should be present");
+        let range: Vec<u16> = contents
+            .split_whitespace()
+            .filter_map(|number| number.parse().ok())
+            .collect();
+        range
+    }
+
+    // Reflect ephemeral port range updated outside of the tracer program internally.
+    fn update_port_range(&self) {
+        let range = Self::read_port_range();
+        self.port_start_range.store(range[0], SeqCst);
+        self.port_end_range.store(range[1], SeqCst);
+    }
 }
 
 /// Messages to the global object.
@@ -932,6 +1020,17 @@ pub enum GlobalRequest {
 
     /// The container is shutting down.  Exit the scheduler "thread".
     UnrecoverableShutdown,
+
+    // Request a port
+    RequestPort(i32),
+
+    // Add port to used ports list
+    AddUsedPort(u16, i32),
+
+    // FreePort
+    FreePort(u16),
+
+    FreePortByFd(i32),
 }
 
 /// Responses from the global object
@@ -955,6 +1054,11 @@ pub enum GlobalResponse {
     TraceSchedEvent(bool),
     // TODO: use void_send_rpc, and remove this bogus response:
     UnrecoverableShutdown(()),
+
+    RequestPort(u16),
+    AddUsedPort,
+    FreePort,
+    PortFull,
 }
 
 pub async fn send_and_update_time<G, T>(

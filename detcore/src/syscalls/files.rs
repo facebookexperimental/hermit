@@ -150,6 +150,16 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let fd = call.fd();
         let res = self.record_or_replay(guest, call).await?;
+        let mytime = guest.thread_state().thread_logical_time.clone();
+        let resp = guest
+            .send_rpc((mytime, GlobalRequest::FreePortByFd(fd)))
+            .await;
+        match resp.1 {
+            GlobalResponse::FreePort => {
+                trace!("Closed {}", fd);
+            }
+            _ => unreachable!(),
+        }
         guest.thread_state_mut().remove_fd(fd);
         Ok(res)
     }
@@ -706,41 +716,99 @@ impl<T: RecordOrReplay> Detcore<T> {
             let req = guest.thread_state().mk_request(resource, Permission::W);
             resource_request(guest, req).await;
         }
-        if guest.config().warn_non_zero_binds {
-            let addr = call.umyaddr().ok_or(Errno::EFAULT)?;
+        let addr = call.umyaddr().ok_or(Errno::EFAULT)?;
+        let sock_fd = call.fd();
 
-            // like: sockaddr.sa_family
-            let sockaddr_family = guest.memory().read_value(addr.cast::<u16>())?;
+        let sockaddr_family = guest.memory().read_value(addr.cast::<u16>())?;
+        if sockaddr_family == libc::AF_INET as u16 {
+            // For IPv4
+            let mut sockaddr_in: libc::sockaddr_in = guest
+                .memory()
+                .read_value(addr.cast::<libc::sockaddr_in>())?;
 
-            if sockaddr_family == libc::AF_INET as u16 {
-                let sockaddr_in: libc::sockaddr_in = guest
-                    .memory()
-                    .read_value(addr.cast::<libc::sockaddr_in>())?;
-                // to_be() == htons
-                let port = sockaddr_in.sin_port.to_be();
-                let addr = Ipv4Addr::from(sockaddr_in.sin_addr.s_addr);
-                if port != 0 {
+            let port = sockaddr_in.sin_port.to_be();
+            let ipaddr = Ipv4Addr::from(sockaddr_in.sin_addr.s_addr);
+            if port != 0 {
+                if guest.config().warn_non_zero_binds {
                     warn!(
                         "Analyze Networking: Non-zero port detected: {:?}:{:?}",
-                        addr, port
+                        ipaddr, port
                     );
                 }
-            } else if sockaddr_family == libc::AF_INET6 as u16 {
-                let sockaddr_in: libc::sockaddr_in6 = guest
-                    .memory()
-                    .read_value(addr.cast::<libc::sockaddr_in6>())?;
-                // to_be() == htons
-                let port = sockaddr_in.sin6_port.to_be();
-                let addr = Ipv6Addr::from(sockaddr_in.sin6_addr.s6_addr);
-                if port != 0 {
+                let mytime = guest.thread_state().thread_logical_time.clone();
+                // Send RPC to make sure already used ports are not used.
+                let resp = guest
+                    .send_rpc((mytime, GlobalRequest::AddUsedPort(port, sock_fd)))
+                    .await;
+                match resp.1 {
+                    GlobalResponse::AddUsedPort => {
+                        trace!("Added to used port {}", port);
+                    }
+                    _ => unreachable!(),
+                }
+            } else {
+                let mytime = guest.thread_state().thread_logical_time.clone();
+                // Request a determinzed port
+                let resp = guest
+                    .send_rpc((mytime, GlobalRequest::RequestPort(sock_fd)))
+                    .await;
+                match resp.1 {
+                    GlobalResponse::RequestPort(port_assigned) => {
+                        sockaddr_in.sin_port = port_assigned.to_be();
+                        guest
+                            .memory()
+                            .write_value(addr.cast::<libc::sockaddr_in>(), &sockaddr_in)?;
+                    }
+                    GlobalResponse::PortFull => {
+                        return Err(reverie::Error::from(nix::errno::Errno::EADDRINUSE));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        } else if sockaddr_family == libc::AF_INET6 as u16 {
+            // For IPv6
+            let mut sockfaddr_in: libc::sockaddr_in6 = guest
+                .memory()
+                .read_value(addr.cast::<libc::sockaddr_in6>())?;
+            let port = sockfaddr_in.sin6_port.to_be();
+            let ipaddr = Ipv6Addr::from(sockfaddr_in.sin6_addr.s6_addr);
+            if port != 0 {
+                if guest.config().warn_non_zero_binds {
                     warn!(
                         "Analyze Networking: Non-zero port detected: {:?}:{:?}",
-                        addr, port
+                        ipaddr, port
                     );
+                }
+                let mytime = guest.thread_state().thread_logical_time.clone();
+                let resp = guest
+                    .send_rpc((mytime, GlobalRequest::AddUsedPort(port, sock_fd)))
+                    .await;
+                match resp.1 {
+                    GlobalResponse::AddUsedPort => {
+                        trace!("Added to used port {}", port);
+                    }
+                    _ => unreachable!(),
+                }
+            } else {
+                let mytime = guest.thread_state().thread_logical_time.clone();
+                let resp = guest
+                    .send_rpc((mytime, GlobalRequest::RequestPort(sock_fd)))
+                    .await;
+                match resp.1 {
+                    GlobalResponse::RequestPort(port_assigned) => {
+                        sockfaddr_in.sin6_port = port_assigned.to_be();
+                        guest
+                            .memory()
+                            .write_value(addr.cast::<libc::sockaddr_in6>(), &sockfaddr_in)?;
+                        trace!("Port assigned {}", port_assigned)
+                    }
+                    GlobalResponse::PortFull => {
+                        return Err(reverie::Error::from(nix::errno::Errno::EADDRINUSE));
+                    }
+                    _ => unreachable!(),
                 }
             }
         }
-
         let res = self.record_or_replay(guest, call).await?;
 
         Ok(res)

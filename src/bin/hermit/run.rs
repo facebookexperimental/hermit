@@ -301,13 +301,11 @@ impl RunOpts {
             config.warn_non_zero_binds = true;
         }
 
-        // if self.strict {
         config.sequentialize_threads = !self.no_sequentialize_threads;
         config.deterministic_io = !self.no_deterministic_io;
         config.virtualize_time = true;
         config.virtualize_metadata = true;
         config.virtualize_cpuid = true;
-        // }
 
         // Perform internal validation on the Config args, before taking into account the
         // hermit run args:
