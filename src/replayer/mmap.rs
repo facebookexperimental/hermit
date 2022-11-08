@@ -1,4 +1,10 @@
-// (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
 
 //! `mmap` is a tricky case. When using `MAP_ANONYMOUS` with a file descriptor of
 //! -1, we are effectively allocating memory. If ASLR is turned off, this should

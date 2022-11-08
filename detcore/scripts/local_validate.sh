@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
 set -Eeuo pipefail
 # This script is a "preflight" checklist: a series of tests that should run locally BEFORE publishing a diff.

@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
 # RUN: %hermit run --bind /tmp --chaos --verify -- %s
 # RUN: %hermit run --bind /tmp --chaos --sched-heuristic=random --verify -- %s
