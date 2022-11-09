@@ -3,7 +3,7 @@ Hermit: a reproducible Linux container
 
 This directory contains a Rust project that builds the "hermit" binary.  Hermit can sandbox the execution of a guest program (and its children).  It isolates the guest from the host platform and any nondeterministic responses by the underlying Linux kernel. It is a container in certain respects (process namespace, network namespace), but it doesn't hide the host file system from the guest.  Rather, hermit is userspace software that is typically run inside another container (such as Docker) which provides the file system base image. Like Wine or WSL(1), Hermit sits between the guest process and the OS, accepting guest system call requests on one side, and producing sending system calls to the Linux kernel on the other side.
 
-Read below about how to build hermit, and you can't get an idea of what it does from running examples in the [./examples](./examples) folder.
+Read below about how to build hermit, and you can get an idea of what it does from running examples in the [./examples](./examples) folder.
 
 Building hermit
 ===============
