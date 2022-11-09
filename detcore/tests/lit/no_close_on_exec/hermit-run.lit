@@ -1,0 +1,1 @@
+RUN: %hermit run --no-sequentialize-threads --no-deterministic-io -- %me
