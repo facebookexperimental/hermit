@@ -26,12 +26,12 @@ trap on_exit EXIT
 
 RUST_LOG=detcore=trace "$hermit" --log-file="$log1".log run --bind="$tmpdir" --base-env=minimal --chaos \
   --record-preemptions-to="$log1".trace \
-  -- bash -c 'find ./hermetic_infra/hermit/src'
+  -- bash -c 'find ./hermetic_infra/hermit/hermit-cli/src'
 
 RUST_LOG=detcore=trace "$hermit" --log-file="$log2".log run --bind="$tmpdir" --base-env=minimal \
   --replay-schedule-from="$log1".trace \
   --record-preemptions-to="$log2".trace \
-  -- bash -c 'find ./hermetic_infra/hermit/src'
+  -- bash -c 'find ./hermetic_infra/hermit/hermit-cli/src'
 
 wc "$log1".log "$log2".log "$log1".trace "$log2".trace
 
