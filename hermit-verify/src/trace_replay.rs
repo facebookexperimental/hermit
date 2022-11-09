@@ -96,6 +96,8 @@ impl UseCase for TraceReplayOpts {
             verify_detlog: true,
             verify_commits: false,
             verify_exit_statuses: true,
+            verify_desync: true,
+            verify_schedules: true,
         }
     }
 }

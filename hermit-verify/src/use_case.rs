@@ -24,8 +24,10 @@ pub struct UseCaseOptions {
     pub verify_stdout: bool,
     pub verify_stderr: bool,
     pub verify_detlog: bool,
+    pub verify_desync: bool,
     pub verify_commits: bool,
     pub verify_exit_statuses: bool,
+    pub verify_schedules: bool,
 }
 
 pub trait UseCase {
@@ -38,6 +40,8 @@ pub trait UseCase {
             verify_detlog: true,
             verify_commits: true,
             verify_exit_statuses: true,
+            verify_desync: true,
+            verify_schedules: false,
         }
     }
 
@@ -83,6 +87,14 @@ fn compare_results<T: UseCase>(
 
     if options.verify_exit_statuses {
         result &= verify.verify_exit_statuses(left, right)?;
+    }
+
+    if options.verify_desync {
+        result &= verify.verify_desync(right)?;
+    }
+
+    if options.verify_schedules {
+        result &= verify.verify_schedules(left, right)?;
     }
 
     Ok(result)

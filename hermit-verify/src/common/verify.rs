@@ -7,6 +7,8 @@
  */
 
 use std::ffi::OsStr;
+use std::io::BufRead;
+use std::io::BufReader;
 use std::path::Path;
 
 use colored::Colorize;
@@ -23,12 +25,10 @@ impl<P: AsRef<OsStr>> Verify<P> {
         Self { hermit_bin }
     }
 
-    fn verify_files(left: &Path, right: &Path) -> anyhow::Result<bool> {
-        let left = std::fs::read_to_string(left)?;
-        let right = std::fs::read_to_string(right)?;
+    fn verify_lines<S1: AsRef<str>, S2: AsRef<str>>(left: S1, right: S2) -> anyhow::Result<bool> {
         let result = similar::TextDiff::configure()
             .algorithm(similar::Algorithm::Myers)
-            .diff_lines(&left, &right);
+            .diff_lines(left.as_ref(), right.as_ref());
 
         if result.ratio() == 1.0 {
             Ok(true)
@@ -46,6 +46,42 @@ impl<P: AsRef<OsStr>> Verify<P> {
             }
             Ok(false)
         }
+    }
+
+    fn verify_files(left: &Path, right: &Path) -> anyhow::Result<bool> {
+        let left = std::fs::read_to_string(left)?;
+        let right = std::fs::read_to_string(right)?;
+        Self::verify_lines(left, right)
+    }
+
+    fn format_json<TPath: AsRef<Path>>(path: TPath) -> anyhow::Result<String> {
+        let value: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(path.as_ref())?)?;
+        let schedules = match &value {
+            serde_json::Value::Object(sched_file) => sched_file.get("global").ok_or_else(|| {
+                anyhow::Error::msg("expecting \"global\" key in the target json file")
+            }),
+            _ => Err(anyhow::Error::msg(format!(
+                "{} has unexpected format",
+                path.as_ref().display()
+            ))),
+        };
+        Ok(serde_json::to_string_pretty(schedules?)?)
+    }
+
+    pub fn verify_schedules(
+        &self,
+        left: &RunEnvironment,
+        right: &RunEnvironment,
+    ) -> anyhow::Result<bool> {
+        println!(
+            "{}",
+            ":: Checking that event schedules match (fixed point)".bold()
+        );
+        Self::verify_lines(
+            Self::format_json(&left.schedule_file)?,
+            Self::format_json(&right.schedule_file)?,
+        )
     }
 
     pub fn verify_stdout(
@@ -70,6 +106,20 @@ impl<P: AsRef<OsStr>> Verify<P> {
             left.std_err_file_path.as_path(),
             right.std_err_file_path.as_path(),
         )
+    }
+
+    pub fn verify_desync(&self, right: &RunEnvironment) -> anyhow::Result<bool> {
+        //FIXME: extract log-diff out of hermit and handle DESYNCs there (T135657122 + some extra work)
+        println!("{}", ":: Looking for desync events:".bold());
+        let buffer = BufReader::new(std::fs::File::open(&right.log_file_path)?);
+        for line in buffer.lines() {
+            if line?.contains("DESYNC") {
+                println!("{}", "WARNING: DESYNCs found".red());
+                return Ok(false);
+            }
+        }
+        println!("DESYNC events not found");
+        Ok(true)
     }
 
     pub fn verify_logs(
@@ -148,8 +198,56 @@ mod test {
         Ok(())
     }
 
-    fn write_to_file(file_path: &Path, content: &str) -> anyhow::Result<()> {
-        let mut file = File::create(file_path)?;
+    #[test]
+    fn test_compare_desync() -> anyhow::Result<()> {
+        let env = TemporaryEnvironmentBuilder::new().run_count(3).build()?;
+
+        write_to_file(&env.runs()[0].log_file_path, "DESYNC Hello")?;
+        write_to_file(&env.runs()[1].log_file_path, "Test 1")?;
+        write_to_file(&env.runs()[2].log_file_path, "Test 1: TIME-DESYNC")?;
+
+        let verify = Verify::new(PathBuf::from("hermit"));
+        let logs_equal = [
+            verify.verify_desync(&env.runs()[0])?,
+            verify.verify_desync(&env.runs()[1])?,
+            verify.verify_desync(&env.runs()[2])?,
+        ];
+        assert_eq!(logs_equal, [false, true, false]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_compare_schedules() -> anyhow::Result<()> {
+        let env = TemporaryEnvironmentBuilder::new().run_count(4).build()?;
+        let verify = Verify::new("hermit");
+        write_to_file(
+            &env.runs()[0].schedule_file,
+            r#"{ "global" : { "name" : "name1"} }"#,
+        )?;
+        write_to_file(
+            &env.runs()[1].schedule_file,
+            r#"{ "global" : { "name" : "name2"} }"#,
+        )?;
+        write_to_file(
+            &env.runs()[2].schedule_file,
+            r#"{ "global" : { "name" : "name123"} }"#,
+        )?;
+        write_to_file(
+            &env.runs()[3].schedule_file,
+            r#"{ "some": "value", "global" : { "name" : "name123"} }"#,
+        )?;
+
+        let result = [
+            verify.verify_schedules(&env.runs()[0], &env.runs()[1])?,
+            verify.verify_schedules(&env.runs()[2], &env.runs()[3])?,
+        ];
+        assert_eq!(result, [false, true]);
+        Ok(())
+    }
+
+    fn write_to_file<P: AsRef<Path>>(file_path: &P, content: &str) -> anyhow::Result<()> {
+        let mut file = File::create(file_path.as_ref())?;
         write!(file, "{}", content)?;
         Ok(())
     }
