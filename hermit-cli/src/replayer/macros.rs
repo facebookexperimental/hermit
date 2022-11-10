@@ -10,7 +10,7 @@
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// let event = next_event!(guest, Read);
 /// ```
 ///
