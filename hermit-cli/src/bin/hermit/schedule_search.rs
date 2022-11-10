@@ -263,7 +263,7 @@ where
     //
     // if no branches from the first event in the critical pair are used, the ciritical event
     // will appear one index sooner becase events with zero count are filtered
-    let critical_event_index = prefix.len() + 1 + if i > 0 { 1 } else { 0 };
+    let critical_event_index = prefix.len() + 1 + usize::from(i > 0);
 
     let failing_schedule =
         create_schedule_with_critical_pair(prefix, postfix, &critical_pair_passing, i, j);

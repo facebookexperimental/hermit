@@ -1140,7 +1140,7 @@ impl AnalyzeOpts {
                     "Reproducer".green().bold(),
                     self.to_repro_chaos(sched_seed)
                 );
-                std::fs::copy(&preempts, &preempts_path).expect("file copy to succeed");
+                std::fs::copy(&preempts, preempts_path).expect("file copy to succeed");
                 break;
             }
             round += 1;
