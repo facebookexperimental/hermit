@@ -11,6 +11,7 @@ cli = { path = "../../../cli/rust/cli" }
 colored = "1.9"
 fbinit = { path = "../../../common/rust/shed/fbinit" }
 fbinit-tokio = { path = "../../../common/rust/shed/fbinit/fbinit-tokio" }
+serde_json = { version = "1.0.79", features = ["float_roundtrip", "unbounded_depth"] }
 similar = { version = "2.2.0", features = ["inline"] }
 tempfile = "3.3"
 tracing = "0.1.35"
