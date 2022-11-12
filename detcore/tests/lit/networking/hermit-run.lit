@@ -1,0 +1,3 @@
+RUN: %hermit run --no-sequentialize-threads --no-deterministic-io --analyze-networking -- %me |& FileCheck %s
+CHECK: {{.* 0.0.0.0:1299}}
+CHECK-NEXT: {{.* :::1299}}

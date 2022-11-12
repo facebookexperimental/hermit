@@ -1,0 +1,5 @@
+RUN: %hermit run --no-sequentialize-threads --no-deterministic-io -- %me | FileCheck %s
+CHECK: SIGHUP is masked
+CHECK-NEXT: SIGALRM is masked
+CHECK-NEXT: SIGSTKFLT is not masked
+CHECK-EMPTY:

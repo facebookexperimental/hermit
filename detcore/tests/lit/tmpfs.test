@@ -1,0 +1,22 @@
+RUN: mkdir foo bar
+RUN: touch foo/{1,2}.txt bar/{1,2,3}.txt
+RUN: %hermit run --no-sequentialize-threads --no-deterministic-io --bind foo:/tmp/foo --bind bar:/tmp/bar -- ls -aR /tmp | FileCheck %s
+CHECK: /tmp
+CHECK-NEXT: .
+CHECK-NEXT: ..
+CHECK-NEXT: bar
+CHECK-NEXT: foo
+CHECK-EMPTY:
+CHECK-NEXT: /tmp/bar
+CHECK-NEXT: .
+CHECK-NEXT: ..
+CHECK-NEXT: 1.txt
+CHECK-NEXT: 2.txt
+CHECK-NEXT: 3.txt
+CHECK-EMPTY:
+CHECK-NEXT: /tmp/foo
+CHECK-NEXT: .
+CHECK-NEXT: ..
+CHECK-NEXT: 1.txt
+CHECK-NEXT: 2.txt
+CHECK-EMPTY:

@@ -1,0 +1,1 @@
+../../examples/devrand.sh

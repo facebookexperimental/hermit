@@ -1,0 +1,51 @@
+RUN: %hermit run -- %me | FileCheck %s
+CHECK: stat1: stat {
+CHECK-NEXT:     st_dev: [[ST_DEV:[0-9]+]],
+CHECK-NEXT:     st_ino: [[ST_INO:[0-9]+]],
+CHECK-NEXT:     st_nlink: 1,
+CHECK-NEXT:     st_mode: 33152,
+CHECK-NEXT:     st_uid: 0,
+CHECK-NEXT:     st_gid: 0,
+CHECK-NEXT:     __pad0: 0,
+CHECK-NEXT:     st_rdev: 0,
+CHECK-NEXT:     st_size: 0,
+CHECK-NEXT:     st_blksize: 4096,
+CHECK-NEXT:     st_blocks: 0,
+CHECK-NEXT:     st_atime: 946684799,
+CHECK-NEXT:     st_atime_nsec: 0,
+CHECK-NEXT:     st_mtime: 946684799,
+CHECK-NEXT:     st_mtime_nsec: 0,
+CHECK-NEXT:     st_ctime: 946684799,
+CHECK-NEXT:     st_ctime_nsec: 0,
+CHECK-NEXT:     __unused: [
+CHECK-NEXT:         0,
+CHECK-NEXT:         0,
+CHECK-NEXT:         0,
+CHECK-NEXT:     ],
+CHECK-NEXT: }
+CHECK-NEXT: stat2: stat {
+CHECK-NEXT:     st_dev: [[ST_DEV]],
+CHECK-NEXT:     st_ino: [[ST_INO]],
+CHECK-NEXT:     st_nlink: 1,
+CHECK-NEXT:     st_mode: 33152,
+CHECK-NEXT:     st_uid: 0,
+CHECK-NEXT:     st_gid: 0,
+CHECK-NEXT:     __pad0: 0,
+CHECK-NEXT:     st_rdev: 0,
+CHECK-NEXT:     st_size: 6,
+CHECK-NEXT:     st_blksize: 4096,
+CHECK-NEXT:     st_blocks: 8,
+CHECK-NEXT:     st_atime: 946684799,
+CHECK-NEXT:     st_atime_nsec: 0,
+// FIXME: With --strict, st_mtime and st_mtime_nsec should be deterministic, but
+// they're not.
+CHECK-NEXT:     st_mtime: {{([0-9]+)}},
+CHECK-NEXT:     st_mtime_nsec: {{([0-9]+)}},
+CHECK-NEXT:     st_ctime: 946684799,
+CHECK-NEXT:     st_ctime_nsec: 0,
+CHECK-NEXT:     __unused: [
+CHECK-NEXT:         0,
+CHECK-NEXT:         0,
+CHECK-NEXT:         0,
+CHECK-NEXT:     ],
+CHECK-NEXT: }
