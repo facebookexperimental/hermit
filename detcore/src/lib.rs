@@ -771,6 +771,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // It is safe to mutate this address since libc has not yet had a
             // chance to modify or copy the auxv table.
             let bytes: [u8; 16] = guest.thread_state_mut().thread_prng().gen();
+            detlog!(
+                "[post_exec, dtid {}] init auxv AT_RANDOM value to {:?}",
+                guest.thread_state().dettid,
+                bytes
+            );
             let ptr = unsafe { ptr.into_mut() };
             guest.memory().write_value(ptr, &bytes)?;
         }
