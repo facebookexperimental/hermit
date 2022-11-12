@@ -27,6 +27,7 @@ use std::time::SystemTime;
 
 use chrono::DateTime;
 use chrono::Utc;
+use nix::sys::signal::Signal;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::CloneFlags;
 use reverie::syscalls::MemoryAccess;
@@ -62,6 +63,7 @@ use crate::scheduler::Priority;
 use crate::scheduler::SchedResponse;
 use crate::scheduler::SchedValue;
 use crate::scheduler::Scheduler;
+use crate::scheduler::Seconds;
 use crate::scheduler::ThreadNextTurn;
 use crate::scheduler::DEFAULT_PRIORITY;
 use crate::tool_local::Detcore;
@@ -455,6 +457,10 @@ impl GlobalTool for GlobalState {
                 let print_backtrace = self.recv_trace_schedevent(ev, detpid).await;
                 R::TraceSchedEvent(print_backtrace)
             }
+            GlobalRequest::RegisterAlarm(dpid, dtid, secs, sig) => {
+                let remaining = self.recv_register_alarm(dpid, dtid, secs, sig).await;
+                R::RegisterAlarm(remaining)
+            }
             GlobalRequest::UnrecoverableShutdown => {
                 self.force_shutdown_with_error();
                 R::UnrecoverableShutdown(())
@@ -523,7 +529,12 @@ impl GlobalTool for GlobalState {
 }
 
 impl GlobalState {
-    async fn recv_request_resources(&self, from: Tid, detpid: DetPid, rs: Resources) {
+    async fn recv_request_resources(
+        &self,
+        from: Tid,
+        detpid: DetPid,
+        rs: Resources,
+    ) -> ResumeStatus {
         let dettid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
 
         let resp2 = {
@@ -545,7 +556,7 @@ impl GlobalState {
             &resp2,
             rs
         );
-        let _answer = resp2.get().await; // Block on the scheduler allowing our guest to proceed.
+        let answer = resp2.get().await; // Block on the scheduler allowing our guest to proceed.
         if rs.resources.contains_key(&ResourceID::Exit(true)) {
             info!(
                 "Scheduler authorized an exit-group scenario, from dettid {} / detpid {}",
@@ -568,7 +579,24 @@ impl GlobalState {
                 }
             }
         }
-        trace!("[detcore, dtid {}] resources granted: {:?}", dettid, rs);
+
+        match answer {
+            SchedResponse::Go(_) => {
+                trace!(
+                    "[detcore, dtid {}] resources granted, resuming normally: {:?}",
+                    dettid,
+                    rs
+                );
+                ResumeStatus::Normal
+            }
+            SchedResponse::Signaled() => {
+                trace!(
+                    "[detcore, dtid {}] resources granted but interrupted by signal",
+                    dettid,
+                );
+                ResumeStatus::Signaled
+            }
+        }
     }
 
     async fn recv_release_resources(&self, from: Tid, rs: Resources) {
@@ -833,6 +861,7 @@ impl GlobalState {
                 );
                 answer
             }
+            SchedResponse::Signaled() => Some(SchedValue::Value(nix::errno::Errno::EINTR as u64)),
         }
     }
 
@@ -967,6 +996,20 @@ impl GlobalState {
         self.port_start_range.store(range[0], SeqCst);
         self.port_end_range.store(range[1], SeqCst);
     }
+
+    /// Register an alarm (delayed signal delivery) with the global scheduler.
+    pub async fn recv_register_alarm(
+        &self,
+        detpid: DetPid,
+        dettid: DetTid,
+        seconds: Seconds,
+        sig: SigWrapper,
+    ) -> Seconds {
+        self.sched
+            .lock()
+            .unwrap()
+            .register_alarm(detpid, dettid, seconds, sig.0)
+    }
 }
 
 /// Messages to the global object.
@@ -1015,8 +1058,11 @@ pub enum GlobalRequest {
     /// Retrieve global time.
     GlobalTimeLowerBound,
 
-    // Record scheduling event in a total order.
+    /// Record scheduling event in a total order.
     TraceSchedEvent(SchedEvent, DetPid),
+
+    /// Basically performs an alarm syscall, takes seconds.
+    RegisterAlarm(DetPid, DetTid, Seconds, SigWrapper),
 
     /// The container is shutting down.  Exit the scheduler "thread".
     UnrecoverableShutdown,
@@ -1037,7 +1083,7 @@ pub enum GlobalRequest {
 #[allow(missing_docs, clippy::unit_arg)]
 #[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
 pub enum GlobalResponse {
-    RequestResources(()),
+    RequestResources(ResumeStatus),
     ReleaseResources(()),
     ReleaseAllResources(()),
     CreateChildThread(()),
@@ -1052,6 +1098,7 @@ pub enum GlobalResponse {
     GlobalTimeLowerBound(LogicalTime),
     /// A true response indicates that the stacktrace should be printed by the guest before proceeding.
     TraceSchedEvent(bool),
+    RegisterAlarm(Seconds),
     // TODO: use void_send_rpc, and remove this bogus response:
     UnrecoverableShutdown(()),
 
@@ -1077,10 +1124,19 @@ where
     resp
 }
 
+/// When the thread resumes after a potentially-blocking scheduler request, is it a normal
+/// continuation of execution, or is it because the thread will now execute a signal handler.
+/// If the latter, that interrupts logically blocking syscalls that were in progress.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub enum ResumeStatus {
+    Normal,
+    Signaled,
+}
+
 /// Global method RPC to request to control a resource.
 ///
 /// Blocking: future returns only when resources are fully acquired.
-pub async fn resource_request<G, T>(guest: &mut G, r: Resources)
+pub async fn resource_request<G, T>(guest: &mut G, r: Resources) -> ResumeStatus
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -1106,6 +1162,8 @@ where
             }
             _ => unreachable!(),
         }
+    } else {
+        ResumeStatus::Normal
     }
 }
 
@@ -1433,6 +1491,26 @@ where
     };
     if do_backtrace {
         print_backtrace(guest, &None);
+    }
+}
+
+/// Register an alarm (delayed signal delivery) with the global scheduler.
+/// Returns the number of seconds remaining until any previously scheduled alarm.
+pub async fn register_alarm<G, T>(guest: &mut G, seconds: Seconds, sig: Signal) -> Seconds
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let dettid = guest.thread_state().dettid;
+    let detpid = guest.thread_state().detpid.expect("detpid unset");
+    let resp = send_and_update_time(
+        guest,
+        GlobalRequest::RegisterAlarm(detpid, dettid, seconds, SigWrapper(sig)),
+    )
+    .await;
+    match resp.1 {
+        GlobalResponse::RegisterAlarm(x) => x,
+        _ => unreachable!(),
     }
 }
 

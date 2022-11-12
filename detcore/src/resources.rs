@@ -20,6 +20,7 @@ use crate::types::DetInode;
 use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
+use crate::types::SigWrapper;
 
 /*
 NOTE [Blocking Syscalls via Internal Polling]
@@ -203,6 +204,10 @@ pub enum ResourceID {
     ///
     /// Also includes the local time at which the guest observed the preemption point.
     PriorityChangePoint(u64, LogicalTime),
+
+    /// A physical signal has been received by the thread, request to continue delivering it and
+    /// invoking the signal handler as the next thing to run.
+    InboundSignal(SigWrapper),
 }
 
 /// Permission to a device, which behaves like a predefined "inode".

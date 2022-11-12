@@ -20,18 +20,20 @@ void sig_handler(int signo) {
 }
 
 int main() {
-  printf("== Start test\n");
-  if (signal(SIGILL, sig_handler) == SIG_ERR) {
+  puts("== Start test\n");
+  if (signal(SIGALRM, sig_handler) == SIG_ERR) {
     printf("\nError: Cannot register signal handler for SIGINT\n");
     return 1;
   }
-  pthread_kill(pthread_self(), SIGILL);
+
+  alarm(1);
+  sleep(3);
+
   if (flag) {
-    printf(
-        "== Success: Synchronously delivered control to the signal handler and back.\n");
+    puts("== Success: Delivered control to the signal handler and back.\n");
     return 0;
   } else {
-    printf("Error: failed to invoke signal handler\n");
+    puts("Error: failed to invoke signal handler\n");
     return 1;
   }
 }

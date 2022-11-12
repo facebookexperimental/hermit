@@ -499,7 +499,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::rt_sigprocmask,
                 Sysno::rt_sigaction,
                 Sysno::sysinfo,
+                // TODO(T137258824): add proper Select / PSelect6
+                // Sysno::pselect6,
+                // Sysno::select,
             ]);
+
+            if do_sched {
+                subscription.syscalls([
+                    // TODO: some of the above could probably move to this bucket.
+                    Sysno::alarm,
+                    Sysno::pause,
+                ]);
+            }
 
             if config.virtualize_metadata {
                 subscription.syscalls([
@@ -1001,6 +1012,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Getcpu(s) => self.handle_getcpu(guest, s).await,
             Syscall::RtSigprocmask(s) => self.handle_rt_sigprocmask(guest, s).await,
             Syscall::RtSigaction(s) => self.handle_rt_sigaction(guest, s).await,
+            Syscall::Alarm(s) => self.handle_alarm(guest, s).await,
+            Syscall::Pause(s) => self.handle_pause(guest, s).await,
 
             // These are to allow execution of a minimal rust executable
             // (namely //hermetic_infra/detcore:get-syscall-support)

@@ -10,6 +10,9 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
 
+use nix::sys::signal::Signal;
+
+use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 
@@ -21,11 +24,19 @@ use crate::types::LogicalTime;
 pub struct TimedEvents {
     // Inner btreeset is *always* non-empty:
     map: BTreeMap<LogicalTime, BTreeSet<TimedEvent>>,
+
+    // There is only one alarm allowed at a time per process, so we keep track of the current alarm
+    // for each process and replace it if any other is inserted.
+    alarm_times: BTreeMap<DetPid, LogicalTime>,
 }
 
 /// An event that occurs at a particular time in the execution, typically at an offset in the future.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TimedEvent {
+    // An upcoming alarm, destined for particular pids, with a designated tid in that process (if it
+    // still exists).
+    AlarmEvt(DetPid, DetTid, Signal),
+
     /// A timed event on a particular thread (sleep, timeout, etc)
     ThreadEvt(DetTid),
 }
@@ -33,7 +44,8 @@ pub enum TimedEvent {
 impl fmt::Display for TimedEvent {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            TimedEvent::ThreadEvt(dt) => write!(f, "{}", dt),
+            TimedEvent::ThreadEvt(dt) => write!(f, "ThreadEvt({})", dt),
+            TimedEvent::AlarmEvt(dp, dt, sig) => write!(f, "AlarmEvt({},{},{})", dp, dt, sig),
         }
     }
 }
@@ -47,6 +59,56 @@ impl TimedEvents {
                 dt
             );
         }
+    }
+
+    // Return the last absolute alarm time for this pid, if any.
+    pub fn insert_alarm(
+        &mut self,
+        ns: LogicalTime,
+        dp: DetPid,
+        dt: DetTid,
+        sig: Signal,
+    ) -> Option<LogicalTime> {
+        let old = self.alarm_times.insert(dp, ns);
+        self.clear_old_alarm(old);
+
+        let set = self.map.entry(ns).or_insert_with(BTreeSet::new);
+        let evt = TimedEvent::AlarmEvt(dp, dt, sig);
+        if !set.insert(evt) {
+            panic!(
+                "TimedEvents::insert should not insert an alarm event which is *already* in the set: {}",
+                evt
+            );
+        }
+        old
+    }
+
+    fn clear_old_alarm(&mut self, old: Option<LogicalTime>) {
+        if let Some(time) = old {
+            let set = self
+                .map
+                .get_mut(&time)
+                .expect("internal invariant broken, entry missing");
+
+            // Could use a drain_filter here, but it is nightly only:
+            let mut to_remove = None;
+            for evt in set.iter() {
+                if matches!(evt, TimedEvent::AlarmEvt(_, _, _)) {
+                    assert!(to_remove.is_none());
+                    to_remove = Some(*evt);
+                }
+            }
+            if let Some(evt) = to_remove {
+                assert!(set.remove(&evt));
+            }
+        }
+    }
+
+    // Return the time of any previous alarm on this process.
+    pub fn remove_alarm(&mut self, dp: DetPid) -> Option<LogicalTime> {
+        let old = self.alarm_times.remove(&dp);
+        self.clear_old_alarm(old);
+        old
     }
 
     pub fn len(&self) -> usize {

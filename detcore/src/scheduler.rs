@@ -23,6 +23,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 use std::vec::IntoIter;
 
+use nix::sys::signal;
+use nix::sys::signal::Signal;
+use nix::unistd::Pid;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 pub use runqueue::entropy_to_priority;
@@ -58,10 +61,14 @@ use crate::types::GlobalTime;
 use crate::types::LogicalTime;
 use crate::types::Op;
 use crate::types::SchedEvent;
+use crate::types::SigWrapper;
 use crate::types::SyscallPhase;
 
 /// Unique identifier for an action.
 pub type ActionID = u64;
+
+/// A non-negative integer number of seconds.
+pub type Seconds = u32;
 
 /// A representation of side effects that are happening, or could be happening, right now
 /// in the background.
@@ -82,6 +89,10 @@ pub struct Action {
 pub enum SchedResponse {
     /// Keep running.
     Go(Option<SchedValue>),
+
+    /// The guest was interupted by a signal while waiting on the scheduler, and will now execute
+    /// the handler.
+    Signaled(),
     // TODO: Time to exit, or an exit is already under way
     // Exit,
 }
@@ -746,7 +757,6 @@ pub struct ConsumeResult {
     pub print_stack: bool,
 }
 
-#[allow(dead_code)]
 enum ThreadStatus {
     // Not present in scheduler structures.
     Gone,
@@ -1139,7 +1149,41 @@ impl Scheduler {
         {
             match evt {
                 TimedEvent::ThreadEvt(dtid) => self.wake_timed_event(time_ns, dtid),
+                TimedEvent::AlarmEvt(dpid, dtid, sig) => self.fire_alarm(dpid, dtid, sig),
             }
+        }
+    }
+
+    fn fire_alarm(&mut self, dtid: DetTid, dpid: DetPid, sig: Signal) {
+        let target = self.select_signal_target(dpid, Some(dtid));
+        info!(
+            "[dtid {}] Alarm fired, delivering signal {} to guest.",
+            target, sig
+        );
+        self.signal_guest(target, sig);
+    }
+
+    // Follow Linux semantics for delivering a signal to a thread within a process group.
+    // Optionally take a hint on which tid detcore would *like* to deliver to, if it is available.
+    fn select_signal_target(&self, detpid: DetPid, m_dettid: Option<DetTid>) -> DetTid {
+        // TODO(T137242449): chaos selection point for fuzzing all nondeterministic semantics:
+
+        if let Some(dettid) = m_dettid {
+            match self.thread_status(dettid) {
+                ThreadStatus::Gone => {}
+                ThreadStatus::Running | ThreadStatus::NotRunning => {
+                    return dettid;
+                }
+            }
+        }
+        // TODO: handle changes in group leader here...
+        if let ThreadStatus::Gone = self.thread_status(detpid) {
+            panic!(
+                "Unhandled case of signal delivery to process pid={}, but group leader thread has exited",
+                detpid
+            );
+        } else {
+            detpid
         }
     }
 
@@ -1163,6 +1207,61 @@ impl Scheduler {
             }
         }
         self.runqueue_push_front(dettid);
+    }
+
+    /// Send a signal to the guest, which should be blocked on the scheduler when this is sent.
+    /// (I.e. the signal is physically delivered when the scheduler resumes the thread's execution.)
+    fn signal_guest(&mut self, dettid: DetTid, signal: Signal) {
+        debug!(
+            "[dtid {}] deliver signal {} physically to guest thread.",
+            dettid, signal
+        );
+        if cfg!(debug_assertions) {
+            let nxtturn = self
+                .next_turns
+                .get(&dettid)
+                .expect("internal invariant broken");
+            assert!(
+                nxtturn.req.try_read().is_some(),
+                "signal_guest: thread should be parked in the scheduler"
+            );
+        }
+        let pid = Pid::from_raw(dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
+        signal::kill(pid, signal).expect("signal::kill to go through");
+
+        // Now that the thread is signaled, it needs to be runnable for the scheduler to continue it.
+        match self.thread_status(dettid) {
+            ThreadStatus::Gone => {
+                panic!(
+                    "signal_guest: should not have just delivered a signal to a nonexistent thread..."
+                );
+            }
+            ThreadStatus::Running => {
+                // TODO(T137242449): could reprioritize to run it sooner, but for now we leave the priorities alone.
+            }
+            ThreadStatus::NotRunning => {
+                let mut rsrcs = Resources::new(dettid);
+                rsrcs.insert(ResourceID::InboundSignal(SigWrapper(signal)), Permission::W);
+                self.force_unblock_thread(dettid, rsrcs);
+            }
+        }
+    }
+
+    // Force a thread out blocking and into the runnable state, replacing its resource request.
+    fn force_unblock_thread(&mut self, dettid: DetTid, rsrcs: Resources) {
+        info!(
+            "[dtid {}] removing blocking entries and requeuing thread",
+            dettid
+        );
+        self.remove_blocking_entries(&dettid);
+
+        if let Some(nxt) = self.next_turns.get_mut(&dettid) {
+            // Counterfeit the entry as though the thread had requested this resource from the start:
+            nxt.req = Ivar::full(Ok(rsrcs));
+        }
+
+        // TODO(T137242449): randomize choice of front/back and priority under --chaos:
+        self.runqueue_push_back(dettid);
     }
 
     /// Check on threads that were backgrounded performing external IO.
@@ -1316,6 +1415,7 @@ impl Scheduler {
 
                 match evt {
                     TimedEvent::ThreadEvt(dtid) => self.wake_timed_event(event_ns, dtid),
+                    TimedEvent::AlarmEvt(dpid, dtid, sig) => self.fire_alarm(dpid, dtid, sig),
                 }
                 return Err(SkipTurn);
             }
@@ -1551,6 +1651,7 @@ impl Scheduler {
             ResourceID::InternalIOPolling => Ok(()),
             ResourceID::FutexWait => Ok(()),
             ResourceID::TraceReplay => Ok(()),
+            ResourceID::InboundSignal(_) => Ok(()),
         }
     }
 
@@ -1771,8 +1872,28 @@ impl Scheduler {
             &resp,
             &dtid
         );
+        let sig = self.is_signal_inbound(dtid); // Peek before we clear the ivars.
         self.clear_nextturn(dtid);
-        resp.put(SchedResponse::Go(None));
+        let answer = if sig {
+            SchedResponse::Signaled()
+        } else {
+            SchedResponse::Go(None)
+        };
+        resp.put(answer);
+    }
+
+    fn is_signal_inbound(&self, dettid: DetTid) -> bool {
+        let req = &self.next_turns.get(&dettid).unwrap().req;
+        if let Some(Ok(rsrcs)) = req.try_read() {
+            for rsrc in rsrcs.resources.iter() {
+                if let (ResourceID::InboundSignal(_), _) = rsrc {
+                    return true;
+                }
+            }
+            false
+        } else {
+            false
+        }
     }
 
     /// Clear the thread's nextturn, installing fresh ivars.
@@ -1870,7 +1991,6 @@ impl Scheduler {
     }
 
     /// Check if a thread is alive, but removed from run queue.
-    #[allow(dead_code)]
     fn thread_status(&self, dtid: DetTid) -> ThreadStatus {
         if self.run_queue.contains_tid(dtid) {
             ThreadStatus::Running
@@ -1891,6 +2011,7 @@ impl Scheduler {
                             return ThreadStatus::NotRunning;
                         }
                     }
+                    TimedEvent::AlarmEvt(_, _, _) => {}
                 }
             }
             if self.blocked.external_io_blockers.contains(&dtid) {
@@ -1966,6 +2087,32 @@ impl Scheduler {
         let print_stack = self.try_pop_stacktrace_event(self.recorded_event_count);
         self.recorded_event_count += 1;
         print_stack
+    }
+
+    // Returns the number of seconds until any previously scheduled alarm, if any (zero otherwise).
+    pub fn register_alarm(
+        &mut self,
+        detpid: DetPid,
+        dettid: DetTid,
+        seconds: Seconds,
+        sig: Signal,
+    ) -> Seconds {
+        let old = if seconds == 0 {
+            // Alarm of 0 cancels any pending signal.
+            self.blocked.timed_waiters.remove_alarm(detpid)
+        } else {
+            let target_time = self.committed_time + Duration::from_secs(seconds as u64);
+            self.blocked
+                .timed_waiters
+                .insert_alarm(target_time, detpid, dettid, sig)
+        };
+        if let Some(old_target_time) = old {
+            let remain_ns: u64 = old_target_time.as_nanos() - self.committed_time.as_nanos();
+            (remain_ns / 1_000_000_000) as u32
+        } else {
+            // Return 0 if no previous alarm, as per https://man7.org/linux/man-pages/man2/alarm.2.html
+            0
+        }
     }
 }
 

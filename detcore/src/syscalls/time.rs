@@ -20,6 +20,7 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
 use tracing::error;
+use tracing::info;
 use tracing::trace;
 
 use crate::record_or_replay::RecordOrReplay;
@@ -30,8 +31,24 @@ use crate::scheduler::entropy_to_priority;
 use crate::scheduler::Priority;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
+use crate::tool_global::ResumeStatus;
 use crate::tool_local::Detcore;
 use crate::types::LogicalTime;
+
+fn time_from_resources(rsrcs: &Resources) -> Option<LogicalTime> {
+    if rsrcs.resources.len() > 1 {
+        panic!(
+            "time_from_resources: multiple resource ids in resource request: {:?}",
+            rsrcs
+        );
+    }
+    for rs in rsrcs.resources.iter() {
+        if let (ResourceID::SleepUntil(tm), _) = rs {
+            return Some(*tm);
+        }
+    }
+    None
+}
 
 impl<T: RecordOrReplay> Detcore<T> {
     /// Convenience function for constructing a sleep request with a nanosecond offset from "now".
@@ -153,6 +170,38 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
+    /// Helper function to wait a given period, which may either succeed or be interrupted by a signal.
+    /// Return 0 or EINTR respectively.
+    async fn wait_and_return<R: Guest<Self>>(
+        guest: &mut R,
+        request: Resources,
+        call: NanosleepFamily,
+    ) -> Result<i64, Error> {
+        let target_time = time_from_resources(&request).expect("a sleepuntil resource request");
+        match resource_request(guest, request).await {
+            ResumeStatus::Normal => Ok(0),
+            ResumeStatus::Signaled => {
+                let now = thread_observe_time(guest).await;
+                let delta: Duration = target_time.duration_since(now);
+                let addr2 = call.rem();
+                if let Some(addr2) = addr2 {
+                    info!(
+                        "[interrupted] sleep till (until {}), woke up {:?} early, writing into nanosleep rem argument.",
+                        target_time, delta
+                    );
+                    let t = Timespec {
+                        tv_sec: delta.as_secs() as i64,
+                        tv_nsec: delta.subsec_nanos() as i64,
+                    };
+                    guest.memory().write_value(addr2, &t)?;
+                } else {
+                    info!("[interrupted] nanosleep rem argument is null, not writing it.")
+                }
+                Err(reverie::Error::Errno(Errno::EINTR))
+            }
+        }
+    }
+
     /// clock_nanosleep and nanosleep
     pub async fn handle_nanosleep_family<R: Guest<Self>>(
         &self,
@@ -172,12 +221,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             .read_value(addr)
             .expect("should be able to read from memory");
 
-        let wait_and_return =
-            async move |guest: &mut R, request: Resources| -> Result<i64, Error> {
-                resource_request(guest, request).await;
-                Ok(0)
-            };
-
         match call.flags() {
             0 => {
                 if self.cfg.sequentialize_threads {
@@ -189,7 +232,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         time,
                         &request
                     );
-                    wait_and_return(guest, request).await
+                    Self::wait_and_return(guest, request, call).await
                 } else {
                     trace!("Not sequentializing threads, letting nanosleep through...");
                     Ok(guest.inject(Syscall::from(call)).await?)
@@ -206,14 +249,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                             target_time,
                             &request
                         );
-                        wait_and_return(guest, request).await
+                        Self::wait_and_return(guest, request, call).await
                     } else {
                         // TODO T124594597: Record-replay case here, need better ideas to enable proper handling of this case.
                         error!(
                             "Sequentializing but not virtualizing, so can't rely on passed abs time, especially when replaying a recording, just yelding"
                         );
                         let request = Self::yield_request(guest);
-                        wait_and_return(guest, request).await
+                        Self::wait_and_return(guest, request, call).await
                     }
                 } else if self.cfg.virtualize_time {
                     trace!(
