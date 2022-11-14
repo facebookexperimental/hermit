@@ -67,12 +67,7 @@ impl AnalyzeOpts {
     }
 
     /// Launch a chaos run searching for a failing schudule.
-    fn launch_search(
-        &self,
-        round: u64,
-        tmp_dir: &Path,
-        sched_seed: u64,
-    ) -> Result<Option<PathBuf>, Error> {
+    fn launch_search(&self, round: u64, sched_seed: u64) -> Result<Option<PathBuf>, Error> {
         eprintln!(
             ":: {}",
             format!(
@@ -82,6 +77,7 @@ impl AnalyzeOpts {
             .yellow()
             .bold()
         );
+        let tmp_dir = self.tmp_dir.as_ref().unwrap();
         let preempts_path =
             tmp_dir.join(format!("search_round_{:0wide$}.preempts", round, wide = 3));
         let mut run_cmd: Vec<String> = vec!["hermit-run".to_string()];
@@ -136,8 +132,7 @@ impl AnalyzeOpts {
         runopts.det_opts.det_config.record_preemptions = true;
         runopts.det_opts.det_config.record_preemptions_to = Some(preempts_path.to_path_buf());
 
-        let mut tmp_dir = preempts_path.to_path_buf();
-        assert!(tmp_dir.pop());
+        let tmp_dir = self.tmp_dir.as_ref().unwrap();
         let bind_dir: Bind = Bind::from_str(tmp_dir.to_str().unwrap())?;
         runopts.bind.push(bind_dir);
 
@@ -184,8 +179,7 @@ impl AnalyzeOpts {
             ro.det_opts.det_config.record_preemptions_to = Some(path.to_path_buf());
         }
 
-        let mut tmp_dir = preempts_path.to_path_buf();
-        assert!(tmp_dir.pop());
+        let tmp_dir = self.tmp_dir.as_ref().unwrap();
         let bind_dir: Bind = Bind::from_str(tmp_dir.to_str().unwrap())?;
         ro.bind = vec![bind_dir];
 
@@ -223,8 +217,7 @@ impl AnalyzeOpts {
         ]
         .to_vec();
 
-        let mut tmp_dir = schedule_path.to_path_buf();
-        assert!(tmp_dir.pop());
+        let tmp_dir = self.tmp_dir.as_ref().unwrap();
         let bind_dir: Bind = Bind::from_str(tmp_dir.to_str().unwrap())?;
         ro.bind = vec![bind_dir];
 
@@ -257,8 +250,7 @@ impl AnalyzeOpts {
         ro.det_opts.det_config.sequentialize_threads = true;
         ro.det_opts.det_config.replay_schedule_from = Some(schedule_path.to_path_buf());
 
-        let mut tmp_dir = schedule_path.to_path_buf();
-        assert!(tmp_dir.pop());
+        let tmp_dir = self.tmp_dir.as_ref().unwrap();
         let bind_dir: Bind = Bind::from_str(tmp_dir.to_str().unwrap())?;
         ro.bind = vec![bind_dir];
 
@@ -276,9 +268,7 @@ impl AnalyzeOpts {
 
     // TODO: replace this with a more general way to convert RunOpts back to CLI args.
     pub(super) fn to_repro_cmd(&self, preempts_path: &Path, extra_flags: &str) -> String {
-        let mut tmp_dir = preempts_path.to_path_buf();
-        assert!(tmp_dir.pop());
-
+        let tmp_dir = self.tmp_dir.as_ref().unwrap();
         format!(
             "hermit --log-file=/dev/stderr run --bind={} --sequentialize-threads --replay-preemptions-from='{}' {} {}",
             tmp_dir.as_path().to_string_lossy(),
@@ -370,7 +360,7 @@ impl AnalyzeOpts {
     /// Create our workspace and verify the input run matches the criteria, or find one that does.
     ///
     /// Returns the logs and preemption (path) extracted from the initial target run.
-    fn phase1_establish_target_run(&mut self) -> Result<(PathBuf, PathBuf, PathBuf), Error> {
+    fn phase1_establish_target_run(&mut self) -> Result<(PathBuf, PathBuf), Error> {
         let run1_opts = self.get_run1_runopts()?;
 
         eprintln!(
@@ -381,11 +371,13 @@ impl AnalyzeOpts {
         let dir = tempfile::Builder::new()
             .prefix("hermit_analyze")
             .tempdir()?;
-        let dir_path = dir.into_path(); // For now always keep the temporary results.
-        eprintln!(":: Temp workspace: {}", dir_path.display());
+        let tmpdir_path = dir.into_path(); // For now always keep the temporary results.
+        eprintln!(":: Temp workspace: {}", tmpdir_path.display());
 
-        let run1_log_path = dir_path.join("run1_log");
-        let preempts_path = dir_path.join("orig.preempts");
+        let run1_log_path = tmpdir_path.join("run1_log");
+        let preempts_path = tmpdir_path.join("orig.preempts");
+        self.tmp_dir = Some(tmpdir_path);
+
         if let Some(p) = &self.run1_preemptions {
             // Copy into our temp working folder so everything is self contained.
             std::fs::copy(p, &preempts_path).expect("copy file to succeed");
@@ -432,7 +424,7 @@ impl AnalyzeOpts {
             eprintln!(":: {}", "WARNING: run without any --filter arguments, so accepting ALL runs. This is probably not what you wanted.".red().bold());
         }
 
-        Ok((dir_path, run1_log_path, preempts_path))
+        Ok((run1_log_path, preempts_path))
     }
 
     /// Reduce the set of preemptions needed to match the criteria.
@@ -518,11 +510,11 @@ impl AnalyzeOpts {
     pub fn phase3_strict_preempt_replay_check(
         &mut self,
         global: &GlobalOpts,
-        dir_path: &Path,
         run1_log_path: &Path,
         run1_preempts_path: &Path,
     ) -> Result<(), Error> {
         if self.selfcheck {
+            let dir_path = self.tmp_dir.as_ref().unwrap();
             eprintln!(
                 ":: {}",
                 "[selfcheck] Verifying target run preserved under preemption-replay"
@@ -587,8 +579,8 @@ impl AnalyzeOpts {
         &mut self,
         global: &GlobalOpts,
         matching_pr: PreemptionRecord,
-        dir_path: &Path,
     ) -> anyhow::Result<(PreemptionRecord, PathBuf)> {
+        let dir_path = self.tmp_dir.as_ref().unwrap();
         let sched_path = dir_path.join("nearby_non_matching.events");
         let baseline_log_path = dir_path.join("baseline1.log");
         let run2_opts = self.get_run2_runopts()?;
@@ -634,10 +626,10 @@ impl AnalyzeOpts {
     /// Perform the binary search through schedule-space, identifying critical events.
     pub fn phase5_bisect_traces(
         &mut self,
-        dir_path: &Path,
         failing: Vec<SchedEvent>,
         passing: Vec<SchedEvent>,
     ) -> CriticalSchedule {
+        let dir_path = self.tmp_dir.as_ref().unwrap();
         let mut i = 0;
         let test_fn = |sched: &[SchedEvent]| {
             i += 1;
@@ -664,11 +656,8 @@ impl AnalyzeOpts {
     }
 
     /// Record the schedules on disk as reproducers and report stack-traces of critical events.
-    pub fn phase6_record_outputs(
-        &mut self,
-        dir_path: PathBuf,
-        crit: CriticalSchedule,
-    ) -> Result<Report, Error> {
+    pub fn phase6_record_outputs(&mut self, crit: CriticalSchedule) -> Result<Report, Error> {
+        let dir_path = self.tmp_dir.as_ref().unwrap();
         let CriticalSchedule {
             failing_schedule,
             passing_schedule,
@@ -739,17 +728,12 @@ impl AnalyzeOpts {
             todo!()
         }
 
-        let (dir_path, run1_log_path, preempts_path) = self.phase1_establish_target_run()?;
+        let (run1_log_path, preempts_path) = self.phase1_establish_target_run()?;
 
         let (min_preempts, min_preempts_path, maybe_min_log) =
             self.phase2_minimize(global, &preempts_path)?;
         let min_log_path = maybe_min_log.unwrap_or(run1_log_path);
-        self.phase3_strict_preempt_replay_check(
-            global,
-            &dir_path,
-            &min_log_path,
-            &min_preempts_path,
-        )?;
+        self.phase3_strict_preempt_replay_check(global, &min_log_path, &min_preempts_path)?;
 
         let mut normalized_preempts = min_preempts.normalize();
         normalized_preempts.preemptions_only();
@@ -761,6 +745,7 @@ impl AnalyzeOpts {
                 serde_json::to_string_pretty(&normalized_preempts).unwrap()
             )
         );
+        let dir_path = self.tmp_dir.as_ref().unwrap();
         let normalized_preempts_path = dir_path.join("final.preempts");
         normalized_preempts
             .write_to_disk(&normalized_preempts_path)
@@ -777,16 +762,16 @@ impl AnalyzeOpts {
         // The other endpoint of the bisection search:
         // What we thought was the final_pr can change here:
         let (final_pr, non_matching_sched_events_path) =
-            self.phase4_choose_baseline_sched_events(global, normalized_preempts, &dir_path)?;
+            self.phase4_choose_baseline_sched_events(global, normalized_preempts)?;
 
         self.save_final_baseline_sched_events(&final_pr, &target_sched_events_path, global);
 
         let target = read_trace(&target_sched_events_path);
         let baseline = read_trace(&non_matching_sched_events_path);
 
-        let crit_sched = self.phase5_bisect_traces(&dir_path, target, baseline);
+        let crit_sched = self.phase5_bisect_traces(target, baseline);
 
-        let report = self.phase6_record_outputs(dir_path, crit_sched)?;
+        let report = self.phase6_record_outputs(crit_sched)?;
         if let Some(path) = &self.report_file {
             let txt = serde_json::to_string(&report).unwrap();
             std::fs::write(path, txt).expect("Unable to write report file");
@@ -805,9 +790,7 @@ impl AnalyzeOpts {
         sched_events_path: &Path,
         _global: &GlobalOpts,
     ) {
-        let mut tmp_dir = sched_events_path.to_path_buf();
-        assert!(tmp_dir.pop());
-
+        let tmp_dir = self.tmp_dir.as_ref().unwrap();
         let final_preempts_path = tmp_dir.join("final_pass.preempts");
         final_preempts
             .write_to_disk(&final_preempts_path)
@@ -851,8 +834,7 @@ impl AnalyzeOpts {
         sched_events_path: &Path,
         _global: &GlobalOpts,
     ) -> anyhow::Result<()> {
-        let mut tmp_dir = sched_events_path.to_path_buf();
-        assert!(tmp_dir.pop());
+        let tmp_dir = self.tmp_dir.as_ref().unwrap();
 
         // Verify that the new preemption record does in fact now cause a matching execution,
         // and rerecord during this verification with full recording that include sched events
@@ -909,8 +891,7 @@ impl AnalyzeOpts {
             );
         }
 
-        let mut tmp_dir = sched_events_path.to_path_buf();
-        assert!(tmp_dir.pop());
+        let tmp_dir = self.tmp_dir.as_ref().unwrap();
         let non_matching_preempts_path = tmp_dir.join("nearby_non_matching.preempts");
         non_matching_preempts
             .write_to_disk(&non_matching_preempts_path)
@@ -956,9 +937,6 @@ impl AnalyzeOpts {
 
     /// Search for a failing run. Destination passing style: takes the path that it writes its output to.
     fn do_search(&self, preempts_path: &Path) {
-        let mut tmp_dir = preempts_path.to_path_buf();
-        assert!(tmp_dir.pop());
-
         let search_seed = self.seed.unwrap_or_else(|| {
             let mut rng0 = rand::thread_rng();
             let seed: u64 = rng0.gen();
@@ -976,7 +954,7 @@ impl AnalyzeOpts {
         loop {
             let sched_seed = rng.gen();
             if let Some(preempts) = self
-                .launch_search(round, &tmp_dir, sched_seed)
+                .launch_search(round, sched_seed)
                 .unwrap_or_else(|e| panic!("Error: {}", e))
             {
                 let init_schedule: PreemptionRecord = PreemptionReader::new(&preempts).load_all();

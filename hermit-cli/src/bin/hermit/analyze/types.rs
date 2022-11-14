@@ -149,6 +149,12 @@ pub struct AnalyzeOpts {
     #[clap(long, short)]
     pub verbose: bool,
 
+    /// Where the analysis run will store its temporary artifacts.
+    ///
+    /// By default this is a directory in `/tmp`
+    #[clap(long, value_name = "PATH")]
+    pub tmp_dir: Option<PathBuf>,
+
     /// A full set of CLI arguments for the original `hermit run` to analyze.
     #[clap(value_name = "ARGS")]
     pub run_args: Vec<String>,
