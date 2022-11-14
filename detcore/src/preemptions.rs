@@ -203,6 +203,15 @@ impl PreemptionRecord {
                 *prio = *priomap.get(prio).unwrap();
             }
         }
+
+        // One more pass to remove anything that just has default priority its whole lifetime.
+        let mut finalmap = BTreeMap::new();
+        for (tid, history) in clone.per_thread.into_iter() {
+            if history.final_prio != DEFAULT_PRIORITY || !history.prio_changes.is_empty() {
+                assert!(finalmap.insert(tid, history).is_none());
+            }
+        }
+        clone.per_thread = finalmap;
         clone
     }
 
@@ -463,14 +472,13 @@ mod tests {
         let pr2 = pr.normalize();
         pr2.validate().unwrap();
         let bmap = pr2.as_vecs();
-        assert_eq!(
-            bmap.get(&DetTid::from_raw(3)).unwrap(),
-            &vec![(LogicalTime::from_nanos(0), 1000)]
-        );
-        assert_eq!(
-            bmap.get(&DetTid::from_raw(5)).unwrap(),
-            &vec![(LogicalTime::from_nanos(0), 1000)]
-        );
+        // Normalization may remove the useless default-prio entry:
+        if let Some(x) = bmap.get(&DetTid::from_raw(3)) {
+            assert_eq!(x, &vec![(LogicalTime::from_nanos(0), 1000)]);
+        }
+        if let Some(x) = bmap.get(&DetTid::from_raw(5)) {
+            assert_eq!(x, &vec![(LogicalTime::from_nanos(0), 1000)]);
+        }
         assert_eq!(
             bmap.get(&DetTid::from_raw(7)).unwrap(),
             &vec![(LogicalTime::from_nanos(0), 1002)]
@@ -482,10 +490,9 @@ mod tests {
                 (LogicalTime::from_nanos(946684799006227400), 1003)
             ]
         );
-        assert_eq!(
-            bmap.get(&DetTid::from_raw(11)).unwrap(),
-            &vec![(LogicalTime::from_nanos(0), 1000)]
-        );
+        if let Some(x) = bmap.get(&DetTid::from_raw(11)) {
+            assert_eq!(x, &vec![(LogicalTime::from_nanos(0), 1000)]);
+        }
     }
 
     #[test_case(

@@ -20,7 +20,6 @@ TESTBIN=$2
 if [[ -z "$HERMIT_ARGS" ]]; then
     # hermit analyze args:
     HERMIT_ARGS="--seed=0 "
-    HERMIT_ARGS+="--verbose "
     HERMIT_ARGS+="--minimize "
     HERMIT_ARGS+="--search "
     HERMIT_ARGS+=" -- "
