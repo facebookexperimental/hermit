@@ -170,6 +170,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Read,
     ) -> Result<i64, Error> {
+        if call.len() == 0 {
+            // Zero-count reads only serve to detect errors.
+            let res = guest.inject(Syscall::from(call)).await?;
+            return Ok(res);
+        }
+
         let (fd_type, resource) = guest
             .thread_state_mut()
             .with_detfd(call.fd(), |detfd| (detfd.ty, detfd.resource.clone()))?;

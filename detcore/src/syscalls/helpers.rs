@@ -145,7 +145,7 @@ pub enum IOAction {
     PassThru,
 }
 
-/// Returns true if FD-based call may actually block when executed.
+/// Returns strategy based on FD-based call may actually block when executed.
 pub fn ioaction_based_on_fd_status<
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -457,7 +457,7 @@ fn network_comm_syscall<T: RecordOrReplay, G: Guest<Detcore<T>>, C: SyscallInfo 
     // Already nonblocking because we've assured the socket is.
     let fd = get_fd(call.into()).unwrap_or_else(|| {
         panic!(
-            "network_comm_syscall called on invalid syscall: {}",
+            "network_comm_syscall called on invalid syscall / unknown fd: {}",
             call.name()
         );
     });
