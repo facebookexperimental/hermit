@@ -75,32 +75,34 @@ impl AnalyzeOpts {
         assert!(tmp_dir.pop());
 
         let tids: Vec<DetTid> = pr.all_threads();
+        let init_schedule: PreemptionRecord = pr.load_all();
+        let mut round: u64 = 0;
+
+        // All the preemption points we don't know about yet.  Are they critical?
+        let mut remaining_unknown: BTreeMap<DetTid, _> = BTreeMap::new();
+        let mut init_intervention_count = 0;
+        for (dtid, history) in init_schedule.extract_all() {
+            let vec = history.as_vec();
+            sanity_preempts(&vec)?;
+            init_intervention_count += vec.len();
+            remaining_unknown.insert(dtid, vec);
+        }
+
         eprintln!(
             ":: {}",
             format!(
-                "RootCause: starting with schedule of {} preemptions for {} threads.",
-                pr.size(),
+                "RootCause: starting with schedule of {} interventions for {} threads.",
+                init_intervention_count,
                 tids.len()
             )
             .yellow()
             .bold()
         );
-        let init_schedule: PreemptionRecord = pr.load_all();
         if self.verbose {
             eprintln!(
                 "Initial schedule:\n{}",
                 truncated(1000, format!("{}", init_schedule))
             );
-        }
-
-        let mut round: u64 = 0;
-
-        // All the preemption points we don't know about yet.  Are they critical?
-        let mut remaining_unknown: BTreeMap<DetTid, _> = BTreeMap::new();
-        for (dtid, history) in init_schedule.extract_all() {
-            let vec = history.as_vec();
-            sanity_preempts(&vec)?;
-            remaining_unknown.insert(dtid, vec);
         }
 
         // The ones we know for sure are critical.
@@ -163,7 +165,7 @@ impl AnalyzeOpts {
                         eprintln!(
                             ":: {}",
                             "Minimized to ZERO interventions.  The base run matches the critera."
-                                .green()
+                                .yellow()
                                 .bold()
                         );
                     } else {

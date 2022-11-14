@@ -20,6 +20,11 @@ if [[ -z "$KEEP_LOGS" ]]; then
     KEEP_LOGS=0
 fi
 
+if [[ -z "$DO_MINIMIZE" ]]; then
+    DO_MINIMIZE=0
+fi
+
+
 if [[ "$KEEP_LOGS" != "0" ]]; then
     set -x
 fi
@@ -28,7 +33,10 @@ fi
 if [[ -z "$HERMIT_ARGS" ]]; then
     # hermit analyze args:
     HERMIT_ARGS="--seed=0 "
-    HERMIT_ARGS+="--minimize "
+    if [[ "$DO_MINIMIZE" != "0" ]]; then
+        HERMIT_ARGS+="--minimize "
+    fi
+    # HERMIT_ARGS+="--run1-seed=14230524012508565024 "
     HERMIT_ARGS+="--search "
     if [[ "$KEEP_LOGS" != "0" ]]; then
         HERMIT_ARGS+="--verbose "
@@ -37,7 +45,6 @@ if [[ -z "$HERMIT_ARGS" ]]; then
     # hermit run args:
     HERMIT_ARGS+="--base-env=minimal "
     HERMIT_ARGS+="--chaos "
-    HERMIT_ARGS+="--sched-seed=14230524012508565024 "
     HERMIT_ARGS+="--preemption-timeout=400000 "
 fi
 set -eu

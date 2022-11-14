@@ -9,6 +9,10 @@
 /*! One of the simplest possible race conditions.
     Exits with a nonzero code under one order, and not the other.
 
+    However, we complicate things a bit by having an rdtsc and a branch right before
+    the critical event, to make it easier to recognize in the raw schedule recordings,
+    as when manually checking the results of this test.
+
 ```cargo
  [dependencies]
  core = "1.6.0"
@@ -16,12 +20,11 @@
  */
 
 use core::arch::x86_64::_rdtsc;
-use std::ptr::read_volatile;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
 
-#[inline(never)]
+#[inline(always)]
 fn rdtsc() -> u64 {
     unsafe { _rdtsc() }
 }
@@ -29,27 +32,44 @@ fn rdtsc() -> u64 {
 const WORK_AMT: usize = 100;
 
 #[inline(never)]
-fn do_work(iters: usize) {
-    let mut x = iters;
+fn do_work(iters: usize) -> u64 {
     let mut max = 0;
-    while unsafe { read_volatile(&x as *const _) } > 0usize {
+    for _i in 0..iters {
         let new = rdtsc();
         max = std::cmp::max(max, new);
-        x -= 1;
     }
+    max
 }
 
 #[inline(never)]
 fn thread1(var: Arc<AtomicUsize>) {
     do_work(4 * WORK_AMT);
-    var.store(1, SeqCst);
+    // Provide a little extra context so we can judge the accuracy of the pinpointing result.
+    let fin = rdtsc(); // last intercepted instruction
+    if fin % 2 == 0
+    // last branch before critical event
+    {
+        var.store(1, SeqCst); // critical event
+    } else {
+        var.store(11, SeqCst); // critical event
+    }
     do_work(4 * WORK_AMT);
 }
 
 #[inline(never)]
 fn thread2(var: Arc<AtomicUsize>) {
     do_work(4 * WORK_AMT);
-    var.store(2, SeqCst);
+
+    // Provide a little extra context so we can judge the accuracy of the pinpointing result.
+    let fin = rdtsc(); // last intercepted instruction
+    if fin % 2 == 0
+    // last branch before critical event
+    {
+        var.store(2, SeqCst); // critical event
+    } else {
+        var.store(22, SeqCst); // critical event
+    }
+
     do_work(4 * WORK_AMT);
 }
 
@@ -65,7 +85,7 @@ fn main() {
 
     let val = Arc::try_unwrap(d).unwrap().into_inner();
     println!("Final value: {}", val);
-    if val == 1 {
+    if val == 1 || val == 11 {
         println!("Antagonistic schedule reached, failing.");
         std::process::exit(1);
     }
