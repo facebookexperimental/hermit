@@ -24,7 +24,7 @@ pub struct LogDiffCLIOpts {
     file_b: PathBuf,
 
     #[clap(flatten)]
-    more: logdiff::LogDiffOpts,
+    pub more: logdiff::LogDiffOpts,
 }
 
 impl LogDiffCLIOpts {

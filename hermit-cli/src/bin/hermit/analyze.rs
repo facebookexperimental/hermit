@@ -267,6 +267,12 @@ fn sanity_preempts(vec: &[(LogicalTime, Priority)]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {
+    let pr1 = PreemptionReader::new(path1).load_all();
+    let pr2 = PreemptionReader::new(path2).load_all();
+    pr1 == pr2
+}
+
 /// Right now we don't want turning on logging for `hermit analyze` itself to ALSO turn on logging
 /// for each one of the (many) individual hermit executions it calls.  This could change in the
 /// future and instead share the GlobalOpts passed to `main()`.
@@ -691,7 +697,7 @@ impl AnalyzeOpts {
         }
     }
 
-    fn log_diff(
+    fn _log_diff(
         &self,
         global: &GlobalOpts,
         run1_log_path: &Path,
@@ -703,7 +709,7 @@ impl AnalyzeOpts {
                 "[comparing] with log-diff command:".yellow().bold()
             );
             eprintln!(
-                "::   hermit log-diff {} {}",
+                "    hermit log-diff {} {}",
                 run1_log_path.display(),
                 run2_log_path.display(),
             );
@@ -712,29 +718,72 @@ impl AnalyzeOpts {
         ldopts.main(global)
     }
 
-    pub fn phase3_strict_determinism_check(
+    /// A weaker log difference that does not expect certain lines to be conserved in preemption replay.
+    fn log_diff_preemption_replay(
+        &self,
+        global: &GlobalOpts,
+        run1_log_path: &Path,
+        run2_log_path: &Path,
+    ) -> ExitStatus {
+        if self.verbose {
+            eprintln!(
+                ":: {}",
+                "[comparing] with log-diff command:".yellow().bold()
+            );
+            eprintln!(
+                "    hermit log-diff --ignore-lines=CHAOSRAND {} {}",
+                run1_log_path.display(),
+                run2_log_path.display(),
+            );
+        }
+        let mut ldopts = LogDiffCLIOpts::new(run1_log_path, run2_log_path);
+        ldopts.more.ignore_lines = vec!["CHAOSRAND".to_string()];
+        ldopts.main(global)
+    }
+
+    /// Optionally do an extra run to verify that preemptions replay and yield the exact same
+    /// execution.a
+    pub fn phase3_strict_preempt_replay_check(
         &mut self,
         global: &GlobalOpts,
         dir_path: &Path,
         run1_log_path: &Path,
+        run1_preempts_path: &Path,
     ) -> Result<(), Error> {
         if self.selfcheck {
             eprintln!(
                 ":: {}",
-                "[selfcheck] Verifying full determinism before proceeding"
+                "[selfcheck] Verifying target run preserved under preemption-replay"
                     .yellow()
                     .bold()
             );
 
-            let run1b_opts = self.get_run1_runopts()?;
-            let run1b_log_path = dir_path.join("run1B_log");
+            let mut run1b_opts = self.get_run1_runopts()?;
+            let run1b_log_path =
+                dir_path.join("selfcheck_second_run_for_clean_preemption_replay.log");
+            let run1b_preempts_path =
+                dir_path.join("selfcheck_second_run_for_clean_preemption_replay.preempts");
+
+            run1b_opts.det_opts.det_config.replay_preemptions_from =
+                Some(run1_preempts_path.to_path_buf());
+            run1b_opts.det_opts.det_config.record_preemptions_to =
+                Some(run1b_preempts_path.clone());
+            eprintln!("    {}", run1b_opts);
+
             let second_matches = self.launch_logged(
-                "Additional run1: ",
+                "[selfecheck] Additional (target) run, replaying preemptions,",
                 &run1b_log_path,
-                &dir_path.join("second.preempts"),
+                run1_preempts_path, // TODO: Redundant.
                 run1b_opts,
             )?;
-            let status = self.log_diff(global, run1_log_path, &run1b_log_path);
+
+            eprintln!(
+                ":: {}",
+                "[selfcheck] Comparing output from additional run."
+                    .yellow()
+                    .bold()
+            );
+            let status = self.log_diff_preemption_replay(global, run1_log_path, &run1b_log_path);
             if !second_matches {
                 bail!("First run matched criteria but second run did not.");
             }
@@ -743,9 +792,15 @@ impl AnalyzeOpts {
                     "Log differences found, aborting because --selfcheck requires perfect reproducibility of the target run!"
                 )
             }
+            if preempt_files_equal(run1_preempts_path, &run1b_preempts_path) {
+                bail!(
+                    "The preemptions recorded by the additional run did not match the preemptions replayed (no fixed point)."
+                );
+            }
+
             eprintln!(
                 ":: {}",
-                "Full determinism verified between two instances of the target run."
+                "Identical executions confirmed between target run and its preemption-based replay."
                     .green()
                     .bold()
             );
@@ -904,9 +959,18 @@ impl AnalyzeOpts {
         }
 
         let (dir_path, run1_log_path, preempts_path) = self.phase1_establish_target_run()?;
-        let (min_pr, _min_pr_path, _maybe_min_log) =
+
+        let (min_preempts, min_preempts_path, maybe_min_log) =
             self.phase2_minimize(global, &preempts_path)?;
-        let mut normalized_preempts = min_pr.normalize();
+        let min_log_path = maybe_min_log.unwrap_or(run1_log_path);
+        self.phase3_strict_preempt_replay_check(
+            global,
+            &dir_path,
+            &min_log_path,
+            &min_preempts_path,
+        )?;
+
+        let mut normalized_preempts = min_preempts.normalize();
         normalized_preempts.preemptions_only();
         eprintln!(
             ":: {}\n {}",
@@ -916,20 +980,26 @@ impl AnalyzeOpts {
                 serde_json::to_string_pretty(&normalized_preempts).unwrap()
             )
         );
+        let normalized_preempts_path = dir_path.join("final.preempts");
+        normalized_preempts
+            .write_to_disk(&normalized_preempts_path)
+            .expect("write of preempts file to succeed");
 
-        self.phase3_strict_determinism_check(global, &dir_path, &run1_log_path)?;
-
-        let final_pr = normalized_preempts;
-        let final_sched_events_path = dir_path.join("final_matching.events");
-        self.save_final_sched_events(&final_pr, &final_sched_events_path, global)?;
-
+        // One endpoint of the bisection search:
+        let first_sched_events_path = dir_path.join("first_matching.events");
+        self.save_final_target_sched_events(
+            &normalized_preempts_path,
+            &first_sched_events_path,
+            global,
+        )?;
+        // The other endpoint of the bisection search:
         let non_matching_sched_events_path =
-            self.phase4_choose_baseline_sched_events(global, &final_pr, &dir_path)?;
+            self.phase4_choose_baseline_sched_events(global, &min_preempts, &dir_path)?;
 
-        let failing = read_trace(&final_sched_events_path);
-        let passing = read_trace(&non_matching_sched_events_path);
+        let target = read_trace(&first_sched_events_path);
+        let baseline = read_trace(&non_matching_sched_events_path);
 
-        let crit_sched = self.phase5_bisect_traces(&dir_path, failing, passing);
+        let crit_sched = self.phase5_bisect_traces(&dir_path, target, baseline);
 
         let report = self.phase6_record_outputs(dir_path, crit_sched)?;
         if let Some(path) = &self.report_file {
@@ -967,7 +1037,7 @@ impl AnalyzeOpts {
                 .bold()
         );
         eprintln!(
-            ":: {}",
+            "    {}",
             self.to_repro_cmd(
                 &final_preempts_path,
                 &format!(
@@ -988,19 +1058,16 @@ impl AnalyzeOpts {
         }
     }
 
-    fn save_final_sched_events(
+    // This extra run, to record the schedule, thus converting Preemptions to a full Schedule
+    // would be unnecessary if we recorded that each time as we minimize.
+    fn save_final_target_sched_events(
         &self,
-        final_preempts: &PreemptionRecord,
+        final_preempts_path: &Path,
         sched_events_path: &Path,
         _global: &GlobalOpts,
     ) -> anyhow::Result<()> {
         let mut tmp_dir = sched_events_path.to_path_buf();
         assert!(tmp_dir.pop());
-
-        let final_preempts_path = tmp_dir.join("final.preempts");
-        final_preempts
-            .write_to_disk(&final_preempts_path)
-            .expect("write of preempts file to succeed");
 
         // Verify that the new preemption record does in fact now cause a matching execution,
         // and rerecord during this verification with full recording that include sched events
@@ -1011,9 +1078,9 @@ impl AnalyzeOpts {
                 .bold()
         );
         eprintln!(
-            ":: {}",
+            "    {}",
             self.to_repro_cmd(
-                &final_preempts_path,
+                final_preempts_path,
                 &format!(
                     "--record-preemptions-to={}",
                     sched_events_path.to_string_lossy()
@@ -1023,7 +1090,7 @@ impl AnalyzeOpts {
         if !self
             .launch_controlled(
                 &tmp_dir.join("verify_final_fail.log"),
-                &final_preempts_path,
+                final_preempts_path,
                 Some(sched_events_path),
             )
             .unwrap()
@@ -1072,7 +1139,7 @@ impl AnalyzeOpts {
                 .bold()
         );
         eprintln!(
-            ":: {}",
+            "    {}",
             self.to_repro_cmd(
                 &non_matching_preempts_path,
                 &format!(
@@ -1284,7 +1351,7 @@ impl AnalyzeOpts {
                 last_attempt = Some(pr_new);
 
                 let batch = batch_sizes.get_mut(&selected_tid).unwrap();
-                eprintln!(":: {}", self.to_repro_cmd(&new_preempts_path, ""));
+                eprintln!("    {}", self.to_repro_cmd(&new_preempts_path, ""));
                 let log_path = tmp_dir.join(&format!("round_{:0wide$}.log", round, wide = 3));
                 if self
                     .launch_controlled(&log_path, &new_preempts_path, None)
@@ -1374,7 +1441,7 @@ impl AnalyzeOpts {
                     );
                 }
                 eprintln!(
-                    ":: {}:\n{}",
+                    ":: {}:\n    {}",
                     "Reproducer".green().bold(),
                     self.to_repro_chaos(sched_seed)
                 );
