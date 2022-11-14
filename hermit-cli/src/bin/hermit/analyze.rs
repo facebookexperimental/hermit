@@ -814,9 +814,9 @@ impl AnalyzeOpts {
     pub fn phase4_choose_baseline_sched_events(
         &mut self,
         global: &GlobalOpts,
-        matching_pr: &PreemptionRecord,
+        matching_pr: PreemptionRecord,
         dir_path: &Path,
-    ) -> anyhow::Result<PathBuf> {
+    ) -> anyhow::Result<(PreemptionRecord, PathBuf)> {
         let sched_path = dir_path.join("nearby_non_matching.events");
         let baseline_log_path = dir_path.join("baseline1.log");
         let run2_opts = self.get_run2_runopts()?;
@@ -837,17 +837,26 @@ impl AnalyzeOpts {
             eprintln!(":: Recorded preemptions from --run2-seed as baseline run.");
         } else if let Some(path) = &self.run2_preemptions {
             let pr = PreemptionReader::new(path).load_all();
-            self.save_final_pass_sched_events(&pr, path, global);
+            self.save_final_baseline_sched_events(&pr, path, global);
         } else if self.minimize {
             // If we're minimizing, then we know that ALL interventions in the schedule are critical.
             // Thus omitting any of them is sufficient to exit the target schedule space.
             // Omitting the last one should yield the lowest distance match/non-match schedule pair.
-            self.save_nearby_non_matching_sched_events(matching_pr, &sched_path, global)?;
+            let mut pr = matching_pr;
+            loop {
+                if let Some(still_matching_pr) =
+                    self.save_nearby_non_matching_sched_events(&pr, &sched_path, global)?
+                {
+                    pr = still_matching_pr;
+                } else {
+                    return Ok((pr, sched_path));
+                }
+            }
         } else {
             let empty_pr = matching_pr.clone().strip_contents();
-            self.save_final_pass_sched_events(&empty_pr, &sched_path, global);
+            self.save_final_baseline_sched_events(&empty_pr, &sched_path, global);
         }
-        Ok(sched_path)
+        Ok((matching_pr, sched_path))
     }
 
     /// Perform the binary search through schedule-space, identifying critical events.
@@ -986,17 +995,21 @@ impl AnalyzeOpts {
             .expect("write of preempts file to succeed");
 
         // One endpoint of the bisection search:
-        let first_sched_events_path = dir_path.join("first_matching.events");
+        let target_sched_events_path = dir_path.join("first_matching.events");
         self.save_final_target_sched_events(
             &normalized_preempts_path,
-            &first_sched_events_path,
+            &target_sched_events_path,
             global,
         )?;
-        // The other endpoint of the bisection search:
-        let non_matching_sched_events_path =
-            self.phase4_choose_baseline_sched_events(global, &min_preempts, &dir_path)?;
 
-        let target = read_trace(&first_sched_events_path);
+        // The other endpoint of the bisection search:
+        // What we thought was the final_pr can change here:
+        let (final_pr, non_matching_sched_events_path) =
+            self.phase4_choose_baseline_sched_events(global, normalized_preempts, &dir_path)?;
+
+        self.save_final_baseline_sched_events(&final_pr, &target_sched_events_path, global);
+
+        let target = read_trace(&target_sched_events_path);
         let baseline = read_trace(&non_matching_sched_events_path);
 
         let crit_sched = self.phase5_bisect_traces(&dir_path, target, baseline);
@@ -1014,7 +1027,7 @@ impl AnalyzeOpts {
         Ok(ExitStatus::SUCCESS)
     }
 
-    fn save_final_pass_sched_events(
+    fn save_final_baseline_sched_events(
         &self,
         final_preempts: &PreemptionRecord,
         sched_events_path: &Path,
@@ -1054,7 +1067,7 @@ impl AnalyzeOpts {
             )
             .unwrap()
         {
-            eprintln!("Good: baseline run does not match criteria (i.e. pass not fail).");
+            eprintln!("Good: baseline run does not match criteria (e.g. pass not fail).");
         }
     }
 
@@ -1095,17 +1108,18 @@ impl AnalyzeOpts {
             )
             .unwrap()
         {
-            bail!("Final preemption record still fails criteria");
+            bail!("Final preemption record still does not match target criteria");
         }
         Ok(())
     }
 
+    // Returns the record, with one knockout, if it still satisfies the criteria that we want it not to.
     fn save_nearby_non_matching_sched_events(
         &self,
         matching_preempts: &PreemptionRecord,
         sched_events_path: &Path,
         _global: &GlobalOpts,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<PreemptionRecord>> {
         // Given preemptions that hermit analyze has determined are critical to match the criteria
         // (most commonly, a failing execution), removing the last critical preemption should
         // cause the minimal execution change to now no longer match the criteria (most commonly,
@@ -1134,7 +1148,7 @@ impl AnalyzeOpts {
         // and rerecord during this verification with full recording that include sched events
         eprintln!(
             ":: {}:",
-            "Verify preemption record without latest critical preempt causes criteria to fail and record sched events"
+            "Verify preemption record without latest critical preempt causes criteria non-match and record sched events"
                 .yellow()
                 .bold()
         );
@@ -1156,9 +1170,16 @@ impl AnalyzeOpts {
             )
             .unwrap()
         {
-            bail!("New preemption record still passes criteria");
+            eprintln!(
+                "{}",
+                ":: New preemption record still matches criteria! Attempting further knockouts.."
+                    .red()
+                    .bold(),
+            );
+            Ok(Some(non_matching_preempts))
+        } else {
+            Ok(None)
         }
-        Ok(())
     }
 
     /// Iteratively minimize the schedule needed to produce the error.
