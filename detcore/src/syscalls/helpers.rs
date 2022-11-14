@@ -437,6 +437,8 @@ impl TimeoutableSyscall for reverie::syscalls::RtSigtimedwait {
     }
 }
 
+/// While the read syscall is quite general, this nonblocking capacity is used
+/// ONLY for sockets and pipes.
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Read {
     async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
@@ -444,6 +446,30 @@ impl NonblockableSyscall for reverie::syscalls::Read {
         guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
         network_comm_syscall(self, guest)
+    }
+
+    fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
+        // A return value of Ok(0) indicates end of file.
+        // Note that we've ruled out 0-count reads before this point.
+        res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
+    }
+}
+
+/// While the read syscall is quite general, this nonblocking capacity is used
+/// ONLY for sockets and pipes.
+#[async_trait]
+impl NonblockableSyscall for reverie::syscalls::Write {
+    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        self,
+        guest: &mut G,
+    ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
+        network_comm_syscall(self, guest)
+    }
+
+    fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
+        // A return value of Ok(0) indicates end of file.
+        // Note that we've ruled out 0-count reads before this point.
+        res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
     }
 }
 
@@ -466,7 +492,7 @@ fn network_comm_syscall<T: RecordOrReplay, G: Guest<Detcore<T>>, C: SyscallInfo 
         .with_detfd(fd, |detfd| {
             assert!(
                 detfd.physically_nonblocking,
-                "expecting network sockets to be physically nonblocking"
+                "expecting sockets/pipes to be physically nonblocking"
             );
         })
         .unwrap();
