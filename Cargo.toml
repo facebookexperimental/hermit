@@ -1,0 +1,11 @@
+[workspace]
+members = [
+  "common/digest",
+  "common/edit-distance",
+  "common/test-allocator",
+  "detcore",
+  "detcore-model",
+  "detcore/tests/testutils",
+  "hermit-cli",
+  "hermit-verify",
+]

@@ -48,10 +48,10 @@ fn count_thread_events(schedule: &Schedule) -> HashMap<u32, usize> {
 /// Counts the number of events for each thread.
 #[allow(dead_code)]
 fn partition_thread_events(schedule: Schedule) -> HashMap<u32, Vec<SchedEvent>> {
-    let mut result = HashMap::new();
+    let mut result = HashMap::<u32, Vec<_>>::new();
 
     for event in schedule {
-        result.entry(event.tid).or_insert(Vec::new()).push(event);
+        result.entry(event.tid).or_default().push(event);
     }
 
     result

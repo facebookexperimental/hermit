@@ -423,7 +423,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 "[dtid {}] Executing non-blocking wait4 in one shot.",
                 dettid
             );
-            return Ok(guest.inject_with_retry(call).await?);
+            Ok(guest.inject_with_retry(call).await?)
         } else {
             retry_nonblocking_syscall(guest, call, rsrc).await
         }

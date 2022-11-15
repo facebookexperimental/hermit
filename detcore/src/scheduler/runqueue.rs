@@ -82,7 +82,7 @@ pub const DEFAULT_PRIORITY: Priority = 1000;
 /// Whether the priority is user-accessible. We use some values for special
 /// purposes; these shouldn't be set by the user.
 pub fn is_ordinary_priority(prio: Priority) -> bool {
-    return FIRST_PRIORITY <= prio && prio <= LAST_PRIORITY;
+    (FIRST_PRIORITY..=LAST_PRIORITY).contains(&prio)
 }
 
 /// Deterministically transform 64 bits of entropy into a random user-settable
@@ -346,7 +346,7 @@ impl RunQueue {
 
     /// Read-only: this is ok while locked by tentative_pop.
     pub fn contains_tid(&self, tid: DetTid) -> bool {
-        self.tids().find(|t| **t == tid).is_some()
+        self.tids().any(|t| t == &tid)
     }
 
     /// Remove `tid` from the queue, returning true if removal ocurred.
@@ -436,7 +436,7 @@ impl RunQueue {
                 let key = *self
                     .queue
                     .iter()
-                    .find(|(_k, v)| (**v).tid == tentative_selection)
+                    .find(|(_k, v)| v.tid == tentative_selection)
                     .map(|(k, _v)| k)
                     .unwrap();
                 self.queue.remove(&key).map(|v| v.tid)
@@ -452,7 +452,7 @@ impl RunQueue {
                 let key = *self
                     .queue
                     .iter()
-                    .find(|(_k, v)| (**v).tid == tid)
+                    .find(|(_k, v)| v.tid == tid)
                     .map(|(k, _v)| k)
                     .unwrap();
 
@@ -477,7 +477,7 @@ impl RunQueue {
     fn turn_counter(&self) -> u64 {
         debug_assert!(self.last_back_turn >= 0);
         debug_assert!(self.last_front_turn <= 0);
-        self.last_back_turn as u64 + self.last_front_turn.abs() as u64
+        self.last_back_turn as u64 + self.last_front_turn.unsigned_abs()
     }
 
     fn check_poll_upgrade(&mut self) {

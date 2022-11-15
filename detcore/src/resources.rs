@@ -212,6 +212,7 @@ pub enum ResourceID {
 
 /// Permission to a device, which behaves like a predefined "inode".
 /// These correspond to special files under /dev
+#[allow(clippy::enum_variant_names)]
 #[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize, Hash)]
 pub enum Device {
     /// The Stdin, not just from the current process, but from the entire sandboxed job. This

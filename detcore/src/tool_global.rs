@@ -258,12 +258,10 @@ impl GlobalState {
                 // In this case, print summary irrespective of logging level.
                 // TODO: output summary in machine-readable, JSON form.
                 eprint!("{}", buf);
+            } else if det {
+                info!("{}", buf);
             } else {
-                if det {
-                    info!("{}", buf);
-                } else {
-                    debug!("{}", buf);
-                }
+                debug!("{}", buf);
             }
             buf.clear();
         };
@@ -1143,7 +1141,7 @@ where
 {
     if guest.config().sequentialize_threads {
         let dettid = guest.thread_state().dettid;
-        let detpid = guest.thread_state().detpid.clone().expect("detpid unset");
+        let detpid = guest.thread_state().detpid.expect("detpid unset");
         trace!(
             "[detcore, dtid {}] BLOCKING on resource_request rpc... {:?}",
             &dettid,
@@ -1221,8 +1219,8 @@ where
 /// Nonblocking: future returning does not guarantee anything about the central scheduler,
 /// except that it will eventually give a slot to the child.  Then the protocol is that
 /// child will subsequently make a `thread_start_request` to gate the start of its execution.
-pub async fn create_child_thread<'a, G, T>(
-    guest: &'a mut G,
+pub async fn create_child_thread<G, T>(
+    guest: &mut G,
     child_dettid: DetTid,
     ctid: usize,
     flags: Option<CloneFlags>,

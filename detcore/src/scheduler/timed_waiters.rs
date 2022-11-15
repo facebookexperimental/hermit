@@ -179,7 +179,6 @@ impl TimedEvents {
     pub fn iter(&self) -> impl Iterator<Item = (LogicalTime, TimedEvent)> + '_ {
         self.map
             .iter()
-            .map(|(key, set)| set.iter().map(|dtid| (*key, *dtid)))
-            .flatten()
+            .flat_map(|(key, set)| set.iter().map(|dtid| (*key, *dtid)))
     }
 }

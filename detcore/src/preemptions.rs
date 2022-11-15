@@ -130,7 +130,7 @@ impl PreemptionRecord {
     pub fn write_to_disk(&self, path: &Path) -> Result<(), String> {
         let mut str: String = self.to_string();
         str.push('\n');
-        match File::create(&path) {
+        match File::create(path) {
             Ok(mut file) => match std::io::Write::write_all(&mut file, str.as_bytes()) {
                 Ok(_) => Ok(()),
                 Err(err) => Err(format!(
@@ -290,6 +290,7 @@ impl ThreadHistory {
     }
 
     /// Turns the thread history into an iterator that produces a stream of preemption events.
+    #[allow(clippy::should_implement_trait)]
     pub fn into_iter(self) -> ThreadHistoryIterator {
         ThreadHistoryIterator {
             full_history: self,

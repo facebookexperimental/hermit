@@ -42,7 +42,7 @@ impl ExpandedPermResult {
         } = self;
 
         PermutationResult {
-            perm: perm.into_iter().filter_map(|v| v).collect(),
+            perm: perm.into_iter().flatten().collect(),
             unmatched_source_indices,
             unmatched_target_indices,
         }
@@ -303,10 +303,10 @@ where
     iterable_bubble_sort(source, target).history_size
 }
 
-pub fn iterable_bubble_sort_from_perm<'a, T>(
-    source: &'a [T],
+pub fn iterable_bubble_sort_from_perm<T>(
+    source: &[T],
     permutation_result: PermutationResult,
-) -> BubbleSortIter<'a, T>
+) -> BubbleSortIter<T>
 where
     T: Hash + Eq,
 {
@@ -323,7 +323,7 @@ where
     BubbleSortIter::new(perm, source, history, unused_values)
 }
 
-pub fn iterable_bubble_sort<'a, T>(source: &'a [T], target: &[T]) -> BubbleSortIter<'a, T>
+pub fn iterable_bubble_sort<'a, T>(source: &'a [T], target: &'a [T]) -> BubbleSortIter<'a, T>
 where
     T: Hash + Eq,
 {
