@@ -962,7 +962,7 @@ impl AnalyzeOpts {
 
     /// Search for a failing run. Destination passing style: takes the path that it writes its output to.
     fn do_search(&self, preempts_path: &Path) {
-        let search_seed = self.seed.unwrap_or_else(|| {
+        let search_seed = self.analyze_seed.unwrap_or_else(|| {
             let mut rng0 = rand::thread_rng();
             let seed: u64 = rng0.gen();
             seed

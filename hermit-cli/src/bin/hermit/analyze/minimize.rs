@@ -113,7 +113,7 @@ impl AnalyzeOpts {
         let all_threads = pr.all_threads();
         let mut remaining_threads = Vec::new();
 
-        let min_seed = self.seed.unwrap_or_else(|| {
+        let min_seed = self.analyze_seed.unwrap_or_else(|| {
             let mut rng0 = rand::thread_rng();
             let seed: u64 = rng0.gen();
             seed

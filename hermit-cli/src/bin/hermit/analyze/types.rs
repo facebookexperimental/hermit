@@ -140,10 +140,11 @@ pub struct AnalyzeOpts {
     pub report_file: Option<PathBuf>,
 
     // TODO: run2_schedule
-    /// Use to seed the PRNG that supplies randomness to the analyzer search process.
-    /// If unset, then system randomness is used.
+    //
+    /// Use to seed the PRNG that supplies randomness to the analyzer when it is making random
+    /// decisions during search or minimization.  If unset, then system randomness is used.
     #[clap(long)]
-    pub seed: Option<u64>,
+    pub analyze_seed: Option<u64>,
 
     /// Print quite a bit of extra information so that you can see exactly what is happening.
     #[clap(long, short)]

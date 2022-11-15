@@ -32,7 +32,7 @@ fi
 # Common arguments:
 if [[ -z "$HERMIT_ARGS" ]]; then
     # hermit analyze args:
-    HERMIT_ARGS="--seed=0 "
+    HERMIT_ARGS="--analyze-seed=0 "
     if [[ "$DO_MINIMIZE" != "0" ]]; then
         HERMIT_ARGS+="--minimize "
     fi
