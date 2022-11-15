@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fmt::Write;
 use std::fs;
+use std::fs::File;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -59,6 +60,7 @@ use crate::scheduler::runqueue::REPLAY_DEFERRED_PRIORITY;
 use crate::scheduler::runqueue::REPLAY_FOREGROUND_PRIORITY;
 use crate::scheduler::sched_loop;
 use crate::scheduler::ConsumeResult;
+use crate::scheduler::MaybePrintStack;
 use crate::scheduler::Priority;
 use crate::scheduler::SchedResponse;
 use crate::scheduler::SchedValue;
@@ -919,8 +921,13 @@ impl GlobalState {
         info.mtime = mtime;
     }
 
-    /// The return value indicates whether the backtrace of this event should be printed.
-    async fn recv_trace_schedevent(&self, ev: SchedEvent, detpid: DetPid) -> bool {
+    /// The return value indicates whether the backtrace of this event should be printed, and if so,
+    /// whether it should be printed to a file.
+    async fn recv_trace_schedevent(
+        &self,
+        ev: SchedEvent,
+        detpid: DetPid,
+    ) -> Option<Option<PathBuf>> {
         // TODO(T124316762): debug address randomization in the tracer and get rid of this hack:
         let ev = {
             if self.past_first_execve.load(SeqCst) {
@@ -944,6 +951,7 @@ impl GlobalState {
             let ConsumeResult {
                 keep_running,
                 print_stack,
+                event_ix: _,
             } = self.sched.lock().unwrap().consume_schedevent(&ev);
             let print_stack2 = self.record_event(&ev);
             if !keep_running {
@@ -960,18 +968,18 @@ impl GlobalState {
                     &ev.dettid,
                 );
             }
-            print_stack || print_stack2
+            print_stack.or(print_stack2)
         } else {
             self.record_event(&ev)
         }
     }
 
     // Return whether we should print the stacktrace after recording this event.
-    fn record_event(&self, ev: &SchedEvent) -> bool {
+    fn record_event(&self, ev: &SchedEvent) -> MaybePrintStack {
         if self.cfg.record_preemptions {
             self.sched.lock().unwrap().record_event(ev)
         } else {
-            false
+            None
         }
     }
 
@@ -1094,8 +1102,7 @@ pub enum GlobalResponse {
     UnlinkInode(()),
     TouchFile(()),
     GlobalTimeLowerBound(LogicalTime),
-    /// A true response indicates that the stacktrace should be printed by the guest before proceeding.
-    TraceSchedEvent(bool),
+    TraceSchedEvent(MaybePrintStack),
     RegisterAlarm(Seconds),
     // TODO: use void_send_rpc, and remove this bogus response:
     UnrecoverableShutdown(()),
@@ -1405,33 +1412,30 @@ where
 }
 
 /// Helper function just for printing backtrace to a given file (or stderr)
-fn print_backtrace<G, T>(guest: &mut G, _maybe_path: &Option<PathBuf>)
+fn print_backtrace<G, T>(guest: &mut G, maybe_path: &Option<PathBuf>)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    // let mut file_writer: Box<dyn Write> = match &maybe_path {
-    //     Some(path) => {
-    //         Box::new(File::create(path).expect("Failed to open preemption stacktrace log file"))
-    //     }
-    //     None => Box::new(std::io::stderr()),
-    // };
+    let mut file_writer: Box<dyn std::io::Write> = match &maybe_path {
+        Some(path) => {
+            Box::new(File::create(path).expect("Failed to open preemption stacktrace log file"))
+        }
+        None => Box::new(std::io::stderr()),
+    };
     let ts = guest.thread_state();
-    // writeln!(
-    //     file_writer,
-    eprintln!(
-        ">>> Guest tid {}, at thread time {}, has the below backtrace.",
+    writeln!(
+        file_writer,
+        ":: Guest tid {}, at thread time {}, has the below backtrace.",
         ts.dettid,
         ts.thread_logical_time.as_nanos(),
-    );
-    // .unwrap();
+    )
+    .unwrap();
     if let Some(backtrace) = guest.backtrace() {
         if let Ok(pbt) = backtrace.pretty() {
-            // writeln!(file_writer, "{}", pbt).unwrap();
-            eprintln!("{}", pbt);
+            writeln!(file_writer, "{}", pbt).unwrap();
         } else {
-            // writeln!(file_writer, "{}", backtrace).unwrap();
-            eprintln!("{}", backtrace);
+            writeln!(file_writer, "{}", backtrace).unwrap();
         }
     } else {
         warn!("Could not read backtrace!");
@@ -1487,8 +1491,8 @@ where
         GlobalResponse::TraceSchedEvent(x) => x,
         _ => unreachable!(),
     };
-    if do_backtrace {
-        print_backtrace(guest, &None);
+    if let Some(x) = do_backtrace {
+        print_backtrace(guest, &x);
     }
 }
 

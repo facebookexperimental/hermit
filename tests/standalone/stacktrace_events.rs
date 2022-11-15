@@ -116,7 +116,7 @@ fn main() {
         };
 
         let tids: Vec<i32> = {
-            let re = Regex::new(r">>> Guest tid (\d+),").unwrap();
+            let re = Regex::new(r":: Guest tid (\d+),").unwrap();
             stderr
                 .lines()
                 .filter(|l| re.is_match(l))

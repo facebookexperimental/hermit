@@ -8,6 +8,7 @@
 
 //! A mode for analyzing a hermit run.
 
+use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -53,12 +54,27 @@ const NO_LOGGING_PLZ: GlobalOpts = GlobalOpts {
     log_file: None,
 };
 
+// We identify a run by a root file name, and then append a standard set of suffixes to store the
+// associated files for that run.
+const LOG_EXT: &str = "log";
+const PREEMPTS_EXT: &str = "preempts";
+
 impl AnalyzeOpts {
+    fn log_path(&self, runname: &str) -> PathBuf {
+        let tmp_dir = self.tmp_dir.as_ref().unwrap();
+        tmp_dir.join(runname).with_extension(LOG_EXT)
+    }
+
+    fn preempts_path(&self, runname: &str) -> PathBuf {
+        let tmp_dir = self.tmp_dir.as_ref().unwrap();
+        tmp_dir.join(runname).with_extension(PREEMPTS_EXT)
+    }
+
     fn print_and_validate_runopts(&self, ro: &mut RunOpts, log_path: &Path) {
         if self.verbose {
             ro.summary = true;
             eprintln!(
-                ":: Full Run configuration (logging to {}):\n {:#?}",
+                ":: Full Run configuration (logging to {}):\n  hermit run {}",
                 log_path.display(),
                 ro
             );
@@ -114,44 +130,49 @@ impl AnalyzeOpts {
         }
     }
 
-    /// Launch a single run with logging and preemption recording.  Return true if it matches the criteria.
-    fn launch_logged(
-        &self,
-        msg: &str,
-        log_path: &Path,
-        preempts_path: &Path,
-        mut runopts: RunOpts,
-    ) -> Result<bool, Error> {
-        eprintln!(
-            ":: {}",
-            format!("{} record preemptions and logs...", msg)
-                .yellow()
-                .bold()
-        );
-
-        runopts.det_opts.det_config.record_preemptions = true;
-        runopts.det_opts.det_config.record_preemptions_to = Some(preempts_path.to_path_buf());
-
+    /// Launch a single run with the given options.
+    /// (Also set up logging and temp dir binding.)
+    ///
+    /// Return true if it matches the criteria.
+    fn launch_config(&self, runname: &str, mut runopts: RunOpts) -> Result<bool, Error> {
         let tmp_dir = self.tmp_dir.as_ref().unwrap();
         let bind_dir: Bind = Bind::from_str(tmp_dir.to_str().unwrap())?;
         runopts.bind.push(bind_dir);
 
-        self.print_and_validate_runopts(&mut runopts, log_path);
+        let root = tmp_dir.join(runname);
+        let log_path = self.log_path(runname);
+        self.print_and_validate_runopts(&mut runopts, &log_path);
 
         let log_file = File::create(log_path)?;
         let out1: Output = runopts.run_verify(log_file, &NO_LOGGING_PLZ)?;
 
-        File::create(preempts_path.with_extension("stdout"))
+        File::create(root.with_extension("stdout"))
             .unwrap()
             .write_all(&out1.stdout)
             .unwrap();
-        File::create(preempts_path.with_extension("stderr"))
+        File::create(root.with_extension("stderr"))
             .unwrap()
             .write_all(&out1.stderr)
             .unwrap();
 
         let is_a_match = self.output_matches(&out1);
         Ok(is_a_match)
+    }
+
+    /// Launch a single run with logging and preemption recording.  Return true if it matches the criteria.
+    fn launch_logged(&self, runname: &str, msg: &str, mut runopts: RunOpts) -> Result<bool, Error> {
+        eprintln!(
+            ":: {}",
+            format!("{} record preemptions and logs...", msg)
+                .yellow()
+                .bold()
+        );
+        let preempts_path = self.preempts_path(runname);
+
+        runopts.det_opts.det_config.record_preemptions = true;
+        runopts.det_opts.det_config.record_preemptions_to = Some(preempts_path);
+
+        self.launch_config(runname, runopts)
     }
 
     /// Launch a run with preempts provided (to replay). No logging. Return true
@@ -197,10 +218,15 @@ impl AnalyzeOpts {
     /// Runs the program with the specified schedule.
     fn launch_final(
         &self,
-        verify_log_file_name: &str,
+        runname: &str,
         schedule_path: &Path,
         critical_event_index: u64,
-    ) -> Result<bool, Error> {
+    ) -> Result<(bool, PathBuf, PathBuf), Error> {
+        let tmp_dir = self.tmp_dir.as_ref().unwrap();
+        let verify_log_file_name = tmp_dir.join(runname).with_extension(LOG_EXT);
+        let stack1_path = tmp_dir.join(runname).with_extension("stack1");
+        let stack2_path = tmp_dir.join(runname).with_extension("stack2");
+
         let mut run_cmd: Vec<String> = vec!["hermit-run".to_string()];
         for arg in &self.run_args {
             run_cmd.push(arg.to_string());
@@ -212,8 +238,8 @@ impl AnalyzeOpts {
         ro.det_opts.det_config.sequentialize_threads = true;
         ro.det_opts.det_config.replay_schedule_from = Some(schedule_path.to_path_buf());
         ro.det_opts.det_config.stacktrace_event = [
-            (critical_event_index - 1, None),
-            (critical_event_index, None),
+            (critical_event_index - 1, Some(stack1_path.clone())),
+            (critical_event_index, Some(stack2_path.clone())),
         ]
         .to_vec();
 
@@ -230,7 +256,7 @@ impl AnalyzeOpts {
         let out1: Output = ro.run_verify(log_file, &NO_LOGGING_PLZ)?;
 
         let is_a_match = self.output_matches(&out1);
-        Ok(is_a_match)
+        Ok((is_a_match, stack1_path, stack2_path))
     }
 
     /// Runs the program with the specified schedule.
@@ -373,10 +399,10 @@ impl AnalyzeOpts {
             .tempdir()?;
         let tmpdir_path = dir.into_path(); // For now always keep the temporary results.
         eprintln!(":: Temp workspace: {}", tmpdir_path.display());
-
-        let run1_log_path = tmpdir_path.join("run1_log");
-        let preempts_path = tmpdir_path.join("orig.preempts");
         self.tmp_dir = Some(tmpdir_path);
+
+        let runname = "phase1_target";
+        let preempts_path = self.preempts_path(runname);
 
         if let Some(p) = &self.run1_preemptions {
             // Copy into our temp working folder so everything is self contained.
@@ -386,9 +412,8 @@ impl AnalyzeOpts {
         let is_a_match = if self.run1_preemptions.is_none() {
             // Translate the seed into a set of preemptions we can work from.
             self.launch_logged(
+                runname,
                 format!("Establish target criteria ({}):", self.display_criteria()).as_str(),
-                &run1_log_path,
-                &preempts_path,
                 run1_opts,
             )?
         } else {
@@ -424,6 +449,7 @@ impl AnalyzeOpts {
             eprintln!(":: {}", "WARNING: run without any --filter arguments, so accepting ALL runs. This is probably not what you wanted.".red().bold());
         }
 
+        let run1_log_path = self.log_path(runname);
         Ok((run1_log_path, preempts_path))
     }
 
@@ -514,7 +540,6 @@ impl AnalyzeOpts {
         run1_preempts_path: &Path,
     ) -> Result<(), Error> {
         if self.selfcheck {
-            let dir_path = self.tmp_dir.as_ref().unwrap();
             eprintln!(
                 ":: {}",
                 "[selfcheck] Verifying target run preserved under preemption-replay"
@@ -523,21 +548,14 @@ impl AnalyzeOpts {
             );
 
             let mut run1b_opts = self.get_run1_runopts()?;
-            let run1b_log_path =
-                dir_path.join("selfcheck_second_run_for_clean_preemption_replay.log");
-            let run1b_preempts_path =
-                dir_path.join("selfcheck_second_run_for_clean_preemption_replay.preempts");
-
             run1b_opts.det_opts.det_config.replay_preemptions_from =
                 Some(run1_preempts_path.to_path_buf());
-            run1b_opts.det_opts.det_config.record_preemptions_to =
-                Some(run1b_preempts_path.clone());
             eprintln!("    {}", run1b_opts);
 
+            let runname = "run1b_selfcheck";
             let second_matches = self.launch_logged(
+                runname,
                 "[selfecheck] Additional (target) run, replaying preemptions,",
-                &run1b_log_path,
-                run1_preempts_path, // TODO: Redundant.
                 run1b_opts,
             )?;
 
@@ -547,6 +565,7 @@ impl AnalyzeOpts {
                     .yellow()
                     .bold()
             );
+            let run1b_log_path = self.log_path(runname);
             let status = self.log_diff_preemption_replay(global, run1_log_path, &run1b_log_path);
             if !second_matches {
                 bail!("First run matched criteria but second run did not.");
@@ -556,6 +575,7 @@ impl AnalyzeOpts {
                     "Log differences found, aborting because --selfcheck requires perfect reproducibility of the target run!"
                 )
             }
+            let run1b_preempts_path = self.preempts_path(runname);
             if preempt_files_equal(run1_preempts_path, &run1b_preempts_path) {
                 bail!(
                     "The preemptions recorded by the additional run did not match the preemptions replayed (no fixed point)."
@@ -580,21 +600,19 @@ impl AnalyzeOpts {
         global: &GlobalOpts,
         matching_pr: PreemptionRecord,
     ) -> anyhow::Result<(PreemptionRecord, PathBuf)> {
-        let dir_path = self.tmp_dir.as_ref().unwrap();
-        let sched_path = dir_path.join("nearby_non_matching.events");
-        let baseline_log_path = dir_path.join("baseline1.log");
         let run2_opts = self.get_run2_runopts()?;
+        let runname = "run2_baseline";
+        let sched_path = self.preempts_path(runname); // TODO(T136650888): separate files.
 
         if self.run2_seed.is_some() {
             // Translate the seed into a set of preemptions we can work from.
             self.launch_logged(
+                runname,
                 format!(
                     "Record preemptions from baseline run, WITHOUT criteria ({}):",
                     self.display_criteria()
                 )
                 .as_str(),
-                &baseline_log_path,
-                &sched_path,
                 run2_opts,
             )
             .unwrap();
@@ -696,17 +714,24 @@ impl AnalyzeOpts {
                 "You must add synchronization to prevent these operations from racing, or give them a different order.\n",
             );
 
-            eprintln!("{}\n", header);
-            let stack1 = "".to_string();
-            let stack2 = "".to_string();
-
             // "Final run for stack traces:",
-            let res = self.launch_final(
-                "final_run_log",
+            let (res, stack1_path, stack2_path) = self.launch_final(
+                "final_run",
                 &final_failing_path,
                 critical_event_index as u64,
             )?;
+
+            let stack1 = fs::read_to_string(stack1_path).unwrap();
+            let stack2 = fs::read_to_string(stack2_path).unwrap();
+
             if res {
+                // Also print to the screen:
+                println!(
+                    "\n------------------------------ hermit analyze report ------------------------------"
+                );
+                println!("{}", header);
+                println!("{}", stack1);
+                println!("{}", stack2);
                 eprintln!(":: {}", "Completed analysis successfully.".green().bold());
                 Ok(Report {
                     header,

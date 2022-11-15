@@ -28,6 +28,7 @@ RUST_LOG=detcore=trace "$hermit" --log-file="$log1".log run --bind="$tmpdir" --b
 
 err=$(mktemp -p "$tmpdir")
 
+# Print a couple arbitrary points inside this particular guest program.
 RUST_LOG=detcore=trace "$hermit" --log-file="$log2".log run --bind="$tmpdir" --base-env=minimal \
   --replay-schedule-from="$log1".trace \
   --stacktrace-event=10 --stacktrace-event=26 \
@@ -45,7 +46,7 @@ fi
 
 "$hermit" log-diff "$log1".log "$log2".log
 
-if ! grep -s "Printing stack" "$err"; then
+if ! grep -s "Stack trace for thread" "$err"; then
   echo "ERROR: failed to print stacktrace for indicated trace events";
   exit 1
 fi

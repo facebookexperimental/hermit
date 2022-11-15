@@ -754,8 +754,14 @@ pub struct ConsumeResult {
     /// Should we keep runnning this thread, if false we background the current thread after this schedevent to let the next thread run.
     pub keep_running: bool,
     /// Should we print the stacktrace in the guest, as per --stacktrace-event
-    pub print_stack: bool,
+    pub print_stack: MaybePrintStack,
+    /// The number of this event in the global total order of events.
+    pub event_ix: u64,
 }
+
+/// Any non-None response means that the guest should print its stack trace before proceeding, and
+/// a response that further includes a path means print to a file at that location.
+pub type MaybePrintStack = Option<Option<PathBuf>>;
 
 enum ThreadStatus {
     // Not present in scheduler structures.
@@ -849,17 +855,17 @@ impl Scheduler {
 
     /// Try to pop the next event from the sorted list of stacktrace_events, if it matches the given
     /// index.  This is idempotent, because subsequent attempts will just fizzle.
-    fn try_pop_stacktrace_event(&mut self, current_ix: u64) -> bool {
-        let mut result = false;
+    fn try_pop_stacktrace_event(&mut self, current_ix: u64) -> MaybePrintStack {
+        let mut result = None;
         if let Some(iter) = &mut self.stacktrace_events {
-            if let Some((next_ix, _)) = iter.peek() {
+            if let Some((next_ix, m_path)) = iter.peek() {
                 if *next_ix == current_ix {
-                    eprintln!(
+                    info!(
                         "\nPrinting stack trace for scheduled event #{}:",
                         current_ix
                     );
+                    result = Some(m_path.clone());
                     let _ = iter.next();
-                    result = true;
                 }
             }
         }
@@ -939,6 +945,7 @@ impl Scheduler {
             ConsumeResult {
                 keep_running,
                 print_stack,
+                event_ix: current_ix,
             }
         } else {
             if self.replay_exhausted_panic {
@@ -956,7 +963,8 @@ impl Scheduler {
             // We're PAST the last event.  Uncharted territory...
             ConsumeResult {
                 keep_running: true,
-                print_stack: false,
+                print_stack: None,
+                event_ix: current_ix,
             }
         }
     }
@@ -1947,6 +1955,7 @@ impl Scheduler {
             let ConsumeResult {
                 keep_running,
                 print_stack,
+                event_ix: _,
             } = self.consume_schedevent(&ev);
             // We should not ever need to background the thread when it is going to exit anyway.
             if !keep_running {
@@ -1957,12 +1966,12 @@ impl Scheduler {
             }
             print_stack
         } else {
-            false
+            None
         };
-        let print_stack2 = record && self.record_event(&ev);
-        if print_stack1 || print_stack2 {
+        let print_stack2 = if record { self.record_event(&ev) } else { None };
+        if print_stack1.is_some() || print_stack2.is_some() {
             eprintln!(
-                ">>> Guest tid {}, at thread time {}, backtrace requested but not available post-exit!\n",
+                ":: Guest tid {}, at thread time {}, backtrace requested but not available post-exit!\n",
                 dettid, thread_time
             );
         }
@@ -2073,7 +2082,7 @@ impl Scheduler {
     // Return whether we should print the stacktrace after recording this event.
     // This is redundant with the consume_schedevent logic but allows us to print on either
     // recording or replay.
-    pub fn record_event(&mut self, ev: &SchedEvent) -> bool {
+    pub fn record_event(&mut self, ev: &SchedEvent) -> MaybePrintStack {
         debug!(
             "[detcore, dtid {}] Record scheduled event #{}: {:?}",
             &ev.dettid, self.recorded_event_count, ev
