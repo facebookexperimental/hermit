@@ -74,9 +74,9 @@ impl AnalyzeOpts {
         if self.verbose {
             ro.summary = true;
             eprintln!(
-                ":: Full Run configuration (logging to {}):\n  hermit run {}",
+                ":: [verbose] Run configuration (logging to {}):\n{}",
                 log_path.display(),
-                ro
+                self.runopts_to_repro(ro)
             );
         }
         ro.validate_args();
@@ -136,9 +136,6 @@ impl AnalyzeOpts {
     /// Return true if it matches the criteria.
     fn launch_config(&self, runname: &str, mut runopts: RunOpts) -> Result<bool, Error> {
         let tmp_dir = self.tmp_dir.as_ref().unwrap();
-        let bind_dir: Bind = Bind::from_str(tmp_dir.to_str().unwrap())?;
-        runopts.bind.push(bind_dir);
-
         let root = tmp_dir.join(runname);
         let log_path = self.log_path(runname);
         self.print_and_validate_runopts(&mut runopts, &log_path);
@@ -168,7 +165,6 @@ impl AnalyzeOpts {
                 .bold()
         );
         let preempts_path = self.preempts_path(runname);
-
         runopts.det_opts.det_config.record_preemptions = true;
         runopts.det_opts.det_config.record_preemptions_to = Some(preempts_path);
 
@@ -292,6 +288,18 @@ impl AnalyzeOpts {
         Ok(is_a_match)
     }
 
+    fn runopts_to_repro(&self, runopts: &RunOpts) -> String {
+        format!("hermit run {}", runopts)
+    }
+
+    fn runopts_add_binds(&self, runopts: &mut RunOpts) -> anyhow::Result<()> {
+        let tmp_dir = self.tmp_dir.as_ref().unwrap();
+        let bind_dir: Bind = Bind::from_str(tmp_dir.to_str().unwrap())?;
+        runopts.bind.push(bind_dir);
+        runopts.validate_args();
+        Ok(())
+    }
+
     // TODO: replace this with a more general way to convert RunOpts back to CLI args.
     pub(super) fn to_repro_cmd(&self, preempts_path: &Path, extra_flags: &str) -> String {
         let tmp_dir = self.tmp_dir.as_ref().unwrap();
@@ -323,12 +331,15 @@ impl AnalyzeOpts {
         for arg in &self.run_args {
             run_cmd.push(arg.to_string());
         }
-        let ro = RunOpts::from_iter(run_cmd.iter());
+        let mut ro = RunOpts::from_iter(run_cmd.iter());
         if ro.no_sequentialize_threads {
             bail!(
                 "Error, cannot search through executions with --no-sequentialize-threads.  Determinism required.",
             )
         }
+
+        ro.validate_args();
+        assert!(ro.det_opts.det_config.sequentialize_threads);
         if self.run1_seed.is_some() && !ro.det_opts.det_config.chaos {
             eprintln!(
                 "{}",
@@ -337,6 +348,8 @@ impl AnalyzeOpts {
                     .red()
             )
         }
+        self.runopts_add_binds(&mut ro)?;
+
         Ok(ro)
     }
 
@@ -387,19 +400,20 @@ impl AnalyzeOpts {
     ///
     /// Returns the logs and preemption (path) extracted from the initial target run.
     fn phase1_establish_target_run(&mut self) -> Result<(PathBuf, PathBuf), Error> {
-        let run1_opts = self.get_run1_runopts()?;
-
-        eprintln!(
-            ":: {} hermit run {}",
-            "Studying execution: ".yellow().bold(),
-            run1_opts
-        );
         let dir = tempfile::Builder::new()
             .prefix("hermit_analyze")
             .tempdir()?;
         let tmpdir_path = dir.into_path(); // For now always keep the temporary results.
         eprintln!(":: Temp workspace: {}", tmpdir_path.display());
         self.tmp_dir = Some(tmpdir_path);
+
+        // Must run after tmp_dir is set:
+        let run1_opts = self.get_run1_runopts()?;
+        eprintln!(
+            ":: {} hermit run {}",
+            "Studying execution: ".yellow().bold(),
+            run1_opts
+        );
 
         let runname = "phase1_target";
         let preempts_path = self.preempts_path(runname);
@@ -550,12 +564,12 @@ impl AnalyzeOpts {
             let mut run1b_opts = self.get_run1_runopts()?;
             run1b_opts.det_opts.det_config.replay_preemptions_from =
                 Some(run1_preempts_path.to_path_buf());
-            eprintln!("    {}", run1b_opts);
+            eprintln!("    {}", self.runopts_to_repro(&run1b_opts));
 
             let runname = "run1b_selfcheck";
             let second_matches = self.launch_logged(
                 runname,
-                "[selfecheck] Additional (target) run, replaying preemptions,",
+                "[selfcheck] Additional (target) run, replaying preemptions:",
                 run1b_opts,
             )?;
 
@@ -576,9 +590,11 @@ impl AnalyzeOpts {
                 )
             }
             let run1b_preempts_path = self.preempts_path(runname);
-            if preempt_files_equal(run1_preempts_path, &run1b_preempts_path) {
+            if !preempt_files_equal(run1_preempts_path, &run1b_preempts_path) {
                 bail!(
-                    "The preemptions recorded by the additional run did not match the preemptions replayed (no fixed point)."
+                    "The preemptions recorded by the additional run did not match the preemptions replayed (no fixed point): {} vs {}",
+                    run1_preempts_path.display(),
+                    run1b_preempts_path.display(),
                 );
             }
 

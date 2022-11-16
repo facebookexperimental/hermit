@@ -347,6 +347,28 @@ impl fmt::Display for RunOpts {
         if let Some(p) = &self.workdir {
             write!(f, " --workdir={}", p)?;
         }
+        for mount in &self.mount {
+            let mut acc = Vec::new();
+            if let Some(s) = &mount.get_source() {
+                acc.push(format!("source={}", s.display()));
+            }
+            acc.push(format!("target={}", mount.get_target().display()));
+            write!(f, "--mount={}", shell_words::quote(&acc.join(",")),)?;
+        }
+        for bind in &self.bind {
+            let src = bind.source.to_str().expect("valid unicode bind source");
+            let tar = bind.target.to_str().expect("valid unicode target");
+            if bind.source == bind.target {
+                write!(f, " --bind={}", shell_words::quote(src))?;
+            } else {
+                write!(
+                    f,
+                    " --bind={}:{}",
+                    shell_words::quote(src),
+                    shell_words::quote(tar)
+                )?;
+            }
+        }
 
         let dop = &self.det_opts.det_config;
         if !dop.virtualize_time {

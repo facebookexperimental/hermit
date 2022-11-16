@@ -48,7 +48,7 @@ if [[ -z "$HERMIT_ARGS" ]]; then
 fi
 set -eu
 TEMP=$(mktemp -d /tmp/analyze_test_XXXXX)
-echo "[analyze_test] Temporary workspace: $TEMP"
+echo ":: [analyze_test] Temporary workspace: $TEMP"
 TEMPLOG="${TEMP}/log.txt"
 HERMIT_ARGS="--report-file=${TEMP}/report.json $HERMIT_ARGS"
 
@@ -60,13 +60,13 @@ function cleanup {
     fi
 }
 
-echo "[analyze_test] Invoking analyze with: $HERMIT analyze $HERMIT_ARGS -- $TESTBIN"
+echo ":: [analyze_test] Invoking analyze with: $HERMIT analyze $HERMIT_ARGS -- $TESTBIN"
 
 # shellcheck disable=SC2086 # Intended splitting of args and command:
 $HERMIT analyze $HERMIT_ARGS -- "$TESTBIN" > >(tee "$TEMPLOG") \
   || (echo "Analyze failed."; exit 1)
 
-echo "[analyze_test] Searching for printed backtraces in $TEMPLOG"
+echo ":: [analyze_test] Searching for printed backtraces in $TEMPLOG"
 grep -q "Guest .* below backtrace" "$TEMPLOG" \
    || (echo "Stack trace not printed by hermit analyze!"; exit 1)
 code=$?
