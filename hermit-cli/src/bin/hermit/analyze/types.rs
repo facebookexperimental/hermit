@@ -156,6 +156,11 @@ pub struct AnalyzeOpts {
     #[clap(long, value_name = "PATH")]
     pub tmp_dir: Option<PathBuf>,
 
+    /// Specify that analyze itself should return a non-zero exit code on success.
+    /// This is needed under esoteric invocation scenarios.
+    #[clap(long, value_name = "INT32")]
+    pub success_exit_code: Option<i32>,
+
     /// A full set of CLI arguments for the original `hermit run` to analyze.
     #[clap(value_name = "ARGS")]
     pub run_args: Vec<String>,

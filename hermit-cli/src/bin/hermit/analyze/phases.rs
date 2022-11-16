@@ -806,7 +806,10 @@ impl AnalyzeOpts {
                 path.display()
             );
         }
-        Ok(ExitStatus::SUCCESS)
+        self.success_exit_code
+            .map_or(Ok(ExitStatus::SUCCESS), |exit_code| {
+                Ok(ExitStatus::Exited(exit_code))
+            })
     }
 
     fn save_final_baseline_sched_events(
