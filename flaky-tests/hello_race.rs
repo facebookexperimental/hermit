@@ -73,7 +73,12 @@ fn thread2(var: Arc<AtomicUsize>) {
     do_work(4 * WORK_AMT);
 }
 
-fn main() {
+#[test]
+fn unit_test() {
+    run_test();
+}
+
+fn run_test() {
     let d = Arc::new(AtomicUsize::new(1));
     let d1 = Arc::clone(&d);
     let d2 = Arc::clone(&d);
@@ -90,4 +95,8 @@ fn main() {
         std::process::exit(1);
     }
     println!("Did not find antagonistic schedule. Succeeding.");
+}
+
+fn main() {
+    run_test();
 }
