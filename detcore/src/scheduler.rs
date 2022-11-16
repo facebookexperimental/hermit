@@ -8,6 +8,7 @@
 
 //! Deterministic scheduling algorithm.
 
+pub mod replay_cursor;
 pub mod runqueue;
 pub mod timed_waiters;
 
@@ -26,6 +27,7 @@ use std::vec::IntoIter;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
+use replay_cursor::ReplayCursor;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 pub use runqueue::entropy_to_priority;
@@ -262,7 +264,7 @@ pub struct Scheduler {
     pub preemption_writer: Option<PreemptionWriter>,
 
     /// A cursor that holds our place in the global total order of events being replayed.
-    pub replay_cursor: Option<Peekable<IntoIter<SchedEvent>>>,
+    pub replay_cursor: Option<ReplayCursor<SchedEvent>>,
 
     /// Keep track of how many events we have replayed.  The current value is the event number of
     /// the NEXT event to replay.
@@ -313,6 +315,7 @@ pub struct ThreadTree {
 
 use pretty::Doc;
 use pretty::RcDoc;
+
 impl ThreadTree {
     /// Internal helper. Add a [child] process to the tree, with the parent being `None`
     /// if it's the root of the tree.
@@ -788,7 +791,7 @@ impl Scheduler {
                     trace!("Scheduler loading trace from path {}", path.display());
                     let vec = read_trace(path);
                     trace!("Trace loaded, length {}", vec.len());
-                    Some(vec.into_iter().peekable())
+                    Some(vec.into_iter().collect())
                 }
                 None => None,
             },
