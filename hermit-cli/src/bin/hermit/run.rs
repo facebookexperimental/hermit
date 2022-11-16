@@ -127,7 +127,7 @@ pub struct RunOpts {
     /// hermit runs execute in parallel and rand based collisions exist.  "Args" generates
     /// the seed from the other arguments passed to hermit, "SystemRandom" uses system
     /// randomness to generate a seed, and creates a log message recording it.
-    #[clap(long, value_name = "Args|SystemRandom")]
+    #[clap(long, value_name = "'Args'|'SystemRandom'")]
     seed_from: Option<SeedFrom>,
 
     /// After running, immediately run a SECOND time, and compare the two
@@ -163,27 +163,45 @@ pub struct RunOpts {
     #[clap(long, default_value = "host", value_name = "str", possible_values = &["empty", "minimal", "host"])]
     base_env: BaseEnv,
 
-    /// Additionally append one or more environment variables to the container environment.
-    #[clap(short, long, parse(try_from_str = parse_assignment))]
+    /// Additionally append one or more environment variables to the container environment. If a
+    /// name is provided without a value, pass that variable through from the host.
+    #[clap(short = 'e', long, parse(try_from_str = parse_assignment), value_name="name[=val]")]
     env: Vec<(String, String)>,
 
     /// An option to set current directory for the guest process.
     /// Note that the directory is relative to the guest. i.e. all mounted directories will be respected (e.g /tmp)
-    #[clap(long)]
+    #[clap(long, value_name = "path")]
     workdir: Option<String>,
 }
 
 fn parse_assignment(src: &str) -> Result<(String, String), Error> {
     lazy_static! {
         static ref ENV_RE: regex::Regex =
-            regex::Regex::new("^([\x07-<>-~]+)=([\x07-~]*)$").unwrap();
+           // Here we are extremely permissive, allowing all charecters in the "Portable Character
+           // Set", ISO/IEC 6429:1992 standard:
+           regex::Regex::new("^([\x07-<>-~]+)=([\x07-~]*)$").unwrap();
+        static ref VAR_RE: regex::Regex =
+           regex::Regex::new("^([\x07-<>-~]+)$").unwrap();
     }
     if let Some(capture) = ENV_RE.captures(src) {
         if let (Some(name), Some(value)) = (capture.get(1), capture.get(2)) {
-            return Ok((name.as_str().to_owned(), value.as_str().to_owned()));
+            Ok((name.as_str().to_owned(), value.as_str().to_owned()))
+        } else {
+            anyhow::bail!("unable to parse name=value from '{}'", src)
         }
+    } else if VAR_RE.is_match(src) {
+        let var: String = src.to_owned();
+        if let Ok(value) = std::env::var(&var) {
+            Ok((var, value))
+        } else {
+            anyhow::bail!(
+                "Attempt to pass through env var {}, but it is not set in the host environment",
+                var
+            )
+        }
+    } else {
+        anyhow::bail!("unable to parse env var name or name=value from '{}'", src)
     }
-    anyhow::bail!("unable to parse name=value from '{}'", src)
 }
 
 #[derive(Debug, Clone, Copy, Parser, Eq, PartialEq)]

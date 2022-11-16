@@ -259,19 +259,19 @@ pub struct Config {
 
     /// Configure a time offset (in seconds) between a container OS considered booted and a guest is executed
     /// This primarily affects 'sysinfo' syscall's 'uptime' field reporting
-    #[clap(long, default_value = "120")]
+    #[clap(long, default_value = "120", value_name = "uint64")]
     pub sysinfo_uptime_offset: u64,
 
-    /// Configure memory available for the container.
-    /// Right now this doesn't enforce an upper bound, but does
-    /// affect the amount of memory reported to the guest.
-    #[clap(long, default_value = "1GB", parse(try_from_str = try_parse_memory))]
+    /// Configure memory available for the container.  Takes a number of bytes, or shorthand (e.g.
+    /// "1GB"). Right now this doesn't enforce an upper bound, but does affect the amount of memory
+    /// reported to the guest.
+    #[clap(long, default_value = "1GB", parse(try_from_str = try_parse_memory), value_name = "bytesize")]
     pub memory: u64,
 
     /// Configure extra interrupt points based on thread id and rcb counter. Detcore will raise a precise
     /// timer for this RCB whenever it detects that current current thread timeslice intercects any of the
     /// interrupt points specified
-    #[clap(long, value_name = "index:rcbs", parse(try_from_str = try_parse_numbers_with_colon))]
+    #[clap(long, value_name = "tid:rcbs", parse(try_from_str = try_parse_numbers_with_colon))]
     pub interrupt_at: Vec<(DetTid, u64)>,
 }
 
