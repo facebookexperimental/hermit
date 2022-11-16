@@ -76,7 +76,7 @@ impl<P: AsRef<OsStr>> Verify<P> {
     ) -> anyhow::Result<bool> {
         println!(
             "{}",
-            ":: Checking that event schedules match (fixed point)".bold()
+            "::  Checking that event schedules match (fixed point)".bold()
         );
         Self::verify_lines(
             Self::format_json(&left.schedule_file)?,
@@ -110,7 +110,7 @@ impl<P: AsRef<OsStr>> Verify<P> {
 
     pub fn verify_desync(&self, right: &RunEnvironment) -> anyhow::Result<bool> {
         //FIXME: extract log-diff out of hermit and handle DESYNCs there (T135657122 + some extra work)
-        println!("{}", ":: Looking for desync events:".bold());
+        println!("{}", "::  Looking for desync events:".bold());
         let buffer = BufReader::new(std::fs::File::open(&right.log_file_path)?);
         for line in buffer.lines() {
             if line?.contains("DESYNC") {
