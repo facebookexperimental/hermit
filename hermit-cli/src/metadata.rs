@@ -178,6 +178,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         replay_exhausted_panic: false,
         die_on_desync: true,
         stacktrace_event: Vec::new(),
+        stacktrace_signal: None,
         preemption_stacktrace: false,
         preemption_stacktrace_log_file: None,
         stop_after_turn: None,

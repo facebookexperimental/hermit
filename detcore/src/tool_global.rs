@@ -28,7 +28,9 @@ use std::time::SystemTime;
 
 use chrono::DateTime;
 use chrono::Utc;
+use nix::sys::signal;
 use nix::sys::signal::Signal;
+use nix::unistd::Pid;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::CloneFlags;
 use reverie::syscalls::MemoryAccess;
@@ -923,11 +925,7 @@ impl GlobalState {
 
     /// The return value indicates whether the backtrace of this event should be printed, and if so,
     /// whether it should be printed to a file.
-    async fn recv_trace_schedevent(
-        &self,
-        ev: SchedEvent,
-        detpid: DetPid,
-    ) -> Option<Option<PathBuf>> {
+    async fn recv_trace_schedevent(&self, ev: SchedEvent, detpid: DetPid) -> MaybePrintStack {
         // TODO(T124316762): debug address randomization in the tracer and get rid of this hack:
         let ev = {
             if self.past_first_execve.load(SeqCst) {
@@ -947,7 +945,7 @@ impl GlobalState {
         }
 
         // Yield this guest thread if needed to follow schedule.
-        if self.cfg.replay_schedule_from.is_some() {
+        let maybe_print = if self.cfg.replay_schedule_from.is_some() {
             let ConsumeResult {
                 keep_running,
                 print_stack,
@@ -971,7 +969,24 @@ impl GlobalState {
             print_stack.or(print_stack2)
         } else {
             self.record_event(&ev)
+        };
+
+        if maybe_print.is_some() {
+            if let Some(sig) = &self.cfg.stacktrace_signal {
+                trace!(
+                    "[dtid {}] signaling thread with {} at the point of stack trace printing.",
+                    ev.dettid,
+                    sig.0
+                );
+                let tid = Pid::from_raw(ev.dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
+                // We send a raw signal here and let the guest pick it up WHENEVER it resumes.
+                // We don't use the "signal_guest" method because we don't necessarily respect that
+                // protocol here.
+                signal::kill(tid, sig.0).unwrap();
+            }
         }
+
+        maybe_print
     }
 
     // Return whether we should print the stacktrace after recording this event.
@@ -1411,7 +1426,7 @@ where
     global_time_lower_bound(guest).await
 }
 
-/// Helper function just for printing backtrace to a given file (or stderr)
+/// Helper function just for printing backtrace to a given file (otherwise stderr)
 fn print_backtrace<G, T>(guest: &mut G, maybe_path: &Option<PathBuf>)
 where
     G: Guest<Detcore<T>>,
@@ -1492,6 +1507,7 @@ where
         _ => unreachable!(),
     };
     if let Some(x) = do_backtrace {
+        trace!("[trace_schedevent] printing stacktrace via Reverie...");
         print_backtrace(guest, &x);
     }
 }
