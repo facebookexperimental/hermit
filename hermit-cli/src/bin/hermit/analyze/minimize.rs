@@ -252,9 +252,10 @@ impl AnalyzeOpts {
 
                 let batch = batch_sizes.get_mut(&selected_tid).unwrap();
                 eprintln!("    {}", self.to_repro_cmd(&new_preempts_path, ""));
-                let log_path = tmp_dir.join(&format!("round_{:0wide$}.log", round, wide = 3));
+                let runname = format!("round_{:0wide$}", round, wide = 3);
+                let log_path = tmp_dir.join(&runname).with_extension("log");
                 if self
-                    .launch_controlled(&log_path, &new_preempts_path, None)
+                    .launch_from_preempts_to_sched(&runname, &new_preempts_path, None)
                     .unwrap()
                 {
                     eprintln!(

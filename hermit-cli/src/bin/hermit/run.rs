@@ -47,7 +47,7 @@ use super::verify::temp_log_files;
 const TMP_DIR: &str = "/tmp";
 
 // Just a place to put the clap(flatten) directive..
-#[derive(Debug, Parser)]
+#[derive(Debug, Parser, Clone)]
 pub(crate) struct DetOptions {
     /// detcore configuration
     #[clap(flatten)]
@@ -55,7 +55,7 @@ pub(crate) struct DetOptions {
 }
 
 /// Command-line options for the "run" subcommand.
-#[derive(Debug, Parser)]
+#[derive(Debug, Parser, Clone)]
 pub struct RunOpts {
     /// Program to run.
     #[clap(value_name = "PROGRAM")]
