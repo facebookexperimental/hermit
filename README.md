@@ -53,7 +53,7 @@ Hermit is built with the standard Rust cargo tool.
 cargo build
 ```
 This builds the whole cargo workspace. The actual binary is located in target
-directory of the hermit crate (under hermit-cli/target directory)
+directory (`target/debug/hermit`).
 
 Then, once you've built Hermit, all you need to run your program
 deterministically is:
@@ -78,6 +78,20 @@ running a controlled, deterministic one (virtual time, pseudo-randomness, etc).
 hermit record <prog>
 hermit replay
 ```
+
+# Example programs
+
+See the [the examples folder](./examples/README.md) for example programs and
+instructions on how to run them.  These showcase different sources of
+nondeterminism, and how hermit eliminates or controls them.
+
+# The state of CI and testing
+
+At Meta, this repository is built using buck.  We have over 700 integration
+tests that run under this setup. But as of this initial release (2022-11-21), we
+have not ported these tests to an external build system yet.
+
+
 
 # Applications
 
