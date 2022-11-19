@@ -118,6 +118,9 @@ impl AnalyzeOpts {
         let log_path = self.log_path(runname);
         self.print_and_validate_runopts(runopts, &log_path);
 
+        let conf_file = root.with_extension("config");
+        runopts.save_config = Some(conf_file);
+
         let log_file = File::create(&log_path)?;
         let out1: Output = runopts.run_verify(log_file, &NO_LOGGING_PLZ)?;
 

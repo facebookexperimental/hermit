@@ -9,8 +9,10 @@
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::fs;
+use std::fs::File;
 use std::hash::Hash;
 use std::hash::Hasher;
+use std::io::Write;
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::path::PathBuf;
@@ -106,12 +108,7 @@ pub struct RunOpts {
     /// created and `/tmp` is isolated. It is still possible to introduce
     /// non-determinism through time and thread scheduling. Can be combined with
     /// `--no-networking` to also disable networking.
-    #[clap(
-        long,
-        conflicts_with = "chaos",
-        conflicts_with = "verify"
-        // conflicts_with = "strict"
-    )]
+    #[clap(long, conflicts_with = "chaos", conflicts_with = "verify")]
     lite: bool,
 
     /// Specifies the directory to use as `/tmp`. This path gets bind-mounted
@@ -172,6 +169,11 @@ pub struct RunOpts {
     /// Note that the directory is relative to the guest. i.e. all mounted directories will be respected (e.g /tmp)
     #[clap(long, value_name = "path")]
     workdir: Option<String>,
+
+    /// For debugging, save the details of this final run config: printed to a file in a human
+    /// readable format.
+    #[clap(long, value_name = "path")]
+    pub save_config: Option<PathBuf>,
 }
 
 fn parse_assignment(src: &str) -> Result<(String, String), Error> {
@@ -345,8 +347,13 @@ impl fmt::Display for RunOpts {
             write!(f, " --env={}={}", key, val)?;
         }
         if let Some(p) = &self.workdir {
-            write!(f, " --workdir={}", p)?;
+            write!(f, " --workdir={}", shell_words::quote(p))?;
         }
+        if let Some(p) = &self.save_config {
+            let s = p.to_str().expect("valid string provided to --save-config");
+            write!(f, " --save-config={}", shell_words::quote(s))?;
+        }
+
         for mount in &self.mount {
             let mut acc = Vec::new();
             if let Some(s) = &mount.get_source() {
@@ -807,6 +814,14 @@ impl RunOpts {
         }
     }
 
+    fn save_config_to_disk(&self) -> Result<(), Error> {
+        if let Some(path) = &self.save_config {
+            let mut file = File::create(path)?;
+            file.write_all(format!("{:#?}\n", self).as_bytes())?;
+        }
+        Ok(())
+    }
+
     fn run_in_container(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         let _guard = global.init_tracing();
 
@@ -837,6 +852,7 @@ impl RunOpts {
         }
 
         let config = self.det_opts.det_config.clone();
+        self.save_config_to_disk()?;
 
         hermit::run(command, config, self.summary)
     }
@@ -867,6 +883,7 @@ impl RunOpts {
         }
 
         let config = self.det_opts.det_config.clone();
+        self.save_config_to_disk()?;
 
         hermit::run_with_output(command, config, self.summary)
     }
