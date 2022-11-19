@@ -2,18 +2,33 @@
 
 ## Overview
 
-Hermit uses a combination of lightweight containerization and system call interception to identify and compensate for potentially random behavior that may occur during the execution of a given program or command. In this way, hermit can be used to launch arbitrary programs and run them in a way that is deterministic and reproducible.
+Hermit uses a combination of lightweight containerization and system call
+interception to identify and compensate for potentially random behavior that may
+occur during the execution of a given program or command. In this way, hermit
+can be used to launch arbitrary programs and run them in a way that is
+deterministic and reproducible.
 
-Future releases will support more Linux programs. This early release package provides only the core deterministic container concept, and it is useful primarily for deterministic builds and software tests.
+This initial release supports a substantial number of Linux features. But it's a
+large surface area, and compatibility is not 100%. If you find that your program
+errors or hangs under hermit, report a bug here:
+
+   https://github.com/facebookexperimental/hermit/issues
 
 ## Basic Usage
 
-Typical usage of the hermit tool consists of simply placing `hermit run` at the beginning of the command that is to be executed. For example, running the script `my-example.sh` would be achieved by the following command:
+Typical usage of the hermit tool consists of simply placing `hermit run` at the
+beginning of the command that is to be executed. For example, running the script
+`my-example.sh` would be achieved by the following command:
+
 ```shell
 hermit run ./my-example.sh
 ```
 
-Similarly, we could run `hermit run -- ls -l`, revealing that the process run under hermit can still by default access the full file system, including `/bin/ls`. More detailed control over the starting conditions of the deterministic computation is enabled with additional command line flags. To see these flags and how to use them, please refer to the command line help info:
+Similarly, we could run `hermit run -- ls -l`, revealing that the process run
+under hermit can still by default access the full file system, including
+`/bin/ls`. More detailed control over the starting conditions of the
+deterministic computation is enabled with additional command line flags. To see
+these flags and how to use them, please refer to the command line help info:
 
 ```shell
 hermit --help
@@ -22,9 +37,9 @@ hermit run --help
 
 ## Examples
 
-To run the example scripts in this directory, first switch to it.
-Next, run one of the examples a few times without hermit. For example,
-running `./rand.py` should output a new series of random numbers on each execution:
+To run the example scripts in this directory, first switch to it.  Next, run one
+of the examples a few times without hermit. For example, running `./rand.py`
+should output a new series of random numbers on each execution:
 
 ```shell
 $ ./rand.py

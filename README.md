@@ -53,7 +53,7 @@ Hermit is built with the standard Rust cargo tool.
 cargo build
 ```
 This builds the whole cargo workspace. The actual binary is located in target
-directory of the hermit crate (under hermit-cli/target directory)
+directory (`target/debug/hermit`).
 
 Then, once you've built Hermit, all you need to run your program
 deterministically is:
@@ -74,10 +74,49 @@ You can use hermit as a replay-debugger as well, either recording a
 non-deterministic execution (real time, real randomness, etc), or repeatedly
 running a controlled, deterministic one (virtual time, pseudo-randomness, etc).
 
-```
+```bash
 hermit record <prog>
 hermit replay
 ```
+
+# Example programs
+
+See the [the examples folder](./examples/README.md) for example programs and
+instructions on how to run them.  These showcase different sources of
+nondeterminism, and how hermit eliminates or controls them.
+
+In order to explore more advanced examples, you can look at some of
+the integration tests built from [./tests/`]() or [./flaky-tests/]().
+For example, using the commands below you can run a racy example
+multiple times to see its nondeterminism.  Then run it under hermit to
+watch that determinism disappear.  Then run it under hermit `--chaos`
+to bring that nondeterminism back, but in a controlled way that can be
+reproduced based on the input seed.
+
+```bash
+cargo build
+for ((i=0; i<20; i++)); do ./target/debug/hello_race; done
+
+for ((i=0; i<20; i++)); do hermit run ./target/debug/hello_race; done
+
+for ((i=0; i<20; i++)); do
+  hermit run --chaos --seed-from=SystemRandom ./target/debug/hello_race;
+done
+```
+
+# The state of CI and testing
+
+At Meta, this repository is built using buck.  We have over 700 integration
+tests that run under this setup. But as of this initial release (2022-11-21), we
+have not ported these tests to an external build system yet.
+
+A few unit tests run under `cargo test`, but the integration tests are more
+complicated because they combine various run modes with each of the test
+binaries (which are built from `tests/`, `flaky-tests/`, and the rr test suite
+too).
+
+We plan to get the internal Buck configuration files building externally with
+buck or bazel.
 
 # Applications
 
