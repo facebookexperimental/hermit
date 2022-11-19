@@ -4,7 +4,9 @@
 
 Hermit uses a combination of lightweight containerization and system call interception to identify and compensate for potentially random behavior that may occur during the execution of a given program or command. In this way, hermit can be used to launch arbitrary programs and run them in a way that is deterministic and reproducible.
 
-Future releases will support more Linux programs. This early release package provides only the core deterministic container concept, and it is useful primarily for deterministic builds and software tests.
+This initial release supports a substantial number of Linux features. But it's a large surface area, and compatibility is not 100%. If you find that your program errors or hangs under hermit, report a bug here:
+
+   https://github.com/facebookexperimental/hermit/issues
 
 ## Basic Usage
 
