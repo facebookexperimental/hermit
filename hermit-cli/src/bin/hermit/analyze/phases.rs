@@ -116,8 +116,13 @@ impl AnalyzeOpts {
         Ok((is_a_match, log_path))
     }
 
-    /// Launch a chaos run searching for a failing schudule.
-    fn launch_search(&self, round: u64, sched_seed: u64) -> Result<Option<PathBuf>, Error> {
+    /// Launch a chaos run searching for a target (e.g. failing) schudule.
+    /// Returns Some if a target schedule is found.
+    fn launch_search(
+        &self,
+        round: u64,
+        sched_seed: u64,
+    ) -> Result<Option<(PathBuf, RunOpts)>, Error> {
         eprintln!(
             ":: {}",
             format!(
@@ -139,7 +144,7 @@ impl AnalyzeOpts {
 
         let (is_a_match, _) = self.launch_config(&runname, &mut ro)?;
         if is_a_match {
-            Ok(Some(preempts_path))
+            Ok(Some((preempts_path, ro)))
         } else {
             Ok(None)
         }
@@ -172,14 +177,14 @@ impl AnalyzeOpts {
         runname: &str,
         preempts_path: &Path,
         record_sched_path: Option<&Path>,
-    ) -> Result<bool, Error> {
+    ) -> Result<(bool, RunOpts), Error> {
         let mut ro = self.get_base_runopts()?;
         ro.det_opts.det_config.replay_preemptions_from = Some(preempts_path.to_path_buf());
         if let Some(path) = record_sched_path {
             ro.det_opts.det_config.record_preemptions_to = Some(path.to_path_buf());
         }
         let (is_a_match, _) = self.launch_config(runname, &mut ro)?;
-        Ok(is_a_match)
+        Ok((is_a_match, ro))
     }
 
     /// Runs the program with the specified schedule.
@@ -226,24 +231,6 @@ impl AnalyzeOpts {
         runopts.bind.push(bind_dir);
         runopts.validate_args();
         Ok(())
-    }
-
-    // TODO: replace this with a more general way to convert RunOpts back to CLI args.
-    pub(super) fn to_repro_cmd(&self, preempts_path: &Path, extra_flags: &str) -> String {
-        let tmp_dir = self.tmp_dir.as_ref().unwrap();
-        format!(
-            "hermit --log-file=/dev/stderr run --bind={} --sequentialize-threads --replay-preemptions-from='{}' {} {}",
-            tmp_dir.as_path().to_string_lossy(),
-            preempts_path.to_string_lossy(),
-            extra_flags,
-            self.run_args.join(" "),
-        )
-    }
-
-    fn to_repro_chaos(&self, seed: u64) -> String {
-        let mut str = format!("hermit --log-file=/dev/stderr run --seed={} ", seed);
-        str.push_str(&self.run_args.join(" "));
-        str
     }
 
     /// It's weird if no filter is specified.
@@ -564,7 +551,7 @@ impl AnalyzeOpts {
             eprintln!(":: Recorded preemptions from --run2-seed as baseline run.");
         } else if let Some(path) = &self.run2_preemptions {
             let pr = PreemptionReader::new(path).load_all();
-            self.save_final_baseline_sched_events(&pr, path, global);
+            self.save_final_baseline_sched_events(&pr, path, global)?;
         } else if self.minimize {
             // If we're minimizing, then we know that ALL interventions in the schedule are critical.
             // Thus omitting any of them is sufficient to exit the target schedule space.
@@ -581,7 +568,7 @@ impl AnalyzeOpts {
             }
         } else {
             let empty_pr = matching_pr.clone().strip_contents();
-            self.save_final_baseline_sched_events(&empty_pr, &sched_path, global);
+            self.save_final_baseline_sched_events(&empty_pr, &sched_path, global)?;
         }
         Ok((matching_pr, sched_path))
     }
@@ -758,7 +745,7 @@ impl AnalyzeOpts {
         let (final_pr, non_matching_sched_events_path) =
             self.phase4_choose_baseline_sched_events(global, normalized_preempts)?;
 
-        self.save_final_baseline_sched_events(&final_pr, &target_sched_events_path, global);
+        self.save_final_baseline_sched_events(&final_pr, &target_sched_events_path, global)?;
 
         let target = read_trace(&target_sched_events_path);
         let baseline = read_trace(&non_matching_sched_events_path);
@@ -786,7 +773,7 @@ impl AnalyzeOpts {
         final_preempts: &PreemptionRecord,
         sched_events_path: &Path,
         _global: &GlobalOpts,
-    ) {
+    ) -> anyhow::Result<()> {
         let tmp_dir = self.tmp_dir.as_ref().unwrap();
         let final_preempts_path = tmp_dir.join("final_pass.preempts");
         final_preempts
@@ -801,26 +788,21 @@ impl AnalyzeOpts {
                 .yellow()
                 .bold()
         );
+        let runname = "verify_baseline_endpoint";
+        let (is_match, ro) = self.launch_from_preempts_to_sched(
+            runname,
+            &final_preempts_path,
+            Some(sched_events_path),
+        )?;
+        let log_path = self.log_path(runname);
         eprintln!(
             "    {}",
-            self.to_repro_cmd(
-                &final_preempts_path,
-                &format!(
-                    "--record-preemptions-to={}",
-                    sched_events_path.to_string_lossy()
-                )
-            )
+            self.runopts_to_repro(&ro, Some(log_path.to_str().unwrap()))
         );
-        if !self
-            .launch_from_preempts_to_sched(
-                "verify_baseline_endpoint",
-                &final_preempts_path,
-                Some(sched_events_path),
-            )
-            .unwrap()
-        {
+        if !is_match {
             eprintln!("Good: baseline run does not match criteria (e.g. pass not fail).");
         }
+        Ok(())
     }
 
     // This extra run, to record the schedule, thus converting Preemptions to a full Schedule
@@ -839,24 +821,18 @@ impl AnalyzeOpts {
                 .yellow()
                 .bold()
         );
+        let runname = "verify_target_endpoint";
+        let (is_match, ro) = self.launch_from_preempts_to_sched(
+            runname,
+            final_preempts_path,
+            Some(sched_events_path),
+        )?;
+        let log_path = self.log_path(runname);
         eprintln!(
             "    {}",
-            self.to_repro_cmd(
-                final_preempts_path,
-                &format!(
-                    "--record-preemptions-to={}",
-                    sched_events_path.to_string_lossy()
-                )
-            )
+            self.runopts_to_repro(&ro, Some(log_path.to_str().unwrap())),
         );
-        if !self
-            .launch_from_preempts_to_sched(
-                "verify_target_endpoint",
-                final_preempts_path,
-                Some(sched_events_path),
-            )
-            .unwrap()
-        {
+        if !is_match {
             bail!("Final preemption record still does not match target criteria");
         }
         Ok(())
@@ -900,24 +876,17 @@ impl AnalyzeOpts {
                 .yellow()
                 .bold()
         );
+        let (is_match, ro) = self.launch_from_preempts_to_sched(
+            runname,
+            &non_matching_preempts_path,
+            Some(sched_events_path),
+        )?;
+        let log_path = self.log_path(runname);
         eprintln!(
             "    {}",
-            self.to_repro_cmd(
-                &non_matching_preempts_path,
-                &format!(
-                    "--record-preemptions-to={}",
-                    sched_events_path.to_string_lossy()
-                )
-            )
+            self.runopts_to_repro(&ro, Some(log_path.to_str().unwrap())),
         );
-        if self
-            .launch_from_preempts_to_sched(
-                runname,
-                &non_matching_preempts_path,
-                Some(sched_events_path),
-            )
-            .unwrap()
-        {
+        if is_match {
             eprintln!(
                 "{}",
                 ":: New preemption record still matches criteria! Attempting further knockouts.."
@@ -948,7 +917,7 @@ impl AnalyzeOpts {
         let mut round = 0;
         loop {
             let sched_seed = rng.gen();
-            if let Some(preempts) = self
+            if let Some((preempts, runopts)) = self
                 .launch_search(round, sched_seed)
                 .unwrap_or_else(|e| panic!("Error: {}", e))
             {
@@ -963,7 +932,7 @@ impl AnalyzeOpts {
                 eprintln!(
                     ":: {}:\n    {}",
                     "Reproducer".green().bold(),
-                    self.to_repro_chaos(sched_seed)
+                    self.runopts_to_repro(&runopts, None)
                 );
                 std::fs::copy(&preempts, preempts_path).expect("file copy to succeed");
                 break;
