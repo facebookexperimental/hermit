@@ -68,7 +68,12 @@ pub struct AnalyzeOpts {
     /// Given a passing/failing run pair, based on different chaos seeds, first minimize the
     /// chaos-mode interventions necessary to flip between the two outcomes.  This may accelerate
     /// the subsequent binary search.
-    #[clap(long)]
+    #[clap(
+        long,
+        conflicts_with = "run2-seed",
+        conflicts_with = "run2-preemptions",
+        conflicts_with = "run2-schedule"
+    )]
     pub minimize: bool,
 
     /// Use `--imprecise-timers` during the (chaos) search phase. Only has an effect if search is

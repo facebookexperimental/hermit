@@ -16,7 +16,6 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::bail;
-use anyhow::Context;
 use clap::Parser;
 use colored::Colorize;
 use detcore::preemptions::read_trace;
@@ -41,9 +40,12 @@ use crate::run::RunOpts;
 use crate::schedule_search::search_for_critical_schedule;
 use crate::schedule_search::CriticalSchedule;
 
+/// Compare only preemptions, not recorded schedules.
 fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {
-    let pr1 = PreemptionReader::new(path1).load_all();
-    let pr2 = PreemptionReader::new(path2).load_all();
+    let mut pr1 = PreemptionReader::new(path1).load_all();
+    let mut pr2 = PreemptionReader::new(path2).load_all();
+    pr1.preemptions_only();
+    pr2.preemptions_only();
     pr1 == pr2
 }
 
@@ -63,7 +65,11 @@ const SCHED_EXT: &str = "events";
 
 /// Return true the launched run matches the target criteria.
 /// Also return the path to the log file that was written.
-type LaunchResult = Result<(bool, PathBuf), Error>;
+type LaunchResult = anyhow::Result<(bool, PathBuf)>;
+
+fn yellow_msg(msg: &str) {
+    eprintln!(":: {}", msg.yellow().bold());
+}
 
 impl AnalyzeOpts {
     fn log_path(&self, runname: &str) -> PathBuf {
@@ -74,6 +80,19 @@ impl AnalyzeOpts {
     fn preempts_path(&self, runname: &str) -> PathBuf {
         let tmp_dir = self.tmp_dir.as_ref().unwrap();
         tmp_dir.join(runname).with_extension(PREEMPTS_EXT)
+    }
+
+    fn _sched_path(&self, runname: &str) -> PathBuf {
+        let tmp_dir = self.tmp_dir.as_ref().unwrap();
+        tmp_dir.join(runname).with_extension(SCHED_EXT)
+    }
+
+    fn get_tmp(&self) -> anyhow::Result<&Path> {
+        if let Some(pb) = &self.tmp_dir {
+            Ok(pb.as_path())
+        } else {
+            bail!("Expected tmp_dir to be set at this point!")
+        }
     }
 
     fn print_and_validate_runopts(&self, ro: &mut RunOpts, log_path: &Path) {
@@ -95,8 +114,7 @@ impl AnalyzeOpts {
     /// Launch a single run with the given options.
     /// (Also set up logging and temp dir binding.)
     fn launch_config(&self, runname: &str, runopts: &mut RunOpts) -> LaunchResult {
-        let tmp_dir = self.tmp_dir.as_ref().unwrap();
-        let root = tmp_dir.join(runname);
+        let root = self.get_tmp()?.join(runname);
         let log_path = self.log_path(runname);
         self.print_and_validate_runopts(runopts, &log_path);
 
@@ -123,15 +141,10 @@ impl AnalyzeOpts {
         round: u64,
         sched_seed: u64,
     ) -> Result<Option<(PathBuf, RunOpts)>, Error> {
-        eprintln!(
-            ":: {}",
-            format!(
-                "Searching (round {}) for a failing execution, chaos --sched-seed={} ",
-                round, sched_seed
-            )
-            .yellow()
-            .bold()
-        );
+        yellow_msg(&format!(
+            "Searching (round {}) for a failing execution, chaos --sched-seed={} ",
+            round, sched_seed
+        ));
         let runname = format!("search_round_{:0wide$}", round, wide = 3);
         let preempts_path = self.preempts_path(&runname);
         let mut ro = self.get_base_runopts()?;
@@ -157,12 +170,7 @@ impl AnalyzeOpts {
         msg: &str,
         mut runopts: RunOpts,
     ) -> LaunchResult {
-        eprintln!(
-            ":: {}",
-            format!("{} record preemptions and logs...", msg)
-                .yellow()
-                .bold()
-        );
+        yellow_msg(&format!("{} record preemptions and schedule...", msg));
         let preempts_path = self.preempts_path(runname);
         runopts.det_opts.det_config.record_preemptions = true;
         runopts.det_opts.det_config.record_preemptions_to = Some(preempts_path);
@@ -177,7 +185,7 @@ impl AnalyzeOpts {
         runname: &str,
         preempts_path: &Path,
         record_sched_path: Option<&Path>,
-    ) -> Result<(bool, RunOpts), Error> {
+    ) -> anyhow::Result<(bool, RunOpts)> {
         let mut ro = self.get_base_runopts()?;
         ro.det_opts.det_config.replay_preemptions_from = Some(preempts_path.to_path_buf());
         if let Some(path) = record_sched_path {
@@ -195,8 +203,8 @@ impl AnalyzeOpts {
         runname: &str,
         schedule_path: &Path,
         critical_event_index: u64,
-    ) -> Result<(bool, PathBuf, PathBuf, RunOpts), Error> {
-        let tmp_dir = self.tmp_dir.as_ref().context("tmp_dir set")?;
+    ) -> anyhow::Result<(bool, PathBuf, PathBuf, RunOpts)> {
+        let tmp_dir = self.get_tmp()?;
         let stack1_path = tmp_dir.join(runname).with_extension("stack1");
         let stack2_path = tmp_dir.join(runname).with_extension("stack2");
 
@@ -226,8 +234,7 @@ impl AnalyzeOpts {
     }
 
     fn runopts_add_binds(&self, runopts: &mut RunOpts) -> anyhow::Result<()> {
-        let tmp_dir = self.tmp_dir.as_ref().unwrap();
-        let bind_dir: Bind = Bind::from_str(tmp_dir.to_str().unwrap())?;
+        let bind_dir: Bind = Bind::from_str(self.get_tmp()?.to_str().unwrap())?;
         runopts.bind.push(bind_dir);
         runopts.validate_args();
         Ok(())
@@ -275,17 +282,6 @@ impl AnalyzeOpts {
         if let Some(seed) = self.run1_seed {
             ro.det_opts.det_config.seed = seed;
         } else if let Some(path) = &self.run1_preemptions {
-            ro.det_opts.det_config.replay_preemptions_from = Some(path.clone());
-        }
-        Ok(ro)
-    }
-
-    /// Extract the (initial) RunOpts for run2 that are implied by all of hermit analyze's arguments.
-    fn get_run2_runopts(&self) -> anyhow::Result<RunOpts> {
-        let mut ro = self.get_base_runopts()?;
-        if let Some(seed) = self.run2_seed {
-            ro.det_opts.det_config.seed = seed;
-        } else if let Some(path) = &self.run2_preemptions {
             ro.det_opts.det_config.replay_preemptions_from = Some(path.clone());
         }
         Ok(ro)
@@ -424,10 +420,7 @@ impl AnalyzeOpts {
         run2_log_path: &Path,
     ) -> ExitStatus {
         if self.verbose {
-            eprintln!(
-                ":: {}",
-                "[comparing] with log-diff command:".yellow().bold()
-            );
+            yellow_msg("[comparing] with log-diff command:");
             eprintln!(
                 "    hermit log-diff {} {}",
                 run1_log_path.display(),
@@ -446,10 +439,7 @@ impl AnalyzeOpts {
         run2_log_path: &Path,
     ) -> ExitStatus {
         if self.verbose {
-            eprintln!(
-                ":: {}",
-                "[comparing] with log-diff command:".yellow().bold()
-            );
+            yellow_msg("[comparing] with log-diff command:");
             eprintln!(
                 "    hermit log-diff --ignore-lines=CHAOSRAND {} {}",
                 run1_log_path.display(),
@@ -470,12 +460,7 @@ impl AnalyzeOpts {
         run1_preempts_path: &Path,
     ) -> Result<(), Error> {
         if self.selfcheck {
-            eprintln!(
-                ":: {}",
-                "[selfcheck] Verifying target run preserved under preemption-replay"
-                    .yellow()
-                    .bold()
-            );
+            yellow_msg("[selfcheck] Verifying target run preserved under preemption-replay");
 
             let mut run1b_opts = self.get_run1_runopts()?;
             run1b_opts.det_opts.det_config.replay_preemptions_from =
@@ -489,12 +474,7 @@ impl AnalyzeOpts {
                 run1b_opts,
             )?;
 
-            eprintln!(
-                ":: {}",
-                "[selfcheck] Comparing output from additional run."
-                    .yellow()
-                    .bold()
-            );
+            yellow_msg("[selfcheck] Comparing output from additional run.");
             let run1b_log_path = self.log_path(runname);
             let status = self.log_diff_preemption_replay(global, run1_log_path, &run1b_log_path);
             if !second_matches {
@@ -527,50 +507,100 @@ impl AnalyzeOpts {
     /// Once we have the target MATCHING run in hand (usually crashing/failing), we need to
     /// determine which baseline, non-matching run to use. Then we need to extract the schedule from
     /// it.
+    ///
+    /// Returns a path to a file containing recorded schedule events for the baseline run.
     pub fn phase4_choose_baseline_sched_events(
         &mut self,
         global: &GlobalOpts,
         matching_pr: PreemptionRecord,
-    ) -> anyhow::Result<(PreemptionRecord, PathBuf)> {
-        let run2_opts = self.get_run2_runopts()?;
+    ) -> anyhow::Result<PathBuf> {
         let runname = "run2_baseline";
         let sched_path = self.preempts_path(runname); // TODO(T136650888): separate files.
+        if self.minimize {
+            // Enforced by the clap conflicts_with annotations:
+            assert!(self.run2_seed.is_none());
+            assert!(self.run2_preemptions.is_none());
+            assert!(self.run2_schedule.is_none());
 
-        if self.run2_seed.is_some() {
-            // Translate the seed into a set of preemptions we can work from.
-            self.launch_and_record_preempts(
-                runname,
-                format!(
-                    "Record preemptions from baseline run, WITHOUT criteria ({}):",
-                    self.display_criteria()
-                )
-                .as_str(),
-                run2_opts,
-            )
-            .unwrap();
-            eprintln!(":: Recorded preemptions from --run2-seed as baseline run.");
-        } else if let Some(path) = &self.run2_preemptions {
-            let pr = PreemptionReader::new(path).load_all();
-            self.save_final_baseline_sched_events(&pr, path, global)?;
-        } else if self.minimize {
             // If we're minimizing, then we know that ALL interventions in the schedule are critical.
             // Thus omitting any of them is sufficient to exit the target schedule space.
             // Omitting the last one should yield the lowest distance match/non-match schedule pair.
             let mut pr = matching_pr;
+            let mut ix = 1;
+            let mut path = sched_path;
             loop {
                 if let Some(still_matching_pr) =
-                    self.save_nearby_non_matching_sched_events(&pr, &sched_path, global)?
+                    self.save_nearby_non_matching_sched_events(&pr, &path, global)?
                 {
                     pr = still_matching_pr;
+                    path = self.preempts_path(&format!("{}_retry{}", &runname, ix));
+                    ix += 1;
                 } else {
-                    return Ok((pr, sched_path));
+                    return Ok(path);
                 }
             }
         } else {
-            let empty_pr = matching_pr.clone().strip_contents();
-            self.save_final_baseline_sched_events(&empty_pr, &sched_path, global)?;
+            // Tweak the runopts according to several different scenarios:
+            let mut ro = self.get_base_runopts()?;
+            ro.det_opts.det_config.record_preemptions_to = Some(sched_path.clone()); // TODO(T136650888): record schedule only
+
+            let from_where;
+
+            if let Some(seed) = self.run2_seed {
+                // Replay from seed to record schedule.
+                ro.det_opts.det_config.seed = seed;
+                from_where = "--run2-seed";
+            } else if let Some(path) = &self.run2_preemptions {
+                // Replay from preemption record to record schedule.
+                ro.det_opts.det_config.replay_preemptions_from = Some(path.clone());
+                // TODO: if the file already contains a schedule, we don't need to rerun it.
+                // Unless selfcheck is specified.
+                from_where = "--run2-preemptions";
+            } else if let Some(path) = &self.run2_schedule {
+                if self.selfcheck {
+                    // TODO: Don't trust the recorded schedule is a baseline, replay and check it.
+                }
+                return Ok(path.clone());
+            } else {
+                from_where = "non-chaos (0 extra preemptions) run";
+
+                // Otherwise we just assume that a *baseline* (non-chaos) run will do the trick.
+                ro.det_opts.det_config.chaos = false;
+
+                // Alternative:
+                // We use the empty preemption record to basically approximate a non-chaos run.
+                // let empty_pr = matching_pr.clone().strip_contents();
+                // let empty_path = self
+                //     .get_tmp()
+                //     .join("empty_preempts")
+                //     .with_extension(PREEMPTS_EXT);
+                // empty_pr.write_to_disk(&empty_path).unwrap();
+                // ro.det_opts.det_config.replay_preemptions_from = Some(empty_path.to_path_buf());
+            }
+
+            let (is_match, _) = self.launch_and_record_preempts(
+                runname,
+                format!(
+                    "Baseline run, WITHOUT criteria ({}):",
+                    self.display_criteria()
+                )
+                .as_str(),
+                ro,
+            )?;
+            eprintln!(
+                ":: Recorded schedule from {} as baseline run ({})",
+                from_where,
+                sched_path.display(),
+            );
+            if is_match {
+                bail!(
+                    "Expectations not met... baseline run matched target criteria when it should not."
+                )
+            } else {
+                eprintln!("Good: baseline run does not match criteria (e.g. pass not fail).");
+                Ok(sched_path)
+            }
         }
-        Ok((matching_pr, sched_path))
     }
 
     /// Perform the binary search through schedule-space, identifying critical events.
@@ -579,7 +609,6 @@ impl AnalyzeOpts {
         target: Vec<SchedEvent>,
         baseline: Vec<SchedEvent>,
     ) -> anyhow::Result<CriticalSchedule> {
-        let tmp_dir = self.tmp_dir.as_ref().context("tmp_dir set")?;
         let mut i = 0;
 
         let base_opts = self.get_base_runopts()?;
@@ -588,7 +617,7 @@ impl AnalyzeOpts {
             let runname = format!("bisect_round_{}", i);
 
             // Prepare the next synthetic schedule on disk:
-            let sched_path = tmp_dir.join(format!("{}.events", &runname));
+            let sched_path = self.get_tmp().unwrap().join(format!("{}.events", &runname));
             let next_sched = PreemptionRecord::from_sched_events(sched.to_owned());
             next_sched.write_to_disk(&sched_path).unwrap();
 
@@ -624,7 +653,7 @@ impl AnalyzeOpts {
 
     /// Record the schedules on disk as reproducers and report stack-traces of critical events.
     pub fn phase6_record_outputs(&mut self, crit: CriticalSchedule) -> Result<Report, Error> {
-        let tmp_dir = self.tmp_dir.as_ref().unwrap();
+        let tmp_dir = self.get_tmp()?;
         let CriticalSchedule {
             failing_schedule,
             passing_schedule,
@@ -742,13 +771,11 @@ impl AnalyzeOpts {
 
         // The other endpoint of the bisection search:
         // What we thought was the final_pr can change here:
-        let (final_pr, non_matching_sched_events_path) =
+        let baseline_sched_events_path =
             self.phase4_choose_baseline_sched_events(global, normalized_preempts)?;
 
-        self.save_final_baseline_sched_events(&final_pr, &target_sched_events_path, global)?;
-
         let target = read_trace(&target_sched_events_path);
-        let baseline = read_trace(&non_matching_sched_events_path);
+        let baseline = read_trace(&baseline_sched_events_path);
 
         let crit_sched = self.phase5_bisect_traces(target, baseline)?;
 
@@ -768,43 +795,6 @@ impl AnalyzeOpts {
             })
     }
 
-    fn save_final_baseline_sched_events(
-        &self,
-        final_preempts: &PreemptionRecord,
-        sched_events_path: &Path,
-        _global: &GlobalOpts,
-    ) -> anyhow::Result<()> {
-        let tmp_dir = self.tmp_dir.as_ref().unwrap();
-        let final_preempts_path = tmp_dir.join("final_pass.preempts");
-        final_preempts
-            .write_to_disk(&final_preempts_path)
-            .expect("write of preempts file to succeed");
-
-        // Verify that the new preemption record does in fact now cause a matching execution,
-        // and rerecord during this verification with full recording that include sched events
-        eprintln!(
-            ":: {}:",
-            "Verify baseline endpoint schedule causes criteria NOT to hold, and record sched events"
-                .yellow()
-                .bold()
-        );
-        let runname = "verify_baseline_endpoint";
-        let (is_match, ro) = self.launch_from_preempts_to_sched(
-            runname,
-            &final_preempts_path,
-            Some(sched_events_path),
-        )?;
-        let log_path = self.log_path(runname);
-        eprintln!(
-            "    {}",
-            self.runopts_to_repro(&ro, Some(log_path.to_str().unwrap()))
-        );
-        if !is_match {
-            eprintln!("Good: baseline run does not match criteria (e.g. pass not fail).");
-        }
-        Ok(())
-    }
-
     // This extra run, to record the schedule, thus converting Preemptions to a full Schedule
     // would be unnecessary if we recorded that each time as we minimize.
     fn save_final_target_sched_events(
@@ -815,11 +805,8 @@ impl AnalyzeOpts {
     ) -> anyhow::Result<()> {
         // Verify that the new preemption record does in fact now cause a matching execution,
         // and rerecord during this verification with full recording that include sched events
-        eprintln!(
-            ":: {}:",
-            "Verify target endpoint preemption record causes criteria to hold and record sched events"
-                .yellow()
-                .bold()
+        yellow_msg(
+            "Verify target endpoint preemption record causes criteria to hold and record sched events",
         );
         let runname = "verify_target_endpoint";
         let (is_match, ro) = self.launch_from_preempts_to_sched(
@@ -870,11 +857,8 @@ impl AnalyzeOpts {
 
         // Verify that the new preemption record does in fact now cause a non-matching execution,
         // and rerecord during this verification with full recording that include sched events
-        eprintln!(
-            ":: {}:",
-            "Verify preemption record *without* latest critical preempt causes criteria non-match. Also record sched events."
-                .yellow()
-                .bold()
+        yellow_msg(
+            "Verify preemption record *without* latest critical preempt causes criteria non-match. Also record sched events.",
         );
         let (is_match, ro) = self.launch_from_preempts_to_sched(
             runname,
@@ -906,12 +890,7 @@ impl AnalyzeOpts {
             let seed: u64 = rng0.gen();
             seed
         });
-        eprintln!(
-            ":: {}",
-            format!("Failure search using RNG seed {}", search_seed)
-                .yellow()
-                .bold()
-        );
+        yellow_msg(&format!("Failure search using RNG seed {}", search_seed));
         let mut rng = Pcg64Mcg::seed_from_u64(search_seed);
 
         let mut round = 0;
