@@ -1,10 +1,14 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
+// @lint-ignore LICENSELINT
+// This simple test program is from: https://pastebin.com/4e73CAkW
+//
+// As per the terms of service (https://pastebin.com/doc_terms_of_service),
+// other users of pastebin are entitled to a limited license to the content
+// which should cover this use.
+//
+// The code is also posted here, and is probably not sufficiently unique to be
+// copyrightable:
+//
+//   https://www.reddit.com/r/C_Programming/comments/se3kgi/hello_world_without_libc/
 
 #define STDOUT 1
 

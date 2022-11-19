@@ -1,5 +1,6 @@
 // @lint-ignore LICENSELINT
-// This simple test program is from: https://pastebin.com/4e73CAkW
+// This test program is based on a simple hello world from:
+// https://pastebin.com/4e73CAkW
 //
 // As per the terms of service (https://pastebin.com/doc_terms_of_service),
 // other users of pastebin are entitled to a limited license to the content
@@ -47,6 +48,15 @@ int write(int fd, const char* buf, int length) {
   return ret;
 }
 
+int fork() {
+  int ret;
+  asm("movl $57, %%eax\n\t" // Fork syscall number.
+      "syscall\n\t"
+      "mov %%eax, %0"
+      : "=r"(ret));
+  return ret;
+}
+
 int strlength(const char* str) {
   const char* i = str;
   for (; *i; i++)
@@ -55,8 +65,14 @@ int strlength(const char* str) {
 }
 
 int main(void) {
-  const char* msg = "Hello, World!\n";
+  char* msg;
+  if (fork()) {
+    msg = "foo";
+  } else {
+    msg = "bar";
+  }
   write(STDOUT, msg, strlength(msg));
+
   return 0;
 }
 
