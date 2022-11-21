@@ -166,6 +166,13 @@ pub struct AnalyzeOpts {
     #[clap(long, value_name = "INT32")]
     pub success_exit_code: Option<i32>,
 
+    /// Additional arguments to pass through unmodified to the hermit run subcommand.  While
+    /// arguments are passed through to hermit run even without this, this explicit flag is useful
+    /// for intermixing flags `hermit run` among the analyze args, in spite of them starting with
+    /// hyphens.
+    #[clap(long, short = 'a')]
+    pub run_arg: Vec<String>,
+
     /// A full set of CLI arguments for the original `hermit run` to analyze.
     #[clap(value_name = "ARGS")]
     pub run_args: Vec<String>,

@@ -253,6 +253,10 @@ impl AnalyzeOpts {
     fn get_base_runopts(&self) -> anyhow::Result<RunOpts> {
         // Bogus arg 0 for CLI argument parsing:
         let mut run_cmd: Vec<String> = vec!["hermit-run".to_string()];
+
+        for arg in &self.run_arg {
+            run_cmd.push(arg.to_string());
+        }
         for arg in &self.run_args {
             run_cmd.push(arg.to_string());
         }
