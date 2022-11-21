@@ -35,6 +35,7 @@ pub fn search_for_critical_schedule<F>(
     mut tester: F,
     initial_passing_schedule: Vec<SchedEvent>,
     initial_failing_schedule: Vec<SchedEvent>,
+    verbose: bool,
 ) -> CriticalSchedule
 where
     F: FnMut(&[SchedEvent]) -> (bool, Vec<SchedEvent>),
@@ -51,6 +52,7 @@ where
         &mut tester,
         initial_passing_schedule,
         initial_failing_schedule,
+        verbose,
     );
 
     // TODO: reenable subdividing blocks of event and searching down to unit granularity:
@@ -72,6 +74,12 @@ where
     }
 }
 
+// Return edit distance and swap distance.
+fn just_distance(sched1: &[SchedEvent], sched2: &[SchedEvent]) -> (usize, usize) {
+    let bubbles = iterable_bubble_sort(sched1, sched2);
+    (bubbles.swap_distance(), bubbles.edit_distance())
+}
+
 /// Perform a multi-level search of the schedule space to find the critical schedule
 /// between the two starting schedules by evaluating the given function at each step.
 /// The result will be a failing schedule and coordinates in that schedule for the
@@ -80,6 +88,7 @@ fn event_level_search<F>(
     tester: &mut F,
     mut passing_schedule: Vec<SchedEvent>,
     mut failing_schedule: Vec<SchedEvent>,
+    verbose: bool,
 ) -> EventLevelSearchResult
 where
     F: FnMut(&[SchedEvent]) -> (bool, Vec<SchedEvent>),
@@ -95,7 +104,7 @@ where
         };
 
         eprintln!(
-            "Event-Level Search Pass {} => EditDistance = {}, Swap Distance = {}",
+            ":: Event-Level Search Pass {} => EditDistance = {}, Swap Distance = {}",
             pass_number, edit_dist, swap_dist
         );
 
@@ -113,6 +122,15 @@ where
         }
 
         let (midpoint_passes, midpoint_actual_schedule) = tester(&requested_midpoint_schedule);
+
+        if verbose {
+            let (edit, swap) =
+                just_distance(&requested_midpoint_schedule, &midpoint_actual_schedule);
+            eprintln!(
+                ":: Jitter was {},{} edit/swap distance (requested synthetic schedule vs actual schedule)",
+                edit, swap
+            );
+        }
 
         if midpoint_passes {
             passing_schedule = midpoint_actual_schedule;
@@ -450,7 +468,7 @@ mod tests {
             failing_schedule: critical_failing_schedule,
             critical_event_index,
             ..
-        } = search_for_critical_schedule(mock_tester, passing_sched, failing_sched);
+        } = search_for_critical_schedule(mock_tester, passing_sched, failing_sched, true);
 
         assert_eq!(critical_event_index, 379);
 

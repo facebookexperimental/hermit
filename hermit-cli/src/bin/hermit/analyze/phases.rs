@@ -646,7 +646,7 @@ impl AnalyzeOpts {
             (!is_match, sched.to_owned())
         };
 
-        let crit = search_for_critical_schedule(test_fn, baseline, target);
+        let crit = search_for_critical_schedule(test_fn, baseline, target, self.verbose);
         eprintln!(
             "Critical event of final on-target schedule is {}",
             crit.critical_event_index
@@ -777,9 +777,13 @@ impl AnalyzeOpts {
         let baseline_sched_events_path =
             self.phase4_choose_baseline_sched_events(global, normalized_preempts)?;
 
+        eprintln!(
+            ":: Beginning bisection using endpoints: {} {}",
+            target_sched_events_path.display(),
+            baseline_sched_events_path.display(),
+        );
         let target = read_trace(&target_sched_events_path);
         let baseline = read_trace(&baseline_sched_events_path);
-
         let crit_sched = self.phase5_bisect_traces(target, baseline)?;
 
         let report = self.phase6_record_outputs(crit_sched)?;
