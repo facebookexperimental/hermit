@@ -293,11 +293,16 @@ impl FromStr for SeedFrom {
 /// Displays as a string which needs only to be prepended with "hermit " to be a runnable command.
 impl fmt::Display for RunOpts {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let dop = &self.det_opts.det_config;
+
         if self.no_sequentialize_threads {
             write!(f, " --no-sequentialize-threads")?;
         }
         if self.no_deterministic_io {
             write!(f, " --no-deterministic-io")?;
+            assert!(!dop.deterministic_io)
+        } else {
+            assert!(dop.deterministic_io)
         }
         if self.no_networking {
             write!(f, " --no-networking")?;
@@ -374,7 +379,6 @@ impl fmt::Display for RunOpts {
             }
         }
 
-        let dop = &self.det_opts.det_config;
         if !dop.virtualize_time {
             write!(f, " --no-virtualize-time")?;
         }
@@ -430,9 +434,6 @@ impl fmt::Display for RunOpts {
         }
         if dop.preemption_stacktrace {
             write!(f, " --preemption-stacktrace")?;
-        }
-        if dop.deterministic_io {
-            write!(f, " --deterministic-io")?;
         }
         if dop.panic_on_unsupported_syscalls {
             write!(f, " --panic-on-unsupported-syscalls")?;
@@ -536,7 +537,8 @@ impl fmt::Display for RunOpts {
 #[test]
 fn display_runopts1() {
     let vec: Vec<&str> = vec!["fakehermit", "fakeprog", "arg1", "arg2"];
-    let ro = RunOpts::from_iter(vec.iter());
+    let mut ro = RunOpts::from_iter(vec.iter());
+    ro.validate_args();
     assert_eq!(format!("{}", ro), " -- fakeprog arg1 arg2");
 }
 
@@ -549,7 +551,8 @@ fn display_runopts2() {
         "arg1",
         "arg2",
     ];
-    let ro = RunOpts::from_iter(vec.iter());
+    let mut ro = RunOpts::from_iter(vec.iter());
+    ro.validate_args();
     assert_eq!(format!("{}", ro), " -- fakeprog arg1 arg2");
 }
 
@@ -564,7 +567,8 @@ fn display_runopts3() {
         "arg1",
         "arg2",
     ];
-    let ro = RunOpts::from_iter(vec.iter());
+    let mut ro = RunOpts::from_iter(vec.iter());
+    ro.validate_args();
     assert_eq!(
         format!("{}", ro),
         " --no-sequentialize-threads --no-virtualize-metadata --epoch=2000-12-31T23:59:59+00:00 -- fakeprog arg1 arg2"
@@ -574,7 +578,8 @@ fn display_runopts3() {
 #[test]
 fn display_runopts4() {
     let vec: Vec<&str> = vec!["fakehermit", "--sequentialize-threads", "fakeprog", "arg1"];
-    let ro = RunOpts::from_iter(vec.iter());
+    let mut ro = RunOpts::from_iter(vec.iter());
+    ro.validate_args();
     assert_eq!(format!("{}", ro), " -- fakeprog arg1");
 }
 
