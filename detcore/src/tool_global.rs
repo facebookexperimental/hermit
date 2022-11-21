@@ -270,32 +270,29 @@ impl GlobalState {
             buf.clear();
         };
 
-        // Thread report:
-        let mut sched = self.sched.lock().unwrap();
-        buf.push_str(&sched.thread_tree.final_report());
-        flush(true, &mut buf);
+        {
+            let mut sched = self.sched.lock().unwrap();
+            let s = sched
+                .final_summary()
+                .unwrap_or_else(|e| format!("ERROR when printing final summary: {:?}", e));
+            buf.push_str(&s);
+            flush(true, &mut buf);
 
-        writeln!(
-            buf,
-            "Internally, the hermit scheduler ran {} turns, recorded {} events, replayed {} events.",
-            sched.turn, sched.recorded_event_count, sched.traced_event_count
-        )
-        .unwrap();
-
-        if let Some(pw) = sched.preemption_writer.take() {
-            writeln!(
-                buf,
-                "Record of {} preemption and reprioritization events:",
-                pw.len()
-            )
-            .unwrap();
-            if let Some(path) = &self.cfg.record_preemptions_to {
-                writeln!(buf, "  (Writing to file {:?})", path).unwrap();
-                if let Err(str) = pw.flush() {
-                    warn!("{}", str);
+            if let Some(pw) = sched.preemption_writer.take() {
+                writeln!(
+                    buf,
+                    "Record of {} preemption and reprioritization events:",
+                    pw.len()
+                )
+                .unwrap();
+                if let Some(path) = &self.cfg.record_preemptions_to {
+                    writeln!(buf, "  (Writing to file {:?})", path).unwrap();
+                    if let Err(str) = pw.flush() {
+                        tracing::warn!("{}", str);
+                    }
+                } else {
+                    writeln!(buf, "{}", truncated(200, pw.into_string())).unwrap();
                 }
-            } else {
-                writeln!(buf, "{}", truncated(200, pw.into_string())).unwrap();
             }
         }
 

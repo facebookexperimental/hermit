@@ -99,6 +99,12 @@ where
             pass_number, edit_dist, swap_dist
         );
 
+        if swap_dist == 0 {
+            panic!(
+                "Aborting search, if the swap distance is 0, that means we didn't find ANY matching events between schedules. This is a bad sign."
+            );
+        }
+
         if swap_dist == 1 {
             return EventLevelSearchResult {
                 passing_schedule,

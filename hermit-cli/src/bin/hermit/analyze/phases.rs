@@ -617,7 +617,7 @@ impl AnalyzeOpts {
         let base_opts = self.get_base_runopts()?;
         let test_fn = |sched: &[SchedEvent]| {
             i += 1;
-            let runname = format!("bisect_round_{}", i);
+            let runname = format!("bisect_round_{:0wide$}", i, wide = 3);
 
             // Prepare the next synthetic schedule on disk:
             let sched_path = self.get_tmp().unwrap().join(format!("{}.events", &runname));

@@ -53,6 +53,7 @@ HERMIT_ARGS+=" -- "
 # hermit run args:
 HERMIT_ARGS+="--base-env=minimal "
 HERMIT_ARGS+="--chaos "
+HERMIT_ARGS+="--summary "
 HERMIT_ARGS+="--preemption-timeout=400000 "
 
 TEMP=$(mktemp -d /tmp/analyze_test_XXXXX)

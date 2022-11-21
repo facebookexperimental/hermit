@@ -274,6 +274,9 @@ pub struct Scheduler {
     /// and recording at the same time.
     pub recorded_event_count: u64,
 
+    /// Desync events observed per thread.  Counts (soft,hard) desyncs.
+    pub desync_counts: BTreeMap<DetTid, (u64, u64)>,
+
     /// A copy of the `Config::stacktrace_event` vector.  This is MUTABLE,
     /// because we pop events off as we handle them.  The u64 is an index into
     /// the (original) replay_cursor trace.
@@ -721,6 +724,10 @@ fn is_hard_desync(observed: &SchedEvent, expected: &SchedEvent) -> bool {
     strip1 != strip2
 }
 
+fn is_desync(observed: &SchedEvent, expected: &SchedEvent) -> bool {
+    *observed != *expected
+}
+
 fn compare_desync(observed: &SchedEvent, expected: &SchedEvent) -> String {
     if *observed == *expected {
         "MATCHED".to_string()
@@ -797,6 +804,7 @@ impl Scheduler {
             },
             traced_event_count: 0,
             recorded_event_count: 0,
+            desync_counts: BTreeMap::new(),
             stacktrace_events: if cfg.stacktrace_event.is_empty() {
                 None
             } else {
@@ -910,9 +918,17 @@ impl Scheduler {
                 self.replay_cursor.as_mut().unwrap().peek()
             );
 
-            if is_hard_desync(observed, &expected) && self.die_on_desync {
-                eprintln!("Replay mode desynchronized from trace, bailing out.");
-                immediate_fatal_exit();
+            if is_desync(observed, &expected) {
+                let counts = self.desync_counts.entry(mytid).or_insert((0, 0));
+                if is_hard_desync(observed, &expected) {
+                    if self.die_on_desync {
+                        eprintln!("Replay mode desynchronized from trace, bailing out.");
+                        immediate_fatal_exit();
+                    }
+                    counts.1 += 1;
+                } else {
+                    counts.0 += 1;
+                }
             }
 
             let keep_running = if let Some(next_ev) = self.replay_cursor.as_mut().unwrap().peek() {
@@ -2033,7 +2049,41 @@ impl Scheduler {
         }
     }
 
-    /// Summarize the state of the scheduler (verbose).
+    /// Summarize the run after completion.
+    pub fn final_summary(&self) -> anyhow::Result<String> {
+        let mut buf = String::new();
+        // Thread report:
+        buf.push_str(&self.thread_tree.final_report());
+
+        let (total_soft, total_hard) = &self
+            .desync_counts
+            .values()
+            .fold((0, 0), |(x, y), (a, b)| (x + a, y + b));
+        writeln!(
+            buf,
+            "Internally, the hermit scheduler ran {} turns, recorded {} events, replayed {} events ({} desynced)",
+            self.turn,
+            self.recorded_event_count,
+            self.traced_event_count,
+            total_soft + total_hard
+        )?;
+
+        if total_soft + total_hard > 0 {
+            write!(
+                buf,
+                "Encountered {} soft desyncs, {} hard.  Per thread: ",
+                total_soft, total_hard
+            )?;
+            for (tid, (soft, hard)) in self.desync_counts.iter() {
+                write!(buf, "{}=>({},{}) ", tid, soft, hard)?;
+            }
+            writeln!(buf)?;
+        }
+
+        Ok(buf)
+    }
+
+    /// Summarize the state of the scheduler while executing (verbose).
     pub fn full_summary(&self) -> String {
         let mut buf = String::new();
         write!(&mut buf, "  {}", &self.run_queue).unwrap();
