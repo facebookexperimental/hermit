@@ -38,9 +38,9 @@ pub struct RunOpts {
     #[clap(long, default_value = "2")]
     run_count: i32,
 
-    /// Additional arguments for hermit run subcommand
-    #[clap(long)]
-    hermit_args: Vec<String>,
+    /// Additional argument for hermit run subcommand
+    #[clap(long, short = 'a')]
+    hermit_arg: Vec<String>,
 
     /// Path to a guest program
     #[clap(value_name = "PROGRAM")]
@@ -69,7 +69,7 @@ impl UseCase for RunOpts {
             .log_level(tracing::Level::DEBUG)
             .log_file(current_run.log_file_path.clone())
             .run(self.guest_program.clone(), self.args.clone())
-            .hermit_args(self.hermit_args.clone())
+            .hermit_args(self.hermit_arg.clone())
             .workdir_isolate(current_run.workdir.clone(), self.isolate_workdir)
             .bind(temp_env.path().to_owned())
             .into_args()
