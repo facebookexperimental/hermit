@@ -88,12 +88,14 @@ mod tests {
     // TODO: Find out if both schedules are permutations of each other (after
     // slicing off the end of the longer schedule).
 
+    #[allow(dead_code)]
     static PASS: &str = include_str!("testdata/pass.json");
+    #[allow(dead_code)]
     static FAIL: &str = include_str!("testdata/fail.json");
 
-    #[test]
-    #[ignore]
-    fn smoke() {
+    // #[test]
+    // TODO, unfinished:
+    fn _smoke() {
         let passing_schedule: Schedule = serde_json::from_str(PASS).unwrap();
         assert_eq!(passing_schedule.len(), 239);
         let failing_schedule: Schedule = serde_json::from_str(FAIL).unwrap();
@@ -117,9 +119,9 @@ mod tests {
         );
     }
 
-    #[test]
-    #[ignore]
-    fn pruning() {
+    // #[test]
+    // TODO, unfinished:
+    fn _pruning() {
         let passing: Schedule = serde_json::from_str(PASS).unwrap();
         let failing: Schedule = serde_json::from_str(FAIL).unwrap();
 

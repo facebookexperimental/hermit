@@ -272,6 +272,10 @@ fn bubble_sort_history<T>(perm: &mut [usize], source: &[T]) -> Vec<(usize, usize
     let sortable_slice = &mut perm[sortable_range];
     let size = sortable_slice.len();
 
+    if size == 0 {
+        return history;
+    }
+
     for i in 0..(size - 1) {
         let mut swapped = false;
         for j in 0..(size - i - 1) {
