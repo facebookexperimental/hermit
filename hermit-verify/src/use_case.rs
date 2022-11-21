@@ -100,29 +100,25 @@ fn compare_results<T: UseCase>(
     Ok(result)
 }
 
-fn output_stdout(run: &RunEnvironment, options: &UseCaseOptions) -> anyhow::Result<()> {
-    if options.output_stdout {
-        println!(":: ------------------Stdout----------------------");
-        println!(
-            "{}",
-            std::fs::read_to_string(run.std_out_file_path.as_path())?
-        );
-        println!(":: ----------------End Stdout--------------------");
-        println!();
-    }
+fn output_stdout(run: &RunEnvironment) -> anyhow::Result<()> {
+    println!(":: ------------------Stdout----------------------");
+    println!(
+        "{}",
+        std::fs::read_to_string(run.std_out_file_path.as_path())?
+    );
+    println!(":: ----------------End Stdout--------------------");
+    println!();
     Ok(())
 }
 
-fn output_stderr(run: &RunEnvironment, options: &UseCaseOptions) -> anyhow::Result<()> {
-    if options.output_stderr {
-        println!(":: ------------------Stderr----------------------");
-        println!(
-            "{}",
-            std::fs::read_to_string(run.std_err_file_path.as_path())?
-        );
-        println!(":: ----------------End Stderr--------------------");
-        println!();
-    }
+fn output_stderr(run: &RunEnvironment) -> anyhow::Result<()> {
+    println!(":: ------------------Stderr----------------------");
+    println!(
+        "{}",
+        std::fs::read_to_string(run.std_err_file_path.as_path())?
+    );
+    println!(":: ----------------End Stderr--------------------");
+    println!();
     Ok(())
 }
 
@@ -154,6 +150,8 @@ fn run_hermit(
                 .yellow()
                 .bold()
         );
+        let _ = output_stdout(run);
+        let _ = output_stderr(run);
         anyhow::bail!("Nonzero exit not allowed.")
     }
 }
@@ -191,8 +189,12 @@ pub fn run_use_case<T: UseCase>(use_case: T, common_args: &CommonOpts) -> anyhow
                 // during verification we'll get a diff view so we're skipping printing here
                 // it only makes sense to output the stdout/stderr for the first run (if any)
                 if counter == 1 {
-                    output_stdout(current, &options)?;
-                    output_stderr(current, &options)?;
+                    if options.output_stdout {
+                        output_stdout(current)?;
+                    }
+                    if options.output_stderr {
+                        output_stderr(current)?;
+                    }
                 }
             }
             current = next;

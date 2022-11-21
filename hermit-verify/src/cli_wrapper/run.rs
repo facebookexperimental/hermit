@@ -162,6 +162,8 @@ impl HermitRunBuilder {
 
         Self::setup_workdir(&mut command_args, workdir, workdir_destination);
 
+        command_args.push(String::from("--"));
+
         command_args.push(guest_program.display().to_string());
 
         for guest_arg in guest_args.into_iter() {
@@ -194,14 +196,20 @@ mod test {
     #[test]
     fn test_default_args() {
         let hermit = HermitRunBuilder::new(PathBuf::from("cat"), vec!["/proc/meminfo".to_owned()]);
-        assert_args(hermit, vec!["--log=info", "run", "cat", "/proc/meminfo"]);
+        assert_args(
+            hermit,
+            vec!["--log=info", "run", "--", "cat", "/proc/meminfo"],
+        );
     }
 
     #[test]
     fn test_with_hermit_args() {
         let hermit = HermitRunBuilder::new(PathBuf::from("ls"), vec![])
             .hermit_args(vec!["run".to_owned(), "--detlog-stack".to_owned()]);
-        assert_args(hermit, vec!["--log=info", "run", "--detlog-stack", "ls"]);
+        assert_args(
+            hermit,
+            vec!["--log=info", "run", "--detlog-stack", "--", "ls"],
+        );
     }
 
     #[test]
@@ -216,6 +224,7 @@ mod test {
                 "run",
                 "--record-preemptions-to=/temp/record",
                 "--replay-schedule-from=/temp/replay",
+                "--",
                 "ls",
             ],
         );
@@ -234,6 +243,7 @@ mod test {
                 "run",
                 r#"--mount=type=bind,source=/tmp/runs/1/out,target=/tmp/out"#,
                 "--workdir=/tmp/out",
+                "--",
                 "ls",
             ],
         )
