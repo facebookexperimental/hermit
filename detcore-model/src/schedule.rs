@@ -36,64 +36,6 @@ pub struct SchedEvent {
     pub end_time: Option<LogicalTime>,
 }
 
-/// A smaller version of `SchedEvent` that we can use to do comparisons on the
-/// sched event.
-#[derive(Copy, Clone, PartialEq, Debug, Eq, Hash, Serialize, Deserialize)]
-pub struct MiniSchedEvent {
-    /// The thread that originated the event.
-    pub dettid: DetTid,
-    /// The operation performed by the thread.
-    pub op: Op,
-    /// The consecutive count of that same operation (run length encoding).
-    pub count: u32,
-}
-
-impl From<&SchedEvent> for MiniSchedEvent {
-    fn from(event: &SchedEvent) -> Self {
-        Self {
-            dettid: event.dettid,
-            op: event.op,
-            count: event.count,
-        }
-    }
-}
-
-impl From<&MiniSchedEvent> for SchedEvent {
-    fn from(event: &MiniSchedEvent) -> Self {
-        Self {
-            dettid: event.dettid,
-            op: event.op,
-            count: event.count,
-            start_rip: None,
-            end_rip: None,
-            end_time: None,
-        }
-    }
-}
-
-impl From<SchedEvent> for MiniSchedEvent {
-    fn from(event: SchedEvent) -> Self {
-        Self {
-            dettid: event.dettid,
-            op: event.op,
-            count: event.count,
-        }
-    }
-}
-
-impl From<MiniSchedEvent> for SchedEvent {
-    fn from(event: MiniSchedEvent) -> Self {
-        Self {
-            dettid: event.dettid,
-            op: event.op,
-            count: event.count,
-            start_rip: None,
-            end_rip: None,
-            end_time: None,
-        }
-    }
-}
-
 impl SchedEvent {
     /// Add a syscall to the global scheduling history.  This takes the instruction pointer of the
     /// syscall itself.
