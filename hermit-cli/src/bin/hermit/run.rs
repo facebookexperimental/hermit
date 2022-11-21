@@ -611,9 +611,13 @@ impl RunOpts {
 
         config.sequentialize_threads = !self.no_sequentialize_threads;
         config.deterministic_io = !self.no_deterministic_io;
-        config.virtualize_time = true;
-        config.virtualize_metadata = true;
-        config.virtualize_cpuid = true;
+
+        // virtualize_metadata implies virtualize_time
+        if config.virtualize_metadata && !config.virtualize_time {
+            panic!(
+                "virtualize-metadata can only be activated if virtualize-time is as well.  Conversely, --no-virtualize-time requires --no-virtualize-metadata."
+            );
+        }
 
         // Perform internal validation on the Config args, before taking into account the
         // hermit run args:

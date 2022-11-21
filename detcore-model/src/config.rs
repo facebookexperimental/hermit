@@ -30,7 +30,7 @@ use crate::pid::DetTid;
 /// Configuration options for detcore.
 #[derive(Debug, Serialize, Deserialize, Clone, Parser)]
 pub struct Config {
-    /// Disable virtual/logical time
+    /// Disable virtual/logical time. Note that virtual time is required for virtual metadata.
     #[clap(long = "no-virtualize-time", parse(from_flag = std::ops::Not::not))]
     pub virtualize_time: bool,
 
@@ -549,12 +549,7 @@ impl Config {
             OsString::from("CMD"), // Silly/unused.
             OsString::from(format!("--epoch={}", DEFAULT_EPOCH_STR)),
         ];
-        let mut config = Config::from_iter(args.iter());
-        // virtualize_metadata implies virtualize_time
-        if config.virtualize_metadata {
-            config.virtualize_time = true;
-        }
-        config
+        Config::from_iter(args.iter())
     }
 }
 
