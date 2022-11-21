@@ -23,7 +23,7 @@ use crate::CommonOpts;
 pub struct TraceReplayOpts {
     /// Whether to keep temp directory created for each container run. This directory contains (stdout, stderr, log file, etc) of the container process
     /// This allows manual inspection of container outputs in cases when a cause of failure is unclear
-    #[clap(long)]
+    #[clap(long, env = "KEEP_TEMP_DIR")]
     keep_temp_dir: bool,
 
     /// Underlying hermit container will receive "isolated" workdir
