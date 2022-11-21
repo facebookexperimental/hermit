@@ -75,11 +75,11 @@ pub struct Config {
     #[clap(long)]
     pub imprecise_timers: bool,
 
-    /// Schedule threads chaotically.  Implies `--strict`.
+    /// Schedule threads chaotically.
     ///
-    /// The Behavior of this flag is subject to change. Current behavior is to
-    /// randomize thread priorities at every timeout caused by the
-    /// `--preemption-timeout`.
+    /// The behavior of this flag is subject to change. Current behavior is to randomize thread
+    /// priorities at every timeout caused by the `--preemption-timeout`.  Other randomization
+    /// strategies are possible with `--sched-heuristic`.
     ///
     /// Thread scheduling remains deterministic, determined by the random seed.
     #[clap(long)]
@@ -339,20 +339,20 @@ impl Config {
 
         if self.stop_after_turn.is_some() && !self.sequentialize_threads {
             tracing::warn!(
-                "--stop-after-turn will have no effect if --sequentialize-threads is enabled (e.g. via --strict)"
+                "--stop-after-turn will have no effect if --no-sequentialize-threads is enabled"
             );
             self.stop_after_turn = None;
         }
         if self.stop_after_iter.is_some() && !self.sequentialize_threads {
             tracing::warn!(
-                "--stop-after--iter will have no effect if --sequentialize-threads is enabled (e.g. via --strict)"
+                "--stop-after-iter will have no effect if --no-sequentialize-threads is enabled"
             );
             self.stop_after_iter = None;
         }
 
         if self.debug_externalize_sockets && !self.sequentialize_threads {
             tracing::warn!(
-                "--debug-externalize-sockets will have no effect unless --sequentialize-threads is enabled (e.g. via --strict)"
+                "--debug-externalize-sockets will have no effect if --no-sequentialize-threads is enabled"
             );
             self.debug_externalize_sockets = false;
         }
