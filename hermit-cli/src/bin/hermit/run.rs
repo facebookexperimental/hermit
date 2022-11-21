@@ -163,7 +163,7 @@ pub struct RunOpts {
     /// Additionally append one or more environment variables to the container environment. If a
     /// name is provided without a value, pass that variable through from the host.
     #[clap(short = 'e', long, parse(try_from_str = parse_assignment), value_name="name[=val]")]
-    env: Vec<(String, String)>,
+    env: Vec<(String, Option<String>)>,
 
     /// An option to set current directory for the guest process.
     /// Note that the directory is relative to the guest. i.e. all mounted directories will be respected (e.g /tmp)
@@ -176,7 +176,7 @@ pub struct RunOpts {
     pub save_config: Option<PathBuf>,
 }
 
-fn parse_assignment(src: &str) -> Result<(String, String), Error> {
+fn parse_assignment(src: &str) -> Result<(String, Option<String>), Error> {
     lazy_static! {
         static ref ENV_RE: regex::Regex =
            // Here we are extremely permissive, allowing all charecters in the "Portable Character
@@ -187,20 +187,13 @@ fn parse_assignment(src: &str) -> Result<(String, String), Error> {
     }
     if let Some(capture) = ENV_RE.captures(src) {
         if let (Some(name), Some(value)) = (capture.get(1), capture.get(2)) {
-            Ok((name.as_str().to_owned(), value.as_str().to_owned()))
+            Ok((name.as_str().to_owned(), Some(value.as_str().to_owned())))
         } else {
             anyhow::bail!("unable to parse name=value from '{}'", src)
         }
     } else if VAR_RE.is_match(src) {
         let var: String = src.to_owned();
-        if let Ok(value) = std::env::var(&var) {
-            Ok((var, value))
-        } else {
-            anyhow::bail!(
-                "Attempt to pass through env var {}, but it is not set in the host environment",
-                var
-            )
-        }
+        Ok((var, None))
     } else {
         anyhow::bail!("unable to parse env var name or name=value from '{}'", src)
     }
@@ -343,8 +336,12 @@ impl fmt::Display for RunOpts {
             }
             BaseEnv::Host => {} // default
         }
-        for (key, val) in &self.env {
-            write!(f, " --env={}={}", key, val)?;
+        for (key, m_val) in &self.env {
+            if let Some(val) = m_val {
+                write!(f, " --env={}={}", key, shell_words::quote(val))?;
+            } else {
+                write!(f, " --env={}", key)?;
+            }
         }
         if let Some(p) = &self.workdir {
             write!(f, " --workdir={}", shell_words::quote(p))?;
@@ -808,10 +805,20 @@ impl RunOpts {
         })
     }
 
-    fn merge_from_env_settings(&self, command: &mut Command) {
-        for assignment in &self.env {
-            command.env(&assignment.0, &assignment.1);
+    fn merge_from_env_settings(&self, command: &mut Command) -> anyhow::Result<()> {
+        for (var, m_val) in &self.env {
+            if let Some(val) = m_val {
+                command.env(var, val);
+            } else if let Ok(value) = std::env::var(var) {
+                command.env(var, &value);
+            } else {
+                anyhow::bail!(
+                    "Attempt to pass through env var {}, but it is not set in the host environment",
+                    var
+                )
+            }
         }
+        Ok(())
     }
 
     fn save_config_to_disk(&self) -> Result<(), Error> {
@@ -833,7 +840,7 @@ impl RunOpts {
         match self.base_env {
             BaseEnv::Empty => {
                 command.env_clear();
-                self.merge_from_env_settings(&mut command)
+                self.merge_from_env_settings(&mut command)?
             }
             BaseEnv::Minimal => {
                 command.env_clear();
@@ -843,11 +850,11 @@ impl RunOpts {
                     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                 );
                 command.env("HOME", "/root");
-                self.merge_from_env_settings(&mut command)
+                self.merge_from_env_settings(&mut command)?
             }
             BaseEnv::Host => {
                 // Let it all through.
-                self.merge_from_env_settings(&mut command)
+                self.merge_from_env_settings(&mut command)?
             }
         }
 
