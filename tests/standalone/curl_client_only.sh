@@ -27,7 +27,7 @@ echo "Server address: $address"
 
 echo "Running curl with hermit command: $hermit"
 echo "Now run curl from $(command -v curl)..."
-"$hermit" --log=info run --base-env=minimal curl "$address"
+"$hermit" --log=info run --network=host --base-env=minimal curl "$address"
 
 echo "Waiting for server shutdown"
 wait

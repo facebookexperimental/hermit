@@ -11,4 +11,4 @@ hermit="$1"
 
 input_program="$2"
 
-"$hermit" --log=error run --no-networking "$input_program"
+"$hermit" --log=error run "$input_program"

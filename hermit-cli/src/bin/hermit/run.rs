@@ -100,14 +100,19 @@ pub struct RunOpts {
     #[clap(long, value_name = "path")]
     pub(crate) bind: Vec<Bind>,
 
-    /// Disables external networking using a network namespace.
-    #[clap(long, alias = "no-net", alias = "disable-networking")]
-    no_networking: bool,
+    /// Whether to allow expose a network device to the guest, which of course compromises isolation
+    /// and deterministic reproducibility.
+    #[clap(
+        long,
+        alias = "net",
+        value_name = "local|host",
+        default_value = "local"
+    )]
+    network: NetworkingMode,
 
-    /// Runs the given program in "lite" mode. In this mode, a PID namespace is
-    /// created and `/tmp` is isolated. It is still possible to introduce
-    /// non-determinism through time and thread scheduling. Can be combined with
-    /// `--no-networking` to also disable networking.
+    /// Runs the given program in "lite" mode. In this mode, a PID namespace is created and `/tmp`
+    /// is isolated. It is still possible to introduce non-determinism through time and thread
+    /// scheduling. Still isolates network by default but can be combined with `--net=host`.
     #[clap(long, conflicts_with = "chaos", conflicts_with = "verify")]
     lite: bool,
 
@@ -150,7 +155,7 @@ pub struct RunOpts {
     pub(crate) summary: bool,
 
     /// Containarize networking and warn for non-zero bindings. Implies
-    /// `--no-networking`.
+    /// an isolated network nampespace and thus conflicts with `--net=host`.
     #[clap(long)]
     analyze_networking: bool,
 
@@ -196,6 +201,45 @@ fn parse_assignment(src: &str) -> Result<(String, Option<String>), Error> {
         Ok((var, None))
     } else {
         anyhow::bail!("unable to parse env var name or name=value from '{}'", src)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Parser, Eq, PartialEq)]
+pub enum NetworkingMode {
+    /// Create a local loopback device and allow local, intra-container network communication only.
+    Local,
+    /// Allow through all network access via the host's network interface.
+    Host,
+    // None, // TODO: no network interface at all
+    // Record, // TODO: record network traffic only, not other syscalls.
+}
+
+impl Default for NetworkingMode {
+    fn default() -> Self {
+        // WARNING: written in two places, here and in the #[clap(default_value)] above.
+        NetworkingMode::Local
+    }
+}
+
+// Upper case will work, but prefer lower case.
+impl fmt::Display for NetworkingMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match &self {
+            NetworkingMode::Local => "local",
+            NetworkingMode::Host => "host",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+impl FromStr for NetworkingMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "local" => Ok(NetworkingMode::Local),
+            "host" => Ok(NetworkingMode::Host),
+            _ => Err(format!("Could not parse: {:?}", s)),
+        }
     }
 }
 
@@ -304,8 +348,8 @@ impl fmt::Display for RunOpts {
         } else {
             assert!(dop.deterministic_io)
         }
-        if self.no_networking {
-            write!(f, " --no-networking")?;
+        if self.network != Default::default() {
+            write!(f, " --network={}", self.network)?;
         }
         if self.lite {
             write!(f, " --lite")?;
@@ -705,8 +749,11 @@ impl RunOpts {
             .mount(Mount::proc())
             .mounts(self.mounts(tmpfs.path())?);
 
-        if self.no_networking {
-            command.local_networking_only();
+        match &self.network {
+            NetworkingMode::Local => {
+                command.local_networking_only();
+            }
+            NetworkingMode::Host => {}
         }
 
         let mut child = command.spawn()?;
@@ -792,8 +839,16 @@ impl RunOpts {
     fn container(&self, tmpfs: &Path) -> Result<Container, Error> {
         let mut container = default_container(self.pin_threads);
 
-        if self.no_networking || self.analyze_networking {
-            container.local_networking_only();
+        match &self.network {
+            NetworkingMode::Local => {
+                container.local_networking_only();
+            }
+            NetworkingMode::Host => {
+                // This conflict/invariant should could be resolved upstream:
+                if self.analyze_networking {
+                    container.local_networking_only();
+                }
+            }
         }
 
         container.mounts(self.mounts(tmpfs)?);
