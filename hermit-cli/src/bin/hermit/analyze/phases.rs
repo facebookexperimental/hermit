@@ -250,7 +250,8 @@ impl AnalyzeOpts {
             || self.target_exit_code != ExitStatusConstraint::Any
     }
 
-    fn get_base_runopts(&self) -> anyhow::Result<RunOpts> {
+    /// The raw, unvarnished, RunOpts.
+    fn get_raw_runopts(&self) -> RunOpts {
         // Bogus arg 0 for CLI argument parsing:
         let mut run_cmd: Vec<String> = vec!["hermit-run".to_string()];
 
@@ -260,12 +261,23 @@ impl AnalyzeOpts {
         for arg in &self.run_args {
             run_cmd.push(arg.to_string());
         }
-        let mut ro = RunOpts::from_iter(run_cmd.iter());
+        RunOpts::from_iter(run_cmd.iter())
+    }
+
+    /// The baseline RunOpts based on user flags plus some sanitation/validation.
+    fn get_base_runopts(&self) -> anyhow::Result<RunOpts> {
+        let mut ro = self.get_raw_runopts();
         if ro.no_sequentialize_threads {
             bail!(
                 "Error, cannot search through executions with --no-sequentialize-threads.  Determinism required.",
             )
         }
+
+        // We could add a flag for analyze-without chaos, but it's a rare use case that isn't
+        // usefully supported now anyway.  Exploring with RNG alone doesn't make sense, but we may
+        // want to make it possible to do analyze with the stick random scheduler instead of the
+        // one.
+        ro.det_opts.det_config.chaos = true;
 
         ro.validate_args();
         assert!(ro.det_opts.det_config.sequentialize_threads);
@@ -743,6 +755,13 @@ impl AnalyzeOpts {
         }
         if self.run2_schedule.is_some() {
             todo!()
+        }
+
+        if !self.get_raw_runopts().det_opts.det_config.chaos {
+            eprintln!(
+                ":: {} You may want to turn it on explicitly, along with a --preemption-timeout that works well for this program.",
+                "WARNING: implicitly activating --chaos.".yellow().bold()
+            );
         }
 
         let (run1_log_path, preempts_path) = self.phase1_establish_target_run()?;
