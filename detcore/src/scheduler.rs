@@ -1719,14 +1719,17 @@ impl Scheduler {
         // Alter the threads priority and requeue.
         let old_priority = self.priorities.insert(dettid, new_priority);
 
-        if let Some(pw) = &mut self.preemption_writer {
-            let old_prio = old_priority.unwrap();
-            debug!(
-                "[dtid {}] Recording preemption point, current time {} prior priority {} (next priority {})",
-                dettid, guest_time, old_prio, new_priority
-            );
-            pw.insert_reprioritization(dettid, guest_time, old_prio, new_priority);
-            pw.set_current(dettid, new_priority);
+        // Do not attempt to record preemptions/priorities when we're dictated by a raw schedule replay.
+        if self.replay_cursor.is_none() {
+            if let Some(pw) = &mut self.preemption_writer {
+                let old_prio = old_priority.unwrap();
+                debug!(
+                    "[dtid {}] Recording preemption point, current time {} prior priority {} (next priority {})",
+                    dettid, guest_time, old_prio, new_priority
+                );
+                pw.insert_reprioritization(dettid, guest_time, old_prio, new_priority);
+                pw.set_current(dettid, new_priority);
+            }
         }
 
         let popped = self.run_queue.commit_tentative_pop(); // Begun in step3.
@@ -2071,7 +2074,7 @@ impl Scheduler {
         if total_soft + total_hard > 0 {
             write!(
                 buf,
-                "Encountered {} soft desyncs, {} hard.  Per thread: ",
+                "  Encountered {} soft desyncs, {} hard.  Per thread: ",
                 total_soft, total_hard
             )?;
             for (tid, (soft, hard)) in self.desync_counts.iter() {
