@@ -17,8 +17,4 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - name: Build
-      working-directory: detcore-model
-      run: echo cargo build --verbose
-    - name: Run tests
-      working-directory: detcore-model
-      run: echo cargo test --verbose
+      run: cargo build --verbose
