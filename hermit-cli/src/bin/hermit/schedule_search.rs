@@ -77,7 +77,7 @@ where
 // Return edit distance and swap distance.
 fn just_distance(sched1: &[SchedEvent], sched2: &[SchedEvent]) -> (usize, usize) {
     let bubbles = iterable_bubble_sort(sched1, sched2);
-    (bubbles.swap_distance(), bubbles.edit_distance())
+    (bubbles.edit_distance(), bubbles.swap_distance())
 }
 
 /// Perform a multi-level search of the schedule space to find the critical schedule
@@ -127,7 +127,7 @@ where
             let (edit, swap) =
                 just_distance(&requested_midpoint_schedule, &midpoint_actual_schedule);
             eprintln!(
-                ":: Jitter was {},{} edit/swap distance (requested synthetic schedule vs actual schedule)",
+                ":: Jitter was {}, {} edit/swap distance (requested synthetic schedule vs actual schedule)",
                 edit, swap
             );
         }
