@@ -95,17 +95,12 @@ impl AnalyzeOpts {
         }
     }
 
-    fn print_and_validate_runopts(&self, ro: &mut RunOpts, log_path: &Path) {
+    fn print_and_validate_runopts(&self, ro: &mut RunOpts, runname: &str) {
         if self.verbose {
             ro.summary = true;
             eprintln!(
-                ":: [verbose] Run configuration (logging to {}):\n{:#?}",
-                log_path.display(),
-                &ro
-            );
-            eprintln!(
                 ":: [verbose] Repro command:\n{}",
-                self.runopts_to_repro(ro, None)
+                self.runopts_to_repro(ro, Some(runname))
             );
         }
         ro.validate_args();
@@ -116,7 +111,7 @@ impl AnalyzeOpts {
     fn launch_config(&self, runname: &str, runopts: &mut RunOpts) -> LaunchResult {
         let root = self.get_tmp()?.join(runname);
         let log_path = self.log_path(runname);
-        self.print_and_validate_runopts(runopts, &log_path);
+        self.print_and_validate_runopts(runopts, runname);
 
         let conf_file = root.with_extension("config");
         runopts.save_config = Some(conf_file);
