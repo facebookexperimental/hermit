@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![allow(dead_code)]
+#![allow(unused_variables)]
+
 use std::io::Write;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;

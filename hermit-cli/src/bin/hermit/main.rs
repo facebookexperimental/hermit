@@ -32,7 +32,6 @@ use hermit::Error;
 use hermit::ExitStatus;
 
 use self::analyze::AnalyzeOpts;
-use self::bnz::BnzOpts;
 use self::clean::CleanOpts;
 use self::global_opts::GlobalOpts;
 use self::list::ListOpts;
@@ -86,9 +85,6 @@ enum Subcommand {
     /// Take the difference of two (run/record) logs written to files.
     LogDiff(LogDiffCLIOpts),
 
-    /// Check bind syscall when port number is non-zero.
-    Bnz(BnzOpts),
-
     Analyze(AnalyzeOpts),
 }
 
@@ -102,7 +98,6 @@ impl Subcommand {
             Subcommand::Remove(x) => x.main(global),
             Subcommand::Clean(x) => x.main(global),
             Subcommand::LogDiff(x) => Ok(x.main(global)),
-            Subcommand::Bnz(x) => x.main(global),
             Subcommand::Analyze(x) => x.main(global),
         }
     }
