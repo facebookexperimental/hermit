@@ -50,12 +50,23 @@ pub struct Config {
     )]
     pub epoch: DateTime<Utc>,
 
+    /// Use this number to seed the PRNG randomness for both RNG and scheduler.
+    /// This acts as a global fallback in case either `sched_seed` or `rng-seed`
+    /// are not explicitly specified
+    #[clap(
+        long = "seed",
+        env = "HERMIT_PRNG",
+        default_value = "0",
+        value_name = "uint64"
+    )]
+    pub seed: u64,
+
     /// Use this number to seed the PRNG that supplies randomness to the guest.
     /// This supplies guest system calls that expose randomness, as well as
     /// the `/dev/[u]random` files. It does not affect the `rdrand` instruction,
     /// which is disabled in the guest.
-    #[clap(long, env = "HERMIT_PRNG", default_value = "0", value_name = "uint64")]
-    pub seed: u64,
+    #[clap(long, value_name = "uint64")]
+    pub rng_seed: Option<u64>,
 
     /// Logical clock multiplier. Values above one make time appear to go faster within the sandbox.
     #[clap(long, value_name = "float")]
@@ -359,6 +370,11 @@ impl Config {
 
         if self.preemption_stacktrace_log_file.is_some() {
             self.preemption_stacktrace = true;
+        }
+
+        //FIXME: Remove when fully implement T138408647
+        if self.rng_seed.is_some() {
+            self.seed = self.rng_seed.unwrap();
         }
     }
 

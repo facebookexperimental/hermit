@@ -67,7 +67,7 @@ or varying other parameters of the configuration such as the speed at which
 virtual time passes inside the container, or the random number generation seed:
 
 ```bash
-hermit run --chaos --seed=3 <prog>
+hermit run --chaos --sched-seed=3 <prog>
 ```
 
 You can use hermit as a replay-debugger as well, either recording a

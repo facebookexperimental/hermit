@@ -164,6 +164,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         kill_daemons: default_config.kill_daemons,
         preemption_timeout: default_config.preemption_timeout,
         seed: default_config.seed,
+        rng_seed: None,
         imprecise_timers: false,
         chaos: false,
         sigint_instakill: false,
