@@ -1,5 +1,5 @@
 name: Rust
-0;95;0c
+
 on:
   push:
     branches: [ "main" ]
