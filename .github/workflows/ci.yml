@@ -1,5 +1,5 @@
 name: Rust
-
+0;95;0c
 on:
   push:
     branches: [ "main" ]
@@ -16,5 +16,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+    - name: Dependencies
+      run: sudo apt-get install -y libunwind-dev
     - name: Build
       run: cargo build --verbose
