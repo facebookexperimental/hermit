@@ -568,6 +568,12 @@ impl Config {
     pub fn rng_seed(&self) -> u64 {
         self.rng_seed.unwrap_or(self.seed)
     }
+
+    /// Returns effective "sched-seed" parameter taking in account "seed"
+    /// parameter if former isn't specified
+    pub fn sched_seed(&self) -> u64 {
+        self.sched_seed.unwrap_or(self.seed)
+    }
 }
 
 /// N.B. we don't want to specify two different notions of "default", so we use the

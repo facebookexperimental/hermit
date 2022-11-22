@@ -394,11 +394,9 @@ impl<T> ThreadState<T> {
             "USER RAND: seeding PRNG for root thread with seed {}",
             cfg.rng_seed()
         );
-        // If unset, define the chaos_seed in terms of the regular seed:
-        let chaos_seed = cfg.sched_seed.unwrap_or(cfg.seed);
         detlog!(
             "CHAOSRAND: seeding chaos scheduler with seed {}",
-            chaos_seed
+            cfg.sched_seed()
         );
         ThreadState {
             dettid: pid,
@@ -408,7 +406,7 @@ impl<T> ThreadState<T> {
             clone_flags: None,
             // For the root thread, we initialize from the seed in the config:
             prng: Pcg64Mcg::seed_from_u64(cfg.rng_seed()),
-            chaos_prng: Pcg64Mcg::seed_from_u64(chaos_seed),
+            chaos_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed()),
             thread_logical_time: DetTime::new(cfg),
             committed_clock_value: 0,
             end_of_timeslice: None, // Temporary/bogus.

@@ -784,9 +784,6 @@ enum ThreadStatus {
 impl Scheduler {
     /// Create a new scheduler based on the configuration.
     pub fn new(cfg: &Config) -> Self {
-        // Just like chaos_prng, use the default seed if this internal
-        // scheduler-seed isn't specifically provided by the user:
-        let sched_seed = cfg.sched_seed.unwrap_or(cfg.seed);
         Self {
             preemption_writer: if cfg.record_preemptions {
                 Some(PreemptionWriter::new(cfg.record_preemptions_to.clone()))
@@ -815,7 +812,7 @@ impl Scheduler {
             recordreplay_modes: cfg.recordreplay_modes,
             run_queue: RunQueue::new(
                 cfg.sched_heuristic,
-                sched_seed,
+                cfg.sched_seed(),
                 cfg.sched_sticky_random_param,
             ),
             die_on_desync: cfg.die_on_desync,
