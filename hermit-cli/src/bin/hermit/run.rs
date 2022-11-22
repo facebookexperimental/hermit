@@ -439,6 +439,11 @@ impl fmt::Display for RunOpts {
         if dop.seed != 0 {
             write!(f, " --seed={}", dop.seed)?;
         }
+
+        if let Some(rng_seed) = dop.rng_seed {
+            write!(f, " --rng-seed={}", rng_seed)?;
+        }
+
         if let Some(m) = dop.clock_multiplier {
             write!(f, " --clock-multiplier={}", m)?;
         }

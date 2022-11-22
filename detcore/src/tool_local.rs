@@ -392,7 +392,7 @@ impl<T> ThreadState<T> {
     pub fn new(pid: DetPid, cfg: &Config, record_or_replay: T) -> Self {
         detlog!(
             "USER RAND: seeding PRNG for root thread with seed {}",
-            cfg.seed
+            cfg.rng_seed()
         );
         // If unset, define the chaos_seed in terms of the regular seed:
         let chaos_seed = cfg.sched_seed.unwrap_or(cfg.seed);
@@ -407,7 +407,7 @@ impl<T> ThreadState<T> {
             file_metadata: Arc::new(Mutex::new(FileMetadata::new().setup_stdio(pid.into()))),
             clone_flags: None,
             // For the root thread, we initialize from the seed in the config:
-            prng: Pcg64Mcg::seed_from_u64(cfg.seed),
+            prng: Pcg64Mcg::seed_from_u64(cfg.rng_seed()),
             chaos_prng: Pcg64Mcg::seed_from_u64(chaos_seed),
             thread_logical_time: DetTime::new(cfg),
             committed_clock_value: 0,

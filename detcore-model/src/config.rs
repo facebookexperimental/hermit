@@ -371,11 +371,6 @@ impl Config {
         if self.preemption_stacktrace_log_file.is_some() {
             self.preemption_stacktrace = true;
         }
-
-        //FIXME: Remove when fully implement T138408647
-        if self.rng_seed.is_some() {
-            self.seed = self.rng_seed.unwrap();
-        }
     }
 
     /// Should we use RCB in computing logical time?
@@ -566,6 +561,12 @@ impl Config {
             OsString::from(format!("--epoch={}", DEFAULT_EPOCH_STR)),
         ];
         Config::from_iter(args.iter())
+    }
+
+    /// Returns effective "rng-seed" parameter taking in account "seed"
+    /// parameter if former isn't specified
+    pub fn rng_seed(&self) -> u64 {
+        self.rng_seed.unwrap_or(self.seed)
     }
 }
 
