@@ -47,7 +47,13 @@ from running examples in the [./examples](./examples) folder.
 
 # Building and running Hermit
 
-Hermit is built with the standard Rust cargo tool.
+Hermit requires x86_64 Linux (though preliminary ARM support is available).
+
+First, install system dependencies:
+
+ * libunwind, e.g. `apt-get install libunwind-dev`
+
+Then, hermit is built with the standard Rust cargo tool.
 
 ```bash
 cargo build

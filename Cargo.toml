@@ -6,8 +6,8 @@ members = [
   "detcore",
   "detcore-model",
   "detcore/tests/testutils",
-  "flaky-tests",
+  # "flaky-tests",
   "hermit-cli",
   "hermit-verify",
-  "tests",
+  # "tests",
 ]
