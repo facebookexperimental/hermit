@@ -444,13 +444,6 @@ buck_sh_binary(
     name = "chaos_stress_wrapper",
     main = "util/chaos_stress_wrapper.sh",
 )
-
-# An alternate, shell-script version of the builtin `hermit run --verify`
-buck_sh_binary(
-    name = "hermit_chaosreplay_verify",
-    main = "util/hermit_chaosreplay_verify.sh",
-)
-
 # TODO: In the future add Java tests, go tests, etc.
 
 wrap_test_suite(
