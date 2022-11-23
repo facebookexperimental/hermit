@@ -86,7 +86,7 @@ instructions on how to run them.  These showcase different sources of
 nondeterminism, and how hermit eliminates or controls them.
 
 In order to explore more advanced examples, you can look at some of
-the integration tests built from [./tests/`]() or [./flaky-tests/]().
+the integration tests built from [./tests/]() or [./flaky-tests/]().
 For example, using the commands below you can run a racy example
 multiple times to see its nondeterminism.  Then run it under hermit to
 watch that determinism disappear.  Then run it under hermit `--chaos`
