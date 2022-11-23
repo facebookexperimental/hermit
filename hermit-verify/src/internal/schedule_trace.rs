@@ -51,9 +51,13 @@ impl DiffOpts {
         let bubbles = iterable_bubble_sort(&first_schedule, &second_schedule);
         eprintln!(
             ":: {}",
-            format!("Diffs found in schedules {} ", bubbles.swap_distance())
-                .yellow()
-                .bold()
+            format!(
+                "Diffs found in schedules : Swap distance  = {}, Edit distance = {} ",
+                bubbles.swap_distance(),
+                bubbles.edit_distance()
+            )
+            .yellow()
+            .bold()
         );
         Ok(true)
     }
