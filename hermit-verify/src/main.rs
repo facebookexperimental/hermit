@@ -13,16 +13,14 @@ use clap::Subcommand;
 mod chaos_replay;
 mod cli_wrapper;
 mod common;
-mod internal;
 mod run;
+mod schedule_trace;
 mod trace_replay;
 mod use_case;
 
 use colored::*;
 pub use common::CommonOpts;
 use use_case::run_use_case;
-
-use self::internal::InternalOpts;
 
 #[derive(Parser, Debug)]
 #[clap(author = "oncall+hermit@xmail.facebook.com")]
@@ -38,9 +36,10 @@ struct Args {
 pub enum Commands {
     Run(run::RunOpts),
     TraceReplay(trace_replay::TraceReplayOpts),
-    /// Internal features
-    Internal(InternalOpts),
     ChaosReplay(chaos_replay::ChaosReplayOpts),
+    /// Schedule Trace
+    #[clap(subcommand)]
+    SchedTrace(schedule_trace::SchedTraceOpts),
 }
 
 #[fbinit::main]
@@ -53,8 +52,8 @@ fn main() -> Result<()> {
     let result = match command {
         Commands::Run(cmd) => run_use_case(cmd, &common_opts)?,
         Commands::TraceReplay(cmd) => run_use_case(cmd, &common_opts)?,
-        Commands::Internal(cmd) => cmd.internal_command.main(&common_opts)?,
         Commands::ChaosReplay(cmd) => run_use_case(cmd, &common_opts)?,
+        Commands::SchedTrace(cmd) => cmd.main(&common_opts)?,
     };
 
     if !result {
@@ -62,7 +61,7 @@ fn main() -> Result<()> {
         anyhow::bail!("Verification check failed")
     } else {
         println!("{}", "Success!".green().bold());
-    }
+    };
 
     Ok(())
 }
