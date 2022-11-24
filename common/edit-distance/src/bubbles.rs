@@ -227,6 +227,16 @@ where
         self.current()
     }
 
+    pub fn interpolate<'b>(&'b mut self, interpolate_percentage: u8) -> Perm<'a, 'b, T> {
+        let m = (self.history_size * (interpolate_percentage as usize)) / 100;
+        if m > self.history_cursor {
+            self.skip(m - self.history_cursor);
+        } else {
+            self.skip_back(self.history_cursor - m);
+        }
+        self.current()
+    }
+
     pub fn history_size(&self) -> usize {
         self.history_size
     }
