@@ -2193,7 +2193,6 @@ mod test {
         let mut v = tree.my_thread_group(&p2);
         v.sort();
         assert_eq!(&v, &[p1, p2, p3]);
-        tracing_subscriber::fmt::init();
         tree.final_report();
     }
 
@@ -2217,8 +2216,6 @@ mod test {
         let mut v = tree.my_thread_group(&p5);
         v.sort();
         assert_eq!(&v, &[p3, p4, p5]);
-
-        tracing_subscriber::fmt::init();
         tree.final_report();
     }
 }

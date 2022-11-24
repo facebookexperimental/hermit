@@ -265,8 +265,12 @@ const DEFAULT_SIZE: usize = 0x20000000000; // 128 GiB, try to avoid any rlimits
 /// Use this constant to calculate expected addresses in conjunction with
 /// `skip_to_offset`.
 /// ```no_run
-/// GLOBAL.skip_to_offset(0x100000).unwrap()
+/// # use test_allocator::GLOBAL;
+/// # use test_allocator::GLOBAL_SLAB_TOP;
+/// # unsafe {
+/// GLOBAL.skip_to_offset(0x100000).unwrap();
 /// assert_eq!(GLOBAL.allocate(4, 4) as usize, GLOBAL_SLAB_TOP - 0x100000 - 4);
+/// # }
 /// ```
 pub const GLOBAL_SLAB_TOP: usize = DEFAULT_PAGE_ADDRESS + DEFAULT_SIZE;
 
