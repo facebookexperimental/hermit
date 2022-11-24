@@ -12,7 +12,7 @@
 #![feature(map_first_last)]
 #![feature(nonzero_ops)]
 #![deny(clippy::all)]
-#![deny(missing_docs)
+#![deny(missing_docs)]
 
 mod config;
 mod consts;
