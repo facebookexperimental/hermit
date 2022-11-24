@@ -119,10 +119,17 @@ def build_test(name, bin_target, raw, run, no_sequentialize_threads, no_determin
         buck_sh_test(
             name = "hermit_run_chaosreplay__" + name,
             args = [
+                "--hermit-bin=$(location //hermetic_infra/hermit/hermit-cli:hermit)",
+                "chaos-replay",
+                "--isolate-workdir",
+                "--hermit-args=--base-env=empty",
+                "--hermit-args=--env=HERMIT_MODE=chaosreplay",
+                "--hermit-args=--chaos",
+                "--",
                 "$(location " + bin_target + ")",
             ],
             env = common_env,
-            test = "//hermetic_infra/hermit/tests:hermit_chaosreplay_verify",
+            test = "//hermetic_infra/hermit/hermit-verify:hermit-verify",
         )
 
     if record_and_replay:

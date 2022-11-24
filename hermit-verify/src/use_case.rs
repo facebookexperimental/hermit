@@ -28,6 +28,7 @@ pub struct UseCaseOptions {
     pub verify_commits: bool,
     pub verify_exit_statuses: bool,
     pub verify_schedules: bool,
+    pub ignore_lines: Option<String>,
 }
 
 pub trait UseCase {
@@ -42,6 +43,7 @@ pub trait UseCase {
             verify_exit_statuses: true,
             verify_desync: true,
             verify_schedules: false,
+            ignore_lines: None,
         }
     }
 
@@ -81,8 +83,13 @@ fn compare_results<T: UseCase>(
     }
 
     if options.verify_commits || options.verify_detlog {
-        result &=
-            verify.verify_logs(left, right, !options.verify_detlog, !options.verify_commits)?;
+        result &= verify.verify_logs(
+            left,
+            right,
+            !options.verify_detlog,
+            !options.verify_commits,
+            options.ignore_lines,
+        )?;
     }
 
     if options.verify_exit_statuses {
