@@ -49,87 +49,59 @@ def build_test(name, bin_target, raw, run, no_sequentialize_threads, no_determin
     # if strict:
     # Run tests in hermit run mode, strict settings:
     if not (no_deterministic_io or no_sequentialize_threads):
-        buck_sh_test(
-            name = "hermit_run_strict__" + name,
-            # Warning: hacky tuning! The preemption-timeout here is
-            # arbitrary, and is basically selected to be the largest
-            # number that we can tolerate while still observing some
-            # context switches in the mem_race test.  It needs to be
-            # large because the performance of deterministic
-            # preemptions is currently quite slow, and frequent
-            # preemptions will slow down *all* tests.
-            args = [
-                "--hermit-bin=$(location //hermetic_infra/hermit/hermit-cli:hermit)",
-                "run",
-                "--isolate-workdir",
-                "--hermit-arg=--base-env=empty",
-                "--hermit-arg=--env=HERMIT_MODE=strict",
-                "--hermit-arg=--preemption-timeout=80000000",
-                "--",
-                "$(location " + bin_target + ")",
-            ],
+        # Warning: hacky tuning! The preemption-timeout here is
+        # arbitrary, and is basically selected to be the largest
+        # number that we can tolerate while still observing some
+        # context switches in the mem_race test.  It needs to be
+        # large because the performance of deterministic
+        # preemptions is currently quite slow, and frequent
+        # preemptions will slow down *all* tests.
+        hermit_verify(
+            "hermit_run_strict__" + name,
+            guest = "$(location " + bin_target + ")",
+            guest_args = [],
+            args = ["run", "--isolate-workdir"],
+            hermit_args = ["--base-env=empty", "--env=HERMIT_MODE=strict", "--preemption-timeout=80000000"],
             env = {},
-            test = "//hermetic_infra/hermit/hermit-verify:hermit-verify",
         )
 
     if tracereplay:
-        # Also run with replay of recorded preemptions.
-        buck_sh_test(
-            name = "hermit_run_tracereplay__" + name,
-            args = [
-                "--hermit-bin=$(location //hermetic_infra/hermit/hermit-cli:hermit)",
-                "trace-replay",
-                "--isolate-workdir",
-                "--hermit-arg=--base-env=empty",
-                "--hermit-arg=--env=HERMIT_MODE=tracereplay",
-                "--",
-                "$(location " + bin_target + ")",
-            ],
+        hermit_verify(
+            "hermit_run_tracereplay__" + name,
+            guest = "$(location " + bin_target + ")",
+            guest_args = [],
+            args = ["trace-replay", "--isolate-workdir"],
+            hermit_args = ["--base-env=empty", "--env=HERMIT_MODE=tracereplay"],
             env = common_env,
-            test = "//hermetic_infra/hermit/hermit-verify:hermit-verify",
         )
 
     if chaos:
         # Run tests in hermit run mode, strict settings, chaotic scheduling:
-        buck_sh_test(
-            name = "hermit_run_chaos__" + name,
-            # Warning: hacky tuning! The preemption-timeout here is
-            # arbitrary, and is basically selected to be the smallest
-            # number that we can tolerate for chaos tests. Smaller numbers
-            # create more priority change points, which are deterministic
-            # preemptions and thus quite slow. Frequent change points thus
-            # slow down *all* tests. The slowest/deadlocking tests have specific
-            # disables for chaos mode.
-            args = [
-                "--hermit-bin=$(location //hermetic_infra/hermit/hermit-cli:hermit)",
-                "run",
-                "--isolate-workdir",
-                "--hermit-arg=--base-env=empty",
-                "--hermit-arg=--env=HERMIT_MODE=chaos",
-                "--hermit-arg=--chaos",
-                "--hermit-arg=--preemption-timeout=1000000",
-                "--",
-                "$(location " + bin_target + ")",
-            ],
+
+        # Warning: hacky tuning! The preemption-timeout here is
+        # arbitrary, and is basically selected to be the smallest
+        # number that we can tolerate for chaos tests. Smaller numbers
+        # create more priority change points, which are deterministic
+        # preemptions and thus quite slow. Frequent change points thus
+        # slow down *all* tests. The slowest/deadlocking tests have specific
+        # disables for chaos mode.
+        hermit_verify(
+            "hermit_run_chaos__" + name,
+            guest = "$(location " + bin_target + ")",
+            guest_args = [],
+            args = ["run", "--isolate-workdir"],
+            hermit_args = ["--chaos", "--base-env=empty", "--env=HERMIT_MODE=chaos", "--preemption-timeout=1000000"],
             env = {},
-            test = "//hermetic_infra/hermit/hermit-verify:hermit-verify",
         )
     if chaosreplay:
         # Also run with replay of recorded preemptions.
-        buck_sh_test(
-            name = "hermit_run_chaosreplay__" + name,
-            args = [
-                "--hermit-bin=$(location //hermetic_infra/hermit/hermit-cli:hermit)",
-                "chaos-replay",
-                "--isolate-workdir",
-                "--hermit-args=--base-env=empty",
-                "--hermit-args=--env=HERMIT_MODE=chaosreplay",
-                "--hermit-args=--chaos",
-                "--",
-                "$(location " + bin_target + ")",
-            ],
+        hermit_verify(
+            "hermit_run_chaosreplay__" + name,
+            guest = "$(location " + bin_target + ")",
+            guest_args = [],
+            args = ["chaos-replay", "--isolate-workdir"],
+            hermit_args = ["--chaos", "--base-env=empty", "--env=HERMIT_MODE=chaosreplay"],
             env = common_env,
-            test = "//hermetic_infra/hermit/hermit-verify:hermit-verify",
         )
 
     if record_and_replay:
@@ -147,6 +119,20 @@ def build_test(name, bin_target, raw, run, no_sequentialize_threads, no_determin
             ),
             test = "//hermetic_infra/hermit/hermit-cli:hermit",
         )
+
+def hermit_verify(name, guest, guest_args = [], args = [], hermit_args = [], env = {}):
+    buck_sh_test(
+        name = name,
+        args =
+            ["--hermit-bin=$(location //hermetic_infra/hermit/hermit-cli:hermit)"] +
+            args +
+            ["--hermit-arg=" + arg for arg in hermit_args] +
+            ["--"] +
+            [guest] +
+            guest_args,
+        env = env,
+        test = "//hermetic_infra/hermit/hermit-verify:hermit-verify",
+    )
 
 def hermit_shell_test(path, raw, run, no_sequentialize_threads, no_deterministic_io, chaos, record_and_replay, chaosreplay, tracereplay = False):
     basename = paths.replace_extension(paths.basename(path), "")

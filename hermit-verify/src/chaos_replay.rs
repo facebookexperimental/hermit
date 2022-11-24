@@ -32,7 +32,7 @@ pub struct ChaosReplayOpts {
 
     /// Additional arguments for hermit run subcommand
     #[clap(long)]
-    hermit_args: Vec<String>,
+    hermit_arg: Vec<String>,
 
     /// Path to a guest program
     #[clap(value_name = "PROGRAM")]
@@ -61,7 +61,7 @@ impl UseCase for ChaosReplayOpts {
             .log_level(tracing::Level::TRACE)
             .log_file(current_run.log_file_path.clone())
             .run(self.guest_program.clone(), self.args.clone())
-            .hermit_args(self.hermit_args.clone())
+            .hermit_args(self.hermit_arg.clone())
             .bind(temp_env.path().to_owned())
             .workdir_isolate(current_run.workdir.clone(), self.isolate_workdir)
             .record_preemptions_to(current_run.schedule_file.clone())
@@ -79,7 +79,7 @@ impl UseCase for ChaosReplayOpts {
             .log_level(tracing::Level::TRACE)
             .log_file(current_run.log_file_path.clone())
             .run(self.guest_program.clone(), self.args.clone())
-            .hermit_args(self.hermit_args.clone())
+            .hermit_args(self.hermit_arg.clone())
             .bind(temp_env.path().to_owned())
             .workdir_isolate(current_run.workdir.clone(), self.isolate_workdir)
             .replay_preemptions_from(prev_run.schedule_file.clone())
