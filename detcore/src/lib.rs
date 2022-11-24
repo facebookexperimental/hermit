@@ -13,7 +13,6 @@
 #![feature(nonzero_ops)]
 #![deny(clippy::all)]
 #![deny(missing_docs)]
-
 mod config;
 mod consts;
 mod cpuid;
