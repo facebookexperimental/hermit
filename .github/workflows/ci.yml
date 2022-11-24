@@ -16,9 +16,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+    - name: Dependencies
+      run: sudo apt-get install -y libunwind-dev
     - name: Build
-      working-directory: detcore-model
-      run: echo cargo build --verbose
-    - name: Run tests
-      working-directory: detcore-model
-      run: echo cargo test --verbose
+      run: cargo buil
