@@ -1,0 +1,92 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+mod run_hermit;
+mod run_usecase;
+
+pub use run_hermit::run_hermit;
+pub use run_usecase::run_use_case;
+
+use crate::common::RunEnvironment;
+use crate::common::TemporaryEnvironment;
+use crate::common::TemporaryEnvironmentBuilder;
+use crate::CommonOpts;
+
+pub struct UseCaseOptions {
+    pub output_stdout: bool,
+    pub output_stderr: bool,
+    pub verify_stdout: bool,
+    pub verify_stderr: bool,
+    pub verify_detlog: bool,
+    pub verify_desync: bool,
+    pub verify_commits: bool,
+    pub verify_exit_statuses: bool,
+    pub verify_schedules: bool,
+    pub ignore_lines: Option<String>,
+}
+
+pub trait UseCase {
+    fn options(&self) -> UseCaseOptions {
+        UseCaseOptions {
+            output_stdout: true,
+            output_stderr: true,
+            verify_stdout: true,
+            verify_stderr: true,
+            verify_detlog: true,
+            verify_commits: true,
+            verify_exit_statuses: true,
+            verify_desync: true,
+            verify_schedules: false,
+            ignore_lines: None,
+        }
+    }
+
+    fn build_temp_env(&self, common_args: &CommonOpts) -> TemporaryEnvironmentBuilder;
+
+    fn build_first_hermit_args(
+        &self,
+        temp_env: &TemporaryEnvironment,
+        current_run: &RunEnvironment,
+    ) -> Vec<String>;
+
+    fn build_next_hermit_args(
+        &self,
+        run_no: usize,
+        temp_env: &TemporaryEnvironment,
+        prev_run: &RunEnvironment,
+        current_run: &RunEnvironment,
+    ) -> Vec<String>;
+
+    fn exec_first_run(
+        &self,
+        common_args: &CommonOpts,
+        temp_env: &TemporaryEnvironment,
+        run: &RunEnvironment,
+    ) -> anyhow::Result<()> {
+        run_hermit(
+            self.build_first_hermit_args(temp_env, run),
+            common_args,
+            run,
+        )
+    }
+
+    fn exec_next_run(
+        &self,
+        common_args: &CommonOpts,
+        counter: usize,
+        temp_env: &TemporaryEnvironment,
+        prev_run: &RunEnvironment,
+        current_run: &RunEnvironment,
+    ) -> anyhow::Result<()> {
+        run_hermit(
+            self.build_next_hermit_args(counter + 1, temp_env, prev_run, current_run),
+            common_args,
+            current_run,
+        )
+    }
+}
