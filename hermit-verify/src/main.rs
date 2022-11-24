@@ -10,6 +10,7 @@ use anyhow::Result;
 use clap::Parser;
 use clap::Subcommand;
 
+mod chaos_replay;
 mod cli_wrapper;
 mod common;
 mod internal;
@@ -39,6 +40,7 @@ pub enum Commands {
     TraceReplay(trace_replay::TraceReplayOpts),
     /// Internal features
     Internal(InternalOpts),
+    ChaosReplay(chaos_replay::ChaosReplayOpts),
 }
 
 #[fbinit::main]
@@ -52,6 +54,7 @@ fn main() -> Result<()> {
         Commands::Run(cmd) => run_use_case(cmd, &common_opts)?,
         Commands::TraceReplay(cmd) => run_use_case(cmd, &common_opts)?,
         Commands::Internal(cmd) => cmd.internal_command.main(&common_opts)?,
+        Commands::ChaosReplay(cmd) => run_use_case(cmd, &common_opts)?,
     };
 
     if !result {

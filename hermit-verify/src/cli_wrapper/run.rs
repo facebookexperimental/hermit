@@ -19,7 +19,9 @@ pub struct HermitRunBuilder {
     pub guest_program: PathBuf,
     pub guest_args: Vec<String>,
     pub record_preemptions_to: Option<PathBuf>,
+    pub replay_preemptions_from: Option<PathBuf>,
     pub replay_schedule_from: Option<PathBuf>,
+    pub chaos: bool,
 }
 
 impl HermitRunBuilder {
@@ -44,6 +46,11 @@ impl HermitRunBuilder {
 
     pub fn record_preemptions_to(mut self, path: PathBuf) -> Self {
         self.record_preemptions_to = Some(path);
+        self
+    }
+
+    pub fn replay_preemptions_from(mut self, path: PathBuf) -> Self {
+        self.replay_preemptions_from = Some(path);
         self
     }
 
@@ -120,7 +127,9 @@ impl HermitRunBuilder {
             workdir,
             workdir_destination,
             record_preemptions_to,
+            replay_preemptions_from,
             replay_schedule_from,
+            chaos,
         } = self;
 
         let mut command_args = vec![];
@@ -135,6 +144,10 @@ impl HermitRunBuilder {
 
         command_args.push(String::from("run"));
 
+        if chaos {
+            command_args.push("--chaos".to_string());
+        }
+
         for arg in hermit_args
             .into_iter()
             .filter(Self::is_hermit_arg_applicable)
@@ -146,6 +159,12 @@ impl HermitRunBuilder {
             command_args.push(format!(
                 "--record-preemptions-to={}",
                 record_preemptions_to.display()
+            ));
+        }
+        if let Some(replay_preemptions_from) = replay_preemptions_from {
+            command_args.push(format!(
+                "--replay-preemptions-from={}",
+                replay_preemptions_from.display()
             ));
         }
         if let Some(replay_schedule_from) = replay_schedule_from {

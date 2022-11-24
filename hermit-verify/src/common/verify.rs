@@ -122,25 +122,43 @@ impl<P: AsRef<OsStr>> Verify<P> {
         Ok(true)
     }
 
+    fn build_command_args(
+        &self,
+        left: &RunEnvironment,
+        right: &RunEnvironment,
+        skip_detlog: bool,
+        skip_commit: bool,
+        ignore_lines: Option<String>,
+    ) -> Vec<String> {
+        let mut result = vec![];
+        result.push(String::from("log-diff"));
+        result.push(String::from("--syscall-history=5"));
+        if skip_detlog {
+            result.push(String::from("--skip-detlog"));
+        }
+        if skip_commit {
+            result.push(String::from("--skip-commit"));
+        }
+        if let Some(mode) = ignore_lines {
+            result.push(format!("--ignore-lines={}", mode));
+        }
+        result.push(format!("{}", left.log_file_path.display()));
+        result.push(format!("{}", right.log_file_path.display()));
+
+        result
+    }
+
     pub fn verify_logs(
         &self,
         left: &RunEnvironment,
         right: &RunEnvironment,
         skip_detlog: bool,
         skip_commit: bool,
+        ignore_lines: Option<String>,
     ) -> anyhow::Result<bool> {
         println!("{}", "::  Comparing log files".bold());
         let mut command = std::process::Command::new(&self.hermit_bin);
-        command.arg("log-diff");
-        command.arg("--syscall-history=5");
-        if skip_detlog {
-            command.arg("--skip-detlog");
-        }
-        if skip_commit {
-            command.arg("--skip-commit");
-        }
-        command.arg(format!("{}", left.log_file_path.display()));
-        command.arg(format!("{}", right.log_file_path.display()));
+        command.args(self.build_command_args(left, right, skip_detlog, skip_commit, ignore_lines));
 
         println!("{}", format!("    {}", display_cmd(&command)).bold());
         Ok(command.status()?.success())
@@ -170,6 +188,36 @@ mod test {
 
     use super::*;
     use crate::common::TemporaryEnvironmentBuilder;
+
+    #[test]
+    fn test_build_command_args_ignore_lines_provided() -> anyhow::Result<()> {
+        let env = TemporaryEnvironmentBuilder::new().run_count(2).build()?;
+        let verify = Verify::new(PathBuf::from("hermit"));
+        let args = verify.build_command_args(
+            &env.runs()[0],
+            &env.runs()[1],
+            false,
+            false,
+            Some(String::from("test")),
+        );
+
+        assert_eq!(args.into_iter().any(|x| x == "--ignore-lines=test"), true);
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_command_args_ignore_lines_not_provided() -> anyhow::Result<()> {
+        let env = TemporaryEnvironmentBuilder::new().run_count(2).build()?;
+        let verify = Verify::new(PathBuf::from("hermit"));
+        let args = verify.build_command_args(&env.runs()[0], &env.runs()[1], false, false, None);
+
+        assert_eq!(
+            args.into_iter().any(|x| x.contains("--ignore-lines")),
+            false
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_compare_equal_files() -> anyhow::Result<()> {
         let env = TemporaryEnvironmentBuilder::new().run_count(2).build()?;
