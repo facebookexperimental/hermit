@@ -57,4 +57,3 @@ reverie-ptrace = { version = "0.1.0", git = "https://github.com/facebookexperime
 tempfile = "3.3"
 test-allocator = { version = "0.0.0", path = "../common/test-allocator" }
 test-case = "1.2"
-tracing-subscriber = { version = "0.3.16", features = ["ansi", "env-filter", "fmt", "json", "local-time", "parking_lot", "registry"] }
