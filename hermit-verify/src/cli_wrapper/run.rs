@@ -22,6 +22,7 @@ pub struct HermitRunBuilder {
     pub replay_preemptions_from: Option<PathBuf>,
     pub replay_schedule_from: Option<PathBuf>,
     pub chaos: bool,
+    pub seed: Option<i32>,
 }
 
 impl HermitRunBuilder {
@@ -32,6 +33,11 @@ impl HermitRunBuilder {
             guest_args,
             ..Default::default()
         }
+    }
+
+    pub fn log_level(mut self, level: tracing::Level) -> Self {
+        self.level = Some(level);
+        self
     }
 
     fn to_level_string(level: tracing::Level) -> &'static str {
@@ -46,6 +52,11 @@ impl HermitRunBuilder {
 
     pub fn record_preemptions_to(mut self, path: PathBuf) -> Self {
         self.record_preemptions_to = Some(path);
+        self
+    }
+
+    pub fn seed(mut self, seed: i32) -> Self {
+        self.seed = Some(seed);
         self
     }
 
@@ -130,6 +141,7 @@ impl HermitRunBuilder {
             replay_preemptions_from,
             replay_schedule_from,
             chaos,
+            seed,
         } = self;
 
         let mut command_args = vec![];
@@ -146,6 +158,10 @@ impl HermitRunBuilder {
 
         if chaos {
             command_args.push("--chaos".to_string());
+        }
+
+        if let Some(seed_value) = seed {
+            command_args.push(format!("--seed={}", seed_value));
         }
 
         for arg in hermit_args

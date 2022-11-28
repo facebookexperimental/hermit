@@ -11,6 +11,7 @@ use clap::Parser;
 use clap::Subcommand;
 
 mod chaos_replay;
+mod chaos_stress;
 mod cli_wrapper;
 mod common;
 mod run;
@@ -40,6 +41,7 @@ pub enum Commands {
     /// Schedule Trace
     #[clap(subcommand)]
     SchedTrace(schedule_trace::SchedTraceOpts),
+    ChaosStress(chaos_stress::ChaosStressOpts),
 }
 
 #[fbinit::main]
@@ -54,6 +56,7 @@ fn main() -> Result<()> {
         Commands::TraceReplay(cmd) => run_use_case(cmd, &common_opts)?,
         Commands::ChaosReplay(cmd) => run_use_case(cmd, &common_opts)?,
         Commands::SchedTrace(cmd) => cmd.main(&common_opts)?,
+        Commands::ChaosStress(cmd) => cmd.run(&common_opts)?,
     };
 
     if !result {

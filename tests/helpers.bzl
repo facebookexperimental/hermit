@@ -191,13 +191,11 @@ def hermit_rust_test(path, raw, run, no_sequentialize_threads, no_deterministic_
     build_test("rs_" + basename, bin_target, raw, run, no_sequentialize_threads, no_deterministic_io, record_and_replay, chaos, chaosreplay, tracereplay)
 
 def hermit_chaos_stress_test(name, bin_target, preempt_interval, max_iterations):
-    buck_sh_test(
-        name = "hermit_chaos_fail_" + name,
-        args = [
-            "$(location //hermetic_infra/hermit/hermit-cli:hermit)",
-            "$(location " + bin_target + ")",
-            str(preempt_interval),
-            str(max_iterations),
-        ],
-        test = "//hermetic_infra/hermit/tests:chaos_stress_wrapper",
+    hermit_verify(
+        "hermit_chaos_fail_" + name,
+        guest = "$(location " + bin_target + ")",
+        guest_args = [],
+        args = ["chaos-stress", "--max-iterations-count=" + str(max_iterations)],
+        hermit_args = ["--chaos", "--base-env=minimal", "--preemption-timeout=" + str(preempt_interval)],
+        env = {},
     )
