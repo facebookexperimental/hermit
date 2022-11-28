@@ -17,6 +17,9 @@ rootdir="$(pwd)"
 hermit="$rootdir/target/debug/hermit"
 hverify="$rootdir/target/debug/hermit-verify"
 
+# Hello world smoke test:
+"$hermit" run --no-rcb-time --preemption-timeout=disabled -- /bin/echo hello
+
 function hermit_verify {
     # Github Actions VMs don't expose the perf counters we need to use RCBs:
     "$hverify" --hermit-bin="$hermit" run --isolate-workdir \
@@ -65,3 +68,4 @@ do
     file="$rootdir/target/debug/$test"
     hermit_verify "$file"
 done
+
