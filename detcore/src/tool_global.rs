@@ -408,7 +408,8 @@ impl GlobalTool for GlobalState {
         #[allow(clippy::unit_arg)]
         let resp = match gr.1 {
             GlobalRequest::RequestResources(rs, pid) => {
-                R::RequestResources(self.recv_request_resources(from, pid, rs).await)
+                let (response, _endtime) = self.recv_request_resources(from, pid, rs).await;
+                R::RequestResources(response)
             }
             GlobalRequest::ReleaseResources(rs) => {
                 R::ReleaseResources(self.recv_release_resources(from, rs).await)
@@ -453,8 +454,8 @@ impl GlobalTool for GlobalState {
                 R::GlobalTimeLowerBound(ns)
             }
             GlobalRequest::TraceSchedEvent(ev, detpid) => {
-                let print_backtrace = self.recv_trace_schedevent(ev, detpid).await;
-                R::TraceSchedEvent(print_backtrace)
+                let res = self.recv_trace_schedevent(ev, detpid).await;
+                R::TraceSchedEvent(res)
             }
             GlobalRequest::RegisterAlarm(dpid, dtid, secs, sig) => {
                 let remaining = self.recv_register_alarm(dpid, dtid, secs, sig).await;
@@ -533,7 +534,7 @@ impl GlobalState {
         from: Tid,
         detpid: DetPid,
         rs: Resources,
-    ) -> ResumeStatus {
+    ) -> (ResumeStatus, Option<LogicalTime>) {
         let dettid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
 
         let resp2 = {
@@ -580,20 +581,34 @@ impl GlobalState {
         }
 
         match answer {
-            SchedResponse::Go(_) => {
+            // In this context, SchedValue
+            SchedResponse::Go(Some(schedval)) => {
                 trace!(
-                    "[detcore, dtid {}] resources granted, resuming normally: {:?}",
+                    "[dtid {}] resources granted, resuming normally: {:?}",
                     dettid,
                     rs
                 );
-                ResumeStatus::Normal
+
+                let endtime_update = match schedval {
+                    // Only syscalls timeout, and they don't need to update guest timeslice end.
+                    SchedValue::TimeOut => None,
+                    SchedValue::Value(timeslice) => Some(LogicalTime::from_nanos(timeslice)),
+                };
+                (ResumeStatus::Normal, endtime_update)
+            }
+            SchedResponse::Go(None) => {
+                trace!(
+                    "[dtid {}] resources granted but no timeslice specified",
+                    dettid,
+                );
+                (ResumeStatus::Normal, None)
             }
             SchedResponse::Signaled() => {
                 trace!(
-                    "[detcore, dtid {}] resources granted but interrupted by signal",
+                    "[dtid {}] resources granted but interrupted by signal",
                     dettid,
                 );
-                ResumeStatus::Signaled
+                (ResumeStatus::Signaled, None)
             }
         }
     }
@@ -920,9 +935,11 @@ impl GlobalState {
         info.mtime = mtime;
     }
 
-    /// The return value indicates whether the backtrace of this event should be printed, and if so,
-    /// whether it should be printed to a file.
-    async fn recv_trace_schedevent(&self, ev: SchedEvent, detpid: DetPid) -> MaybePrintStack {
+    async fn recv_trace_schedevent(
+        &self,
+        ev: SchedEvent,
+        detpid: DetPid,
+    ) -> TraceSchedEventResponse {
         // TODO(T124316762): debug address randomization in the tracer and get rid of this hack:
         let ev = {
             if self.past_first_execve.load(SeqCst) {
@@ -942,13 +959,20 @@ impl GlobalState {
         }
 
         // Yield this guest thread if needed to follow schedule.
-        let maybe_print = if self.cfg.replay_schedule_from.is_some() {
+        let result = if self.cfg.replay_schedule_from.is_some() {
             let ConsumeResult {
                 keep_running,
                 print_stack,
                 event_ix: _,
+                mut end_of_timeslice,
             } = self.sched.lock().unwrap().consume_schedevent(&ev);
+            trace!(
+                "keep_running :{}, end_of_timeslice: {:?}",
+                keep_running,
+                end_of_timeslice
+            );
             let print_stack2 = self.record_event(&ev);
+
             if !keep_running {
                 trace!(
                     "[detcore, dtid {}] Thread yielding to follow replay schedule",
@@ -957,25 +981,33 @@ impl GlobalState {
                 let tid = reverie::Tid::from(ev.dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
                 let mut rsrcs = Resources::new(ev.dettid);
                 rsrcs.insert(ResourceID::TraceReplay, Permission::RW);
-                self.recv_request_resources(tid, detpid, rsrcs).await;
+                end_of_timeslice = self.recv_request_resources(tid, detpid, rsrcs).await.1;
                 trace!(
                     "[detcore, dtid {}] Thread reactivated after yielding for replay schedule",
                     &ev.dettid,
                 );
             }
-            print_stack.or(print_stack2)
+
+            TraceSchedEventResponse {
+                print_stack_strace: print_stack.or(print_stack2),
+                timeslice: end_of_timeslice,
+            }
         } else {
-            self.record_event(&ev)
+            TraceSchedEventResponse {
+                print_stack_strace: self.record_event(&ev),
+                timeslice: None,
+            }
         };
 
-        if maybe_print.is_some() {
+        if result.print_stack_strace.is_some() {
             if let Some(sig) = &self.cfg.stacktrace_signal {
                 trace!(
                     "[dtid {}] signaling thread with {} at the point of stack trace printing.",
                     ev.dettid,
                     sig.0
                 );
-                let tid = Pid::from_raw(ev.dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
+                let tid = Pid::from_raw(ev.dettid.as_raw());
+                // TODO(T78538674): virtualize pid/tid:
                 // We send a raw signal here and let the guest pick it up WHENEVER it resumes.
                 // We don't use the "signal_guest" method because we don't necessarily respect that
                 // protocol here.
@@ -983,7 +1015,7 @@ impl GlobalState {
             }
         }
 
-        maybe_print
+        result
     }
 
     // Return whether we should print the stacktrace after recording this event.
@@ -1114,7 +1146,7 @@ pub enum GlobalResponse {
     UnlinkInode(()),
     TouchFile(()),
     GlobalTimeLowerBound(LogicalTime),
-    TraceSchedEvent(MaybePrintStack),
+    TraceSchedEvent(TraceSchedEventResponse),
     RegisterAlarm(Seconds),
     // TODO: use void_send_rpc, and remove this bogus response:
     UnrecoverableShutdown(()),
@@ -1454,6 +1486,13 @@ where
     }
 }
 
+/// Additional instructions to a guest after shed events is consumed by global tool
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub struct TraceSchedEventResponse {
+    print_stack_strace: MaybePrintStack,
+    timeslice: Option<LogicalTime>,
+}
+
 /// Record an event in the schedule trace, OR check the event on replay.
 /// This also prints the backtrace of the schedevent, if indicated.
 ///
@@ -1499,13 +1538,33 @@ where
 
     let detpid = guest.thread_state().detpid.expect("detpid unset");
     let resp = send_and_update_time(guest, GlobalRequest::TraceSchedEvent(ev, detpid)).await;
-    let do_backtrace = match resp.1 {
-        GlobalResponse::TraceSchedEvent(x) => x,
-        _ => unreachable!(),
-    };
-    if let Some(x) = do_backtrace {
-        trace!("[trace_schedevent] printing stacktrace via Reverie...");
-        print_backtrace(guest, &x);
+
+    trace!("trace_schedevent result: {:?}", resp);
+    match resp {
+        (
+            _,
+            GlobalResponse::TraceSchedEvent(TraceSchedEventResponse {
+                print_stack_strace,
+                timeslice,
+            }),
+        ) => {
+            if let Some(x) = print_stack_strace {
+                trace!("[trace_schedevent] printing stacktrace via Reverie...");
+                print_backtrace(guest, &x);
+            }
+
+            if timeslice.is_some() && guest.thread_state().past_global_first_execve {
+                trace!(
+                    "[detcore][dettid {}] setting end_of_timeslice to {:?} as instructed by replayer",
+                    guest.thread_state().dettid,
+                    timeslice
+                );
+                guest.thread_state_mut().end_of_timeslice = timeslice;
+            }
+        }
+        _ => {
+            unreachable!()
+        }
     }
 }
 

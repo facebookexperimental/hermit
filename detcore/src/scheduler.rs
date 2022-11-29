@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
+use std::u64;
 use std::vec::IntoIter;
 
 use nix::sys::signal;
@@ -107,7 +108,9 @@ pub enum SchedResponse {
 /// It can be used to have the scheduler EMULATE behaviors (syscalls) that would normally happen in
 /// the guest. The first application for this is futexes.
 pub enum SchedValue {
+    /// The action timed out while waiting on the scheduler.
     TimeOut,
+    // TODO(T137799529) make this more strongly typed, an enum for different scenarios:
     Value(u64),
 }
 
@@ -258,6 +261,11 @@ pub struct Scheduler {
     ///
     /// NB: BTreeMap over HashMap for deterministic printing.
     pub priorities: BTreeMap<DetTid, Priority>,
+
+    /// Tracks explicit optional timeslices to run for each thread.
+    /// If a guest is to be unblocked on a thread the guest will receive this
+    /// information and needs to "cooperate" and setup it's preemption for the amount
+    pub timeslices: BTreeMap<DetTid, Option<LogicalTime>>,
 
     /// A record of which preemptions occured on each thread.  Only used IF `--record-preemptions`
     /// was specified in the Config, otherwise this remains empty.
@@ -725,17 +733,41 @@ fn is_hard_desync(observed: &SchedEvent, expected: &SchedEvent) -> bool {
 }
 
 fn is_desync(observed: &SchedEvent, expected: &SchedEvent) -> bool {
-    *observed != *expected
+    if (
+        observed.dettid,
+        observed.op,
+        observed.count,
+        observed.end_time,
+    ) != (
+        expected.dettid,
+        expected.op,
+        expected.count,
+        expected.end_time,
+    ) {
+        return true;
+    }
+
+    if observed.start_rip != expected.start_rip && expected.start_rip.is_some() {
+        return true;
+    }
+
+    if observed.end_rip != expected.end_rip && expected.end_rip.is_some() {
+        return true;
+    }
+
+    false
 }
 
 fn compare_desync(observed: &SchedEvent, expected: &SchedEvent) -> String {
-    if *observed == *expected {
+    if !is_desync(observed, expected) {
         "MATCHED".to_string()
     } else if observed.op != expected.op {
         "FULL-OP-DESYNC".to_string()
     } else {
         let mut msg = "DESYNC".to_string();
-        if observed.start_rip != expected.start_rip || observed.end_rip != expected.end_rip {
+        if (expected.start_rip.is_some() && observed.start_rip != expected.start_rip)
+            || (expected.end_rip.is_some() && observed.end_rip != expected.end_rip)
+        {
             msg = "RIP-".to_owned() + &msg;
         }
         if observed.end_time != expected.end_time {
@@ -763,6 +795,8 @@ pub fn immediate_fatal_exit() {
 pub struct ConsumeResult {
     /// Should we keep runnning this thread, if false we background the current thread after this schedevent to let the next thread run.
     pub keep_running: bool,
+    /// A timeslice this thread is required to run according to the replay schedule
+    pub end_of_timeslice: Option<LogicalTime>,
     /// Should we print the stacktrace in the guest, as per --stacktrace-event
     pub print_stack: MaybePrintStack,
     /// The number of this event in the global total order of events.
@@ -826,6 +860,7 @@ impl Scheduler {
             started_up: Default::default(),
             thread_tree: Default::default(),
             priorities: Default::default(),
+            timeslices: Default::default(),
         }
     }
 
@@ -880,6 +915,42 @@ impl Scheduler {
         result
     }
 
+    /// This function look-aheads into following instruction to determine if
+    /// an explicit timer preemption is required while replaying. This is required when
+    /// the original run schedule was modified before replaying which should be a valid
+    /// usecase for hermit analyze
+    fn resolve_explicit_end_of_time(&self, next: &SchedEvent) -> Option<LogicalTime> {
+        if let Some(ref replay_cursor) = self.replay_cursor {
+            match (next, replay_cursor.peek_nth(1), replay_cursor.peek_nth(2)) {
+                (
+                    SchedEvent { op: Op::Branch, .. },
+                    Some(SchedEvent {
+                        op: Op::OtherInstructions,
+                        ..
+                    }),
+                    Some(SchedEvent { op: Op::Branch, .. }),
+                )
+                | (
+                    // this is currently impossible because we always have OtherInstruction
+                    // following a branch but this doesn't have to be the case and it might
+                    // be better to avoid this behavior in the future
+                    SchedEvent { op: Op::Branch, .. },
+                    Some(SchedEvent { op: Op::Branch, .. }),
+                    _,
+                ) => {
+                    trace!(
+                        "matching sequence to setup end_of_timeslice: {:?}",
+                        next.end_time
+                    );
+                    next.end_time
+                }
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
     /// Verify that the event we're replaying matches what just happened.  Set up the next
     /// (replayed) event to run.  Return true if the current thread will keep running and false if
     /// it needs to be descheduled.
@@ -894,7 +965,6 @@ impl Scheduler {
         let current_ix = self.traced_event_count;
         self.traced_event_count += 1;
         let print_stack = self.try_pop_stacktrace_event(current_ix);
-
         if let Some(expected) = self
             .replay_cursor
             .as_mut()
@@ -928,10 +998,16 @@ impl Scheduler {
                 }
             }
 
-            let keep_running = if let Some(next_ev) = self.replay_cursor.as_mut().unwrap().peek() {
+            let (keep_running, timeslice) = if let Some(next_ev) =
+                self.replay_cursor.as_ref().unwrap().peek()
+            {
+                let is_prehook = matches!(observed.op, Op::Syscall(_, SyscallPhase::Prehook));
+
                 let next_tid = next_ev.dettid;
+                // Checking for an optional timeslice in case of RCB
+                let timeslice = self.resolve_explicit_end_of_time(next_ev);
+
                 if next_tid != observed.dettid {
-                    let is_prehook = matches!(observed.op, Op::Syscall(_, SyscallPhase::Prehook));
                     if is_prehook {
                         info!(
                             "[detcore, dtid {}] CONTEXT SWITCH to {} after this syscall blocks.  Reprioritizing at time {}",
@@ -943,25 +1019,34 @@ impl Scheduler {
                             &mytid, next_tid, time
                         );
                     }
+
                     self.requeue_with_new_priority(mytid, REPLAY_DEFERRED_PRIORITY);
                     self.requeue_with_new_priority(next_tid, REPLAY_FOREGROUND_PRIORITY);
+                    self.timeslices.insert(next_tid, timeslice);
                     // The *downgrading* of the current thread will be handled by the caller if the
                     // context switch is *now*.  If the last traced event on this thread is instead
                     // a prehook, well we don't deschedule the current thread quite yet.  Rather, we
                     // let the thread plow ahead, and actually block on the syscall, which will have
                     // the effect of descheduling the therad anyway.  After that, the priorities
                     // be set so as to make sure the correct thread (next_tid) runs.
-                    is_prehook
+                    (is_prehook, timeslice)
                 } else {
-                    true // We're still running the next event.
+                    // We're still running the next event.
+                    (true, timeslice)
                 }
             } else {
-                true // We're the very last event.  Nothing to do.
+                (true, None) // We're the very last event.  Nothing to do.
             };
+            trace!(
+                "returning consume_event: keep_running = {}, timeslice: {:?}",
+                keep_running,
+                timeslice
+            );
             ConsumeResult {
                 keep_running,
                 print_stack,
                 event_ix: current_ix,
+                end_of_timeslice: timeslice,
             }
         } else {
             if self.replay_exhausted_panic {
@@ -981,6 +1066,7 @@ impl Scheduler {
                 keep_running: true,
                 print_stack: None,
                 event_ix: current_ix,
+                end_of_timeslice: None,
             }
         }
     }
@@ -1904,7 +1990,14 @@ impl Scheduler {
         let answer = if sig {
             SchedResponse::Signaled()
         } else {
-            SchedResponse::Go(None)
+            let timeslice = self.timeslices.remove(&dtid).flatten();
+            // TODO(T137799529): use a more strongly typed representation rather than reusing
+            // SchedValue/u64:
+            let as_schedvalue = timeslice
+                .as_ref()
+                .map(LogicalTime::as_nanos)
+                .map(SchedValue::Value);
+            SchedResponse::Go(as_schedvalue)
         };
         resp.put(answer);
     }
@@ -1975,6 +2068,7 @@ impl Scheduler {
                 keep_running,
                 print_stack,
                 event_ix: _,
+                end_of_timeslice: _,
             } = self.consume_schedevent(&ev);
             // We should not ever need to background the thread when it is going to exit anyway.
             if !keep_running {
