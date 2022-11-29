@@ -94,9 +94,12 @@ pub use types::DetTid;
 use types::*;
 pub use util::punch_out_print;
 
+use crate::resources::Permission;
+use crate::resources::ResourceID;
 use crate::tool_global::resource_request;
 use crate::tool_global::trace_schedevent;
 use crate::tool_global::unrecoverable_shutdown;
+use crate::types::SigWrapper;
 
 #[macro_use]
 extern crate bitflags;
@@ -653,15 +656,43 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             unrecoverable_shutdown(guest).await
         } else {
             self.pre_handler_hook(guest).await;
-            let thread_state = guest.thread_state_mut();
-            info!(
-                "detcore handling signal (#{}) {}",
-                thread_state.stats.signal_count, signal
-            );
-            thread_state.stats.count_signal();
 
-            // TODO(T98118634): suppress every signal and delay it until the scheduler is
-            // ready to deliver.
+            let dettid = guest.thread_state().dettid;
+            let mycount = guest.thread_state().stats.signal_count;
+            info!(
+                "[dtid {}] handling inbound signal (#{}) {}",
+                dettid, mycount, signal
+            );
+            guest.thread_state_mut().stats.count_signal();
+            let time = &guest.thread_state().thread_logical_time;
+            let nanos = time.as_nanos();
+
+            if self.cfg.sequentialize_threads && self.cfg.should_trace_schedevent() {
+                trace_schedevent(
+                    guest,
+                    SchedEvent {
+                        dettid,
+                        op: Op::SignalReceived(signal.into()),
+                        count: 1,
+                        start_rip: None,
+                        end_rip: None,
+                        end_time: Some(nanos),
+                    },
+                    true,
+                )
+                .await;
+            }
+
+            let request = guest.thread_state_mut().mk_request(
+                ResourceID::InboundSignal(SigWrapper(signal)),
+                Permission::RW,
+            );
+            resource_request(guest, request).await;
+            info!(
+                "[dtid {}] finish delivering signal (#{}) {}",
+                dettid, mycount, signal
+            );
+
             self.post_handler_hook(guest).await;
             Ok(Some(signal))
         }
