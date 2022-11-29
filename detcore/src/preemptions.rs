@@ -10,9 +10,11 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::iter::FromIterator;
 use std::path::Path;
 use std::path::PathBuf;
 
+use detcore_model::collections::ReplayCursor;
 use serde::Deserialize;
 use serde::Serialize;
 use tracing::trace;
@@ -72,6 +74,25 @@ impl PreemptionRecord {
         }
         self.global = Vec::new();
         self
+    }
+
+    /// Iterates over each sched event and applies function event -> *event yielding resulting iterator as new events
+    /// This effectively moves content of global allowing to split or delete events based on the function provided
+    pub fn split_map<F, R>(&mut self, splitter: F)
+    where
+        R: IntoIterator<Item = SchedEvent>,
+        F: Fn(SchedEvent, &ReplayCursor<SchedEvent>) -> R,
+    {
+        let mut result = Vec::new();
+        let global = std::mem::take(&mut self.global);
+        let mut cursor = ReplayCursor::from_iter(global);
+
+        while let Some(event) = cursor.next() {
+            for new_event in splitter(event, &cursor) {
+                result.push(new_event);
+            }
+        }
+        self.global = result;
     }
 
     /// Leave only the per-thread preemption records, not the global schedule.
@@ -371,6 +392,7 @@ impl Iterator for ThreadHistoryIterator {
 
 #[cfg(test)]
 mod tests {
+    use detcore_model::schedule::Op;
     use pretty_assertions::assert_eq;
     use test_case::test_case;
 
@@ -542,6 +564,67 @@ mod tests {
 
         pr_with_latest_removed.validate().unwrap();
         self::assert_eq!(pr_with_latest_removed, expected_pr);
+    }
+
+    #[test]
+    fn test_split_map() {
+        let mut pr: PreemptionRecord = serde_json::from_str(
+            r#"
+            {
+                "per_thread" : {
+                },
+                "global" : [
+                    {
+                        "dettid": 3,
+                        "op": "OtherInstructions",
+                        "count": 1,
+                        "start_rip": null,
+                        "end_rip": null,
+                        "end_time": 946684799000000000
+                    },
+                    {
+                        "dettid": 3,
+                        "op": "Branch",
+                        "count": 311,
+                        "start_rip": null,
+                        "end_rip": null,
+                        "end_time": 946684799000003110
+                    },
+                    {
+                        "dettid": 3,
+                        "op": "OtherInstructions",
+                        "count": 1,
+                        "start_rip": null,
+                        "end_rip": null,
+                        "end_time": 946684799000003110
+                    }
+                ]
+            }
+        "#,
+        )
+        .unwrap();
+        let original = pr.global.clone();
+        pr.split_map(|e, _| vec![e]); // shouldn't change contents with this
+        assert_eq!(original, pr.global);
+
+        pr.split_map(|e, _| match &e {
+            // this will split event with Op::Branch into two
+            SchedEvent { op: Op::Branch, .. } => vec![e.clone(), e],
+            _ => vec![e],
+        });
+
+        assert_eq!(
+            pr.global.iter().map(|e| e.op).collect::<Vec<_>>(),
+            vec![
+                Op::OtherInstructions,
+                Op::Branch,
+                Op::Branch,
+                Op::OtherInstructions
+            ]
+        );
+
+        pr.split_map(|_, _| vec![]); // this will remove all entries
+        assert_eq!(pr.global, Vec::new());
     }
 }
 
