@@ -8,6 +8,7 @@
 
 use std::num::NonZeroUsize;
 
+use nix::sys::signal::Signal;
 use reverie_syscalls::Sysno;
 use serde::Deserialize;
 use serde::Serialize;
@@ -97,6 +98,15 @@ pub enum SyscallPhase {
     Posthook,
 }
 
+#[derive(PartialEq, Debug, Eq, Copy, Clone, Hash, Serialize, Deserialize)]
+pub struct SignalInfo(i32);
+
+impl From<Signal> for SignalInfo {
+    fn from(sig: Signal) -> Self {
+        Self(unsafe { std::mem::transmute(sig) })
+    }
+}
+
 /// The observable operations that happen on a guest thread.  Each of these ultimately corresponds
 /// to marker between two instructions.  As follows:
 ///
@@ -125,4 +135,8 @@ pub enum Op {
     /// An unknown number of other instructions that occured BETWEEN hermit-interceptable events.
     /// The only way to preempt inbewteen these is expensive single-stepping.
     OtherInstructions,
+
+    /// The point a signal handler is received, just after whatever regular user instruction
+    /// preceeded it, and just before the first instruction of the signal handler.
+    SignalReceived(SignalInfo),
 }
