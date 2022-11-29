@@ -16,6 +16,7 @@ use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::path::Path;
+use std::str::FromStr;
 
 use clap;
 use clap::Parser;
@@ -51,6 +52,78 @@ pub struct LogDiffOpts {
     /// Do not consider "DETLOG" messages for deterministic check
     #[clap(long)]
     pub skip_detlog: bool,
+
+    /// In case --skip-detlog=false this parameter further filters which
+    /// "DETLOG" messages will be included for determnistic check
+    #[clap(long, default_values = &["syscall", "syscallresult", "other"])]
+    pub include_detlogs: Vec<DetLogFilter>,
+}
+
+impl LogDiffOpts {
+    fn is_skip(&self, filter: DetLogFilter) -> bool {
+        !self.include_detlogs.contains(&filter)
+    }
+
+    fn skip_detlog(&self, entry: &str) -> bool {
+        if self.skip_detlog {
+            return true;
+        }
+
+        if is_detlog_syscall(entry) && self.is_skip(DetLogFilter::Syscall) {
+            return true;
+        }
+        if is_detlog_syscall_result(entry) && self.is_skip(DetLogFilter::SyscallResult) {
+            return true;
+        }
+
+        if !is_detlog_syscall(entry)
+            && !is_detlog_syscall_result(entry)
+            && self.is_skip(DetLogFilter::Other)
+        {
+            return true;
+        }
+
+        false
+    }
+
+    fn filter_deterministic<'a>(&self, v: &[(usize, &'a str)]) -> Vec<(usize, &'a str)> {
+        v.iter()
+            .filter_map(|(i, s)| {
+                if (is_detlog(s) && !self.skip_detlog(s)) || (is_commit(s) && !self.skip_commit) {
+                    Some((*i, *s))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+/// Indicates which DETLOG entries to be used for log-diff comparison
+#[derive(Debug, PartialEq, Eq)]
+pub enum DetLogFilter {
+    ///the start of syscall will be used for logdiff
+    Syscall,
+    ///the syscall result  will be used for logdiff
+    SyscallResult,
+    ///all other unspecified DETLOG entries will be used for logdiff
+    Other,
+}
+
+impl FromStr for DetLogFilter {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "syscall" => Ok(DetLogFilter::Syscall),
+            "syscallresult" => Ok(DetLogFilter::SyscallResult),
+            "other" => Ok(DetLogFilter::Other),
+            _ => Err(anyhow::Error::msg(format!(
+                "unknown value {} for DetLogFilter",
+                s
+            ))),
+        }
+    }
 }
 
 /// N.B. we don't want to specify two different notions of "default", so we use the
@@ -170,22 +243,6 @@ fn _truncate_messages(_v: &[&str]) -> String {
 
 fn filter_infos<'a>(v: &[(usize, &'a str)]) -> Vec<(usize, &'a str)> {
     v.iter().filter(|(_i, s)| is_info(s)).copied().collect()
-}
-
-fn filter_deterministic<'a>(
-    v: &[(usize, &'a str)],
-    skip_commit: bool,
-    skip_detlog: bool,
-) -> Vec<(usize, &'a str)> {
-    v.iter()
-        .filter_map(|(i, s)| {
-            if (is_detlog(s) && !skip_detlog) || (is_commit(s) && !skip_commit) {
-                Some((*i, *s))
-            } else {
-                None
-            }
-        })
-        .collect()
 }
 
 fn filter_detcore<'a>(v: &[(usize, &'a str)]) -> Vec<(usize, &'a str)> {
@@ -408,8 +465,8 @@ fn log_diff_from_strs(
     let vec_b = filter_detcore(&vec_b);
     let infos_a = filter_infos(&vec_a);
     let infos_b = filter_infos(&vec_b);
-    let detlogs_a = filter_deterministic(&vec_a, opts.skip_commit, opts.skip_detlog);
-    let detlogs_b = filter_deterministic(&vec_b, opts.skip_commit, opts.skip_detlog);
+    let detlogs_a = opts.filter_deterministic(&vec_a);
+    let detlogs_b = opts.filter_deterministic(&vec_b);
     let syscalls = collect_syscalls(&vec_a);
     writeln!(
         w,
@@ -453,6 +510,8 @@ fn log_diff_from_strs(
 #[cfg(test)]
 mod test {
     use pretty_assertions::assert_eq;
+
+    use crate::logdiff::DetLogFilter;
 
     #[test]
     fn test_compare_with_no_color() {
@@ -502,6 +561,11 @@ mod test {
                 skip_commit: false,
                 skip_detlog: false,
                 ignore_lines: Vec::new(),
+                include_detlogs: vec![
+                    DetLogFilter::Syscall,
+                    DetLogFilter::SyscallResult,
+                    DetLogFilter::Other,
+                ],
             },
             &mut result,
         )?;
@@ -560,6 +624,11 @@ mod test {
                 skip_commit: false,
                 skip_detlog: false,
                 ignore_lines: Vec::new(),
+                include_detlogs: vec![
+                    DetLogFilter::Syscall,
+                    DetLogFilter::SyscallResult,
+                    DetLogFilter::Other,
+                ],
             },
             &mut result,
         )?;
@@ -644,7 +713,16 @@ mod test {
 
     #[test]
     fn test_filter_deterministic() {
-        let v = super::filter_deterministic(
+        let opts = super::LogDiffOpts {
+            include_detlogs: vec![
+                DetLogFilter::Syscall,
+                DetLogFilter::SyscallResult,
+                DetLogFilter::Other,
+            ],
+            ..Default::default()
+        };
+
+        let v = opts.filter_deterministic(
             &[
                 (
                     1,
@@ -659,8 +737,6 @@ mod test {
                     "INFO COMMIT turn 5, dettid 2 using resources {Path(\"/proc/2/fd/1\"): W} at time 946684799205300000",
                 ),
             ],
-            false,
-            false,
         );
 
         assert_eq!(
@@ -676,6 +752,33 @@ mod test {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn test_filter_deterministic_with_filter() {
+        let opts = super::LogDiffOpts {
+            include_detlogs: vec![DetLogFilter::Syscall],
+            skip_commit: true,
+            ..Default::default()
+        };
+
+        let v = opts.filter_deterministic(
+            &[
+                (
+                    1,
+                    "INFO detcore: registers [dtid 3]. user_regs_struct { r15...",
+                ),
+                (
+                    2,
+                    "INFO DETLOG detcore:[syscall] syscall 1",
+                ),
+                (
+                    3,
+                    "INFO COMMIT turn 5, dettid 2 using resources {Path(\"/proc/2/fd/1\"): W} at time 946684799205300000",
+                ),
+            ],
+        );
+        assert_eq!(v, vec![(2, "INFO DETLOG detcore:[syscall] syscall 1")]);
     }
 
     #[test]
