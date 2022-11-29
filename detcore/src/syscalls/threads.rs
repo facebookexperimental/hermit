@@ -447,31 +447,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::SchedGetaffinity,
     ) -> Result<i64, Error> {
-        const MAX_BYTES: usize = 1024;
+        let size_bytes: usize = call.len() as usize;
 
         // N.B. we can't use an opaque, type-safe representation such as
         // nix::sched::CpuSet currently.  The problem is that the
         // SchedGetAffinity syscall treats this field as a u64.
-        let mut cpu_set: [u8; MAX_BYTES] = [0; MAX_BYTES];
-        cpu_set[0] = 1;
+        let mut cpu_set = vec![0u8; size_bytes];
 
-        let mut size_bytes: usize = call.len() as usize;
-        if size_bytes > MAX_BYTES {
-            tracing::error!(
-                "sched_getaffinity: Not expecting request for more than {} byte cpu mask, actual was {} bytes",
-                MAX_BYTES,
-                size_bytes,
-            );
-            size_bytes = MAX_BYTES;
+        if let Some(first) = cpu_set.first_mut() {
+            *first = 1;
         }
-        let cpu_set = &cpu_set[..size_bytes]; // Crop it down to what was requested.
+
         info!(
             "Suppressing sched_getaffinity and returning {}-byte virtualized result, {:?}",
             size_bytes, cpu_set
         );
         if let Some(mask) = call.mask() {
             let mask: AddrMut<u8> = mask.cast();
-            guest.memory().write_exact(mask, cpu_set)?;
+            guest.memory().write_exact(mask, &cpu_set)?;
             // From the man page:
             // > On success, the raw sched_getaffinity() system call returns the size (in bytes) of
             // > the cpumask_t data type that is used internally by the kernel to represent the CPU
