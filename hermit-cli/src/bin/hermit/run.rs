@@ -110,11 +110,17 @@ pub struct RunOpts {
     )]
     network: NetworkingMode,
 
-    /// Runs the given program in "lite" mode. In this mode, a PID namespace is created and `/tmp`
-    /// is isolated. It is still possible to introduce non-determinism through time and thread
-    /// scheduling. Still isolates network by default but can be combined with `--net=host`.
-    #[clap(long, conflicts_with = "chaos", conflicts_with = "verify")]
-    lite: bool,
+    /// Runs the given program only with namespaces, not syscall interception.  In this mode, a PID
+    /// namespace is created and `/tmp` is isolated, but nothing is done to determinize execution.
+    /// This can be combined with any of the network isolation levels, and is useful for a quick
+    /// smoke test of whether something runs under hermit at all.
+    #[clap(
+        long,
+        alias = "lite",
+        conflicts_with = "chaos",
+        conflicts_with = "verify"
+    )]
+    namespace_only: bool,
 
     /// Specifies the directory to use as `/tmp`. This path gets bind-mounted
     /// over `/tmp` and the guest program does not see the real `/tmp` directory.
@@ -155,7 +161,7 @@ pub struct RunOpts {
     pub(crate) summary: bool,
 
     /// Containarize networking and warn for non-zero bindings. Implies
-    /// an isolated network nampespace and thus conflicts with `--net=host`.
+    /// an isolated network nampespace and thus conflicts with `--network=host`.
     #[clap(long)]
     analyze_networking: bool,
 
@@ -351,8 +357,8 @@ impl fmt::Display for RunOpts {
         if self.network != Default::default() {
             write!(f, " --network={}", self.network)?;
         }
-        if self.lite {
-            write!(f, " --lite")?;
+        if self.namespace_only {
+            write!(f, " --namespace-only")?;
         }
         if self.summary {
             write!(f, " --summary")?;
@@ -644,8 +650,8 @@ impl RunOpts {
         self.validate_args();
         // });
 
-        if self.lite {
-            self.run_lite(global)
+        if self.namespace_only {
+            self.run_with_namespace_only(global)
         } else if self.verify {
             self.verify(global)
         } else {
@@ -737,7 +743,7 @@ impl RunOpts {
         with_container(&mut container, || self.run_in_container(global))
     }
 
-    fn run_lite(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+    fn run_with_namespace_only(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         // TODO: Make this use detcore instead after detcore is capable of being
         // "lightweight".
         let _guard = global.init_tracing();
