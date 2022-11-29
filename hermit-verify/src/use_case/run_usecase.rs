@@ -9,6 +9,7 @@
 use colored::Colorize;
 
 use super::UseCase;
+use crate::common::LogDiffOptions;
 use crate::common::RunEnvironment;
 use crate::common::Verify;
 use crate::use_case::run_hermit::output_stderr;
@@ -33,13 +34,18 @@ fn compare_results<T: UseCase>(
         result &= verify.verify_stderr(left, right)?;
     }
 
-    if options.verify_commits || options.verify_detlog {
+    if options.should_log_diff() {
         result &= verify.verify_logs(
             left,
             right,
-            !options.verify_detlog,
-            !options.verify_commits,
-            options.ignore_lines,
+            LogDiffOptions {
+                ignore_lines: options.ignore_lines,
+                skip_commits: !options.verify_commits,
+                skip_detlog_others: !options.verify_detlog_others,
+                skip_detlog_syscalls: !options.verify_detlog_syscalls,
+                skip_detlog_syscall_results: !options.verify_detlog_syscall_results,
+                syscall_history: 5,
+            },
         )?;
     }
 

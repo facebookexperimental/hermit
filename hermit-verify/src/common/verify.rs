@@ -20,6 +20,55 @@ pub struct Verify<P: AsRef<OsStr>> {
     hermit_bin: P,
 }
 
+/// options to pass for log diff tool
+#[derive(Default)]
+pub struct LogDiffOptions {
+    /// Number of syscalls to display when failure
+    pub syscall_history: usize,
+    /// Whether to skip commits for determinism check
+    pub skip_commits: bool,
+    /// Whether to skip syscalls for determinism check
+    pub skip_detlog_syscalls: bool,
+    /// Whether to skip syscall results for determinism check
+    pub skip_detlog_syscall_results: bool,
+    /// Whether to skip the rest of DETLOGs for determinism check
+    pub skip_detlog_others: bool,
+    /// Which lines to ignore for DETLOGs
+    pub ignore_lines: Option<String>,
+}
+
+impl LogDiffOptions {
+    fn into_args(self) -> Vec<String> {
+        let mut result = Vec::new();
+        if self.skip_detlog_others && self.skip_detlog_syscalls && self.skip_detlog_syscall_results
+        {
+            result.push("--skip-detlog".to_owned());
+        } else {
+            if !self.skip_detlog_others {
+                result.push("--include-detlogs=other".to_owned());
+            }
+            if !self.skip_detlog_syscall_results {
+                result.push("--include-detlogs=syscallresult".to_owned());
+            }
+            if !self.skip_detlog_syscalls {
+                result.push("--include-detlogs=syscall".to_owned());
+            }
+        }
+
+        if self.skip_commits {
+            result.push("--skip-commit".to_owned())
+        }
+
+        result.push(format!("--syscall-history={}", self.syscall_history));
+
+        if let Some(ignore_lines) = self.ignore_lines {
+            result.push(format!("--ignore-lines={}", ignore_lines));
+        }
+
+        result
+    }
+}
+
 impl<P: AsRef<OsStr>> Verify<P> {
     pub fn new(hermit_bin: P) -> Self {
         Self { hermit_bin }
@@ -126,22 +175,11 @@ impl<P: AsRef<OsStr>> Verify<P> {
         &self,
         left: &RunEnvironment,
         right: &RunEnvironment,
-        skip_detlog: bool,
-        skip_commit: bool,
-        ignore_lines: Option<String>,
+        options: LogDiffOptions,
     ) -> Vec<String> {
         let mut result = vec![];
         result.push(String::from("log-diff"));
-        result.push(String::from("--syscall-history=5"));
-        if skip_detlog {
-            result.push(String::from("--skip-detlog"));
-        }
-        if skip_commit {
-            result.push(String::from("--skip-commit"));
-        }
-        if let Some(mode) = ignore_lines {
-            result.push(format!("--ignore-lines={}", mode));
-        }
+        result.append(&mut options.into_args());
         result.push(format!("{}", left.log_file_path.display()));
         result.push(format!("{}", right.log_file_path.display()));
 
@@ -152,13 +190,11 @@ impl<P: AsRef<OsStr>> Verify<P> {
         &self,
         left: &RunEnvironment,
         right: &RunEnvironment,
-        skip_detlog: bool,
-        skip_commit: bool,
-        ignore_lines: Option<String>,
+        options: LogDiffOptions,
     ) -> anyhow::Result<bool> {
         println!("{}", "::  Comparing log files".bold());
         let mut command = std::process::Command::new(&self.hermit_bin);
-        command.args(self.build_command_args(left, right, skip_detlog, skip_commit, ignore_lines));
+        command.args(self.build_command_args(left, right, options));
 
         println!("{}", format!("    {}", display_cmd(&command)).bold());
         Ok(command.status()?.success())
@@ -196,9 +232,10 @@ mod test {
         let args = verify.build_command_args(
             &env.runs()[0],
             &env.runs()[1],
-            false,
-            false,
-            Some(String::from("test")),
+            LogDiffOptions {
+                ignore_lines: Some(String::from("test")),
+                ..Default::default()
+            },
         );
 
         assert_eq!(args.into_iter().any(|x| x == "--ignore-lines=test"), true);
@@ -209,7 +246,14 @@ mod test {
     fn test_build_command_args_ignore_lines_not_provided() -> anyhow::Result<()> {
         let env = TemporaryEnvironmentBuilder::new().run_count(2).build()?;
         let verify = Verify::new(PathBuf::from("hermit"));
-        let args = verify.build_command_args(&env.runs()[0], &env.runs()[1], false, false, None);
+        let args = verify.build_command_args(
+            &env.runs()[0],
+            &env.runs()[1],
+            LogDiffOptions {
+                ignore_lines: None,
+                ..Default::default()
+            },
+        );
 
         assert_eq!(
             args.into_iter().any(|x| x.contains("--ignore-lines")),

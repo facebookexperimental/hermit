@@ -12,4 +12,5 @@ mod verify;
 
 pub use env::*;
 pub use opts::CommonOpts;
+pub use verify::LogDiffOptions;
 pub use verify::Verify;
