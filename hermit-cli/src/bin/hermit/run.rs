@@ -122,6 +122,22 @@ pub struct RunOpts {
     )]
     namespace_only: bool,
 
+    /// Run the program in the minimally invasive mode which still intercepts syscalls.
+    /// It should be combined with activating logging at the INFO level or higher (`hermit
+    /// --log=info`), in order to print out those syscalls like strace.
+    ///
+    /// This does not determinize execution.  It is a shorthand for
+    /// --tmp=/tmp --network=host --no-virtualize-cpuid --no-virtualize-time --no-virtualize-metadata --no-sequentialize-threads --no-deterministic-io --no-rcb-time /bin/date
+    #[clap(
+        long,
+        conflicts_with = "chaos",
+        conflicts_with = "namespace-only",
+        conflicts_with = "seed",
+        conflicts_with = "seed-from",
+        conflicts_with = "analyze-networking"
+    )]
+    strace_only: bool,
+
     /// Specifies the directory to use as `/tmp`. This path gets bind-mounted
     /// over `/tmp` and the guest program does not see the real `/tmp` directory.
     /// If this path does not exist, it is created.
@@ -660,6 +676,7 @@ impl RunOpts {
     }
 
     /// Some arguments imply others. This is the place where that validation occurs.
+    /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
     pub fn validate_args(&mut self) {
         let config = &mut self.det_opts.det_config;
 
@@ -721,6 +738,19 @@ impl RunOpts {
         // we're expecting full determinstic execution (sequentialize_threads).
         if config.preemption_timeout.is_some() && config.sequentialize_threads {
             self.pin_threads = true;
+        }
+
+        if self.strace_only {
+            config.virtualize_cpuid = false;
+            config.virtualize_metadata = false;
+            config.virtualize_time = false;
+            config.deterministic_io = false;
+            self.network = NetworkingMode::Host;
+            config.sequentialize_threads = false;
+            config.no_rcb_time = true;
+            if self.tmp.is_none() {
+                self.tmp = Some(PathBuf::from("/tmp"));
+            }
         }
     }
 
