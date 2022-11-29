@@ -6,14 +6,5 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Widely-shared type definitions.
-
-pub mod collections;
-pub mod config;
-pub mod fd;
-pub mod futex;
-pub mod pid;
-pub mod schedule;
-pub mod time;
-
-pub use config::SigWrapper;
+mod replay_cursor;
+pub use replay_cursor::ReplayCursor;

@@ -45,7 +45,7 @@ impl<T> Iterator for ReplayCursor<T> {
 
 impl<T> FromIterator<T> for ReplayCursor<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let reverse_data: VecDeque<_> = iter.into_iter().collect();
+        let reverse_data: VecDeque<_> = VecDeque::from_iter(iter);
         Self {
             inner_data: reverse_data,
         }

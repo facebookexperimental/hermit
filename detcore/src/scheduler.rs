@@ -8,7 +8,6 @@
 
 //! Deterministic scheduling algorithm.
 
-pub mod replay_cursor;
 pub mod runqueue;
 pub mod timed_waiters;
 
@@ -25,10 +24,10 @@ use std::time::Duration;
 use std::u64;
 use std::vec::IntoIter;
 
+use detcore_model::collections::ReplayCursor;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
-use replay_cursor::ReplayCursor;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 pub use runqueue::entropy_to_priority;
