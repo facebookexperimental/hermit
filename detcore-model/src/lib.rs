@@ -15,5 +15,3 @@ pub mod futex;
 pub mod pid;
 pub mod schedule;
 pub mod time;
-
-pub use config::SigWrapper;

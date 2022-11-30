@@ -11,6 +11,6 @@
 pub use detcore_model::fd::*;
 pub use detcore_model::futex::*;
 pub use detcore_model::pid::*;
+pub use detcore_model::schedule::SigWrapper;
 pub use detcore_model::schedule::*;
 pub use detcore_model::time::*;
-pub use detcore_model::SigWrapper;

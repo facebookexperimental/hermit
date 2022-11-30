@@ -18,14 +18,11 @@ use std::str::FromStr;
 use chrono::DateTime;
 use chrono::Utc;
 use clap::Parser;
-use nix::errno;
-use nix::sys::signal::Signal;
-use serde::de;
 use serde::Deserialize;
 use serde::Serialize;
-use serde::Serializer;
 
 use crate::pid::DetTid;
+use crate::schedule::SigWrapper;
 
 /// Configuration options for detcore.
 #[derive(Debug, Serialize, Deserialize, Clone, Parser)]
@@ -582,54 +579,5 @@ impl Default for Config {
     fn default() -> Self {
         let v: Vec<String> = vec![];
         Config::from_iter(v.iter())
-    }
-}
-
-/// Simply a type to hang Serialize/Deserialize instances off of.
-#[derive(PartialEq, Debug, Eq, Clone, Hash)]
-pub struct SigWrapper(pub Signal);
-
-impl Serialize for SigWrapper {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.0.as_str())
-    }
-}
-
-impl<'de> de::Deserialize<'de> for SigWrapper {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: de::Deserializer<'de>,
-    {
-        struct SignalVisitor;
-        impl<'de> de::Visitor<'de> for SignalVisitor {
-            type Value = Signal;
-
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                write!(f, "string representing a Signal")
-            }
-
-            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                let sig: Result<Signal, String> =
-                    FromStr::from_str(v).map_err(|e: errno::Errno| e.to_string());
-                sig.map_err(de::Error::custom)
-            }
-        }
-
-        let sig = deserializer.deserialize_str(SignalVisitor)?;
-        Ok(SigWrapper(sig))
-    }
-}
-
-impl FromStr for SigWrapper {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> anyhow::Result<Self> {
-        Ok(SigWrapper(Signal::from_str(s)?))
     }
 }

@@ -7,11 +7,14 @@
  */
 
 use std::num::NonZeroUsize;
+use std::str::FromStr;
 
 use nix::sys::signal::Signal;
 use reverie_syscalls::Sysno;
+use serde::de;
 use serde::Deserialize;
 use serde::Serialize;
+use serde::Serializer;
 
 use crate::pid::DetTid;
 use crate::time::LogicalTime;
@@ -98,12 +101,58 @@ pub enum SyscallPhase {
     Posthook,
 }
 
-#[derive(PartialEq, Debug, Eq, Copy, Clone, Hash, Serialize, Deserialize)]
-pub struct SignalInfo(i32);
+/// Simply a type to hang Serialize/Deserialize instances off of.
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Hash)]
+pub struct SigWrapper(pub Signal);
 
-impl From<Signal> for SignalInfo {
-    fn from(sig: Signal) -> Self {
-        Self(unsafe { std::mem::transmute(sig) })
+impl Serialize for SigWrapper {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.0.as_str())
+    }
+}
+
+impl<'de> de::Deserialize<'de> for SigWrapper {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        struct SignalVisitor;
+        impl<'de> de::Visitor<'de> for SignalVisitor {
+            type Value = Signal;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "string representing a Signal")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let sig: Result<Signal, String> =
+                    FromStr::from_str(v).map_err(|e: nix::errno::Errno| e.to_string());
+                sig.map_err(serde::de::Error::custom)
+            }
+        }
+
+        let sig = deserializer.deserialize_str(SignalVisitor)?;
+        Ok(SigWrapper(sig))
+    }
+}
+
+impl FromStr for SigWrapper {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        Ok(SigWrapper(Signal::from_str(s)?))
+    }
+}
+
+impl From<Signal> for SigWrapper {
+    fn from(signal: Signal) -> Self {
+        Self(signal)
     }
 }
 
@@ -138,5 +187,5 @@ pub enum Op {
 
     /// The point a signal handler is received, just after whatever regular user instruction
     /// preceeded it, and just before the first instruction of the signal handler.
-    SignalReceived(SignalInfo),
+    SignalReceived(SigWrapper),
 }
