@@ -671,7 +671,8 @@ impl RunOpts {
         } else if self.verify {
             self.verify(global)
         } else {
-            self.run(global)
+            let (status, _) = self.run(global, false)?;
+            Ok(status)
         }
     }
 
@@ -765,12 +766,18 @@ impl RunOpts {
         }
     }
 
-    pub fn run(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+    pub fn run(
+        &self,
+        global: &GlobalOpts,
+        capture_output: bool,
+    ) -> Result<(ExitStatus, Option<Output>), Error> {
         let tmpfs = self.tmpfs()?;
 
         let mut container = self.container(tmpfs.path())?;
 
-        with_container(&mut container, || self.run_in_container(global))
+        with_container(&mut container, || {
+            self.run_in_container(global, capture_output)
+        })
     }
 
     fn run_with_namespace_only(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
@@ -934,7 +941,11 @@ impl RunOpts {
         Ok(())
     }
 
-    fn run_in_container(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+    fn run_in_container(
+        &self,
+        global: &GlobalOpts,
+        capture_output: bool,
+    ) -> Result<(ExitStatus, Option<Output>), Error> {
         let _guard = global.init_tracing();
 
         let mut command = Command::new(&self.program);
@@ -966,7 +977,13 @@ impl RunOpts {
         let config = self.det_opts.det_config.clone();
         self.save_config_to_disk()?;
 
-        hermit::run(command, config, self.summary)
+        if capture_output {
+            let out = hermit::run_with_output(command, config, self.summary)?;
+            Ok((out.status, Some(out)))
+        } else {
+            let status = hermit::run(command, config, self.summary)?;
+            Ok((status, None))
+        }
     }
 
     fn run_verify_in_container(

@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::bail;
+use anyhow::Context;
 use clap::Parser;
 use colored::Colorize;
 use detcore::preemptions::read_trace;
@@ -29,6 +30,7 @@ use rand::SeedableRng;
 use rand_pcg::Pcg64Mcg;
 use reverie::process::ExitStatus;
 use reverie::process::Output;
+use tracing::metadata::LevelFilter;
 
 use crate::analyze::types::AnalyzeOpts;
 use crate::analyze::types::ExitStatusConstraint;
@@ -52,7 +54,7 @@ fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {
 /// Right now we don't want turning on logging for `hermit analyze` itself to ALSO turn on logging
 /// for each one of the (many) individual hermit executions it calls.  This could change in the
 /// future and instead share the GlobalOpts passed to `main()`.
-const NO_LOGGING_PLZ: GlobalOpts = GlobalOpts {
+const NO_LOGGING: GlobalOpts = GlobalOpts {
     log: None,
     log_file: None,
 };
@@ -116,19 +118,28 @@ impl AnalyzeOpts {
         let conf_file = root.with_extension("config");
         runopts.save_config = Some(conf_file);
 
-        let log_file = File::create(&log_path)?;
-        let out1: Output = runopts.run_verify(log_file, &NO_LOGGING_PLZ)?;
+        let gopts = if self.verbose || self.selfcheck {
+            GlobalOpts {
+                log: Some(LevelFilter::DEBUG),
+                log_file: Some(log_path.clone()),
+            }
+        } else {
+            NO_LOGGING.clone()
+        };
+
+        let (_, output) = runopts.run(&gopts, true)?;
+        let output: Output = output.context("expected captured output")?;
 
         File::create(root.with_extension("stdout"))
             .unwrap()
-            .write_all(&out1.stdout)
+            .write_all(&output.stdout)
             .unwrap();
         File::create(root.with_extension("stderr"))
             .unwrap()
-            .write_all(&out1.stderr)
+            .write_all(&output.stderr)
             .unwrap();
 
-        let is_a_match = self.output_matches(&out1);
+        let is_a_match = self.output_matches(&output);
         Ok((is_a_match, log_path))
     }
 
@@ -140,7 +151,7 @@ impl AnalyzeOpts {
         sched_seed: u64,
     ) -> Result<Option<(PathBuf, RunOpts)>, Error> {
         yellow_msg(&format!(
-            "Searching (round {}) for a failing execution, chaos --sched-seed={} ",
+            "Searching (round {}) for a target execution, chaos --sched-seed={} ",
             round, sched_seed
         ));
         let runname = format!("search_round_{:0wide$}", round, wide = 3);
@@ -155,6 +166,13 @@ impl AnalyzeOpts {
 
         let (is_a_match, _) = self.launch_config(&runname, &mut ro)?;
         if is_a_match {
+            eprintln!(
+                ":: {}:\n    {}",
+                "Target run established by --search. Reproducer"
+                    .green()
+                    .bold(),
+                self.runopts_to_repro(&ro, Some(&runname))
+            );
             Ok(Some((preempts_path, ro)))
         } else {
             Ok(None)
@@ -220,14 +238,15 @@ impl AnalyzeOpts {
 
     fn runopts_to_repro(&self, runopts: &RunOpts, runname: Option<&str>) -> String {
         if let Some(runname) = runname {
-            let path = self.log_path(runname);
-            format!(
-                "hermit --log=debug --log-file={} run {}",
-                path.display(),
-                runopts
-            )
+            let logging = if self.verbose || self.selfcheck {
+                let path = self.log_path(runname);
+                format!(" --log=debug --log-file={}", path.display())
+            } else {
+                "".to_string()
+            };
+            format!("hermit{} run {}", logging, runopts)
         } else {
-            format!("hermit --log=debug run {}", runopts)
+            format!("hermit run {}", runopts)
         }
     }
 
@@ -340,7 +359,7 @@ impl AnalyzeOpts {
             run1_opts
         );
 
-        let runname = "phase1_target";
+        let runname = "run1_target";
         let preempts_path = self.preempts_path(runname);
 
         if let Some(p) = &self.run1_preemptions {
@@ -488,7 +507,7 @@ impl AnalyzeOpts {
                 run1b_opts,
             )?;
 
-            yellow_msg("[selfcheck] Comparing output from additional run.");
+            yellow_msg("[selfcheck] Comparing output from additional run (run1 vs run1b)");
             let run1b_log_path = self.log_path(runname);
             let status = self.log_diff_preemption_replay(global, run1_log_path, &run1b_log_path);
             if !second_matches {
@@ -915,7 +934,7 @@ impl AnalyzeOpts {
         }
     }
 
-    /// Search for a failing run. Destination passing style: takes the path that it writes its output to.
+    /// Search for a target run. Destination passing style: takes the path that it writes its output to.
     fn do_search(&self, preempts_path: &Path) {
         let search_seed = self.analyze_seed.unwrap_or_else(|| {
             let mut rng0 = rand::thread_rng();
@@ -928,7 +947,7 @@ impl AnalyzeOpts {
         let mut round = 0;
         loop {
             let sched_seed = rng.gen();
-            if let Some((preempts, runopts)) = self
+            if let Some((preempts, _runopts)) = self
                 .launch_search(round, sched_seed)
                 .unwrap_or_else(|e| panic!("Error: {}", e))
             {
@@ -936,15 +955,12 @@ impl AnalyzeOpts {
                 if self.verbose {
                     eprintln!(
                         ":: {}:\nSchedule:\n {}",
-                        "Search successfully found a failing run:".green().bold(),
+                        "Search successfully found a failing run with schedule:"
+                            .green()
+                            .bold(),
                         truncated(1000, serde_json::to_string(&init_schedule).unwrap()),
                     );
                 }
-                eprintln!(
-                    ":: {}:\n    {}",
-                    "Reproducer".green().bold(),
-                    self.runopts_to_repro(&runopts, None)
-                );
                 std::fs::copy(&preempts, preempts_path).expect("file copy to succeed");
                 break;
             }
