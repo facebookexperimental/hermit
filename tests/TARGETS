@@ -232,7 +232,6 @@ buck_sh_test(
         tracereplay =
             # TODO(T124837711): get the rest of the tests working under trace replay:
             not p in [
-                "c/just_spin.c",
                 "c/vforkExec.c",
                 # TODO(T126420790): A particularly gnarly divergence inside pthread code:
                 "c/threadExhaustion.c",

@@ -11,10 +11,12 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-static int x = 0;
+static long x = 0;
+
 void __attribute__((noinline)) foo() {
   x *= 2;
-  x -= 1;
+  x += 10;
+  x /= 2;
 }
 void __attribute__((optnone)) spin() {
   for (int i = 0; i < 15 * 1000 * 1000; i++) {
