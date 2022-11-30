@@ -66,7 +66,7 @@ $HERMIT analyze $ANALYZE_OPTS $HERMIT_ARGS -- "$TESTBIN" > >(tee "$TEMPLOG") \
   || (echo "Analyze failed."; exit 1)
 
 echo ":: [analyze_test] Searching for printed backtraces in $TEMPLOG"
-grep -q "Guest .* below backtrace" "$TEMPLOG" \
+grep -q 'Stack trace for thread' "$TEMPLOG" \
    || (echo "Stack trace not printed by hermit analyze!"; exit 1)
 
 if [[ "$EXPECTED_OUTPUT" != "" ]]; then

@@ -8,6 +8,8 @@
 
 //! Test that --stacktrace-event actually prints the right event.
 
+use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 
 use detcore::preemptions::PreemptionReader;
@@ -51,7 +53,10 @@ fn main() {
         for ix in 0..events.len() - 1 {
             let tid1 = events[ix].dettid;
             let tid2 = events[ix + 1].dettid;
-            if tid1 != tid2 {
+            // Backtraces are not available for events without rips, so exclude switch points
+            // to and from such events. TODO(T138829292): Perhaps this test should instead not
+            // expect backtraces?
+            if tid1 != tid2 && events[ix].end_rip.is_some() && events[ix + 1].end_rip.is_some() {
                 switch_points.push(ix);
                 expected_pairs.push((tid1.as_raw(), tid2.as_raw()));
             }
@@ -80,6 +85,10 @@ fn main() {
         .collect();
 
     let go = |args: Vec<&str>| {
+        let stacktrace_paths: Vec<PathBuf> = before_after_switch
+            .iter()
+            .map(|_ix| NamedTempFile::new().unwrap().path().into())
+            .collect();
         let output = {
             let mut rerun_cmd = Command::new(hermit);
             let mut rerun = &mut rerun_cmd;
@@ -89,8 +98,12 @@ fn main() {
                 .arg("--base-env=minimal")
                 .arg("--tmp=/tmp")
                 .args(args);
-            for ix in &before_after_switch {
-                rerun = rerun.arg(format!("--stacktrace-event={}", ix));
+            for (i, ix) in before_after_switch.iter().enumerate() {
+                rerun = rerun.arg(format!(
+                    "--stacktrace-event={},{}",
+                    ix,
+                    stacktrace_paths[i].display()
+                ));
             }
             eprintln!(":: Running command: {:?}", &rerun);
             rerun.arg(prog).output().expect("hermit run to succeed")
@@ -115,22 +128,16 @@ fn main() {
                 .collect()
         };
 
-        let tids: Vec<i32> = {
-            let re = Regex::new(r":: Guest tid (\d+),").unwrap();
-            stderr
-                .lines()
-                .filter(|l| re.is_match(l))
-                .map(|l| {
-                    let cap = re.captures(l);
-                    cap.unwrap()
-                        .get(1)
-                        .unwrap()
-                        .as_str()
-                        .parse::<i32>()
-                        .unwrap()
-                })
-                .collect()
-        };
+        let tids: Vec<i32> = stacktrace_paths
+            .iter()
+            .filter_map(|path| {
+                let stack = fs::read_to_string(path).ok()?;
+                let re = Regex::new(r#""thread_id":(\d+)"#).unwrap();
+                re.captures(&stack)
+                    .and_then(|captures| captures.get(1))
+                    .and_then(|tid| tid.as_str().parse::<i32>().ok())
+            })
+            .collect();
 
         eprintln!(
             ":: Sched event indices successfully printed ({}): {:?}",

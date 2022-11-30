@@ -26,14 +26,15 @@ RUST_LOG=detcore=trace "$hermit" --log-file="$log1".log run --bind="$tmpdir" --b
   --record-preemptions-to="$log1".trace \
   -- bash -c 'du -sch /usr/bin'
 
-err=$(mktemp -p "$tmpdir")
+stack1=$(mktemp -p "$tmpdir")
+stack2=$(mktemp -p "$tmpdir")
 
 # Print a couple arbitrary points inside this particular guest program.
 RUST_LOG=detcore=trace "$hermit" --log-file="$log2".log run --bind="$tmpdir" --base-env=minimal \
   --replay-schedule-from="$log1".trace \
-  --stacktrace-event=10 --stacktrace-event=26 \
+  --stacktrace-event=10,"$stack1" --stacktrace-event=26,"$stack2" \
   --record-preemptions-to="$log2".trace \
-  -- bash -c 'du -sch /usr/bin' 2> "$err"
+  -- bash -c 'du -sch /usr/bin'
 
 wc "$log1".log "$log2".log "$log1".trace "$log2".trace
 
@@ -46,8 +47,11 @@ fi
 
 "$hermit" log-diff "$log1".log "$log2".log
 
-if ! grep -s "Stack trace for thread" "$err"; then
-  echo "ERROR: failed to print stacktrace for indicated trace events";
+event1_ip=$(jq -r ".frames[0].frame.ip" "$stack1")
+event2_ip=$(jq -r ".frames[0].frame.ip" "$stack2")
+
+if [ "$event1_ip" -eq "$event2_ip" ]; then
+  echo "ERROR: event stacktraces point to the same instruction";
   exit 1
 fi
 

@@ -8,7 +8,6 @@
 
 //! A mode for analyzing a hermit run.
 
-use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -34,6 +33,7 @@ use reverie::process::Output;
 use crate::analyze::types::AnalyzeOpts;
 use crate::analyze::types::ExitStatusConstraint;
 use crate::analyze::types::Report;
+use crate::analyze::types::ReportCriticalEvent;
 use crate::global_opts::GlobalOpts;
 use crate::logdiff::LogDiffCLIOpts;
 use crate::run::RunOpts;
@@ -720,8 +720,10 @@ impl AnalyzeOpts {
             )?;
             eprintln!("{}", self.runopts_to_repro(&runopts, Some(runname)));
 
-            let stack1 = fs::read_to_string(stack1_path).unwrap();
-            let stack2 = fs::read_to_string(stack2_path).unwrap();
+            let stack1_file = File::open(stack1_path).unwrap();
+            let stack1 = serde_json::from_reader(stack1_file).unwrap();
+            let stack2_file = File::open(stack2_path).unwrap();
+            let stack2 = serde_json::from_reader(stack2_file).unwrap();
 
             if res {
                 // Also print to the screen:
@@ -733,9 +735,14 @@ impl AnalyzeOpts {
                 println!("{}", stack2);
                 eprintln!(":: {}", "Completed analysis successfully.".green().bold());
                 Ok(Report {
-                    header,
-                    stack1,
-                    stack2,
+                    critical_event1: ReportCriticalEvent {
+                        event_index: critical_event_index - 1,
+                        stack: stack1,
+                    },
+                    critical_event2: ReportCriticalEvent {
+                        event_index: critical_event_index,
+                        stack: stack2,
+                    },
                 })
             } else {
                 bail!("Internal error! Final run did NOT match the criteria as expected!")

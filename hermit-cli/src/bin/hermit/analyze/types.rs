@@ -14,6 +14,7 @@ use std::str::FromStr;
 use clap::Parser;
 use regex::Regex;
 use reverie::process::ExitStatus;
+use reverie::PrettyBacktrace;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -223,13 +224,21 @@ impl FromStr for ExitStatusConstraint {
 }
 
 /// The final report that comes out of the analyze process.
-#[derive(PartialEq, Default, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
+#[derive(PartialEq, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
 pub struct Report {
-    /// Any additional context about the error detected.
-    pub header: String,
     /// The runtime context for one critical event, which is racing with, and does not commute with
     /// the other.
-    pub stack1: String,
+    pub critical_event1: ReportCriticalEvent,
     /// The runtime context for the other identified critical event.
-    pub stack2: String,
+    pub critical_event2: ReportCriticalEvent,
+}
+
+/// Runtime context for a critical event included in the analyze report.
+#[derive(PartialEq, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
+pub struct ReportCriticalEvent {
+    /// The event index.
+    pub event_index: usize,
+
+    /// The thread stack trace.
+    pub stack: PrettyBacktrace,
 }

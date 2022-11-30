@@ -1455,32 +1455,15 @@ where
     global_time_lower_bound(guest).await
 }
 
-/// Helper function just for printing backtrace to a given file (otherwise stderr)
-fn print_backtrace<G, T>(guest: &mut G, maybe_path: &Option<PathBuf>)
+/// Writes a structured json backtrace to a given file
+fn write_backtrace<G, T>(guest: &mut G, path: &PathBuf)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let mut file_writer: Box<dyn std::io::Write> = match &maybe_path {
-        Some(path) => {
-            Box::new(File::create(path).expect("Failed to open preemption stacktrace log file"))
-        }
-        None => Box::new(std::io::stderr()),
-    };
-    let ts = guest.thread_state();
-    writeln!(
-        file_writer,
-        ":: Guest tid {}, at thread time {}, has the below backtrace.",
-        ts.dettid,
-        ts.thread_logical_time.as_nanos(),
-    )
-    .unwrap();
     if let Some(backtrace) = guest.backtrace() {
-        if let Ok(pbt) = backtrace.pretty() {
-            writeln!(file_writer, "{}", pbt).unwrap();
-        } else {
-            writeln!(file_writer, "{}", backtrace).unwrap();
-        }
+        let file = File::create(path).expect("Failed to open preemption stacktrace log file");
+        serde_json::to_writer(file, &backtrace.force_pretty()).unwrap();
     } else {
         warn!("Could not read backtrace!");
     }
@@ -1548,9 +1531,9 @@ where
                 timeslice,
             }),
         ) => {
-            if let Some(x) = print_stack_strace {
-                trace!("[trace_schedevent] printing stacktrace via Reverie...");
-                print_backtrace(guest, &x);
+            if let Some(Some(path)) = print_stack_strace {
+                trace!("[trace_schedevent] writing stacktrace via Reverie...");
+                write_backtrace(guest, &path);
             }
 
             if timeslice.is_some() && guest.thread_state().past_global_first_execve {
