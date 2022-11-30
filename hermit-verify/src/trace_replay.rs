@@ -13,6 +13,7 @@ use clap::Parser;
 use crate::cli_wrapper::*;
 use crate::common::TemporaryEnvironment;
 use crate::common::TemporaryEnvironmentBuilder;
+use crate::use_case::split_branches_in_file;
 use crate::use_case::UseCase;
 use crate::CommonOpts;
 
@@ -37,6 +38,11 @@ pub struct TraceReplayOpts {
     /// Path to a guest program
     #[clap(value_name = "PROGRAM")]
     guest_program: PathBuf,
+
+    /// Whether to split blocks of multiple branch events in half
+    #[clap(long)]
+    split_branches: bool,
+
     /// Arguments for a guest program
     #[clap(value_name = "ARGS")]
     args: Vec<String>,
@@ -95,12 +101,31 @@ impl UseCase for TraceReplayOpts {
             verify_stderr: true,
             verify_detlog_syscalls: true,
             verify_detlog_syscall_results: true,
-            verify_detlog_others: true,
+            verify_detlog_others: !self.split_branches,
             verify_commits: false,
             verify_exit_statuses: true,
             verify_desync: true,
-            verify_schedules: true,
+            verify_schedules: false,
             ignore_lines: None,
         }
+    }
+
+    fn exec_first_run(
+        &self,
+        common_args: &CommonOpts,
+        temp_env: &TemporaryEnvironment,
+        run: &crate::common::RunEnvironment,
+    ) -> anyhow::Result<()> {
+        crate::use_case::run_hermit(
+            self.build_first_hermit_args(temp_env, run),
+            common_args,
+            run,
+        )?;
+
+        if self.split_branches {
+            split_branches_in_file(&run.schedule_file, true)?;
+        }
+
+        Ok(())
     }
 }

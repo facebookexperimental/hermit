@@ -8,9 +8,11 @@
 
 mod run_hermit;
 mod run_usecase;
+mod split_branches;
 
 pub use run_hermit::run_hermit;
 pub use run_usecase::run_use_case;
+pub use split_branches::split_branches_in_file;
 
 use crate::common::RunEnvironment;
 use crate::common::TemporaryEnvironment;
