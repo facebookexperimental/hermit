@@ -120,6 +120,21 @@ def build_test(name, bin_target, raw, run, no_sequentialize_threads, no_determin
             test = "//hermetic_infra/hermit/hermit-cli:hermit",
         )
 
+def resolve_target_name(path, kind):
+    basename = paths.replace_extension(paths.basename(path), "")
+    return "{}bin_{}".format(kind, basename)
+
+def hermit_verify_c_bin(path, name_suffix, guest_args = [], args = [], hermit_args = [], env = {}):
+    target = resolve_target_name(path, "c")
+    if not native.rule_exists(target):
+        cpp_binary(
+            name = target,
+            srcs = [path],
+            headers = ["c/util/assert.h"],
+            deps = [],
+        )
+    hermit_verify(name = "{}_{}".format(target, name_suffix), guest = "$(location :" + target + ")", guest_args = guest_args, env = env, hermit_args = hermit_args, args = args)
+
 def hermit_verify(name, guest, guest_args = [], args = [], hermit_args = [], env = {}):
     buck_sh_test(
         name = name,

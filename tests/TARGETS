@@ -10,7 +10,7 @@ load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_genrule", "buck_sh_binary", "buck_sh_test")
 load("@fbcode_macros//build_defs:rust_binary.bzl", "rust_binary")
 load("//hermetic_infra/common:wrap_test_suite.bzl", "RR_TEST_TARGETS", "wrap_test_suite")
-load(":helpers.bzl", "hermit_bin_test", "hermit_c_test", "hermit_chaos_stress_test", "hermit_python_test", "hermit_rust_test", "hermit_shell_test")
+load(":helpers.bzl", "hermit_bin_test", "hermit_c_test", "hermit_chaos_stress_test", "hermit_python_test", "hermit_rust_test", "hermit_shell_test", "hermit_verify_c_bin")
 
 # Everything in each of these test folders is an active test. To
 # disable it, delete or move to a disabled/ folder.
@@ -257,6 +257,27 @@ buck_sh_test(
     for t in [
         "//hermetic_infra/hermit/tests:minimal_hello",
     ]
+]
+
+# Similar to trace-replay tests but with lower preemption timeout and schedule split
+
+[
+    hermit_verify_c_bin(
+        args = [
+            "trace-replay",
+            "--split-branches",
+        ],
+        env = {},
+        guest_args = [],
+        hermit_args = hermit_args,
+        name_suffix = "trace_replay_split",
+        path = path,
+    )
+    for path, hermit_args in {
+        "c/just_spin.c": [
+            "--preemption-timeout=10000000",
+        ],
+    }.items()
 ]
 
 buck_genrule(
