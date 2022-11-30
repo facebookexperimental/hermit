@@ -156,14 +156,52 @@ impl From<Signal> for SigWrapper {
     }
 }
 
-/// The observable operations that happen on a guest thread.  Each of these ultimately corresponds
-/// to marker between two instructions.  As follows:
+/// NOTE [Event Semantics]
+///
+/// The observable operations that happen on a guest thread.
+///
+/// Each Op event has a beginning and an end, containing an interval of zero or more instructions
+/// inbetween. Each beginning and end point in time can be thought of as an imaginary marker between
+/// two instructions.  Start/end RIP values, if present in the containing `SchedEvent`, correspond
+/// to those beginning/end points and always point to the *next* instruction to execute.
+///
+/// If we speak of an event as an instantaneous thing, we're usually thinking of it as its end
+/// marker. Which is as follows for each:
 ///
 /// - Branches: after the  branch instruction has retired
-/// - Syscall prehooks: just before the syscall instruction
-/// - Syscall posthooks: just before the syscall instruction
+/// - Syscall prehooks: just before the syscall instruction, after whatever came before
+/// - Syscall posthooks: just after the syscall instruction completes
 /// - Rdtsc/Cpuid: just after the designated instruction
-/// - OtherInstructions: just after the region of zero or more non-interceptable instructions.
+/// - OtherInstructions: just after the region of zero or more branch-free, non-interceptable
+///   instructions.
+/// - SignalReceived: just after the last regular, pre-signal guest instruction, and just before the
+///   first instruction of the signal handler.
+///
+/// If we view each event as a series of instructions contained between its start/end markers, then
+/// the pattern of instructions for each would be as follows.  Here we use simple regular
+/// expressions with "B" standing for branch instructions, "S" for syscall instructions, "R" for
+/// RDTSC, "C" for CPUID, and "O" for all other instructions.
+///
+/// - Branch "O*B"
+/// - Syscall prehook: ""
+/// - Syscall posthook: "S"
+/// - Rdtsc: "R"
+/// - Cpuid: "C"
+/// - OtherInstructions: "O*"
+/// - SignalReceived: ""
+///
+/// A few observations about the above:
+///
+/// - Some events always correspond to zero instructions.
+/// - OtherInstructions are omnipresent "dark matter" that we cannot intercept or count, so are
+///   implicitly present between other events.
+/// - Therefore the OtherInstructions event itself is only interesting insofar as it signals the
+///   absence of other events.
+/// - Branches include an implicit prefix of OtherInstructions.  This is because for a branch count
+///   > 1 to make sense, we need to include the full between-branches O's: "..BO*B..". We could
+///   change this design by going to either extreme. (1) removing implicit O's and changing the
+///   count mechanism to allow repetition of entire sequences "(O*B)^3" instead of "B^3".  Or (2),
+///   including implicit O's in all event types, and not recording them explicitly.
 ///
 #[derive(PartialEq, Debug, Eq, Copy, Clone, Hash, Serialize, Deserialize)]
 pub enum Op {
@@ -182,7 +220,7 @@ pub enum Op {
     Syscall(Sysno, SyscallPhase),
 
     /// An unknown number of other instructions that occured BETWEEN hermit-interceptable events.
-    /// The only way to preempt inbewteen these is expensive single-stepping.
+    /// The only way to preempt in between these is expensive single-stepping.
     OtherInstructions,
 
     /// The point a signal handler is received, just after whatever regular user instruction
