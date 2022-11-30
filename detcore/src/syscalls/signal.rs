@@ -90,7 +90,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         // PERF_EVENT_SIGNAL is reserved.
         if call.signum() == reverie::PERF_EVENT_SIGNAL as i32 {
-            return Err(Errno::EINVAL.into());
+            // The go runtime attempts to register this (unused) signal handler.  We will never
+            // deliver signals of this kind to the guest, so we just turn this action into a noop
+            // rather than returning `Err(Errno::EINVAL.into())`.
+            return Ok(0);
         }
         Ok(if let Some(action) = call.action() {
             let mut memory = guest.memory();
