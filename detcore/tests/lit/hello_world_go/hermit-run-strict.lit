@@ -1,0 +1,2 @@
+RUN: %hermit run -- %me | FileCheck %s
+CHECK: Hello world!
