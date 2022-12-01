@@ -38,7 +38,7 @@ pub struct Config {
     /// Epoch of the logical time.
     ///
     /// This is the datetime from which all time and date modtimes begin and
-    /// monotonically increase. It is in RFC3339 format such as: 1999-12-31T23:59:59Z"
+    /// monotonically increase. It is in RFC3339 format such as: 2021-12-31T23:59:59Z"
     #[clap(
         long,
         env = "HERMIT_EPOCH",
@@ -548,7 +548,7 @@ impl std::error::Error for ParsePreemptionTimeoutError {
 ///
 /// N.B. Default to a reasonable date. Some programs (like zip) have trouble with the
 /// original unix epoch (time zero).
-pub static DEFAULT_EPOCH_STR: &str = "1999-12-31T23:59:59Z";
+pub static DEFAULT_EPOCH_STR: &str = "2021-12-31T23:59:59Z";
 
 impl Config {
     /// Construct the config using environment variables only, not CLI args.
