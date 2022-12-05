@@ -12,7 +12,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use colored::Colorize;
-use tempfile::tempdir;
+use tempfile::tempdir_in;
 use tempfile::TempDir;
 
 pub struct TemporaryEnvironmentBuilder {
@@ -20,6 +20,9 @@ pub struct TemporaryEnvironmentBuilder {
     keep_temp_dir: bool,
     // Count of temp environments to prepare
     run_count: i32,
+
+    // Path to test artifacts directory usually in test environment
+    temp_dir_path: PathBuf,
 }
 
 impl TemporaryEnvironmentBuilder {
@@ -27,11 +30,21 @@ impl TemporaryEnvironmentBuilder {
         TemporaryEnvironmentBuilder {
             keep_temp_dir: false,
             run_count: 2,
+            temp_dir_path: std::env::temp_dir(),
         }
+    }
+
+    pub fn temp_dir_path(mut self, path: Option<&PathBuf>) -> TemporaryEnvironmentBuilder {
+        if let Some(p) = path {
+            self.keep_temp_dir = true;
+            self.temp_dir_path = p.to_owned();
+        }
+        self
     }
 
     pub fn persist_temp_dir(mut self, persist: bool) -> TemporaryEnvironmentBuilder {
         self.keep_temp_dir = persist;
+
         self
     }
 
@@ -50,9 +63,17 @@ impl TemporaryEnvironmentBuilder {
         Ok(file_path)
     }
 
+    fn create_root_temp_dir(&self) -> anyhow::Result<TempDir> {
+        if !Path::new(&self.temp_dir_path).exists() {
+            std::fs::create_dir_all(&self.temp_dir_path)?;
+        }
+
+        Ok(tempdir_in(&self.temp_dir_path)?)
+    }
+
     pub fn build(self) -> anyhow::Result<TemporaryEnvironment> {
         println!("Preparing temporary environment to run experiments");
-        let root_temp_dir = tempdir()?;
+        let root_temp_dir = self.create_root_temp_dir()?;
         println!(
             "{}",
             format!("Root dir created: {}", root_temp_dir.path().display()).dimmed()
@@ -183,9 +204,12 @@ pub struct RunEnvironment {
 
 #[cfg(test)]
 mod test {
+    use std::path::Path;
     use std::path::PathBuf;
 
     use pretty_assertions::assert_eq;
+    use tempfile::tempdir;
+    use tempfile::TempDir;
 
     #[test]
     fn test_create_env_for_every_run() -> anyhow::Result<()> {
@@ -259,6 +283,53 @@ mod test {
             "Should keep temp dir if persist specified"
         );
         std::fs::remove_dir_all(temp_dir_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_root_path_specified() -> anyhow::Result<()> {
+        let temp_dir = tempdir()?;
+        fn create_tmp_env(dir: &TempDir) -> anyhow::Result<PathBuf> {
+            let temp_dir_path = dir.path();
+            let env = super::TemporaryEnvironmentBuilder::new()
+                .temp_dir_path(Some(&temp_dir_path.to_path_buf()))
+                .run_count(1)
+                .build()?;
+            Ok(get_temp_dir_path(&env.path))
+        }
+        let temp_dir_path = create_tmp_env(&temp_dir)?;
+        let temp_root_exists = temp_dir_path.is_dir();
+        assert_eq!(
+            temp_dir_path.starts_with(temp_dir.path()),
+            true,
+            "Should create environment in temp_dir_path if specified"
+        );
+        assert_eq!(
+            temp_root_exists, true,
+            "Should not clean temp direrctory if temp_dir_path specified"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_root_temp_dir_specified_but_not_exists() -> anyhow::Result<()> {
+        let temp_dir = tempdir()?;
+        let root_dir_path = format!("{}/not_exists", temp_dir.path().display());
+        fn create_tmp_env(path: &str) -> anyhow::Result<PathBuf> {
+            let env = super::TemporaryEnvironmentBuilder::new()
+                .temp_dir_path(Some(&PathBuf::from(&path)))
+                .run_count(1)
+                .build()?;
+            Ok(get_temp_dir_path(&env.path))
+        }
+        create_tmp_env(&root_dir_path)?;
+        assert_eq!(
+            Path::new(&root_dir_path).exists(),
+            true,
+            "If not existing path to root dir provided, it should be created"
+        );
+
         Ok(())
     }
 

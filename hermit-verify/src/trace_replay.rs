@@ -51,10 +51,11 @@ pub struct TraceReplayOpts {
 impl UseCase for TraceReplayOpts {
     fn build_temp_env(
         &self,
-        _common_args: &CommonOpts,
+        common_args: &CommonOpts,
     ) -> crate::common::TemporaryEnvironmentBuilder {
         TemporaryEnvironmentBuilder::new()
             .persist_temp_dir(self.keep_temp_dir)
+            .temp_dir_path(common_args.temp_dir_path.as_ref())
             .run_count(2)
     }
 

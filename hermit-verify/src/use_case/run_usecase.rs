@@ -11,6 +11,7 @@ use colored::Colorize;
 use super::UseCase;
 use crate::common::LogDiffOptions;
 use crate::common::RunEnvironment;
+use crate::common::TestArtifacts;
 use crate::common::Verify;
 use crate::use_case::run_hermit::output_stderr;
 use crate::use_case::run_hermit::output_stdout;
@@ -76,6 +77,7 @@ pub fn run_use_case<T: UseCase>(use_case: T, common_args: &CommonOpts) -> anyhow
 
     use_case.exec_first_run(common_args, &temp_env, current)?;
 
+    let mut result = true;
     // Compare each run to the one before it (rather than comparing all to the first):
     loop {
         counter += 1;
@@ -85,7 +87,8 @@ pub fn run_use_case<T: UseCase>(use_case: T, common_args: &CommonOpts) -> anyhow
             use_case.exec_next_run(common_args, counter + 1, &temp_env, current, next)?;
 
             if !compare_results(&use_case, common_args, current, next)? {
-                return Ok(false);
+                result = false;
+                break;
             } else {
                 // during verification we'll get a diff view so we're skipping printing here
                 // it only makes sense to output the stdout/stderr for the first run (if any)
@@ -103,5 +106,18 @@ pub fn run_use_case<T: UseCase>(use_case: T, common_args: &CommonOpts) -> anyhow
             break;
         }
     }
-    Ok(true)
+
+    if !common_args.ignore_test_result_artifacts_dir {
+        if let Some(path) = &common_args.test_result_artifact_dir {
+            println!(
+                "{}",
+                format!(":: Copy artifacts to {}", path.display())
+                    .yellow()
+                    .bold()
+            );
+            let test_artifacts = TestArtifacts::new(path.to_owned());
+            test_artifacts.copy_run_results(&temp_env)?;
+        }
+    }
+    Ok(result)
 }
