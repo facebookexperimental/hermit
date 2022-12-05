@@ -111,6 +111,7 @@ def build_test(name, bin_target, raw, run, no_sequentialize_threads, no_determin
             name = "hermit_record_" + name,
             args = [
                 "record",
+                "start",
                 "--verify",
                 "--",
                 "$(location " + bin_target + ")",

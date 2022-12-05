@@ -75,7 +75,7 @@ non-deterministic execution (real time, real randomness, etc), or repeatedly
 running a controlled, deterministic one (virtual time, pseudo-randomness, etc).
 
 ```bash
-hermit record <prog>
+hermit record start <prog>
 hermit replay
 ```
 

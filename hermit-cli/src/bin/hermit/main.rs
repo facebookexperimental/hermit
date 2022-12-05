@@ -17,6 +17,7 @@ mod global_opts;
 mod list;
 mod logdiff;
 mod record;
+mod record_start;
 mod remove;
 mod replay;
 mod run;
@@ -32,12 +33,9 @@ use hermit::Error;
 use hermit::ExitStatus;
 
 use self::analyze::AnalyzeOpts;
-use self::clean::CleanOpts;
 use self::global_opts::GlobalOpts;
-use self::list::ListOpts;
 use self::logdiff::LogDiffCLIOpts;
 use self::record::RecordOpts;
-use self::remove::RemoveOpts;
 use self::replay::ReplayOpts;
 use self::run::RunOpts;
 use self::version::Version;
@@ -70,18 +68,6 @@ enum Subcommand {
     #[clap(name = "replay", setting = AppSettings::TrailingVarArg)]
     Replay(ReplayOpts),
 
-    /// List the available recordings.
-    #[clap(name = "list", alias = "ls")]
-    List(ListOpts),
-
-    /// Delete a specific recording.
-    #[clap(name = "rm", alias = "remove")]
-    Remove(RemoveOpts),
-
-    /// Cleans up all past recordings.
-    #[clap(name = "clean")]
-    Clean(CleanOpts),
-
     /// Take the difference of two (run/record) logs written to files.
     LogDiff(LogDiffCLIOpts),
 
@@ -95,9 +81,6 @@ impl Subcommand {
             Subcommand::Run(x) => x.main(global),
             Subcommand::Record(x) => x.main(global),
             Subcommand::Replay(x) => x.main(global),
-            Subcommand::List(x) => x.main(global),
-            Subcommand::Remove(x) => x.main(global),
-            Subcommand::Clean(x) => x.main(global),
             Subcommand::LogDiff(x) => Ok(x.main(global)),
             Subcommand::Analyze(x) => x.main(global),
         }
