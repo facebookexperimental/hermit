@@ -15,6 +15,7 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::time::Duration;
 
+use detcore_model::pedigree::Pedigree;
 use nix::fcntl::AtFlags;
 use nix::fcntl::OFlag;
 use nix::sys::stat;
@@ -271,6 +272,10 @@ pub struct ThreadState<T> {
     /// The deterministic process ID of the this thread.
     pub detpid: Option<DetTid>,
 
+    /// This threads path within the thread/process ancestry tree. (The terminology comes from
+    /// Cilk.)
+    pub pedigree: Pedigree,
+
     /// Counting various events.
     pub stats: ThreadStats,
 
@@ -400,7 +405,8 @@ impl<T> ThreadState<T> {
         );
         ThreadState {
             dettid: pid,
-            detpid: None, // Initialized later.
+            detpid: None,              // Initialized later.
+            pedigree: Pedigree::new(), // Root thread.
             stats: ThreadStats::new(),
             file_metadata: Arc::new(Mutex::new(FileMetadata::new().setup_stdio(pid.into()))),
             clone_flags: None,

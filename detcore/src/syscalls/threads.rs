@@ -82,6 +82,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         );
 
         create_child_thread(guest, child_dettid, ctid, Some(flags)).await;
+
+        {
+            // The child will have updated their pedigree, we update ours before continuing.
+            let parent_pedigree = &mut guest.thread_state_mut().pedigree;
+            let child_pedigree = parent_pedigree.fork_mut();
+            debug!(
+                "[dtid {}] after creating child thread (tid {}, pedigree {}) parents pedigree becomes {}",
+                parent_dettid, child_dettid, child_pedigree, parent_pedigree,
+            );
+        }
+
         Ok(child_dettid.as_raw() as i64)
     }
 

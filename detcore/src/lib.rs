@@ -718,9 +718,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .clone_flags
                     .expect("clone_flags must be set by parent");
                 let dettid = DetPid::from_raw(tid.into());
+
+                // If we had mutable access to the parent state, we could update it here, but
+                // instead we leave that to the clone/fork handling.
+                let (child_pedigree, _parent) = pts.1.pedigree.fork();
+
                 ThreadState {
                     dettid,
                     detpid: None, // Initialized later.
+                    pedigree: child_pedigree,
                     stats: ThreadStats::new(),
                     file_metadata: {
                         debug!(
