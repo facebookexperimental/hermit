@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::fmt;
 use std::num::NonZeroUsize;
 use std::str::FromStr;
 
@@ -38,6 +39,27 @@ pub struct SchedEvent {
     /// An optional snapshot of the thread logical time at this point.
     /// This includes time waiting on the global scheduler.
     pub end_time: Option<LogicalTime>,
+}
+
+/// A more compact printing.
+impl fmt::Display for SchedEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "(dtid{}", self.dettid)?;
+        if self.count > 1 {
+            write!(f, " cnt={}", self.count)?;
+        }
+        if let Some(srip) = self.start_rip {
+            write!(f, " strt={:#x}", srip)?;
+        }
+        if let Some(erip) = self.end_rip {
+            write!(f, " end={:#x}", erip)?;
+        }
+        if let Some(time) = self.end_time {
+            write!(f, " time={}", time)?;
+        }
+        write!(f, " {:?})", self.op)?;
+        Ok(())
+    }
 }
 
 impl SchedEvent {

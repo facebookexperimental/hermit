@@ -6,18 +6,24 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use clap::Parser;
 use colored::Colorize;
 use detcore::preemptions::read_trace;
 use detcore::preemptions::PreemptionRecord;
+use detcore_model::pid::DetTid;
+use detcore_model::schedule::SchedEvent;
 use edit_distance::iterable_bubble_sort;
 
 use crate::CommonOpts;
 
 #[derive(Debug, Parser)]
 pub enum SchedTraceOpts {
+    /// Inspect and report statistics on one schedule.
+    Inspect(InspectOpts),
+
     /// Difference between two preempt files
     Diff(DiffOpts),
 
@@ -30,15 +36,16 @@ impl SchedTraceOpts {
         match self {
             SchedTraceOpts::Diff(x) => x.run(common_args),
             SchedTraceOpts::Interpolate(x) => x.run(common_args),
+            SchedTraceOpts::Inspect(x) => x.run(common_args),
         }
     }
 }
 
 #[derive(Debug, Parser)]
 pub struct DiffOpts {
-    /// First log to compare.
+    /// First schedule file to compare.
     file_a: PathBuf,
-    /// Second log to compare.
+    /// Second schedule file to compare.
     file_b: PathBuf,
 }
 
@@ -59,6 +66,58 @@ impl DiffOpts {
             .yellow()
             .bold()
         );
+        Ok(true)
+    }
+}
+
+#[derive(Debug, Parser)]
+pub struct InspectOpts {
+    /// Schedule to inspect.
+    file_a: PathBuf,
+
+    /// Print O(N) output proportional to the length of the schedule.
+    #[clap(long, short = 'v')]
+    verbose: bool,
+}
+
+/// Return all events which are right before a preemption.
+fn preempt_events(sched: &Vec<SchedEvent>) -> Vec<SchedEvent> {
+    let mut acc = Vec::new();
+    for ix in 0..sched.len() - 1 {
+        if sched[ix].dettid != sched[ix + 1].dettid {
+            acc.push(sched[ix].clone());
+        }
+    }
+    acc
+}
+
+/// Split apart an event series into a per-thread record.
+fn per_thread_events(events: &Vec<SchedEvent>) -> BTreeMap<DetTid, Vec<SchedEvent>> {
+    let mut acc = BTreeMap::new();
+    for evt in events {
+        let vec: &mut Vec<SchedEvent> = acc.entry(evt.dettid).or_default();
+        vec.push(evt.clone());
+    }
+    acc
+}
+
+impl InspectOpts {
+    pub fn run(&self, _common_args: &CommonOpts) -> anyhow::Result<bool> {
+        let schedule = read_trace(&self.file_a);
+        println!("Schedule length: {}", schedule.len());
+
+        let preempts = preempt_events(&schedule);
+        println!("Preemption events: {}", preempts.len());
+        println!("Per thread preemption events:");
+        let per_thread_preempts = per_thread_events(&preempts);
+        for (tid, vec) in &per_thread_preempts {
+            println!("  tid {}: {} preemptions", tid, vec.len());
+            if self.verbose {
+                for evt in vec {
+                    println!("    {}", evt);
+                }
+            }
+        }
         Ok(true)
     }
 }
