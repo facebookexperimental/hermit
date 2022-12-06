@@ -8,6 +8,7 @@
 
 //! An example that tracks thread pedigree using local state.
 
+use std::fmt;
 use std::io;
 use std::mem;
 
@@ -58,6 +59,7 @@ fn longest_run(sequence: &BitVec) -> (usize, usize) {
 ///
 /// TODO: Add serialization / deserialization
 pub struct Pedigree {
+    // TODO: it probably makes sense to represent this in run-length-encoded form always:
     pedigree: BitVec,
 }
 
@@ -65,7 +67,7 @@ impl Pedigree {
     /// Create a new root pedigree representing the top of a tree of processes or threads.
     pub fn new() -> Self {
         Pedigree {
-            pedigree: bitvec![0],
+            pedigree: bitvec![0], // TODO: remove this useless extra bit.
         }
     }
 
@@ -99,7 +101,7 @@ impl Pedigree {
 }
 
 /// Attempts to convert the pedigree bitstring into a deterministic virtual PID
-impl TryFrom<&Pedigree> for Pid {
+impl TryFrom<&Pedigree> for i32 {
     type Error = io::Error;
     fn try_from(pedigree: &Pedigree) -> Result<Self, Self::Error> {
         // Define mpping of pedigree bits -> PID bits
@@ -172,8 +174,31 @@ impl TryFrom<&Pedigree> for Pid {
 
             debug_assert!(vpid_bits.len() == mem::size_of::<pid_t>() * 8);
 
-            Ok(Pid::from_raw(vpid_bits.into_vec()[0] as i32))
+            Ok(vpid_bits.into_vec()[0] as i32)
         }
+    }
+}
+
+impl TryFrom<&Pedigree> for Pid {
+    type Error = io::Error;
+    fn try_from(pedigree: &Pedigree) -> Result<Self, Self::Error> {
+        let num: i32 = i32::try_from(pedigree)?;
+        Ok(Pid::from_raw(num))
+    }
+}
+
+impl fmt::Display for Pedigree {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), std::fmt::Error> {
+        let len = self.pedigree.len();
+        // TODO: remove the superfluous false at the start.
+        debug_assert!(len > 0);
+        debug_assert!(!self.pedigree[0]);
+        let mut iter = self.pedigree.iter();
+        let _ = iter.next();
+        for bit in iter {
+            write!(f, "{}", if *bit { "C" } else { "P" })?;
+        }
+        Ok(())
     }
 }
 
@@ -248,5 +273,15 @@ mod test {
             pedigree: many_forks_bitstring,
         };
         assert!(Pid::try_from(&many_forks_pedigree).is_err());
+    }
+
+    #[test]
+    fn display_pedigree() {
+        let p0 = Pedigree::new();
+        let (p1, _c1) = p0.fork();
+        let (p2, _c2) = p1.fork();
+        let (p3, c3) = p2.fork();
+        assert_eq!(format!("{}", p3), "PPP");
+        assert_eq!(format!("{}", c3), "PPC");
     }
 }
