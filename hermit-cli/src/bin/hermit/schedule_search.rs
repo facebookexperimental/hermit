@@ -104,8 +104,11 @@ where
         };
 
         eprintln!(
-            ":: Event-Level Search Pass {} => EditDistance = {}, Swap Distance = {}",
-            pass_number, edit_dist, swap_dist
+            ":: Event-Level Search Pass {} => EditDistance = {}, Swap Distance = {} (Midpoint sched length = {})",
+            pass_number,
+            edit_dist,
+            swap_dist,
+            requested_midpoint_schedule.len()
         );
 
         if swap_dist == 0 {

@@ -51,6 +51,12 @@ fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {
     pr1 == pr2
 }
 
+// An expensive way to measure the length of a schedule by reading it in.
+fn sched_length(path: &Path) -> usize {
+    let pr = PreemptionReader::new(path).load_all();
+    pr.into_global().len()
+}
+
 /// Right now we don't want turning on logging for `hermit analyze` itself to ALSO turn on logging
 /// for each one of the (many) individual hermit executions it calls.  This could change in the
 /// future and instead share the GlobalOpts passed to `main()`.
@@ -822,9 +828,18 @@ impl AnalyzeOpts {
             self.phase4_choose_baseline_sched_events(global, normalized_preempts)?;
 
         eprintln!(
-            ":: Beginning bisection using endpoints: {} {}",
-            target_sched_events_path.display(),
-            baseline_sched_events_path.display(),
+            ":: {} (event lengths {} / {}): {} {}",
+            "Beginning bisection using endpoints".yellow().bold(),
+            sched_length(&baseline_sched_events_path),
+            sched_length(&target_sched_events_path),
+            baseline_sched_events_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            target_sched_events_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
         );
         let target = read_trace(&target_sched_events_path);
         let baseline = read_trace(&baseline_sched_events_path);
