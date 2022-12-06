@@ -28,6 +28,9 @@ use detcore_model::collections::ReplayCursor;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
+use rand_pcg::Pcg64Mcg;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 pub use runqueue::entropy_to_priority;
@@ -202,7 +205,7 @@ fn assert_continue_request(req: &Resources) {
 }
 
 /// The state for the deterministic scheduler.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Scheduler {
     /// Monotonically count upwards.
     pub turn: u64,
@@ -289,6 +292,9 @@ pub struct Scheduler {
     /// the (original) replay_cursor trace.
     pub stacktrace_events: Option<StacktraceEventsIter>,
 
+    /// PRNG to drive any fuzzing of OS semantics (other than scheduling).
+    fuzz_prng: Pcg64Mcg,
+
     /// A cached copy of the same (immutable) field in Config.
     stop_after_turn: Option<u64>,
     /// A cached copy of the same (immutable) field in Config.
@@ -299,6 +305,8 @@ pub struct Scheduler {
     die_on_desync: bool,
     /// A cached copy of the same (immutable) field in Config.
     replay_exhausted_panic: bool,
+    /// A cached copy of the same (immutable) field in Config.
+    fuzz_futexes: bool,
 }
 
 type StacktraceEventsIter = Peekable<IntoIter<(u64, Option<PathBuf>)>>;
@@ -860,6 +868,8 @@ impl Scheduler {
             thread_tree: Default::default(),
             priorities: Default::default(),
             timeslices: Default::default(),
+            fuzz_futexes: cfg.fuzz_futexes,
+            fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
         }
     }
 
@@ -1180,8 +1190,33 @@ impl Scheduler {
         // is ready to run in normal order.
     }
 
+    fn choose_futex_wakees(
+        &mut self,
+        vec: &mut Vec<(DetPid, Ivar<SchedResponse>)>,
+        num_woken: usize,
+    ) -> Vec<(DetPid, Ivar<SchedResponse>)> {
+        if self.fuzz_futexes {
+            let rng = &mut self.fuzz_prng;
+            debug!(
+                "[fuzz-futexes] selecting {} tids, pre shuffle: {:?}",
+                num_woken,
+                vec.iter().map(|x| x.0).collect::<Vec<DetPid>>()
+            );
+
+            // No need to actually use the results here since vec was mutated:
+            let (_extracted, _remain) = &vec[..].partial_shuffle(rng, num_woken);
+
+            info!(
+                "[fuzz-futexes] selecting {} tids, post shuffle: {:?}",
+                num_woken,
+                vec.iter().map(|x| x.0).collect::<Vec<DetPid>>()
+            );
+        }
+        // just take the first N, in whatever deterministic order they are in:
+        vec.split_off(vec.len() - num_woken)
+    }
+
     /// Reschedule all threads blocked on a particular futex.
-    /// TODO: support rescheduling exactly K threads.
     pub fn wake_futex_waiters(
         &mut self,
         _waker_dettid: DetTid,
@@ -1210,7 +1245,8 @@ impl Scheduler {
             vec.len(),
         );
         let num_woken: usize = std::cmp::min(vec.len(), max_to_wake.try_into().unwrap());
-        let to_wake = vec.split_off(vec.len() - num_woken);
+        let to_wake = self.choose_futex_wakees(&mut vec, num_woken);
+
         assert_eq!(to_wake.len(), num_woken);
         for waiter in to_wake {
             self.wake_futex_waiter(waiter);

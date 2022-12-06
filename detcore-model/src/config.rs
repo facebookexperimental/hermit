@@ -65,6 +65,12 @@ pub struct Config {
     #[clap(long, value_name = "uint64")]
     pub rng_seed: Option<u64>,
 
+    /// Seeds the PRNG which drives syscall response fuzzing (i.e. chaotically exercising syscall
+    /// nondeterminism).  Like other seeds, this is initialized from the `--seed` if not
+    /// specifically provided.
+    #[clap(long, value_name = "uint64")]
+    pub fuzz_seed: Option<u64>,
+
     /// Logical clock multiplier. Values above one make time appear to go faster within the sandbox.
     #[clap(long, value_name = "float")]
     pub clock_multiplier: Option<f64>,
@@ -92,6 +98,10 @@ pub struct Config {
     /// Thread scheduling remains deterministic, determined by the random seed.
     #[clap(long)]
     pub chaos: bool,
+
+    /// Uses the `--fuzz-seed` to generate randomness and fuzz nondeterminism in the futex semantics.
+    #[clap(long)]
+    pub fuzz_futexes: bool,
 
     /// Record the timing of preemption events for future replay or experimentation.
     /// This is only useful in chaos modes.
@@ -564,6 +574,12 @@ impl Config {
     /// parameter if former isn't specified
     pub fn rng_seed(&self) -> u64 {
         self.rng_seed.unwrap_or(self.seed)
+    }
+
+    /// Returns the fuzz_seed, as specified by the user or defaulting to the primary seed if
+    /// unspecified.
+    pub fn fuzz_seed(&self) -> u64 {
+        self.fuzz_seed.unwrap_or(self.seed)
     }
 
     /// Returns effective "sched-seed" parameter taking in account "seed"

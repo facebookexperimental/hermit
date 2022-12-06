@@ -66,6 +66,7 @@ lazy_static! {
     seed: DEFAULT_CFG.seed,
     rng_seed: None,
     sched_seed: None,
+    fuzz_seed: None,
     gdbserver: false,
     gdbserver_port: 1234,
     preemption_timeout: NonZeroU64::new(5000000),
@@ -94,6 +95,7 @@ lazy_static! {
     sysinfo_uptime_offset: 60,
     memory: 1024 * 1024 * 1024, //1 GiB
     interrupt_at: vec![],
+    fuzz_futexes: false,
   };
 
   /// Standardized test config: common options on.
@@ -115,6 +117,7 @@ lazy_static! {
     seed: DEFAULT_CFG.seed,
     rng_seed: None,
     sched_seed: None,
+    fuzz_seed: None,
     gdbserver: false,
     gdbserver_port: 1234,
     preemption_timeout: NonZeroU64::new(5000000),
@@ -143,6 +146,7 @@ lazy_static! {
     sysinfo_uptime_offset: 60,
     memory: 1024 * 1024 * 1024, //1 GiB
     interrupt_at: vec![],
+    fuzz_futexes: false,
   };
 
   /// Standardized test config: all options on.
@@ -164,6 +168,7 @@ lazy_static! {
     seed: DEFAULT_CFG.seed,
     rng_seed: None,
     sched_seed: None,
+    fuzz_seed: None,
     gdbserver: false,
     gdbserver_port: 1234,
     preemption_timeout: NonZeroU64::new(5000000),
@@ -192,6 +197,7 @@ lazy_static! {
     sysinfo_uptime_offset: 60,
     memory: 1024 * 1024 * 1024, //1 GiB
     interrupt_at: vec![],
+    fuzz_futexes: false,
   };
 }
 

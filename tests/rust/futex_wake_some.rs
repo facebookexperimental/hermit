@@ -16,7 +16,7 @@ use nix::errno::errno;
 use nix::errno::Errno;
 
 const TOTAL: i64 = 4;
-const TO_WAKE: i64 = 3;
+const TO_WAKE: i64 = 2;
 
 fn main() {
     let layout = std::alloc::Layout::from_size_align(4, 4).unwrap(); // u32
@@ -45,6 +45,7 @@ fn main() {
             };
             if val == 0 {
                 children_post.fetch_add(1, Ordering::SeqCst);
+                eprintln!("tid {} woken", ix);
             } else {
                 println!(
                     "UNLIKELY: child thread {} issued wait after wake already happened, errno {}",
