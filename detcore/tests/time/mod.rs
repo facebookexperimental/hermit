@@ -94,7 +94,8 @@ fn tod_gettimeofday() {
                 0
             );
             let tp = unsafe { tp.assume_init() };
-            let naive_time = NaiveDateTime::from_timestamp(tp.tv_sec, 1000 * tp.tv_usec as u32);
+            let naive_time =
+                NaiveDateTime::from_timestamp_opt(tp.tv_sec, 1000 * tp.tv_usec as u32).unwrap();
 
             let dt = DateTime::<Utc>::from_utc(naive_time, Utc);
             // However exactly we compute logical time, this should be within a small
@@ -114,7 +115,8 @@ fn raw_getimeofday_delta() {
             0
         );
         let tp = unsafe { tp.assume_init() };
-        let naive_time = NaiveDateTime::from_timestamp(tp.tv_sec, 1000 * tp.tv_usec as u32);
+        let naive_time =
+            NaiveDateTime::from_timestamp_opt(tp.tv_sec, 1000 * tp.tv_usec as u32).unwrap();
         DateTime::<Utc>::from_utc(naive_time, Utc)
     };
     let dt2 = {
@@ -124,7 +126,8 @@ fn raw_getimeofday_delta() {
             0
         );
         let tp = unsafe { tp.assume_init() };
-        let naive_time = NaiveDateTime::from_timestamp(tp.tv_sec, 1000 * tp.tv_usec as u32);
+        let naive_time =
+            NaiveDateTime::from_timestamp_opt(tp.tv_sec, 1000 * tp.tv_usec as u32).unwrap();
         DateTime::<Utc>::from_utc(naive_time, Utc)
     };
 
@@ -158,7 +161,7 @@ fn tod_time() {
         || {
             let t = unsafe { libc::time(&mut tloc as *mut i64) };
             assert_eq!(t, tloc);
-            let naive_time = NaiveDateTime::from_timestamp(t, 0);
+            let naive_time = NaiveDateTime::from_timestamp_opt(t, 0).unwrap();
 
             let dt = DateTime::<Utc>::from_utc(naive_time, Utc);
             assert_eq!(dt.timestamp(), epoch.timestamp());
@@ -186,7 +189,8 @@ fn tod_clock_gettime() {
                 0
             );
             let tp = unsafe { tp.assume_init() };
-            let naive_time = NaiveDateTime::from_timestamp(tp.tv_sec, tp.tv_nsec as u32);
+            let naive_time =
+                NaiveDateTime::from_timestamp_opt(tp.tv_sec, tp.tv_nsec as u32).unwrap();
 
             let dt = DateTime::<Utc>::from_utc(naive_time, Utc);
             // However exactly we compute logical time, this should be within a small
