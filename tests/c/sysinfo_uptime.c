@@ -13,7 +13,7 @@
 #include <sys/sysinfo.h>
 #include <unistd.h>
 
-static int x = 0;
+static long long x = 0;
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic unsigned long uptime_1;
 static _Atomic unsigned long uptime_2;
@@ -25,9 +25,12 @@ void sleep_ms(int ms) {
   struct timespec rem = {0, 0};
   nanosleep(&req, &rem);
 }
-void __attribute__((noinline)) foo() {
-  x *= 2;
-  x -= 1;
+void __attribute__((noinline)) meaningless_work() {
+  // Do some meaningless work but without overflowing the integer.
+  if (x > 100000000) {
+    x = x / 25;
+  }
+  x += 111;
 }
 
 // disabling optimizations here as at -O3 level the compiler precomputes the
@@ -35,7 +38,7 @@ void __attribute__((noinline)) foo() {
 void __attribute__((optnone)) spin() {
   for (int i = 0; i < 3 * 1000; i++) {
     for (int j = 0; j < 1000; j++) {
-      foo();
+      meaningless_work();
     }
     sleep_ms(3);
   }
