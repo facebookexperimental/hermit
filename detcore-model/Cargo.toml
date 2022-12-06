@@ -7,9 +7,11 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.65"
+bitvec = { version = "0.17", features = ["serde"] }
 bytesize = "1.1"
 chrono = { version = "0.4", features = ["clock", "serde", "std"], default-features = false }
 clap = { version = "3.2.17", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
+libc = "0.2.137"
 nix = "0.25"
 reverie-syscalls = { version = "0.1.0", git = "https://github.com/facebookexperimental/reverie.git", branch = "main" }
 serde = { version = "1.0.136", features = ["derive", "rc"] }

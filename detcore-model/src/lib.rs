@@ -12,6 +12,7 @@ pub mod collections;
 pub mod config;
 pub mod fd;
 pub mod futex;
+pub mod pedigree;
 pub mod pid;
 pub mod schedule;
 pub mod time;
