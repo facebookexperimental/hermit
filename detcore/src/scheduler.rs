@@ -802,8 +802,8 @@ pub fn immediate_fatal_exit() {
 pub struct ConsumeResult {
     /// Should we keep runnning this thread, if false we background the current thread after this schedevent to let the next thread run.
     pub keep_running: bool,
-    /// A timeslice this thread is required to run according to the replay schedule
-    pub end_of_timeslice: Option<LogicalTime>,
+    /// A remaining (delta) timeslice this thread is required to run according to the replay schedule
+    pub timeslice_remaining: Option<LogicalTime>,
     /// Should we print the stacktrace in the guest, as per --stacktrace-event
     pub print_stack: MaybePrintStack,
     /// The number of this event in the global total order of events.
@@ -927,37 +927,45 @@ impl Scheduler {
     /// This function look-aheads into following instruction to determine if
     /// an explicit timer preemption is required while replaying. This is required when
     /// the original run schedule was modified before replaying which should be a valid
-    /// usecase for hermit analyze
-    fn resolve_explicit_end_of_time(&self, next: &SchedEvent) -> Option<LogicalTime> {
+    /// usecase for hermit analyze. Returned LogicalTime is RELATIVE to the corresponding thread localtime
+    fn resolve_time_to_run(&self, next: &SchedEvent) -> Option<LogicalTime> {
         if let Some(ref replay_cursor) = self.replay_cursor {
-            match (next, replay_cursor.peek_nth(1), replay_cursor.peek_nth(2)) {
-                (
-                    SchedEvent { op: Op::Branch, .. },
-                    Some(SchedEvent {
-                        op: Op::OtherInstructions,
-                        ..
-                    }),
-                    Some(SchedEvent { op: Op::Branch, .. }),
-                )
-                | (
-                    // this is currently impossible because we always have OtherInstruction
-                    // following a branch but this doesn't have to be the case and it might
-                    // be better to avoid this behavior in the future
-                    SchedEvent { op: Op::Branch, .. },
-                    Some(SchedEvent { op: Op::Branch, .. }),
-                    _,
-                ) => {
-                    trace!(
-                        "matching sequence to setup end_of_timeslice: {:?}",
-                        next.end_time
-                    );
-                    next.end_time
+            if let Some(next_time_slice_in_brances) =
+                match (next, replay_cursor.peek_nth(1), replay_cursor.peek_nth(2)) {
+                    (
+                        SchedEvent {
+                            op: Op::Branch,
+                            count,
+                            ..
+                        },
+                        Some(SchedEvent {
+                            op: Op::OtherInstructions,
+                            ..
+                        }),
+                        Some(SchedEvent { op: Op::Branch, .. }),
+                    )
+                    | (
+                        // this is currently impossible because we always have OtherInstruction
+                        // following a branch but this doesn't have to be the case and it might
+                        // be better to avoid this behavior in the future
+                        SchedEvent {
+                            op: Op::Branch,
+                            count,
+                            ..
+                        },
+                        Some(SchedEvent { op: Op::Branch, .. }),
+                        _,
+                    ) => {
+                        trace!("branch count to set the next_timeslice: {}", count);
+                        Some(count)
+                    }
+                    _ => None,
                 }
-                _ => None,
+            {
+                return Some(LogicalTime::from_rcbs(*next_time_slice_in_brances as u64));
             }
-        } else {
-            None
         }
+        None
     }
 
     /// Verify that the event we're replaying matches what just happened.  Set up the next
@@ -1014,7 +1022,7 @@ impl Scheduler {
 
                 let next_tid = next_ev.dettid;
                 // Checking for an optional timeslice in case of RCB
-                let timeslice = self.resolve_explicit_end_of_time(next_ev);
+                let timeslice_remaining = self.resolve_time_to_run(next_ev);
 
                 if next_tid != observed.dettid {
                     if is_prehook {
@@ -1031,17 +1039,17 @@ impl Scheduler {
 
                     self.requeue_with_new_priority(mytid, REPLAY_DEFERRED_PRIORITY);
                     self.requeue_with_new_priority(next_tid, REPLAY_FOREGROUND_PRIORITY);
-                    self.timeslices.insert(next_tid, timeslice);
+                    self.timeslices.insert(next_tid, timeslice_remaining);
                     // The *downgrading* of the current thread will be handled by the caller if the
                     // context switch is *now*.  If the last traced event on this thread is instead
                     // a prehook, well we don't deschedule the current thread quite yet.  Rather, we
                     // let the thread plow ahead, and actually block on the syscall, which will have
                     // the effect of descheduling the therad anyway.  After that, the priorities
                     // be set so as to make sure the correct thread (next_tid) runs.
-                    (is_prehook, timeslice)
+                    (is_prehook, timeslice_remaining)
                 } else {
                     // We're still running the next event.
-                    (true, timeslice)
+                    (true, timeslice_remaining)
                 }
             } else {
                 (true, None) // We're the very last event.  Nothing to do.
@@ -1055,7 +1063,7 @@ impl Scheduler {
                 keep_running,
                 print_stack,
                 event_ix: current_ix,
-                end_of_timeslice: timeslice,
+                timeslice_remaining: timeslice,
             }
         } else {
             if self.replay_exhausted_panic {
@@ -1075,7 +1083,7 @@ impl Scheduler {
                 keep_running: true,
                 print_stack: None,
                 event_ix: current_ix,
-                end_of_timeslice: None,
+                timeslice_remaining: None,
             }
         }
     }
@@ -2103,7 +2111,7 @@ impl Scheduler {
                 keep_running,
                 print_stack,
                 event_ix: _,
-                end_of_timeslice: _,
+                timeslice_remaining: _,
             } = self.consume_schedevent(&ev);
             // We should not ever need to background the thread when it is going to exit anyway.
             if !keep_running {

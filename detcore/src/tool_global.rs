@@ -964,7 +964,7 @@ impl GlobalState {
                 keep_running,
                 print_stack,
                 event_ix: _,
-                mut end_of_timeslice,
+                timeslice_remaining: mut end_of_timeslice,
             } = self.sched.lock().unwrap().consume_schedevent(&ev);
             trace!(
                 "keep_running :{}, end_of_timeslice: {:?}",
@@ -1537,12 +1537,14 @@ where
             }
 
             if timeslice.is_some() && guest.thread_state().past_global_first_execve {
+                let end_of_timeslice =
+                    guest.thread_state().thread_logical_time.as_nanos() + timeslice.unwrap();
                 trace!(
                     "[detcore][dettid {}] setting end_of_timeslice to {:?} as instructed by replayer",
                     guest.thread_state().dettid,
-                    timeslice
+                    end_of_timeslice
                 );
-                guest.thread_state_mut().end_of_timeslice = timeslice;
+                guest.thread_state_mut().end_of_timeslice = Some(end_of_timeslice);
             }
         }
         _ => {
