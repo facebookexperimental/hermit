@@ -185,7 +185,15 @@ buck_sh_test(
         ),
         # TODO: enable more analyze tests:
         # ("cas_sequence", "$(location //hermetic_infra/hermit/tests:chaos_cas_sequence_bin)"),
-        # ("nanosleep-threads-nocrash", "$(location //hermetic_infra/hermit/tests:nanosleep-threads-nocrash)"),
+        (
+            "nanosleep-threads-nocrash",
+            "$(location //hermetic_infra/hermit/tests:nanosleep-threads-nocrash)",
+            # TODO(T139493442): this test exits under the baseline hermit run currently, so we could use a feature to
+            # flip the target/baseline automatically
+            "--run-arg=--base-env=empty --target-exit-code=0",
+            # TODO: indicate the right lines to blame:
+            "",
+        ),
     ]
 ]
 
