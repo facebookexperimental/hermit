@@ -723,16 +723,28 @@ where
     G: Guest<Detcore<T>>,
 {
     let dettid = guest.thread_state().dettid;
-    let nanos = guest.thread_state().thread_logical_time.as_nanos();
     let cfg = &guest.config();
     if cfg.sequentialize_threads && cfg.should_trace_schedevent() {
         trace_schedevent(
             guest,
-            SchedEvent::syscall(dettid, call.number(), SyscallPhase::Polling).with_time(nanos),
+            with_guest_time(
+                guest,
+                SchedEvent::syscall(dettid, call.number(), SyscallPhase::Polling),
+            ),
             true,
         )
         .await;
     }
+}
+
+// A helper function for enriching the schedevent with local information.
+pub fn with_guest_time<G, T>(guest: &G, event: SchedEvent) -> SchedEvent
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let dettime = &guest.thread_state().thread_logical_time;
+    event.with_time(dettime.as_nanos())
 }
 
 // Convert to absolute logical time point for the timeout.

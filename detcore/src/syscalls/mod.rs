@@ -9,7 +9,7 @@
 //! This module just aggregates submodules.
 
 mod files;
-mod helpers;
+pub mod helpers;
 mod io;
 mod misc;
 mod signal;

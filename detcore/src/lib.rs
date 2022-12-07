@@ -96,6 +96,7 @@ pub use util::punch_out_print;
 
 use crate::resources::Permission;
 use crate::resources::ResourceID;
+use crate::syscalls::helpers::with_guest_time;
 use crate::tool_global::resource_request;
 use crate::tool_global::trace_schedevent;
 use crate::tool_global::unrecoverable_shutdown;
@@ -128,7 +129,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             assert!(thread_state.committed_clock_value <= clock_value);
             let delta_rcbs: u64 = clock_value - thread_state.committed_clock_value;
             thread_state.thread_logical_time.add_rcbs(delta_rcbs);
-            let nanos = thread_state.thread_logical_time.as_nanos();
             thread_state.committed_clock_value = clock_value;
 
             if thread_state.end_of_timeslice.is_some() {
@@ -154,10 +154,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                     "Invariant violation: end_of_timeslice is None during update_logical_time_rcbs..."
                 )
             }
+
             trace!(
                 "[dtid {}] updated rcb clock, new logical time: {:?}, i.e. {}, timeslice end: {}, local rcb clock_value {:?}",
                 dettid,
-                thread_state.thread_logical_time,
+                &thread_state.thread_logical_time,
                 thread_state.thread_logical_time.as_nanos(),
                 thread_state
                     .end_of_timeslice
@@ -165,13 +166,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 clock_value,
             );
             if self.cfg.should_trace_schedevent() {
-                let ev = SchedEvent::branches(
-                    dettid,
-                    delta_rcbs
-                        .try_into()
-                        .expect("should not have more than 2^32 branches at once"),
-                )
-                .with_time(nanos);
+                let ev = with_guest_time(
+                    guest,
+                    SchedEvent::branches(
+                        dettid,
+                        delta_rcbs
+                            .try_into()
+                            .expect("should not have more than 2^32 branches at once"),
+                    ),
+                );
                 if delta_rcbs > 0 {
                     // We don't fill the end_rip here, because the current rip is NOT precisely the
                     // end of this block of branch events.  Other instructions may have occured
@@ -187,14 +190,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // This will ALWAYS record, even if the branches above are zero.
                 trace_schedevent(
                     guest,
-                    SchedEvent {
-                        dettid,
-                        op: Op::OtherInstructions,
-                        count: 1,
-                        start_rip: None,
-                        end_rip: None,
-                        end_time: Some(nanos),
-                    },
+                    with_guest_time(
+                        guest,
+                        SchedEvent {
+                            dettid,
+                            op: Op::OtherInstructions,
+                            count: 1,
+                            start_rip: None,
+                            end_rip: None,
+                            end_time: None,
+                        },
+                    ),
                     true, // Fill in end_rip because current rip represents the end of this event.
                 )
                 .await;
@@ -617,15 +623,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         self.pre_handler_hook(guest).await;
         let result = if guest.config().virtualize_time {
             let dettid = guest.thread_state().dettid;
-            let time = &mut guest.thread_state_mut().thread_logical_time;
-            time.add_rdtsc();
-            let nanos = time.as_nanos();
+            guest.thread_state_mut().thread_logical_time.add_rdtsc();
             info!(
                 "[dtid {}] inbound rdtsc, new logical time: {:?}",
-                dettid, time
+                dettid,
+                guest.thread_state().thread_logical_time
             );
             if self.cfg.should_trace_schedevent() {
-                trace_schedevent(
+                let ev = with_guest_time(
                     guest,
                     SchedEvent {
                         dettid,
@@ -633,14 +638,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         count: 1,
                         start_rip: None,
                         end_rip: None,
-                        end_time: Some(nanos),
+                        end_time: None,
                     },
-                    true,
-                )
-                .await;
+                );
+                trace_schedevent(guest, ev, true).await;
             }
+            // TODO: use global time for rdtsc:
             Ok(RdtscResult {
-                tsc: nanos.as_nanos(), // We treat virtual cycles as equivalent to virtual nanoseconds.
+                tsc: guest
+                    .thread_state()
+                    .thread_logical_time
+                    .as_nanos()
+                    .as_nanos(), // We treat virtual cycles as equivalent to virtual nanoseconds.
                 aux: None,
             })
         } else {
@@ -899,10 +908,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let config = guest.config().clone(); // TODO/FIXME: this is an inefficient and unnecessary copy
 
         if config.sequentialize_threads && self.cfg.should_trace_schedevent() {
-            let nanos = guest.thread_state_mut().thread_logical_time.as_nanos();
             trace_schedevent(
                 guest,
-                SchedEvent::syscall(dettid, call.number(), SyscallPhase::Prehook).with_time(nanos),
+                with_guest_time(
+                    guest,
+                    SchedEvent::syscall(dettid, call.number(), SyscallPhase::Prehook),
+                ),
                 true,
             )
             .await;
@@ -1106,10 +1117,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         self.detlog_memory_maps(guest)?;
 
         if config.sequentialize_threads && self.cfg.should_trace_schedevent() {
-            let nanos = guest.thread_state_mut().thread_logical_time.as_nanos();
             trace_schedevent(
                 guest,
-                SchedEvent::syscall(dettid, call.number(), SyscallPhase::Posthook).with_time(nanos),
+                with_guest_time(
+                    guest,
+                    SchedEvent::syscall(dettid, call.number(), SyscallPhase::Posthook),
+                ),
                 true,
             )
             .await;
