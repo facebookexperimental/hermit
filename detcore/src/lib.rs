@@ -528,6 +528,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 ]);
             }
 
+            if true
+            // TODO: could introduce a flag for this:
+            /* config.virtualize_keys */
+            {
+                subscription.syscalls([Sysno::add_key, Sysno::request_key, Sysno::keyctl]);
+            }
+
             if do_sched {
                 subscription.syscall(Sysno::connect);
             }
@@ -1069,6 +1076,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Prctl(_) => self.passthrough(guest, call).await,
             Syscall::Sigaltstack(_) => self.passthrough(guest, call).await,
             Syscall::Sysinfo(s) => self.handle_sysinfo(guest, s).await,
+
+            // TODO(#30) handle key mgmt syscalls, virtualizing serial numbers:
+            Syscall::AddKey(_) => self.passthrough(guest, call).await,
+            Syscall::Keyctl(_) => self.passthrough(guest, call).await,
+            Syscall::RequestKey(_) => self.passthrough(guest, call).await,
 
             _ => {
                 if config.panic_on_unsupported_syscalls {
