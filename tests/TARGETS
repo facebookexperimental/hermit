@@ -356,7 +356,6 @@ tracereplay_exempt_rs = [
     # Seems to run tid 9 instead of tid 3:
     "rust/futex_and_print.rs",
     "rust/futex_wake_some.rs",
-    "rust/mem_race.rs",
     "rust/poll_spin.rs",
     "rust/thread_random.rs",
 ]
@@ -378,6 +377,7 @@ tracereplay_exempt_rs = [
         tracereplay_chaos =
             not p in tracereplay_exempt_rs and
             not p in [
+                "rust/mem_race.rs",
                 "rust/print_nanosleep_race.rs",
                 "rust/print_clock_nanosleep_monotonic_abs_race.rs",
                 "rust/print_clock_nanosleep_monotonic_race.rs",
