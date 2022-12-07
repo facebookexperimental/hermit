@@ -43,7 +43,7 @@ impl TestArtifacts {
         if file_path.as_path().exists() {
             let file_name = file_path.file_name();
             if let Some(file) = file_name {
-                let new_file_name = format!("{}{}", run_number, file.to_str().unwrap());
+                let new_file_name = format!("{}_{}", run_number, file.to_str().unwrap());
                 let new_file_path = self.test_result_artifact_dir.as_path().join(new_file_name);
                 std::fs::copy(file_path, new_file_path)?;
             }
@@ -72,16 +72,16 @@ mod test {
 
         let files = std::fs::read_dir(artifactd_dir.path())?;
         let expected_artifacts = vec![
-            format!("{}/1log", artifactd_dir.path().display()),
-            format!("{}/1std_out", artifactd_dir.path().display()),
-            format!("{}/1std_err", artifactd_dir.path().display()),
-            format!("{}/1exit_status", artifactd_dir.path().display()),
-            format!("{}/1sched", artifactd_dir.path().display()),
-            format!("{}/2log", artifactd_dir.path().display()),
-            format!("{}/2std_out", artifactd_dir.path().display()),
-            format!("{}/2std_err", artifactd_dir.path().display()),
-            format!("{}/2exit_status", artifactd_dir.path().display()),
-            format!("{}/2sched", artifactd_dir.path().display()),
+            format!("{}/1_log", artifactd_dir.path().display()),
+            format!("{}/1_std_out", artifactd_dir.path().display()),
+            format!("{}/1_std_err", artifactd_dir.path().display()),
+            format!("{}/1_exit_status", artifactd_dir.path().display()),
+            format!("{}/1_sched", artifactd_dir.path().display()),
+            format!("{}/2_log", artifactd_dir.path().display()),
+            format!("{}/2_std_out", artifactd_dir.path().display()),
+            format!("{}/2_std_err", artifactd_dir.path().display()),
+            format!("{}/2_exit_status", artifactd_dir.path().display()),
+            format!("{}/2_sched", artifactd_dir.path().display()),
         ];
 
         let copied_artifacts: Vec<String> = files
