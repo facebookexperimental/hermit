@@ -31,7 +31,7 @@ pub struct UseCaseOptions {
     pub verify_commits: bool,
     pub verify_exit_statuses: bool,
     pub verify_schedules: bool,
-    pub ignore_lines: Option<String>,
+    pub ignore_lines: Vec<String>,
 }
 
 impl UseCaseOptions {
@@ -57,7 +57,7 @@ pub trait UseCase {
             verify_exit_statuses: true,
             verify_desync: true,
             verify_schedules: false,
-            ignore_lines: None,
+            ignore_lines: Vec::new(),
         }
     }
 

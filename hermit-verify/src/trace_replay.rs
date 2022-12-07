@@ -107,7 +107,7 @@ impl UseCase for TraceReplayOpts {
             verify_exit_statuses: true,
             verify_desync: true,
             verify_schedules: false,
-            ignore_lines: None,
+            ignore_lines: Vec::new(),
         }
     }
 

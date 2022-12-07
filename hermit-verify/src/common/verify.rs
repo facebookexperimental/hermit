@@ -34,7 +34,7 @@ pub struct LogDiffOptions {
     /// Whether to skip the rest of DETLOGs for determinism check
     pub skip_detlog_others: bool,
     /// Which lines to ignore for DETLOGs
-    pub ignore_lines: Option<String>,
+    pub ignore_lines: Vec<String>,
 }
 
 impl LogDiffOptions {
@@ -61,7 +61,7 @@ impl LogDiffOptions {
 
         result.push(format!("--syscall-history={}", self.syscall_history));
 
-        if let Some(ignore_lines) = self.ignore_lines {
+        for ignore_lines in self.ignore_lines {
             result.push(format!("--ignore-lines={}", ignore_lines));
         }
 
@@ -233,7 +233,7 @@ mod test {
             &env.runs()[0],
             &env.runs()[1],
             LogDiffOptions {
-                ignore_lines: Some(String::from("test")),
+                ignore_lines: vec![String::from("test")],
                 ..Default::default()
             },
         );
@@ -250,7 +250,7 @@ mod test {
             &env.runs()[0],
             &env.runs()[1],
             LogDiffOptions {
-                ignore_lines: None,
+                ignore_lines: Vec::new(),
                 ..Default::default()
             },
         );

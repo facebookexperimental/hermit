@@ -100,7 +100,7 @@ impl UseCase for ChaosReplayOpts {
             verify_exit_statuses: true,
             verify_desync: true,
             verify_schedules: true,
-            ignore_lines: Some(String::from("CHAOSRAND")),
+            ignore_lines: vec![String::from("CHAOSRAND")],
         }
     }
 }
