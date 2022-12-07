@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use procfs::process::Process;
 use reverie::syscalls;
 use reverie::syscalls::MemoryAccess;
 use reverie::Error;
@@ -49,7 +50,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             loads_5: 1,
             loads_15: 1,
             total_ram: self.cfg.memory,
-            free_ram: self.cfg.memory / 2,
+            free_ram: self.free_ram(guest, self.cfg.memory)?,
             buffer_ram: MB,
             shared_ram: MB,
             total_swap: 0,
@@ -59,5 +60,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             free_high: 0,
             mem_unit: 1,
         })
+    }
+
+    fn free_ram<G: Guest<Self>>(&self, guest: &mut G, total_ram: u64) -> anyhow::Result<u64> {
+        let process = Process::new(guest.pid().as_raw())?;
+        let page_size = procfs::page_size()? as u64;
+        let statm = process.statm()?;
+        let used_memory = statm.resident * page_size;
+        if used_memory > total_ram {
+            return Ok(0);
+        }
+        Ok(total_ram - used_memory)
     }
 }

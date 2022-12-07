@@ -8,12 +8,24 @@
 
 #include <locale.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/sysinfo.h>
 #include <unistd.h>
 
+void allocateMemory(int size) {
+  char* ptr;
+  ptr = (char*)malloc(size);
+  for (int i = 0; i < size; ++i) {
+    ptr[i] = 64;
+  }
+}
+const int MB = 1024 * 1024;
 int main() {
   struct sysinfo info;
   sleep(5);
+
+  allocateMemory(1 * MB); // allocating 1Mb of memory to check in sysinfo result
+
   sysinfo(&info);
 
   setlocale(LC_NUMERIC, ""); // Print large numbers with commas.
@@ -31,5 +43,5 @@ int main() {
   printf("free high: %'lu\n", info.freehigh);
   printf("\n");
   printf("mem_unit: %u\n", info.mem_unit);
-  printf("Free minus used: %'lu\n", info.totalram - info.freeram);
+  printf("Total - free = used: %'lu\n", info.totalram - info.freeram);
 }
