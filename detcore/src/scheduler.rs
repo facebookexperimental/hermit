@@ -2132,14 +2132,14 @@ impl Scheduler {
         if !(replay || record) {
             return;
         }
-        let thread_time = global_time.lock().unwrap().threads_time(dettid);
+        let thread_duration = global_time.lock().unwrap().threads_duration(dettid);
         debug!(
             "simulate exit posthook on tid {}, thread time {}: {:?}",
-            dettid, thread_time, placeholder_syscall
+            dettid, thread_duration, placeholder_syscall
         );
 
         let ev = SchedEvent::syscall(dettid, placeholder_syscall.number(), SyscallPhase::Posthook)
-            .with_time(thread_time);
+            .with_time(thread_duration);
         let print_stack1 = if replay {
             let ConsumeResult {
                 keep_running,
@@ -2162,7 +2162,7 @@ impl Scheduler {
         if print_stack1.is_some() || print_stack2.is_some() {
             eprintln!(
                 ":: Guest tid {}, at thread time {}, backtrace requested but not available post-exit!\n",
-                dettid, thread_time
+                dettid, thread_duration
             );
         }
     }

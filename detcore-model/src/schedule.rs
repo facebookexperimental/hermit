@@ -18,6 +18,8 @@ use serde::Serialize;
 use serde::Serializer;
 
 use crate::pid::DetTid;
+use crate::time::DetTime;
+use crate::time::LogicalDuration;
 use crate::time::LogicalTime;
 // Scheduler events
 //--------------------------------------------------------------------------------
@@ -88,9 +90,15 @@ impl SchedEvent {
         }
     }
 
-    /// Set the logical time.
-    pub fn with_time(mut self, time: LogicalTime) -> SchedEvent {
+    /// Set the logical time directly.
+    pub fn with_time(mut self, time: LogicalDuration) -> SchedEvent {
         self.end_time = Some(time);
+        self
+    }
+
+    /// Correctly set logical time based on the threads current time.
+    pub fn with_dettime(mut self, dt: &DetTime) -> SchedEvent {
+        self.end_time = Some(dt.without_starting());
         self
     }
 

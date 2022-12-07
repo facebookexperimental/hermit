@@ -67,6 +67,10 @@ pub const NANOS_PER_SCHED: f64 = 500_000.0;
 )]
 pub struct LogicalTime(u64);
 
+// TODO: replace this with a wrapper around Duration, and change places that currently use Duration
+// but should use LogicalDuration.
+pub type LogicalDuration = LogicalTime;
+
 impl LogicalTime {
     /// 0 integer nanoseconds.
     pub const ZERO: LogicalTime = LogicalTime(0);
@@ -435,6 +439,12 @@ impl DetTime {
         )
     }
 
+    /// Same as as_nanos but without the starting time.
+    pub fn without_starting(&self) -> LogicalDuration {
+        let LogicalTime(t1) = self.as_nanos();
+        LogicalTime(t1 - (self.starting_micros * 1000))
+    }
+
     /// Project deterministic logical time into a rough number of microseconds.
     pub fn as_micros(&self) -> Microseconds {
         self.as_nanos().0 / 1000
@@ -560,18 +570,22 @@ impl GlobalTime {
         self.as_nanos()
     }
 
-    /// Project out the time of a particular thread, which includes its own work only.
+    /// Project out the time of a particular thread, which includes its own work only plus any
+    /// global starting time.
     pub fn threads_time(&self, dtid: DetTid) -> LogicalTime {
-        self.starting_nanos
-            + *self.time_vector.get(&dtid).unwrap_or_else(|| {
-                panic!(
-                    "Trying to extract time for thread {}, but no entry found!",
-                    dtid
-                )
-            })
+        self.starting_nanos + self.threads_duration(dtid)
     }
 
-    #[allow(unused)]
+    /// Project out the time consumed by the work of a given thread, i.e., its running duration.
+    pub fn threads_duration(&self, dtid: DetTid) -> LogicalDuration {
+        *self.time_vector.get(&dtid).unwrap_or_else(|| {
+            panic!(
+                "Trying to extract time for thread {}, but no entry found!",
+                dtid
+            )
+        })
+    }
+
     /// Deterministic lower bound on the amount of work that has happened across all
     /// threads, starting with the same epoch time as individual thread clocks.
     ///
