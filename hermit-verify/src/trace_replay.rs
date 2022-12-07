@@ -31,6 +31,10 @@ pub struct TraceReplayOpts {
     #[clap(long)]
     isolate_workdir: bool,
 
+    /// Active chaos mode in hermit run, and make the log-diff comparison appropriate.
+    #[clap(long)]
+    chaos: bool,
+
     /// Additional argument for hermit run subcommand
     #[clap(long)]
     hermit_arg: Vec<String>,
@@ -69,6 +73,7 @@ impl UseCase for TraceReplayOpts {
             .log_file(current_run.log_file_path.clone())
             .run(self.guest_program.clone(), self.args.clone())
             .hermit_args(self.hermit_arg.clone())
+            .chaos(self.chaos)
             .bind(temp_env.path().to_owned())
             .workdir_isolate(current_run.workdir.clone(), self.isolate_workdir)
             .record_preemptions_to(current_run.schedule_file.clone())
@@ -87,6 +92,7 @@ impl UseCase for TraceReplayOpts {
             .log_file(current_run.log_file_path.clone())
             .run(self.guest_program.clone(), self.args.clone())
             .hermit_args(self.hermit_arg.clone())
+            .chaos(self.chaos)
             .bind(temp_env.path().to_owned())
             .workdir_isolate(current_run.workdir.clone(), self.isolate_workdir)
             .replay_schedule_from(prev_run.schedule_file.clone())
@@ -107,7 +113,11 @@ impl UseCase for TraceReplayOpts {
             verify_exit_statuses: true,
             verify_desync: true,
             verify_schedules: false,
-            ignore_lines: Vec::new(),
+            ignore_lines: if self.chaos {
+                vec!["CHAOSRAND".to_string()]
+            } else {
+                Vec::new()
+            },
         }
     }
 

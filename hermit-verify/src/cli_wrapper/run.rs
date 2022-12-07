@@ -75,6 +75,11 @@ impl HermitRunBuilder {
         self
     }
 
+    pub fn chaos(mut self, chaos: bool) -> Self {
+        self.chaos = chaos;
+        self
+    }
+
     pub fn workdir_isolate(self, path: PathBuf, isolate: bool) -> Self {
         self.workdir(
             path,

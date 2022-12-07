@@ -12,7 +12,7 @@ load("@fbcode_macros//build_defs:python_binary.bzl", "python_binary")
 load("@fbcode_macros//build_defs:rust_binary.bzl", "rust_binary")
 load("@fbsource//tools/build_defs:testpilot_defs.bzl", "special_tags")
 
-def build_test(name, bin_target, raw, run, no_sequentialize_threads, no_deterministic_io, record_and_replay, chaos, chaosreplay, tracereplay):
+def build_test(name, bin_target, raw, run, no_sequentialize_threads, no_deterministic_io, record_and_replay, chaos, chaosreplay, tracereplay, tracereplay_chaos):
     # Used only by shell tests.
     common_env = {
         "HERMIT_BIN": "$(location //hermetic_infra/hermit/hermit-cli:hermit)",
@@ -74,6 +74,15 @@ def build_test(name, bin_target, raw, run, no_sequentialize_threads, no_determin
             guest_args = [],
             args = ["trace-replay", "--isolate-workdir"],
             hermit_args = ["--base-env=empty", "--env=HERMIT_MODE=tracereplay"],
+            env = common_env,
+        )
+    if tracereplay_chaos:
+        hermit_verify(
+            "hermit_run_tracereplay_chaos__" + name,
+            guest = "$(location " + bin_target + ")",
+            guest_args = [],
+            args = ["trace-replay", "--chaos", "--isolate-workdir"],
+            hermit_args = ["--base-env=empty", "--env=HERMIT_MODE=tracereplay_chaos"],
             env = common_env,
         )
 
@@ -154,12 +163,12 @@ def hermit_verify(name, guest, guest_args = [], args = [], hermit_args = [], env
         test = "//hermetic_infra/hermit/hermit-verify:hermit-verify",
     )
 
-def hermit_shell_test(path, raw, run, no_sequentialize_threads, no_deterministic_io, chaos, record_and_replay, chaosreplay, tracereplay = False):
+def hermit_shell_test(path, raw, run, no_sequentialize_threads, no_deterministic_io, chaos, record_and_replay, chaosreplay, tracereplay = False, tracereplay_chaos = False):
     basename = paths.replace_extension(paths.basename(path), "")
     export_file(name = "shellfile_" + basename, src = path)
-    build_test("sh_" + basename, ":shellfile_" + basename, raw, run, no_sequentialize_threads, no_deterministic_io, record_and_replay, chaos, chaosreplay, tracereplay)
+    build_test("sh_" + basename, ":shellfile_" + basename, raw, run, no_sequentialize_threads, no_deterministic_io, record_and_replay, chaos, chaosreplay, tracereplay, tracereplay_chaos)
 
-def hermit_python_test(path, module_base, raw, run, no_sequentialize_threads, no_deterministic_io, chaos, record_and_replay, chaosreplay = False, tracereplay = False):
+def hermit_python_test(path, module_base, raw, run, no_sequentialize_threads, no_deterministic_io, chaos, record_and_replay, chaosreplay = False, tracereplay = False, tracereplay_chaos = False):
     basename = paths.replace_extension(paths.basename(path), "")
     bin_name = "pythonbin_" + basename
     bin_target = ":" + bin_name
@@ -174,9 +183,9 @@ def hermit_python_test(path, module_base, raw, run, no_sequentialize_threads, no
         # for testing purposes, we don't need a self-contained par file.
         par_style = "live",
     )
-    build_test("py_" + basename, bin_target, raw, run, no_sequentialize_threads, no_deterministic_io, record_and_replay, chaos, chaosreplay, tracereplay)
+    build_test("py_" + basename, bin_target, raw, run, no_sequentialize_threads, no_deterministic_io, record_and_replay, chaos, chaosreplay, tracereplay, tracereplay_chaos)
 
-def hermit_c_test(path, raw, run, no_sequentialize_threads, no_deterministic_io, chaos, record_and_replay, chaosreplay, tracereplay = False):
+def hermit_c_test(path, raw, run, no_sequentialize_threads, no_deterministic_io, chaos, record_and_replay, chaosreplay, tracereplay = False, tracereplay_chaos = False):
     basename = paths.replace_extension(paths.basename(path), "")
     bin_name = "cbin_" + basename
     bin_target = ":" + bin_name
@@ -186,15 +195,15 @@ def hermit_c_test(path, raw, run, no_sequentialize_threads, no_deterministic_io,
         headers = ["c/util/assert.h"],
         deps = [],
     )
-    build_test("c_" + basename, bin_target, raw, run, no_sequentialize_threads, no_deterministic_io, record_and_replay, chaos, chaosreplay, tracereplay)
+    build_test("c_" + basename, bin_target, raw, run, no_sequentialize_threads, no_deterministic_io, record_and_replay, chaos, chaosreplay, tracereplay, tracereplay_chaos)
 
 # Similar to C/Rust tests but with a prebuilt custom binary.
-def hermit_bin_test(bin_target, raw, run, no_sequentialize_threads, no_deterministic_io, chaos, record_and_replay, chaosreplay, tracereplay = False):
+def hermit_bin_test(bin_target, raw, run, no_sequentialize_threads, no_deterministic_io, chaos, record_and_replay, chaosreplay, tracereplay = False, tracereplay_chaos = False):
     # Accept a fairly limited syntax of targets only:
     basename = bin_target.split(":")[-1]
-    build_test("custombin_" + basename, bin_target, raw, run, no_sequentialize_threads, no_deterministic_io, record_and_replay, chaos, chaosreplay, tracereplay)
+    build_test("custombin_" + basename, bin_target, raw, run, no_sequentialize_threads, no_deterministic_io, record_and_replay, chaos, chaosreplay, tracereplay, tracereplay_chaos)
 
-def hermit_rust_test(path, raw, run, no_sequentialize_threads, no_deterministic_io, chaos, record_and_replay, chaosreplay, tracereplay = False):
+def hermit_rust_test(path, raw, run, no_sequentialize_threads, no_deterministic_io, chaos, record_and_replay, chaosreplay, tracereplay = False, tracereplay_chaos = False):
     basename = paths.replace_extension(paths.basename(path), "")
     bin_name = "rustbin_" + basename
     bin_target = ":" + bin_name
@@ -208,7 +217,7 @@ def hermit_rust_test(path, raw, run, no_sequentialize_threads, no_deterministic_
             "fbsource//third-party/rust:tempfile",
         ],
     )
-    build_test("rs_" + basename, bin_target, raw, run, no_sequentialize_threads, no_deterministic_io, record_and_replay, chaos, chaosreplay, tracereplay)
+    build_test("rs_" + basename, bin_target, raw, run, no_sequentialize_threads, no_deterministic_io, record_and_replay, chaos, chaosreplay, tracereplay, tracereplay_chaos)
 
 def hermit_chaos_stress_test(name, bin_target, preempt_interval, max_iterations):
     hermit_verify(

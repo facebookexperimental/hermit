@@ -242,6 +242,7 @@ buck_sh_test(
             not p in [
                 "c/vforkExec.c",
             ],
+        tracereplay_chaos = False,
     )
     for p in glob(["c/*.c"])
 ]
