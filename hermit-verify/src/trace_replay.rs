@@ -114,7 +114,10 @@ impl UseCase for TraceReplayOpts {
             verify_desync: true,
             verify_schedules: false,
             ignore_lines: if self.chaos {
-                vec!["CHAOSRAND".to_string()]
+                vec![
+                    "CHAOSRAND".to_string(),
+                    "advance global time for scheduler turn".to_string(),
+                ]
             } else {
                 Vec::new()
             },

@@ -35,6 +35,12 @@ oncall("hermit")
         record_and_replay = False,
         run = True,
         tracereplay = True,
+        tracereplay_chaos =
+            not p in [
+                # TODO: fix a register divergence here:
+                "shell/py_hello.sh",
+                "shell/par_work.sh",
+            ],
     )
     for p in glob(["shell/*.sh"])
 ]
@@ -49,6 +55,8 @@ oncall("hermit")
         raw = True,
         record_and_replay = False,
         run = True,
+        tracereplay = False,
+        tracereplay_chaos = False,
     )
     # TODO(T124816271): phase out these non_strict tests as they work under strict mode:
     for p in glob(["shell/non_strict/*.sh"])
@@ -208,6 +216,7 @@ buck_sh_test(
         record_and_replay = False,
         run = True,
         tracereplay = True,
+        tracereplay_chaos = True,
     )
     for p in glob(["python/*.py"])
 ]
@@ -222,9 +231,15 @@ buck_sh_test(
         raw = True,
         record_and_replay = False,
         run = True,
+        tracereplay = False,
+        tracereplay_chaos = False,
     )
     # TODO(T124816271): phase out these non_strict tests as they work under strict mode:
     for p in glob(["python/non_strict/*.py"])
+]
+
+tracereplay_exempt_c = [
+    "c/vforkExec.c",
 ]
 
 [
@@ -239,10 +254,13 @@ buck_sh_test(
         run = True,
         tracereplay =
             # TODO(T124837711): get the rest of the tests working under trace replay:
+            not p in tracereplay_exempt_c,
+        tracereplay_chaos =
+            # TODO(T124837711): get the rest of the tests working under trace replay:
+            not p in tracereplay_exempt_c and
             not p in [
-                "c/vforkExec.c",
+                "c/just_spin.c",
             ],
-        tracereplay_chaos = False,
     )
     for p in glob(["c/*.c"])
 ]
@@ -259,6 +277,7 @@ buck_sh_test(
         record_and_replay = True,
         run = True,
         tracereplay = True,
+        tracereplay_chaos = True,
     )
     for t in [
         "//hermetic_infra/hermit/tests:minimal_hello",
@@ -329,6 +348,19 @@ cpp_binary(
     ],
 )
 
+# TODO(T124837711): get the rest of the tests working under trace replay:
+tracereplay_exempt_rs = [
+    "rust/bind_connect_race.rs",
+    "rust/clock_total_order.rs",
+    "rust/exit_group.rs",
+    # Seems to run tid 9 instead of tid 3:
+    "rust/futex_and_print.rs",
+    "rust/futex_wake_some.rs",
+    "rust/mem_race.rs",
+    "rust/poll_spin.rs",
+    "rust/thread_random.rs",
+]
+
 [
     hermit_rust_test(
         chaos = True,
@@ -342,17 +374,14 @@ cpp_binary(
         raw = True,
         record_and_replay = True,
         run = True,
-        tracereplay =
-            # TODO(T124837711): get the rest of the tests working under trace replay:
+        tracereplay = not p in tracereplay_exempt_rs,
+        tracereplay_chaos =
+            not p in tracereplay_exempt_rs and
             not p in [
-                "rust/bind_connect_race.rs",
-                "rust/clock_total_order.rs",
-                "rust/exit_group.rs",
-                "rust/futex_and_print.rs",
-                "rust/futex_wake_some.rs",
-                "rust/mem_race.rs",
-                "rust/poll_spin.rs",
-                "rust/thread_random.rs",
+                "rust/print_nanosleep_race.rs",
+                "rust/print_clock_nanosleep_monotonic_abs_race.rs",
+                "rust/print_clock_nanosleep_monotonic_race.rs",
+                "rust/print_clock_nanosleep_realtime_abs_race.rs",
             ],
     )
     for p in glob(["rust/*.rs"])
