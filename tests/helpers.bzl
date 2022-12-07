@@ -72,7 +72,7 @@ def build_test(name, bin_target, raw, run, no_sequentialize_threads, no_determin
             "hermit_run_tracereplay__" + name,
             guest = "$(location " + bin_target + ")",
             guest_args = [],
-            args = ["trace-replay", "--isolate-workdir"],
+            args = ["--verbose", "trace-replay", "--isolate-workdir"],
             hermit_args = ["--base-env=empty", "--env=HERMIT_MODE=tracereplay"],
             env = common_env,
         )
@@ -81,7 +81,7 @@ def build_test(name, bin_target, raw, run, no_sequentialize_threads, no_determin
             "hermit_run_tracereplay_chaos__" + name,
             guest = "$(location " + bin_target + ")",
             guest_args = [],
-            args = ["trace-replay", "--chaos", "--isolate-workdir"],
+            args = ["--verbose", "trace-replay", "--chaos", "--isolate-workdir"],
             hermit_args = ["--base-env=empty", "--env=HERMIT_MODE=tracereplay_chaos"],
             env = common_env,
         )

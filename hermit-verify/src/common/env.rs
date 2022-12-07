@@ -23,6 +23,9 @@ pub struct TemporaryEnvironmentBuilder {
 
     // Path to test artifacts directory usually in test environment
     temp_dir_path: PathBuf,
+
+    // Whether to be chatty.
+    verbose: bool,
 }
 
 impl TemporaryEnvironmentBuilder {
@@ -31,6 +34,7 @@ impl TemporaryEnvironmentBuilder {
             keep_temp_dir: false,
             run_count: 2,
             temp_dir_path: std::env::temp_dir(),
+            verbose: false,
         }
     }
 
@@ -44,7 +48,11 @@ impl TemporaryEnvironmentBuilder {
 
     pub fn persist_temp_dir(mut self, persist: bool) -> TemporaryEnvironmentBuilder {
         self.keep_temp_dir = persist;
+        self
+    }
 
+    pub fn verbose(mut self, verbose: bool) -> TemporaryEnvironmentBuilder {
+        self.verbose = verbose;
         self
     }
 
@@ -76,7 +84,7 @@ impl TemporaryEnvironmentBuilder {
         let root_temp_dir = self.create_root_temp_dir()?;
         println!(
             "{}",
-            format!("Root dir created: {}", root_temp_dir.path().display()).dimmed()
+            format!("  Root dir created: {}", root_temp_dir.path().display()).dimmed()
         );
 
         let mut result = TemporaryEnvironment::new();
@@ -87,32 +95,42 @@ impl TemporaryEnvironmentBuilder {
             create_dir(&run_temp_dir_path)?;
             println!(
                 "{}",
-                format!("Temp dir created: {:?}", run_temp_dir_path).dimmed()
+                format!("  Temp dir created: {:?}", run_temp_dir_path).dimmed()
             );
             let workdir = run_temp_dir_path.join("workdir");
             create_dir(workdir.as_path())?;
-            println!("{}", format!("Work dir created: {:?}", &workdir).dimmed());
+            if self.verbose {
+                println!("  {}", format!("Work dir created: {:?}", &workdir).dimmed());
+            }
 
             let log_file_path = self.create_file(&run_temp_dir_path, "log")?;
-            println!(
-                "{}",
-                format!("Log file created: {:?}", log_file_path).dimmed()
-            );
+            if self.verbose {
+                println!(
+                    "{}",
+                    format!("  Log file created: {:?}", log_file_path).dimmed()
+                );
+            }
 
             let std_out_path = self.create_file(&run_temp_dir_path, "std_out")?;
-            println!("{}", format!("Std out path: {:?}", std_out_path).dimmed());
+            if self.verbose {
+                println!("{}", format!("  Std out path: {:?}", std_out_path).dimmed());
+            }
 
             let std_err_path = self.create_file(&run_temp_dir_path, "std_err")?;
-            println!("{}", format!("Std err path: {:?}", std_err_path).dimmed());
+            if self.verbose {
+                println!("{}", format!("  Std err path: {:?}", std_err_path).dimmed());
+            }
 
             let exit_status_file_path = self.create_file(&run_temp_dir_path, "exit_status")?;
-            println!(
-                "{}",
-                format!("Exit status path: {:?}", exit_status_file_path).dimmed()
-            );
+            if self.verbose {
+                println!(
+                    "{}",
+                    format!("  Exit status path: {:?}", exit_status_file_path).dimmed()
+                );
+            }
 
             let schedules_path = self.create_file(&run_temp_dir_path, "sched")?;
-            println!("{}", format!("Sched path: {:?}", schedules_path).dimmed());
+            println!("{}", format!("  Sched path: {:?}", schedules_path).dimmed());
 
             result.run_envs.push(RunEnvironment {
                 temp_dir: run_temp_dir_path,

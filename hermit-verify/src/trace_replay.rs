@@ -13,6 +13,7 @@ use clap::Parser;
 use crate::cli_wrapper::*;
 use crate::common::TemporaryEnvironment;
 use crate::common::TemporaryEnvironmentBuilder;
+use crate::schedule_trace::InspectOpts;
 use crate::use_case::split_branches_in_file;
 use crate::use_case::UseCase;
 use crate::CommonOpts;
@@ -60,6 +61,7 @@ impl UseCase for TraceReplayOpts {
         TemporaryEnvironmentBuilder::new()
             .persist_temp_dir(self.keep_temp_dir)
             .temp_dir_path(common_args.temp_dir_path.as_ref())
+            .verbose(common_args.verbose)
             .run_count(2)
     }
 
@@ -138,6 +140,16 @@ impl UseCase for TraceReplayOpts {
 
         if self.split_branches {
             split_branches_in_file(&run.schedule_file, true)?;
+        }
+
+        if common_args.verbose {
+            println!("------------------ Recorded Schedule Summary ------------------");
+            InspectOpts {
+                sched_file: run.schedule_file.clone(),
+                verbose: true,
+            }
+            .run(common_args)?;
+            println!("---------------------------------------------------------------\n");
         }
 
         Ok(())

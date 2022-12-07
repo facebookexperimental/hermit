@@ -32,4 +32,8 @@ pub struct CommonOpts {
     /// verification as successful if all runs match each other.
     #[clap(long)]
     pub allow_nonzero_exit: bool,
+
+    /// Print extra information while running.
+    #[clap(long, short = 'v')]
+    pub verbose: bool,
 }

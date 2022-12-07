@@ -73,11 +73,11 @@ impl DiffOpts {
 #[derive(Debug, Parser)]
 pub struct InspectOpts {
     /// Schedule to inspect.
-    file_a: PathBuf,
+    pub sched_file: PathBuf,
 
     /// Print O(N) output proportional to the length of the schedule.
     #[clap(long, short = 'v')]
-    verbose: bool,
+    pub verbose: bool,
 }
 
 /// Return all events which are right before a preemption.
@@ -103,11 +103,11 @@ fn per_thread_events(events: &Vec<SchedEvent>) -> BTreeMap<DetTid, Vec<SchedEven
 
 impl InspectOpts {
     pub fn run(&self, _common_args: &CommonOpts) -> anyhow::Result<bool> {
-        let schedule = read_trace(&self.file_a);
+        let schedule = read_trace(&self.sched_file);
         println!("Schedule length: {}", schedule.len());
 
         let preempts = preempt_events(&schedule);
-        println!("Preemption events: {}", preempts.len());
+        println!("Context-switch/preemption events: {}", preempts.len());
         println!("Per thread preemption events:");
         let per_thread_preempts = per_thread_events(&preempts);
         for (tid, vec) in &per_thread_preempts {
@@ -118,6 +118,18 @@ impl InspectOpts {
                 }
             }
         }
+
+        if self.verbose {
+            println!("Full context switch event list in order, with before/after events:");
+            let mut count = 0;
+            for ix in 0..schedule.len() - 1 {
+                if schedule[ix].dettid != schedule[ix + 1].dettid {
+                    count += 1;
+                    println!(" {: >2}: {} => {}", count, schedule[ix], schedule[ix + 1]);
+                }
+            }
+        }
+
         Ok(true)
     }
 }
