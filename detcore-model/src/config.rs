@@ -414,6 +414,166 @@ impl Config {
     }
 }
 
+impl fmt::Display for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.virtualize_time {
+            write!(f, " --no-virtualize-time")?;
+        }
+        if !self.virtualize_cpuid {
+            write!(f, " --no-virtualize-cpuid")?;
+        }
+        if !self.virtualize_metadata {
+            write!(f, " --no-virtualize-metadata")?;
+        }
+        let default_epoch: DateTime<Utc> = DEFAULT_EPOCH_STR.parse::<DateTime<Utc>>().unwrap();
+        if self.epoch != default_epoch {
+            write!(f, " --epoch={}", self.epoch.to_rfc3339())?;
+        }
+        if self.seed != 0 {
+            write!(f, " --seed={}", self.seed)?;
+        }
+
+        if let Some(rng_seed) = self.rng_seed {
+            write!(f, " --rng-seed={}", rng_seed)?;
+        }
+        if let Some(fuzz_seed) = self.fuzz_seed {
+            write!(f, " --fuzz-seed={}", fuzz_seed)?;
+        }
+
+        if self.fuzz_futexes {
+            write!(f, " --fuzz-futexes")?;
+        }
+        if let Some(m) = self.clock_multiplier {
+            write!(f, " --clock-multiplier={}", m)?;
+        }
+        if self.imprecise_timers {
+            write!(f, " --imprecise-timers")?;
+        }
+        if self.chaos {
+            write!(f, " --chaos")?;
+        }
+        if self.record_preemptions {
+            write!(f, " --record-preemptions")?;
+        }
+
+        if let Some(p) = &self.record_preemptions_to {
+            let s = p.to_str().expect("valid unicode path");
+            write!(f, " --record-preemptions-to={}", shell_words::quote(s))?;
+        }
+        if let Some(p) = &self.replay_preemptions_from {
+            let s = p.to_str().expect("valid unicode path");
+            write!(f, " --replay-preemptions-from={}", shell_words::quote(s))?;
+        }
+        if let Some(p) = &self.replay_schedule_from {
+            let s = p.to_str().expect("valid unicode path");
+            write!(f, " --replay-schedule-from={}", shell_words::quote(s))?;
+        }
+        if self.replay_exhausted_panic {
+            write!(f, " --replay-exhausted-panic")?;
+        }
+        if self.die_on_desync {
+            write!(f, " --die-on-desync")?;
+        }
+        for (index, path) in &self.stacktrace_event {
+            write!(f, " --stacktrace-event={}", index)?;
+            if let Some(p) = path {
+                let s = p.to_str().expect("valid unicode path");
+                write!(f, ",{}", shell_words::quote(s))?;
+            }
+        }
+        if self.preemption_stacktrace {
+            write!(f, " --preemption-stacktrace")?;
+        }
+        if self.panic_on_unsupported_syscalls {
+            write!(f, " --panic-on-unsupported-syscalls")?;
+        }
+        if self.kill_daemons {
+            write!(f, " --kill-daemons")?;
+        }
+        if self.gdbserver {
+            write!(f, " --gdbserver")?;
+        }
+        if self.gdbserver_port != /* default */ 1234u16 {
+            write!(f, " --gdbserver-port={}", self.gdbserver_port)?;
+        }
+        match &self.preemption_timeout {
+            Some(x) => {
+                if *x != NonZeroU64::new(200_000_000).unwrap() {
+                    write!(f, " --preemption-timeout={}", x)?;
+                }
+            }
+            None => {
+                write!(f, " --preemption-timeout=disabled")?;
+            }
+        }
+        if self.sigint_instakill {
+            write!(f, " --sigint-instakill")?;
+        }
+        if self.warn_non_zero_binds {
+            write!(f, " --warn-non-zero-binds")?;
+        }
+        match &self.sched_heuristic {
+            SchedHeuristic::None => {}
+            SchedHeuristic::ConnectBind => {
+                write!(f, " --sched-heuristic=connectbind")?;
+            }
+            SchedHeuristic::Random => {
+                write!(f, " --sched-heuristic=random")?;
+            }
+            SchedHeuristic::StickyRandom => {
+                write!(f, " --sched-heuristic=stickyrandom")?;
+            }
+        }
+        if let Some(s) = self.sched_seed {
+            write!(f, " --sched-seed={}", s)?;
+        }
+        if self.sched_sticky_random_param != 0.0 {
+            write!(
+                f,
+                " --sched-sticky-random-param={}",
+                self.sched_sticky_random_param
+            )?;
+        }
+        if let Some(t) = self.stop_after_turn {
+            write!(f, " --stop-after-turn={}", t)?;
+        }
+        if let Some(i) = self.stop_after_iter {
+            write!(f, " --stop-after-iter={}", i)?;
+        }
+        if self.debug_externalize_sockets {
+            write!(f, " --debug-externalize-sockets")?;
+        }
+        match &self.debug_futex_mode {
+            BlockingMode::External => {
+                write!(f, " --debug-futex-mode=external")?;
+            }
+            BlockingMode::Polling => {
+                write!(f, " --debug-futex-mode=polling")?;
+            }
+            BlockingMode::Precise => { /* default */ }
+        }
+        if self.no_rcb_time {
+            write!(f, " --no-rcb-time")?;
+        }
+        if self.detlog_heap {
+            write!(f, " --detlog-heap")?;
+        }
+        if self.detlog_stack {
+            write!(f, " --detlog-stack")?;
+        }
+        if self.sysinfo_uptime_offset != /* default */ 120 {
+            write!(f, " --sysinfo-uptime-offset={}", self.sysinfo_uptime_offset)?;
+        }
+        if self.memory != 1_000_000_000 {
+            write!(f, " --memory={}", self.memory)?;
+        }
+        for (tid, rcb) in &self.interrupt_at {
+            write!(f, " --interrupt-at={}:{}", tid, rcb)?;
+        }
+        Ok(())
+    }
+}
+
 /// How should we handle syscalls which may block, but are internal to the hermit container?
 /// These syscalls are determinizable, but there are multiple methods of doing so.
 /// These choices *do not* apply to blocking syscalls that wait for external conditions outside the

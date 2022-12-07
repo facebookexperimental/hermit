@@ -13,19 +13,13 @@ use std::fs::File;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::io::Write;
-use std::num::NonZeroU64;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use ::tracing::metadata::LevelFilter;
-use chrono::DateTime;
-use chrono::Utc;
 use clap::Parser;
 use colored::Colorize;
-use detcore::BlockingMode;
-use detcore::SchedHeuristic;
-use detcore_model::config::DEFAULT_EPOCH_STR;
 use hermit::Context;
 use hermit::DetConfig;
 use hermit::Error;
@@ -445,159 +439,8 @@ impl fmt::Display for RunOpts {
             }
         }
 
-        if !dop.virtualize_time {
-            write!(f, " --no-virtualize-time")?;
-        }
-        if !dop.virtualize_cpuid {
-            write!(f, " --no-virtualize-cpuid")?;
-        }
-        if !dop.virtualize_metadata {
-            write!(f, " --no-virtualize-metadata")?;
-        }
-        let default_epoch: DateTime<Utc> = DEFAULT_EPOCH_STR.parse::<DateTime<Utc>>().unwrap();
-        if dop.epoch != default_epoch {
-            write!(f, " --epoch={}", dop.epoch.to_rfc3339())?;
-        }
-        if dop.seed != 0 {
-            write!(f, " --seed={}", dop.seed)?;
-        }
-
-        if let Some(rng_seed) = dop.rng_seed {
-            write!(f, " --rng-seed={}", rng_seed)?;
-        }
-        if let Some(fuzz_seed) = dop.fuzz_seed {
-            write!(f, " --fuzz-seed={}", fuzz_seed)?;
-        }
-
-        if dop.fuzz_futexes {
-            write!(f, " --fuzz-futexes")?;
-        }
-        if let Some(m) = dop.clock_multiplier {
-            write!(f, " --clock-multiplier={}", m)?;
-        }
-        if dop.imprecise_timers {
-            write!(f, " --imprecise-timers")?;
-        }
-        if dop.chaos {
-            write!(f, " --chaos")?;
-        }
-        if dop.record_preemptions {
-            write!(f, " --record-preemptions")?;
-        }
-        if let Some(p) = &dop.record_preemptions_to {
-            let s = p.to_str().expect("valid unicode path");
-            write!(f, " --record-preemptions-to={}", shell_words::quote(s))?;
-        }
-        if let Some(p) = &dop.replay_preemptions_from {
-            let s = p.to_str().expect("valid unicode path");
-            write!(f, " --replay-preemptions-from={}", shell_words::quote(s))?;
-        }
-        if let Some(p) = &dop.replay_schedule_from {
-            let s = p.to_str().expect("valid unicode path");
-            write!(f, " --replay-schedule-from={}", shell_words::quote(s))?;
-        }
-        if dop.replay_exhausted_panic {
-            write!(f, " --replay-exhausted-panic")?;
-        }
-        if dop.die_on_desync {
-            write!(f, " --die-on-desync")?;
-        }
-        for (index, path) in &dop.stacktrace_event {
-            write!(f, " --stacktrace-event={}", index)?;
-            if let Some(p) = path {
-                let s = p.to_str().expect("valid unicode path");
-                write!(f, ",{}", shell_words::quote(s))?;
-            }
-        }
-        if dop.preemption_stacktrace {
-            write!(f, " --preemption-stacktrace")?;
-        }
-        if dop.panic_on_unsupported_syscalls {
-            write!(f, " --panic-on-unsupported-syscalls")?;
-        }
-        if dop.kill_daemons {
-            write!(f, " --kill-daemons")?;
-        }
-        if dop.gdbserver {
-            write!(f, " --gdbserver")?;
-        }
-        if dop.gdbserver_port != /* default */ 1234u16 {
-            write!(f, " --gdbserver-port={}", dop.gdbserver_port)?;
-        }
-        match &dop.preemption_timeout {
-            Some(x) => {
-                if *x != NonZeroU64::new(200_000_000).unwrap() {
-                    write!(f, " --preemption-timeout={}", x)?;
-                }
-            }
-            None => {
-                write!(f, " --preemption-timeout=disabled")?;
-            }
-        }
-        if dop.sigint_instakill {
-            write!(f, " --sigint-instakill")?;
-        }
-        if dop.warn_non_zero_binds {
-            write!(f, " --warn-non-zero-binds")?;
-        }
-        match &dop.sched_heuristic {
-            SchedHeuristic::None => {}
-            SchedHeuristic::ConnectBind => {
-                write!(f, " --sched-heuristic=connectbind")?;
-            }
-            SchedHeuristic::Random => {
-                write!(f, " --sched-heuristic=random")?;
-            }
-            SchedHeuristic::StickyRandom => {
-                write!(f, " --sched-heuristic=stickyrandom")?;
-            }
-        }
-        if let Some(s) = dop.sched_seed {
-            write!(f, " --sched-seed={}", s)?;
-        }
-        if dop.sched_sticky_random_param != 0.0 {
-            write!(
-                f,
-                " --sched-sticky-random-param={}",
-                dop.sched_sticky_random_param
-            )?;
-        }
-        if let Some(t) = dop.stop_after_turn {
-            write!(f, " --stop-after-turn={}", t)?;
-        }
-        if let Some(i) = dop.stop_after_iter {
-            write!(f, " --stop-after-iter={}", i)?;
-        }
-        if dop.debug_externalize_sockets {
-            write!(f, " --debug-externalize-sockets")?;
-        }
-        match &dop.debug_futex_mode {
-            BlockingMode::External => {
-                write!(f, " --debug-futex-mode=external")?;
-            }
-            BlockingMode::Polling => {
-                write!(f, " --debug-futex-mode=polling")?;
-            }
-            BlockingMode::Precise => { /* default */ }
-        }
-        if dop.no_rcb_time {
-            write!(f, " --no-rcb-time")?;
-        }
-        if dop.detlog_heap {
-            write!(f, " --detlog-heap")?;
-        }
-        if dop.detlog_stack {
-            write!(f, " --detlog-stack")?;
-        }
-        if dop.sysinfo_uptime_offset != /* default */ 120 {
-            write!(f, " --sysinfo-uptime-offset={}", dop.sysinfo_uptime_offset)?;
-        }
-        if dop.memory != 1_000_000_000 {
-            write!(f, " --memory={}", dop.memory)?;
-        }
-        for (tid, rcb) in &dop.interrupt_at {
-            write!(f, " --interrupt-at={}:{}", tid, rcb)?;
-        }
+        // Write the rest of the flags from the Config itself:
+        write!(f, "{}", dop)?;
 
         write!(
             f,
