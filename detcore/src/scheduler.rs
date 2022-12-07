@@ -959,6 +959,40 @@ impl Scheduler {
                         trace!("branch count to set the next_timeslice: {}", count);
                         Some(count)
                     }
+                    (
+                        SchedEvent {
+                            op: Op::Branch,
+                            count,
+                            dettid: tid,
+                            ..
+                        },
+                        Some(SchedEvent {
+                            op: Op::OtherInstructions,
+                            ..
+                        }),
+                        Some(SchedEvent {
+                            dettid: next_tid, ..
+                        }),
+                    )
+                    | (
+                        SchedEvent {
+                            op: Op::Branch,
+                            count,
+                            dettid: tid,
+                            ..
+                        },
+                        Some(SchedEvent {
+                            dettid: next_tid, ..
+                        }),
+                        _,
+                    ) if tid != next_tid => {
+                        trace!(
+                            "branch count to set before a context switch event: {}",
+                            count
+                        );
+                        Some(count)
+                    }
+
                     _ => None,
                 }
             {
