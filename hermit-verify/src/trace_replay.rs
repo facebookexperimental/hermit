@@ -6,9 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::path::Path;
 use std::path::PathBuf;
 
 use clap::Parser;
+use detcore::preemptions::PreemptionReader;
 
 use crate::cli_wrapper::*;
 use crate::common::TemporaryEnvironment;
@@ -36,6 +38,10 @@ pub struct TraceReplayOpts {
     #[clap(long)]
     chaos: bool,
 
+    /// Strip times from the schedule to make sure we can still replay it without.
+    #[clap(long)]
+    strip_times: bool,
+
     /// Additional argument for hermit run subcommand
     #[clap(long)]
     hermit_arg: Vec<String>,
@@ -51,6 +57,18 @@ pub struct TraceReplayOpts {
     /// Arguments for a guest program
     #[clap(value_name = "ARGS")]
     args: Vec<String>,
+}
+
+fn strip_times(sched_path: &Path) -> anyhow::Result<PathBuf> {
+    let new_path = sched_path.with_extension("notimes");
+    let mut preemptions = PreemptionReader::new(sched_path).into_inner();
+    for se in preemptions.schedevents_iter_mut() {
+        se.end_time = None;
+    }
+    preemptions
+        .write_to_disk(new_path.as_ref())
+        .map_err(anyhow::Error::msg)?;
+    Ok(new_path)
 }
 
 impl UseCase for TraceReplayOpts {
@@ -89,6 +107,12 @@ impl UseCase for TraceReplayOpts {
         prev_run: &crate::common::RunEnvironment,
         current_run: &crate::common::RunEnvironment,
     ) -> Vec<String> {
+        let replay_sched = if self.strip_times {
+            strip_times(&prev_run.schedule_file).unwrap()
+        } else {
+            prev_run.schedule_file.clone()
+        };
+
         Hermit::new()
             .log_level(tracing::Level::TRACE)
             .log_file(current_run.log_file_path.clone())
@@ -97,7 +121,7 @@ impl UseCase for TraceReplayOpts {
             .chaos(false) // We don't need chaos on replay.
             .bind(temp_env.path().to_owned())
             .workdir_isolate(current_run.workdir.clone(), self.isolate_workdir)
-            .replay_schedule_from(prev_run.schedule_file.clone())
+            .replay_schedule_from(replay_sched)
             .record_preemptions_to(current_run.schedule_file.clone())
             .into_args()
     }

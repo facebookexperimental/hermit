@@ -73,17 +73,13 @@ fn compare_desync(observed: &SchedEvent, expected: &SchedEvent) -> String {
 }
 
 fn is_desync(observed: &SchedEvent, expected: &SchedEvent) -> bool {
-    if (
-        observed.dettid,
-        observed.op,
-        observed.count,
-        observed.end_time,
-    ) != (
-        expected.dettid,
-        expected.op,
-        expected.count,
-        expected.end_time,
-    ) {
+    if (observed.dettid, observed.op, observed.count)
+        != (expected.dettid, expected.op, expected.count)
+    {
+        return true;
+    }
+    // It is ok for the observed event to contain information not present in the replay trace.
+    if expected.end_time.is_some() && expected.end_time != observed.end_time {
         return true;
     }
 

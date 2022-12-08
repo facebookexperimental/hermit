@@ -95,6 +95,11 @@ impl PreemptionRecord {
         self.global = result;
     }
 
+    /// Iterate over the schedevents.
+    pub fn schedevents_iter_mut(&mut self) -> std::slice::IterMut<SchedEvent> {
+        self.global.iter_mut()
+    }
+
     /// Leave only the per-thread preemption records, not the global schedule.
     pub fn preemptions_only(&mut self) {
         self.global.clear();
