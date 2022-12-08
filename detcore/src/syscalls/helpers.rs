@@ -744,7 +744,7 @@ where
     T: RecordOrReplay,
 {
     let dettime = &guest.thread_state().thread_logical_time;
-    event.with_time(dettime.as_nanos())
+    event.with_dettime(dettime)
 }
 
 // Convert to absolute logical time point for the timeout.
