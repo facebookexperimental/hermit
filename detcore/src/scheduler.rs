@@ -8,6 +8,7 @@
 
 //! Deterministic scheduling algorithm.
 
+mod replayer;
 pub mod runqueue;
 pub mod timed_waiters;
 
@@ -24,7 +25,6 @@ use std::time::Duration;
 use std::u64;
 use std::vec::IntoIter;
 
-use detcore_model::collections::ReplayCursor;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
@@ -59,12 +59,12 @@ use crate::preemptions::PreemptionWriter;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::scheduler::replayer::StopReason;
 use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::FutexID;
 use crate::types::GlobalTime;
 use crate::types::LogicalTime;
-use crate::types::Op;
 use crate::types::SchedEvent;
 use crate::types::SigWrapper;
 use crate::types::SyscallPhase;
@@ -273,19 +273,12 @@ pub struct Scheduler {
     /// was specified in the Config, otherwise this remains empty.
     pub preemption_writer: Option<PreemptionWriter>,
 
-    /// A cursor that holds our place in the global total order of events being replayed.
-    pub replay_cursor: Option<ReplayCursor<SchedEvent>>,
-
-    /// Keep track of how many events we have replayed.  The current value is the event number of
-    /// the NEXT event to replay.
-    pub traced_event_count: u64,
+    /// An instance of replayer that is responsible for replaying events in case --replay-preemptions-from is specified
+    pub replayer: Option<Replayer>,
 
     /// Like `traced_event_count` but for record_event.  These should match if we're both replaying
     /// and recording at the same time.
     pub recorded_event_count: u64,
-
-    /// Desync events observed per thread.  Counts (soft,hard) desyncs.
-    pub desync_counts: BTreeMap<DetTid, (u64, u64)>,
 
     /// A copy of the `Config::stacktrace_event` vector.  This is MUTABLE,
     /// because we pop events off as we handle them.  The u64 is an index into
@@ -301,10 +294,6 @@ pub struct Scheduler {
     stop_after_iter: Option<u64>,
     /// A cached copy of the same (immutable) field in Config.
     recordreplay_modes: bool,
-    /// A cached copy of the same (immutable) field in Config.
-    die_on_desync: bool,
-    /// A cached copy of the same (immutable) field in Config.
-    replay_exhausted_panic: bool,
     /// A cached copy of the same (immutable) field in Config.
     fuzz_futexes: bool,
 }
@@ -333,6 +322,8 @@ pub struct ThreadTree {
 
 use pretty::Doc;
 use pretty::RcDoc;
+
+use self::replayer::Replayer;
 
 impl ThreadTree {
     /// Internal helper. Add a [child] process to the tree, with the parent being `None`
@@ -727,69 +718,6 @@ fn is_futex_request(nextturn: &ThreadNextTurn) -> bool {
     }
 }
 
-/// Is a desync considered fatal, or just kinda bad.
-/// RCB divergence is the later, mismatched syscalls are currently the former.
-fn is_hard_desync(observed: &SchedEvent, expected: &SchedEvent) -> bool {
-    let mut strip1 = observed.clone();
-    let mut strip2 = expected.clone();
-    strip1.end_time = None;
-    strip2.end_time = None;
-    strip1.count = 0;
-    strip2.count = 0;
-    strip1 != strip2
-}
-
-fn is_desync(observed: &SchedEvent, expected: &SchedEvent) -> bool {
-    if (
-        observed.dettid,
-        observed.op,
-        observed.count,
-        observed.end_time,
-    ) != (
-        expected.dettid,
-        expected.op,
-        expected.count,
-        expected.end_time,
-    ) {
-        return true;
-    }
-
-    if observed.start_rip != expected.start_rip && expected.start_rip.is_some() {
-        return true;
-    }
-
-    if observed.end_rip != expected.end_rip && expected.end_rip.is_some() {
-        return true;
-    }
-
-    false
-}
-
-fn compare_desync(observed: &SchedEvent, expected: &SchedEvent) -> String {
-    if !is_desync(observed, expected) {
-        "MATCHED".to_string()
-    } else if observed.op != expected.op {
-        "FULL-OP-DESYNC".to_string()
-    } else {
-        let mut msg = "DESYNC".to_string();
-        if (expected.start_rip.is_some() && observed.start_rip != expected.start_rip)
-            || (expected.end_rip.is_some() && observed.end_rip != expected.end_rip)
-        {
-            msg = "RIP-".to_owned() + &msg;
-        }
-        if observed.end_time != expected.end_time {
-            msg = "TIME-".to_owned() + &msg;
-        }
-        if observed.op == Op::Branch
-            && expected.op == Op::Branch
-            && observed.count != expected.count
-        {
-            msg = "RCB-".to_owned() + &msg;
-        }
-        msg
-    }
-}
-
 /// Until panics are escalated properly, this encapsulates a way to exit the hermit container
 /// entirely.
 pub fn immediate_fatal_exit() {
@@ -831,18 +759,22 @@ impl Scheduler {
             } else {
                 None
             },
-            replay_cursor: match &cfg.replay_schedule_from {
+            replayer: match &cfg.replay_schedule_from {
                 Some(path) => {
                     trace!("Scheduler loading trace from path {}", path.display());
                     let vec = read_trace(path);
                     trace!("Trace loaded, length {}", vec.len());
-                    Some(vec.into_iter().collect())
+                    Some(Replayer {
+                        cursor: vec.into_iter().collect(),
+                        traced_event_count: 0,
+                        desync_counts: BTreeMap::new(),
+                        die_on_desync: cfg.die_on_desync,
+                        replay_exhausted_panic: cfg.replay_exhausted_panic,
+                    })
                 }
                 None => None,
             },
-            traced_event_count: 0,
             recorded_event_count: 0,
-            desync_counts: BTreeMap::new(),
             stacktrace_events: if cfg.stacktrace_event.is_empty() {
                 None
             } else {
@@ -856,8 +788,6 @@ impl Scheduler {
                 cfg.sched_seed(),
                 cfg.sched_sticky_random_param,
             ),
-            die_on_desync: cfg.die_on_desync,
-            replay_exhausted_panic: cfg.replay_exhausted_panic,
             turn: 0,
             next_turns: Default::default(),
             bg_action_pool: Default::default(),
@@ -924,201 +854,52 @@ impl Scheduler {
         result
     }
 
-    /// This function look-aheads into following instruction to determine if
-    /// an explicit timer preemption is required while replaying. This is required when
-    /// the original run schedule was modified before replaying which should be a valid
-    /// usecase for hermit analyze. Returned LogicalTime is RELATIVE to the corresponding thread localtime
-    fn resolve_time_to_run(&self, next: &SchedEvent) -> Option<LogicalTime> {
-        if let Some(ref replay_cursor) = self.replay_cursor {
-            if let Some(next_time_slice_in_brances) =
-                match (next, replay_cursor.peek_nth(1), replay_cursor.peek_nth(2)) {
-                    (
-                        SchedEvent {
-                            op: Op::Branch,
-                            count,
-                            ..
-                        },
-                        Some(SchedEvent {
-                            op: Op::OtherInstructions,
-                            ..
-                        }),
-                        Some(SchedEvent { op: Op::Branch, .. }),
-                    )
-                    | (
-                        // this is currently impossible because we always have OtherInstruction
-                        // following a branch but this doesn't have to be the case and it might
-                        // be better to avoid this behavior in the future
-                        SchedEvent {
-                            op: Op::Branch,
-                            count,
-                            ..
-                        },
-                        Some(SchedEvent { op: Op::Branch, .. }),
-                        _,
-                    ) => {
-                        trace!("branch count to set the next_timeslice: {}", count);
-                        Some(count)
-                    }
-                    (
-                        SchedEvent {
-                            op: Op::Branch,
-                            count,
-                            dettid: tid,
-                            ..
-                        },
-                        Some(SchedEvent {
-                            op: Op::OtherInstructions,
-                            ..
-                        }),
-                        Some(SchedEvent {
-                            dettid: next_tid, ..
-                        }),
-                    )
-                    | (
-                        SchedEvent {
-                            op: Op::Branch,
-                            count,
-                            dettid: tid,
-                            ..
-                        },
-                        Some(SchedEvent {
-                            dettid: next_tid, ..
-                        }),
-                        _,
-                    ) if tid != next_tid => {
-                        trace!(
-                            "branch count to set before a context switch event: {}",
-                            count
-                        );
-                        Some(count)
-                    }
-
-                    _ => None,
-                }
-            {
-                return Some(LogicalTime::from_rcbs(*next_time_slice_in_brances as u64));
-            }
-        }
-        None
-    }
-
     /// Verify that the event we're replaying matches what just happened.  Set up the next
     /// (replayed) event to run.  Return true if the current thread will keep running and false if
     /// it needs to be descheduled.
     ///
     /// PreReq: we're running under --replay-schedule-from
     pub fn consume_schedevent(&mut self, observed: &SchedEvent) -> ConsumeResult {
-        debug_assert!(self.replay_cursor.is_some());
-
+        debug_assert!(self.replayer.is_some());
         let mytid = observed.dettid;
-        let time = observed.end_time.expect("timestamps required for now");
 
-        let current_ix = self.traced_event_count;
-        self.traced_event_count += 1;
-        let print_stack = self.try_pop_stacktrace_event(current_ix);
-        if let Some(expected) = self
-            .replay_cursor
-            .as_mut()
-            .expect("replay iterator set while in replay mode")
-            .next()
-        {
-            debug!(
-                "[detcore, dtid {}] {}: Ran event #{} {:?}, current replay event: {:?}",
-                mytid,
-                compare_desync(observed, &expected),
-                current_ix,
-                observed,
-                expected,
-            );
-            trace!(
-                "[detcore, dtid {}] NEXT event to replay {:?}",
-                mytid,
-                self.replay_cursor.as_mut().unwrap().peek()
-            );
+        if let Some((ix, action)) = self.replayer.as_mut().map(|r| {
+            let current_ix = r.traced_event_count;
+            (current_ix, r.observe_event(observed))
+        }) {
+            let print_stack = self.try_pop_stacktrace_event(ix);
+            debug!("Next ReplayAction = {:?}", action);
 
-            if is_desync(observed, &expected) {
-                let counts = self.desync_counts.entry(mytid).or_insert((0, 0));
-                if is_hard_desync(observed, &expected) {
-                    if self.die_on_desync {
-                        eprintln!("Replay mode desynchronized from trace, bailing out.");
-                        immediate_fatal_exit();
-                    }
-                    counts.1 += 1;
-                } else {
-                    counts.0 += 1;
+            match action {
+                replayer::ReplayAction::Continue(timeslice_remaining) => {
+                    return ConsumeResult {
+                        keep_running: true,
+                        print_stack,
+                        event_ix: ix,
+                        timeslice_remaining,
+                    };
                 }
-            }
-
-            let (keep_running, timeslice) = if let Some(next_ev) =
-                self.replay_cursor.as_ref().unwrap().peek()
-            {
-                let is_prehook = matches!(observed.op, Op::Syscall(_, SyscallPhase::Prehook));
-
-                let next_tid = next_ev.dettid;
-                // Checking for an optional timeslice in case of RCB
-                let timeslice_remaining = self.resolve_time_to_run(next_ev);
-
-                if next_tid != observed.dettid {
-                    if is_prehook {
-                        info!(
-                            "[detcore, dtid {}] CONTEXT SWITCH to {} after this syscall blocks.  Reprioritizing at time {}",
-                            &mytid, next_tid, time
-                        );
-                    } else {
-                        info!(
-                            "[detcore, dtid {}] CONTEXT SWITCH to {} after the last event retired.  Reprioritizing at time {}",
-                            &mytid, next_tid, time
-                        );
-                    }
-
+                replayer::ReplayAction::Stop(StopReason::FatalDesync) => immediate_fatal_exit(),
+                replayer::ReplayAction::Stop(StopReason::ReplayExausted) => immediate_fatal_exit(),
+                replayer::ReplayAction::ContextSwitch(is_now, new_tid, timeslice_remaining) => {
                     self.requeue_with_new_priority(mytid, REPLAY_DEFERRED_PRIORITY);
-                    self.requeue_with_new_priority(next_tid, REPLAY_FOREGROUND_PRIORITY);
-                    self.timeslices.insert(next_tid, timeslice_remaining);
-                    // The *downgrading* of the current thread will be handled by the caller if the
-                    // context switch is *now*.  If the last traced event on this thread is instead
-                    // a prehook, well we don't deschedule the current thread quite yet.  Rather, we
-                    // let the thread plow ahead, and actually block on the syscall, which will have
-                    // the effect of descheduling the therad anyway.  After that, the priorities
-                    // be set so as to make sure the correct thread (next_tid) runs.
-                    (is_prehook, timeslice_remaining)
-                } else {
-                    // We're still running the next event.
-                    (true, timeslice_remaining)
+                    self.requeue_with_new_priority(new_tid, REPLAY_FOREGROUND_PRIORITY);
+                    self.timeslices.insert(new_tid, timeslice_remaining);
+                    return ConsumeResult {
+                        keep_running: !is_now,
+                        print_stack,
+                        event_ix: ix,
+                        timeslice_remaining,
+                    };
                 }
-            } else {
-                (true, None) // We're the very last event.  Nothing to do.
             };
-            trace!(
-                "returning consume_event: keep_running = {}, timeslice: {:?}",
-                keep_running,
-                timeslice
-            );
-            ConsumeResult {
-                keep_running,
-                print_stack,
-                event_ix: current_ix,
-                timeslice_remaining: timeslice,
-            }
-        } else {
-            if self.replay_exhausted_panic {
-                eprintln!(
-                    "[detcore, dtid {}] Replay trace ran out, stopping at unknown event {:?}",
-                    &mytid, observed
-                );
-                immediate_fatal_exit();
-            } else {
-                info!(
-                    "[detcore, dtid {}] Replay trace ran out, unknown event {:?}",
-                    &mytid, observed
-                );
-            }
-            // We're PAST the last event.  Uncharted territory...
-            ConsumeResult {
-                keep_running: true,
-                print_stack: None,
-                event_ix: current_ix,
-                timeslice_remaining: None,
-            }
+        }
+
+        ConsumeResult {
+            keep_running: true,
+            print_stack: None,
+            event_ix: 0,
+            timeslice_remaining: None,
         }
     }
 
@@ -1880,7 +1661,7 @@ impl Scheduler {
         let old_priority = self.priorities.insert(dettid, new_priority);
 
         // Do not attempt to record preemptions/priorities when we're dictated by a raw schedule replay.
-        if self.replay_cursor.is_none() {
+        if self.replayer.is_none() {
             if let Some(pw) = &mut self.preemption_writer {
                 let old_prio = old_priority.unwrap();
                 debug!(
@@ -2127,7 +1908,7 @@ impl Scheduler {
         placeholder_syscall: Syscall,
         global_time: &Mutex<GlobalTime>,
     ) {
-        let replay = self.replay_cursor.is_some();
+        let replay = self.replayer.is_some();
         let record = self.preemption_writer.is_some();
         if !(replay || record) {
             return;
@@ -2226,16 +2007,24 @@ impl Scheduler {
         // Thread report:
         buf.push_str(&self.thread_tree.final_report());
 
-        let (total_soft, total_hard) = &self
-            .desync_counts
-            .values()
-            .fold((0, 0), |(x, y), (a, b)| (x + a, y + b));
+        let (total_soft, total_hard) = self
+            .replayer
+            .as_ref()
+            .map(|r| {
+                r.desync_counts
+                    .values()
+                    .fold((0, 0), |(x, y), (a, b)| (x + a, y + b))
+            })
+            .unwrap_or_default();
         writeln!(
             buf,
             "Internally, the hermit scheduler ran {} turns, recorded {} events, replayed {} events ({} desynced)",
             self.turn,
             self.recorded_event_count,
-            self.traced_event_count,
+            self.replayer
+                .as_ref()
+                .map(|r| r.traced_event_count)
+                .unwrap_or_default(),
             total_soft + total_hard
         )?;
 
@@ -2245,8 +2034,11 @@ impl Scheduler {
                 "  Encountered {} soft desyncs, {} hard.  Per thread: ",
                 total_soft, total_hard
             )?;
-            for (tid, (soft, hard)) in self.desync_counts.iter() {
-                write!(buf, "{}=>({},{}) ", tid, soft, hard)?;
+
+            if let Some(ref replayer) = self.replayer {
+                for (tid, (soft, hard)) in replayer.desync_counts.iter() {
+                    write!(buf, "{}=>({},{}) ", tid, soft, hard)?;
+                }
             }
             writeln!(buf)?;
         }
