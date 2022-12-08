@@ -377,7 +377,6 @@ tracereplay_exempt_rs = [
         tracereplay_chaos =
             not p in tracereplay_exempt_rs and
             not p in [
-                "rust/mem_race.rs",
                 "rust/print_nanosleep_race.rs",
                 "rust/print_clock_nanosleep_monotonic_abs_race.rs",
                 "rust/print_clock_nanosleep_monotonic_race.rs",
