@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -745,6 +746,20 @@ where
 {
     let dettime = &guest.thread_state().thread_logical_time;
     event.with_dettime(dettime)
+}
+
+// Enrich the event with the RIP register from the current guest state, but only if it is unset.
+pub async fn with_guest_rip<G, T>(guest: &mut G, mut event: SchedEvent) -> SchedEvent
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    assert!(event.end_rip.is_none());
+
+    let regs = guest.regs().await;
+    let end_rip = NonZeroUsize::new(regs.rip.try_into().unwrap()).unwrap();
+    event.end_rip = Some(end_rip);
+    event
 }
 
 // Convert to absolute logical time point for the timeout.

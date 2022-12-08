@@ -96,6 +96,7 @@ pub use util::punch_out_print;
 
 use crate::resources::Permission;
 use crate::resources::ResourceID;
+use crate::syscalls::helpers::with_guest_rip;
 use crate::syscalls::helpers::with_guest_time;
 use crate::tool_global::resource_request;
 use crate::tool_global::trace_schedevent;
@@ -114,8 +115,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(self.record_or_replay(guest, call).await?)
     }
 
-    /// Update logical thread time with any outstanding ticks of the Reverie clock.
-    async fn update_logical_time_rcbs<G: Guest<Self>>(&self, guest: &mut G) {
+    /// Update logical thread time with any outstanding ticks of the Reverie clock.  Returns a list
+    /// of corresponding Branch/OtherInstructions events if schedule recording is enabled.
+    async fn update_logical_time_rcbs<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Option<Vec<SchedEvent>> {
         if self.cfg.use_rcb_time() {
             let precise_timers = !guest.config().imprecise_timers;
             // TODO(T86591083): we might need to not always increment as a hack fix
@@ -166,6 +171,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 clock_value,
             );
             if self.cfg.should_trace_schedevent() {
+                let mut vec = Vec::new();
                 let ev = with_guest_time(
                     guest,
                     SchedEvent::branches(
@@ -179,7 +185,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // We don't fill the end_rip here, because the current rip is NOT precisely the
                     // end of this block of branch events.  Other instructions may have occured
                     // since the last branch.
-                    trace_schedevent(guest, ev, false).await;
+                    vec.push(ev)
                 } else {
                     trace!(
                         "[detcore, dtid {}] Refusing to record zero-braches event: {:?}",
@@ -188,23 +194,26 @@ impl<T: RecordOrReplay> Detcore<T> {
                     );
                 }
                 // This will ALWAYS record, even if the branches above are zero.
-                trace_schedevent(
+                let ev2 = with_guest_time(
                     guest,
-                    with_guest_time(
-                        guest,
-                        SchedEvent {
-                            dettid,
-                            op: Op::OtherInstructions,
-                            count: 1,
-                            start_rip: None,
-                            end_rip: None,
-                            end_time: None,
-                        },
-                    ),
-                    true, // Fill in end_rip because current rip represents the end of this event.
-                )
-                .await;
+                    SchedEvent {
+                        dettid,
+                        op: Op::OtherInstructions,
+                        count: 1,
+                        start_rip: None,
+                        end_rip: None,
+                        end_time: None,
+                    },
+                );
+                // Fill in end_rip because current rip represents the end of this event.
+                let ev2 = with_guest_rip(guest, ev2).await;
+                vec.push(ev2);
+                Some(vec)
+            } else {
+                None
             }
+        } else {
+            None
         }
     }
 
@@ -212,7 +221,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// control from the guest.
     async fn pre_handler_hook<G: Guest<Self>>(&self, guest: &mut G) {
         let dettid = guest.thread_state().dettid;
-        self.update_logical_time_rcbs(guest).await;
+        let evs = self.update_logical_time_rcbs(guest).await;
 
         if guest.thread_state().guest_past_first_execve() {
             detlog_debug!(
@@ -237,6 +246,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     slice_end
                 );
                 self.end_timeslice(guest).await;
+            }
+        }
+
+        if let Some(vec) = evs {
+            for ev in vec {
+                trace_schedevent(guest, ev, false).await;
             }
         }
     }
