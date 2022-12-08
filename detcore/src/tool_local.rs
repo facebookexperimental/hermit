@@ -511,6 +511,7 @@ impl<T> ThreadState<T> {
             let current_ns = self.thread_logical_time.as_nanos();
             let mut result = None;
 
+            // Preemption-point replay from recorded --chaos configuration.
             if let Some(thi) = &mut self.preemption_points {
                 if self.stats.last_recorded_slice.is_none() {
                     // We have not tapped out the recording yet.
@@ -543,8 +544,6 @@ impl<T> ThreadState<T> {
                         );
                         self.stats.last_recorded_slice = Some(self.stats.timeslice_count);
                         self.end_of_timeslice = Some(max);
-                        // Still keep last-resort preemption for busy-wait breaking:
-                        // self.end_of_timeslice = Some(current_ns + Nanoseconds::from(u64::from(timeout_ns)));
                         result = Some(prio)
                     }
                 } else {
@@ -556,18 +555,29 @@ impl<T> ThreadState<T> {
                     result = Some(thi.final_priority())
                 }
             } else if !cfg.chaos {
-                // In non-chaos mode, we only care about preemption for breaking busy-waits,
-                // and we can safely reset the clock every time we get control back from the
-                // guest.  This is our preemption-of-last-resort:
-                self.end_of_timeslice =
-                    Some(current_ns + Duration::from_nanos(u64::from(timeout_ns)));
-                debug!(
-                    "[dtid {}] next timeslice (T{}), end of slice set to {} (current {})",
-                    self.dettid,
-                    self.stats.timeslice_count + 1,
-                    self.end_of_timeslice.unwrap(),
-                    current_ns,
-                );
+                if cfg.replay_schedule_from.is_some() {
+                    // This will be over written based on Branch count replayed IF needed.
+                    debug!(
+                        "[dtid {}] next timeslice (T{}), in replay mode setting timeslice to max (current time {})",
+                        self.dettid,
+                        self.stats.timeslice_count + 1,
+                        current_ns
+                    );
+                    self.end_of_timeslice = Some(LogicalTime::MAX);
+                } else {
+                    // In non-chaos mode, we only care about preemption for breaking busy-waits,
+                    // and we can safely reset the clock every time we get control back from the
+                    // guest.  This is our preemption-of-last-resort:
+                    self.end_of_timeslice =
+                        Some(current_ns + Duration::from_nanos(u64::from(timeout_ns)));
+                    debug!(
+                        "[dtid {}] next timeslice (T{}), end of slice set to {} (current {})",
+                        self.dettid,
+                        self.stats.timeslice_count + 1,
+                        self.end_of_timeslice.unwrap(),
+                        current_ns,
+                    );
+                }
             } else {
                 let target_timeout_rcbs = u64::from(timeout_ns) as f64 / NANOS_PER_RCB;
                 let next_rcbs: u64 = if cfg.chaos {
