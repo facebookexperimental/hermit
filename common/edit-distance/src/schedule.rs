@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 #[allow(dead_code)]
-pub type Schedule = Vec<SchedEvent>;
+pub type Schedule = Vec<MiniSchedEvent>;
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
 pub enum Op {
@@ -23,7 +23,7 @@ pub enum Op {
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
-pub struct SchedEvent {
+pub struct MiniSchedEvent {
     #[serde(alias = "dettid")]
     tid: u32,
     op: Op,
@@ -47,7 +47,7 @@ fn count_thread_events(schedule: &Schedule) -> HashMap<u32, usize> {
 
 /// Counts the number of events for each thread.
 #[allow(dead_code)]
-fn partition_thread_events(schedule: Schedule) -> HashMap<u32, Vec<SchedEvent>> {
+fn partition_thread_events(schedule: Schedule) -> HashMap<u32, Schedule> {
     let mut result = HashMap::<u32, Vec<_>>::new();
 
     for event in schedule {
@@ -104,8 +104,8 @@ mod tests {
         let edit_dist = damerau_lev(&passing_schedule, &failing_schedule);
         assert_eq!(edit_dist, 26);
 
-        let passing_schedule: HashSet<SchedEvent> = HashSet::from_iter(passing_schedule);
-        let failing_schedule: HashSet<SchedEvent> = HashSet::from_iter(failing_schedule);
+        let passing_schedule: HashSet<MiniSchedEvent> = HashSet::from_iter(passing_schedule);
+        let failing_schedule: HashSet<MiniSchedEvent> = HashSet::from_iter(failing_schedule);
 
         let diff: Vec<_> = passing_schedule
             .symmetric_difference(&failing_schedule)
