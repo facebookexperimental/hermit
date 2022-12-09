@@ -117,9 +117,15 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Update logical thread time with any outstanding ticks of the Reverie clock.  Returns a list
     /// of corresponding Branch/OtherInstructions events if schedule recording is enabled.
+    ///
+    /// # Arguments
+    ///
+    /// * `precise_branch`: if true, there were no non-branch instructions since the last recorded branch instruction.
+    ///
     async fn update_logical_time_rcbs<G: Guest<Self>>(
         &self,
         guest: &mut G,
+        precise_branch: bool,
     ) -> Option<Vec<SchedEvent>> {
         if self.cfg.use_rcb_time() {
             let precise_timers = !guest.config().imprecise_timers;
@@ -181,6 +187,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                             .expect("should not have more than 2^32 branches at once"),
                     ),
                 );
+                let ev = if precise_branch {
+                    with_guest_rip(guest, ev).await
+                } else {
+                    ev
+                };
+
                 if delta_rcbs > 0 {
                     // We don't fill the end_rip here, because the current rip is NOT precisely the
                     // end of this block of branch events.  Other instructions may have occured
@@ -193,21 +205,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                         ev
                     );
                 }
-                // This will ALWAYS record, even if the branches above are zero.
-                let ev2 = with_guest_time(
-                    guest,
-                    SchedEvent {
-                        dettid,
-                        op: Op::OtherInstructions,
-                        count: 1,
-                        start_rip: None,
-                        end_rip: None,
-                        end_time: None,
-                    },
-                );
-                // Fill in end_rip because current rip represents the end of this event.
-                let ev2 = with_guest_rip(guest, ev2).await;
-                vec.push(ev2);
+                if !precise_branch {
+                    // This will ALWAYS record, even if the branches above are zero.
+                    let ev2 = with_guest_time(
+                        guest,
+                        SchedEvent {
+                            dettid,
+                            op: Op::OtherInstructions,
+                            count: 1,
+                            start_rip: None,
+                            end_rip: None,
+                            end_time: None,
+                        },
+                    );
+                    // Fill in end_rip because current rip represents the end of this event.
+                    let ev2 = with_guest_rip(guest, ev2).await;
+                    vec.push(ev2);
+                }
                 Some(vec)
             } else {
                 None
@@ -219,9 +233,9 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// A common hook called at the start of *every* handler, just after we receive
     /// control from the guest.
-    async fn pre_handler_hook<G: Guest<Self>>(&self, guest: &mut G) {
+    async fn pre_handler_hook<G: Guest<Self>>(&self, guest: &mut G, precise_branch: bool) {
         let dettid = guest.thread_state().dettid;
-        let evs = self.update_logical_time_rcbs(guest).await;
+        let evs = self.update_logical_time_rcbs(guest, precise_branch).await;
 
         if guest.thread_state().guest_past_first_execve() {
             detlog_debug!(
@@ -594,7 +608,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         ecx: u32,
     ) -> Result<CpuIdResult, Errno> {
         trace!("handle_cpuid_event: eax: {}, ecx: {}", eax, ecx);
-        self.pre_handler_hook(guest).await;
+        self.pre_handler_hook(guest, false).await;
         let res = if self.cfg.virtualize_cpuid {
             let dettid = guest.thread_state().dettid;
             let time = &mut guest.thread_state_mut().thread_logical_time;
@@ -635,7 +649,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         request: Rdtsc,
     ) -> Result<RdtscResult, Errno> {
         trace!("handle_rdtsc_event: {:?}", request);
-        self.pre_handler_hook(guest).await;
+        self.pre_handler_hook(guest, false).await;
         let result = if guest.config().virtualize_time {
             let dettid = guest.thread_state().dettid;
             guest.thread_state_mut().thread_logical_time.add_rdtsc();
@@ -686,7 +700,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             warn!("Fatal: Exiting hermit container immediately upon SIGINT");
             unrecoverable_shutdown(guest).await
         } else {
-            self.pre_handler_hook(guest).await;
+            self.pre_handler_hook(guest, false).await;
 
             let dettid = guest.thread_state().dettid;
             let mycount = guest.thread_state().stats.signal_count;
@@ -833,7 +847,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
         // The prehook is a noop for a thread just starting.  Can't end the timeslice.  There's no
         // RCB progress to record.  However, we call it for consistency with all the other handlers.
-        self.pre_handler_hook(guest).await;
+        self.pre_handler_hook(guest, true).await;
+        // ^ precise_branch=true: There should have been ZERO prior instructions before this,
+        // because the thread hasn't done anything yet.
 
         self.record_or_replay
             .handle_thread_start(&mut guest.into_guest())
@@ -845,7 +861,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         guest.thread_state_mut().past_global_first_execve = true;
-        self.pre_handler_hook(guest).await;
+        self.pre_handler_hook(guest, false).await;
 
         if let Some(ptr) = guest.auxv().at_random() {
             // It is safe to mutate this address since libc has not yet had a
@@ -899,7 +915,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // This may LOOK like a noop, but actually all of the logic for ending the timeslice is in
         // the prehook.  All the timer has to do is interrupt the guest and generate an extra call
         // to this prehook.
-        self.pre_handler_hook(guest).await;
+        self.pre_handler_hook(guest, true).await;
         self.post_handler_hook(guest).await;
     }
 
@@ -908,7 +924,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         call: Syscall,
     ) -> Result<i64, Error> {
-        self.pre_handler_hook(guest).await;
+        self.pre_handler_hook(guest, false).await;
 
         let dettid = guest.thread_state().dettid;
 

@@ -32,14 +32,6 @@ fn split_one(event: SchedEvent) -> Vec<SchedEvent> {
             ..event
         },
         SchedEvent {
-            count: 1,
-            op: Op::OtherInstructions,
-            end_time: first_end_time,
-            start_rip: None,
-            end_rip: None,
-            ..event
-        },
-        SchedEvent {
             count: second_count,
             op: Op::Branch,
             start_rip: None,
@@ -121,13 +113,6 @@ mod tests {
             .map(|x| (x.op, x.count, x.end_time.unwrap().as_nanos()))
             .collect();
 
-        assert_eq!(
-            counts,
-            vec![
-                (Op::Branch, 1, 9980),
-                (Op::OtherInstructions, 1, 9980),
-                (Op::Branch, 2, 10000)
-            ]
-        );
+        assert_eq!(counts, vec![(Op::Branch, 1, 9980), (Op::Branch, 2, 10000)]);
     }
 }
