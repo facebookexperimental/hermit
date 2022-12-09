@@ -182,13 +182,18 @@ buck_sh_test(
     for (name, target, analyze_opts, expected_output) in [
         # ("hello_race_mini", "$(location //hermetic_infra/hermit/flaky-tests:hello_race_mini)", "", ""),
         # TODO: switch to --base-env=empty:
-        ("hello_race", "$(location //hermetic_infra/hermit/flaky-tests:hello_race)", "--run-arg=--base-env=host", ""),
+        (
+            "hello_race",
+            "$(location //hermetic_infra/hermit/flaky-tests:hello_race)",
+            "--run-arg=--base-env=host",
+            "",
+        ),
         # This one doesn't crash/exit-with-error, rather it is detected based on stdout.
         # Here we require the test to blame a specific line.  Must be updated if the file changes:
         (
             "racewrite_nostdlib",
             "$(location //hermetic_infra/hermit/tests:racewrite_nostdlib)",
-            "--run-arg=--base-env=empty --target-exit-code=0 --target-stdout=barfoo",
+            "--selfcheck --run-arg=--base-env=empty --target-exit-code=0 --target-stdout=barfoo",
             "simple/racewrite_nostdlib.c:35",
         ),
         # TODO: enable more analyze tests:

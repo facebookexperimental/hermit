@@ -489,7 +489,7 @@ impl AnalyzeOpts {
             );
         }
         let mut ldopts = LogDiffCLIOpts::new(run1_log_path, run2_log_path);
-        ldopts.more.ignore_lines = vec!["CHAOSRAND".to_string()];
+        ldopts.more.ignore_lines = vec!["CHAOSRAND".to_string(), "SCHEDRAND".to_string()];
         ldopts.main(global)
     }
 
