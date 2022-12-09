@@ -346,18 +346,20 @@ impl AnalyzeOpts {
         strs.join(", ")
     }
 
-    /// Create our workspace and verify the input run matches the criteria, or find one that does.
     /// Mutates AnalyzeOpts in order to initialize some fields.
-    ///
-    /// Returns the logs and preemption (path) extracted from the initial target run.
-    fn phase1_establish_target_run(&mut self) -> Result<(PathBuf, PathBuf), Error> {
+    fn phase0_initialize(&mut self) -> anyhow::Result<()> {
         let dir = tempfile::Builder::new()
             .prefix("hermit_analyze")
             .tempdir()?;
         let tmpdir_path = dir.into_path(); // For now always keep the temporary results.
         eprintln!(":: Temp workspace: {}", tmpdir_path.display());
         self.tmp_dir = Some(tmpdir_path);
+        Ok(())
+    }
 
+    /// Create our workspace and verify the input run matches the criteria, or find one that does.
+    /// Returns the results of the target run.
+    fn phase1_establish_target_run(&self) -> Result<(PathBuf, PathBuf), Error> {
         // Must run after tmp_dir is set:
         let run1_opts = self.get_run1_runopts()?;
         eprintln!(
@@ -792,6 +794,7 @@ impl AnalyzeOpts {
             );
         }
 
+        self.phase0_initialize()?;
         let (run1_log_path, preempts_path) = self.phase1_establish_target_run()?;
 
         let (min_preempts, min_preempts_path, maybe_min_log) =
@@ -955,6 +958,7 @@ impl AnalyzeOpts {
         let search_seed = self.analyze_seed.unwrap_or_else(|| {
             let mut rng0 = rand::thread_rng();
             let seed: u64 = rng0.gen();
+            yellow_msg(&format!("WARNING: performing --search with system randomness, use --analyze-seed={} to repro.", seed));
             seed
         });
         yellow_msg(&format!("Failure search using RNG seed {}", search_seed));

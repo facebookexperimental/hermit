@@ -41,7 +41,7 @@ use serde::Serialize;
 /// The critical events are identified to the user by printing their stack traces, optionally into a
 /// separate report file.
 ///
-#[derive(Debug, Parser)]
+#[derive(Debug, Parser, Clone)]
 pub struct AnalyzeOpts {
     /// Target: Analyze runs that have collected stdout output matching this regular expression.
     #[clap(long, value_name = "REGEX")]
@@ -182,7 +182,7 @@ pub struct AnalyzeOpts {
 // TODO: introduce a new type to encapsulate the state of the search, and make it immutable.
 // pub struct SearchState {}
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 pub enum ExitStatusConstraint {
     /// Accept only a specific exit code.
     Exact(i32),
