@@ -347,6 +347,7 @@ impl AnalyzeOpts {
     }
 
     /// Create our workspace and verify the input run matches the criteria, or find one that does.
+    /// Mutates AnalyzeOpts in order to initialize some fields.
     ///
     /// Returns the logs and preemption (path) extracted from the initial target run.
     fn phase1_establish_target_run(&mut self) -> Result<(PathBuf, PathBuf), Error> {
@@ -428,7 +429,7 @@ impl AnalyzeOpts {
     /// - Path of a file containing that same minimized preemption record,
     /// - Path of the log file that corresponds to the last matching (minimal) run, IF minimized.
     fn phase2_minimize(
-        &mut self,
+        &self,
         global: &GlobalOpts,
         preempts_path: &Path,
     ) -> anyhow::Result<(PreemptionRecord, PathBuf, Option<PathBuf>)> {
@@ -493,7 +494,7 @@ impl AnalyzeOpts {
     /// Optionally do an extra run to verify that preemptions replay and yield the exact same
     /// execution.a
     pub fn phase3_strict_preempt_replay_check(
-        &mut self,
+        &self,
         global: &GlobalOpts,
         run1_log_path: &Path,
         run1_preempts_path: &Path,
@@ -549,7 +550,7 @@ impl AnalyzeOpts {
     ///
     /// Returns a path to a file containing recorded schedule events for the baseline run.
     pub fn phase4_choose_baseline_sched_events(
-        &mut self,
+        &self,
         global: &GlobalOpts,
         matching_pr: PreemptionRecord,
     ) -> anyhow::Result<PathBuf> {
@@ -644,7 +645,7 @@ impl AnalyzeOpts {
 
     /// Perform the binary search through schedule-space, identifying critical events.
     pub fn phase5_bisect_traces(
-        &mut self,
+        &self,
         target: Vec<SchedEvent>,
         baseline: Vec<SchedEvent>,
     ) -> anyhow::Result<CriticalSchedule> {
@@ -691,7 +692,7 @@ impl AnalyzeOpts {
     }
 
     /// Record the schedules on disk as reproducers and report stack-traces of critical events.
-    pub fn phase6_record_outputs(&mut self, crit: CriticalSchedule) -> Result<Report, Error> {
+    pub fn phase6_record_outputs(&self, crit: CriticalSchedule) -> Result<Report, Error> {
         let tmp_dir = self.get_tmp()?;
         let CriticalSchedule {
             failing_schedule,
