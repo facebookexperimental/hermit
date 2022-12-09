@@ -6,11 +6,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::path::Path;
 use std::path::PathBuf;
 
 use clap::Parser;
-use detcore::preemptions::PreemptionReader;
+use detcore::preemptions::strip_times_from_events_file;
 
 use crate::cli_wrapper::*;
 use crate::common::TemporaryEnvironment;
@@ -59,18 +58,6 @@ pub struct TraceReplayOpts {
     args: Vec<String>,
 }
 
-fn strip_times(sched_path: &Path) -> anyhow::Result<PathBuf> {
-    let new_path = sched_path.with_extension("notimes");
-    let mut preemptions = PreemptionReader::new(sched_path).into_inner();
-    for se in preemptions.schedevents_iter_mut() {
-        se.end_time = None;
-    }
-    preemptions
-        .write_to_disk(new_path.as_ref())
-        .map_err(anyhow::Error::msg)?;
-    Ok(new_path)
-}
-
 impl UseCase for TraceReplayOpts {
     fn build_temp_env(
         &self,
@@ -108,7 +95,7 @@ impl UseCase for TraceReplayOpts {
         current_run: &crate::common::RunEnvironment,
     ) -> Vec<String> {
         let replay_sched = if self.strip_times {
-            strip_times(&prev_run.schedule_file).unwrap()
+            strip_times_from_events_file(&prev_run.schedule_file, None).unwrap()
         } else {
             prev_run.schedule_file.clone()
         };

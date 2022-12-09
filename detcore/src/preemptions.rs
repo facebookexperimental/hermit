@@ -850,3 +850,21 @@ impl PreemptionReader {
         sum
     }
 }
+
+/// Take a file containing a PreemptionRecord and strip the times from all the events.
+/// Optionally take a destination path, otherwise create a destination file in the same directory
+/// with our own naming convention.
+pub fn strip_times_from_events_file(
+    sched_path: &Path,
+    dest: Option<PathBuf>,
+) -> anyhow::Result<PathBuf> {
+    let new_path = dest.unwrap_or_else(|| sched_path.with_extension("notimes"));
+    let mut preemptions = PreemptionReader::new(sched_path).into_inner();
+    for se in preemptions.schedevents_iter_mut() {
+        se.end_time = None;
+    }
+    preemptions
+        .write_to_disk(new_path.as_ref())
+        .map_err(anyhow::Error::msg)?;
+    Ok(new_path)
+}

@@ -102,12 +102,13 @@ where
                 bubbles.midpoint().cloned().collect::<Vec<_>>(),
             )
         };
-
         eprintln!(
-            ":: Event-Level Search Pass {} => EditDistance = {}, Swap Distance = {} (Midpoint sched length = {})",
+            ":: Event-Level Search Pass {} => EditDistance = {}, Swap Distance = {} ({:.0}% matched, midpoint sched len = {})",
             pass_number,
             edit_dist,
             swap_dist,
+            (100.0 * 2.0 * requested_midpoint_schedule.len() as f64
+                / (passing_schedule.len() + failing_schedule.len()) as f64),
             requested_midpoint_schedule.len()
         );
 
