@@ -39,11 +39,9 @@ pub struct RunData {
     sched_path_out: Option<PathBuf>,
     log_path: Option<PathBuf>,
 
+    /// The input preemptions, if it has been read to memory.
+    in_mem_preempts_in: Option<PreemptionRecord>,
     in_mem_sched_out: Option<PreemptionRecord>,
-
-    /// The input schedule, if it has been read to memory.
-    _sched_in: Option<Vec<SchedEvent>>,
-    _sched_out: Option<Vec<SchedEvent>>,
 
     is_a_match: Option<bool>,
 }
@@ -78,18 +76,12 @@ impl RunData {
     }
 
     // Return a reference to the in-memory preemption record, reading it from disk if it isn't read
-    // already.
+    // already. Errors if the file doesn't exist.
     pub fn preempts_out(&mut self) -> &PreemptionRecord {
         if self.in_mem_sched_out.is_none() {
             let path = self.sched_path_out();
             let pr = PreemptionReader::new(path);
             self.in_mem_sched_out = Some(pr.load_all());
-            // if let Some(path) = &self.sched_path_out {
-            //     let pr = PreemptionReader::new(preempts_path);
-            //     self.in_mem_sched_out = Some(pr.load_all());
-            // } else {
-            //     panic!("preempts_out should only be called after sched_path_out is established");
-            // }
         }
         self.in_mem_sched_out.as_ref().unwrap()
     }
@@ -104,6 +96,20 @@ impl RunData {
             self.sched_path_out = Some(path);
         }
         self.sched_path_out.as_ref().unwrap()
+    }
+
+    /// Convenience function
+    pub fn sched_out_file_name(&mut self) -> String {
+        self.sched_path_out()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string()
+    }
+
+    pub fn sched_out(&mut self) -> &Vec<SchedEvent> {
+        let pr = self.preempts_out();
+        pr.schedevents()
     }
 
     /// Only set after launch.
@@ -196,9 +202,8 @@ impl RunData {
             preempts_path_in: None,
             sched_path_out: None,
             log_path: None,
+            in_mem_preempts_in: None,
             in_mem_sched_out: None,
-            _sched_in: None,
-            _sched_out: None,
             is_a_match: None,
         }
     }
@@ -220,16 +225,44 @@ impl RunData {
             sched_path_out: Some(preempts_path),
             log_path: Some(log_path),
             in_mem_sched_out: Some(in_mem_preempts),
-            _sched_in: None,
-            _sched_out: None,
+            in_mem_preempts_in: None,
             // Invariant: minimize should always return an on-target configuration:
             is_a_match: Some(true),
         }
     }
 
-    pub fn with_replay_preemptions(mut self, path: PathBuf) -> Self {
+    /// Another fake run that stores a result without actually laucnhing anything.
+    pub fn from_schedule_trace(
+        aopts: &AnalyzeOpts,
+        runname: String,
+        runopts: RunOpts,
+        sched_path: PathBuf,
+    ) -> Self {
+        RunData {
+            runname,
+            analyze_opts: aopts.clone(),
+            runopts,
+            preempts_path_in: None,
+            sched_path_out: Some(sched_path),
+            log_path: None,
+            in_mem_sched_out: None,
+            in_mem_preempts_in: None,
+            // Don't claim that it was run:
+            is_a_match: None,
+        }
+    }
+
+    pub fn with_preempts_path_in(mut self, path: PathBuf) -> Self {
         self.runopts.det_opts.det_config.replay_preemptions_from = Some(path);
         self
+    }
+
+    pub fn with_preempts_in(mut self, pr: PreemptionRecord) -> Self {
+        let path = self.preempts_path_in().to_path_buf();
+        pr.write_to_disk(&path)
+            .expect("write of preempts file to succeed");
+        self.in_mem_preempts_in = Some(pr);
+        self.with_preempts_path_in(path)
     }
 
     pub fn with_preemption_recording(mut self) -> Self {

@@ -113,6 +113,11 @@ impl PreemptionRecord {
         }
     }
 
+    /// Read-only access to the raw event schedule.
+    pub fn schedevents(&self) -> &Vec<SchedEvent> {
+        &self.global
+    }
+
     /// Returns true if the schedule trace (SchedEvent) record is nonempty.
     pub fn contains_schedevents(&self) -> bool {
         !self.global.is_empty()
@@ -792,6 +797,7 @@ pub struct PreemptionReader {
     inner: PreemptionRecord,
 }
 
+// Deprecated: use schedevents()
 /// Read a full trace from disk.  Panic if it doesn't load.
 pub fn read_trace(path: &Path) -> Vec<SchedEvent> {
     let pr = read_preemption_record(path);
