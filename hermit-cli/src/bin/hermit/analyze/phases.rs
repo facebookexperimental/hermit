@@ -483,15 +483,17 @@ impl AnalyzeOpts {
     pub fn phase3_strict_preempt_replay_check(
         &self,
         global: &GlobalOpts,
-        run1_log_path: &Path,
-        run1_preempts_path: &Path,
+        min_run: &mut RunData,
     ) -> Result<(), Error> {
+        let min_log_path = &min_run.log_path().unwrap();
+        let min_preempts_path = min_run.preempts_path_out();
+
         if self.selfcheck {
             yellow_msg("[selfcheck] Verifying target run preserved under preemption-replay");
 
             let mut run1b_opts = self.get_run1_runopts()?;
             run1b_opts.det_opts.det_config.replay_preemptions_from =
-                Some(run1_preempts_path.to_path_buf());
+                Some(min_preempts_path.to_path_buf());
             let runname = "run1b_selfcheck";
             eprintln!("    {}", self.runopts_to_repro(&run1b_opts, Some(runname)));
 
@@ -503,7 +505,7 @@ impl AnalyzeOpts {
 
             yellow_msg("[selfcheck] Comparing output from additional run (run1 vs run1b)");
             let run1b_log_path = self.log_path(runname);
-            let status = self.log_diff_preemption_replay(global, run1_log_path, &run1b_log_path);
+            let status = self.log_diff_preemption_replay(global, min_log_path, &run1b_log_path);
             if !second_matches {
                 bail!("First run matched criteria but second run did not.");
             }
@@ -513,10 +515,10 @@ impl AnalyzeOpts {
                 )
             }
             let run1b_preempts_path = self.preempts_path(runname);
-            if !preempt_files_equal(run1_preempts_path, &run1b_preempts_path) {
+            if !preempt_files_equal(min_preempts_path, &run1b_preempts_path) {
                 bail!(
                     "The preemptions recorded by the additional run did not match the preemptions replayed (no fixed point): {} vs {}",
-                    run1_preempts_path.display(),
+                    min_preempts_path.display(),
                     run1b_preempts_path.display(),
                 );
             }
@@ -783,14 +785,10 @@ impl AnalyzeOpts {
         let run1data = self.phase1_establish_target_run()?;
 
         let mut min_run = self.phase2_minimize(global, run1data)?;
-        let min_log_path = min_run.log_path().unwrap();
-        let min_preempts_path = min_run.preempts_path_out().to_owned();
-        let min_preempts = min_run.preempts_out();
+        self.phase3_strict_preempt_replay_check(global, &mut min_run)?;
 
-        self.phase3_strict_preempt_replay_check(global, &min_log_path, &min_preempts_path)?;
-
-        let mut normalized_preempts = min_preempts.normalize();
-        normalized_preempts.preemptions_only();
+        min_run.normalize_preempts_out();
+        let normalized_preempts = min_run.preempts_out().clone();
         eprintln!(
             ":: {}\n {}",
             "Normalized, that preemption record becomes:".green().bold(),
@@ -799,16 +797,12 @@ impl AnalyzeOpts {
                 serde_json::to_string_pretty(&normalized_preempts).unwrap()
             )
         );
-        let dir_path = self.tmp_dir.as_ref().unwrap();
-        let normalized_preempts_path = dir_path.join("final.preempts");
-        normalized_preempts
-            .write_to_disk(&normalized_preempts_path)
-            .expect("write of preempts file to succeed");
 
         // One endpoint of the bisection search:
+        let dir_path = self.tmp_dir.as_ref().unwrap();
         let target_sched_events_path = dir_path.join("first_matching.events");
         self.save_final_target_sched_events(
-            &normalized_preempts_path,
+            min_run.preempts_path_out(),
             &target_sched_events_path,
             global,
         )?;

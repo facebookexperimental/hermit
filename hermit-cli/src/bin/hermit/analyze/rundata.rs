@@ -118,6 +118,25 @@ impl RunData {
         self.is_a_match.expect("only called after launch method")
     }
 
+    pub fn has_launched(&self) -> bool {
+        self.is_a_match.is_some()
+    }
+
+    /// Called after the run has been launched, normalize the output preemptions and swap around so
+    /// that our output file points to the normalized version.
+    pub fn normalize_preempts_out(&mut self) {
+        assert!(self.has_launched());
+        let preempts_path = self.preempts_path_out();
+        let normalized_path = preempts_path.with_extension("normalized");
+
+        let normalized = self.preempts_out().normalize();
+        normalized
+            .write_to_disk(&normalized_path)
+            .expect("write of preempts file to succeed");
+        self.in_mem_sched_out = Some(normalized);
+        self.sched_path_out = Some(normalized_path);
+    }
+
     /// Execute the run. (Including setting up logging and temp dir binding.)
     pub fn launch(&mut self) -> anyhow::Result<()> {
         let root = self.analyze_opts.get_tmp()?.join(&self.runname);
