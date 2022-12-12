@@ -8,8 +8,10 @@
 
 //! A mode for analyzing a hermit run to detect concurrency bugs.
 
+mod consts;
 mod minimize;
 mod phases;
+mod rundata;
 mod types;
 
 pub use types::AnalyzeOpts;

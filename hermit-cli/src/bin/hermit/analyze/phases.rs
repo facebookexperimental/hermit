@@ -32,6 +32,8 @@ use reverie::process::ExitStatus;
 use reverie::process::Output;
 use tracing::metadata::LevelFilter;
 
+use crate::analyze::consts::*;
+use crate::analyze::rundata::RunData;
 use crate::analyze::types::AnalyzeOpts;
 use crate::analyze::types::ExitStatusConstraint;
 use crate::analyze::types::Report;
@@ -57,20 +59,6 @@ fn sched_length(path: &Path) -> usize {
     pr.into_global().len()
 }
 
-/// Right now we don't want turning on logging for `hermit analyze` itself to ALSO turn on logging
-/// for each one of the (many) individual hermit executions it calls.  This could change in the
-/// future and instead share the GlobalOpts passed to `main()`.
-const NO_LOGGING: GlobalOpts = GlobalOpts {
-    log: None,
-    log_file: None,
-};
-
-// We identify a run by a root file name, and then append a standard set of suffixes to store the
-// associated files for that run.
-const LOG_EXT: &str = "log";
-const PREEMPTS_EXT: &str = "preempts";
-const SCHED_EXT: &str = "events";
-
 /// Return true the launched run matches the target criteria.
 /// Also return the path to the log file that was written.
 type LaunchResult = anyhow::Result<(bool, PathBuf)>;
@@ -95,7 +83,7 @@ impl AnalyzeOpts {
         tmp_dir.join(runname).with_extension(SCHED_EXT)
     }
 
-    fn get_tmp(&self) -> anyhow::Result<&Path> {
+    pub fn get_tmp(&self) -> anyhow::Result<&Path> {
         if let Some(pb) = &self.tmp_dir {
             Ok(pb.as_path())
         } else {
@@ -103,7 +91,7 @@ impl AnalyzeOpts {
         }
     }
 
-    fn print_and_validate_runopts(&self, ro: &mut RunOpts, runname: &str) {
+    pub fn print_and_validate_runopts(&self, ro: &mut RunOpts, runname: &str) {
         if self.verbose {
             ro.summary = true;
             eprintln!(
@@ -151,35 +139,32 @@ impl AnalyzeOpts {
 
     /// Launch a chaos run searching for a target (e.g. failing) schudule.
     /// Returns Some if a target schedule is found.
-    fn launch_search(
-        &self,
-        round: u64,
-        sched_seed: u64,
-    ) -> Result<Option<(PathBuf, RunOpts)>, Error> {
+    fn launch_search(&self, round: u64, sched_seed: u64) -> Result<Option<RunData>, Error> {
         yellow_msg(&format!(
             "Searching (round {}) for a target execution, chaos --sched-seed={} ",
             round, sched_seed
         ));
+
         let runname = format!("search_round_{:0wide$}", round, wide = 3);
-        let preempts_path = self.preempts_path(&runname);
+
         let mut ro = self.get_base_runopts()?;
         ro.det_opts.det_config.sched_seed = Some(sched_seed);
-        ro.det_opts.det_config.record_preemptions = true;
-        ro.det_opts.det_config.record_preemptions_to = Some(preempts_path.clone());
         if self.imprecise_search {
             ro.det_opts.det_config.imprecise_timers = true; // TODO: enable this by default when bugs are fixed.
         }
+        let mut rundat = RunData::new(self, runname, ro).with_preemption_recording();
 
-        let (is_a_match, _) = self.launch_config(&runname, &mut ro)?;
-        if is_a_match {
+        rundat.launch()?;
+        // let (is_a_match, _) = self.launch_config(&runname, &mut ro)?;
+        if rundat.is_a_match() {
             eprintln!(
                 ":: {}:\n    {}",
                 "Target run established by --search. Reproducer"
                     .green()
                     .bold(),
-                self.runopts_to_repro(&ro, Some(&runname))
+                rundat.to_repro(),
             );
-            Ok(Some((preempts_path, ro)))
+            Ok(Some(rundat))
         } else {
             Ok(None)
         }
@@ -242,7 +227,7 @@ impl AnalyzeOpts {
         Ok((is_a_match, stack1_path, stack2_path, ro))
     }
 
-    fn runopts_to_repro(&self, runopts: &RunOpts, runname: Option<&str>) -> String {
+    pub fn runopts_to_repro(&self, runopts: &RunOpts, runname: Option<&str>) -> String {
         if let Some(runname) = runname {
             let logging = if self.verbose || self.selfcheck {
                 let path = self.log_path(runname);
@@ -359,7 +344,7 @@ impl AnalyzeOpts {
 
     /// Create our workspace and verify the input run matches the criteria, or find one that does.
     /// Returns the results of the target run.
-    fn phase1_establish_target_run(&self) -> Result<(PathBuf, PathBuf), Error> {
+    fn phase1_establish_target_run(&self) -> Result<RunData, Error> {
         // Must run after tmp_dir is set:
         let run1_opts = self.get_run1_runopts()?;
         eprintln!(
@@ -369,29 +354,21 @@ impl AnalyzeOpts {
         );
 
         let runname = "run1_target";
-        let preempts_path = self.preempts_path(runname);
+        let run1data = RunData::new(self, runname.to_string(), run1_opts);
 
         if let Some(p) = &self.run1_preemptions {
-            // Copy into our temp working folder so everything is self contained.
+            let preempts_path = run1data.preempts_path_out();
+            // Copy preempts to the output location as though they were recorded by this run:
             std::fs::copy(p, &preempts_path).expect("copy file to succeed");
+            // Careful, returning a NON-launched RunData just to contain the output path.
+            return Ok(run1data);
         }
 
-        let is_a_match = if self.run1_preemptions.is_none() {
-            // Translate the seed into a set of preemptions we can work from.
-            self.launch_and_record_preempts(
-                runname,
-                format!("Establish target criteria ({}):", self.display_criteria()).as_str(),
-                run1_opts,
-            )?
-            .0
-        } else {
-            if self.selfcheck {
-                todo!()
-            }
-            true
-        };
+        // Translate the seed into a set of preemptions we can work from.
+        let mut run1data = run1data.with_preemption_recording();
+        run1data.launch()?;
 
-        if !is_a_match {
+        if !run1data.is_a_match() {
             if self.search {
                 eprintln!(
                     ":: {}",
@@ -399,7 +376,7 @@ impl AnalyzeOpts {
                         .red()
                         .bold()
                 );
-                self.do_search(&preempts_path);
+                Ok(self.do_search())
             } else {
                 bail!("FAILED. The run did not match the target criteria. Try --search.");
             }
@@ -413,12 +390,11 @@ impl AnalyzeOpts {
                 .green()
                 .bold(),
             );
+            Ok(run1data)
         } else {
             eprintln!(":: {}", "WARNING: run without any --filter arguments, so accepting ALL runs. This is probably not what you wanted.".red().bold());
+            Ok(run1data)
         }
-
-        let run1_log_path = self.log_path(runname);
-        Ok((run1_log_path, preempts_path))
     }
 
     /// Reduce the set of preemptions needed to match the criteria.
@@ -448,7 +424,7 @@ impl AnalyzeOpts {
 
             Ok((min_pr, min_pr_path, Some(min_log_path)))
         } else {
-            // In this scenario we only care about event traces, and never realyl need to work with
+            // In this scenario we only care about event traces, and never really need to work with
             // preemptions.  Still, we'll need to do another run to record the trace.
             let loaded = PreemptionReader::new(preempts_path).load_all();
             Ok((loaded, preempts_path.to_path_buf(), None))
@@ -795,11 +771,12 @@ impl AnalyzeOpts {
         }
 
         self.phase0_initialize()?;
-        let (run1_log_path, preempts_path) = self.phase1_establish_target_run()?;
+        let run1data = self.phase1_establish_target_run()?;
 
         let (min_preempts, min_preempts_path, maybe_min_log) =
-            self.phase2_minimize(global, &preempts_path)?;
-        let min_log_path = maybe_min_log.unwrap_or(run1_log_path);
+            self.phase2_minimize(global, &run1data.preempts_path_out())?;
+
+        let min_log_path = maybe_min_log.unwrap_or_else(|| run1data.log_path().unwrap());
         self.phase3_strict_preempt_replay_check(global, &min_log_path, &min_preempts_path)?;
 
         let mut normalized_preempts = min_preempts.normalize();
@@ -953,8 +930,8 @@ impl AnalyzeOpts {
         }
     }
 
-    /// Search for a target run. Destination passing style: takes the path that it writes its output to.
-    fn do_search(&self, preempts_path: &Path) {
+    /// Search for a target run. Return the run when found.
+    fn do_search(&self) -> RunData {
         let search_seed = self.analyze_seed.unwrap_or_else(|| {
             let mut rng0 = rand::thread_rng();
             let seed: u64 = rng0.gen();
@@ -967,12 +944,14 @@ impl AnalyzeOpts {
         let mut round = 0;
         loop {
             let sched_seed = rng.gen();
-            if let Some((preempts, _runopts)) = self
+            if let Some(rundat) = self
                 .launch_search(round, sched_seed)
                 .unwrap_or_else(|e| panic!("Error: {}", e))
             {
-                let init_schedule: PreemptionRecord = PreemptionReader::new(&preempts).load_all();
                 if self.verbose {
+                    let preempts = rundat.preempts_path_out();
+                    let init_schedule: PreemptionRecord =
+                        PreemptionReader::new(&preempts).load_all();
                     eprintln!(
                         ":: {}:\nSchedule:\n {}",
                         "Search successfully found a failing run with schedule:"
@@ -981,8 +960,7 @@ impl AnalyzeOpts {
                         truncated(1000, serde_json::to_string(&init_schedule).unwrap()),
                     );
                 }
-                std::fs::copy(&preempts, preempts_path).expect("file copy to succeed");
-                break;
+                return rundat;
             }
             round += 1;
         }
