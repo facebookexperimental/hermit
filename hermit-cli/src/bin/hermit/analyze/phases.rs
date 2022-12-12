@@ -66,16 +66,6 @@ impl AnalyzeOpts {
         tmp_dir.join(runname).with_extension(LOG_EXT)
     }
 
-    fn preempts_path(&self, runname: &str) -> PathBuf {
-        let tmp_dir = self.tmp_dir.as_ref().unwrap();
-        tmp_dir.join(runname).with_extension(PREEMPTS_EXT)
-    }
-
-    fn _sched_path(&self, runname: &str) -> PathBuf {
-        let tmp_dir = self.tmp_dir.as_ref().unwrap();
-        tmp_dir.join(runname).with_extension(SCHED_EXT)
-    }
-
     pub fn get_tmp(&self) -> anyhow::Result<&Path> {
         if let Some(pb) = &self.tmp_dir {
             Ok(pb.as_path())
@@ -149,7 +139,6 @@ impl AnalyzeOpts {
         let mut rundat = RunData::new(self, runname, ro).with_preemption_recording();
 
         rundat.launch()?;
-        // let (is_a_match, _) = self.launch_config(&runname, &mut ro)?;
         if rundat.is_a_match() {
             eprintln!(
                 ":: {}:\n    {}",
@@ -162,21 +151,6 @@ impl AnalyzeOpts {
         } else {
             Ok(None)
         }
-    }
-
-    // TODO: REMOVE
-    /// Launch a single run with logging and preemption recording.  Return true if it matches the criteria.
-    fn launch_and_record_preempts(
-        &self,
-        runname: &str,
-        msg: &str,
-        mut runopts: RunOpts,
-    ) -> LaunchResult {
-        yellow_msg(&format!("{} record preemptions and schedule...", msg));
-        let preempts_path = self.preempts_path(runname);
-        runopts.det_opts.det_config.record_preemptions = true;
-        runopts.det_opts.det_config.record_preemptions_to = Some(preempts_path);
-        self.launch_config(runname, &mut runopts)
     }
 
     // TODO: REMOVE. Only used by minimize atm.
@@ -488,22 +462,18 @@ impl AnalyzeOpts {
         if self.selfcheck {
             yellow_msg("[selfcheck] Verifying target run preserved under preemption-replay");
 
-            let mut run1b_opts = self.get_run1_runopts()?;
-            run1b_opts.det_opts.det_config.replay_preemptions_from =
-                Some(min_preempts_path.to_path_buf());
             let runname = "run1b_selfcheck";
-            eprintln!("    {}", self.runopts_to_repro(&run1b_opts, Some(runname)));
+            let mut run1b = RunData::new(self, runname.to_string(), self.get_run1_runopts()?)
+                .with_preempts_path_in(min_preempts_path.to_path_buf())
+                .with_preemption_recording();
+            eprintln!("    {}", run1b.to_repro());
 
-            let (second_matches, _log_path) = self.launch_and_record_preempts(
-                runname,
-                "[selfcheck] Additional (target) run, replaying preemptions:",
-                run1b_opts,
-            )?;
-
+            run1b.launch()?;
             yellow_msg("[selfcheck] Comparing output from additional run (run1 vs run1b)");
-            let run1b_log_path = self.log_path(runname);
-            let status = self.log_diff_preemption_replay(global, min_log_path, &run1b_log_path);
-            if !second_matches {
+            let run1b_log_path = run1b.log_path().unwrap();
+            let status = self.log_diff_preemption_replay(global, min_log_path, run1b_log_path);
+
+            if !run1b.is_a_match() {
                 bail!("First run matched criteria but second run did not.");
             }
             if !status.success() {
@@ -511,8 +481,8 @@ impl AnalyzeOpts {
                     "Log differences found, aborting because --selfcheck requires perfect reproducibility of the target run!"
                 )
             }
-            let run1b_preempts_path = self.preempts_path(runname);
-            if !preempt_files_equal(min_preempts_path, &run1b_preempts_path) {
+            let run1b_preempts_path = run1b.preempts_path_out();
+            if !preempt_files_equal(min_preempts_path, run1b_preempts_path) {
                 bail!(
                     "The preemptions recorded by the additional run did not match the preemptions replayed (no fixed point): {} vs {}",
                     min_preempts_path.display(),
