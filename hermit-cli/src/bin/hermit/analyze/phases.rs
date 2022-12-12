@@ -403,16 +403,16 @@ impl AnalyzeOpts {
     /// preemptions as a data structure in memory.
     ///
     /// # Returns
-    /// - Minimized preemption record (in memory),
-    /// - Path of a file containing that same minimized preemption record,
-    /// - Path of the log file that corresponds to the last matching (minimal) run, IF minimized.
+    /// - The on-target run with minimized schedule.
     fn phase2_minimize(
         &self,
         global: &GlobalOpts,
-        preempts_path: &Path,
-    ) -> anyhow::Result<(PreemptionRecord, PathBuf, Option<PathBuf>)> {
+        mut last_run: RunData,
+    ) -> anyhow::Result<RunData> {
         if self.minimize {
             // In this scenario we need to work with preemptions.
+
+            let preempts_path = last_run.preempts_path_out();
             let (min_pr, min_pr_path, min_log_path) = self.minimize(preempts_path, global)?;
             eprintln!(
                 ":: {}\n {}",
@@ -422,12 +422,21 @@ impl AnalyzeOpts {
                 truncated(1000, serde_json::to_string(&min_pr).unwrap())
             );
 
-            Ok((min_pr, min_pr_path, Some(min_log_path)))
+            // TEMP: construct a RunData post-facto, until we finish the minimize overhaul:
+            let runname = "minimized".to_string();
+            let min_run = RunData::from_minimize_output(
+                self,
+                runname,
+                last_run.runopts.clone(),
+                min_pr,
+                min_pr_path,
+                min_log_path,
+            );
+            Ok(min_run)
         } else {
             // In this scenario we only care about event traces, and never really need to work with
             // preemptions.  Still, we'll need to do another run to record the trace.
-            let loaded = PreemptionReader::new(preempts_path).load_all();
-            Ok((loaded, preempts_path.to_path_buf(), None))
+            Ok(last_run)
         }
     }
 
@@ -771,12 +780,13 @@ impl AnalyzeOpts {
         }
 
         self.phase0_initialize()?;
-        let mut run1data = self.phase1_establish_target_run()?;
+        let run1data = self.phase1_establish_target_run()?;
 
-        let (min_preempts, min_preempts_path, maybe_min_log) =
-            self.phase2_minimize(global, run1data.preempts_path_out())?;
+        let mut min_run = self.phase2_minimize(global, run1data)?;
+        let min_log_path = min_run.log_path().unwrap();
+        let min_preempts_path = min_run.preempts_path_out().to_owned();
+        let min_preempts = min_run.preempts_out();
 
-        let min_log_path = maybe_min_log.unwrap_or_else(|| run1data.log_path().unwrap());
         self.phase3_strict_preempt_replay_check(global, &min_log_path, &min_preempts_path)?;
 
         let mut normalized_preempts = min_preempts.normalize();

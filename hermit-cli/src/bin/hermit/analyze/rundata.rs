@@ -15,6 +15,8 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Context;
+use detcore::preemptions::PreemptionReader;
+use detcore::preemptions::PreemptionRecord;
 use detcore::types::SchedEvent;
 use reverie::process::Output;
 use tracing::metadata::LevelFilter;
@@ -31,10 +33,11 @@ pub struct RunData {
     /// An immutable snapshot of the options.
     analyze_opts: AnalyzeOpts, // Could use an Rc to share 1 copy.
 
-    runopts: RunOpts,
+    pub runopts: RunOpts, // TEMP: make private.
 
     preempts_path_in: Option<PathBuf>,
     sched_path_out: Option<PathBuf>,
+    in_mem_sched_out: Option<PreemptionRecord>,
 
     /// The input schedule, if it has been read to memory.
     _sched_in: Option<Vec<SchedEvent>>,
@@ -70,6 +73,23 @@ impl RunData {
     pub fn preempts_path_out(&mut self) -> &Path {
         // TODO: split these apart:
         self.sched_path_out()
+    }
+
+    // Return a reference to the in-memory preemption record, reading it from disk if it isn't read
+    // already.
+    pub fn preempts_out(&mut self) -> &PreemptionRecord {
+        if self.in_mem_sched_out.is_none() {
+            let path = self.sched_path_out();
+            let pr = PreemptionReader::new(path);
+            self.in_mem_sched_out = Some(pr.load_all());
+            // if let Some(path) = &self.sched_path_out {
+            //     let pr = PreemptionReader::new(preempts_path);
+            //     self.in_mem_sched_out = Some(pr.load_all());
+            // } else {
+            //     panic!("preempts_out should only be called after sched_path_out is established");
+            // }
+        }
+        self.in_mem_sched_out.as_ref().unwrap()
     }
 
     pub fn sched_path_out(&mut self) -> &Path {
@@ -151,9 +171,33 @@ impl RunData {
             runopts,
             preempts_path_in: None,
             sched_path_out: None,
+            in_mem_sched_out: None,
             _sched_in: None,
             _sched_out: None,
             is_a_match: None,
+        }
+    }
+
+    /// A temporary constructor method until minimize overhaul is complete and it returns a RunData directly.
+    pub fn from_minimize_output(
+        aopts: &AnalyzeOpts,
+        runname: String,
+        runopts: RunOpts,
+        in_mem_preempts: PreemptionRecord,
+        preempts_path: PathBuf,
+        _log_path: PathBuf,
+    ) -> Self {
+        RunData {
+            runname,
+            analyze_opts: aopts.clone(),
+            runopts,
+            preempts_path_in: None,
+            sched_path_out: Some(preempts_path),
+            in_mem_sched_out: Some(in_mem_preempts),
+            _sched_in: None,
+            _sched_out: None,
+            // Invariant: minimize should always return an on-target configuration:
+            is_a_match: Some(true),
         }
     }
 
