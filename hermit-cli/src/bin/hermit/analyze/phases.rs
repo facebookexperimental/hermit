@@ -24,6 +24,7 @@ use rand::SeedableRng;
 use rand_pcg::Pcg64Mcg;
 use reverie::process::ExitStatus;
 use reverie::process::Output;
+use reverie::PrettyBacktrace;
 
 use crate::analyze::consts::*;
 use crate::analyze::rundata::RunData;
@@ -478,8 +479,10 @@ impl AnalyzeOpts {
             critical_event_index,
         } = crit;
 
-        let runname = "final_target_for_stacktraces";
-        let final_failing_path = tmp_dir.join(runname).with_extension(SCHED_EXT);
+        let runname1 = "final_target_for_stacktraces";
+        let runname2 = "final_baseline_for_stacktraces";
+        let final_failing_path = tmp_dir.join(runname1).with_extension(SCHED_EXT);
+        let final_passing_path = tmp_dir.join(runname2).with_extension(SCHED_EXT);
         {
             let pr = PreemptionRecord::from_sched_events(failing_schedule);
             pr.write_to_disk(&final_failing_path).unwrap();
@@ -488,7 +491,6 @@ impl AnalyzeOpts {
                 self.display_criteria(),
                 final_failing_path.display()
             );
-            let final_passing_path = tmp_dir.join("final_baseline").with_extension(SCHED_EXT);
             let pr = PreemptionRecord::from_sched_events(passing_schedule);
             pr.write_to_disk(&final_passing_path).unwrap();
             eprintln!(
@@ -510,48 +512,81 @@ impl AnalyzeOpts {
             header.push_str(
                 "You must add synchronization to prevent these operations from racing, or give them a different order.\n",
             );
-
-            eprintln!(
-                "\n:: {}",
-                "Final run to print stack traces.  Repro command:"
-                    .green()
-                    .bold()
+            header.push_str(
+                "Here are the stacktraces from a baseline run, but flipping the order of these two events makes it exhibit the target behavior (usually a failure).\n",
             );
-            let (rundata, stack1_path, stack2_path) = self.launch_for_stacktraces(
-                runname,
-                &final_failing_path,
-                critical_event_index as u64,
-            )?;
-            let res = rundata.is_a_match();
-            eprintln!("{}", rundata.to_repro());
 
-            let stack1_file = File::open(stack1_path).unwrap();
-            let stack1 = serde_json::from_reader(stack1_file).unwrap();
-            let stack2_file = File::open(stack2_path).unwrap();
-            let stack2 = serde_json::from_reader(stack2_file).unwrap();
+            let (stack1, stack2) =
+                self.print_stacks(runname2, final_passing_path, critical_event_index, false)?;
 
-            if res {
-                // Also print to the screen:
-                println!(
-                    "\n------------------------------ hermit analyze report ------------------------------"
+            // Also print to the screen:
+            println!(
+                "\n------------------------------ hermit analyze report ------------------------------"
+            );
+            println!("{}", header);
+            println!("{}", stack1);
+            println!("{}", stack2);
+
+            if self.verbose {
+                eprintln!(
+                    "\n:: {}",
+                    "[verbose] additional TARGET (failing) run to print those stack traces as well.."
+                        .yellow()
+                        .bold()
                 );
-                println!("{}", header);
+                let (stack1, stack2) =
+                    self.print_stacks(runname1, final_failing_path, critical_event_index, true)?;
+                println!(
+                    "\n----------------------- stacks from final on-target run -----------------------"
+                );
                 println!("{}", stack1);
                 println!("{}", stack2);
-                eprintln!(":: {}", "Completed analysis successfully.".green().bold());
-                Ok(Report {
-                    critical_event1: ReportCriticalEvent {
-                        event_index: critical_event_index - 1,
-                        stack: stack1,
-                    },
-                    critical_event2: ReportCriticalEvent {
-                        event_index: critical_event_index,
-                        stack: stack2,
-                    },
-                })
-            } else {
-                bail!("Internal error! Final run did NOT match the criteria as expected!")
             }
+
+            Ok(Report {
+                critical_event1: ReportCriticalEvent {
+                    event_index: critical_event_index - 1,
+                    stack: stack1,
+                },
+                critical_event2: ReportCriticalEvent {
+                    event_index: critical_event_index,
+                    stack: stack2,
+                },
+            })
+        }
+    }
+
+    fn print_stacks(
+        &self,
+        runname: &str,
+        final_path: PathBuf,
+        critical_event_index: usize,
+        expected_match: bool,
+    ) -> Result<(PrettyBacktrace, PrettyBacktrace), Error> {
+        let (rundata, stack1_path, stack2_path) =
+            self.launch_for_stacktraces(runname, &final_path, critical_event_index as u64)?;
+        let res = rundata.is_a_match();
+        eprintln!(
+            "\n:: {}",
+            "Final run to print stack traces completed.  Repro command:"
+                .green()
+                .bold()
+        );
+        eprintln!("{}", rundata.to_repro());
+
+        let stack1_file = File::open(stack1_path).unwrap();
+        let stack1 = serde_json::from_reader(stack1_file).unwrap();
+        let stack2_file = File::open(stack2_path).unwrap();
+        let stack2 = serde_json::from_reader(stack2_file).unwrap();
+
+        if res == expected_match {
+            eprintln!(":: {}", "Completed analysis successfully.".green().bold());
+            Ok((stack1, stack2))
+        } else {
+            bail!(
+                "Internal error! Final run expected match={}, but observed the opposite!",
+                expected_match,
+            )
         }
     }
 
