@@ -41,6 +41,7 @@ pub struct RunData {
     pub runopts: RunOpts, // TEMP: make private.
 
     preempts_path_in: Option<PathBuf>,
+    sched_path_in: Option<PathBuf>,
     sched_path_out: Option<PathBuf>,
     log_path: Option<PathBuf>,
 
@@ -52,7 +53,7 @@ pub struct RunData {
 }
 
 impl RunData {
-    fn root_path(&self) -> PathBuf {
+    pub fn root_path(&self) -> PathBuf {
         let tmp_dir = self.analyze_opts.tmp_dir.as_ref().unwrap();
         tmp_dir.join(&self.runname)
     }
@@ -96,11 +97,23 @@ impl RunData {
             let path = if let Some(p) = &self.runopts.det_opts.det_config.record_preemptions_to {
                 p.to_owned()
             } else {
-                self.root_path().with_extension(PREEMPTS_EXT)
+                self.out_path().with_extension(PREEMPTS_EXT)
             };
             self.sched_path_out = Some(path);
         }
         self.sched_path_out.as_ref().unwrap()
+    }
+
+    pub fn sched_path_in(&mut self) -> &Path {
+        if self.sched_path_in.is_none() {
+            let path = if let Some(p) = &self.runopts.det_opts.det_config.replay_schedule_from {
+                p.to_owned()
+            } else {
+                self.root_path().with_extension(PREEMPTS_EXT)
+            };
+            self.sched_path_in = Some(path);
+        }
+        self.sched_path_in.as_ref().unwrap()
     }
 
     /// Convenience function
@@ -157,9 +170,6 @@ impl RunData {
     pub fn launch(&mut self) -> anyhow::Result<()> {
         let root = self.root_path();
         let log_path = self.root_path().with_extension(LOG_EXT);
-        self.analyze_opts
-            .print_and_validate_runopts(&mut self.runopts, &self.runname);
-
         let gopts = if self.analyze_opts.verbose || self.analyze_opts.selfcheck {
             GlobalOpts {
                 log: Some(LevelFilter::DEBUG),
@@ -169,6 +179,7 @@ impl RunData {
             NO_LOGGING.clone()
         };
 
+        self.runopts.validate_args();
         let (_, output) = self.runopts.run(&gopts, true)?;
         let output: Output = output.context("expected captured output")?;
 
@@ -202,6 +213,7 @@ impl RunData {
             analyze_opts: aopts.clone(),
             runopts,
             preempts_path_in: None,
+            sched_path_in: None,
             sched_path_out: None,
             log_path: None,
             in_mem_preempts_in: None,
@@ -212,7 +224,6 @@ impl RunData {
         // By default we save the config for every run.
         let conf_file = rd.root_path().with_extension("config");
         rd.runopts.save_config = Some(conf_file);
-        // self.print_and_validate_runopts(runopts, runname);
 
         rd
     }
@@ -220,6 +231,12 @@ impl RunData {
     /// Create a new run with the baseline RunOpts created from the AnalyzeOpts
     pub fn new_baseline(aopts: &AnalyzeOpts, runname: String) -> anyhow::Result<Self> {
         let ro = Self::get_base_runopts(aopts)?;
+        Ok(Self::new(aopts, runname, ro))
+    }
+
+    /// Create a run for the initial on-target execution.
+    pub fn new_run1_target(aopts: &AnalyzeOpts, runname: String) -> anyhow::Result<Self> {
+        let ro = Self::get_run1_runopts(aopts)?;
         Ok(Self::new(aopts, runname, ro))
     }
 
@@ -274,6 +291,19 @@ impl RunData {
         RunOpts::from_iter(run_cmd.iter())
     }
 
+    /// Extract the (initial) RunOpts for target/run1 that are implied by all of hermit analyze's arguments.
+    fn get_run1_runopts(aopts: &AnalyzeOpts) -> anyhow::Result<RunOpts> {
+        let mut ro = Self::get_base_runopts(aopts)?;
+
+        // If there was a --sched-seed specified in run_args, it is overridden by this setting:
+        if let Some(seed) = aopts.run1_seed {
+            ro.det_opts.det_config.seed = seed;
+        } else if let Some(path) = &aopts.run1_preemptions {
+            ro.det_opts.det_config.replay_preemptions_from = Some(path.clone());
+        }
+        Ok(ro)
+    }
+
     /// A temporary constructor method until minimize overhaul is complete and it returns a RunData directly.
     pub fn from_minimize_output(
         aopts: &AnalyzeOpts,
@@ -288,6 +318,7 @@ impl RunData {
             analyze_opts: aopts.clone(),
             runopts,
             preempts_path_in: None,
+            sched_path_in: None,
             sched_path_out: Some(preempts_path),
             log_path: Some(log_path),
             in_mem_sched_out: Some(in_mem_preempts),
@@ -297,7 +328,7 @@ impl RunData {
         }
     }
 
-    /// Another fake run that stores a result without actually laucnhing anything.
+    /// Another fake run that stores a result without actually launching anything.
     pub fn from_schedule_trace(
         aopts: &AnalyzeOpts,
         runname: String,
@@ -309,6 +340,7 @@ impl RunData {
             analyze_opts: aopts.clone(),
             runopts,
             preempts_path_in: None,
+            sched_path_in: None,
             sched_path_out: Some(sched_path),
             log_path: None,
             in_mem_sched_out: None,
@@ -351,14 +383,30 @@ impl RunData {
         self.with_preemption_recording_to(path)
     }
 
+    /// Replay from the default location, as returned by sched_path_in
+    pub fn with_schedule_replay(mut self) -> Self {
+        let path = self.sched_path_in().to_owned();
+        self.with_schedule_replay_from(path)
+    }
+
     pub fn with_schedule_replay_from(mut self, path: PathBuf) -> Self {
         self.runopts.det_opts.det_config.replay_schedule_from = Some(path);
         self
     }
 
     pub fn to_repro(&self) -> String {
-        self.analyze_opts
-            .runopts_to_repro(&self.runopts, Some(&self.runname))
+        let logging = if let Some(path) = &self.log_path {
+            format!(" --log=debug --log-file={}", path.display())
+        } else {
+            "".to_string()
+        };
+        // let logging = if self.analyze_opts.verbose || self.analyze_opts.selfcheck {
+        //     let path = self.log_path().unwrap();
+        //     format!(" --log=debug --log-file={}", path.display())
+        // } else {
+        //     "".to_string()
+        // };
+        format!("hermit{} run {}", logging, self.runopts)
     }
 
     pub fn into_runopts(self) -> RunOpts {

@@ -51,28 +51,12 @@ fn yellow_msg(msg: &str) {
 }
 
 impl AnalyzeOpts {
-    fn log_path(&self, runname: &str) -> PathBuf {
-        let tmp_dir = self.tmp_dir.as_ref().unwrap();
-        tmp_dir.join(runname).with_extension(LOG_EXT)
-    }
-
     pub fn get_tmp(&self) -> anyhow::Result<&Path> {
         if let Some(pb) = &self.tmp_dir {
             Ok(pb.as_path())
         } else {
             bail!("Expected tmp_dir to be set at this point!")
         }
-    }
-
-    pub fn print_and_validate_runopts(&self, ro: &mut RunOpts, runname: &str) {
-        if self.verbose {
-            ro.summary = true;
-            eprintln!(
-                ":: [verbose] Repro command:\n{}",
-                self.runopts_to_repro(ro, Some(runname))
-            );
-        }
-        ro.validate_args();
     }
 
     /// Launch a chaos run searching for a target (e.g. failing) schudule.
@@ -133,37 +117,21 @@ impl AnalyzeOpts {
         runname: &str,
         schedule_path: &Path,
         critical_event_index: u64,
-    ) -> anyhow::Result<(bool, PathBuf, PathBuf, RunOpts)> {
-        let tmp_dir = self.get_tmp()?;
-        let stack1_path = tmp_dir.join(runname).with_extension("stack1");
-        let stack2_path = tmp_dir.join(runname).with_extension("stack2");
-
+    ) -> anyhow::Result<(RunData, PathBuf, PathBuf)> {
         let mut run = RunData::new_baseline(self, runname.to_string())?
             .with_schedule_replay_from(schedule_path.to_path_buf());
+
+        let root_path = run.root_path();
+        let stack1_path = root_path.with_extension("stack1");
+        let stack2_path = root_path.with_extension("stack2");
 
         run.runopts.det_opts.det_config.stacktrace_event = [
             (critical_event_index - 1, Some(stack1_path.clone())),
             (critical_event_index, Some(stack2_path.clone())),
         ]
         .to_vec();
-
         run.launch()?;
-        let is_a_match = run.is_a_match();
-        Ok((is_a_match, stack1_path, stack2_path, run.runopts.clone()))
-    }
-
-    pub fn runopts_to_repro(&self, runopts: &RunOpts, runname: Option<&str>) -> String {
-        if let Some(runname) = runname {
-            let logging = if self.verbose || self.selfcheck {
-                let path = self.log_path(runname);
-                format!(" --log=debug --log-file={}", path.display())
-            } else {
-                "".to_string()
-            };
-            format!("hermit{} run {}", logging, runopts)
-        } else {
-            format!("hermit run {}", runopts)
-        }
+        Ok((run, stack1_path, stack2_path))
     }
 
     /// It's weird if no filter is specified.
@@ -171,21 +139,6 @@ impl AnalyzeOpts {
         self.target_stdout.is_some()
             || self.target_stderr.is_some()
             || self.target_exit_code != ExitStatusConstraint::Any
-    }
-
-    /// Extract the (initial) RunOpts for run1 that are implied by all of hermit analyze's arguments.
-    fn get_run1_runopts(&self) -> anyhow::Result<RunOpts> {
-        // TEMP: REFACTOR IN PROGRESS:
-        let run = RunData::new_baseline(self, "dummy".to_string())?;
-        let mut ro = run.into_runopts();
-
-        // If there was a --sched-seed specified in run_args, it is overridden by this setting:
-        if let Some(seed) = self.run1_seed {
-            ro.det_opts.det_config.seed = seed;
-        } else if let Some(path) = &self.run1_preemptions {
-            ro.det_opts.det_config.replay_preemptions_from = Some(path.clone());
-        }
-        Ok(ro)
     }
 
     fn display_criteria(&self) -> String {
@@ -222,16 +175,12 @@ impl AnalyzeOpts {
     /// Create our workspace and verify the input run matches the criteria, or find one that does.
     /// Returns the results of the target run.
     fn phase1_establish_target_run(&self) -> Result<RunData, Error> {
-        // Must run after tmp_dir is set:
-        let run1_opts = self.get_run1_runopts()?;
+        let mut run1data = RunData::new_run1_target(self, "run1_target".to_string())?;
         eprintln!(
             ":: {} hermit run {}",
-            "Studying execution: ".yellow().bold(),
-            run1_opts
+            "Studying target execution: ".yellow().bold(),
+            run1data.to_repro()
         );
-
-        let runname = "run1_target";
-        let mut run1data = RunData::new(self, runname.to_string(), run1_opts);
 
         if let Some(p) = &self.run1_preemptions {
             let preempts_path = run1data.preempts_path_out();
@@ -351,7 +300,7 @@ impl AnalyzeOpts {
             yellow_msg("[selfcheck] Verifying target run preserved under preemption-replay");
 
             let runname = "run1b_selfcheck";
-            let mut run1b = RunData::new(self, runname.to_string(), self.get_run1_runopts()?)
+            let mut run1b = RunData::new_run1_target(self, runname.to_string())?
                 .with_preempts_path_in(min_preempts_path.to_path_buf())
                 .with_preemption_recording();
             eprintln!("    {}", run1b.to_repro());
@@ -448,16 +397,6 @@ impl AnalyzeOpts {
 
                 // Otherwise we just assume that a *baseline* (non-chaos) run will do the trick.
                 ro.det_opts.det_config.chaos = false;
-
-                // Alternative:
-                // We use the empty preemption record to basically approximate a non-chaos run.
-                // let empty_pr = matching_pr.clone().strip_contents();
-                // let empty_path = self
-                //     .get_tmp()
-                //     .join("empty_preempts")
-                //     .with_extension(PREEMPTS_EXT);
-                // empty_pr.write_to_disk(&empty_path).unwrap();
-                // ro.det_opts.det_config.replay_preemptions_from = Some(empty_path.to_path_buf());
             }
             newrun.launch()?;
 
@@ -492,15 +431,12 @@ impl AnalyzeOpts {
         let test_fn = |sched: &[SchedEvent]| {
             i += 1;
             let runname = format!("bisect_round_{:0wide$}", i, wide = 3);
-
-            // Prepare the next synthetic schedule on disk:
-            let sched_path = self.get_tmp().unwrap().join(format!("{}.events", &runname));
-            let next_sched = PreemptionRecord::from_sched_events(sched.to_owned());
-            next_sched.write_to_disk(&sched_path).unwrap();
-
             let mut newrun = RunData::new_baseline(self, runname)
                 .expect("RunData construction to suceed")
-                .with_schedule_replay_from(sched_path);
+                .with_schedule_replay();
+            // Prepare the next synthetic schedule on disk:
+            let next_sched = PreemptionRecord::from_sched_events(sched.to_owned());
+            next_sched.write_to_disk(newrun.sched_path_in()).unwrap();
 
             if self.verbose {
                 eprintln!(
@@ -581,12 +517,13 @@ impl AnalyzeOpts {
                     .green()
                     .bold()
             );
-            let (res, stack1_path, stack2_path, runopts) = self.launch_for_stacktraces(
+            let (rundata, stack1_path, stack2_path) = self.launch_for_stacktraces(
                 runname,
                 &final_failing_path,
                 critical_event_index as u64,
             )?;
-            eprintln!("{}", self.runopts_to_repro(&runopts, Some(runname)));
+            let res = rundata.is_a_match();
+            eprintln!("{}", rundata.to_repro());
 
             let stack1_file = File::open(stack1_path).unwrap();
             let stack1 = serde_json::from_reader(stack1_file).unwrap();
