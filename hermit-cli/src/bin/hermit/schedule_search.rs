@@ -14,6 +14,9 @@ use edit_distance::iterable_bubble_sort;
 
 const MAX_EVENT_LEVEL_SEARCH_PASSES: usize = 100;
 
+const MAX_JITTER_EDITDIST: usize = 0;
+const MAX_JITTER_SWAPDIST: usize = 0;
+
 struct EventLevelSearchResult {
     passing_schedule: Vec<SchedEvent>,
     failing_schedule: Vec<SchedEvent>,
@@ -127,19 +130,39 @@ where
 
         let (midpoint_passes, midpoint_actual_schedule) = tester(&requested_midpoint_schedule);
 
+        let (jitter_edit, jitter_swap) =
+            just_distance(&requested_midpoint_schedule, &midpoint_actual_schedule);
         if verbose {
-            let (edit, swap) =
-                just_distance(&requested_midpoint_schedule, &midpoint_actual_schedule);
-            eprintln!(
-                ":: Jitter was {}, {} edit/swap distance (requested synthetic schedule vs actual schedule)",
-                edit, swap
-            );
+            if jitter_edit > 0 || jitter_swap > 0 {
+                eprintln!(
+                    ":: Jitter was {},{} edit/swap distance (requested synthetic schedule vs actual schedule)",
+                    jitter_edit, jitter_swap
+                );
+            } else {
+                eprintln!(
+                    ":: No jitter in this run (requested synthetic schedule identical to actual schedule)",
+                );
+            }
         }
 
-        if midpoint_passes {
-            passing_schedule = midpoint_actual_schedule;
+        let selected_new_point = if jitter_edit > MAX_JITTER_EDITDIST
+            || jitter_swap > MAX_JITTER_SWAPDIST
+        {
+            eprintln!(
+                ":: {} ({},{})",
+                "Jitter exceeded threshold, proceeding optimistically along original route rather than rerouting the search".red().bold(),
+                jitter_edit,
+                jitter_swap,
+            );
+            requested_midpoint_schedule
         } else {
-            failing_schedule = midpoint_actual_schedule;
+            midpoint_actual_schedule
+        };
+
+        if midpoint_passes {
+            passing_schedule = selected_new_point;
+        } else {
+            failing_schedule = selected_new_point;
         }
     }
 

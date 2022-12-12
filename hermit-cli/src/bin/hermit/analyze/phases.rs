@@ -434,7 +434,8 @@ impl AnalyzeOpts {
             let runname = format!("bisect_round_{:0wide$}", i, wide = 3);
             let mut newrun = RunData::new_baseline(self, runname)
                 .expect("RunData construction to suceed")
-                .with_schedule_replay();
+                .with_schedule_replay() // Default input path
+                .with_schedule_recording(); // Default output path
             // Prepare the next synthetic schedule on disk:
             let next_sched = PreemptionRecord::from_sched_events(sched.to_owned());
             next_sched.write_to_disk(newrun.sched_path_in()).unwrap();
@@ -456,8 +457,9 @@ impl AnalyzeOpts {
             } else {
                 eprintln!(" => Baseline condition (usually absence of crash)");
             }
-            // FIXME: should return the newly recorded schedule, NOT the synthetic input schedule:
-            (!is_match, sched.to_owned())
+
+            let sched_out = PreemptionReader::new(newrun.sched_path_out()).load_all();
+            (!is_match, sched_out.into_global())
         };
 
         let target = target.to_vec(); // TODO: have search_for_critical_schedule borrow only.
