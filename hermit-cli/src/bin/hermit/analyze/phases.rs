@@ -184,6 +184,8 @@ impl AnalyzeOpts {
         self.launch_config(runname, &mut runopts)
     }
 
+    // TODO: REMOVE.
+    //
     /// Launch a run with preempts provided (to replay). No logging. Return true if it matches the
     /// criteria. If provided, additionally record full schedule events from the run to
     /// `record_sched_path`.
@@ -485,7 +487,7 @@ impl AnalyzeOpts {
         global: &GlobalOpts,
         min_run: &mut RunData,
     ) -> Result<(), Error> {
-        let min_log_path = &min_run.log_path().unwrap();
+        let min_log_path = &min_run.log_path().unwrap().to_path_buf();
         let min_preempts_path = min_run.preempts_path_out();
 
         if self.selfcheck {
@@ -791,32 +793,37 @@ impl AnalyzeOpts {
         let normalized_preempts = min_run.preempts_out().clone();
         eprintln!(
             ":: {}\n {}",
-            "Normalized, that preemption record becomes:".green().bold(),
+            &format!(
+                "Normalized, that preemption record ({}) becomes:",
+                min_run
+                    .preempts_path_out()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+            )
+            .green()
+            .bold(),
             truncated(
                 1000,
-                serde_json::to_string_pretty(&normalized_preempts).unwrap()
+                serde_json::to_string_pretty(&normalized_preempts.clone_preemptions_only())
+                    .unwrap()
             )
         );
 
         // One endpoint of the bisection search:
-        let dir_path = self.tmp_dir.as_ref().unwrap();
-        let target_sched_events_path = dir_path.join("first_matching.events");
-        self.save_final_target_sched_events(
-            min_run.preempts_path_out(),
-            &target_sched_events_path,
-            global,
-        )?;
+        let mut target_endpoint_run = self.save_final_target_sched_events(min_run)?;
 
         // The other endpoint of the bisection search:
         // What we thought was the final_pr can change here:
         let baseline_sched_events_path =
             self.phase4_choose_baseline_sched_events(global, normalized_preempts)?;
 
+        let target_sched_events_path = target_endpoint_run.sched_path_out();
         eprintln!(
             ":: {} (event lengths {} / {}): {} {}",
             "Beginning bisection using endpoints".yellow().bold(),
             sched_length(&baseline_sched_events_path),
-            sched_length(&target_sched_events_path),
+            sched_length(target_sched_events_path),
             baseline_sched_events_path
                 .file_name()
                 .unwrap()
@@ -826,7 +833,7 @@ impl AnalyzeOpts {
                 .unwrap()
                 .to_string_lossy(),
         );
-        let target = read_trace(&target_sched_events_path);
+        let target = read_trace(target_sched_events_path);
         let baseline = read_trace(&baseline_sched_events_path);
         let crit_sched = self.phase5_bisect_traces(target, baseline)?;
 
@@ -846,34 +853,37 @@ impl AnalyzeOpts {
             })
     }
 
-    // This extra run, to record the schedule, thus converting Preemptions to a full Schedule
-    // would be unnecessary if we recorded that each time as we minimize.
-    fn save_final_target_sched_events(
-        &self,
-        final_preempts_path: &Path,
-        sched_events_path: &Path,
-        _global: &GlobalOpts,
-    ) -> anyhow::Result<()> {
-        // Verify that the new preemption record does in fact now cause a matching execution,
-        // and rerecord during this verification with full recording that include sched events
-        yellow_msg(
-            "Verify target endpoint preemption record causes criteria to hold and record sched events",
-        );
-        let runname = "verify_target_endpoint";
-        let (is_match, ro) = self.launch_from_preempts_to_sched(
-            runname,
-            final_preempts_path,
-            Some(sched_events_path),
-        )?;
-        let log_path = self.log_path(runname);
-        eprintln!(
-            "    {}",
-            self.runopts_to_repro(&ro, Some(log_path.to_str().unwrap())),
-        );
-        if !is_match {
-            bail!("Final preemption record still does not match target criteria");
+    /// This extra run, to record the schedule, thus converting Preemptions to a full Schedule
+    /// would be unnecessary if we recorded that each time as we minimize.
+    ///
+    /// Argument: the last on-target run that was preemption based.
+    fn save_final_target_sched_events(&self, mut last_run: RunData) -> anyhow::Result<RunData> {
+        let pr = last_run.preempts_out();
+        if pr.contains_schedevents() {
+            let path = last_run.preempts_path_out();
+            // This run already has sched events recorded... no extra run necessary.
+            yellow_msg(&format!(
+                "Using the last run as the target endpoint ({} contains sched events)",
+                path.file_name().unwrap().to_string_lossy()
+            ));
+            Ok(last_run)
+        } else {
+            // Verify that the new preemption record does in fact now cause a matching execution,
+            // and rerecord during this verification with full recording that include sched events
+            yellow_msg(
+                "Verify target endpoint preemption record causes criteria to hold and record sched events",
+            );
+            let runname = "verify_target_endpoint";
+            let mut newrun = RunData::new(self, runname.to_string(), last_run.runopts.clone())
+                .with_replay_preemptions(last_run.preempts_path_out().to_path_buf())
+                .with_schedule_recording();
+            newrun.launch()?;
+            eprintln!("    {}", newrun.to_repro());
+            if !newrun.is_a_match() {
+                bail!("Final preemption record still does not match target criteria");
+            }
+            Ok(newrun)
         }
-        Ok(())
     }
 
     // Returns the record, with one knockout, if it still satisfies the criteria that we want it not to.
@@ -911,11 +921,14 @@ impl AnalyzeOpts {
         yellow_msg(
             "Verify preemption record *without* latest critical preempt causes criteria non-match. Also record sched events.",
         );
+
+        // TODO: REMOVE
         let (is_match, ro) = self.launch_from_preempts_to_sched(
             runname,
             &non_matching_preempts_path,
             Some(sched_events_path),
         )?;
+
         let log_path = self.log_path(runname);
         eprintln!(
             "    {}",
@@ -961,7 +974,10 @@ impl AnalyzeOpts {
                         "Search successfully found a failing run with schedule:"
                             .green()
                             .bold(),
-                        truncated(1000, serde_json::to_string(&init_schedule).unwrap()),
+                        truncated(
+                            1000,
+                            serde_json::to_string(&init_schedule.clone_preemptions_only()).unwrap()
+                        ),
                     );
                 }
                 return rundat;

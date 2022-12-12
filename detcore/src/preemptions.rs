@@ -105,6 +105,19 @@ impl PreemptionRecord {
         self.global.clear();
     }
 
+    /// Make a copy just of the preemptions (cheap) rather than the whole schedule trace (expensive)
+    pub fn clone_preemptions_only(&self) -> Self {
+        PreemptionRecord {
+            per_thread: self.per_thread.clone(),
+            global: Vec::new(),
+        }
+    }
+
+    /// Returns true if the schedule trace (SchedEvent) record is nonempty.
+    pub fn contains_schedevents(&self) -> bool {
+        !self.global.is_empty()
+    }
+
     /// Convert from a flat vector representation (Time,Priority_AFTER_Time) into the internal representation.
     /// The very first timeslice should have a zero timestamp, but it is ignored if nonzero.
     pub fn from_vecs(bt: &BTreeMap<DetTid, Vec<(LogicalTime, Priority)>>) -> Self {

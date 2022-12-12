@@ -37,6 +37,8 @@ pub struct RunData {
 
     preempts_path_in: Option<PathBuf>,
     sched_path_out: Option<PathBuf>,
+    log_path: Option<PathBuf>,
+
     in_mem_sched_out: Option<PreemptionRecord>,
 
     /// The input schedule, if it has been read to memory.
@@ -105,9 +107,12 @@ impl RunData {
     }
 
     /// Only set after launch.
-    pub fn log_path(&self) -> Option<PathBuf> {
-        if self.is_a_match.is_some() {
-            Some(self.root_path().with_extension(LOG_EXT))
+    pub fn log_path(&mut self) -> Option<&PathBuf> {
+        if self.has_launched() {
+            if self.log_path.is_none() {
+                self.log_path = Some(self.root_path().with_extension(LOG_EXT))
+            }
+            self.log_path.as_ref()
         } else {
             None
         }
@@ -190,6 +195,7 @@ impl RunData {
             runopts,
             preempts_path_in: None,
             sched_path_out: None,
+            log_path: None,
             in_mem_sched_out: None,
             _sched_in: None,
             _sched_out: None,
@@ -204,7 +210,7 @@ impl RunData {
         runopts: RunOpts,
         in_mem_preempts: PreemptionRecord,
         preempts_path: PathBuf,
-        _log_path: PathBuf,
+        log_path: PathBuf,
     ) -> Self {
         RunData {
             runname,
@@ -212,6 +218,7 @@ impl RunData {
             runopts,
             preempts_path_in: None,
             sched_path_out: Some(preempts_path),
+            log_path: Some(log_path),
             in_mem_sched_out: Some(in_mem_preempts),
             _sched_in: None,
             _sched_out: None,
@@ -220,14 +227,20 @@ impl RunData {
         }
     }
 
-    fn _replay_preemptions_from(&mut self, path: PathBuf) {
+    pub fn with_replay_preemptions(mut self, path: PathBuf) -> Self {
         self.runopts.det_opts.det_config.replay_preemptions_from = Some(path);
+        self
     }
 
     pub fn with_preemption_recording(mut self) -> Self {
         let path = self.out_path().with_extension(PREEMPTS_EXT);
         self.runopts.det_opts.det_config.record_preemptions_to = Some(path);
         self
+    }
+
+    // TODO: separate from preemption recording
+    pub fn with_schedule_recording(self) -> Self {
+        self.with_preemption_recording()
     }
 
     pub fn to_repro(&self) -> String {
