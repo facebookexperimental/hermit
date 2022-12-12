@@ -9,27 +9,21 @@
 //! A mode for analyzing a hermit run.
 
 use std::fs::File;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::str::FromStr;
 
 use anyhow::bail;
-use anyhow::Context;
-use clap::Parser;
 use colored::Colorize;
 use detcore::preemptions::PreemptionReader;
 use detcore::preemptions::PreemptionRecord;
 use detcore::types::SchedEvent;
 use detcore::util::truncated;
-use hermit::process::Bind;
 use hermit::Error;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_pcg::Pcg64Mcg;
 use reverie::process::ExitStatus;
 use reverie::process::Output;
-use tracing::metadata::LevelFilter;
 
 use crate::analyze::consts::*;
 use crate::analyze::rundata::RunData;
@@ -51,10 +45,6 @@ fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {
     pr2.preemptions_only();
     pr1 == pr2
 }
-
-/// Return true the launched run matches the target criteria.
-/// Also return the path to the log file that was written.
-type LaunchResult = anyhow::Result<(bool, PathBuf)>;
 
 fn yellow_msg(msg: &str) {
     eprintln!(":: {}", msg.yellow().bold());
@@ -85,42 +75,6 @@ impl AnalyzeOpts {
         ro.validate_args();
     }
 
-    // TODO: REMOVE
-    /// Launch a single run with the given options.
-    /// (Also set up logging and temp dir binding.)
-    fn launch_config(&self, runname: &str, runopts: &mut RunOpts) -> LaunchResult {
-        let root = self.get_tmp()?.join(runname);
-        let log_path = self.log_path(runname);
-        self.print_and_validate_runopts(runopts, runname);
-
-        let conf_file = root.with_extension("config");
-        runopts.save_config = Some(conf_file);
-
-        let gopts = if self.verbose || self.selfcheck {
-            GlobalOpts {
-                log: Some(LevelFilter::DEBUG),
-                log_file: Some(log_path.clone()),
-            }
-        } else {
-            NO_LOGGING.clone()
-        };
-
-        let (_, output) = runopts.run(&gopts, true)?;
-        let output: Output = output.context("expected captured output")?;
-
-        File::create(root.with_extension("stdout"))
-            .unwrap()
-            .write_all(&output.stdout)
-            .unwrap();
-        File::create(root.with_extension("stderr"))
-            .unwrap()
-            .write_all(&output.stderr)
-            .unwrap();
-
-        let is_a_match = self.output_matches(&output);
-        Ok((is_a_match, log_path))
-    }
-
     /// Launch a chaos run searching for a target (e.g. failing) schudule.
     /// Returns Some if a target schedule is found.
     fn launch_search(&self, round: u64, sched_seed: u64) -> Result<Option<RunData>, Error> {
@@ -128,16 +82,12 @@ impl AnalyzeOpts {
             "Searching (round {}) for a target execution, chaos --sched-seed={} ",
             round, sched_seed
         ));
-
         let runname = format!("search_round_{:0wide$}", round, wide = 3);
-
-        let mut ro = self.get_base_runopts()?;
-        ro.det_opts.det_config.sched_seed = Some(sched_seed);
+        let mut rundat = RunData::new_baseline(self, runname)?.with_preemption_recording();
+        rundat.runopts.det_opts.det_config.sched_seed = Some(sched_seed);
         if self.imprecise_search {
-            ro.det_opts.det_config.imprecise_timers = true; // TODO: enable this by default when bugs are fixed.
+            rundat.runopts.det_opts.det_config.imprecise_timers = true; // TODO: enable this by default when bugs are fixed.
         }
-        let mut rundat = RunData::new(self, runname, ro).with_preemption_recording();
-
         rundat.launch()?;
         if rundat.is_a_match() {
             eprintln!(
@@ -164,13 +114,15 @@ impl AnalyzeOpts {
         preempts_path: &Path,
         record_sched_path: Option<&Path>,
     ) -> anyhow::Result<(bool, RunOpts)> {
-        let mut ro = self.get_base_runopts()?;
-        ro.det_opts.det_config.replay_preemptions_from = Some(preempts_path.to_path_buf());
+        let mut run = RunData::new_baseline(self, runname.to_string())?
+            .with_preempts_path_in(preempts_path.to_path_buf());
+
         if let Some(path) = record_sched_path {
-            ro.det_opts.det_config.record_preemptions_to = Some(path.to_path_buf());
+            run = run.with_schedule_recording_to(path.to_path_buf());
         }
-        let (is_a_match, _) = self.launch_config(runname, &mut ro)?;
-        Ok((is_a_match, ro))
+        run.launch()?;
+        let is_match = run.is_a_match();
+        Ok((is_match, run.into_runopts()))
     }
 
     /// Runs the program with the specified schedule.
@@ -186,16 +138,18 @@ impl AnalyzeOpts {
         let stack1_path = tmp_dir.join(runname).with_extension("stack1");
         let stack2_path = tmp_dir.join(runname).with_extension("stack2");
 
-        let mut ro = self.get_base_runopts()?;
-        ro.det_opts.det_config.replay_schedule_from = Some(schedule_path.to_path_buf());
-        ro.det_opts.det_config.stacktrace_event = [
+        let mut run = RunData::new_baseline(self, runname.to_string())?
+            .with_schedule_replay_from(schedule_path.to_path_buf());
+
+        run.runopts.det_opts.det_config.stacktrace_event = [
             (critical_event_index - 1, Some(stack1_path.clone())),
             (critical_event_index, Some(stack2_path.clone())),
         ]
         .to_vec();
 
-        let (is_a_match, _log_path) = self.launch_config(runname, &mut ro)?;
-        Ok((is_a_match, stack1_path, stack2_path, ro))
+        run.launch()?;
+        let is_a_match = run.is_a_match();
+        Ok((is_a_match, stack1_path, stack2_path, run.runopts.clone()))
     }
 
     pub fn runopts_to_repro(&self, runopts: &RunOpts, runname: Option<&str>) -> String {
@@ -212,13 +166,6 @@ impl AnalyzeOpts {
         }
     }
 
-    fn runopts_add_binds(&self, runopts: &mut RunOpts) -> anyhow::Result<()> {
-        let bind_dir: Bind = Bind::from_str(self.get_tmp()?.to_str().unwrap())?;
-        runopts.bind.push(bind_dir);
-        runopts.validate_args();
-        Ok(())
-    }
-
     /// It's weird if no filter is specified.
     fn has_filters(&self) -> bool {
         self.target_stdout.is_some()
@@ -226,53 +173,12 @@ impl AnalyzeOpts {
             || self.target_exit_code != ExitStatusConstraint::Any
     }
 
-    /// The raw, unvarnished, RunOpts.
-    fn get_raw_runopts(&self) -> RunOpts {
-        // Bogus arg 0 for CLI argument parsing:
-        let mut run_cmd: Vec<String> = vec!["hermit-run".to_string()];
-
-        for arg in &self.run_arg {
-            run_cmd.push(arg.to_string());
-        }
-        for arg in &self.run_args {
-            run_cmd.push(arg.to_string());
-        }
-        RunOpts::from_iter(run_cmd.iter())
-    }
-
-    /// The baseline RunOpts based on user flags plus some sanitation/validation.
-    fn get_base_runopts(&self) -> anyhow::Result<RunOpts> {
-        let mut ro = self.get_raw_runopts();
-        if ro.no_sequentialize_threads {
-            bail!(
-                "Error, cannot search through executions with --no-sequentialize-threads.  Determinism required.",
-            )
-        }
-
-        // We could add a flag for analyze-without chaos, but it's a rare use case that isn't
-        // usefully supported now anyway.  Exploring with RNG alone doesn't make sense, but we may
-        // want to make it possible to do analyze with the stick random scheduler instead of the
-        // one.
-        ro.det_opts.det_config.chaos = true;
-
-        ro.validate_args();
-        assert!(ro.det_opts.det_config.sequentialize_threads);
-        if self.run1_seed.is_some() && !ro.det_opts.det_config.chaos {
-            eprintln!(
-                "{}",
-                "WARNING: --chaos not in supplied hermit run args, but --run1-seed is.  Usually this is an error."
-                    .bold()
-                    .red()
-            )
-        }
-        self.runopts_add_binds(&mut ro)?;
-
-        Ok(ro)
-    }
-
     /// Extract the (initial) RunOpts for run1 that are implied by all of hermit analyze's arguments.
     fn get_run1_runopts(&self) -> anyhow::Result<RunOpts> {
-        let mut ro = self.get_base_runopts()?;
+        // TEMP: REFACTOR IN PROGRESS:
+        let run = RunData::new_baseline(self, "dummy".to_string())?;
+        let mut ro = run.into_runopts();
+
         // If there was a --sched-seed specified in run_args, it is overridden by this setting:
         if let Some(seed) = self.run1_seed {
             ro.det_opts.det_config.seed = seed;
@@ -411,24 +317,6 @@ impl AnalyzeOpts {
         }
     }
 
-    fn _log_diff(
-        &self,
-        global: &GlobalOpts,
-        run1_log_path: &Path,
-        run2_log_path: &Path,
-    ) -> ExitStatus {
-        if self.verbose {
-            yellow_msg("[comparing] with log-diff command:");
-            eprintln!(
-                "    hermit log-diff {} {}",
-                run1_log_path.display(),
-                run2_log_path.display(),
-            );
-        }
-        let ldopts = LogDiffCLIOpts::new(run1_log_path, run2_log_path);
-        ldopts.main(global)
-    }
-
     /// A weaker log difference that does not expect certain lines to be conserved in preemption replay.
     fn log_diff_preemption_replay(
         &self,
@@ -532,8 +420,11 @@ impl AnalyzeOpts {
                 }
             }
         } else {
+            let runname = "run2_baseline".to_string();
+            let mut newrun = RunData::new_baseline(self, runname)?.with_preemption_recording();
+
             // Tweak the runopts according to several different scenarios:
-            let mut ro = self.get_base_runopts()?;
+            let ro = &mut newrun.runopts;
             let from_where;
             if let Some(seed) = self.run2_seed {
                 // Replay from seed to record schedule.
@@ -550,7 +441,7 @@ impl AnalyzeOpts {
                     // TODO: Don't trust the recorded schedule is a baseline, replay and check it.
                 }
                 let runname = "from_existing_run2_schedule".to_string();
-                let fakerun = RunData::from_schedule_trace(self, runname, ro, path.clone());
+                let fakerun = RunData::from_schedule_trace(self, runname, ro.clone(), path.clone());
                 return Ok(fakerun);
             } else {
                 from_where = "non-chaos (0 extra preemptions) run";
@@ -568,8 +459,6 @@ impl AnalyzeOpts {
                 // empty_pr.write_to_disk(&empty_path).unwrap();
                 // ro.det_opts.det_config.replay_preemptions_from = Some(empty_path.to_path_buf());
             }
-            let runname = "run2_baseline".to_string();
-            let mut newrun = RunData::new(self, runname, ro).with_preemption_recording();
             newrun.launch()?;
 
             eprintln!(
@@ -600,7 +489,6 @@ impl AnalyzeOpts {
     ) -> anyhow::Result<CriticalSchedule> {
         let mut i = 0;
 
-        let base_opts = self.get_base_runopts()?;
         let test_fn = |sched: &[SchedEvent]| {
             i += 1;
             let runname = format!("bisect_round_{:0wide$}", i, wide = 3);
@@ -610,25 +498,28 @@ impl AnalyzeOpts {
             let next_sched = PreemptionRecord::from_sched_events(sched.to_owned());
             next_sched.write_to_disk(&sched_path).unwrap();
 
-            let mut runopts = base_opts.clone();
-            runopts.det_opts.det_config.replay_schedule_from = Some(sched_path);
+            let mut newrun = RunData::new_baseline(self, runname)
+                .expect("RunData construction to suceed")
+                .with_schedule_replay_from(sched_path);
+
             if self.verbose {
                 eprintln!(
                     ":: {}, repro command:\n    {}",
                     format!("Testing execution during search (#{})", i)
                         .yellow()
                         .bold(),
-                    self.runopts_to_repro(&runopts, Some(&runname)),
+                    newrun.to_repro(),
                 );
             }
-            let (is_match, _log_path) = self
-                .launch_config(&runname, &mut runopts)
-                .expect("Run failure");
+
+            newrun.launch().expect("New run to succeed");
+            let is_match = newrun.is_a_match();
             if is_match {
                 eprintln!(" => Target condition ({})", self.display_criteria());
             } else {
                 eprintln!(" => Baseline condition (usually absence of crash)");
             }
+            // FIXME: should return the newly recorded schedule, NOT the synthetic input schedule:
             (!is_match, sched.to_owned())
         };
 
@@ -727,7 +618,7 @@ impl AnalyzeOpts {
         }
     }
 
-    pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+    pub fn main(&mut self, global: &GlobalOpts) -> anyhow::Result<ExitStatus> {
         // Not implemented yet:
         if self.run1_schedule.is_some() {
             todo!()
@@ -736,14 +627,17 @@ impl AnalyzeOpts {
             todo!()
         }
 
-        if !self.get_raw_runopts().det_opts.det_config.chaos {
-            eprintln!(
-                ":: {} You may want to turn it on explicitly, along with a --preemption-timeout that works well for this program.",
-                "WARNING: implicitly activating --chaos.".yellow().bold()
-            );
+        self.phase0_initialize()?; // Need this early to set tmp_dir.
+        {
+            let dummy = RunData::new_baseline(self, "dummy".to_string())?;
+            if !dummy.runopts.det_opts.det_config.chaos {
+                eprintln!(
+                    ":: {} You may want to turn it on explicitly, along with a --preemption-timeout that works well for this program.",
+                    "WARNING: implicitly activating --chaos.".yellow().bold()
+                );
+            }
         }
 
-        self.phase0_initialize()?;
         let run1data = self.phase1_establish_target_run()?;
 
         let mut min_run = self.phase2_minimize(global, run1data)?;
@@ -865,8 +759,7 @@ impl AnalyzeOpts {
             );
         }
 
-        let ro = self.get_base_runopts()?;
-        let mut newrun = RunData::new(self, runname.to_string(), ro)
+        let mut newrun = RunData::new_baseline(self, runname.to_string())?
             .with_preempts_in(non_matching_preempts)
             .with_schedule_recording();
 

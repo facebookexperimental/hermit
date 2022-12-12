@@ -13,11 +13,16 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::str::FromStr;
 
+use anyhow::bail;
 use anyhow::Context;
+use clap::Parser;
+use colored::Colorize;
 use detcore::preemptions::PreemptionReader;
 use detcore::preemptions::PreemptionRecord;
 use detcore::types::SchedEvent;
+use hermit::process::Bind;
 use reverie::process::Output;
 use tracing::metadata::LevelFilter;
 
@@ -150,13 +155,10 @@ impl RunData {
 
     /// Execute the run. (Including setting up logging and temp dir binding.)
     pub fn launch(&mut self) -> anyhow::Result<()> {
-        let root = self.analyze_opts.get_tmp()?.join(&self.runname);
+        let root = self.root_path();
         let log_path = self.root_path().with_extension(LOG_EXT);
         self.analyze_opts
             .print_and_validate_runopts(&mut self.runopts, &self.runname);
-
-        let conf_file = root.with_extension("config");
-        self.runopts.save_config = Some(conf_file);
 
         let gopts = if self.analyze_opts.verbose || self.analyze_opts.selfcheck {
             GlobalOpts {
@@ -195,7 +197,7 @@ impl RunData {
     }
 
     pub fn new(aopts: &AnalyzeOpts, runname: String, runopts: RunOpts) -> Self {
-        RunData {
+        let mut rd = RunData {
             runname,
             analyze_opts: aopts.clone(),
             runopts,
@@ -205,7 +207,71 @@ impl RunData {
             in_mem_preempts_in: None,
             in_mem_sched_out: None,
             is_a_match: None,
+        };
+
+        // By default we save the config for every run.
+        let conf_file = rd.root_path().with_extension("config");
+        rd.runopts.save_config = Some(conf_file);
+        // self.print_and_validate_runopts(runopts, runname);
+
+        rd
+    }
+
+    /// Create a new run with the baseline RunOpts created from the AnalyzeOpts
+    pub fn new_baseline(aopts: &AnalyzeOpts, runname: String) -> anyhow::Result<Self> {
+        let ro = Self::get_base_runopts(aopts)?;
+        Ok(Self::new(aopts, runname, ro))
+    }
+
+    /// The baseline RunOpts based on user flags plus some sanitation/validation.
+    fn get_base_runopts(aopts: &AnalyzeOpts) -> anyhow::Result<RunOpts> {
+        let mut ro = Self::get_raw_runopts(aopts);
+        if ro.no_sequentialize_threads {
+            bail!(
+                "Error, cannot search through executions with --no-sequentialize-threads.  Determinism required.",
+            )
         }
+
+        // We could add a flag for analyze-without chaos, but it's a rare use case that isn't
+        // usefully supported now anyway.  Exploring with RNG alone doesn't make sense, but we may
+        // want to make it possible to do analyze with the stick random scheduler instead of the
+        // one.
+        ro.det_opts.det_config.chaos = true;
+
+        ro.validate_args();
+        assert!(ro.det_opts.det_config.sequentialize_threads);
+        if aopts.run1_seed.is_some() && !ro.det_opts.det_config.chaos {
+            eprintln!(
+                "{}",
+                "WARNING: --chaos not in supplied hermit run args, but --run1-seed is.  Usually this is an error."
+                    .bold()
+                    .red()
+            )
+        }
+        Self::runopts_add_binds(aopts, &mut ro)?;
+
+        Ok(ro)
+    }
+
+    fn runopts_add_binds(aopts: &AnalyzeOpts, runopts: &mut RunOpts) -> anyhow::Result<()> {
+        let bind_dir: Bind = Bind::from_str(aopts.get_tmp()?.to_str().unwrap())?;
+        runopts.bind.push(bind_dir);
+        runopts.validate_args();
+        Ok(())
+    }
+
+    /// The raw, unvarnished, RunOpts.
+    fn get_raw_runopts(aopts: &AnalyzeOpts) -> RunOpts {
+        // Bogus arg 0 for CLI argument parsing:
+        let mut run_cmd: Vec<String> = vec!["hermit-run".to_string()];
+
+        for arg in &aopts.run_arg {
+            run_cmd.push(arg.to_string());
+        }
+        for arg in &aopts.run_args {
+            run_cmd.push(arg.to_string());
+        }
+        RunOpts::from_iter(run_cmd.iter())
     }
 
     /// A temporary constructor method until minimize overhaul is complete and it returns a RunData directly.
@@ -265,8 +331,12 @@ impl RunData {
         self.with_preempts_path_in(path)
     }
 
-    pub fn with_preemption_recording(mut self) -> Self {
+    pub fn with_preemption_recording(self) -> Self {
         let path = self.out_path().with_extension(PREEMPTS_EXT);
+        self.with_preemption_recording_to(path)
+    }
+
+    pub fn with_preemption_recording_to(mut self, path: PathBuf) -> Self {
         self.runopts.det_opts.det_config.record_preemptions_to = Some(path);
         self
     }
@@ -276,8 +346,22 @@ impl RunData {
         self.with_preemption_recording()
     }
 
+    // TODO: separate from preemption recording
+    pub fn with_schedule_recording_to(self, path: PathBuf) -> Self {
+        self.with_preemption_recording_to(path)
+    }
+
+    pub fn with_schedule_replay_from(mut self, path: PathBuf) -> Self {
+        self.runopts.det_opts.det_config.replay_schedule_from = Some(path);
+        self
+    }
+
     pub fn to_repro(&self) -> String {
         self.analyze_opts
             .runopts_to_repro(&self.runopts, Some(&self.runname))
+    }
+
+    pub fn into_runopts(self) -> RunOpts {
+        self.runopts
     }
 }
