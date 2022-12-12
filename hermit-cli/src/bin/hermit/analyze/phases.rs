@@ -354,12 +354,12 @@ impl AnalyzeOpts {
         );
 
         let runname = "run1_target";
-        let run1data = RunData::new(self, runname.to_string(), run1_opts);
+        let mut run1data = RunData::new(self, runname.to_string(), run1_opts);
 
         if let Some(p) = &self.run1_preemptions {
             let preempts_path = run1data.preempts_path_out();
             // Copy preempts to the output location as though they were recorded by this run:
-            std::fs::copy(p, &preempts_path).expect("copy file to succeed");
+            std::fs::copy(p, preempts_path).expect("copy file to succeed");
             // Careful, returning a NON-launched RunData just to contain the output path.
             return Ok(run1data);
         }
@@ -771,10 +771,10 @@ impl AnalyzeOpts {
         }
 
         self.phase0_initialize()?;
-        let run1data = self.phase1_establish_target_run()?;
+        let mut run1data = self.phase1_establish_target_run()?;
 
         let (min_preempts, min_preempts_path, maybe_min_log) =
-            self.phase2_minimize(global, &run1data.preempts_path_out())?;
+            self.phase2_minimize(global, run1data.preempts_path_out())?;
 
         let min_log_path = maybe_min_log.unwrap_or_else(|| run1data.log_path().unwrap());
         self.phase3_strict_preempt_replay_check(global, &min_log_path, &min_preempts_path)?;
@@ -944,14 +944,14 @@ impl AnalyzeOpts {
         let mut round = 0;
         loop {
             let sched_seed = rng.gen();
-            if let Some(rundat) = self
+            if let Some(mut rundat) = self
                 .launch_search(round, sched_seed)
                 .unwrap_or_else(|e| panic!("Error: {}", e))
             {
                 if self.verbose {
                     let preempts = rundat.preempts_path_out();
                     let init_schedule: PreemptionRecord =
-                        PreemptionReader::new(&preempts).load_all();
+                        PreemptionReader::new(preempts).load_all();
                     eprintln!(
                         ":: {}:\nSchedule:\n {}",
                         "Search successfully found a failing run with schedule:"

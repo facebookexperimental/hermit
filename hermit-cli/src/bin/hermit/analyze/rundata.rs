@@ -11,6 +11,7 @@
 
 use std::fs::File;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -32,6 +33,9 @@ pub struct RunData {
 
     runopts: RunOpts,
 
+    preempts_path_in: Option<PathBuf>,
+    sched_path_out: Option<PathBuf>,
+
     /// The input schedule, if it has been read to memory.
     _sched_in: Option<Vec<SchedEvent>>,
     _sched_out: Option<Vec<SchedEvent>>,
@@ -50,25 +54,34 @@ impl RunData {
         tmp_dir.join(self.runname.clone() + "_out")
     }
 
-    pub fn _preempts_path_in(&self) -> PathBuf {
-        if let Some(p) = &self.runopts.det_opts.det_config.replay_preemptions_from {
-            p.to_owned()
-        } else {
-            self.root_path().with_extension(PREEMPTS_EXT)
+    #[allow(dead_code)]
+    pub fn preempts_path_in(&mut self) -> &Path {
+        if self.preempts_path_in.is_none() {
+            let path = if let Some(p) = &self.runopts.det_opts.det_config.replay_preemptions_from {
+                p.to_owned()
+            } else {
+                self.root_path().with_extension(PREEMPTS_EXT)
+            };
+            self.preempts_path_in = Some(path);
         }
+        self.preempts_path_in.as_ref().unwrap()
     }
 
-    pub fn preempts_path_out(&self) -> PathBuf {
+    pub fn preempts_path_out(&mut self) -> &Path {
         // TODO: split these apart:
         self.sched_path_out()
     }
 
-    fn sched_path_out(&self) -> PathBuf {
-        if let Some(p) = &self.runopts.det_opts.det_config.record_preemptions_to {
-            p.to_owned()
-        } else {
-            self.out_path().with_extension(PREEMPTS_EXT)
+    pub fn sched_path_out(&mut self) -> &Path {
+        if self.sched_path_out.is_none() {
+            let path = if let Some(p) = &self.runopts.det_opts.det_config.record_preemptions_to {
+                p.to_owned()
+            } else {
+                self.root_path().with_extension(PREEMPTS_EXT)
+            };
+            self.sched_path_out = Some(path);
         }
+        self.sched_path_out.as_ref().unwrap()
     }
 
     /// Only set after launch.
@@ -136,6 +149,8 @@ impl RunData {
             runname,
             analyze_opts: aopts.clone(),
             runopts,
+            preempts_path_in: None,
+            sched_path_out: None,
             _sched_in: None,
             _sched_out: None,
             is_a_match: None,
