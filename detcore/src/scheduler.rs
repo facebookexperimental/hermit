@@ -25,6 +25,7 @@ use std::time::Duration;
 use std::u64;
 use std::vec::IntoIter;
 
+use detcore_model::summary::RunSummary;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
@@ -68,6 +69,7 @@ use crate::types::LogicalTime;
 use crate::types::SchedEvent;
 use crate::types::SigWrapper;
 use crate::types::SyscallPhase;
+use crate::util::truncated;
 
 /// Unique identifier for an action.
 pub type ActionID = u64;
@@ -484,20 +486,6 @@ impl ThreadTree {
         }
         assert!(acc.contains(me));
         acc
-    }
-
-    /// Print out some information at the end of a run.
-    pub fn final_report(&self) -> String {
-        let mut buf = String::new();
-        writeln!(buf, "Final thread-tree was: {}", self).unwrap();
-        writeln!(
-            buf,
-            "There were {} group leaders of {} thread(s) total.",
-            self.thread_group_leaders.len(),
-            self.size(),
-        )
-        .unwrap();
-        buf
     }
 }
 
@@ -2001,12 +1989,19 @@ impl Scheduler {
         }
     }
 
-    /// Summarize the run after completion.
-    pub fn final_summary(&self) -> anyhow::Result<String> {
-        let mut buf = String::new();
-        // Thread report:
-        buf.push_str(&self.thread_tree.final_report());
-
+    /// Summarize the run after completion, as a RunSummary. This is partial because the Scheduler
+    /// doesn't have all the necessary information.
+    ///
+    /// Side Effects: This also flushes the in-memory PreemptionWriter to disk.
+    pub fn generate_partial_run_summary(
+        &mut self,
+        preemptions_to: Option<&PathBuf>,
+    ) -> anyhow::Result<RunSummary> {
+        let schedevent_replayed = self
+            .replayer
+            .as_ref()
+            .map(|r| r.traced_event_count)
+            .unwrap_or_default();
         let (total_soft, total_hard) = self
             .replayer
             .as_ref()
@@ -2016,34 +2011,64 @@ impl Scheduler {
                     .fold((0, 0), |(x, y), (a, b)| (x + a, y + b))
             })
             .unwrap_or_default();
-        writeln!(
-            buf,
-            "Internally, the hermit scheduler ran {} turns, recorded {} events, replayed {} events ({} desynced)",
-            self.turn,
-            self.recorded_event_count,
-            self.replayer
-                .as_ref()
-                .map(|r| r.traced_event_count)
-                .unwrap_or_default(),
-            total_soft + total_hard
-        )?;
 
-        if total_soft + total_hard > 0 {
+        let desync_descrip = if total_soft + total_hard > 0 {
+            let mut buf = String::new();
             write!(
                 buf,
                 "  Encountered {} soft desyncs, {} hard.  Per thread: ",
                 total_soft, total_hard
             )?;
-
             if let Some(ref replayer) = self.replayer {
                 for (tid, (soft, hard)) in replayer.desync_counts.iter() {
                     write!(buf, "{}=>({},{}) ", tid, soft, hard)?;
                 }
             }
             writeln!(buf)?;
-        }
+            Some(buf)
+        } else {
+            None
+        };
 
-        Ok(buf)
+        let reprio_descrip = if let Some(pw) = self.preemption_writer.take() {
+            let mut buf = String::new();
+            writeln!(
+                buf,
+                "Record of {} preemption and reprioritization events:",
+                pw.len()
+            )?;
+            if let Some(path) = preemptions_to {
+                writeln!(buf, "  (Writing to file {:?})", path)?;
+                if let Err(str) = pw.flush() {
+                    tracing::warn!("{}", str);
+                }
+            } else {
+                // Recording, but not outputting to file, so this is the only (partial) record of it:
+                writeln!(buf, "{}", truncated(200, pw.into_string()))?;
+            }
+            Some(buf)
+        } else {
+            None
+        };
+
+        let num_processes = self.thread_tree.thread_group_leaders.len() as u64;
+        let num_threads = self.thread_tree.size() as u64;
+        let threads_descrip = format!("{}", self.thread_tree);
+
+        Ok(RunSummary {
+            sched_turns: self.turn,
+            schedevent_replayed,
+            schedevent_recorded: self.recorded_event_count,
+            schedevent_desynced: total_soft + total_hard,
+            desync_descrip,
+            reprio_descrip,
+            threads_descrip,
+            num_processes,
+            num_threads,
+            virttime_elapsed: 0, // Cannot fill.
+            virttime_final: 0,   // Cannot fill.
+            realtime_elapsed: None,
+        })
     }
 
     /// Summarize the state of the scheduler while executing (verbose).
@@ -2156,7 +2181,8 @@ mod test {
         let mut v = tree.my_thread_group(&p2);
         v.sort();
         assert_eq!(&v, &[p1, p2, p3]);
-        tree.final_report();
+        let s = format!("{}", tree);
+        assert!(!s.is_empty());
     }
 
     #[test]
@@ -2179,6 +2205,7 @@ mod test {
         let mut v = tree.my_thread_group(&p5);
         v.sort();
         assert_eq!(&v, &[p3, p4, p5]);
-        tree.final_report();
+        let s = tree.pretty_print();
+        assert!(!s.is_empty());
     }
 }

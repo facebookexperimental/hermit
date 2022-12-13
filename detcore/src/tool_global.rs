@@ -14,7 +14,6 @@ use std::collections::btree_map::Entry;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
-use std::fmt::Write;
 use std::fs;
 use std::fs::File;
 use std::num::NonZeroUsize;
@@ -26,8 +25,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
+use anyhow::bail;
 use chrono::DateTime;
 use chrono::Utc;
+use detcore_model::summary::RunSummary;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
@@ -42,7 +43,6 @@ use reverie::Tid;
 use serde::Deserialize;
 use serde::Serialize;
 use tracing::debug;
-use tracing::error;
 use tracing::info;
 use tracing::trace;
 use tracing::warn;
@@ -72,7 +72,6 @@ use crate::scheduler::ThreadNextTurn;
 use crate::scheduler::DEFAULT_PRIORITY;
 use crate::tool_local::Detcore;
 use crate::types::*;
-use crate::util::truncated;
 
 #[derive(Debug)]
 struct InodePool {
@@ -250,86 +249,52 @@ impl GlobalState {
             handle.await.expect("Global scheduler clean shutdown");
             debug!("Global state cleanup, continuing...");
         }
-        let mut buf: String = String::new();
-        writeln!(
-            buf,
-            "  ------------------------------ hermit run report ------------------------------"
-        )
-        .unwrap();
-
-        let flush = |det: bool, buf: &mut String| {
-            if to_stderr {
-                // In this case, print summary irrespective of logging level.
-                // TODO: output summary in machine-readable, JSON form.
-                eprint!("{}", buf);
-            } else if det {
-                info!("{}", buf);
-            } else {
-                debug!("{}", buf);
-            }
-            buf.clear();
-        };
-
-        {
-            let mut sched = self.sched.lock().unwrap();
-            let s = sched
-                .final_summary()
-                .unwrap_or_else(|e| format!("ERROR when printing final summary: {:?}", e));
-            buf.push_str(&s);
-            flush(true, &mut buf);
-
-            if let Some(pw) = sched.preemption_writer.take() {
-                writeln!(
-                    buf,
-                    "Record of {} preemption and reprioritization events:",
-                    pw.len()
-                )
-                .unwrap();
-                if let Some(path) = &self.cfg.record_preemptions_to {
-                    writeln!(buf, "  (Writing to file {:?})", path).unwrap();
-                    if let Err(str) = pw.flush() {
-                        tracing::warn!("{}", str);
-                    }
-                } else {
-                    writeln!(buf, "{}", truncated(200, pw.into_string())).unwrap();
-                }
+        let banner =
+            "  ------------------------------ hermit run report ------------------------------";
+        let mut summary = self.into_run_summary().unwrap();
+        if to_stderr {
+            // In this case, print summary irrespective of logging level.
+            // TODO: output summary in machine-readable, JSON form.
+            eprint!("{}\n{}", banner, summary);
+        } else {
+            // Separate out the nondeterministic bits and print them at debug level:
+            let rt = summary.realtime_elapsed.take();
+            info!("\n{}\n{}", banner, summary);
+            if let Some(x) = rt {
+                debug!("Nondeterministic realtime elapsed: {:?}", x);
             }
         }
+    }
 
+    fn into_run_summary(self) -> anyhow::Result<RunSummary> {
+        // First, the scheduler can generate part of the summary
+        let mut summary = {
+            let mut sched = self.sched.lock().unwrap();
+            sched.generate_partial_run_summary(self.cfg.record_preemptions_to.as_ref())?
+        };
+        // Second, we fill in the rest based on global state.
+        //
         // Real time report:
         // N.B.: We don't have a job-level exit hook atm (T76248597), so we use the
         // CURRENT time -- that we are calling summarize -- as the end time:
-        if let Ok(realtime_elapsed) = self.realtime_start.elapsed() {
-            writeln!(
-                buf,
-                "Nondeterministic realtime elapsed: {:?}",
-                realtime_elapsed
-            )
-            .unwrap();
-        }
-        flush(false, &mut buf);
+        summary.realtime_elapsed = Some(self.realtime_start.elapsed()?);
 
-        // Virtual time report:
         if self.cfg.virtualize_time {
             let final_time = self.global_time.lock().unwrap();
             let final_time_ns = final_time.as_nanos();
-            writeln!(buf, "Final virtual global (cpu) time: {}", final_time_ns).unwrap();
             let epoch_ns = LogicalTime::from_nanos(self.cfg.epoch.timestamp_nanos() as u64);
-            if final_time_ns.as_nanos() >= epoch_ns.as_nanos() {
-                writeln!(
-                    buf,
-                    "Elapsed virtual global (cpu) time: {}",
-                    final_time_ns - epoch_ns
-                )
-                .unwrap();
+            summary.virttime_final = final_time_ns.as_nanos();
+            summary.virttime_elapsed = if final_time_ns.as_nanos() >= epoch_ns.as_nanos() {
+                (final_time_ns - epoch_ns).as_nanos()
             } else {
-                error!(
+                bail!(
                     "Internal invariant violated! Global time is before epoch start {}",
                     epoch_ns
                 );
             }
         }
-        flush(true, &mut buf);
+
+        Ok(summary)
     }
 }
 

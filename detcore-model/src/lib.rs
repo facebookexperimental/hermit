@@ -15,4 +15,5 @@ pub mod futex;
 pub mod pedigree;
 pub mod pid;
 pub mod schedule;
+pub mod summary;
 pub mod time;
