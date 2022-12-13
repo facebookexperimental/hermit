@@ -111,7 +111,7 @@ impl Replay {
     pub async fn wait(self) -> Result<ExitStatus, reverie::Error> {
         let (exit_status, global_state) = self.tracer.wait().await?;
         self.chroot.remove()?;
-        global_state.clean_up(false).await;
+        global_state.clean_up(false, &None).await;
         Ok(exit_status)
     }
 
@@ -119,7 +119,7 @@ impl Replay {
     pub async fn wait_with_output(self) -> Result<Output, reverie::Error> {
         let (output, global_state) = self.tracer.wait_with_output().await?;
         self.chroot.remove()?;
-        global_state.clean_up(false).await;
+        global_state.clean_up(false, &None).await;
         Ok(output)
     }
 }

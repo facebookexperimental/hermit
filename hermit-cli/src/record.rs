@@ -59,14 +59,14 @@ impl Record {
     /// Waits for the replay to finish and returns its exit status.
     pub async fn wait(self) -> Result<ExitStatus, reverie::Error> {
         let (exit_status, global_state) = self.tracer.wait().await?;
-        global_state.clean_up(false).await;
+        global_state.clean_up(false, &None).await;
         Ok(exit_status)
     }
 
     /// Waits for the replay to finish and collects its output.
     pub async fn wait_with_output(self) -> Result<Output, reverie::Error> {
         let (output, global_state) = self.tracer.wait_with_output().await?;
-        global_state.clean_up(false).await;
+        global_state.clean_up(false, &None).await;
         Ok(output)
     }
 }

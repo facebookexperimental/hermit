@@ -75,13 +75,16 @@ pub async fn run(
     command: Command,
     config: DetConfig,
     print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
 ) -> Result<ExitStatus, Error> {
     let mut builder = reverie_ptrace::TracerBuilder::<Detcore>::new(command).config(config.clone());
     if config.gdbserver {
         builder = builder.gdbserver(config.gdbserver_port);
     }
     let (exit_status, global_state) = builder.spawn().await?.wait().await?;
-    global_state.clean_up(print_summary).await; // Before it's dropped by this function.
+    global_state
+        .clean_up(print_summary, print_summary_to_json_file)
+        .await; // Before it's dropped by this function.
     Ok(exit_status)
 }
 
@@ -91,6 +94,7 @@ pub async fn run_with_output(
     mut command: Command,
     config: DetConfig,
     print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
 ) -> Result<Output, Error> {
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
@@ -100,7 +104,9 @@ pub async fn run_with_output(
         builder = builder.gdbserver(config.gdbserver_port);
     }
     let (output, global_state) = builder.spawn().await?.wait_with_output().await?;
-    global_state.clean_up(print_summary).await;
+    global_state
+        .clean_up(print_summary, print_summary_to_json_file)
+        .await;
     Ok(output)
 }
 

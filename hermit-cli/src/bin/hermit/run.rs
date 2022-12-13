@@ -170,6 +170,10 @@ pub struct RunOpts {
     #[clap(long, short = 'u')]
     pub(crate) summary: bool,
 
+    /// Print a machine readable version of --summary to a file.
+    #[clap(long)]
+    pub(crate) summary_json: Option<PathBuf>,
+
     /// Containarize networking and warn for non-zero bindings. Implies
     /// an isolated network nampespace and thus conflicts with `--network=host`.
     #[clap(long)]
@@ -372,6 +376,10 @@ impl fmt::Display for RunOpts {
         }
         if self.summary {
             write!(f, " --summary")?;
+        }
+        if let Some(p) = &self.summary_json {
+            let s = p.to_str().expect("valid unicode path");
+            write!(f, " --summary-json={}", shell_words::quote(s))?;
         }
         if self.analyze_networking {
             write!(f, " --analyze-networking")?;
@@ -827,10 +835,10 @@ impl RunOpts {
         self.save_config_to_disk()?;
 
         if capture_output {
-            let out = hermit::run_with_output(command, config, self.summary)?;
+            let out = hermit::run_with_output(command, config, self.summary, &self.summary_json)?;
             Ok((out.status, Some(out)))
         } else {
-            let status = hermit::run(command, config, self.summary)?;
+            let status = hermit::run(command, config, self.summary, &self.summary_json)?;
             Ok((status, None))
         }
     }
@@ -863,7 +871,7 @@ impl RunOpts {
         let config = self.det_opts.det_config.clone();
         self.save_config_to_disk()?;
 
-        hermit::run_with_output(command, config, self.summary)
+        hermit::run_with_output(command, config, self.summary, &self.summary_json)
     }
 }
 
