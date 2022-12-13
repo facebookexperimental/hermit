@@ -256,7 +256,7 @@ impl GlobalState {
         // Print machine-readable summary:
         if let Some(path) = print_summary_to_json_file {
             let json = serde_json::to_string_pretty(&summary).unwrap();
-            fs::write(path, json).unwrap();
+            fs::write(path, json + "\n").unwrap();
         }
 
         // Print human-readable summary:

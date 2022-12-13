@@ -180,6 +180,10 @@ impl RunData {
         };
 
         self.runopts.validate_args();
+
+        let repro_file = self.root_path().with_extension("repro");
+        std::fs::write(&repro_file, self.to_repro() + "\n")?;
+
         let (_, output) = self.runopts.run(&gopts, true)?;
         let output: Output = output.context("expected captured output")?;
 
@@ -224,6 +228,9 @@ impl RunData {
         // By default we save the config for every run.
         let conf_file = rd.root_path().with_extension("config");
         rd.runopts.save_config = Some(conf_file);
+
+        let summary_file = rd.root_path().with_extension("summary");
+        rd.runopts.summary_json = Some(summary_file);
 
         rd
     }
