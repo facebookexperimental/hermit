@@ -10,12 +10,15 @@ use std::ops::Range;
 
 use colored::Colorize;
 use detcore::types::SchedEvent;
+use edit_distance::generate_permutation;
 use edit_distance::iterable_bubble_sort;
 
 const MAX_EVENT_LEVEL_SEARCH_PASSES: usize = 100;
 
 const MAX_JITTER_EDITDIST: usize = 0;
 const MAX_JITTER_SWAPDIST: usize = 0;
+
+const MAX_UNMATCHED_TOPRINT: usize = 10;
 
 struct EventLevelSearchResult {
     passing_schedule: Vec<SchedEvent>,
@@ -114,6 +117,20 @@ where
                 / (passing_schedule.len() + failing_schedule.len()) as f64),
             requested_midpoint_schedule.len()
         );
+
+        if verbose {
+            let unmatched_total = passing_schedule.len() + failing_schedule.len()
+                - 2 * requested_midpoint_schedule.len();
+            if unmatched_total <= MAX_UNMATCHED_TOPRINT {
+                let perm = generate_permutation(&passing_schedule, &failing_schedule);
+                for ix in perm.unmatched_source_indices {
+                    eprintln!(" :: unmatched source evt: {}", passing_schedule[ix]);
+                }
+                for ix in perm.unmatched_target_indices {
+                    eprintln!(" :: unmatched target evt: {}", failing_schedule[ix]);
+                }
+            }
+        }
 
         if swap_dist == 0 {
             panic!(
