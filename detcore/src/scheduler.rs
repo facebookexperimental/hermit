@@ -325,6 +325,7 @@ pub struct ThreadTree {
 use pretty::Doc;
 use pretty::RcDoc;
 
+use self::replayer::DesyncStats;
 use self::replayer::Replayer;
 
 impl ThreadTree {
@@ -872,6 +873,18 @@ impl Scheduler {
                 replayer::ReplayAction::ContextSwitch(is_now, new_tid, timeslice_remaining) => {
                     self.requeue_with_new_priority(mytid, REPLAY_DEFERRED_PRIORITY);
                     self.requeue_with_new_priority(new_tid, REPLAY_FOREGROUND_PRIORITY);
+                    if !self.run_queue.contains_tid(new_tid) {
+                        // If it is not yet in next_turns, that is because it was JUST spawned and
+                        // hasn't showed up yet, but it will by the next scheduler turn.
+                        if self.next_turns.contains_key(&new_tid) {
+                            tracing::error!(
+                                "Attempted to context switch to tid {}, but it is not runnable atm.",
+                                new_tid
+                            );
+                            // TODO(T138906107): make this a fatal error when RESYNC capability is robust enough.
+                            // immediate_fatal_exit();
+                        }
+                    }
                     self.timeslices.insert(new_tid, timeslice_remaining);
                     return ConsumeResult {
                         keep_running: !is_now,
@@ -2002,26 +2015,33 @@ impl Scheduler {
             .as_ref()
             .map(|r| r.traced_event_count)
             .unwrap_or_default();
-        let (total_soft, total_hard) = self
+        let total_desync_stats = self
             .replayer
             .as_ref()
             .map(|r| {
                 r.desync_counts
                     .values()
-                    .fold((0, 0), |(x, y), (a, b)| (x + a, y + b))
+                    .fold(Default::default(), |x: DesyncStats, y: &DesyncStats| x + *y)
             })
             .unwrap_or_default();
 
-        let desync_descrip = if total_soft + total_hard > 0 {
+        let total_desyncs = total_desync_stats.soft + total_desync_stats.hard;
+        let desync_descrip = if total_desyncs > 0 {
             let mut buf = String::new();
             write!(
                 buf,
-                "  Encountered {} soft desyncs, {} hard.  Per thread: ",
-                total_soft, total_hard
+                "  Encountered {} soft desyncs, {} hard (with {} at context switch points).  Per thread: ",
+                total_desync_stats.soft,
+                total_desync_stats.hard,
+                total_desync_stats.at_context_switch
             )?;
             if let Some(ref replayer) = self.replayer {
-                for (tid, (soft, hard)) in replayer.desync_counts.iter() {
-                    write!(buf, "{}=>({},{}) ", tid, soft, hard)?;
+                for (tid, desync_stats) in replayer.desync_counts.iter() {
+                    write!(
+                        buf,
+                        "{}=>({},{},{}) ",
+                        tid, desync_stats.soft, desync_stats.hard, desync_stats.at_context_switch
+                    )?;
                 }
             }
             writeln!(buf)?;
@@ -2059,7 +2079,8 @@ impl Scheduler {
             sched_turns: self.turn,
             schedevent_replayed,
             schedevent_recorded: self.recorded_event_count,
-            schedevent_desynced: total_soft + total_hard,
+            schedevent_desynced: total_desyncs,
+            // schedevent_desynced_at_context_switch: total_desyncs.at_context_switch,
             desync_descrip,
             reprio_descrip,
             threads_descrip,

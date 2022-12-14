@@ -7,6 +7,7 @@
  */
 
 use std::collections::BTreeMap;
+use std::ops::Add;
 
 use detcore_model::collections::ReplayCursor;
 use detcore_model::pid::DetTid;
@@ -26,12 +27,35 @@ pub struct Replayer {
     /// Keep track of how many events we have replayed.  The current value is the event number of
     /// the NEXT event to replay
     pub traced_event_count: u64,
-    /// Desync events observed per thread.  Counts (soft,hard) desyncs.
-    pub desync_counts: BTreeMap<DetTid, (u64, u64)>,
+    /// Desync events observed per thread.  Counts different kinds of desyncs.
+    pub desync_counts: BTreeMap<DetTid, DesyncStats>,
     /// A cached copy of the same (immutable) field in Config.
     pub replay_exhausted_panic: bool,
     /// A cached copy of the same (immutable) field in Config.
     pub die_on_desync: bool,
+}
+
+/// The count of desyncs for a particular thread.
+#[derive(Debug, PartialEq, Eq, Default, Copy, Clone)]
+pub struct DesyncStats {
+    /// Not inclusive of hard desyncs.  You must add soft+hard together to get total desyncs.
+    pub soft: u64,
+    pub hard: u64,
+    /// The very worst kind, where we need to context switch, but we don't have a match on the
+    /// current event. These are a subset of the hard desyncs.
+    pub at_context_switch: u64,
+}
+
+impl Add for DesyncStats {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        DesyncStats {
+            soft: self.soft + rhs.soft,
+            hard: self.hard + rhs.hard,
+            at_context_switch: self.at_context_switch + rhs.at_context_switch,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -214,16 +238,18 @@ impl Replayer {
                 self.peek_next()
             );
 
+            let mut in_hard_desync_mode = false;
             if is_desync(observed, &expected) {
-                let counts = self.desync_counts.entry(mytid).or_insert((0, 0));
+                let counts = self.desync_counts.entry(mytid).or_default();
                 if is_hard_desync(observed, &expected) {
                     if self.die_on_desync {
                         eprintln!("Replay mode desynchronized from trace, bailing out.");
                         return ReplayAction::Stop(StopReason::FatalDesync);
                     }
-                    counts.1 += 1;
+                    counts.hard += 1;
+                    in_hard_desync_mode = true;
                 } else {
-                    counts.0 += 1;
+                    counts.soft += 1;
                 }
             }
 
@@ -235,6 +261,17 @@ impl Replayer {
                 let timeslice = self.resolve_time_to_run(next_ev);
 
                 if next_tid != observed.dettid {
+                    if in_hard_desync_mode {
+                        tracing::warn!(
+                            "[dtid {}] context switch to {}, but in a desynced state at this event (#{}) in --replay-schedule-from",
+                            &mytid,
+                            next_tid,
+                            current_ix
+                        );
+                        let counts = self.desync_counts.entry(mytid).or_default();
+                        counts.at_context_switch += 1;
+                    }
+
                     if is_prehook {
                         info!(
                             "[detcore, dtid {}] CONTEXT SWITCH to {} after this syscall blocks.  Reprioritizing at time {}",
