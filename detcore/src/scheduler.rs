@@ -278,8 +278,8 @@ pub struct Scheduler {
     /// An instance of replayer that is responsible for replaying events in case --replay-preemptions-from is specified
     pub replayer: Option<Replayer>,
 
-    /// Like `traced_event_count` but for record_event.  These should match if we're both replaying
-    /// and recording at the same time.
+    /// Count record_event calls which determines the event number if we're recording a schedule
+    /// event trace.
     pub recorded_event_count: u64,
 
     /// A copy of the `Config::stacktrace_event` vector.  This is MUTABLE,
@@ -759,6 +759,7 @@ impl Scheduler {
                         desync_counts: BTreeMap::new(),
                         die_on_desync: cfg.die_on_desync,
                         replay_exhausted_panic: cfg.replay_exhausted_panic,
+                        events_popped: 0,
                     })
                 }
                 None => None,
@@ -2013,7 +2014,7 @@ impl Scheduler {
         let schedevent_replayed = self
             .replayer
             .as_ref()
-            .map(|r| r.traced_event_count)
+            .map(|r| r.events_popped)
             .unwrap_or_default();
         let total_desync_stats = self
             .replayer

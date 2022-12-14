@@ -24,9 +24,13 @@ use tracing::trace;
 pub struct Replayer {
     /// A cursor that holds our place in the global total order of events being replayed.
     pub cursor: ReplayCursor<SchedEvent>,
-    /// Keep track of how many events we have replayed.  The current value is the event number of
-    /// the NEXT event to replay
+    /// Keep track of how many events we have observed during replay.  The current value is the
+    /// event number of the NEXT event to replay.
     pub traced_event_count: u64,
+
+    /// The number of events we've popped from the recording.
+    pub events_popped: u64,
+
     /// Desync events observed per thread.  Counts different kinds of desyncs.
     pub desync_counts: BTreeMap<DetTid, DesyncStats>,
     /// A cached copy of the same (immutable) field in Config.
@@ -208,6 +212,7 @@ impl Replayer {
     }
 
     fn pop_next(&mut self) -> Option<SchedEvent> {
+        self.events_popped += 1;
         self.cursor.next()
     }
 
@@ -407,6 +412,7 @@ mod tests {
             die_on_desync: false,
             replay_exhausted_panic: false,
             traced_event_count: 0,
+            events_popped: 0,
         }
     }
 

@@ -13,7 +13,8 @@ use std::iter::FromIterator;
 ///
 /// Apart from being an [Iterator] is supports methods [peek] and [peek_nth] to be able to look ahead arbitrary number of events forward
 /// look ahead while replaying.
-/// all of supported operations have O(1) time complexity
+///
+/// All supported operations have O(1) time complexity.
 #[derive(Debug)]
 pub struct ReplayCursor<T> {
     inner_data: VecDeque<T>,

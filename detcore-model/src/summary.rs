@@ -22,7 +22,7 @@ pub struct RunSummary {
     /// Internal number of steps taken by the scheduler.
     pub sched_turns: u64,
 
-    /// [tracereplay] SchedEvents replayed from the input recording.
+    /// [tracereplay] SchedEvents read and replayed from the input recording.
     pub schedevent_replayed: u64,
     /// [tracereplay] SchedEvents recorded to disk during execution.
     pub schedevent_recorded: u64,
