@@ -499,12 +499,6 @@ impl GlobalTime {
 
     /// Tick the time of a particular thread.
     pub fn update_global_time(&mut self, tid: DetTid, newtime: LogicalTime) {
-        trace!(
-            "[tid {}] ticked its global time component to {}",
-            tid,
-            newtime,
-        );
-
         if newtime < self.starting_nanos {
             panic!(
                 "update_global_time: Cannot set thread {} time to {}, which is before start of container execution {}",
@@ -514,6 +508,11 @@ impl GlobalTime {
 
         // TODO(T136359599): change to duration_since, and store durations in time_vector:
         let newtime = newtime - self.starting_nanos;
+        trace!(
+            "[tid {}] ticked its global time component to {}",
+            tid,
+            newtime,
+        );
         if let Some(old) = self.time_vector.insert(tid, newtime) {
             if old > newtime {
                 panic!(
