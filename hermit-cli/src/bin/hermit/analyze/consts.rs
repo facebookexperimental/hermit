@@ -22,4 +22,5 @@ pub const NO_LOGGING: GlobalOpts = GlobalOpts {
 // associated files for that run.
 pub const LOG_EXT: &str = "log";
 pub const PREEMPTS_EXT: &str = "preempts";
+pub const PREEMPTS_EXT_PRESTRIPPED: &str = "preempts_with_times";
 pub const SCHED_EXT: &str = "events";

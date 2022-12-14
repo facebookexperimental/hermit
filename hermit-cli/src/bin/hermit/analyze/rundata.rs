@@ -19,6 +19,7 @@ use anyhow::bail;
 use anyhow::Context;
 use clap::Parser;
 use colored::Colorize;
+use detcore::preemptions::strip_times_from_events_file;
 use detcore::preemptions::PreemptionReader;
 use detcore::preemptions::PreemptionRecord;
 use detcore::types::SchedEvent;
@@ -179,6 +180,19 @@ impl RunData {
             NO_LOGGING.clone()
         };
 
+        let final_record_path = self
+            .runopts
+            .det_opts
+            .det_config
+            .record_preemptions_to
+            .take();
+
+        // Some last-minute sleight-of-hand to record to a temporary location instead.
+        if final_record_path.is_some() {
+            let temp_path = root.with_extension(PREEMPTS_EXT_PRESTRIPPED);
+            self.runopts.det_opts.det_config.record_preemptions_to = Some(temp_path);
+        }
+
         self.runopts.validate_args();
 
         let repro_file = self.root_path().with_extension("repro");
@@ -196,6 +210,18 @@ impl RunData {
             .write_all(&output.stderr)
             .unwrap();
 
+        let temp_path = self
+            .runopts
+            .det_opts
+            .det_config
+            .record_preemptions_to
+            .take();
+        if let Some(temp_path) = temp_path {
+            Self::post_process_events_file(&temp_path, final_record_path.as_ref().unwrap())?;
+            // Restore the setting:
+            self.runopts.det_opts.det_config.record_preemptions_to = final_record_path;
+        }
+
         self.is_a_match = Some(self.analyze_opts.output_matches(&output));
 
         if self.analyze_opts.verbose {
@@ -208,6 +234,12 @@ impl RunData {
                 String::from_utf8(output.stderr).unwrap()
             );
         }
+        Ok(())
+    }
+
+    /// Any post-processing that needs to be applied to a recorded file of SchedEvents
+    pub fn post_process_events_file(sched_path: &Path, dest: &Path) -> anyhow::Result<()> {
+        let _ = strip_times_from_events_file(sched_path, Some(dest.to_owned()))?;
         Ok(())
     }
 
