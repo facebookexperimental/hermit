@@ -142,6 +142,13 @@ impl AnalyzeOpts {
             || self.target_exit_code != ExitStatusConstraint::Any
     }
 
+    /// Is the criteria the most common setting of target = failure = nonzero exit.
+    fn is_vanilla_criteria(&self) -> bool {
+        self.target_stdout.is_none()
+            && self.target_stderr.is_none()
+            && self.target_exit_code == ExitStatusConstraint::NonZero
+    }
+
     fn display_criteria(&self) -> String {
         let mut strs: Vec<String> = Vec::new();
         match &self.target_exit_code {
@@ -154,10 +161,10 @@ impl AnalyzeOpts {
             ExitStatusConstraint::Any => {}
         }
         if self.target_stdout.is_some() {
-            strs.push(" matching stdout".to_string());
+            strs.push("matching stdout".to_string());
         }
         if self.target_stderr.is_some() {
-            strs.push(" matching stderr".to_string());
+            strs.push("matching stderr".to_string());
         }
         strs.join(", ")
     }
@@ -507,16 +514,24 @@ impl AnalyzeOpts {
                 "These two operations, on different threads, are RACING with eachother.\n",
             );
             header.push_str(&format!(
-                "The current order of events {} and {} is causing a FAILURE.\n",
+                "The order of events (#{} and #{} in the schedule) determines the program outcome.\n",
                 critical_event_index - 1,
-                critical_event_index
+                critical_event_index,
             ));
             header.push_str(
                 "You must add synchronization to prevent these operations from racing, or give them a different order.\n",
             );
-            header.push_str(
-                "Here are the stacktraces from a baseline run, but flipping the order of these two events makes it exhibit the target behavior (usually a failure).\n",
-            );
+
+            if self.is_vanilla_criteria() {
+                header.push_str(
+                    "Attached are the stacktraces from a PASSING run, but flipping the order of the two events makes the program FAIL (nonzero exit).\n",
+                );
+            } else {
+                header.push_str(&format!(
+                    "Attached are the stacktraces from a baseline run, while flipping the order makes the program exhibit the target criteria ({}).\n",
+                    self.display_criteria()
+                ));
+            }
 
             let (stack1, stack2) =
                 self.print_stacks(runname2, final_passing_path, critical_event_index, false)?;
