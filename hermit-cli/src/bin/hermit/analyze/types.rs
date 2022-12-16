@@ -160,6 +160,11 @@ pub struct AnalyzeOpts {
     #[clap(long, short)]
     pub verbose: bool,
 
+    /// Number of events to print before/after the critical events found, when showing the execution
+    /// context along weth the analyze report.
+    #[clap(long, short, value_name = "EVTCNT", default_value = "5")]
+    pub execution_context: usize,
+
     /// Where the analysis run will store its temporary artifacts.
     ///
     /// By default this is a directory in `/tmp`
@@ -230,6 +235,15 @@ impl FromStr for ExitStatusConstraint {
 /// The final report that comes out of the analyze process.
 #[derive(PartialEq, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
 pub struct Report {
+    /// A header containing some contextual information, to go at the beginning of the report.
+    pub header: String,
+
+    /// Some additional context about where in the execution the issue occured. (Basically used as a footer.)
+    pub additional_context: String,
+
+    /// Is it a baseline run (e.g. passing run) vs a target run (e.g. failing/crashing).
+    pub baseline_run: bool,
+
     /// The runtime context for one critical event, which is racing with, and does not commute with
     /// the other.
     pub critical_event1: ReportCriticalEvent,

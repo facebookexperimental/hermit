@@ -46,7 +46,7 @@ pub struct SchedEvent {
 /// A more compact printing.
 impl fmt::Display for SchedEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "(dtid{}", self.dettid)?;
+        write!(f, "(tid{}", self.dettid)?;
         if self.count > 1 {
             write!(f, " cnt={}", self.count)?;
         }

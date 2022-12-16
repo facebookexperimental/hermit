@@ -8,6 +8,7 @@
 
 //! A mode for analyzing a hermit run.
 
+use std::cmp;
 use std::fs::File;
 use std::path::Path;
 use std::path::PathBuf;
@@ -485,6 +486,32 @@ impl AnalyzeOpts {
         Ok(crit)
     }
 
+    fn generate_context(
+        sched: &[SchedEvent],
+        critical_event_index: usize,
+        window_size: usize,
+    ) -> String {
+        let mut additional_context = "Execution context for the critical events (*):\n".to_string();
+        {
+            let start = critical_event_index - 1;
+            let start = start - cmp::min(window_size, start);
+            let end = cmp::min(critical_event_index + window_size + 1, sched.len());
+
+            for (ix, item) in sched.iter().enumerate().take(end).skip(start) {
+                additional_context.push_str(&format!(
+                    "  {} {}\n",
+                    if ix == critical_event_index || ix == critical_event_index - 1 {
+                        "*"
+                    } else {
+                        " "
+                    },
+                    item
+                ));
+            }
+        }
+        additional_context
+    }
+
     /// Record the schedules on disk as reproducers and report stack-traces of critical events.
     pub fn phase6_record_outputs(&self, crit: CriticalSchedule) -> Result<Report, Error> {
         let tmp_dir = self.get_tmp()?;
@@ -498,6 +525,18 @@ impl AnalyzeOpts {
         let runname2 = "final_baseline_for_stacktraces";
         let final_failing_path = tmp_dir.join(runname1).with_extension(SCHED_EXT);
         let final_passing_path = tmp_dir.join(runname2).with_extension(SCHED_EXT);
+
+        let passing_context = Self::generate_context(
+            &passing_schedule,
+            critical_event_index,
+            self.execution_context,
+        );
+        let failing_context = Self::generate_context(
+            &failing_schedule,
+            critical_event_index,
+            self.execution_context,
+        );
+
         {
             let pr = PreemptionRecord::from_sched_events(failing_schedule);
             pr.write_to_disk(&final_failing_path).unwrap();
@@ -549,6 +588,21 @@ impl AnalyzeOpts {
             println!("{}", header);
             println!("{}", stack1);
             println!("{}", stack2);
+            println!("\n{}", passing_context);
+
+            let report = Report {
+                header,
+                additional_context: passing_context,
+                baseline_run: true,
+                critical_event1: ReportCriticalEvent {
+                    event_index: critical_event_index - 1,
+                    stack: stack1,
+                },
+                critical_event2: ReportCriticalEvent {
+                    event_index: critical_event_index,
+                    stack: stack2,
+                },
+            };
 
             if self.verbose {
                 eprintln!(
@@ -564,18 +618,10 @@ impl AnalyzeOpts {
                 );
                 println!("{}", stack1);
                 println!("{}", stack2);
+                println!("\n{}", failing_context);
             }
 
-            Ok(Report {
-                critical_event1: ReportCriticalEvent {
-                    event_index: critical_event_index - 1,
-                    stack: stack1,
-                },
-                critical_event2: ReportCriticalEvent {
-                    event_index: critical_event_index,
-                    stack: stack2,
-                },
-            })
+            Ok(report)
         }
     }
 
