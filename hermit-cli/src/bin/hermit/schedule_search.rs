@@ -12,6 +12,7 @@ use colored::Colorize;
 use detcore::types::SchedEvent;
 use edit_distance::generate_permutation;
 use edit_distance::iterable_bubble_sort;
+use edit_distance::NeedlemanWunsch;
 
 const MAX_EVENT_LEVEL_SEARCH_PASSES: usize = 100;
 
@@ -35,6 +36,26 @@ pub struct CriticalSchedule {
     pub critical_event_index: usize,
 }
 
+/// return 2 if first == second (ignores end_time)
+/// return -1 if only count is different
+/// return -2 otherwise
+pub fn scoring_function(first: SchedEvent, second: SchedEvent) -> i32 {
+    let mut score = -2;
+    if (first.dettid == second.dettid)
+        && (first.op == second.op)
+        && (first.start_rip == second.start_rip)
+        && (first.end_rip == second.end_rip)
+    {
+        score += 1;
+    } else {
+        return score;
+    }
+    if first.count == second.count {
+        score += 3;
+    }
+    score
+}
+
 #[allow(dead_code)]
 /// Search for a schedule which is failing the criteria, but is edit distance one from succeeding.
 pub fn search_for_critical_schedule<F>(
@@ -42,6 +63,7 @@ pub fn search_for_critical_schedule<F>(
     initial_passing_schedule: Vec<SchedEvent>,
     initial_failing_schedule: Vec<SchedEvent>,
     verbose: bool,
+    run_needleman: bool,
 ) -> CriticalSchedule
 where
     F: FnMut(&[SchedEvent]) -> (bool, Vec<SchedEvent>),
@@ -54,12 +76,21 @@ where
     let EventLevelSearchResult {
         passing_schedule,
         failing_schedule,
-    } = event_level_search(
-        &mut tester,
-        initial_passing_schedule,
-        initial_failing_schedule,
-        verbose,
-    );
+    } = if run_needleman {
+        needleman_level_search(
+            &mut tester,
+            initial_passing_schedule,
+            initial_failing_schedule,
+            verbose,
+        )
+    } else {
+        event_level_search(
+            &mut tester,
+            initial_passing_schedule,
+            initial_failing_schedule,
+            verbose,
+        )
+    };
 
     // TODO: reenable subdividing blocks of event and searching down to unit granularity:
     // sub_event_search(&mut tester, passing_schedule, failing_schedule)
@@ -73,6 +104,7 @@ where
         let (common_prefix, _) = get_common_pre_and_postfix(&passing_schedule, &failing_schedule);
         common_prefix.len() + 1
     };
+    eprintln!("Critical event index {}", critical_event_index);
     CriticalSchedule {
         failing_schedule,
         passing_schedule,
@@ -84,6 +116,72 @@ where
 fn just_distance(sched1: &[SchedEvent], sched2: &[SchedEvent]) -> (usize, usize) {
     let bubbles = iterable_bubble_sort(sched1, sched2);
     (bubbles.edit_distance(), bubbles.swap_distance())
+}
+
+/// Search of the schedule space to find the critical schedule
+fn needleman_level_search<F>(
+    tester: &mut F,
+    mut passing_schedule: Vec<SchedEvent>,
+    mut failing_schedule: Vec<SchedEvent>,
+    _verbose: bool,
+) -> EventLevelSearchResult
+where
+    F: FnMut(&[SchedEvent]) -> (bool, Vec<SchedEvent>),
+{
+    for _pass_number in 0..MAX_EVENT_LEVEL_SEARCH_PASSES {
+        let mut needleman = NeedlemanWunsch {
+            first_sequence: passing_schedule.clone(),
+            second_sequence: failing_schedule.clone(),
+            ..Default::default()
+        };
+        let (start_index, global_alignment) =
+            needleman.match_sequences(Some(scoring_function), None, Some(-2));
+        if global_alignment.is_empty() {
+            panic!(
+                "Aborting search, if the swap distance is 0, that means we didn't find ANY matching events between schedules. This is a bad sign."
+            );
+        }
+        // TODO: Find a good stopping condition
+        if global_alignment.len() == 1 {
+            return EventLevelSearchResult {
+                passing_schedule,
+                failing_schedule,
+            };
+        }
+        let requested_midpoint_schedule =
+            needleman.generate_midpoint_schedule(start_index, global_alignment);
+        let (midpoint_passes, midpoint_actual_schedule) = tester(&requested_midpoint_schedule);
+        let (jitter_edit, jitter_swap) =
+            just_distance(&requested_midpoint_schedule, &midpoint_actual_schedule);
+        eprintln!(
+            ":: THROUGH NEEDLEMAN Jitter was {},{} edit/swap distance (requested synthetic schedule vs actual schedule)",
+            jitter_edit, jitter_swap
+        );
+        let selected_new_point = if jitter_edit > MAX_JITTER_EDITDIST
+            || jitter_swap > MAX_JITTER_SWAPDIST
+        {
+            eprintln!(
+                ":: {} ({},{})",
+                "Jitter exceeded threshold, proceeding optimistically along original route rather than rerouting the search".red().bold(),
+                jitter_edit,
+                jitter_swap,
+            );
+            requested_midpoint_schedule
+        } else {
+            midpoint_actual_schedule
+        };
+
+        if midpoint_passes {
+            passing_schedule = selected_new_point;
+        } else {
+            failing_schedule = selected_new_point;
+        }
+    }
+
+    panic!(
+        "Event-Level Search Failed - No convergence after {} passes",
+        MAX_EVENT_LEVEL_SEARCH_PASSES
+    );
 }
 
 /// Perform a multi-level search of the schedule space to find the critical schedule
@@ -512,7 +610,7 @@ mod tests {
             failing_schedule: critical_failing_schedule,
             critical_event_index,
             ..
-        } = search_for_critical_schedule(mock_tester, passing_sched, failing_sched, true);
+        } = search_for_critical_schedule(mock_tester, passing_sched, failing_sched, true, false);
 
         assert_eq!(critical_event_index, 379);
 

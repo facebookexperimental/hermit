@@ -66,6 +66,10 @@ pub struct AnalyzeOpts {
     #[clap(long)]
     pub search: bool,
 
+    /// If the first run doesn't match the target criteria, search for one that does.
+    #[clap(long)]
+    pub run_needleman: bool,
+
     /// Given a passing/failing run pair, based on different chaos seeds, first minimize the
     /// chaos-mode interventions necessary to flip between the two outcomes.  This may accelerate
     /// the subsequent binary search.

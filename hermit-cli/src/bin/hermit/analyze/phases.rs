@@ -471,7 +471,13 @@ impl AnalyzeOpts {
 
         let target = target.to_vec(); // TODO: have search_for_critical_schedule borrow only.
         let baseline = baseline.to_vec();
-        let crit = search_for_critical_schedule(test_fn, baseline, target, self.verbose);
+        let crit = search_for_critical_schedule(
+            test_fn,
+            baseline,
+            target,
+            self.verbose,
+            self.run_needleman,
+        );
         eprintln!(
             "Critical event of final on-target schedule is {}",
             crit.critical_event_index
