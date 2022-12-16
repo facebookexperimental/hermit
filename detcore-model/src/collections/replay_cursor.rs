@@ -13,14 +13,12 @@ use std::iter::FromIterator;
 ///
 /// Apart from being an [Iterator] is supports methods [peek] and [peek_nth] to be able to look ahead arbitrary number of events forward
 /// look ahead while replaying.
-///
-/// All supported operations have O(1) time complexity.
 #[derive(Debug)]
 pub struct ReplayCursor<T> {
     inner_data: VecDeque<T>,
 }
 
-impl<T> ReplayCursor<T> {
+impl<T: Eq> ReplayCursor<T> {
     /// peeks the following nth element from the top of the cursor
     pub fn peek_nth(&self, index: usize) -> Option<&T> {
         self.inner_data.get(index)
@@ -29,6 +27,21 @@ impl<T> ReplayCursor<T> {
     /// peeks the following item from the top of the cursor
     pub fn peek(&self) -> Option<&T> {
         self.peek_nth(0)
+    }
+
+    /// Look ahead N positions to see if the element is found within that window.
+    /// Return the position, if found.
+    pub fn prefix_contains(&self, winsize: usize, item: &T) -> Option<usize> {
+        for (i, v) in self.inner_data.iter().enumerate().take(winsize) {
+            if v == item {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    pub fn drop(&mut self, count: usize) {
+        let _ = self.inner_data.split_off(count);
     }
 }
 
@@ -61,7 +74,10 @@ mod tests {
 
     use super::*;
 
-    fn peek_pair<T>(cursor: &ReplayCursor<T>) -> (Option<&T>, Option<&T>) {
+    fn peek_pair<T>(cursor: &ReplayCursor<T>) -> (Option<&T>, Option<&T>)
+    where
+        T: std::cmp::Eq,
+    {
         (cursor.peek_nth(0), cursor.peek_nth(1))
     }
 

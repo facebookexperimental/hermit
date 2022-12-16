@@ -19,6 +19,8 @@ use tracing::debug;
 use tracing::info;
 use tracing::trace;
 
+const LOOKAHEAD_WINDOW: usize = 10;
+
 /// Replayer
 #[derive(Debug)]
 pub struct Replayer {
@@ -48,6 +50,14 @@ pub struct DesyncStats {
     /// The very worst kind, where we need to context switch, but we don't have a match on the
     /// current event. These are a subset of the hard desyncs.
     pub at_context_switch: u64,
+    /// How many times do we find a match again, after a mismatch, specifically new obserserved
+    /// events that were not expected.
+    pub resync_insertions: u64,
+    /// How many times do we find a match again, after a mismatch, specifically expected events that
+    /// were not observed.
+    pub resync_deletions: u64,
+    /// A bit of statefulness: true when the last event processed was a desync.
+    pub last_was_desync: bool,
 }
 
 impl Add for DesyncStats {
@@ -58,6 +68,10 @@ impl Add for DesyncStats {
             soft: self.soft + rhs.soft,
             hard: self.hard + rhs.hard,
             at_context_switch: self.at_context_switch + rhs.at_context_switch,
+            resync_insertions: self.resync_insertions + rhs.resync_insertions,
+            resync_deletions: self.resync_deletions + rhs.resync_deletions,
+            // Not commutative!
+            last_was_desync: rhs.last_was_desync,
         }
     }
 }
@@ -72,12 +86,14 @@ pub enum StopReason {
 pub enum ReplayAction {
     Continue(Option<LogicalTime>),
     Stop(StopReason),
+    /// The boolean indicates if the context switch should be immediate (or wait till the current
+    /// thread blocks itself and naturally yields control).
     ContextSwitch(bool, DetTid, Option<LogicalTime>),
 }
 
 fn compare_desync(observed: &SchedEvent, expected: &SchedEvent) -> String {
     if !is_desync(observed, expected) {
-        "MATCHED".to_string()
+        "SYNCED".to_string()
     } else if observed.op != expected.op {
         "FULL-OP-DESYNC".to_string()
     } else {
@@ -216,35 +232,47 @@ impl Replayer {
         self.cursor.next()
     }
 
-    fn peek_next(&self) -> Option<&SchedEvent> {
-        self.cursor.peek()
+    fn peek_next(&self) -> Option<SchedEvent> {
+        self.cursor.peek().cloned()
+    }
+
+    fn next_replay_matches(&self, observed: &SchedEvent) -> bool {
+        if let Some(expected) = self.cursor.peek() {
+            !is_desync(observed, expected)
+        } else {
+            false
+        }
     }
 
     pub fn observe_event(&mut self, observed: &SchedEvent) -> ReplayAction {
         let mytid = observed.dettid;
-        let time = observed.end_time.expect("timestamps required for now");
         let current_ix = self.traced_event_count;
         self.traced_event_count += 1;
 
-        let next = self.pop_next();
-
-        if let Some(expected) = next {
+        if let Some(expected) = self.peek_next() {
             debug!(
-                "[detcore, dtid {}] {}: Ran event #{} {:?}, current replay event: {:?}",
+                "[detcore, dtid {}] {}: Ran event #{} {}, current replay event: {}",
                 mytid,
                 compare_desync(observed, &expected),
                 current_ix,
                 observed,
                 expected,
             );
-            trace!(
-                "[detcore, dtid {}] NEXT event to replay {:?}",
-                mytid,
-                self.peek_next()
-            );
+            if let Some(nxt) = self.cursor.peek_nth(1) {
+                trace!("[detcore, dtid {}] NEXT event to replay {}", mytid, nxt);
+            }
+            if observed.dettid != expected.dettid {
+                tracing::warn!(
+                    "[tracereplay] expected to be running thread {}, but running {} at event #{}",
+                    expected.dettid,
+                    observed.dettid,
+                    current_ix
+                );
+            }
 
+            let is_desync = is_desync(observed, &expected);
             let mut in_hard_desync_mode = false;
-            if is_desync(observed, &expected) {
+            if is_desync {
                 let counts = self.desync_counts.entry(mytid).or_default();
                 if is_hard_desync(observed, &expected) {
                     if self.die_on_desync {
@@ -254,69 +282,140 @@ impl Replayer {
                     counts.hard += 1;
                     in_hard_desync_mode = true;
                 } else {
+                    // TODO: we need to handle a mismatch in counts by doing a partial-pop on the
+                    // replayer state.
                     counts.soft += 1;
                 }
             }
+            self.counts_next_round(mytid, is_desync);
 
-            if let Some(next_ev) = self.peek_next() {
-                let is_prehook = matches!(observed.op, Op::Syscall(_, SyscallPhase::Prehook));
-
-                let next_tid = next_ev.dettid;
-                // Checking for an optional timeslice in case of RCB
-                let timeslice = self.resolve_time_to_run(next_ev);
-
-                if next_tid != observed.dettid {
-                    if in_hard_desync_mode {
-                        tracing::warn!(
-                            "[dtid {}] context switch to {}, but in a desynced state at this event (#{}) in --replay-schedule-from",
-                            &mytid,
-                            next_tid,
-                            current_ix
-                        );
-                        let counts = self.desync_counts.entry(mytid).or_default();
-                        counts.at_context_switch += 1;
-                    }
-
-                    if is_prehook {
-                        info!(
-                            "[detcore, dtid {}] CONTEXT SWITCH to {} after this syscall blocks.  Reprioritizing at time {}",
-                            &mytid, next_tid, time
-                        );
-                    } else {
-                        info!(
-                            "[detcore, dtid {}] CONTEXT SWITCH to {} after the last event retired.  Reprioritizing at time {}",
-                            &mytid, next_tid, time
-                        );
-                    }
-
-                    // The *downgrading* of the current thread will be handled by the caller if the
-                    // context switch is *now*.  If the last traced event on this thread is instead
-                    // a prehook, well we don't deschedule the current thread quite yet.  Rather, we
-                    // let the thread plow ahead, and actually block on the syscall, which will have
-                    // the effect of descheduling the therad anyway.  After that, the priorities
-                    // be set so as to make sure the correct thread (next_tid) runs.
-                    return ReplayAction::ContextSwitch(!is_prehook, next_tid, timeslice);
-                } else {
-                    // We're still running the next event.
-                    return ReplayAction::Continue(timeslice);
+            if is_desync {
+                if let Some(ix) = self.check_fast_forward(observed) {
+                    debug_assert!(ix > 0);
+                    // This counts DELETIONS (missing events from observed stream):
+                    let counts = self.desync_counts.entry(mytid).or_default();
+                    counts.resync_deletions += 1;
+                    in_hard_desync_mode = false;
+                    // is_desync = false; // Logically correct, but... unused_assignments
                 }
-            } else {
-                return ReplayAction::Continue(None);
             }
-        } else {
-            if self.replay_exhausted_panic {
-                eprintln!(
-                    "[detcore, dtid {}] Replay trace ran out, stopping at unknown event {:?}",
-                    &mytid, observed
+
+            if !in_hard_desync_mode {
+                // Whether naturally or by fast forward, we should end up in this state before we pop:
+                debug_assert!(
+                    self.next_replay_matches(observed),
+                    "expected match before pop: {} {:?}",
+                    observed,
+                    self.cursor
                 );
-                return ReplayAction::Stop(StopReason::ReplayExausted);
+                let _ = self.pop_next();
             }
+
+            let action = self.check_context_switch(observed);
+            if let ReplayAction::ContextSwitch(_, next_tid, _) = action {
+                if in_hard_desync_mode {
+                    tracing::warn!(
+                        "[dtid {}] context switch to {}, but in a desynced state at this event (#{}) in --replay-schedule-from",
+                        &mytid,
+                        next_tid,
+                        current_ix
+                    );
+                    let counts = self.desync_counts.entry(mytid).or_default();
+                    counts.at_context_switch += 1;
+                }
+            }
+            action
+        } else if self.replay_exhausted_panic {
+            eprintln!(
+                "[detcore, dtid {}] Replay trace ran out, stopping at unknown event {:?}",
+                &mytid, observed
+            );
+            ReplayAction::Stop(StopReason::ReplayExausted)
+        } else {
             info!(
                 "[detcore, dtid {}] Replay trace ran out, unknown event {:?}",
                 &mytid, observed
             );
+            ReplayAction::Continue(None)
         }
-        ReplayAction::Continue(None)
+    }
+
+    /// Logically advance the counting machinery to the next round.
+    fn counts_next_round(&mut self, mytid: DetTid, is_desync: bool) {
+        let counts = self.desync_counts.entry(mytid).or_default();
+        if is_desync {
+            // Set it for the next round:
+            counts.last_was_desync = true;
+        } else {
+            if counts.last_was_desync {
+                // This counts INSERTION events (new events in observed stream), because we
+                // previously desynced and left unmatched events on the replay cursor, which are
+                // now matched.
+                counts.resync_insertions += 1;
+            }
+            counts.last_was_desync = false;
+        }
+    }
+
+    /// Return how many to drop to have observed equal to the head of the replay tape,
+    /// i.e. jump past missing or mismatched events on the replay tape.
+    fn check_fast_forward(&mut self, observed: &SchedEvent) -> Option<usize> {
+        if let Some(ix) = self.cursor.prefix_contains(LOOKAHEAD_WINDOW, observed) {
+            // Drop the corresponding number of of missed/mismatched events so that the observed
+            // matches the head of the replay tape (which is to be popped).
+            self.cursor.drop(ix);
+            Some(ix)
+        } else {
+            None
+        }
+    }
+
+    fn check_context_switch(&mut self, observed: &SchedEvent) -> ReplayAction {
+        // We run after the pop of any matched action, so the next action in replay represents the
+        // FUTURE not the PRESENT/PAST:
+        if let Some(next_ev) = self.cursor.peek() {
+            let mytid = observed.dettid;
+            let time = observed.end_time.expect("timestamps required for now");
+            let is_prehook = matches!(observed.op, Op::Syscall(_, SyscallPhase::Prehook));
+
+            let next_tid = next_ev.dettid;
+            // Checking for an optional timeslice in case of RCB
+            let timeslice = self.resolve_time_to_run(next_ev);
+
+            if next_tid != observed.dettid {
+                if is_prehook {
+                    info!(
+                        "[detcore, dtid {}] CONTEXT SWITCH to {} after this syscall blocks.  Reprioritizing at time {}",
+                        &mytid, next_tid, time
+                    );
+                } else {
+                    info!(
+                        "[detcore, dtid {}] CONTEXT SWITCH to {} after the last event retired.  Reprioritizing at time {}",
+                        &mytid, next_tid, time
+                    );
+                }
+
+                // The *downgrading* of the current thread will be handled by the caller if the
+                // context switch is *now*.  If the last traced event on this thread is instead
+                // a prehook, well we don't deschedule the current thread quite yet.  Rather, we
+                // let the thread plow ahead, and actually block on the syscall, which will have
+                // the effect of descheduling the therad anyway.  After that, the priorities
+                // be set so as to make sure the correct thread (next_tid) runs.
+                //
+                // Note: for *natural* schedules that are recorded from hermit, the only reason
+                // to switch away from the thread after the prehook is if it blocked. But a
+                // synthetic schedule can choose to do this arbitrarily, and we need to assign
+                // semantics to that on replay.  If we have threads A&B, and events "A_prehook,
+                // B_*, A_posthook", then does the effect of A's syscall happen before or after
+                // B's logic?
+                ReplayAction::ContextSwitch(!is_prehook, next_tid, timeslice)
+            } else {
+                // We're still running the next event.
+                ReplayAction::Continue(timeslice)
+            }
+        } else {
+            ReplayAction::Continue(None)
+        }
     }
 }
 
@@ -416,6 +515,15 @@ mod tests {
         }
     }
 
+    fn strip_times(vec: Vec<SchedEvent>) -> Vec<SchedEvent> {
+        vec.iter()
+            .map(|se| SchedEvent {
+                end_time: Some(LogicalTime::from_nanos(0)),
+                ..*se
+            })
+            .collect()
+    }
+
     #[test]
     fn test_continue_() {
         let mut b = builder::SchedTestBuilder::new();
@@ -485,5 +593,55 @@ mod tests {
             replayer.observe_event(&schedule[0]),
             ReplayAction::ContextSwitch(true, tid(3), None)
         );
+    }
+
+    #[test]
+    fn test_fast_forward() {
+        let mut b = builder::SchedTestBuilder::new();
+
+        // Strip times so we don't have a time mismatch in the branch 123 events:
+        let observed = strip_times(vec![
+            b.other(SOME_RIP, tid(3)),
+            b.branch(123, tid(3)),
+            b.syscall_pre(Sysno::exit, SOME_RIP, tid(3)),
+        ]);
+        let expected = strip_times(vec![
+            b.branch(123, tid(3)),
+            b.syscall_pre(Sysno::exit, SOME_RIP, tid(3)),
+        ]);
+        let mut replayer = create_replayer(expected);
+        let action1 = replayer.observe_event(&observed[0]);
+        {
+            let counts = replayer.desync_counts.get(&tid(3)).unwrap();
+            assert_eq!(
+                *counts,
+                DesyncStats {
+                    soft: 0,
+                    hard: 1,
+                    at_context_switch: 0,
+                    resync_insertions: 0,
+                    resync_deletions: 0,
+                    last_was_desync: true,
+                }
+            );
+        }
+        assert_eq!(action1, ReplayAction::Continue(None));
+
+        let action2 = replayer.observe_event(&observed[1]);
+        {
+            let counts = replayer.desync_counts.get(&tid(3)).unwrap();
+            assert_eq!(
+                *counts,
+                DesyncStats {
+                    soft: 0,
+                    hard: 1,
+                    at_context_switch: 0,
+                    resync_insertions: 1,
+                    resync_deletions: 0,
+                    last_was_desync: false,
+                }
+            );
+        }
+        assert_eq!(action2, ReplayAction::Continue(None));
     }
 }

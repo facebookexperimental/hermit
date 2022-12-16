@@ -357,7 +357,7 @@ where
     };
 
     eprintln!(
-        "Passign Size - {}, Failing Size - {}, Prefix Size - {}, Postfix Size - {}",
+        "Passing Size - {}, Failing Size - {}, Prefix Size - {}, Postfix Size - {}",
         passing_schedule.len(),
         failing_schedule.len(),
         prefix.len(),

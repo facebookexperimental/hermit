@@ -978,7 +978,7 @@ impl Scheduler {
         rsrc.insert(ResourceID::FutexWait, Permission::R);
         nxt.req.put(Ok(rsrc));
         trace!(
-            "[detcore, dtid {}] Waiter blocking on futex {:?}, now {} waiters, on {}",
+            "[dtid {}] Waiter blocking on futex {:?}, now {} waiters, on {}",
             &dettid,
             &futexid,
             entry.len(),
@@ -2031,17 +2031,24 @@ impl Scheduler {
             let mut buf = String::new();
             write!(
                 buf,
-                "  Encountered {} soft desyncs, {} hard (with {} at context switch points).  Per thread: ",
+                "  Encountered {} soft desyncs, {} hard (with {} at context switch points), {} resyncs ({}/{} insertion/deletion).\n  Per thread (soft,hard,@switch,resync): ",
                 total_desync_stats.soft,
                 total_desync_stats.hard,
-                total_desync_stats.at_context_switch
+                total_desync_stats.at_context_switch,
+                total_desync_stats.resync_insertions + total_desync_stats.resync_deletions,
+                total_desync_stats.resync_insertions,
+                total_desync_stats.resync_deletions,
             )?;
             if let Some(ref replayer) = self.replayer {
                 for (tid, desync_stats) in replayer.desync_counts.iter() {
                     write!(
                         buf,
-                        "{}=>({},{},{}) ",
-                        tid, desync_stats.soft, desync_stats.hard, desync_stats.at_context_switch
+                        "{}=>({},{},{},{}) ",
+                        tid,
+                        desync_stats.soft,
+                        desync_stats.hard,
+                        desync_stats.at_context_switch,
+                        desync_stats.resync_insertions + desync_stats.resync_deletions,
                     )?;
                 }
             }
@@ -2147,7 +2154,7 @@ impl Scheduler {
     // recording or replay.
     pub fn record_event(&mut self, ev: &SchedEvent) -> MaybePrintStack {
         debug!(
-            "[detcore, dtid {}] Record scheduled event #{}: {:?}",
+            "[dtid {}] Record scheduled event #{}: {:?}",
             &ev.dettid, self.recorded_event_count, ev
         );
         let pw = self
