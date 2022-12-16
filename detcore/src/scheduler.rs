@@ -300,7 +300,7 @@ pub struct Scheduler {
     fuzz_futexes: bool,
 }
 
-type StacktraceEventsIter = Peekable<IntoIter<(u64, Option<PathBuf>)>>;
+type StacktraceEventsIter = Peekable<IntoIter<(u64, Option<SchedEvent>, Option<PathBuf>)>>;
 
 // type ThreadTree = HashMap<DetTid, Vec<DetTid>>;
 #[derive(Debug, Clone, Default)]
@@ -742,17 +742,18 @@ enum ThreadStatus {
 impl Scheduler {
     /// Create a new scheduler based on the configuration.
     pub fn new(cfg: &Config) -> Self {
-        Self {
-            preemption_writer: if cfg.record_preemptions {
-                Some(PreemptionWriter::new(cfg.record_preemptions_to.clone()))
-            } else {
-                None
-            },
-            replayer: match &cfg.replay_schedule_from {
-                Some(path) => {
-                    trace!("Scheduler loading trace from path {}", path.display());
-                    let vec = read_trace(path);
-                    trace!("Trace loaded, length {}", vec.len());
+        let (replayer, m_vec) = match &cfg.replay_schedule_from {
+            Some(path) => {
+                trace!("Scheduler loading trace from path {}", path.display());
+                let vec = read_trace(path);
+                trace!("Trace loaded, length {}", vec.len());
+
+                let toprint: Vec<_> = cfg
+                    .stacktrace_event
+                    .iter()
+                    .map(|(ix, path)| (*ix, Some(vec[*ix as usize].clone()), path.clone()))
+                    .collect();
+                (
                     Some(Replayer {
                         cursor: vec.into_iter().collect(),
                         traced_event_count: 0,
@@ -760,16 +761,36 @@ impl Scheduler {
                         die_on_desync: cfg.die_on_desync,
                         replay_exhausted_panic: cfg.replay_exhausted_panic,
                         events_popped: 0,
-                    })
-                }
-                None => None,
-            },
-            recorded_event_count: 0,
-            stacktrace_events: if cfg.stacktrace_event.is_empty() {
-                None
+                    }),
+                    Some(toprint),
+                )
+            }
+            None => (
+                None,
+                if cfg.stacktrace_event.is_empty() {
+                    None
+                } else {
+                    let vec: Vec<_> = cfg
+                        .stacktrace_event
+                        .iter()
+                        .map(|(ix, path)| (*ix, None, path.clone()))
+                        .collect();
+                    Some(vec)
+                },
+            ),
+        };
+
+        let stacktrace_events = m_vec.map(|v| v.into_iter().peekable());
+
+        Self {
+            preemption_writer: if cfg.record_preemptions {
+                Some(PreemptionWriter::new(cfg.record_preemptions_to.clone()))
             } else {
-                Some(cfg.stacktrace_event.clone().into_iter().peekable())
+                None
             },
+            replayer,
+            recorded_event_count: 0,
+            stacktrace_events,
             stop_after_turn: cfg.stop_after_turn,
             stop_after_iter: cfg.stop_after_iter,
             recordreplay_modes: cfg.recordreplay_modes,
@@ -827,10 +848,14 @@ impl Scheduler {
 
     /// Try to pop the next event from the sorted list of stacktrace_events, if it matches the given
     /// index.  This is idempotent, because subsequent attempts will just fizzle.
-    fn try_pop_stacktrace_event(&mut self, current_ix: u64) -> MaybePrintStack {
+    fn try_pop_stacktrace_event(
+        &mut self,
+        current_ix: u64,
+        _observed: &SchedEvent,
+    ) -> MaybePrintStack {
         let mut result = None;
         if let Some(iter) = &mut self.stacktrace_events {
-            if let Some((next_ix, m_path)) = iter.peek() {
+            if let Some((next_ix, _event, m_path)) = iter.peek() {
                 if *next_ix == current_ix {
                     info!(
                         "\nPrinting stack trace for scheduled event #{}:",
@@ -857,7 +882,7 @@ impl Scheduler {
             let current_ix = r.traced_event_count;
             (current_ix, r.observe_event(observed))
         }) {
-            let print_stack = self.try_pop_stacktrace_event(ix);
+            let print_stack = self.try_pop_stacktrace_event(ix, observed);
             debug!("Next ReplayAction = {:?}", action);
 
             match action {
@@ -2163,7 +2188,7 @@ impl Scheduler {
             .expect("trace_schedevent should be called only when preemption_writer is set");
         pw.insert_schedevent(ev.clone());
 
-        let print_stack = self.try_pop_stacktrace_event(self.recorded_event_count);
+        let print_stack = self.try_pop_stacktrace_event(self.recorded_event_count, ev);
         self.recorded_event_count += 1;
         print_stack
     }

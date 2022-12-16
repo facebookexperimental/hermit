@@ -127,11 +127,11 @@ fn is_desync(observed: &SchedEvent, expected: &SchedEvent) -> bool {
         return true;
     }
 
-    if observed.start_rip != expected.start_rip && expected.start_rip.is_some() {
+    if expected.start_rip.is_some() && observed.start_rip != expected.start_rip {
         return true;
     }
 
-    if observed.end_rip != expected.end_rip && expected.end_rip.is_some() {
+    if expected.end_rip.is_some() && observed.end_rip != expected.end_rip {
         return true;
     }
 
