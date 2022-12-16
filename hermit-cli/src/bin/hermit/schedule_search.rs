@@ -184,6 +184,42 @@ where
     );
 }
 
+/// Generate a permutation between source and target and print unmatched events (up to a limit).
+fn print_unmatched_events(
+    passing_schedule: &[SchedEvent],
+    failing_schedule: &[SchedEvent],
+    max_to_print: usize,
+) {
+    let perm = generate_permutation(passing_schedule, failing_schedule);
+    for ix in perm.unmatched_source_indices.iter().take(max_to_print) {
+        eprintln!(
+            " :: unmatched source evt #{}: {}",
+            ix, passing_schedule[*ix]
+        );
+    }
+    let unmatched_src = perm.unmatched_source_indices.len();
+    if unmatched_src > max_to_print {
+        eprintln!(
+            " :: ... plus {} more unmatched events",
+            unmatched_src - max_to_print,
+        )
+    }
+
+    for ix in perm.unmatched_target_indices.iter().take(max_to_print) {
+        eprintln!(
+            " :: unmatched target evt #{}: {}",
+            ix, failing_schedule[*ix]
+        );
+    }
+    let unmatched_trg = perm.unmatched_target_indices.len();
+    if unmatched_trg > max_to_print {
+        eprintln!(
+            " :: ... plus {} more unmatched events",
+            unmatched_trg - max_to_print,
+        )
+    }
+}
+
 /// Perform a multi-level search of the schedule space to find the critical schedule
 /// between the two starting schedules by evaluating the given function at each step.
 /// The result will be a failing schedule and coordinates in that schedule for the
@@ -216,18 +252,10 @@ where
             requested_midpoint_schedule.len()
         );
 
-        if verbose {
-            let unmatched_total = passing_schedule.len() + failing_schedule.len()
-                - 2 * requested_midpoint_schedule.len();
-            if unmatched_total <= MAX_UNMATCHED_TOPRINT {
-                let perm = generate_permutation(&passing_schedule, &failing_schedule);
-                for ix in perm.unmatched_source_indices {
-                    eprintln!(" :: unmatched source evt: {}", passing_schedule[ix]);
-                }
-                for ix in perm.unmatched_target_indices {
-                    eprintln!(" :: unmatched target evt: {}", failing_schedule[ix]);
-                }
-            }
+        let unmatched_total =
+            passing_schedule.len() + failing_schedule.len() - 2 * requested_midpoint_schedule.len();
+        if verbose && unmatched_total > 0 {
+            print_unmatched_events(&passing_schedule, &failing_schedule, MAX_UNMATCHED_TOPRINT);
         }
 
         if swap_dist == 0 {

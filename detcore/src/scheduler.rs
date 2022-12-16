@@ -903,8 +903,8 @@ impl Scheduler {
                         // If it is not yet in next_turns, that is because it was JUST spawned and
                         // hasn't showed up yet, but it will by the next scheduler turn.
                         if self.next_turns.contains_key(&new_tid) {
-                            tracing::error!(
-                                "Attempted to context switch to tid {}, but it is not runnable atm.",
+                            tracing::warn!(
+                                "Attempted to context switch to tid {}, but it is not runnable atm. This could be legitimate if it is awoken by another thread exiting (futex wake).",
                                 new_tid
                             );
                             // TODO(T138906107): make this a fatal error when RESYNC capability is robust enough.
