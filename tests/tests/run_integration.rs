@@ -6,10 +6,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+//! An all-rust runner for some integration tests (no buck)
+
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 
+// use std::process::Command;
 use subprocess::Popen;
 use subprocess::PopenConfig;
 use subprocess::Redirection;
@@ -29,9 +31,8 @@ fn strict_determinism_test_filter(p: &Path) -> bool {
     }
 }
 
-fn hermit_strict(pb: PathBuf) {
+fn raw_exec(pb: PathBuf) {
     let root = Path::new("../").canonicalize().unwrap();
-    // let stat = Command::new("pwd").status().unwrap();
     let bin = root.join(&pb);
 
     let mut p = Popen::create(
@@ -41,38 +42,16 @@ fn hermit_strict(pb: PathBuf) {
             stderr: Redirection::Merge,
             ..Default::default()
         },
-    );
+    )
+    .unwrap();
 
-    let (out, err) = p.communicate(None).unwrap();
-
+    let (out, _err) = p.communicate(None).unwrap();
+    let status = p.wait().unwrap();
     println!(
         "Guest output:\n----------------------------------------\n{}",
-        String::from_utf8_lossy(&out),
+        out.unwrap_or("".to_string()),
     );
-
-    /*
-        // let stat = Command::new(&bin).status().unwrap_or_else(|err| {
-        let out = Command::new(&bin).output().unwrap_or_else(|err| {
-            panic!(
-                "Failed to execute test binary at path: {}\nError: {}",
-                bin.display(),
-                err
-            )
-        });
-        // assert!(stat.success());
-
-        println!(
-            "Guest stdout:\n----------------------------------------\n{}",
-            String::from_utf8_lossy(&out.stdout),
-        );
-        println!(
-            "Guest stderr:\n----------------------------------------\n{}",
-            String::from_utf8_lossy(&out.stderr),
-        );
-        assert!(out.status.success());
-    */
-
-    todo!()
+    assert!(status.success());
 }
 
 #[cfg(test)]
@@ -82,17 +61,12 @@ mod integration {
 
     use test_generator::test_resources;
 
-    #[test]
-    fn my_unit() {
-        panic!("bad");
-    }
-
     #[test_resources("target/debug/rustbin_*")]
-    fn hermit_strict(rsrc: &str) {
+    fn raw(rsrc: &str) {
         let pb = PathBuf::from(rsrc);
         if super::strict_determinism_test_filter(&pb) {
             println!("Verifying strict run {}", rsrc);
-            super::hermit_strict(pb);
+            super::raw_exec(pb);
         } else {
             println!("Not running test for {}", rsrc);
         }
