@@ -133,9 +133,16 @@ path = "rust/thread_random.rs"
 name = "standalone_stacktrace_events"
 path = "standalone/stacktrace_events.rs"
 
+# An all-rust runner for some integration tests (no buck)
+[[bin]]
+name = "rust_runner"
+path = "rust_runner.rs"
+
 [dependencies]
 detcore = { version = "0.0.0", path = "../detcore" }
 libc = "0.2.137"
 nix = "0.25"
 regex = "1.6.0"
 tempfile = "3.3"
+test-generator = "0.3.1"
+subprocess = "0.2.9"
