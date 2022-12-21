@@ -782,8 +782,10 @@ impl Scheduler {
             ),
         };
 
-        let stacktrace_events: Option<StacktraceEventsIter> =
-            m_vec.map(|v| v.into_iter().peekable());
+        let stacktrace_events: Option<StacktraceEventsIter> = m_vec.map(|mut v| {
+            v.sort_by_key(|(ix, _, _)| *ix);
+            v.into_iter().peekable()
+        });
 
         Self {
             preemption_writer: if cfg.record_preemptions {
