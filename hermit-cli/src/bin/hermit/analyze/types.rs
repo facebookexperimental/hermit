@@ -258,5 +258,5 @@ pub struct ReportCriticalEvent {
     pub event_index: usize,
 
     /// The thread stack trace.
-    pub stack: PrettyBacktrace,
+    pub stack: Option<PrettyBacktrace>,
 }

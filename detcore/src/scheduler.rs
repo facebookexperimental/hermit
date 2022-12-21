@@ -60,6 +60,8 @@ use crate::preemptions::PreemptionWriter;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::scheduler::replayer::events_consistent;
+use crate::scheduler::replayer::events_match;
 use crate::scheduler::replayer::StopReason;
 use crate::types::DetPid;
 use crate::types::DetTid;
@@ -748,7 +750,7 @@ impl Scheduler {
                 let vec = read_trace(path);
                 trace!("Trace loaded, length {}", vec.len());
 
-                let toprint: Vec<_> = cfg
+                let toprint = cfg
                     .stacktrace_event
                     .iter()
                     .map(|(ix, path)| (*ix, Some(vec[*ix as usize].clone()), path.clone()))
@@ -780,7 +782,8 @@ impl Scheduler {
             ),
         };
 
-        let stacktrace_events = m_vec.map(|v| v.into_iter().peekable());
+        let stacktrace_events: Option<StacktraceEventsIter> =
+            m_vec.map(|v| v.into_iter().peekable());
 
         Self {
             preemption_writer: if cfg.record_preemptions {
@@ -851,12 +854,18 @@ impl Scheduler {
     fn try_pop_stacktrace_event(
         &mut self,
         current_ix: u64,
-        _observed: &SchedEvent,
+        observed: &SchedEvent,
     ) -> MaybePrintStack {
         let mut result = None;
         if let Some(iter) = &mut self.stacktrace_events {
-            if let Some((next_ix, _event, m_path)) = iter.peek() {
-                if *next_ix == current_ix {
+            if let Some((next_ix, event, m_path)) = iter.peek() {
+                let go = if let Some(ev) = event {
+                    (*next_ix == current_ix && events_consistent(observed, ev))
+                        || events_match(observed, ev)
+                } else {
+                    *next_ix == current_ix
+                };
+                if go {
                     info!(
                         "\nPrinting stack trace for scheduled event #{}:",
                         current_ix

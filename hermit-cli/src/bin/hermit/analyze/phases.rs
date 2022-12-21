@@ -578,16 +578,20 @@ impl AnalyzeOpts {
                 ));
             }
 
-            let (stack1, stack2) =
-                self.print_stacks(runname2, final_passing_path, critical_event_index, false)?;
+            let (stack1, stack2) = self.run_and_retrieve_stacks(
+                runname2,
+                final_passing_path,
+                critical_event_index,
+                false,
+            )?;
 
             // Also print to the screen:
             println!(
                 "\n------------------------------ hermit analyze report ------------------------------"
             );
             println!("{}", header);
-            println!("{}", stack1);
-            println!("{}", stack2);
+            Self::print_stack("stack1", &stack1);
+            Self::print_stack("stack2", &stack2);
             println!("\n{}", passing_context);
 
             let report = Report {
@@ -611,13 +615,17 @@ impl AnalyzeOpts {
                         .yellow()
                         .bold()
                 );
-                let (stack1, stack2) =
-                    self.print_stacks(runname1, final_failing_path, critical_event_index, true)?;
+                let (stack1, stack2) = self.run_and_retrieve_stacks(
+                    runname1,
+                    final_failing_path,
+                    critical_event_index,
+                    true,
+                )?;
                 println!(
                     "\n----------------------- stacks from final on-target run -----------------------"
                 );
-                println!("{}", stack1);
-                println!("{}", stack2);
+                Self::print_stack("stack1", &stack1);
+                Self::print_stack("stack2", &stack2);
                 println!("\n{}", failing_context);
             }
 
@@ -625,13 +633,21 @@ impl AnalyzeOpts {
         }
     }
 
-    fn print_stacks(
+    fn print_stack(which: &str, m_stack: &Option<PrettyBacktrace>) {
+        if let Some(s) = m_stack {
+            println!("{}", s);
+        } else {
+            println!(" ({} not available) ", which);
+        }
+    }
+
+    fn run_and_retrieve_stacks(
         &self,
         runname: &str,
         final_path: PathBuf,
         critical_event_index: usize,
         expected_match: bool,
-    ) -> Result<(PrettyBacktrace, PrettyBacktrace), Error> {
+    ) -> Result<(Option<PrettyBacktrace>, Option<PrettyBacktrace>), Error> {
         let (rundata, stack1_path, stack2_path) =
             self.launch_for_stacktraces(runname, &final_path, critical_event_index as u64)?;
         let res = rundata.is_a_match();
@@ -643,10 +659,12 @@ impl AnalyzeOpts {
         );
         eprintln!("{}", rundata.to_repro());
 
-        let stack1_file = File::open(stack1_path).unwrap();
-        let stack1 = serde_json::from_reader(stack1_file).unwrap();
-        let stack2_file = File::open(stack2_path).unwrap();
-        let stack2 = serde_json::from_reader(stack2_file).unwrap();
+        let stack1 = File::open(&stack1_path)
+            .map(|file| serde_json::from_reader(file).unwrap())
+            .ok();
+        let stack2 = File::open(&stack2_path)
+            .map(|file| serde_json::from_reader(file).unwrap())
+            .ok();
 
         if res == expected_match {
             eprintln!(":: {}", "Completed analysis successfully.".green().bold());

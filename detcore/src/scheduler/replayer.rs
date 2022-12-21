@@ -116,6 +116,20 @@ fn compare_desync(observed: &SchedEvent, expected: &SchedEvent) -> String {
     }
 }
 
+/// Are the two events consistent with eachother, i.e. that they could come from the same execution.
+/// This returns true for an event which is a prefix of another (having a lower count).
+///
+/// This weaker notion always implies `events_match` but not the other way around.
+pub fn events_consistent(observed: &SchedEvent, expected: &SchedEvent) -> bool {
+    !is_hard_desync(observed, expected)
+}
+
+/// Do the events describe the same range of instructions, based on all the information present.
+/// end_time is ignored because it depends on the global context, not just these events.
+pub fn events_match(observed: &SchedEvent, expected: &SchedEvent) -> bool {
+    !is_desync(observed, expected)
+}
+
 fn is_desync(observed: &SchedEvent, expected: &SchedEvent) -> bool {
     if (observed.dettid, observed.op, observed.count)
         != (expected.dettid, expected.op, expected.count)
