@@ -7,6 +7,7 @@
  */
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::iter::FromIterator;
 
 /// This is a queue like data structure used when replaying schedule
@@ -18,7 +19,7 @@ pub struct ReplayCursor<T> {
     inner_data: VecDeque<T>,
 }
 
-impl<T: Eq> ReplayCursor<T> {
+impl<T: Eq + fmt::Display> ReplayCursor<T> {
     /// peeks the following nth element from the top of the cursor
     pub fn peek_nth(&self, index: usize) -> Option<&T> {
         self.inner_data.get(index)
@@ -43,6 +44,17 @@ impl<T: Eq> ReplayCursor<T> {
     pub fn drop(&mut self, count: usize) {
         let _ = self.inner_data.split_off(count);
     }
+
+    // print a window of up to N events
+    pub fn display_first_n(&self, count: usize) -> String {
+        let mut acc = String::new();
+        let mut first = true;
+        for x in self.inner_data.iter().take(count) {
+            acc.push_str(&format!("{}{}", if first { "" } else { " " }, x));
+            first = false;
+        }
+        acc
+    }
 }
 
 impl<T> Iterator for ReplayCursor<T> {
@@ -57,7 +69,7 @@ impl<T> Iterator for ReplayCursor<T> {
     }
 }
 
-impl<T> FromIterator<T> for ReplayCursor<T> {
+impl<T: fmt::Display> FromIterator<T> for ReplayCursor<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let reverse_data: VecDeque<_> = VecDeque::from_iter(iter);
         Self {
@@ -69,6 +81,7 @@ impl<T> FromIterator<T> for ReplayCursor<T> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::fmt::Display;
 
     use pretty_assertions::assert_eq;
 
@@ -76,7 +89,7 @@ mod tests {
 
     fn peek_pair<T>(cursor: &ReplayCursor<T>) -> (Option<&T>, Option<&T>)
     where
-        T: std::cmp::Eq,
+        T: std::cmp::Eq + Display,
     {
         (cursor.peek_nth(0), cursor.peek_nth(1))
     }

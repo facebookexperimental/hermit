@@ -238,7 +238,7 @@ impl Replayer {
 
     fn next_replay_matches(&self, observed: &SchedEvent) -> bool {
         if let Some(expected) = self.cursor.peek() {
-            !is_desync(observed, expected)
+            !is_hard_desync(observed, expected)
         } else {
             false
         }
@@ -302,12 +302,13 @@ impl Replayer {
 
             if !in_hard_desync_mode {
                 // Whether naturally or by fast forward, we should end up in this state before we pop:
-                debug_assert!(
-                    self.next_replay_matches(observed),
-                    "expected match before pop: {} {:?}",
-                    observed,
-                    self.cursor
-                );
+                if !self.next_replay_matches(observed) {
+                    tracing::warn!(
+                        "Expected match before pop, observed: {}\n Cursor at: {}",
+                        observed,
+                        self.cursor.display_first_n(10)
+                    );
+                }
                 let _ = self.pop_next();
             }
 
