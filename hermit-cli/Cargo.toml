@@ -32,7 +32,7 @@ serde = { version = "1.0.136", features = ["derive", "rc"] }
 serde_json = { version = "1.0.79", features = ["float_roundtrip", "unbounded_depth"] }
 shell-words = "1.1.0"
 tempfile = "3.3"
-tokio = { version = "1.21.2", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.25.0", features = ["full", "test-util", "tracing"] }
 tracing = "0.1.35"
 tracing-appender = "0.2.2"
 tracing-subscriber = { version = "0.3.16", features = ["ansi", "env-filter", "fmt", "json", "local-time", "parking_lot", "registry"] }
