@@ -34,12 +34,12 @@ impl FromStr for Id {
 
 impl fmt::Display for Id {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Display::fmt(&self.0.to_simple_ref(), f)
+        fmt::Display::fmt(&self.0.as_simple(), f)
     }
 }
 
 impl fmt::Debug for Id {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Display::fmt(&self.0.to_simple_ref(), f)
+        fmt::Display::fmt(&self.0.as_simple(), f)
     }
 }
