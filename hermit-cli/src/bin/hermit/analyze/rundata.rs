@@ -196,7 +196,7 @@ impl RunData {
         self.runopts.validate_args();
 
         let repro_file = self.root_path().with_extension("repro");
-        std::fs::write(&repro_file, self.to_repro() + "\n")?;
+        std::fs::write(repro_file, self.to_repro() + "\n")?;
 
         let (_, output) = self.runopts.run(&gopts, true)?;
         let output: Output = output.context("expected captured output")?;

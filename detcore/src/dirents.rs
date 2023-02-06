@@ -94,7 +94,7 @@ pub unsafe fn serialize_dirents64(dents: &[Dirent64], bytes: &mut [u8]) -> usize
         j += std::mem::size_of::<u64>() as isize;
         ptr::write(dirp.offset(j).cast::<i64>(), ent.off);
         j += std::mem::size_of::<i64>() as isize;
-        ptr::write(dirp.offset(j).cast::<u16>(), ent.reclen as u16);
+        ptr::write(dirp.offset(j).cast::<u16>(), ent.reclen);
         j += std::mem::size_of::<u16>() as isize;
         ptr::write(dirp.offset(j).cast::<u8>(), ent.ty);
         j += std::mem::size_of::<u8>() as isize;

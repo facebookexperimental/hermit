@@ -81,7 +81,7 @@ fn run_server(socket_path: PathBuf, server_ready_pair: ServerReadyPair) -> threa
 fn run_client(socket_path: PathBuf) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         println!("[Client] Connecting...");
-        let mut stream = UnixStream::connect(&socket_path).unwrap();
+        let mut stream = UnixStream::connect(socket_path).unwrap();
 
         println!("[Client] Sending request...");
         stream.write_all(b"Hello, world!").unwrap();

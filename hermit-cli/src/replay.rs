@@ -85,7 +85,7 @@ impl Replay {
         command.mount(
             Mount::bind(
                 Path::new("/usr/local/fbcode"),
-                &chroot.path().join("usr/local/fbcode"),
+                chroot.path().join("usr/local/fbcode"),
             )
             .recursive()
             .touch_target(),

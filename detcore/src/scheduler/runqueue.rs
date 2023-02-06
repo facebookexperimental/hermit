@@ -341,7 +341,7 @@ impl RunQueue {
 
     /// Read-only: this is ok while locked by tentative_pop.
     pub fn tids(&self) -> impl Iterator<Item = &DetTid> {
-        self.queue.iter().map(|(_k, v)| &v.tid)
+        self.queue.values().map(|v| &v.tid)
     }
 
     /// Read-only: this is ok while locked by tentative_pop.

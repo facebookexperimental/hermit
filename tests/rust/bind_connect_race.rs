@@ -22,7 +22,7 @@ fn run_test() {
     let p2 = path.clone();
 
     let _t1 = thread::spawn(move || {
-        let listener = UnixListener::bind(&p2).expect("bind to succeed");
+        let listener = UnixListener::bind(p2).expect("bind to succeed");
 
         if let Some(stream) = listener.incoming().next() {
             match stream {
@@ -38,7 +38,7 @@ fn run_test() {
         }
     });
     let t2 = thread::spawn(move || {
-        if let Ok(_stream) = UnixStream::connect(&path) {
+        if let Ok(_stream) = UnixStream::connect(path) {
             eprintln!("Client: connection succeeded..");
         } else {
             eprintln!("Client: connection failed.");

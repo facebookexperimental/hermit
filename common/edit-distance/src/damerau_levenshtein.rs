@@ -92,6 +92,7 @@ where
             let ch_t = &target[col - 1];
             let last_match_row = *last_row.get(&ch_t).unwrap_or(&0);
 
+            #[allow(clippy::bool_to_int_with_if)]
             let cost = if ch_s == ch_t { 0 } else { 1 };
 
             let dist_add = matrix[index(width, row, col + 1)] + 1;

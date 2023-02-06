@@ -146,8 +146,8 @@ impl AnalyzeOpts {
         loop {
             round += 1;
             {
-                let sum: usize = remaining_unknown.iter().map(|(_, v)| v.len()).sum();
-                let sum2: usize = critical_preempts.iter().map(|(_, s)| s.len()).sum();
+                let sum: usize = remaining_unknown.values().map(|v| v.len()).sum();
+                let sum2: usize = critical_preempts.values().map(|s| s.len()).sum();
                 eprintln!(
                     ":: {}",
                     format!(

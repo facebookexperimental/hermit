@@ -14,7 +14,7 @@ use std::net::TcpListener;
 fn main() {
     let mut port_list = Vec::new();
     for i in 32768..65535 {
-        port_list.push(TcpListener::bind(("127.0.0.1", i as u16)).unwrap());
+        port_list.push(TcpListener::bind(("127.0.0.1", i)).unwrap());
         assert_eq!(
             port_list.last().unwrap().local_addr().unwrap(),
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), i))

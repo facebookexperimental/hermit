@@ -50,7 +50,7 @@ impl Recorder {
                     // length specified on the memory map. The left over bytes
                     // that extend past the end of the physical file should be
                     // set to zeros when we replay this `mmap`.
-                    let mut buf = vec![0u8; len as usize];
+                    let mut buf = vec![0u8; len];
                     let physical_length = guest.memory().read(addr, &mut buf)?;
 
                     // Don't store more bytes than we need to. When we create

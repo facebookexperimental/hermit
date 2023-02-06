@@ -887,7 +887,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.add_fd(
             guest,
             fd,
-            OFlag::from_bits_truncate((call.flags() & libc::MFD_CLOEXEC as u32) as i32),
+            OFlag::from_bits_truncate((call.flags() & libc::MFD_CLOEXEC) as i32),
             FdType::Memfd,
         )
         .await?;

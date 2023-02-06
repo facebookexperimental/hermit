@@ -659,10 +659,10 @@ impl AnalyzeOpts {
         );
         eprintln!("{}", rundata.to_repro());
 
-        let stack1 = File::open(&stack1_path)
+        let stack1 = File::open(stack1_path)
             .map(|file| serde_json::from_reader(file).unwrap())
             .ok();
-        let stack2 = File::open(&stack2_path)
+        let stack2 = File::open(stack2_path)
             .map(|file| serde_json::from_reader(file).unwrap())
             .ok();
 

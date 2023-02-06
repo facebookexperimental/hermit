@@ -79,12 +79,12 @@ impl LogicalTime {
 
     /// Returns the total number of whole microseconds contained by this `LogicalTime`.
     pub fn as_micros(&self) -> u64 {
-        self.0 / (NANOS_PER_MICRO as u64)
+        self.0 / NANOS_PER_MICRO
     }
 
     /// Returns the total number of whole milliseconds contained by this `LogicalTime`.
     pub fn as_millis(&self) -> u64 {
-        self.0 / (NANOS_PER_MILLI as u64)
+        self.0 / NANOS_PER_MILLI
     }
 
     /// Returns the total number of nanoseconds contained by this `LogicalTime`.
@@ -96,17 +96,17 @@ impl LogicalTime {
     /// The returned value does not include fractional (nanosecond) part of the duration,
     /// which can be obtained using `subsec_nanos`.
     pub fn as_secs(&self) -> u64 {
-        self.0 / (NANOS_PER_SEC as u64)
+        self.0 / NANOS_PER_SEC
     }
 
     /// Creates a new `LogicalTime` from the specified number of microseconds.
     pub fn from_micros(micros: u64) -> Self {
-        LogicalTime(micros * (NANOS_PER_MICRO as u64))
+        LogicalTime(micros * NANOS_PER_MICRO)
     }
 
     /// Creates a new `LogicalTime` from the specified number of milliseconds.
     pub fn from_millis(millis: u64) -> Self {
-        LogicalTime(millis * (NANOS_PER_MILLI as u64))
+        LogicalTime(millis * NANOS_PER_MILLI)
     }
 
     /// Creates a new `LogicalTime` from the specified number of nanoseconds.
@@ -122,28 +122,28 @@ impl LogicalTime {
 
     /// Creates a new `LogicalTime` from the specified number of seconds.
     pub fn from_secs(secs: u64) -> Self {
-        LogicalTime(secs * (NANOS_PER_SEC as u64))
+        LogicalTime(secs * NANOS_PER_SEC)
     }
 
     /// Returns the fractional part of this `LogicalTime`, in microseconds.
     /// This method does not return the length of the duration when represented by microseconds. The returned number always represents
     /// a fractional portion of a second (i.e., it is less than one million).
     pub fn subsec_micros(&self) -> u32 {
-        (self.0 % (MICROS_PER_SEC as u64)) as u32
+        (self.0 % MICROS_PER_SEC) as u32
     }
 
     /// Returns the fractional part of this `LogicalTime`, in milliseconds.
     /// This method does not return the length of the duration when represented by milliseconds. The returned number always represents
     /// a fractional portion of a second (i.e., it is less than one thousand).
     pub fn subsec_millis(&self) -> u32 {
-        (self.0 % (MILLIS_PER_SEC as u64)) as u32
+        (self.0 % MILLIS_PER_SEC) as u32
     }
 
     /// Returns the fractional part of this `LogicalTime`, in nanoseconds.
     /// This method does not return the length of the duration when represented by nanoseconds. The returned number always represents
     /// a fractional portion of a second (i.e., it is less than one billion).
     pub fn subsec_nanos(&self) -> u32 {
-        (self.0 % (NANOS_PER_SEC as u64)) as u32
+        (self.0 % NANOS_PER_SEC) as u32
     }
 
     /// Convert a number of Retired Conditional Branches (RCBs) to Nanoseconds
@@ -432,7 +432,7 @@ impl DetTime {
         // Note: these counts could be pre-collapsed into scalar within the DetTime
         // representation.  But currently we leave them separate for debuggability.
         LogicalTime(
-            (self.starting_micros * 1000) as u64
+            (self.starting_micros * 1000)
                 + ((self.syscalls as f64 * NANOS_PER_SYSCALL * self.multiplier) as u64)
                 + ((self.rcbs as f64 * NANOS_PER_RCB * self.multiplier) as u64)
                 + ((self.nondet_instrs as f64 * NANOS_PER_NONDET_INSTR * self.multiplier) as u64),
