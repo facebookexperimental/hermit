@@ -755,17 +755,10 @@ impl Scheduler {
                     .iter()
                     .map(|(ix, path)| (*ix, Some(vec[*ix as usize].clone()), path.clone()))
                     .collect();
-                (
-                    Some(Replayer {
-                        cursor: vec.into_iter().collect(),
-                        traced_event_count: 0,
-                        desync_counts: BTreeMap::new(),
-                        die_on_desync: cfg.die_on_desync,
-                        replay_exhausted_panic: cfg.replay_exhausted_panic,
-                        events_popped: 0,
-                    }),
-                    Some(toprint),
-                )
+                let mut replayer = Replayer::new(vec.into_iter());
+                replayer.replay_exhausted_panic = cfg.replay_exhausted_panic;
+                replayer.die_on_desync = cfg.die_on_desync;
+                (Some(replayer), Some(toprint))
             }
             None => (
                 None,

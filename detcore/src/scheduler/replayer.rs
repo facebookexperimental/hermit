@@ -168,6 +168,19 @@ fn is_hard_desync(observed: &SchedEvent, expected: &SchedEvent) -> bool {
 }
 
 impl Replayer {
+    /// Allocate a new replayer.
+    pub fn new(i: impl IntoIterator<Item = SchedEvent>) -> Replayer {
+        let cursor = ReplayCursor::from_iter(i);
+        Replayer {
+            cursor,
+            desync_counts: BTreeMap::new(),
+            die_on_desync: false,
+            replay_exhausted_panic: false,
+            traced_event_count: 0,
+            events_popped: 0,
+        }
+    }
+
     /// This function look-aheads into following instruction to determine if
     /// an explicit timer preemption is required while replaying. This is required when
     /// the original run schedule was modified before replaying which should be a valid
@@ -534,9 +547,6 @@ mod builder {
 
 #[cfg(test)]
 mod tests {
-
-    use std::iter::FromIterator;
-
     use pretty_assertions::assert_eq;
     use reverie::syscalls::Sysno;
 
@@ -546,17 +556,6 @@ mod tests {
 
     fn tid(raw: i32) -> DetTid {
         DetTid::from_raw(raw)
-    }
-
-    fn create_replayer(i: impl IntoIterator<Item = SchedEvent>) -> Replayer {
-        Replayer {
-            cursor: ReplayCursor::from_iter(i),
-            desync_counts: BTreeMap::new(),
-            die_on_desync: false,
-            replay_exhausted_panic: false,
-            traced_event_count: 0,
-            events_popped: 0,
-        }
     }
 
     fn strip_times(vec: Vec<SchedEvent>) -> Vec<SchedEvent> {
@@ -572,7 +571,7 @@ mod tests {
     fn test_continue_() {
         let mut b = builder::SchedTestBuilder::new();
         let schedule = vec![b.branch(10, tid(3))];
-        let mut replayer = create_replayer(schedule.clone());
+        let mut replayer = Replayer::new(schedule.clone());
         assert_eq!(
             replayer.observe_event(&schedule[0]),
             ReplayAction::Continue(None)
@@ -588,7 +587,7 @@ mod tests {
             b.other(SOME_RIP, tid(3)),
             b.branch(1, tid(5)),
         ];
-        let mut replayer = create_replayer(schedule.clone());
+        let mut replayer = Replayer::new(schedule.clone());
         assert_eq!(
             replayer.observe_event(&schedule[0]),
             ReplayAction::Continue(Some(LogicalTime::from_rcbs(123)))
@@ -604,7 +603,7 @@ mod tests {
             b.other(SOME_RIP, tid(3)),
             b.syscall_post(Sysno::exit, SOME_RIP, tid(5)),
         ];
-        let mut replayer = create_replayer(schedule.clone());
+        let mut replayer = Replayer::new(schedule.clone());
         assert_eq!(
             replayer.observe_event(&schedule[0]),
             ReplayAction::Continue(Some(LogicalTime::from_rcbs(123)))
@@ -618,7 +617,7 @@ mod tests {
             b.other(SOME_RIP, tid(5)),
             b.syscall_pre(Sysno::exit, SOME_RIP, tid(3)),
         ];
-        let mut replayer = create_replayer(schedule.clone());
+        let mut replayer = Replayer::new(schedule.clone());
         assert_eq!(
             replayer.observe_event(&schedule[0]),
             ReplayAction::ContextSwitch(true, tid(3), None)
@@ -632,7 +631,7 @@ mod tests {
             b.other(SOME_RIP, tid(5)),
             b.syscall_post(Sysno::exit, SOME_RIP, tid(3)),
         ];
-        let mut replayer = create_replayer(schedule.clone());
+        let mut replayer = Replayer::new(schedule.clone());
         assert_eq!(
             replayer.observe_event(&schedule[0]),
             ReplayAction::ContextSwitch(true, tid(3), None)
@@ -653,7 +652,7 @@ mod tests {
             b.branch(123, tid(3)),
             b.syscall_pre(Sysno::exit, SOME_RIP, tid(3)),
         ]);
-        let mut replayer = create_replayer(expected);
+        let mut replayer = Replayer::new(expected);
         let action1 = replayer.observe_event(&observed[0]);
         {
             let counts = replayer.desync_counts.get(&tid(3)).unwrap();
