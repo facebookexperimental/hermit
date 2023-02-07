@@ -44,6 +44,10 @@ pub struct RunData {
     preempts_path_in: Option<PathBuf>,
     sched_path_in: Option<PathBuf>,
     sched_path_out: Option<PathBuf>,
+
+    /// How much logging to enable in the guest.
+    log_level: LevelFilter,
+    /// Where to write the guest log too (otherwise stderr).
     log_path: Option<PathBuf>,
 
     /// The input preemptions, if it has been read to memory.
@@ -171,15 +175,14 @@ impl RunData {
     pub fn launch(&mut self) -> anyhow::Result<()> {
         let root = self.root_path();
         let log_path = self.root_path().with_extension(LOG_EXT);
-        let gopts = if self.analyze_opts.verbose || self.analyze_opts.selfcheck {
-            GlobalOpts {
-                log: Some(LevelFilter::DEBUG),
-                log_file: Some(log_path),
-            }
-        } else {
-            NO_LOGGING.clone()
+        let gopts = GlobalOpts {
+            log: Some(self.log_level),
+            log_file: if self.analyze_opts.verbose || self.analyze_opts.selfcheck {
+                Some(log_path)
+            } else {
+                None
+            },
         };
-
         let final_record_path = self
             .runopts
             .det_opts
@@ -243,7 +246,29 @@ impl RunData {
         Ok(())
     }
 
+    fn log_level(aopts: &AnalyzeOpts) -> LevelFilter {
+        let mut lvl = if let Some(l) = &aopts.guest_log {
+            *l
+        } else {
+            LevelFilter::WARN
+        };
+
+        // Ensure a minum level for these functionalities:
+        if aopts.verbose || aopts.selfcheck && lvl < LevelFilter::DEBUG {
+            if aopts.guest_log.is_some() {
+                eprintln!(
+                    "WARNING: manually set log lvl to {} but need DEBUG for selfcheck/verbose functionality",
+                    lvl
+                );
+            }
+            lvl = LevelFilter::DEBUG;
+        }
+
+        lvl
+    }
+
     pub fn new(aopts: &AnalyzeOpts, runname: String, runopts: RunOpts) -> Self {
+        let log_level: LevelFilter = Self::log_level(aopts);
         let mut rd = RunData {
             runname,
             analyze_opts: aopts.clone(),
@@ -255,6 +280,7 @@ impl RunData {
             in_mem_preempts_in: None,
             in_mem_sched_out: None,
             is_a_match: None,
+            log_level,
         };
 
         // By default we save the config for every run.
@@ -352,6 +378,7 @@ impl RunData {
         preempts_path: PathBuf,
         log_path: PathBuf,
     ) -> Self {
+        let log_level: LevelFilter = Self::log_level(aopts);
         RunData {
             runname,
             analyze_opts: aopts.clone(),
@@ -360,6 +387,7 @@ impl RunData {
             sched_path_in: None,
             sched_path_out: Some(preempts_path),
             log_path: Some(log_path),
+            log_level,
             in_mem_sched_out: Some(in_mem_preempts),
             in_mem_preempts_in: None,
             // Invariant: minimize should always return an on-target configuration:
@@ -374,6 +402,7 @@ impl RunData {
         runopts: RunOpts,
         sched_path: PathBuf,
     ) -> Self {
+        let log_level: LevelFilter = Self::log_level(aopts);
         RunData {
             runname,
             analyze_opts: aopts.clone(),
@@ -382,6 +411,7 @@ impl RunData {
             sched_path_in: None,
             sched_path_out: Some(sched_path),
             log_path: None,
+            log_level,
             in_mem_sched_out: None,
             in_mem_preempts_in: None,
             // Don't claim that it was run:

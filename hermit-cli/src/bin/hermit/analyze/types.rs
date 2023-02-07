@@ -17,6 +17,7 @@ use reverie::process::ExitStatus;
 use reverie::PrettyBacktrace;
 use serde::Deserialize;
 use serde::Serialize;
+use tracing::metadata::LevelFilter;
 
 /// Repeat a run multiple times in a controlled search to find concurrency bugs.
 ///
@@ -57,6 +58,16 @@ pub struct AnalyzeOpts {
     /// crash or error.
     #[clap(long, default_value = "nonzero", value_name = "NUM|nonzero|any")]
     pub target_exit_code: ExitStatusConstraint,
+
+    /// What level of logging to enable for the guest runs.
+    #[clap(
+        short,
+        long,
+        value_name = "LEVEL",
+        env = "HERMIT_LOG",
+        possible_values = &["off", "error", "warn", "info", "debug", "trace"]
+    )]
+    pub guest_log: Option<LevelFilter>,
 
     /// Insist on perfect determinism before proceeding with the analysis.
     #[clap(long)]

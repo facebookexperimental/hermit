@@ -72,7 +72,7 @@ enum Subcommand {
     LogDiff(LogDiffCLIOpts),
 
     /// Analyze Pass and failing runs
-    Analyze(AnalyzeOpts),
+    Analyze(Box<AnalyzeOpts>),
 }
 
 impl Subcommand {
