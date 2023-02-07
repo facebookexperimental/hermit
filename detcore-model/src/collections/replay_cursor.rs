@@ -30,11 +30,14 @@ impl<T: Eq + fmt::Display> ReplayCursor<T> {
         self.peek_nth(0)
     }
 
-    /// Look ahead N positions to see if the element is found within that window.
-    /// Return the position, if found.
-    pub fn prefix_contains(&self, winsize: usize, item: &T) -> Option<usize> {
+    /// Look ahead N positions to see if an element satisfying the predicate is found within that
+    /// window.  Return the position, if found.
+    pub fn prefix_contains<F>(&self, winsize: usize, pred: F) -> Option<usize>
+    where
+        F: Fn(&T) -> bool,
+    {
         for (i, v) in self.inner_data.iter().enumerate().take(winsize) {
-            if v == item {
+            if pred(v) {
                 return Some(i);
             }
         }

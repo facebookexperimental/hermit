@@ -56,6 +56,9 @@ pub struct DesyncStats {
     /// How many times do we find a match again, after a mismatch, specifically expected events that
     /// were not observed.
     pub resync_deletions: u64,
+    /// How many times did we fast-forward to resync.
+    pub fast_forwards: u64,
+
     /// A bit of statefulness: true when the last event processed was a desync.
     pub last_was_desync: bool,
 }
@@ -70,6 +73,8 @@ impl Add for DesyncStats {
             at_context_switch: self.at_context_switch + rhs.at_context_switch,
             resync_insertions: self.resync_insertions + rhs.resync_insertions,
             resync_deletions: self.resync_deletions + rhs.resync_deletions,
+            fast_forwards: self.fast_forwards + rhs.fast_forwards,
+
             // Not commutative!
             last_was_desync: rhs.last_was_desync,
         }
@@ -375,12 +380,36 @@ impl Replayer {
     /// Return how many to drop to have observed equal to the head of the replay tape,
     /// i.e. jump past missing or mismatched events on the replay tape.
     fn check_fast_forward(&mut self, observed: &SchedEvent) -> Option<usize> {
-        if let Some(ix) = self.cursor.prefix_contains(LOOKAHEAD_WINDOW, observed) {
+        let print_win = |sz: usize| -> String {
+            let mut acc = String::new();
+            for i in 0..sz {
+                if let Some(ev) = self.cursor.peek_nth(i) {
+                    acc.push_str(&format!(" {}", ev));
+                }
+            }
+            acc
+        };
+
+        if let Some(ix) = self.cursor.prefix_contains(LOOKAHEAD_WINDOW, |expected| {
+            events_match(observed, expected)
+        }) {
+            let counts = self.desync_counts.entry(observed.dettid).or_default();
+            counts.fast_forwards += 1;
+            info!(
+                "FAST FORWARD by dropping {} events from replay to resync: {}",
+                ix,
+                print_win(ix)
+            );
             // Drop the corresponding number of of missed/mismatched events so that the observed
             // matches the head of the replay tape (which is to be popped).
             self.cursor.drop(ix);
             Some(ix)
         } else {
+            trace!(
+                "No fast-forward possible for {} in window{}",
+                observed,
+                print_win(LOOKAHEAD_WINDOW)
+            );
             None
         }
     }
@@ -636,6 +665,7 @@ mod tests {
                     at_context_switch: 0,
                     resync_insertions: 0,
                     resync_deletions: 0,
+                    fast_forwards: 0,
                     last_was_desync: true,
                 }
             );
@@ -653,6 +683,7 @@ mod tests {
                     at_context_switch: 0,
                     resync_insertions: 1,
                     resync_deletions: 0,
+                    fast_forwards: 0,
                     last_was_desync: false,
                 }
             );

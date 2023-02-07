@@ -249,6 +249,9 @@ fn event_level_search<F>(
 where
     F: FnMut(&[SchedEvent]) -> (bool, Vec<SchedEvent>),
 {
+    let orig_passing_schedule = passing_schedule.clone();
+    let orig_failing_schedule = failing_schedule.clone();
+
     for pass_number in 0..cfg.max_event_level_search_passes {
         let (swap_dist, edit_dist, requested_midpoint_schedule) = {
             let mut bubbles = iterable_bubble_sort(&passing_schedule, &failing_schedule);
@@ -259,7 +262,7 @@ where
             )
         };
         eprintln!(
-            ":: Event-Level Search Pass {} => EditDistance = {}, Swap Distance = {} ({:.0}% matched, midpoint sched len = {})",
+            "\n:: Event-Level Search Pass {} => EditDistance = {}, Swap Distance = {} ({:.0}% matched, midpoint sched len = {})",
             pass_number,
             edit_dist,
             swap_dist,
@@ -306,6 +309,18 @@ where
                     ":: No jitter in this run (requested synthetic schedule identical to actual schedule)",
                 );
             }
+            let (edit1, swap1) = just_distance(&passing_schedule, &midpoint_actual_schedule);
+            let (edit2, swap2) = just_distance(&midpoint_actual_schedule, &failing_schedule);
+            eprintln!(
+                ":: Including jitter, actual run was {}:{} from passing pole and {}:{} from failing one",
+                edit1, swap1, edit2, swap2
+            );
+            let (edit1, swap1) = just_distance(&orig_passing_schedule, &passing_schedule);
+            let (edit2, swap2) = just_distance(&failing_schedule, &orig_failing_schedule);
+            eprintln!(
+                ":: Note, those poles are {}:{} from original passing, and {}:{} from original failing respectively.",
+                edit1, swap1, edit2, swap2
+            );
         }
 
         let selected_new_point = if jitter_edit > cfg.max_jitter_editdist
