@@ -150,6 +150,10 @@ pub struct PrintOpts {
     /// Print only events from the given tid, leaving a blank line anywhere the tid was preempted.
     #[clap(long)]
     tid: Option<i32>,
+
+    /// Strip times before printing.
+    #[clap(long)]
+    strip_times: bool,
 }
 
 impl PrintOpts {
@@ -173,6 +177,12 @@ impl PrintOpts {
                     continue;
                 }
             }
+
+            let mut ev = ev.clone();
+            if self.strip_times {
+                ev.end_time = None;
+            }
+
             if self.indices {
                 println!(
                     "{: <9} {}",
