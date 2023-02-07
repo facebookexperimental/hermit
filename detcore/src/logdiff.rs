@@ -14,14 +14,17 @@ use core::fmt::Result;
 use std::cmp::Ordering;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::ops::Bound;
 use std::path::Path;
+use std::process::Command;
 use std::str::FromStr;
 
 use clap;
 use clap::Parser;
 use lazy_static::lazy_static;
 use regex::Regex;
+use tempfile::NamedTempFile;
 
 /// Options for calling `log_diff`.
 #[derive(Debug, Parser)]
@@ -52,6 +55,10 @@ pub struct LogDiffOpts {
     /// Do not consider "DETLOG" messages for deterministic check
     #[clap(long)]
     pub skip_detlog: bool,
+
+    /// Use git diff instead of the internal, basic log comparison.
+    #[clap(long)]
+    pub git_diff: bool,
 
     /// In case --skip-detlog=false this parameter further filters which
     /// "DETLOG" messages will be included for determnistic check
@@ -418,6 +425,41 @@ fn diff_vecs(
     }
 }
 
+fn git_diff(
+    which: &str,
+    v1: &[(usize, &str)],
+    v2: &[(usize, &str)],
+    opts: &LogDiffOpts,
+    w: &mut impl std::io::Write,
+    syscalls: &BTreeMap<Reverse<usize>, &str>,
+) -> std::io::Result<bool> {
+    writeln!(w, "  Comparing {} messages...\n", which)?;
+
+    let mut file1 = NamedTempFile::new()?;
+    let mut file2 = NamedTempFile::new()?;
+
+    for (_, ln) in v1 {
+        writeln!(file1, "{}", ln)?;
+    }
+    for (_, ln) in v2 {
+        writeln!(file2, "{}", ln)?;
+    }
+
+    // git diff --color --color-words -w
+    match Command::new("git")
+        .args(["diff", "--color", "--color-words", "-w"])
+        .arg(file1.path())
+        .arg(file2.path())
+        .status()
+    {
+        Ok(code) => Ok(!code.success()),
+        Err(err) => {
+            eprintln!("Error launching git, falling back to basic diff: {}", err);
+            diff_vecs(which, v1, v2, opts, w, syscalls)
+        }
+    }
+}
+
 /// Process log messages from two files.  Log messages look like this:
 ///     "Apr 09 06:08:03.100  INFO detcore: [detcore, dtid 2]  finish syscall: close(2) = Ok(0)"
 ///
@@ -493,7 +535,11 @@ fn log_diff_from_strs(
 
     let mut diff_found = false;
 
-    diff_found |= diff_vecs("DETLOGs", &detlogs_a, &detlogs_b, opts, w, &syscalls)?;
+    if opts.git_diff {
+        diff_found |= git_diff("DETLOGs", &detlogs_a, &detlogs_b, opts, w, &syscalls)?;
+    } else {
+        diff_found |= diff_vecs("DETLOGs", &detlogs_a, &detlogs_b, opts, w, &syscalls)?;
+    }
 
     // The TRACE level lines will generally include reorderings from racing threads.
     // So not doing any comparisons here for now:
@@ -560,6 +606,7 @@ mod test {
                 no_color: false,
                 skip_commit: false,
                 skip_detlog: false,
+                git_diff: false,
                 ignore_lines: Vec::new(),
                 include_detlogs: vec![
                     DetLogFilter::Syscall,
@@ -623,6 +670,7 @@ mod test {
                 no_color: true,
                 skip_commit: false,
                 skip_detlog: false,
+                git_diff: false,
                 ignore_lines: Vec::new(),
                 include_detlogs: vec![
                     DetLogFilter::Syscall,
@@ -682,6 +730,7 @@ mod test {
 
         let log_options = super::LogDiffOpts {
             no_color: true,
+            git_diff: false,
             ..Default::default()
         };
         super::log_diff_from_strs(log_file_a, log_file_b, &log_options, &mut result)?;
