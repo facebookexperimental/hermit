@@ -37,6 +37,7 @@ use crate::global_opts::GlobalOpts;
 use crate::logdiff::LogDiffCLIOpts;
 use crate::run::RunOpts;
 use crate::schedule_search::search_for_critical_schedule;
+use crate::schedule_search::Config;
 use crate::schedule_search::CriticalSchedule;
 
 /// Compare only preemptions, not recorded schedules.
@@ -472,13 +473,16 @@ impl AnalyzeOpts {
 
         let target = target.to_vec(); // TODO: have search_for_critical_schedule borrow only.
         let baseline = baseline.to_vec();
-        let crit = search_for_critical_schedule(
-            test_fn,
-            baseline,
-            target,
-            self.verbose,
-            self.run_needleman,
-        );
+        let mut cfg = Config {
+            verbose: self.verbose,
+            needleman_search: self.run_needleman,
+            ..Default::default()
+        };
+        if let Some(dist) = self.jitter_dist {
+            cfg.max_jitter_editdist = dist;
+            cfg.max_jitter_swapdist = dist * dist;
+        }
+        let crit = search_for_critical_schedule(test_fn, baseline, target, &cfg);
         eprintln!(
             "Critical event of final on-target schedule is {}",
             crit.critical_event_index

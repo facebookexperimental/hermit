@@ -160,6 +160,10 @@ pub struct AnalyzeOpts {
     #[clap(long, short)]
     pub verbose: bool,
 
+    /// The maximum amount of schedule jitter (deviation) to tolerater while performing the bisection search.
+    #[clap(long)]
+    pub jitter_dist: Option<usize>,
+
     /// Number of events to print before/after the critical events found, when showing the execution
     /// context along weth the analyze report.
     #[clap(long, short, value_name = "EVTCNT", default_value = "5")]

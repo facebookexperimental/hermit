@@ -14,12 +14,29 @@ use edit_distance::generate_permutation;
 use edit_distance::iterable_bubble_sort;
 use edit_distance::NeedlemanWunsch;
 
-const MAX_EVENT_LEVEL_SEARCH_PASSES: usize = 100;
+/// User configurable settings.
+pub struct Config {
+    pub max_jitter_editdist: usize,
+    pub max_jitter_swapdist: usize,
+    pub max_event_level_search_passes: usize,
+    pub max_unmatched_to_print: usize,
+    pub verbose: bool,
+    /// Activate a search that uses Needleman Wunsch alignment during each step.
+    pub needleman_search: bool,
+}
 
-const MAX_JITTER_EDITDIST: usize = 0;
-const MAX_JITTER_SWAPDIST: usize = 0;
-
-const MAX_UNMATCHED_TOPRINT: usize = 10;
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            max_jitter_editdist: 0,
+            max_jitter_swapdist: 0,
+            max_event_level_search_passes: 100,
+            max_unmatched_to_print: 10,
+            verbose: false,
+            needleman_search: false,
+        }
+    }
+}
 
 struct EventLevelSearchResult {
     passing_schedule: Vec<SchedEvent>,
@@ -62,8 +79,7 @@ pub fn search_for_critical_schedule<F>(
     mut tester: F,
     initial_passing_schedule: Vec<SchedEvent>,
     initial_failing_schedule: Vec<SchedEvent>,
-    verbose: bool,
-    run_needleman: bool,
+    cfg: &Config,
 ) -> CriticalSchedule
 where
     F: FnMut(&[SchedEvent]) -> (bool, Vec<SchedEvent>),
@@ -76,19 +92,19 @@ where
     let EventLevelSearchResult {
         passing_schedule,
         failing_schedule,
-    } = if run_needleman {
+    } = if cfg.needleman_search {
         needleman_level_search(
             &mut tester,
             initial_passing_schedule,
             initial_failing_schedule,
-            verbose,
+            cfg,
         )
     } else {
         event_level_search(
             &mut tester,
             initial_passing_schedule,
             initial_failing_schedule,
-            verbose,
+            cfg,
         )
     };
 
@@ -123,12 +139,12 @@ fn needleman_level_search<F>(
     tester: &mut F,
     mut passing_schedule: Vec<SchedEvent>,
     mut failing_schedule: Vec<SchedEvent>,
-    _verbose: bool,
+    cfg: &Config,
 ) -> EventLevelSearchResult
 where
     F: FnMut(&[SchedEvent]) -> (bool, Vec<SchedEvent>),
 {
-    for _pass_number in 0..MAX_EVENT_LEVEL_SEARCH_PASSES {
+    for _pass_number in 0..cfg.max_event_level_search_passes {
         let mut needleman = NeedlemanWunsch {
             first_sequence: passing_schedule.clone(),
             second_sequence: failing_schedule.clone(),
@@ -157,8 +173,8 @@ where
             ":: THROUGH NEEDLEMAN Jitter was {},{} edit/swap distance (requested synthetic schedule vs actual schedule)",
             jitter_edit, jitter_swap
         );
-        let selected_new_point = if jitter_edit > MAX_JITTER_EDITDIST
-            || jitter_swap > MAX_JITTER_SWAPDIST
+        let selected_new_point = if jitter_edit > cfg.max_jitter_editdist
+            || jitter_swap > cfg.max_jitter_swapdist
         {
             eprintln!(
                 ":: {} ({},{})",
@@ -180,7 +196,7 @@ where
 
     panic!(
         "Event-Level Search Failed - No convergence after {} passes",
-        MAX_EVENT_LEVEL_SEARCH_PASSES
+        cfg.max_event_level_search_passes
     );
 }
 
@@ -228,12 +244,12 @@ fn event_level_search<F>(
     tester: &mut F,
     mut passing_schedule: Vec<SchedEvent>,
     mut failing_schedule: Vec<SchedEvent>,
-    verbose: bool,
+    cfg: &Config,
 ) -> EventLevelSearchResult
 where
     F: FnMut(&[SchedEvent]) -> (bool, Vec<SchedEvent>),
 {
-    for pass_number in 0..MAX_EVENT_LEVEL_SEARCH_PASSES {
+    for pass_number in 0..cfg.max_event_level_search_passes {
         let (swap_dist, edit_dist, requested_midpoint_schedule) = {
             let mut bubbles = iterable_bubble_sort(&passing_schedule, &failing_schedule);
             (
@@ -254,8 +270,12 @@ where
 
         let unmatched_total =
             passing_schedule.len() + failing_schedule.len() - 2 * requested_midpoint_schedule.len();
-        if verbose && unmatched_total > 0 {
-            print_unmatched_events(&passing_schedule, &failing_schedule, MAX_UNMATCHED_TOPRINT);
+        if cfg.verbose && unmatched_total > 0 {
+            print_unmatched_events(
+                &passing_schedule,
+                &failing_schedule,
+                cfg.max_unmatched_to_print,
+            );
         }
 
         if swap_dist == 0 {
@@ -275,10 +295,10 @@ where
 
         let (jitter_edit, jitter_swap) =
             just_distance(&requested_midpoint_schedule, &midpoint_actual_schedule);
-        if verbose {
+        if cfg.verbose {
             if jitter_edit > 0 || jitter_swap > 0 {
                 eprintln!(
-                    ":: Jitter was {},{} edit/swap distance (requested synthetic schedule vs actual schedule)",
+                    ":: Jitter was {}:{} edit/swap distance (requested synthetic schedule vs actual schedule)",
                     jitter_edit, jitter_swap
                 );
             } else {
@@ -288,14 +308,17 @@ where
             }
         }
 
-        let selected_new_point = if jitter_edit > MAX_JITTER_EDITDIST
-            || jitter_swap > MAX_JITTER_SWAPDIST
+        let selected_new_point = if jitter_edit > cfg.max_jitter_editdist
+            || jitter_swap > cfg.max_jitter_swapdist
         {
             eprintln!(
-                ":: {} ({},{})",
-                "Jitter exceeded threshold, proceeding optimistically along original route rather than rerouting the search".red().bold(),
-                jitter_edit,
-                jitter_swap,
+                ":: {}",
+                format!("Jitter ({}:{}) exceeded threshold ({}:{}), proceeding optimistically along original route rather than rerouting the search",
+                    jitter_edit,
+                    jitter_swap,
+                    cfg.max_jitter_editdist,
+                    cfg.max_jitter_swapdist,
+                ).red().bold(),
             );
             requested_midpoint_schedule
         } else {
@@ -311,7 +334,7 @@ where
 
     panic!(
         "Event-Level Search Failed - No convergence after {} passes",
-        MAX_EVENT_LEVEL_SEARCH_PASSES
+        cfg.max_event_level_search_passes
     );
 }
 
@@ -638,7 +661,12 @@ mod tests {
             failing_schedule: critical_failing_schedule,
             critical_event_index,
             ..
-        } = search_for_critical_schedule(mock_tester, passing_sched, failing_sched, true, false);
+        } = search_for_critical_schedule(
+            mock_tester,
+            passing_sched,
+            failing_sched,
+            &Default::default(),
+        );
 
         assert_eq!(critical_event_index, 379);
 
