@@ -12,6 +12,7 @@
 #![feature(nonzero_ops)]
 #![deny(clippy::all)]
 #![deny(missing_docs)]
+#![allow(clippy::uninlined_format_args)]
 
 mod config;
 mod consts;

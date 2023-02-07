@@ -8,6 +8,7 @@
 
 // Treat all Clippy warnings as errors.
 #![deny(clippy::all)]
+#![allow(clippy::uninlined_format_args)]
 
 mod analyze;
 mod bnz;
