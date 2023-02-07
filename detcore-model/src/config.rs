@@ -331,6 +331,9 @@ impl Config {
         assert!(self.sched_sticky_random_param >= 0.0);
         assert!(self.sched_sticky_random_param <= 1.0);
 
+        // TODO(T124429978) Restore the eprintln! calls below to tracing::warn! when the tracing
+        // subscriber is set up early enough for these warnings to print.
+
         if self.record_preemptions_to.is_some() {
             self.record_preemptions = true;
         }
@@ -350,27 +353,27 @@ impl Config {
         }
 
         if self.replay_preemptions_from.is_some() && self.imprecise_timers {
-            tracing::warn!(
-                "Setting --imprecise timers with --replay-preemptions-from is probably not what you want. They won't replay precisely."
+            eprintln!(
+                "WARNING: Setting --imprecise timers with --replay-preemptions-from is probably not what you want. They won't replay precisely."
             );
         }
 
         if self.stop_after_turn.is_some() && !self.sequentialize_threads {
-            tracing::warn!(
-                "--stop-after-turn will have no effect if --no-sequentialize-threads is enabled"
+            eprintln!(
+                "WARNING: --stop-after-turn will have no effect if --no-sequentialize-threads is enabled"
             );
             self.stop_after_turn = None;
         }
         if self.stop_after_iter.is_some() && !self.sequentialize_threads {
-            tracing::warn!(
-                "--stop-after-iter will have no effect if --no-sequentialize-threads is enabled"
+            eprintln!(
+                "WARNING: --stop-after-iter will have no effect if --no-sequentialize-threads is enabled"
             );
             self.stop_after_iter = None;
         }
 
         if self.debug_externalize_sockets && !self.sequentialize_threads {
-            tracing::warn!(
-                "--debug-externalize-sockets will have no effect if --no-sequentialize-threads is enabled"
+            eprintln!(
+                "WARNING: --debug-externalize-sockets will have no effect if --no-sequentialize-threads is enabled"
             );
             self.debug_externalize_sockets = false;
         }
@@ -379,8 +382,8 @@ impl Config {
             && !self.record_preemptions
             && self.replay_schedule_from.is_none()
         {
-            tracing::warn!(
-                "-s/--stacktrace-event has no effect if not recording/replaying events!"
+            eprintln!(
+                "WARNING: -s/--stacktrace-event has no effect if not recording/replaying events!"
             );
         }
 
