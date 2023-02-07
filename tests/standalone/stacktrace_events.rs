@@ -112,7 +112,7 @@ fn main() {
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         let event_ixs: Vec<usize> = {
-            let re = Regex::new(r"Printing stack trace for scheduled event #(\d+)").unwrap();
+            let re = Regex::new(r"Now output stack trace for scheduled event #(\d+)").unwrap();
             stderr
                 .lines()
                 .filter(|l| re.is_match(l))

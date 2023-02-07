@@ -869,9 +869,15 @@ impl Scheduler {
                 };
                 if go {
                     info!(
-                        "\nPrinting stack trace for scheduled event #{}:",
-                        current_ix
+                        "Now output stack trace for scheduled event #{} = {}:",
+                        current_ix, observed,
                     );
+                    if m_path.is_none() {
+                        eprintln!(
+                            "\nPrinting stack trace for scheduled event #{} = {}:",
+                            current_ix, observed,
+                        );
+                    }
                     result = Some(m_path.clone());
                     let _ = iter.next();
                 }

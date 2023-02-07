@@ -375,6 +375,15 @@ impl Config {
             self.debug_externalize_sockets = false;
         }
 
+        if !self.stacktrace_event.is_empty()
+            && !self.record_preemptions
+            && self.replay_schedule_from.is_none()
+        {
+            tracing::warn!(
+                "-s/--stacktrace-event has no effect if not recording/replaying events!"
+            );
+        }
+
         if self.preemption_stacktrace_log_file.is_some() {
             self.preemption_stacktrace = true;
         }

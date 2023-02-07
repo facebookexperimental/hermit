@@ -1429,14 +1429,18 @@ where
 }
 
 /// Writes a structured json backtrace to a given file
-fn write_backtrace<G, T>(guest: &mut G, path: &PathBuf)
+fn write_backtrace<G, T>(guest: &mut G, m_path: Option<&PathBuf>)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
     if let Some(backtrace) = guest.backtrace() {
-        let file = File::create(path).expect("Failed to open preemption stacktrace log file");
-        serde_json::to_writer(file, &backtrace.force_pretty()).unwrap();
+        if let Some(path) = m_path {
+            let file = File::create(path).expect("Failed to open preemption stacktrace log file");
+            serde_json::to_writer(file, &backtrace.force_pretty()).unwrap();
+        } else {
+            eprintln!("{}", backtrace.force_pretty());
+        }
     } else {
         warn!("Could not read backtrace!");
     }
@@ -1504,9 +1508,9 @@ where
                 timeslice,
             }),
         ) => {
-            if let Some(Some(path)) = print_stack_strace {
+            if let Some(m_path) = print_stack_strace {
                 trace!("[trace_schedevent] writing stacktrace via Reverie...");
-                write_backtrace(guest, &path);
+                write_backtrace(guest, m_path.as_ref());
             }
 
             if timeslice.is_some() && guest.thread_state().past_global_first_execve {
