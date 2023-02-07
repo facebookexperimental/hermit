@@ -24,6 +24,9 @@ pub enum SchedTraceOpts {
     /// Inspect and report statistics on one schedule.
     Inspect(InspectOpts),
 
+    /// Just dump the raw schedule
+    Print(PrintOpts),
+
     /// Difference between two preempt files
     Diff(DiffOpts),
 
@@ -37,6 +40,7 @@ impl SchedTraceOpts {
             SchedTraceOpts::Diff(x) => x.run(common_args),
             SchedTraceOpts::Interpolate(x) => x.run(common_args),
             SchedTraceOpts::Inspect(x) => x.run(common_args),
+            SchedTraceOpts::Print(x) => x.run(common_args),
         }
     }
 }
@@ -108,7 +112,7 @@ impl InspectOpts {
 
         let preempts = preempt_events(&schedule);
         println!("Context-switch/preemption events: {}", preempts.len());
-        println!("Per thread preemption events:");
+        println!("Per thread pre-preemption events:");
         let per_thread_preempts = per_thread_events(&preempts);
         for (tid, vec) in &per_thread_preempts {
             println!("  tid {}: {} preemptions", tid, vec.len());
@@ -130,6 +134,55 @@ impl InspectOpts {
             }
         }
 
+        Ok(true)
+    }
+}
+
+#[derive(Debug, Parser)]
+pub struct PrintOpts {
+    /// Schedule to inspect.
+    pub sched_file: PathBuf,
+
+    /// Print the indices as well as the raw events.
+    #[clap(long, short = 'i')]
+    indices: bool,
+
+    /// Print only events from the given tid, leaving a blank line anywhere the tid was preempted.
+    #[clap(long)]
+    tid: Option<i32>,
+}
+
+impl PrintOpts {
+    pub fn run(&self, _common_args: &CommonOpts) -> anyhow::Result<bool> {
+        let schedule = read_trace(&self.sched_file);
+        let mut last_skipped = false;
+        let mut thread_counts: BTreeMap<DetTid, u64> = BTreeMap::new();
+        for (global_ix, ev) in schedule.iter().enumerate() {
+            let entry = thread_counts.entry(ev.dettid).or_default();
+            let current_thread_ix: u64 = *entry;
+            *entry += 1;
+
+            if let Some(tid) = self.tid {
+                if ev.dettid.as_raw() == tid {
+                    last_skipped = false;
+                } else {
+                    if !last_skipped {
+                        println!();
+                    }
+                    last_skipped = true;
+                    continue;
+                }
+            }
+            if self.indices {
+                println!(
+                    "{: <9} {}",
+                    format!("({},{})", global_ix, current_thread_ix),
+                    ev
+                );
+            } else {
+                println!("{}", ev);
+            }
+        }
         Ok(true)
     }
 }

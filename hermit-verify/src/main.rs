@@ -51,18 +51,22 @@ fn main() -> Result<()> {
         common_opts,
     } = Args::from_args();
 
+    let mut print_success = true;
     let result = match command {
         Commands::Run(cmd) => run_use_case(cmd, &common_opts)?,
         Commands::TraceReplay(cmd) => run_use_case(cmd, &common_opts)?,
         Commands::ChaosReplay(cmd) => run_use_case(cmd, &common_opts)?,
-        Commands::SchedTrace(cmd) => cmd.main(&common_opts)?,
         Commands::ChaosStress(cmd) => cmd.run(&common_opts)?,
+        Commands::SchedTrace(cmd) => {
+            print_success = false;
+            cmd.main(&common_opts)?
+        }
     };
 
     if !result {
         println!("{}", "Verification use case failed!".red().bold());
         anyhow::bail!("Verification check failed")
-    } else {
+    } else if print_success {
         println!("{}", "Success!".green().bold());
     };
 
