@@ -9,7 +9,7 @@ edition = "2021"
 anyhow = "1.0.65"
 atty = "0.2"
 bincode = "1.3.3"
-clap = { version = "3.2.17", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
+clap = { version = "3.2.23", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
 colored = "1.9"
 detcore = { version = "0.0.0", path = "../detcore" }
 diff = "0.1"
