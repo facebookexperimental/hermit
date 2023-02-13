@@ -10,4 +10,4 @@ name = "test_bin"
 path = "src/test_bin.rs"
 
 [dependencies]
-libc = "0.2.137"
+libc = "0.2.139"
