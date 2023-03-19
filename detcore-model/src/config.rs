@@ -628,11 +628,22 @@ impl FromStr for BlockingMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Parser, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    Parser,
+    PartialEq,
+    Eq
+)]
 /// Apply a specialized scheduling heuristic which may help exercise certain bugs.
 pub enum SchedHeuristic {
     /// Don't modify the scheduling algorithm.
     // TODO: Is the default a round robin?
+    #[default]
     None,
     /// Prioritize connect and deprioritize bind to exercise races
     ConnectBind,
@@ -643,12 +654,6 @@ pub enum SchedHeuristic {
     /// executing on the same thread, or picking another one.
     StickyRandom,
     // TODO: make all sleeps "instant".
-}
-
-impl Default for SchedHeuristic {
-    fn default() -> Self {
-        SchedHeuristic::None
-    }
 }
 
 // Lame to not derive this, but even `derive_more` won't do enums.

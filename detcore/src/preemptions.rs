@@ -514,7 +514,7 @@ mod tests {
 "7":{"final_prio":9722,"prio_changes":[]},
 "9":{"final_prio":9982,"prio_changes":[[946684799006227400,7839]]},
 "11":{"final_prio":1000,"prio_changes":[]}},"global":[]}"#;
-        let pr: PreemptionRecord = serde_json::from_str(&str).unwrap();
+        let pr: PreemptionRecord = serde_json::from_str(str).unwrap();
         let pr2 = pr.normalize();
         pr2.validate().unwrap();
         let bmap = pr2.as_vecs();

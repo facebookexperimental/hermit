@@ -24,9 +24,20 @@ use crate::types::RawFd;
 use crate::types::*;
 
 /// file descriptor type
-#[derive(PartialEq, Eq, Debug, Clone, Copy, Hash, Serialize, Deserialize)]
+#[derive(
+    PartialEq,
+    Eq,
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    Hash,
+    Serialize,
+    Deserialize
+)]
 pub enum FdType {
     /// Regular fd, such as from openat
+    #[default]
     Regular,
     /// signalfd
     Signalfd,
@@ -46,12 +57,6 @@ pub enum FdType {
     Userfaultfd,
     ///
     Rng,
-}
-
-impl Default for FdType {
-    fn default() -> Self {
-        FdType::Regular
-    }
 }
 
 /// Deterministic file descriptor

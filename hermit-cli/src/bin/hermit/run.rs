@@ -224,21 +224,16 @@ fn parse_assignment(src: &str) -> Result<(String, Option<String>), Error> {
     }
 }
 
-#[derive(Debug, Clone, Copy, Parser, Eq, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, Parser, Eq, PartialEq)]
 pub enum NetworkingMode {
     /// Create a local loopback device and allow local, intra-container network communication only.
+    // WARNING: written in two places, here and in the #[clap(default_value)] above.
+    #[default]
     Local,
     /// Allow through all network access via the host's network interface.
     Host,
     // None, // TODO: no network interface at all
     // Record, // TODO: record network traffic only, not other syscalls.
-}
-
-impl Default for NetworkingMode {
-    fn default() -> Self {
-        // WARNING: written in two places, here and in the #[clap(default_value)] above.
-        NetworkingMode::Local
-    }
 }
 
 // Upper case will work, but prefer lower case.

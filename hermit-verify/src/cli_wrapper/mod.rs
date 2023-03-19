@@ -80,7 +80,6 @@ pub fn display_cmd(command: &Command) -> String {
         command.get_program().to_string_lossy(),
         command
             .get_args()
-            .into_iter()
             .map(|x| x.to_os_string())
             .collect::<Vec<_>>()
             .join(OsStr::new(" "))

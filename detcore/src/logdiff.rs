@@ -863,7 +863,7 @@ Jan 09 06:49:03.100  INFO detcore: registers [dtid 3]. user_regs_struct { r15: 1
 Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar 0x7fa26067a150 Go>); clear ivars for the next turn on dettid 2
 ";
 
-        let v = super::extract_log_messages(&s);
+        let v = super::extract_log_messages(s);
         eprintln!("Split into {} log messages", v.len());
         for x in &v {
             eprintln!("{:?}", x);
