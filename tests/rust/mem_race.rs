@@ -8,7 +8,6 @@
 
 #![feature(get_mut_unchecked)]
 #![feature(thread_id_value)]
-#![feature(atomic_mut_ptr)]
 
 use std::env;
 use std::sync::atomic::AtomicUsize;
