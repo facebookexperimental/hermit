@@ -138,4 +138,4 @@ detcore = { version = "0.0.0", path = "../detcore" }
 libc = "0.2.139"
 nix = "0.25"
 regex = "1.6.0"
-tempfile = "3.4"
+tempfile = "3.5"
