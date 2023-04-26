@@ -246,7 +246,7 @@ mod futex_wait_parent {
     #[test]
     fn raw() {
         let sem = Arc::new(AtomicU32::new(1000));
-        let ptr = sem.as_mut_ptr();
+        let ptr = sem.as_ptr();
         let ptr2 = ptr as usize;
         let sem2 = sem.clone();
 
