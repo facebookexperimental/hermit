@@ -56,4 +56,4 @@ tracing = "0.1.35"
 detcore-testutils = { version = "0.0.0", path = "tests/testutils" }
 reverie-ptrace = { version = "0.1.0", git = "https://github.com/facebookexperimental/reverie.git", branch = "main" }
 test-allocator = { version = "0.0.0", path = "../common/test-allocator" }
-test-case = "1.2"
+test-case = "3.1"
