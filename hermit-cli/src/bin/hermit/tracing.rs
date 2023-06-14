@@ -8,6 +8,8 @@
 
 use std::fs::File;
 use std::io;
+use std::io::stderr;
+use std::io::IsTerminal;
 
 use tracing::metadata::LevelFilter;
 use tracing::Subscriber;
@@ -63,7 +65,7 @@ pub fn stderr_subscriber(level: Option<LevelFilter>) -> impl Subscriber {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(io::stderr)
-        .with_ansi(atty::is(atty::Stream::Stderr))
+        .with_ansi(stderr().is_terminal())
         .finish()
 }
 
