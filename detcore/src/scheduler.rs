@@ -1916,7 +1916,7 @@ impl Scheduler {
     /// Precondition: guest is stopped so that there is no chance the ivars are being used
     /// concurrently while they are being cleared.
     fn clear_nextturn(&mut self, dtid: DetTid) {
-        let mut nextturn = self
+        let nextturn = self
             .next_turns
             .get_mut(&dtid)
             .expect("clear_nextturn: Thread should be available in next_turns");

@@ -900,7 +900,7 @@ impl GlobalState {
             );
             d
         };
-        let mut info = mg
+        let info = mg
             .detinodes_info
             .get_mut(&dino)
             // TODO(T87258449): remove this `expect`:
