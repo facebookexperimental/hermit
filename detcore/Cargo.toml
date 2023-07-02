@@ -37,7 +37,7 @@ futures = { version = "0.3.28", features = ["async-await", "compat"] }
 lazy_static = "1.4"
 libc = "0.2.139"
 nix = "0.25"
-pretty = "0.10"
+pretty = "0.12.1"
 pretty_assertions = { version = "1.2", features = ["alloc"], default-features = false }
 procfs = "0.10.1"
 rand = { version = "0.8", features = ["small_rng"] }
