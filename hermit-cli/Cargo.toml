@@ -27,8 +27,8 @@ rand_pcg = { version = "0.3", features = ["serde1"] }
 regex = "1.6.0"
 reverie = { version = "0.1.0", git = "https://github.com/facebookexperimental/reverie.git", branch = "main" }
 reverie-ptrace = { version = "0.1.0", git = "https://github.com/facebookexperimental/reverie.git", branch = "main" }
-serde = { version = "1.0.136", features = ["derive", "rc"] }
-serde_json = { version = "1.0.79", features = ["float_roundtrip", "unbounded_depth"] }
+serde = { version = "1.0.167", features = ["derive", "rc"] }
+serde_json = { version = "1.0.100", features = ["float_roundtrip", "unbounded_depth"] }
 shell-words = "1.1.0"
 tempfile = "3.5"
 tokio = { version = "1.25.0", features = ["full", "test-util", "tracing"] }
