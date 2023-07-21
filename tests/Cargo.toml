@@ -32,102 +32,127 @@ path = "standalone/network_bind.rs"
 [[bin]]
 name = "rustbin_bind_connect_race"
 path = "rust/bind_connect_race.rs"
+test = false
 
 [[bin]]
 name = "rustbin_clock_gettime"
 path = "rust/clock_gettime.rs"
+test = false
 
 [[bin]]
 name = "rustbin_clock_total_order"
 path = "rust/clock_total_order.rs"
+test = false
 
 [[bin]]
 name = "rustbin_exit_group"
 path = "rust/exit_group.rs"
+test = false
 
 [[bin]]
 name = "rustbin_futex_and_print"
 path = "rust/futex_and_print.rs"
+test = false
 
 [[bin]]
 name = "rustbin_futex_timeout"
 path = "rust/futex_timeout.rs"
+test = false
 
 [[bin]]
 name = "rustbin_futex_wait_child"
 path = "rust/futex_wait_child.rs"
+test = false
 
 [[bin]]
 name = "rustbin_futex_wake_some"
 path = "rust/futex_wake_some.rs"
+test = false
 
 [[bin]]
 name = "rustbin_heap_ptrs"
 path = "rust/heap_ptrs.rs"
+test = false
 
 [[bin]]
 name = "rustbin_interrogate_tty"
 path = "rust/interrogate_tty.rs"
+test = false
 
 [[bin]]
 name = "rustbin_mem_race"
 path = "rust/mem_race.rs"
+test = false
 
 [[bin]]
 name = "rustbin_nanosleep"
 path = "rust/nanosleep.rs"
+test = false
 
 [[bin]]
 name = "rustbin_network_hello_world"
 path = "rust/network_hello_world.rs"
+test = false
 
 [[bin]]
 name = "rustbin_pipe_basics"
 path = "rust/pipe_basics.rs"
+test = false
 
 [[bin]]
 name = "rustbin_poll"
 path = "rust/poll.rs"
+test = false
 
 [[bin]]
 name = "rustbin_poll_spin"
 path = "rust/poll_spin.rs"
+test = false
 
 [[bin]]
 name = "rustbin_print_clock_nanosleep_monotonic_abs_race"
 path = "rust/print_clock_nanosleep_monotonic_abs_race.rs"
+test = false
 
 [[bin]]
 name = "rustbin_print_clock_nanosleep_monotonic_race"
 path = "rust/print_clock_nanosleep_monotonic_race.rs"
+test = false
 
 [[bin]]
 name = "rustbin_print_clock_nanosleep_realtime_abs_race"
 path = "rust/print_clock_nanosleep_realtime_abs_race.rs"
+test = false
 
 [[bin]]
 name = "rustbin_print_nanosleep_race"
 path = "rust/print_nanosleep_race.rs"
+test = false
 
 [[bin]]
 name = "rustbin_rdtsc"
 path = "rust/rdtsc.rs"
+test = false
 
 [[bin]]
 name = "rustbin_sched_yield"
 path = "rust/sched_yield.rs"
+test = false
 
 [[bin]]
 name = "rustbin_socketpair"
 path = "rust/socketpair.rs"
+test = false
 
 [[bin]]
 name = "rustbin_stack_ptr"
 path = "rust/stack_ptr.rs"
+test = false
 
 [[bin]]
 name = "rustbin_thread_random"
 path = "rust/thread_random.rs"
+test = false
 
 [[bin]]
 name = "standalone_stacktrace_events"

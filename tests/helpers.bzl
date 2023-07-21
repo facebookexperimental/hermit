@@ -216,6 +216,10 @@ def hermit_rust_test(path, raw, run, no_sequentialize_threads, no_deterministic_
             "fbsource//third-party/rust:nix",
             "fbsource//third-party/rust:tempfile",
         ],
+        rustc_flags = [
+            "-Aunused-crate-dependencies",
+        ],
+        unittests = False,
     )
     build_test("rs_" + basename, bin_target, raw, run, no_sequentialize_threads, no_deterministic_io, record_and_replay, chaos, chaosreplay, tracereplay, tracereplay_chaos)
 
