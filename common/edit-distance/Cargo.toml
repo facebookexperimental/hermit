@@ -6,7 +6,7 @@ version = "0.0.0"
 edition = "2021"
 
 [dependencies]
-serde = { version = "1.0.176", features = ["derive", "rc"] }
+serde = { version = "1.0.185", features = ["derive", "rc"] }
 
 [dev-dependencies]
 rand = { version = "0.8", features = ["small_rng"] }
