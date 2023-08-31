@@ -97,7 +97,7 @@ fn tod_gettimeofday() {
             let naive_time =
                 NaiveDateTime::from_timestamp_opt(tp.tv_sec, 1000 * tp.tv_usec as u32).unwrap();
 
-            let dt = DateTime::<Utc>::from_utc(naive_time, Utc);
+            let dt = naive_time.and_utc();
             // However exactly we compute logical time, this should be within a small
             // fraction of a (logical) second of epoch:
             assert!(diff_millis(dt, epoch) < 100);
@@ -117,7 +117,7 @@ fn raw_getimeofday_delta() {
         let tp = unsafe { tp.assume_init() };
         let naive_time =
             NaiveDateTime::from_timestamp_opt(tp.tv_sec, 1000 * tp.tv_usec as u32).unwrap();
-        DateTime::<Utc>::from_utc(naive_time, Utc)
+        naive_time.and_utc()
     };
     let dt2 = {
         let mut tp: MaybeUninit<libc::timeval> = MaybeUninit::uninit();
@@ -128,7 +128,7 @@ fn raw_getimeofday_delta() {
         let tp = unsafe { tp.assume_init() };
         let naive_time =
             NaiveDateTime::from_timestamp_opt(tp.tv_sec, 1000 * tp.tv_usec as u32).unwrap();
-        DateTime::<Utc>::from_utc(naive_time, Utc)
+        naive_time.and_utc()
     };
 
     let delta_ns = diff_nanos(dt1, dt2);
@@ -163,7 +163,7 @@ fn tod_time() {
             assert_eq!(t, tloc);
             let naive_time = NaiveDateTime::from_timestamp_opt(t, 0).unwrap();
 
-            let dt = DateTime::<Utc>::from_utc(naive_time, Utc);
+            let dt = naive_time.and_utc();
             assert_eq!(dt.timestamp(), epoch.timestamp());
         },
         config,
@@ -192,7 +192,7 @@ fn tod_clock_gettime() {
             let naive_time =
                 NaiveDateTime::from_timestamp_opt(tp.tv_sec, tp.tv_nsec as u32).unwrap();
 
-            let dt = DateTime::<Utc>::from_utc(naive_time, Utc);
+            let dt = naive_time.and_utc();
             // However exactly we compute logical time, this should be within a small
             // fraction of a (logical) second of epoch:
             assert!(diff_millis(dt, epoch) < 100);
