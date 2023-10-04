@@ -64,7 +64,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     fn free_ram<G: Guest<Self>>(&self, guest: &mut G, total_ram: u64) -> anyhow::Result<u64> {
         let process = Process::new(guest.pid().as_raw())?;
-        let page_size = procfs::page_size()? as u64;
+        let page_size = procfs::page_size();
         let statm = process.statm()?;
         let used_memory = statm.resident * page_size;
         if used_memory > total_ram {

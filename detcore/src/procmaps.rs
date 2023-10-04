@@ -26,12 +26,14 @@ fn display_pathname(p: &MMapPath) -> String {
         MMapPath::Other(s) => format!("[other: {}]", s),
         MMapPath::Anonymous => String::from("[annonymous]"),
         MMapPath::Path(s) => s.display().to_string(),
+        MMapPath::Rollup => String::from("[rollup]"),
+        MMapPath::Vsys(vsys) => vsys.to_string(),
     }
 }
 
 pub fn display(map: &MemoryMap) -> String {
     format!(
-        "{:#x}-{:#x} {} {:x} {:x}:{:x} {} {}",
+        "{:#x}-{:#x} {:?} {:x} {:x}:{:x} {} {}",
         map.address.0,
         map.address.1,
         map.perms,
@@ -57,8 +59,8 @@ where
     match procfs::process::Process::new(pid.as_raw()) {
         Ok(process) => match process.maps() {
             Ok(mut maps) => {
-                maps.retain(filter);
-                Ok(maps)
+                maps.memory_maps.retain(filter);
+                Ok(maps.memory_maps)
             }
             Err(err) => Err(map_error(err)),
         },
