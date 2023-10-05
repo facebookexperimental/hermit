@@ -6,7 +6,7 @@ version = "0.0.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1.0.71"
+anyhow = "=1.0.72"
 bitvec = { version = "0.17", features = ["serde"] }
 bytesize = "1.1"
 chrono = { version = "0.4", features = ["clock", "serde", "std"], default-features = false }
