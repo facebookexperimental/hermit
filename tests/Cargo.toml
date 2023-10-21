@@ -163,4 +163,4 @@ detcore = { version = "0.0.0", path = "../detcore" }
 libc = "0.2.139"
 nix = "0.25"
 regex = "1.9.2"
-tempfile = "3.5"
+tempfile = "3.8"
