@@ -160,7 +160,7 @@ path = "standalone/stacktrace_events.rs"
 
 [dependencies]
 detcore = { version = "0.0.0", path = "../detcore" }
-libc = "0.2.139"
+libc = "0.2.149"
 nix = "0.25"
 regex = "1.9.2"
 tempfile = "3.8"

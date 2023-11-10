@@ -35,7 +35,7 @@ detcore-model = { version = "0.0.0", path = "../detcore-model" }
 digest = { version = "0.0.0", path = "../common/digest" }
 futures = { version = "0.3.28", features = ["async-await", "compat"] }
 lazy_static = "1.4"
-libc = "0.2.139"
+libc = "0.2.149"
 nix = "0.25"
 pretty = "0.12.1"
 pretty_assertions = { version = "1.2", features = ["alloc"], default-features = false }
