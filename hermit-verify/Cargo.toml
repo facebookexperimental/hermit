@@ -17,7 +17,7 @@ rand = { version = "0.8", features = ["small_rng"] }
 serde_json = { version = "1.0.100", features = ["float_roundtrip", "unbounded_depth"] }
 similar = { version = "2.2.0", features = ["inline"] }
 tempfile = "3.8"
-tracing = "0.1.35"
+tracing = "0.1.40"
 
 [dev-dependencies]
 pretty_assertions = { version = "1.2", features = ["alloc"], default-features = false }

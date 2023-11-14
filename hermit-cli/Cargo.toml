@@ -32,7 +32,7 @@ serde_json = { version = "1.0.100", features = ["float_roundtrip", "unbounded_de
 shell-words = "1.1.0"
 tempfile = "3.8"
 tokio = { version = "1.29.1", features = ["full", "test-util", "tracing"] }
-tracing = "0.1.35"
+tracing = "0.1.40"
 tracing-appender = "0.2.2"
-tracing-subscriber = { version = "0.3.17", features = ["ansi", "env-filter", "fmt", "json", "local-time", "parking_lot", "registry"] }
+tracing-subscriber = { version = "0.3.18", features = ["ansi", "chrono", "env-filter", "fmt", "json", "local-time", "parking_lot", "registry"] }
 uuid = { version = "1.2", features = ["serde", "v4", "v5", "v6", "v7", "v8"] }

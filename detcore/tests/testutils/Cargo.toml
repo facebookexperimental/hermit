@@ -13,5 +13,5 @@ reverie = { version = "0.1.0", git = "https://github.com/facebookexperimental/re
 reverie-ptrace = { version = "0.1.0", git = "https://github.com/facebookexperimental/reverie.git", branch = "main" }
 test-allocator = { version = "0.0.0", path = "../../../common/test-allocator" }
 tokio = { version = "1.29.1", features = ["full", "test-util", "tracing"] }
-tracing = "0.1.35"
-tracing-subscriber = { version = "0.3.17", features = ["ansi", "env-filter", "fmt", "json", "local-time", "parking_lot", "registry"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["ansi", "chrono", "env-filter", "fmt", "json", "local-time", "parking_lot", "registry"] }

@@ -16,7 +16,7 @@ nix = "0.25"
 reverie-syscalls = { version = "0.1.0", git = "https://github.com/facebookexperimental/reverie.git", branch = "main" }
 serde = { version = "1.0.185", features = ["derive", "rc"] }
 shell-words = "1.1.0"
-tracing = "0.1.35"
+tracing = "0.1.40"
 
 [dev-dependencies]
 pretty_assertions = { version = "1.2", features = ["alloc"], default-features = false }
