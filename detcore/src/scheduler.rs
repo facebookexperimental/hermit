@@ -755,7 +755,7 @@ impl Scheduler {
                     .iter()
                     .map(|(ix, path)| (*ix, Some(vec[*ix as usize].clone()), path.clone()))
                     .collect();
-                let mut replayer = Replayer::new(vec.into_iter());
+                let mut replayer = Replayer::new(vec);
                 replayer.replay_exhausted_panic = cfg.replay_exhausted_panic;
                 replayer.die_on_desync = cfg.die_on_desync;
                 (Some(replayer), Some(toprint))

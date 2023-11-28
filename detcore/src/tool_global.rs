@@ -290,7 +290,9 @@ impl GlobalState {
         if self.cfg.virtualize_time {
             let final_time = self.global_time.lock().unwrap();
             let final_time_ns = final_time.as_nanos();
-            let epoch_ns = LogicalTime::from_nanos(self.cfg.epoch.timestamp_nanos() as u64);
+            #[allow(deprecated)] // FIXME! Deprecatd in chrono-0.4.31
+            let nanos = self.cfg.epoch.timestamp_nanos() as u64;
+            let epoch_ns = LogicalTime::from_nanos(nanos);
             summary.virttime_final = final_time_ns.as_nanos();
             summary.virttime_elapsed = if final_time_ns.as_nanos() >= epoch_ns.as_nanos() {
                 (final_time_ns - epoch_ns).as_nanos()
@@ -854,10 +856,13 @@ impl GlobalState {
 
     async fn recv_determinize_inode(&self, from: Tid, ino: RawInode) -> (DetInode, LogicalTime) {
         // Here we establish a policy that when we first see a file its mtime is epoch.
-        let (dino, ns) = self.inodes.lock().unwrap().add_inode(
-            ino,
-            LogicalTime::from_nanos(self.cfg.epoch.timestamp_nanos() as u64),
-        );
+        #[allow(deprecated)] // FIXME! Deprecatd in chrono-0.4.31
+        let nanos = self.cfg.epoch.timestamp_nanos() as u64;
+        let (dino, ns) = self
+            .inodes
+            .lock()
+            .unwrap()
+            .add_inode(ino, LogicalTime::from_nanos(nanos));
         trace!(
             "[detcore, dtid {}] resolved (raw) inode {:?} to {:?}, mtime {}",
             from,
@@ -880,7 +885,9 @@ impl GlobalState {
             // In this scenario, virtualize_metadata is set and virtualize_time isn't.
             // We virtualize initial mtimes, but update using realtime.
             let dt: DateTime<Utc> = Utc::now();
-            LogicalTime::from_nanos(dt.timestamp_nanos() as u64)
+            #[allow(deprecated)] // FIXME! Deprecatd in chrono-0.4.31
+            let nanos = dt.timestamp_nanos() as u64;
+            LogicalTime::from_nanos(nanos)
         };
         trace!(
             "[dtid {}] bumping mtime on file (rawinode {:?}) to {}",
@@ -894,10 +901,9 @@ impl GlobalState {
         } else {
             // Otherwise we haven't seen this inode yet (e.g. because there hasnt been a
             // stat on it), so we just-in-time add it.
-            let (d, _) = mg.add_inode(
-                ino,
-                LogicalTime::from_nanos(self.cfg.epoch.timestamp_nanos() as u64),
-            );
+            #[allow(deprecated)] // FIXME! Deprecatd in chrono-0.4.31
+            let nanos = self.cfg.epoch.timestamp_nanos() as u64;
+            let (d, _) = mg.add_inode(ino, LogicalTime::from_nanos(nanos));
             d
         };
         let info = mg

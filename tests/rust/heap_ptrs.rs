@@ -8,6 +8,7 @@
 
 //! Test deterministic Rust heap allocation
 
+#[allow(clippy::useless_vec)]
 fn main() {
     // Go far enough that we trigger an mmap directly for a big allocation.
     // Interleaving print/alloc makes it easy to see which ones call mmap in an strace.

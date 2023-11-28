@@ -684,10 +684,10 @@ impl AnalyzeOpts {
     pub fn main(&mut self, global: &GlobalOpts) -> anyhow::Result<ExitStatus> {
         // Not implemented yet:
         if self.run1_schedule.is_some() {
-            todo!()
+            unimplemented!()
         }
         if self.run2_schedule.is_some() {
-            todo!()
+            unimplemented!()
         }
 
         self.phase0_initialize()?; // Need this early to set tmp_dir.

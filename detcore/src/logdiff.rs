@@ -245,7 +245,7 @@ fn is_detlog_syscall_result(line: &str) -> bool {
 // TODO:
 // Append together a sequence of messages while truncating if there are too many.
 fn _truncate_messages(_v: &[&str]) -> String {
-    todo!()
+    unimplemented!()
 }
 
 fn filter_infos<'a>(v: &[(usize, &'a str)]) -> Vec<(usize, &'a str)> {
