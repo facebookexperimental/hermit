@@ -290,8 +290,12 @@ impl GlobalState {
         if self.cfg.virtualize_time {
             let final_time = self.global_time.lock().unwrap();
             let final_time_ns = final_time.as_nanos();
-            #[allow(deprecated)] // FIXME! Deprecatd in chrono-0.4.31
-            let nanos = self.cfg.epoch.timestamp_nanos() as u64;
+            let nanos = self
+                .cfg
+                .epoch
+                .timestamp_nanos_opt()
+                .expect("epoch cannot be represented in a timestamp with nanosecond precision")
+                as u64;
             let epoch_ns = LogicalTime::from_nanos(nanos);
             summary.virttime_final = final_time_ns.as_nanos();
             summary.virttime_elapsed = if final_time_ns.as_nanos() >= epoch_ns.as_nanos() {
@@ -856,8 +860,12 @@ impl GlobalState {
 
     async fn recv_determinize_inode(&self, from: Tid, ino: RawInode) -> (DetInode, LogicalTime) {
         // Here we establish a policy that when we first see a file its mtime is epoch.
-        #[allow(deprecated)] // FIXME! Deprecatd in chrono-0.4.31
-        let nanos = self.cfg.epoch.timestamp_nanos() as u64;
+        let nanos = self
+            .cfg
+            .epoch
+            .timestamp_nanos_opt()
+            .expect("epoch cannot be represented in a timestamp with nanosecond precision")
+            as u64;
         let (dino, ns) = self
             .inodes
             .lock()
@@ -885,8 +893,9 @@ impl GlobalState {
             // In this scenario, virtualize_metadata is set and virtualize_time isn't.
             // We virtualize initial mtimes, but update using realtime.
             let dt: DateTime<Utc> = Utc::now();
-            #[allow(deprecated)] // FIXME! Deprecatd in chrono-0.4.31
-            let nanos = dt.timestamp_nanos() as u64;
+            let nanos = dt.timestamp_nanos_opt().expect(
+                "current time cannot be represented in a timestamp with nanosecond precision",
+            ) as u64;
             LogicalTime::from_nanos(nanos)
         };
         trace!(
@@ -896,16 +905,19 @@ impl GlobalState {
             mtime,
         );
         let mut mg = self.inodes.lock().unwrap();
-        let dino = if let Some(d) = mg.inodes.get(&ino) {
-            *d
-        } else {
-            // Otherwise we haven't seen this inode yet (e.g. because there hasnt been a
-            // stat on it), so we just-in-time add it.
-            #[allow(deprecated)] // FIXME! Deprecatd in chrono-0.4.31
-            let nanos = self.cfg.epoch.timestamp_nanos() as u64;
-            let (d, _) = mg.add_inode(ino, LogicalTime::from_nanos(nanos));
-            d
-        };
+        let dino =
+            if let Some(d) = mg.inodes.get(&ino) {
+                *d
+            } else {
+                // Otherwise we haven't seen this inode yet (e.g. because there hasnt been a
+                // stat on it), so we just-in-time add it.
+                let nanos =
+                    self.cfg.epoch.timestamp_nanos_opt().expect(
+                        "epoch cannot be represented in a timestamp with nanosecond precision",
+                    ) as u64;
+                let (d, _) = mg.add_inode(ino, LogicalTime::from_nanos(nanos));
+                d
+            };
         let info = mg
             .detinodes_info
             .get_mut(&dino)
