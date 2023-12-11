@@ -4,6 +4,8 @@
 name = "edit-distance"
 version = "0.0.0"
 edition = "2021"
+repository = "https://github.com/facebookexperimental/hermit"
+license = "BSD-3-Clause"
 
 [dependencies]
 serde = { version = "1.0.185", features = ["derive", "rc"] }

@@ -4,6 +4,8 @@
 name = "hermit-verify"
 version = "0.0.0"
 edition = "2021"
+repository = "https://github.com/facebookexperimental/hermit"
+license = "BSD-3-Clause"
 
 [dependencies]
 anyhow = "1.0.75"

@@ -4,6 +4,8 @@
 name = "hermetic_infra_hermit_flaky-tests"
 version = "0.0.0"
 edition = "2021"
+repository = "https://github.com/facebookexperimental/hermit"
+license = "BSD-3-Clause"
 
 [[bin]]
 name = "cas_sequence_easy_bin"

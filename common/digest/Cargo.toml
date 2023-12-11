@@ -4,6 +4,8 @@
 name = "digest"
 version = "0.0.0"
 edition = "2021"
+repository = "https://github.com/facebookexperimental/hermit"
+license = "BSD-3-Clause"
 
 [dependencies]
 hex = "0.4.3"

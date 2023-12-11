@@ -4,6 +4,8 @@
 name = "test-allocator"
 version = "0.0.0"
 edition = "2021"
+repository = "https://github.com/facebookexperimental/hermit"
+license = "BSD-3-Clause"
 
 [[bin]]
 name = "test_bin"
