@@ -116,10 +116,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "build_info"
-version = "0.0.0"
-
-[[package]]
 name = "bumpalo"
 version = "3.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -742,7 +738,6 @@ dependencies = [
  "anyhow",
  "atty",
  "bincode",
- "build_info",
  "chrono",
  "clap",
  "colored",
