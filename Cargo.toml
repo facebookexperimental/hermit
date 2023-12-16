@@ -11,3 +11,4 @@ members = [
   "hermit-verify",
   "tests",
 ]
+resolver = "2"
