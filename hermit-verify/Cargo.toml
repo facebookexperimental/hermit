@@ -10,7 +10,7 @@ license = "BSD-3-Clause"
 [dependencies]
 anyhow = "1.0.75"
 clap = { version = "3.2.25", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
-colored = "1.9"
+colored = "2.1.0"
 detcore = { version = "0.0.0", path = "../detcore" }
 detcore-model = { version = "0.0.0", path = "../detcore-model" }
 edit-distance = { version = "0.0.0", path = "../common/edit-distance" }
