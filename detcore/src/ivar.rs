@@ -153,7 +153,6 @@ impl<T: Debug + Clone> Ivar<T> {
     ///
     /// This is, in general, nondeterministic, because it may be racing with a put operation.
     /// Use with care.
-    ///
     pub fn try_read(&self) -> Option<T> {
         let shared = self.inner.lock().expect("Ivar try_read could not lock.");
         shared.contents.clone()
@@ -163,7 +162,6 @@ impl<T: Debug + Clone> Ivar<T> {
     ///
     ///   (1) symmetry with put,
     ///   (2) taking self by reference instead of consuming it
-    ///
     pub async fn get(&self) -> T {
         let v: Ivar<T> = self.clone();
         v.await

@@ -406,7 +406,6 @@ where
 /// critical branch in thread B which will (fortunately) be `j`. We will return the critical
 /// schedule in the form that passes and coordinates into the schedule to indicate where a single
 /// flipped pair of branches can cause the test to fail
-///
 #[allow(unused)]
 fn sub_event_search<F>(
     tester: &mut F,
@@ -555,7 +554,6 @@ fn sched_event_with_new_count(original: &SchedEvent, new_count: u32) -> SchedEve
 /// Original Branches  => AAAAAAAABBBBBBBBB
 /// Synthetic Branches => AAAABBBBBBBAAAABB
 ///                       <A4><- B7-><A4>B2
-///
 fn create_schedule_with_critical_pair(
     prefix: &[SchedEvent],
     postfix: &[SchedEvent],

@@ -269,7 +269,10 @@ const DEFAULT_SIZE: usize = 0x20000000000; // 128 GiB, try to avoid any rlimits
 /// # use test_allocator::GLOBAL_SLAB_TOP;
 /// # unsafe {
 /// GLOBAL.skip_to_offset(0x100000).unwrap();
-/// assert_eq!(GLOBAL.allocate(4, 4) as usize, GLOBAL_SLAB_TOP - 0x100000 - 4);
+/// assert_eq!(
+///     GLOBAL.allocate(4, 4) as usize,
+///     GLOBAL_SLAB_TOP - 0x100000 - 4
+/// );
 /// # }
 /// ```
 pub const GLOBAL_SLAB_TOP: usize = DEFAULT_PAGE_ADDRESS + DEFAULT_SIZE;

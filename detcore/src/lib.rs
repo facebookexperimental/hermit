@@ -121,7 +121,6 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// # Arguments
     ///
     /// * `precise_branch`: if true, there were no non-branch instructions since the last recorded branch instruction.
-    ///
     async fn update_logical_time_rcbs<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -393,7 +392,6 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Effects
     ///  - ends timeslice (mutating thread stats, end_of_timeslice)
     ///  - priority change / yield RPC
-    ///
     async fn end_timeslice<G: Guest<Self>>(&self, guest: &mut G) {
         let thread_state = guest.thread_state();
         let dettid = thread_state.dettid;

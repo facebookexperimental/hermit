@@ -287,7 +287,6 @@ pub type Microseconds = u64;
 /// without a tick occurring. For example, retired branches are a safe bet (any
 /// non-trivial amount of work will execute a branch), but system calls are not: a
 /// spinning thread can burn cycles forever without executing a syscall.
-///
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetTime {
     /// The syscalls issued by this thread.

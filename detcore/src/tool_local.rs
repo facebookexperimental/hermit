@@ -462,7 +462,6 @@ impl<T> ThreadState<T> {
     /// * `ty` - fd type (regular file, socket, pipe, etc..)
     ///
     /// * `stat` - stat returned from fstat
-    ///
     pub fn add_fd(
         &self,
         fd: RawFd,

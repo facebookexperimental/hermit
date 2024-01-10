@@ -41,7 +41,6 @@ use tracing::metadata::LevelFilter;
 ///
 /// The critical events are identified to the user by printing their stack traces, optionally into a
 /// separate report file.
-///
 #[derive(Debug, Parser, Clone)]
 pub struct AnalyzeOpts {
     /// Target: Analyze runs that have collected stdout output matching this regular expression.

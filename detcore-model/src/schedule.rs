@@ -232,7 +232,6 @@ impl From<Signal> for SigWrapper {
 ///   change this design by going to either extreme. (1) removing implicit O's and changing the
 ///   count mechanism to allow repetition of entire sequences "(O*B)^3" instead of "B^3".  Or (2),
 ///   including implicit O's in all event types, and not recording them explicitly.
-///
 #[derive(PartialEq, Debug, Eq, Copy, Clone, Hash, Serialize, Deserialize)]
 pub enum Op {
     /// A single retired conditional branch, corresponding to one increment of the RCB counter.

@@ -1477,7 +1477,6 @@ pub struct TraceSchedEventResponse {
 /// Arguments:
 /// - tag_end_rip: read the current guest registers to fill in the `end_rip` on the event with the
 ///   current instruction pointer.
-///
 pub async fn trace_schedevent<G, T>(guest: &mut G, ev: SchedEvent, tag_end_rip: bool)
 where
     G: Guest<Detcore<T>>,
