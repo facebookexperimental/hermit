@@ -30,7 +30,7 @@ path = "tests/time/mod.rs"
 [dependencies]
 anyhow = "1.0.75"
 async-trait = "0.1.71"
-bitflags = "2.4"
+bitflags = { version = "2.4", features = ["serde"] }
 chrono = { version = "0.4", features = ["clock", "serde", "std"], default-features = false }
 clap = { version = "3.2.25", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
 detcore-model = { version = "0.0.0", path = "../detcore-model" }
