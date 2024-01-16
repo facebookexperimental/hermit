@@ -17,7 +17,7 @@ use serde::Serialize;
 
 bitflags! {
     /// stx_attributes from statx, see linux/stat.h
-    #[derive(Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
     pub struct StatxAttributes: u64 {
         /// [I] File is compressed by the fs
         const STATX_ATTR_COMPRESSED = 0x4;
