@@ -15,5 +15,3 @@ mod rundata;
 mod types;
 
 pub use types::AnalyzeOpts;
-#[allow(unused_imports)]
-pub use types::Report;
