@@ -716,7 +716,6 @@ impl GlobalState {
         // TODO: eliminate this loop. Could instead signal with an ivar.
         let response_ivar = loop {
             tokio::task::yield_now().await;
-            let detpid = detpid;
             let mut sched = self.sched.lock().unwrap();
             // The resources that must be held for the fresh thread to run:
             let rsrcs = {

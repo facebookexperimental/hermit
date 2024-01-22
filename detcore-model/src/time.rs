@@ -329,6 +329,7 @@ impl Ord for DetTime {
     }
 }
 
+#[allow(clippy::non_canonical_partial_ord_impl)]
 impl PartialOrd for DetTime {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         let nanos = other.as_nanos();

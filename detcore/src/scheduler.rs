@@ -999,11 +999,7 @@ impl Scheduler {
             .next_turns
             .get(dettid)
             .expect("Missing next_turns entry");
-        let entry: &mut Vec<_> = self
-            .blocked
-            .futex_waiters
-            .entry(futexid)
-            .or_insert_with(Vec::new);
+        let entry: &mut Vec<_> = self.blocked.futex_waiters.entry(futexid).or_default();
         entry.push((*dettid, nxt.resp.clone()));
         // When we park, we use a resource request to signal WHAT we're blocking on.  But this is
         // not quite the same as when an active thread in the runqueue blocks on a resource, because

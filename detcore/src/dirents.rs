@@ -26,6 +26,7 @@ pub struct Dirent64 {
 }
 
 // sort by name, but "." < ".." <= ..
+#[allow(clippy::non_canonical_partial_ord_impl)]
 impl PartialOrd for Dirent64 {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         if self.name.as_bytes()[..2] == b".\0"[..] {

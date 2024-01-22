@@ -361,7 +361,7 @@ impl ThreadHistory {
 
     /// Return the priority of the initial timeslice after the thread starts running.
     pub fn initial_priority(&self) -> Priority {
-        if let Some((_ns, pr)) = self.prio_changes.get(0) {
+        if let Some((_ns, pr)) = self.prio_changes.first() {
             *pr
         } else {
             self.final_prio

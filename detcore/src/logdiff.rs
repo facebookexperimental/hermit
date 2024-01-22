@@ -340,7 +340,7 @@ fn diff_vecs(
         Ok(false)
     } else {
         let mut diff_count = 0;
-        for (_ix, ((oix, ox), (_, oy))) in v1.iter().zip(v2.iter()).enumerate() {
+        for ((oix, ox), (_, oy)) in v1.iter().zip(v2.iter()) {
             let (x, y) = if opts.strip_lines {
                 (strip_log_entry(ox), strip_log_entry(oy))
             } else {

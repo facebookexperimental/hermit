@@ -279,9 +279,7 @@ impl AnalyzeOpts {
                             ":: Knocked out only one preemption ({:?}), so concluding that one is critical.",
                             critical
                         );
-                        let entry = critical_preempts
-                            .entry(selected_tid)
-                            .or_insert_with(BTreeSet::new);
+                        let entry = critical_preempts.entry(selected_tid).or_default();
 
                         assert!(entry.insert(critical));
                         continue;

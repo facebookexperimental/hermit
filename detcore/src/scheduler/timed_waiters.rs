@@ -52,7 +52,7 @@ impl fmt::Display for TimedEvent {
 
 impl TimedEvents {
     pub fn insert(&mut self, ns: LogicalTime, dt: DetTid) {
-        let set = self.map.entry(ns).or_insert_with(BTreeSet::new);
+        let set = self.map.entry(ns).or_default();
         if !set.insert(TimedEvent::ThreadEvt(dt)) {
             panic!(
                 "TimedEvents::insert should not take a DetTid which is *already* in the set: {}",
@@ -72,7 +72,7 @@ impl TimedEvents {
         let old = self.alarm_times.insert(dp, ns);
         self.clear_old_alarm(old);
 
-        let set = self.map.entry(ns).or_insert_with(BTreeSet::new);
+        let set = self.map.entry(ns).or_default();
         let evt = TimedEvent::AlarmEvt(dp, dt, sig);
         if !set.insert(evt) {
             panic!(
