@@ -9,41 +9,40 @@
 //! Linux dirent64 helpers
 
 use std::cmp::Ordering;
-use std::ffi::CString;
 use std::ptr;
 
 use serde::Deserialize;
 use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct Dirent64 {
+pub struct Dirent64<'a> {
     pub(crate) ino: u64,
     pub(crate) off: i64,
     pub(crate) ty: u8,
     pub(crate) reclen: u16,
     /// null terminated c string, NB: multiple null bytes are expected!
-    pub(crate) name: CString,
+    pub(crate) name: &'a [u8],
 }
 
 // sort by name, but "." < ".." <= ..
 #[allow(clippy::non_canonical_partial_ord_impl)]
-impl PartialOrd for Dirent64 {
+impl<'a> PartialOrd for Dirent64<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        if self.name.as_bytes()[..2] == b".\0"[..] {
+        if self.name == b".\0" {
             Some(Ordering::Less)
-        } else if other.name.as_bytes()[..2] == b".\0"[..] {
+        } else if other.name == b".\0" {
             Some(Ordering::Greater)
-        } else if self.name.as_bytes()[..3] == b"..\0"[..] {
+        } else if self.name == b"..\0" {
             Some(Ordering::Less)
-        } else if other.name.as_bytes()[..3] == b"..\0"[..] {
+        } else if other.name == b"..\0" {
             Some(Ordering::Greater)
         } else {
-            self.name.partial_cmp(&other.name)
+            self.name.partial_cmp(other.name)
         }
     }
 }
 
-impl Ord for Dirent64 {
+impl<'a> Ord for Dirent64<'a> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.partial_cmp(other).unwrap()
     }
@@ -68,13 +67,12 @@ pub unsafe fn deserialize_dirents64(bytes: &[u8]) -> Vec<Dirent64> {
         let ty = ptr::read(dirp.offset(j).cast::<u8>());
         j += std::mem::size_of::<u8>() as isize;
         let name = std::slice::from_raw_parts(dirp.offset(j), 1 + reclen as usize - j as usize);
-        let name = Vec::from(name);
         let ent = Dirent64 {
             ino,
             off,
             reclen,
             ty,
-            name: CString::from_vec_with_nul_unchecked(name),
+            name,
         };
         res.push(ent);
         k += reclen as isize;
@@ -103,7 +101,7 @@ pub unsafe fn serialize_dirents64(dents: &[Dirent64], bytes: &mut [u8]) -> usize
         ptr::copy_nonoverlapping(
             ent.name.as_ptr() as *const u8,
             dirp.offset(j),
-            ent.name.as_bytes().len(),
+            ent.name.len(),
         );
         k += reclen as isize;
         i += 1;
@@ -128,7 +126,6 @@ pub unsafe fn deserialize_dirents(bytes: &[u8]) -> Vec<Dirent64> {
         let reclen = ptr::read(dirp.offset(j).cast::<u16>());
         j += std::mem::size_of::<u16>() as isize;
         let name = std::slice::from_raw_parts(dirp.offset(j), reclen as usize - j as usize);
-        let name = Vec::from(name);
         j = reclen as isize - 1;
         let ty = ptr::read(dirp.offset(j).cast::<u8>());
         let ent = Dirent64 {
@@ -136,7 +133,7 @@ pub unsafe fn deserialize_dirents(bytes: &[u8]) -> Vec<Dirent64> {
             off,
             reclen,
             ty,
-            name: CString::from_vec_with_nul_unchecked(name),
+            name,
         };
         res.push(ent);
         k += reclen as isize;
@@ -163,7 +160,7 @@ pub unsafe fn serialize_dirents(dents: &[Dirent64], bytes: &mut [u8]) -> usize {
         ptr::copy_nonoverlapping(
             ent.name.as_ptr() as *const u8,
             dirp.offset(j),
-            ent.name.as_bytes().len(),
+            ent.name.len(),
         );
         j = reclen as isize - 1;
         ptr::write(dirp.offset(j).cast::<u8>(), ent.ty);
@@ -177,8 +174,11 @@ pub unsafe fn serialize_dirents(dents: &[Dirent64], bytes: &mut [u8]) -> usize {
 mod test {
     use super::*;
 
+    #[repr(align(8))]
+    struct Aligned<T>(T);
+
     // getdents from my homedir
-    const HOME_DIRENTS: &[u8] = &[
+    const HOME_DIRENTS: &[u8] = &Aligned([
         0xf2, 0x5b, 0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x18, 0x00, 0x2e, 0x00, 0x00, 0x00, 0x00, 0x04, 0x1f, 0x11, 0x79, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x2e, 0x2e, 0x00,
@@ -390,10 +390,11 @@ mod test {
         0x36, 0xf2, 0xde, 0x04, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0x7f, 0x00, 0x00, 0x00,
         0x00, 0x20, 0x00, 0x2e, 0x76, 0x69, 0x6d, 0x69, 0x6e, 0x66, 0x6f, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x08,
-    ];
+    ])
+    .0;
 
     // getdents64 from my homedir
-    const HOME_DIRENTS64: &[u8] = &[
+    const HOME_DIRENTS64: &[u8] = &Aligned([
         0xf2, 0x5b, 0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x18, 0x00, 0x04, 0x2e, 0x00, 0x00, 0x00, 0x00, 0x1f, 0x11, 0x79, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x04, 0x2e, 0x2e,
@@ -605,7 +606,8 @@ mod test {
         0x57, 0xc8, 0xdb, 0x04, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0x7f, 0x00, 0x00, 0x00,
         0x00, 0x20, 0x00, 0x08, 0x2e, 0x6c, 0x65, 0x73, 0x73, 0x68, 0x73, 0x74, 0x00, 0x00, 0x00,
         0x00, 0x00,
-    ];
+    ])
+    .0;
 
     #[test]
     fn dents_can_deserialize_serialize() {

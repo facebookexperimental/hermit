@@ -966,24 +966,26 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(0);
         }
 
-        let mut cached_bytes = vec![0; nb as usize];
-        cached_bytes.reserve_exact(128);
+        let mut dents_bytes = vec![0; nb as usize];
+        dents_bytes.reserve_exact(128);
 
         guest
             .memory()
-            .read_exact(dirent.cast(), cached_bytes.as_mut_slice())?;
+            .read_exact(dirent.cast(), dents_bytes.as_mut_slice())?;
 
-        let mut dents = unsafe { deserialize_dirents(&cached_bytes) };
+        let mut dents = unsafe { deserialize_dirents(&dents_bytes) };
         dents.sort();
         for dent in &mut dents {
             let (d_ino, _) = determinize_inode(guest, dent.ino).await;
             dent.ino = d_ino;
         }
-        let _ = unsafe { serialize_dirents(&dents, cached_bytes.as_mut_slice()) };
+
+        let mut dents_bytes = vec![0; dents_bytes.len()];
+        let _ = unsafe { serialize_dirents(&dents, &mut dents_bytes) };
 
         guest
             .memory()
-            .write_exact(dirent.cast(), cached_bytes.as_slice())?;
+            .write_exact(dirent.cast(), dents_bytes.as_slice())?;
         Ok(nb)
     }
 
@@ -1004,24 +1006,26 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(0);
         }
 
-        let mut cached_bytes = vec![0; nb as usize];
-        cached_bytes.reserve_exact(128);
+        let mut dents_bytes = vec![0; nb as usize];
+        dents_bytes.reserve_exact(128);
 
         guest
             .memory()
-            .read_exact(dirent.cast(), cached_bytes.as_mut_slice())?;
+            .read_exact(dirent.cast(), dents_bytes.as_mut_slice())?;
 
-        let mut dents = unsafe { deserialize_dirents64(&cached_bytes) };
+        let mut dents = unsafe { deserialize_dirents64(&dents_bytes) };
         dents.sort();
         for dent in &mut dents {
             let (d_ino, _) = determinize_inode(guest, dent.ino).await;
             dent.ino = d_ino;
         }
-        let _ = unsafe { serialize_dirents64(&dents, cached_bytes.as_mut_slice()) };
+
+        let mut dents_bytes = vec![0; dents_bytes.len()];
+        let _ = unsafe { serialize_dirents64(&dents, &mut dents_bytes) };
 
         guest
             .memory()
-            .write_exact(dirent.cast(), cached_bytes.as_slice())?;
+            .write_exact(dirent.cast(), dents_bytes.as_slice())?;
         Ok(nb)
     }
 }
