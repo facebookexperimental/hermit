@@ -11,6 +11,7 @@
 use std::cmp::Ordering;
 use std::ptr;
 
+use libc::strlen;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -21,6 +22,9 @@ pub struct Dirent64<'a> {
     pub(crate) ty: u8,
     pub(crate) reclen: u16,
     /// null terminated c string, NB: multiple null bytes are expected!
+    /// We do not use the std::ffi::CStr because it enforces a check that
+    /// there are no interior null bytes, while Linux's own implementation
+    /// seems to provide multiple null bytes
     pub(crate) name: &'a [u8],
 }
 
@@ -99,9 +103,12 @@ pub unsafe fn serialize_dirents64(dents: &[Dirent64], bytes: &mut [u8]) -> usize
         j += std::mem::size_of::<u8>() as isize;
         let reclen = ent.reclen;
         ptr::copy_nonoverlapping(
-            ent.name.as_ptr() as *const u8,
+            ent.name.as_ptr(),
             dirp.offset(j),
-            ent.name.len(),
+            // NOTE: name is null-terminated with the man page
+            // explicitly warning against other methods to read
+            // d_name besides strlen(): https://man7.org/linux/man-pages/man3/readdir.3.html
+            strlen(ent.name.as_ptr() as *const i8),
         );
         k += reclen as isize;
         i += 1;
@@ -158,9 +165,9 @@ pub unsafe fn serialize_dirents(dents: &[Dirent64], bytes: &mut [u8]) -> usize {
         j += std::mem::size_of::<u16>() as isize;
         let reclen = ent.reclen;
         ptr::copy_nonoverlapping(
-            ent.name.as_ptr() as *const u8,
+            ent.name.as_ptr(),
             dirp.offset(j),
-            ent.name.len(),
+            strlen(ent.name.as_ptr() as *const i8),
         );
         j = reclen as isize - 1;
         ptr::write(dirp.offset(j).cast::<u8>(), ent.ty);
