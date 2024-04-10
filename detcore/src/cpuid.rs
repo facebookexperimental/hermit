@@ -40,7 +40,13 @@ const fn cpuid_result(eax: u32, ebx: u32, ecx: u32, edx: u32) -> CpuIdResult {
 // masked off to prevent non-determinism.
 const CPUIDS: &[CpuIdResult] = &[
     cpuid_result(0x0000000D, 0x756E6547, 0x6C65746E, 0x49656E69),
-    cpuid_result(0x00000663, 0x00000800, 0x90202001, 0x078BFBFD),
+    cpuid_result(
+        0x00000663,
+        0x00000800,
+        // These flags are required for x86-64-v2 support. Found via https://www.felixcloutier.com/x86/cpuid
+        0x90202001 | (1 << 0) | (1 << 9) | (1 << 13) | (1 << 19) | (1 << 20) | (1 << 23),
+        0x078BFBFD,
+    ),
     cpuid_result(0x00000001, 0x00000000, 0x0000004D, 0x002C307D),
     cpuid_result(0x00000000, 0x00000000, 0x00000000, 0x00000000),
     cpuid_result(0x00000120, 0x01C0003F, 0x0000003F, 0x00000001),
