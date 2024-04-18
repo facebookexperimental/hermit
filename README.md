@@ -1,7 +1,7 @@
 # Hermit: A reproducible container
 
 Hermit forces deterministic execution of arbitrary programs and acts like a
-reproducible container. That is, it *hermetically* isolates the program from
+reproducible container. That is, it _hermetically_ isolates the program from
 sources of non-determinism such as time, thread interleavings, random number
 generation, etc. Guaranteed determinism is a powerful tool and it serves as a
 basis for a number of applications, including concurrency stress testing,
@@ -12,6 +12,17 @@ Hermit cannot isolate the guest program from sources of non-determinism such as
 file system changes or external network responses. Instead, in order to provide
 complete determinism, the user should provide a fixed file system base image
 (e.g., with Docker) and disable external networking.
+
+> [!WARNING]
+>
+> Hermit is no longer under active development within Meta and is in maintenance
+> mode. There is a long tail of unsupported system calls that may cause your
+> program to fail while running under Hermit. Unfortunately, we (the team behind
+> this project) don't have the resources to triage issues, fix major bugs, or
+> add features at this point in time.
+>
+> If you are interested in this project and want to make contributions, please
+> submit a pull request. We will prioritize merging these over anything else.
 
 # How it works
 
@@ -52,6 +63,7 @@ Hermit is built with the standard Rust cargo tool.
 ```bash
 cargo build
 ```
+
 This builds the whole cargo workspace. The actual binary is located in target
 directory (`target/debug/hermit`).
 
@@ -82,15 +94,15 @@ hermit replay
 # Example programs
 
 See the [the examples folder](./examples/README.md) for example programs and
-instructions on how to run them.  These showcase different sources of
+instructions on how to run them. These showcase different sources of
 nondeterminism, and how hermit eliminates or controls them.
 
-In order to explore more advanced examples, you can look at some of
-the integration tests built from [./tests/](./tests/) or [./flaky-tests/](./flaky-tests/).
-For example, using the commands below you can run a racey example
-multiple times to see its nondeterminism.  Then run it under hermit to
-watch that nondeterminism disappear.  Then run it under hermit `--chaos`
-to bring that nondeterminism back, but in a controlled way that can be
+In order to explore more advanced examples, you can look at some of the
+integration tests built from [./tests/](./tests/) or
+[./flaky-tests/](./flaky-tests/). For example, using the commands below you can
+run a racey example multiple times to see its nondeterminism. Then run it under
+hermit to watch that nondeterminism disappear. Then run it under hermit
+`--chaos` to bring that nondeterminism back, but in a controlled way that can be
 reproduced based on the input seed.
 
 ```bash
@@ -106,9 +118,9 @@ done
 
 # The state of CI and testing
 
-At Meta, this repository is built using buck.  We have over 700 integration
-tests that run under this setup. But as of this initial release (2022-11-21), we
-have not ported these tests to an external build system yet.
+At Meta, this repository is built using buck. We have over 700 integration tests
+that run under this setup. But as of this initial release (2022-11-21), we have
+not ported these tests to an external build system yet.
 
 A few unit tests run under `cargo test`, but the integration tests are more
 complicated because they combine various run modes with each of the test
@@ -152,5 +164,4 @@ in this directory.
 
 # Support
 
-Hermit currently supports x86_64 Linux. Aarch64 support is a
-work in progress.
+Hermit currently supports x86_64 Linux. Aarch64 support is a work in progress.
