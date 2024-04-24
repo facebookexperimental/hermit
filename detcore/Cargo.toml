@@ -47,7 +47,7 @@ reverie = { version = "0.1.0", git = "https://github.com/facebookexperimental/re
 serde = { version = "1.0.185", features = ["derive", "rc"] }
 serde_json = { version = "1.0.100", features = ["float_roundtrip", "unbounded_depth"] }
 tempfile = "3.8"
-tokio = { version = "1.36.0", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.37.0", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.40", features = ["attributes"] }
 
 [dev-dependencies]
