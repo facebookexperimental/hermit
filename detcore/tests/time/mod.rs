@@ -13,7 +13,6 @@ use std::ptr;
 use std::time;
 
 use chrono::DateTime;
-use chrono::NaiveDateTime;
 use chrono::Utc;
 use detcore::types::NANOS_PER_RCB;
 use detcore::types::NANOS_PER_SYSCALL;
@@ -94,10 +93,7 @@ fn tod_gettimeofday() {
                 0
             );
             let tp = unsafe { tp.assume_init() };
-            let naive_time =
-                NaiveDateTime::from_timestamp_opt(tp.tv_sec, 1000 * tp.tv_usec as u32).unwrap();
-
-            let dt = naive_time.and_utc();
+            let dt = DateTime::from_timestamp(tp.tv_sec, 1000 * tp.tv_usec as u32).unwrap();
             // However exactly we compute logical time, this should be within a small
             // fraction of a (logical) second of epoch:
             assert!(diff_millis(dt, epoch) < 100);
@@ -115,9 +111,7 @@ fn raw_getimeofday_delta() {
             0
         );
         let tp = unsafe { tp.assume_init() };
-        let naive_time =
-            NaiveDateTime::from_timestamp_opt(tp.tv_sec, 1000 * tp.tv_usec as u32).unwrap();
-        naive_time.and_utc()
+        DateTime::from_timestamp(tp.tv_sec, 1000 * tp.tv_usec as u32).unwrap()
     };
     let dt2 = {
         let mut tp: MaybeUninit<libc::timeval> = MaybeUninit::uninit();
@@ -126,9 +120,7 @@ fn raw_getimeofday_delta() {
             0
         );
         let tp = unsafe { tp.assume_init() };
-        let naive_time =
-            NaiveDateTime::from_timestamp_opt(tp.tv_sec, 1000 * tp.tv_usec as u32).unwrap();
-        naive_time.and_utc()
+        DateTime::from_timestamp(tp.tv_sec, 1000 * tp.tv_usec as u32).unwrap()
     };
 
     let delta_ns = diff_nanos(dt1, dt2);
@@ -161,9 +153,7 @@ fn tod_time() {
         || {
             let t = unsafe { libc::time(&mut tloc as *mut i64) };
             assert_eq!(t, tloc);
-            let naive_time = NaiveDateTime::from_timestamp_opt(t, 0).unwrap();
-
-            let dt = naive_time.and_utc();
+            let dt = DateTime::from_timestamp(t, 0).unwrap();
             assert_eq!(dt.timestamp(), epoch.timestamp());
         },
         config,
@@ -189,10 +179,7 @@ fn tod_clock_gettime() {
                 0
             );
             let tp = unsafe { tp.assume_init() };
-            let naive_time =
-                NaiveDateTime::from_timestamp_opt(tp.tv_sec, tp.tv_nsec as u32).unwrap();
-
-            let dt = naive_time.and_utc();
+            let dt = DateTime::from_timestamp(tp.tv_sec, tp.tv_nsec as u32).unwrap();
             // However exactly we compute logical time, this should be within a small
             // fraction of a (logical) second of epoch:
             assert!(diff_millis(dt, epoch) < 100);
