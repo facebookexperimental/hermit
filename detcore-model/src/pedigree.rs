@@ -12,9 +12,7 @@ use std::fmt;
 use std::io;
 use std::mem;
 
-use bitvec::bitvec;
-use bitvec::order::Msb0;
-use bitvec::vec::BitVec;
+use bitvec::prelude::*;
 use libc::pid_t;
 use nix::unistd::Pid;
 use serde::Deserialize;
@@ -118,7 +116,7 @@ impl TryFrom<&Pedigree> for i32 {
         // Trim off any trailing P's from pedigree, i.e. viewing it as
         // a sequence of 'P' (parent) and 'C' (child) directions.
         let mut sequence = pedigree.raw();
-        while sequence.len() > 1 && sequence.last() == Some(&false) {
+        while sequence.len() > 1 && sequence.last().as_deref() == Some(&false) {
             sequence.pop();
         }
 
@@ -142,7 +140,7 @@ impl TryFrom<&Pedigree> for i32 {
             tree.append(&mut lower_tree);
 
             // Construct a BitVec which will be interpreted as a pid_t
-            let mut vpid_bits: BitVec<Msb0, u32> =
+            let mut vpid_bits: BitVec<u32, Msb0> =
                 BitVec::with_capacity(mem::size_of::<pid_t>() * 8);
 
             // pid_t is signed, so MSB must always be zero or it will be interpreted as error
@@ -152,22 +150,22 @@ impl TryFrom<&Pedigree> for i32 {
             // Pack the rest of the bits, using asserts to make sure the bitfield sizing
             // is correct. Any errors here are fatal bugs, so assert seems acceptable.
 
-            let mut tree_bits: BitVec<Msb0, u32> = BitVec::repeat(false, TREE_BITS - tree.len());
+            let mut tree_bits: BitVec<u32, Msb0> = BitVec::repeat(false, TREE_BITS - tree.len());
             tree_bits.append(&mut tree);
             debug_assert!(tree_bits.len() == TREE_BITS);
             vpid_bits.append(&mut tree_bits);
 
-            let mut run_index_bits = BitVec::<Msb0, u32>::from_element(index as u32);
+            let mut run_index_bits = BitVec::<u32, Msb0>::from_element(index as u32);
             run_index_bits = run_index_bits.split_off(run_index_bits.len() - RUN_INDEX_BITS);
             debug_assert!(run_index_bits.len() == RUN_INDEX_BITS);
             vpid_bits.append(&mut run_index_bits);
 
-            let mut run_type_bits: BitVec<Msb0, u32> = BitVec::new();
+            let mut run_type_bits: BitVec<u32, Msb0> = BitVec::new();
             run_type_bits.push(run[0]);
             debug_assert!(run_type_bits.len() == RUN_TYPE_BITS);
             vpid_bits.append(&mut run_type_bits);
 
-            let mut run_length_bits = BitVec::<Msb0, u32>::from_element(len as u32);
+            let mut run_length_bits = BitVec::<u32, Msb0>::from_element(len as u32);
             run_length_bits = run_length_bits.split_off(run_length_bits.len() - RUN_LENGTH_BITS);
             debug_assert!(run_length_bits.len() == RUN_LENGTH_BITS);
             vpid_bits.append(&mut run_length_bits);
