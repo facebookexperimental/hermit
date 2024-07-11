@@ -199,6 +199,7 @@ impl EnvPath {
 #[derive(Clone)]
 pub struct RunEnvironment {
     // Root directory for one run
+    #[allow(dead_code)]
     pub temp_dir: PathBuf,
 
     // Path to log file

@@ -84,12 +84,15 @@ pub type Seconds = u32;
 #[derive(Debug, Clone)]
 pub struct Action {
     /// Id for the action
+    #[allow(dead_code)]
     pub action_id: ActionID,
 
     /// The action's side effects are completed.
+    #[allow(dead_code)]
     pub completion: Ivar<()>,
 
     /// Which action gets the lock after me.
+    #[allow(dead_code)]
     pub successors: HashMap<ResourceID, ActionID>,
 }
 
@@ -232,6 +235,7 @@ pub struct Scheduler {
     pub next_turns: BTreeMap<DetTid, ThreadNextTurn>,
 
     /// The current set of actions in the background.
+    #[allow(dead_code)]
     pub bg_action_pool: HashMap<ActionID, Action>,
 
     /// The logical, global time consumed by actions that have been committed already.
@@ -242,6 +246,7 @@ pub struct Scheduler {
 
     /// Ac table of "locks held": which action is using which resources.
     /// A given resource can be held by at most one action at a given time.
+    #[allow(dead_code)]
     pub resources: HashMap<ResourceID, ActionID>,
 
     /// Initially false, set to true when the first thread is running.
@@ -726,6 +731,7 @@ pub struct ConsumeResult {
     /// Should we print the stacktrace in the guest, as per --stacktrace-event
     pub print_stack: MaybePrintStack,
     /// The number of this event in the global total order of events.
+    #[allow(dead_code)]
     pub event_ix: u64,
 }
 
