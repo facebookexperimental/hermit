@@ -523,17 +523,14 @@ impl GlobalState {
             }).clone();
             trace!(
                 "[detcore, dtid {}] ResourceRequest, filling request into {}",
-                &dettid,
-                &nextturn.req
+                &dettid, &nextturn.req
             );
             sched.request_put(&nextturn.req, rs.clone(), &self.global_time);
             nextturn.resp
         };
         trace!(
             "[detcore, dtid {}] waiting on {} for resources: {:?}",
-            dettid,
-            &resp2,
-            rs
+            dettid, &resp2, rs
         );
         let answer = resp2.get().await; // Block on the scheduler allowing our guest to proceed.
         if rs.resources.contains_key(&ResourceID::Exit(true)) {
@@ -564,8 +561,7 @@ impl GlobalState {
             SchedResponse::Go(Some(schedval)) => {
                 trace!(
                     "[dtid {}] resources granted, resuming normally: {:?}",
-                    dettid,
-                    rs
+                    dettid, rs
                 );
 
                 let endtime_update = match schedval {
@@ -747,8 +743,7 @@ impl GlobalState {
                 Entry::Occupied(entry) => {
                     trace!(
                         "[detcore, dtid {}] handling StartNewThread rpc.  Found next_turns entry (after {} tries)",
-                        from,
-                        tries
+                        from, tries
                     );
                     entry.get().clone()
                 }
@@ -848,8 +843,7 @@ impl GlobalState {
             SchedResponse::Go(answer) => {
                 trace!(
                     "[detcore, dtid {}] Unblocked from futex_wait! ({})",
-                    &dettid,
-                    &response_iv
+                    &dettid, &response_iv
                 );
                 answer
             }
@@ -872,10 +866,7 @@ impl GlobalState {
             .add_inode(ino, LogicalTime::from_nanos(nanos));
         trace!(
             "[detcore, dtid {}] resolved (raw) inode {:?} to {:?}, mtime {}",
-            from,
-            ino,
-            dino,
-            ns
+            from, ino, dino, ns
         );
         (dino, ns)
     }
@@ -899,9 +890,7 @@ impl GlobalState {
         };
         trace!(
             "[dtid {}] bumping mtime on file (rawinode {:?}) to {}",
-            from,
-            ino,
-            mtime,
+            from, ino, mtime,
         );
         let mut mg = self.inodes.lock().unwrap();
         let dino =
@@ -958,8 +947,7 @@ impl GlobalState {
             } = self.sched.lock().unwrap().consume_schedevent(&ev);
             trace!(
                 "keep_running :{}, end_of_timeslice: {:?}",
-                keep_running,
-                end_of_timeslice
+                keep_running, end_of_timeslice
             );
             let print_stack2 = self.record_event(&ev);
 
@@ -993,8 +981,7 @@ impl GlobalState {
             if let Some(sig) = &self.cfg.stacktrace_signal {
                 trace!(
                     "[dtid {}] signaling thread with {} at the point of stack trace printing.",
-                    ev.dettid,
-                    sig.0
+                    ev.dettid, sig.0
                 );
                 let tid = Pid::from_raw(ev.dettid.as_raw());
                 // TODO(T78538674): virtualize pid/tid:
@@ -1185,8 +1172,7 @@ where
         let detpid = guest.thread_state().detpid.expect("detpid unset");
         trace!(
             "[detcore, dtid {}] BLOCKING on resource_request rpc... {:?}",
-            &dettid,
-            r
+            &dettid, r
         );
         let resp =
             send_and_update_time(guest, GlobalRequest::RequestResources(r.clone(), detpid)).await;
@@ -1194,8 +1180,7 @@ where
             GlobalResponse::RequestResources(x) => {
                 trace!(
                     "[detcore, dtid {}] UNBLOCKED, acquired resources: {:?}",
-                    &dettid,
-                    r
+                    &dettid, r
                 );
                 x
             }
@@ -1507,8 +1492,7 @@ where
             .expect("memory read succeeds");
         trace!(
             "Tracing sched event, after which rip is {}, next two instruction bytes {:#06x}",
-            rip,
-            rip_contents
+            rip, rip_contents
         );
     }
 

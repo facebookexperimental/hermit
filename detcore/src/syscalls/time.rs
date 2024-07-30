@@ -229,8 +229,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let request = Self::sleep_request(guest, time).await;
                     trace!(
                         "nanosleep adding delta {:?} to yield request {:?}",
-                        time,
-                        &request
+                        time, &request
                     );
                     Self::wait_and_return(guest, request, call).await
                 } else {
@@ -246,8 +245,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         let request = Self::sleep_request_abs(guest, target_time).await;
                         trace!(
                             "nanosleep setting absolute time {:?} to yield request {:?}",
-                            target_time,
-                            &request
+                            target_time, &request
                         );
                         Self::wait_and_return(guest, request, call).await
                     } else {

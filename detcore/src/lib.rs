@@ -200,8 +200,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 } else {
                     trace!(
                         "[detcore, dtid {}] Refusing to record zero-braches event: {:?}",
-                        &ev.dettid,
-                        ev
+                        &ev.dettid, ev
                     );
                 }
                 if !precise_branch {
@@ -254,9 +253,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             if slice_end < now_ns {
                 trace!(
                     "prehook [dtid {}] Time {} is beyond end of slice {}",
-                    dettid,
-                    now_ns,
-                    slice_end
+                    dettid, now_ns, slice_end
                 );
                 self.end_timeslice(guest).await;
             }
@@ -295,9 +292,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // Rather, we go back to the scheduler and wait for our turn again.
                 trace!(
                     "posthook [dtid {}] Time {} beyond (or close enough to) end of slice {}! Ending slice.",
-                    dettid,
-                    current_time,
-                    slice_end
+                    dettid, current_time, slice_end
                 );
                 let current_slice = guest.thread_state().stats.timeslice_count;
                 self.end_timeslice(guest).await;
@@ -309,10 +304,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let current_time = guest.thread_state().thread_logical_time.as_nanos();
                 trace!(
                     "posthook [dtid {}] after ending timeslice T{}, next end is {}, current time {}",
-                    dettid,
-                    current_slice,
-                    slice_end,
-                    current_time,
+                    dettid, current_slice, slice_end, current_time,
                 );
             }
             if current_time + epsilon > slice_end {
@@ -345,9 +337,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
             trace!(
                 "posthook [dtid {}] After time consumed by handler/injection, {} remaining in slice ({} rcbs).",
-                dettid,
-                ns_remaining,
-                rcbs_remaining,
+                dettid, ns_remaining, rcbs_remaining,
             );
 
             if ns_remaining.is_zero() {
@@ -615,8 +605,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             let nanos = time.as_nanos();
             trace!(
                 "[dtid {}] inbound cpuid, new logical time: {:?}",
-                dettid,
-                time
+                dettid, time
             );
             if self.cfg.should_trace_schedevent() {
                 trace_schedevent(

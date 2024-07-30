@@ -510,8 +510,7 @@ impl GlobalTime {
         let newtime = newtime - self.starting_nanos;
         trace!(
             "[tid {}] ticked its global time component to {}",
-            tid,
-            newtime,
+            tid, newtime,
         );
         if let Some(old) = self.time_vector.insert(tid, newtime) {
             if old > newtime {

@@ -141,8 +141,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let init_val = guest.memory().read_value(ptr)?;
         trace!(
             "[detcore, dtid {}] futex op with memory address containing value {}",
-            &dettid,
-            init_val
+            &dettid, init_val
         );
 
         if !self.cfg.sequentialize_threads {
@@ -242,9 +241,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         let observed = guest.memory().read_value(ptr).unwrap();
                         trace!(
                             "[detcore, dtid {}] after (emulated) futex wait, memory value is {}, expected {}",
-                            &dettid,
-                            observed,
-                            expected,
+                            &dettid, observed, expected,
                         );
                         if expected == observed {
                             debug!(

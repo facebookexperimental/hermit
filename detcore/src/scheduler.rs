@@ -1038,9 +1038,7 @@ impl Scheduler {
         let pos = self.runqueue_push_back(waiterid);
         trace!(
             "[detcore] Woke one thread, dtid: {}, ivar {:p}, scheduled at position {}",
-            &waiterid,
-            &waiter_ivar,
-            pos,
+            &waiterid, &waiter_ivar, pos,
         );
         let nxt = self
             .next_turns
@@ -1447,8 +1445,7 @@ impl Scheduler {
         {
             trace!(
                 "[sched-step3] queue {:?}, io-blocked {:?}, next_turns: ",
-                &self.run_queue,
-                self.blocked.external_io_blockers
+                &self.run_queue, self.blocked.external_io_blockers
             );
             for (dtid, nxt) in self.next_turns.iter() {
                 trace!(" ==> dtid {}, req {}, resp {}", dtid, nxt.req, nxt.resp);
@@ -1479,8 +1476,7 @@ impl Scheduler {
         assert!(self.run_queue.remove_tid(dettid)); // Deschedule while we wait.
         trace!(
             "[dtid {}] after removal, run queue: {:?}",
-            dettid,
-            &self.run_queue
+            dettid, &self.run_queue
         );
         self.skip_turn()
     }
@@ -1521,8 +1517,7 @@ impl Scheduler {
                 .push_poller(dettid, self.get_priority(dettid), rs.poll_attempt);
             trace!(
                 "[dtid {}] after deprioritizing polling request, run queue: {:?}",
-                dettid,
-                &self.run_queue
+                dettid, &self.run_queue
             );
             self.upgrade_polled_to_runnable(dettid, rs); // Indicate the thread gets to run next time
             self.skip_turn()
@@ -1560,9 +1555,7 @@ impl Scheduler {
         debug_assert!(req.try_read().unwrap().is_ok()); // Ivar should be full
         trace!(
             "[dtid {}] Upgrading polled resource request in {} to runnable non-polled in {}",
-            dettid,
-            req,
-            runnable_req
+            dettid, req, runnable_req
         );
         *req = runnable_req;
     }
@@ -1580,17 +1573,13 @@ impl Scheduler {
                 if *target_ns <= self.committed_time {
                     trace!(
                         "[dtid {}] time-based action ready to execute, target time {} is before committed global time {}",
-                        dettid,
-                        target_ns,
-                        self.committed_time
+                        dettid, target_ns, self.committed_time
                     );
                     Ok(())
                 } else {
                     trace!(
                         "[dtid {}] time-based action not ready yet, registering waiter at future time {}. Current time is {}",
-                        dettid,
-                        target_ns,
-                        self.committed_time
+                        dettid, target_ns, self.committed_time
                     );
                     info!(
                         "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, SKIP dettid {} which wanted resource {:?} (blocking)",
@@ -1674,9 +1663,7 @@ impl Scheduler {
         }
         trace!(
             "[dettid {}] requeue: Priority mapping after change to priority {}: {:?}",
-            dettid,
-            new_priority,
-            self.priorities
+            dettid, new_priority, self.priorities
         );
     }
 
@@ -1717,9 +1704,7 @@ impl Scheduler {
         self.runqueue_push_back(dettid); // Repush with new priority
         trace!(
             "[dettid {}] changepoint: Priority mapping after change to priority {}: {:?}",
-            dettid,
-            new_priority,
-            self.priorities
+            dettid, new_priority, self.priorities
         );
 
         // Update request to be empty so the thread is unconditionally
@@ -1727,8 +1712,7 @@ impl Scheduler {
         let empty_req = Ivar::full(Ok(Resources::new(dettid)));
         trace!(
             "[dettid {}] Priority change point emplaced empty resource request at new {}",
-            dettid,
-            empty_req
+            dettid, empty_req
         );
         self.next_turns
             .get_mut(&dettid)
@@ -1879,8 +1863,7 @@ impl Scheduler {
         self.turn += 1;
         trace!(
             "[sched-step5] Guest unblocking (via {}); clear ivars for the next turn on dettid {}",
-            &resp,
-            &dtid
+            &resp, &dtid
         );
         let sig = self.is_signal_inbound(dtid); // Peek before we clear the ivars.
         self.clear_nextturn(dtid);
