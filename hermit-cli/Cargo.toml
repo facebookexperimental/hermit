@@ -16,7 +16,7 @@ detcore = { version = "0.0.0", path = "../detcore" }
 diff = "0.1"
 dirs = "2.0"
 edit-distance = { version = "0.0.0", path = "../common/edit-distance" }
-fbinit = { version = "0.1.2", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 goblin = "0.5.2"
 lazy_static = "1.4"
 libc = "0.2.139"
