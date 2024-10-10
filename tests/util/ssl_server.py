@@ -23,7 +23,7 @@ if len(sys.argv) > 1:
     sys.stderr.write("[server] Answering only " + str(requests) + " requests.\n")
 
 
-print("{}:{}".format(httpd.server_name, httpd.server_port), flush=True)
+print(f"{httpd.server_name}:{httpd.server_port}", flush=True)
 if requests > 0:
     for _i in range(0, requests):
         httpd.handle_request()

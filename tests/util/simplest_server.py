@@ -24,7 +24,7 @@ if len(sys.argv) > 1:
 
 with socketserver.TCPServer(("", 0), Hello) as server:
     address, port = server.server_address
-    print("{}:{}".format(address, port), flush=True)
+    print(f"{address}:{port}", flush=True)
     if requests > 0:
         for _i in range(0, requests):
             server.handle_request()

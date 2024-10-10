@@ -108,7 +108,7 @@ def yes_no(message):
     Prompts the user for a boolean.
     """
     while True:
-        s = input("{}? (Y/n): ".format(message)).lower()
+        s = input(f"{message}? (Y/n): ").lower()
         if not s or s == "y":
             return True
         if s == "n":
@@ -121,7 +121,7 @@ def gen_test(name, lang):
     try:
         name.mkdir(parents=True, exist_ok=False)
     except FileExistsError:
-        print("The test '{}' already exists.".format(name))
+        print(f"The test '{name}' already exists.")
         return
 
     if lang == "rust":
