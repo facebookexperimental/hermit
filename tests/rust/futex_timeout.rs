@@ -7,7 +7,6 @@
  */
 
 //! Wait on a futex with a timeout.
-use nix::errno::errno;
 use nix::errno::Errno;
 
 fn main() {
@@ -30,10 +29,10 @@ fn main() {
             0,   // val3 - ignored
         )
     };
-    let err = errno();
+    let err = Errno::last_raw();
     eprintln!(
         "Main thread: futex wait timed out and returned {}, errno {:?}",
         res,
-        Errno::from_i32(err)
+        Errno::from_raw(err)
     );
 }

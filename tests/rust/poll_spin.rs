@@ -8,22 +8,23 @@
 
 /*!
 
- Spin poll() repeatedly until it succeeds.  Intentionally nondeterministic to stress determinization.
+Spin poll() repeatedly until it succeeds.  Intentionally nondeterministic to stress determinization.
 
- Run with rust-script if you like:
+Run with rust-script if you like:
 
- ```cargo
- [dependencies]
- nix = "0.20.0"
- tempfile = "3.2.0"
+```cargo
+[dependencies]
+nix = "0.20.0"
+tempfile = "3.2.0"
 
- [build]
- target = "x86_64-unknown-linux-musl"
+[build]
+target = "x86_64-unknown-linux-musl"
 
- [target.x86_64-unknown-linux-musl]
- ```
+[target.x86_64-unknown-linux-musl]
+```
 
 */
+use std::os::fd::AsFd;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -33,6 +34,7 @@ use std::time;
 use nix::poll::poll;
 use nix::poll::PollFd;
 use nix::poll::PollFlags;
+use nix::poll::PollTimeout;
 use nix::unistd;
 
 fn main() {
@@ -44,9 +46,9 @@ fn main() {
         loop {
             work = u64::max(2 * work, 10 ^ 9);
             // let poll1 = PollFd::new(fdread.as_raw_fd(), PollFlags::POLLIN);
-            let poll1 = PollFd::new(fdread, PollFlags::POLLIN);
+            let poll1 = PollFd::new(fdread.as_fd(), PollFlags::POLLIN);
             let mut slice = [poll1];
-            let res = poll(&mut slice, 0); // 0 timeout
+            let res = poll(&mut slice, PollTimeout::ZERO); // 0 timeout
             println!(
                 "Poll result: {:?}, (count {})",
                 res,
@@ -62,7 +64,6 @@ fn main() {
                 break;
             }
         }
-        assert!(unistd::close(fdread).is_ok());
     });
 
     while count2.load(Ordering::SeqCst) == 0 {
@@ -71,8 +72,8 @@ fn main() {
 
     println!("Parent writing to pipe..");
     let msg = "hello world\n";
-    assert_eq!(unistd::write(fdwrite, msg.as_bytes()), Ok(12));
-    assert!(unistd::close(fdwrite).is_ok());
+    assert_eq!(unistd::write(&fdwrite, msg.as_bytes()), Ok(12));
+    drop(fdwrite);
 
     println!("Joining child..");
     handle.join().unwrap();

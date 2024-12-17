@@ -7,6 +7,7 @@
  */
 
 // RUN: %me
+use std::os::fd::AsRawFd;
 
 use nix::fcntl::openat;
 use nix::fcntl::OFlag;
@@ -14,12 +15,13 @@ use nix::sys::stat::Mode;
 
 fn main() {
     let (fd3, fd4) = nix::unistd::pipe().unwrap();
-    assert_eq!(fd4, fd3 + 1);
+    assert_eq!(fd4.as_raw_fd(), fd3.as_raw_fd() + 1);
 
-    let _ = nix::unistd::close(fd3);
+    let fd3_raw = fd3.as_raw_fd();
+    drop(fd3);
 
     assert_eq!(
-        openat(libc::AT_FDCWD, "/dev/null", OFlag::O_RDONLY, Mode::S_IRUSR),
-        Ok(fd3)
+        openat(None, "/dev/null", OFlag::O_RDONLY, Mode::S_IRUSR),
+        Ok(fd3_raw)
     );
 }

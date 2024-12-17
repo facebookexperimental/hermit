@@ -18,7 +18,7 @@ fn main() {
     let _ = nix::unistd::close(0);
 
     assert_eq!(
-        openat(libc::AT_FDCWD, "/dev/null", OFlag::O_RDONLY, Mode::S_IRUSR),
+        openat(None, "/dev/null", OFlag::O_RDONLY, Mode::S_IRUSR),
         Ok(0)
     );
 }

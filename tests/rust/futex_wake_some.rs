@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 /// Multiple threads wait on a futex, some are woken but not all.
 use libc::c_long;
-use nix::errno::errno;
 use nix::errno::Errno;
 
 const TOTAL: i64 = 4;
@@ -50,7 +49,7 @@ fn main() {
                 println!(
                     "UNLIKELY: child thread {} issued wait after wake already happened, errno {}",
                     ix,
-                    Errno::from_i32(errno())
+                    Errno::from_raw(Errno::last_raw())
                 );
             }
         });

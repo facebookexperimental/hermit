@@ -24,16 +24,17 @@
 */
 use std::fs;
 use std::io::Write;
-use std::os::unix::io::AsRawFd;
+use std::os::fd::AsFd;
 
 use nix::poll::poll;
 use nix::poll::PollFd;
 use nix::poll::PollFlags;
+use nix::poll::PollTimeout;
 use tempfile::tempdir;
 
 fn main() {
     println!("Empty poll to sleep 300ms:");
-    poll(&mut [], 300).expect("poll failed");
+    poll(&mut [], 300u16).expect("poll failed");
     println!("Finished empty poll.");
 
     {
@@ -47,16 +48,16 @@ fn main() {
             file2.write_all(b"text2").unwrap();
         }
 
-        for timeout in &[-1, 0, 300] {
+        for timeout in &[PollTimeout::NONE, PollTimeout::ZERO, 300u16.into()] {
             let file1 = fs::File::open(&path1).unwrap();
             let file2 = fs::File::open(&path2).unwrap();
-            let poll1 = PollFd::new(file1.as_raw_fd(), PollFlags::all());
-            let poll2 = PollFd::new(file2.as_raw_fd(), PollFlags::empty());
+            let poll1 = PollFd::new(file1.as_fd(), PollFlags::all());
+            let poll2 = PollFd::new(file2.as_fd(), PollFlags::empty());
             let mut slice = [poll1, poll2];
 
             println!(
-                "\nPoll on two created temp files, fds {:?}, timeout={}:",
-                slice, timeout
+                "\nPoll on two created temp files, fds {:?}, timeout={:?}:",
+                slice, timeout,
             );
             let events = poll(&mut slice, *timeout).expect("poll failed");
             println!("Done poll.");

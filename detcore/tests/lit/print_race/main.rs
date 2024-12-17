@@ -9,16 +9,17 @@
 // RUN: %me | FileCheck %s
 // CHECK: {{([ab]+)}}
 // CHECK-EMPTY:
+use std::os::fd::BorrowedFd;
 
 fn main() {
     let child = std::thread::spawn(move || {
         for _ in 0..200 {
-            nix::unistd::write(1, b"a").unwrap();
+            nix::unistd::write(unsafe { BorrowedFd::borrow_raw(1) }, b"a").unwrap();
         }
     });
     for _ in 0..200 {
-        nix::unistd::write(1, b"b").unwrap();
+        nix::unistd::write(unsafe { BorrowedFd::borrow_raw(1) }, b"b").unwrap();
     }
     child.join().unwrap();
-    nix::unistd::write(1, b"\n").unwrap();
+    nix::unistd::write(unsafe { BorrowedFd::borrow_raw(1) }, b"\n").unwrap();
 }
