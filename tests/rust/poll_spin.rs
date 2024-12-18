@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time;
 
+use close_err::Closable;
 use nix::poll::poll;
 use nix::poll::PollFd;
 use nix::poll::PollFlags;
@@ -64,6 +65,7 @@ fn main() {
                 break;
             }
         }
+        fdread.close().expect("close failed");
     });
 
     while count2.load(Ordering::SeqCst) == 0 {
@@ -73,7 +75,7 @@ fn main() {
     println!("Parent writing to pipe..");
     let msg = "hello world\n";
     assert_eq!(unistd::write(&fdwrite, msg.as_bytes()), Ok(12));
-    drop(fdwrite);
+    fdwrite.close().expect("close failed");
 
     println!("Joining child..");
     handle.join().unwrap();

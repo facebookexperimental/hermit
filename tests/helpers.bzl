@@ -212,6 +212,7 @@ def hermit_rust_test(path, raw, run, no_sequentialize_threads, no_deterministic_
         srcs = [path, paths.dirname(path) + "/test_utils/mod.rs"],
         crate_root = path,
         deps = [
+            "fbsource//third-party/rust:close-err",
             "fbsource//third-party/rust:libc",
             "fbsource//third-party/rust:nix",
             "fbsource//third-party/rust:tempfile",

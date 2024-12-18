@@ -9,6 +9,7 @@
 use std::os::fd::AsRawFd;
 use std::str;
 
+use close_err::Closable;
 use nix::unistd;
 
 fn main() {
@@ -19,7 +20,7 @@ fn main() {
             assert_eq!(unistd::read(fdread.as_raw_fd(), &mut buf), Ok(14));
             println!("Child received message: {}", str::from_utf8(&buf).unwrap());
         }
-        drop(fdread);
+        fdread.close().expect("close failed");
     });
 
     for ix in 10..20 {
@@ -27,7 +28,7 @@ fn main() {
         let msg = format!("hello world {}", ix);
         assert_eq!(unistd::write(&fdwrite, msg.as_bytes()), Ok(14));
     }
-    drop(fdwrite);
+    fdwrite.close().expect("close failed");
 
     println!("Joining child..");
     handle.join().unwrap();

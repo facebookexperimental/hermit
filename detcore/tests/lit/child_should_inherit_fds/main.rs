@@ -12,6 +12,7 @@
 
 use std::os::fd::AsRawFd;
 
+use close_err::Closable;
 use nix::sys::wait::waitpid;
 use nix::sys::wait::WaitStatus;
 use nix::unistd::fork;
@@ -25,7 +26,7 @@ fn main() {
     let msg: [u8; 8] = [0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8];
     match unsafe { fork().unwrap() } {
         ForkResult::Parent { child, .. } => {
-            drop(fdwrite);
+            fdwrite.close().expect("close failed");
             let mut buf: [u8; 8] = [0; 8];
             // XXX: The following SYS_read would timeout due to detcore issue.
             // add a 5 seconds timeout to abort.
@@ -36,7 +37,7 @@ fn main() {
             unsafe { libc::syscall(libc::SYS_exit_group, 0) };
         }
         ForkResult::Child => {
-            drop(fdread);
+            fdread.close().expect("close failed");
             assert_eq!(write(&fdwrite, &msg), Ok(8));
             unsafe { libc::syscall(libc::SYS_exit_group, 0) };
         }

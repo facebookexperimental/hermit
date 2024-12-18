@@ -9,6 +9,7 @@
 // RUN: %me
 use std::os::fd::AsRawFd;
 
+use close_err::Closable;
 use nix::fcntl::openat;
 use nix::fcntl::OFlag;
 use nix::sys::stat::Mode;
@@ -18,7 +19,7 @@ fn main() {
     assert_eq!(fd4.as_raw_fd(), fd3.as_raw_fd() + 1);
 
     let fd3_raw = fd3.as_raw_fd();
-    drop(fd3);
+    fd3.close().expect("close failed");
 
     assert_eq!(
         openat(None, "/dev/null", OFlag::O_RDONLY, Mode::S_IRUSR),

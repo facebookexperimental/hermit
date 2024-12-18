@@ -9,6 +9,7 @@
 // RUN: %me
 use std::os::fd::AsRawFd;
 
+use close_err::Closable;
 use nix::sys::wait::waitpid;
 use nix::sys::wait::WaitStatus;
 use nix::unistd::alarm;
@@ -26,7 +27,7 @@ fn main() {
 
     match unsafe { fork().unwrap() } {
         ForkResult::Parent { child, .. } => {
-            drop(fdwrite);
+            fdwrite.close().expect("close failed");
             let mut buf = [0u8; 8];
 
             // If the file descriptor newfd was previously open,
@@ -45,7 +46,7 @@ fn main() {
             assert_eq!(waitpid(child, None), Ok(WaitStatus::Exited(child, 0)));
         }
         ForkResult::Child => {
-            drop(fdread);
+            fdread.close().expect("close failed");
             assert_eq!(write(fdwrite, &msg), Ok(msg.len()));
         }
     }

@@ -16,6 +16,7 @@
 use std::os::fd::AsRawFd;
 use std::ptr;
 
+use close_err::Closable;
 use nix::errno::Errno;
 use nix::fcntl::OFlag;
 use nix::sys::stat::fstat;
@@ -46,7 +47,7 @@ fn main() {
 
     match unsafe { fork().unwrap() } {
         ForkResult::Parent { child, .. } => {
-            drop(fdwrite);
+            fdwrite.close().expect("close failed");
 
             let mut msg = [0u8; 4];
 
@@ -59,7 +60,7 @@ fn main() {
             assert_eq!(waitpid(child, None), Ok(WaitStatus::Exited(child, 0)));
         }
         ForkResult::Child => {
-            drop(fdread);
+            fdread.close().expect("close failed");
 
             let proc_self = "/proc/self/exe\0".as_ptr() as *const libc::c_char;
 
