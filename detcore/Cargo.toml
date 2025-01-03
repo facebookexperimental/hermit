@@ -24,7 +24,7 @@ name = "tests_time"
 path = "tests/time/mod.rs"
 
 [dependencies]
-anyhow = "1.0.86"
+anyhow = "1.0.95"
 async-trait = "0.1.71"
 bitflags = { version = "2.6", features = ["serde"] }
 chrono = { version = "0.4", features = ["clock", "serde", "std"], default-features = false }
