@@ -34,7 +34,7 @@ digest = { version = "0.0.0", path = "../common/digest" }
 futures = { version = "0.3.30", features = ["async-await", "compat"] }
 lazy_static = "1.4"
 libc = "0.2.139"
-nix = { version = "0.29.0", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "term", "time", "user", "zerocopy"] }
+nix = { version = "0.29.0", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 pretty = "0.12.1"
 pretty_assertions = { version = "1.2", features = ["alloc"], default-features = false }
 procfs = "0.15.1"

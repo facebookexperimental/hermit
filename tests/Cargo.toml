@@ -164,6 +164,6 @@ path = "standalone/stacktrace_events.rs"
 close-err = "1.0.2"
 detcore = { version = "0.0.0", path = "../detcore" }
 libc = "0.2.139"
-nix = { version = "0.29.0", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "term", "time", "user", "zerocopy"] }
+nix = { version = "0.29.0", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 regex = "1.9.2"
 tempfile = "3.8"
