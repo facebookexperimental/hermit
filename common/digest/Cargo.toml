@@ -8,6 +8,6 @@ repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"
 
 [dependencies]
-hex = "0.4.3"
+hex = { version = "0.4.3", features = ["alloc"] }
 serde = { version = "1.0.185", features = ["derive", "rc"] }
 sha2 = "0.10.6"
