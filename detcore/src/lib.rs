@@ -8,7 +8,6 @@
 
 //! Detcore is a Reverie tool that determinizes the execution of a process.
 
-#![feature(async_closure)]
 #![feature(nonzero_ops)]
 #![deny(clippy::all)]
 #![deny(missing_docs)]
