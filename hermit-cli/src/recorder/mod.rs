@@ -14,8 +14,6 @@ mod time;
 
 use std::path::PathBuf;
 
-use reverie::syscalls::Syscall;
-use reverie::syscalls::Sysno;
 use reverie::Errno;
 use reverie::Error;
 use reverie::GlobalTool;
@@ -26,6 +24,8 @@ use reverie::RdtscResult;
 use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
+use reverie::syscalls::Syscall;
+use reverie::syscalls::Sysno;
 use serde::Deserialize;
 use serde::Serialize;
 

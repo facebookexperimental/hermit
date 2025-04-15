@@ -6,9 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use reverie::syscalls::family::StatFamily;
-use reverie::syscalls::family::WriteFamily;
-use reverie::syscalls::ioctl;
+use reverie::Errno;
+use reverie::Guest;
 use reverie::syscalls::Getdents;
 use reverie::syscalls::Getdents64;
 use reverie::syscalls::Ioctl;
@@ -18,8 +17,9 @@ use reverie::syscalls::Read;
 use reverie::syscalls::Readlink;
 use reverie::syscalls::Statx;
 use reverie::syscalls::Syscall;
-use reverie::Errno;
-use reverie::Guest;
+use reverie::syscalls::family::StatFamily;
+use reverie::syscalls::family::WriteFamily;
+use reverie::syscalls::ioctl;
 
 use super::Replayer;
 

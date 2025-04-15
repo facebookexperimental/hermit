@@ -10,23 +10,23 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use reverie::ExitStatus;
 use reverie::process::Command;
 use reverie::process::Mount;
 use reverie::process::Output;
 use reverie::process::Stdio;
-use reverie::ExitStatus;
 
+use crate::Shebang;
 use crate::chroot::TempChroot;
 use crate::consts::EXE_NAME;
 use crate::consts::METADATA_NAME;
 use crate::error::Context;
 use crate::error::Error;
 use crate::interp;
-use crate::metadata::record_or_replay_config;
 use crate::metadata::Metadata;
 use crate::metadata::RECORD_VERSION;
+use crate::metadata::record_or_replay_config;
 use crate::replayer::Replayer;
-use crate::Shebang;
 
 type ReplayTool = detcore::Detcore<Replayer>;
 type Tracer = reverie_ptrace::Tracer<detcore::GlobalState>;

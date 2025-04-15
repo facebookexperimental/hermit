@@ -6,11 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use reverie::syscalls::Syscall;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Subscription;
 use reverie::Tool;
+use reverie::syscalls::Syscall;
 use serde::Deserialize;
 use serde::Serialize;
 

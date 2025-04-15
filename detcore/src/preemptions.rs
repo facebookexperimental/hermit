@@ -19,11 +19,11 @@ use serde::Deserialize;
 use serde::Serialize;
 use tracing::trace;
 
-use crate::scheduler::runqueue::is_ordinary_priority;
+use crate::scheduler::Priority;
 use crate::scheduler::runqueue::DEFAULT_PRIORITY;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
 use crate::scheduler::runqueue::LAST_PRIORITY;
-use crate::scheduler::Priority;
+use crate::scheduler::runqueue::is_ordinary_priority;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 use crate::types::SchedEvent;

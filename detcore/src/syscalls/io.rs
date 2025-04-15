@@ -12,11 +12,11 @@
 
 use std::time::Duration;
 
+use reverie::Error;
+use reverie::Guest;
 use reverie::syscalls;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
-use reverie::Error;
-use reverie::Guest;
 use tracing::debug;
 use tracing::trace;
 
@@ -26,9 +26,9 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
+use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
-use crate::syscalls::helpers::NonblockableSyscall;
 use crate::tool_global::*;
 use crate::tool_local::Detcore;
 

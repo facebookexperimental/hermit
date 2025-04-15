@@ -15,13 +15,13 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use anyhow::bail;
 use anyhow::Context;
+use anyhow::bail;
 use clap::Parser;
 use colored::Colorize;
-use detcore::preemptions::strip_times_from_events_file;
 use detcore::preemptions::PreemptionReader;
 use detcore::preemptions::PreemptionRecord;
+use detcore::preemptions::strip_times_from_events_file;
 use detcore::types::SchedEvent;
 use hermit::process::Bind;
 use reverie::process::Output;

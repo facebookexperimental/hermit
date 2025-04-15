@@ -10,10 +10,10 @@ use core::ops::Add;
 
 use nix::sys::time::TimeSpec;
 use nix::sys::time::TimeValLike;
+use nix::time::ClockId;
 use nix::time::clock_getres;
 use nix::time::clock_gettime;
 use nix::time::clock_settime;
-use nix::time::ClockId;
 
 fn main() {
     let clockids: [(&str, ClockId); 10] = [

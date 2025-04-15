@@ -9,9 +9,9 @@
 // RUN: %me
 
 use nix::unistd::Pid;
-use syscalls::syscall;
 use syscalls::Errno;
 use syscalls::Sysno;
+use syscalls::syscall;
 
 fn raw_sched_getaffinity<const N: usize>() -> Result<(), Errno> {
     let mut buf = [0u8; N];

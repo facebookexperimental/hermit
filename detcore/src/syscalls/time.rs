@@ -9,16 +9,16 @@
 //! System calls for dealing with threads and concurrency.
 use std::time::Duration;
 
+use reverie::Error;
+use reverie::Guest;
+use reverie::Stack;
 use reverie::syscalls;
-use reverie::syscalls::family::NanosleepFamily;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::Timeval;
-use reverie::Error;
-use reverie::Guest;
-use reverie::Stack;
+use reverie::syscalls::family::NanosleepFamily;
 use tracing::error;
 use tracing::info;
 use tracing::trace;
@@ -27,11 +27,11 @@ use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
-use crate::scheduler::entropy_to_priority;
 use crate::scheduler::Priority;
+use crate::scheduler::entropy_to_priority;
+use crate::tool_global::ResumeStatus;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
-use crate::tool_global::ResumeStatus;
 use crate::tool_local::Detcore;
 use crate::types::LogicalTime;
 

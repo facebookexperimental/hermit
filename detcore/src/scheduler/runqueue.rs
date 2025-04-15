@@ -49,9 +49,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Display;
 
-use rand::distributions::uniform::SampleUniform;
 use rand::Rng;
 use rand::SeedableRng;
+use rand::distributions::uniform::SampleUniform;
 use rand_pcg::Pcg64Mcg;
 
 use crate::config::SchedHeuristic;

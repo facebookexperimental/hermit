@@ -20,9 +20,9 @@
  */
 
 use core::arch::x86_64::_rdtsc;
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
-use std::sync::Arc;
 
 #[inline(always)]
 fn rdtsc() -> u64 {

@@ -9,9 +9,9 @@
 //! One of the simplest possible race conditions.
 //! Exits with a nonzero code under one order, and not the other.
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
-use std::sync::Arc;
 
 #[inline(never)]
 fn thread1(var: Arc<AtomicUsize>) {

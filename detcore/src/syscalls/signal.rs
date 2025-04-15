@@ -11,27 +11,27 @@
 use std::time::Duration;
 
 use nix::sys::signal::Signal;
-use reverie::syscalls;
-use reverie::syscalls::AddrMut;
-use reverie::syscalls::MemoryAccess;
-use reverie::syscalls::Timespec;
 use reverie::Errno;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
+use reverie::syscalls;
+use reverie::syscalls::AddrMut;
+use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Timespec;
 use tracing::info;
 
+use crate::Detcore;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
+use crate::tool_global::ResumeStatus;
 use crate::tool_global::register_alarm;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
-use crate::tool_global::ResumeStatus;
 use crate::types::LogicalTime;
-use crate::Detcore;
 
 // NB: note kernel has different notation of sigaction, we cannot
 // use libc's sigaction here unfortunately. See:

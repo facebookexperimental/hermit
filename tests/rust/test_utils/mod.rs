@@ -8,9 +8,9 @@
 
 use std::io;
 use std::io::Write;
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 pub const NANOS_PER_SEC: i64 = 1_000_000_000;
 

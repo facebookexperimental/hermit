@@ -21,14 +21,14 @@
 //! in order to get a blank memory map of the right size. We can then fill this
 //! with the previously recorded bytes.
 
+use reverie::Errno;
+use reverie::Guest;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Mmap;
 use reverie::syscalls::Mprotect;
 use reverie::syscalls::ProtFlags;
-use reverie::Errno;
-use reverie::Guest;
 
 use super::Replayer;
 

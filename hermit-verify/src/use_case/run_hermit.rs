@@ -10,10 +10,10 @@ use std::os::unix::prelude::ExitStatusExt;
 
 use colored::Colorize;
 
+use crate::CommonOpts;
 use crate::cli_wrapper::build_hermit_cmd;
 use crate::cli_wrapper::display_cmd;
 use crate::common::RunEnvironment;
-use crate::CommonOpts;
 
 pub fn output_stdout(run: &RunEnvironment) -> anyhow::Result<()> {
     println!(":: ------------------Stdout----------------------");

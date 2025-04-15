@@ -8,14 +8,14 @@
 
 //! Handles poll, ppoll, epoll, and select system calls.
 
-use reverie::syscalls::family::SockOptFamily;
+use reverie::Errno;
+use reverie::Guest;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Poll;
 use reverie::syscalls::PollFd;
 use reverie::syscalls::Recvfrom;
 use reverie::syscalls::Syscall;
-use reverie::Errno;
-use reverie::Guest;
+use reverie::syscalls::family::SockOptFamily;
 
 use super::Recorder;
 use crate::event::PollEvent;

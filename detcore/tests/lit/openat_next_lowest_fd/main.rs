@@ -10,8 +10,8 @@
 use std::os::fd::AsRawFd;
 
 use close_err::Closable;
-use nix::fcntl::openat;
 use nix::fcntl::OFlag;
+use nix::fcntl::openat;
 use nix::sys::stat::Mode;
 
 fn main() {

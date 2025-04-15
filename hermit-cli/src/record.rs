@@ -9,16 +9,16 @@
 use std::fs;
 use std::path::Path;
 
+use reverie::ExitStatus;
 use reverie::process::Command;
 use reverie::process::Output;
-use reverie::ExitStatus;
 
 use crate::consts::EXE_NAME;
 use crate::consts::METADATA_NAME;
 use crate::error::Context;
 use crate::error::Error;
-use crate::metadata::record_or_replay_config;
 use crate::metadata::Metadata;
+use crate::metadata::record_or_replay_config;
 use crate::recorder::Recorder;
 
 type RecordTool = detcore::Detcore<Recorder>;

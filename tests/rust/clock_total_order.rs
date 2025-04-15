@@ -8,17 +8,17 @@
 
 //! Look at total order of clock_gettime across threads
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::thread;
 
 // use nix::sys::time::TimeSpec;
 use nix::sys::time::TimeValLike;
-// use nix::time::clock_getres;
-use nix::time::clock_gettime;
 // use nix::time::clock_settime;
 use nix::time::ClockId;
+// use nix::time::clock_getres;
+use nix::time::clock_gettime;
 
 /// Absolute nanoseconds.
 type Tm = u128;

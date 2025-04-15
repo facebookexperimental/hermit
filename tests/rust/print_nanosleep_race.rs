@@ -10,9 +10,9 @@
 
 use std::io;
 use std::io::Write;
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 fn run_test() -> u64 {
     let flag = Arc::new(AtomicUsize::new(0));

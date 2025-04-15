@@ -8,8 +8,8 @@
 
 // RUN: %me
 
-use nix::fcntl::openat;
 use nix::fcntl::OFlag;
+use nix::fcntl::openat;
 use nix::sys::stat::Mode;
 
 fn main() {

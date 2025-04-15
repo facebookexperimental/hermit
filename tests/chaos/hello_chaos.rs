@@ -8,9 +8,9 @@
 
 // This simply tests that two schedules are possible with two threads and no dummy work.
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
-use std::sync::Arc;
 
 fn main() {
     let d = Arc::new(AtomicUsize::new(0));

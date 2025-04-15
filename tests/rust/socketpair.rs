@@ -8,10 +8,10 @@
 
 use std::os::fd::AsRawFd;
 
-use nix::sys::socket::socketpair;
 use nix::sys::socket::AddressFamily;
 use nix::sys::socket::SockFlag;
 use nix::sys::socket::SockType;
+use nix::sys::socket::socketpair;
 
 fn main() {
     if matches!(std::env::var("HERMIT_MODE"), Ok(mode) if mode == "record") {

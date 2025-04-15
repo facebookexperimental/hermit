@@ -11,6 +11,9 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use reverie::Error;
+use reverie::Guest;
+use reverie::Pid;
 use reverie::syscalls;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
@@ -20,14 +23,12 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::WaitPidFlag;
-use reverie::Error;
-use reverie::Guest;
-use reverie::Pid;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::trace;
 
+use crate::FileMetadata;
 use crate::config::BlockingMode;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
@@ -37,15 +38,14 @@ use crate::scheduler::SchedValue;
 use crate::syscalls::helpers::nanos_duration_to_absolute_timeout;
 use crate::syscalls::helpers::retry_nonblocking_syscall;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
+use crate::tool_global::FutexAction;
 use crate::tool_global::create_child_thread;
 use crate::tool_global::futex_action;
 use crate::tool_global::resource_request;
-use crate::tool_global::FutexAction;
 use crate::tool_local::Detcore;
 use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
-use crate::FileMetadata;
 
 impl<T: RecordOrReplay> Detcore<T> {
     /// Clone, clone3, fork, vfork system calls

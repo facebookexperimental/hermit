@@ -9,11 +9,11 @@
 use digest::Digest;
 pub use procfs::process::MMapPath;
 pub use procfs::process::MemoryMap;
-use reverie::syscalls::Addr;
-use reverie::syscalls::MemoryAccess;
 use reverie::Guest;
 use reverie::Pid;
 use reverie::Tool;
+use reverie::syscalls::Addr;
+use reverie::syscalls::MemoryAccess;
 
 fn display_pathname(p: &MMapPath) -> String {
     match p {

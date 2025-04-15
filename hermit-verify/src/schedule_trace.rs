@@ -11,8 +11,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use colored::Colorize;
-use detcore::preemptions::read_trace;
 use detcore::preemptions::PreemptionRecord;
+use detcore::preemptions::read_trace;
 use detcore_model::pid::DetTid;
 use detcore_model::schedule::SchedEvent;
 use edit_distance::iterable_bubble_sort;

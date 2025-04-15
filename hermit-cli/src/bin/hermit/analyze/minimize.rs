@@ -15,14 +15,14 @@ use std::path::PathBuf;
 
 use anyhow::bail;
 use colored::Colorize;
+use detcore::DetTid;
+use detcore::FIRST_PRIORITY;
+use detcore::LAST_PRIORITY;
+use detcore::Priority;
 use detcore::preemptions::PreemptionReader;
 use detcore::preemptions::PreemptionRecord;
 use detcore::types::LogicalTime;
 use detcore::util::truncated;
-use detcore::DetTid;
-use detcore::Priority;
-use detcore::FIRST_PRIORITY;
-use detcore::LAST_PRIORITY;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_pcg::Pcg64Mcg;

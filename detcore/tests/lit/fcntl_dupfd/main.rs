@@ -8,8 +8,8 @@
 
 // RUN: %me
 
-use nix::fcntl::fcntl;
 use nix::fcntl::FcntlArg;
+use nix::fcntl::fcntl;
 use nix::sys::stat::fstat;
 use nix::unistd::close;
 use nix::unistd::dup2;

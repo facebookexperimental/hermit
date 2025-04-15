@@ -7,14 +7,14 @@
  */
 
 use procfs::process::Process;
-use reverie::syscalls;
-use reverie::syscalls::MemoryAccess;
 use reverie::Error;
 use reverie::Guest;
+use reverie::syscalls;
+use reverie::syscalls::MemoryAccess;
 
-use crate::tool_global::thread_observe_time;
 use crate::Detcore;
 use crate::RecordOrReplay;
+use crate::tool_global::thread_observe_time;
 
 const MB: u64 = 1024 * 1024;
 

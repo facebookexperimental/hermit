@@ -9,13 +9,13 @@
 use colored::Colorize;
 
 use super::UseCase;
+use crate::CommonOpts;
 use crate::common::LogDiffOptions;
 use crate::common::RunEnvironment;
 use crate::common::TestArtifacts;
 use crate::common::Verify;
 use crate::use_case::run_hermit::output_stderr;
 use crate::use_case::run_hermit::output_stdout;
-use crate::CommonOpts;
 
 fn compare_results<T: UseCase>(
     use_case: &T,

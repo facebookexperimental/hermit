@@ -8,13 +8,13 @@
 
 use std::fs::File;
 use std::io;
-use std::io::stderr;
 use std::io::IsTerminal;
+use std::io::stderr;
 
-use tracing::metadata::LevelFilter;
 use tracing::Subscriber;
-use tracing_subscriber::util::SubscriberInitExt;
+use tracing::metadata::LevelFilter;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::util::SubscriberInitExt;
 
 const DEFAULT_TRACE_LEVEL: LevelFilter = LevelFilter::WARN;
 

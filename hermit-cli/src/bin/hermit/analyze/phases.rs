@@ -23,9 +23,9 @@ use hermit::Error;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_pcg::Pcg64Mcg;
+use reverie::PrettyBacktrace;
 use reverie::process::ExitStatus;
 use reverie::process::Output;
-use reverie::PrettyBacktrace;
 
 use crate::analyze::consts::*;
 use crate::analyze::rundata::RunData;
@@ -36,9 +36,9 @@ use crate::analyze::types::ReportCriticalEvent;
 use crate::global_opts::GlobalOpts;
 use crate::logdiff::LogDiffCLIOpts;
 use crate::run::RunOpts;
-use crate::schedule_search::search_for_critical_schedule;
 use crate::schedule_search::Config;
 use crate::schedule_search::CriticalSchedule;
+use crate::schedule_search::search_for_critical_schedule;
 
 /// Compare only preemptions, not recorded schedules.
 fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {

@@ -10,15 +10,15 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use reverie::Errno;
+use reverie::Error;
+use reverie::Guest;
+use reverie::Stack;
 use reverie::syscalls::Addr;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::WaitPidFlag;
-use reverie::Errno;
-use reverie::Error;
-use reverie::Guest;
-use reverie::Stack;
 
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;

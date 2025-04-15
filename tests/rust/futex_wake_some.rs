@@ -6,9 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 /// Multiple threads wait on a futex, some are woken but not all.
 use libc::c_long;

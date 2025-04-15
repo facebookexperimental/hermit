@@ -6,15 +6,15 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use reverie::syscalls::ioctl;
+use reverie::Errno;
+use reverie::RdtscResult;
 use reverie::syscalls::PollFd;
 use reverie::syscalls::StatBuf;
 use reverie::syscalls::StatxBuf;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::Timeval;
 use reverie::syscalls::Timezone;
-use reverie::Errno;
-use reverie::RdtscResult;
+use reverie::syscalls::ioctl;
 use serde::Deserialize;
 use serde::Serialize;
 

@@ -10,11 +10,11 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+use crate::CommonOpts;
 use crate::cli_wrapper::*;
 use crate::common::TemporaryEnvironment;
 use crate::common::TemporaryEnvironmentBuilder;
 use crate::use_case::UseCase;
-use crate::CommonOpts;
 
 /// Verification utility for replaying preemptions under hermit
 /// This utility runs a guest program under "hermit run" and records schedules and preemptions. On the second run those recorded schedules are replayed via "hermit run" subcommand

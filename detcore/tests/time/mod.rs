@@ -14,9 +14,9 @@ use std::time;
 
 use chrono::DateTime;
 use chrono::Utc;
+use detcore::Detcore;
 use detcore::types::NANOS_PER_RCB;
 use detcore::types::NANOS_PER_SYSCALL;
-use detcore::Detcore;
 use reverie::Rdtsc;
 use reverie::RdtscResult;
 use reverie_ptrace::testing::check_fn_with_config;

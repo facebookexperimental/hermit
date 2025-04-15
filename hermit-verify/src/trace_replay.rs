@@ -11,13 +11,13 @@ use std::path::PathBuf;
 use clap::Parser;
 use detcore::preemptions::strip_times_from_events_file;
 
+use crate::CommonOpts;
 use crate::cli_wrapper::*;
 use crate::common::TemporaryEnvironment;
 use crate::common::TemporaryEnvironmentBuilder;
 use crate::schedule_trace::InspectOpts;
-use crate::use_case::split_branches_in_file;
 use crate::use_case::UseCase;
-use crate::CommonOpts;
+use crate::use_case::split_branches_in_file;
 
 /// Verification utility for replaying preemptions under hermit
 /// This utility runs a guest program under "hermit run" and records schedules and preemptions. On the second run those recorded schedules are replayed via "hermit run" subcommand

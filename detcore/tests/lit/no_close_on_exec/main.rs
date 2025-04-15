@@ -19,13 +19,13 @@ use std::ptr;
 
 use close_err::Closable;
 use nix::fcntl::OFlag;
-use nix::sys::wait::waitpid;
 use nix::sys::wait::WaitStatus;
+use nix::sys::wait::waitpid;
+use nix::unistd::ForkResult;
 use nix::unistd::fork;
 use nix::unistd::pipe2;
 use nix::unistd::read;
 use nix::unistd::write;
-use nix::unistd::ForkResult;
 
 fn main() {
     let mut args = std::env::args();

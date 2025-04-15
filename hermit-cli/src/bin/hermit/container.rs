@@ -9,8 +9,8 @@
 use hermit::Context;
 use hermit::Error;
 use hermit::SerializableError;
-use rand::thread_rng;
 use rand::Rng;
+use rand::thread_rng;
 use reverie::process::Container;
 use reverie::process::Mount;
 use reverie::process::Namespace;

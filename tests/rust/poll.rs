@@ -26,10 +26,10 @@ use std::fs;
 use std::io::Write;
 use std::os::fd::AsFd;
 
-use nix::poll::poll;
 use nix::poll::PollFd;
 use nix::poll::PollFlags;
 use nix::poll::PollTimeout;
+use nix::poll::poll;
 use tempfile::tempdir;
 
 fn main() {

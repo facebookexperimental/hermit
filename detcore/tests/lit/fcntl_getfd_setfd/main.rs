@@ -8,11 +8,11 @@
 
 // RUN: %me
 
-use nix::fcntl::fcntl;
 use nix::fcntl::FcntlArg;
 use nix::fcntl::FdFlag;
-use syscalls::syscall;
+use nix::fcntl::fcntl;
 use syscalls::Sysno;
+use syscalls::syscall;
 
 fn main() {
     // Raw syscall used here because unistd::dup3 is simulated from dup2

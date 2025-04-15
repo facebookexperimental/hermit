@@ -6,14 +6,14 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::fs::create_dir;
 use std::fs::File;
+use std::fs::create_dir;
 use std::path::Path;
 use std::path::PathBuf;
 
 use colored::Colorize;
-use tempfile::tempdir_in;
 use tempfile::TempDir;
+use tempfile::tempdir_in;
 
 pub struct TemporaryEnvironmentBuilder {
     // Whether to keep temp directory after cleaning
@@ -227,8 +227,8 @@ mod test {
     use std::path::PathBuf;
 
     use pretty_assertions::assert_eq;
-    use tempfile::tempdir;
     use tempfile::TempDir;
+    use tempfile::tempdir;
 
     #[test]
     fn test_create_env_for_every_run() -> anyhow::Result<()> {

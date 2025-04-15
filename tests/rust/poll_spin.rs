@@ -25,17 +25,17 @@ target = "x86_64-unknown-linux-musl"
 
 */
 use std::os::fd::AsFd;
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::thread;
 use std::time;
 
 use close_err::Closable;
-use nix::poll::poll;
 use nix::poll::PollFd;
 use nix::poll::PollFlags;
 use nix::poll::PollTimeout;
+use nix::poll::poll;
 use nix::unistd;
 
 fn main() {

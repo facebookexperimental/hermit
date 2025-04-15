@@ -14,9 +14,9 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use goblin::container::Ctx;
-use goblin::elf::program_header;
 use goblin::elf::Elf;
 use goblin::elf::ProgramHeader;
+use goblin::elf::program_header;
 
 // minimal size required to parse elf's .interp section.
 const ELF_MIN_SIZE: usize = 8192;

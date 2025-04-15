@@ -15,11 +15,11 @@ use std::hash::Hasher;
 use chrono::DateTime;
 use chrono::Local;
 use rand::Rng;
+use reverie::Error;
+use reverie::Guest;
 use reverie::syscalls;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
-use reverie::Error;
-use reverie::Guest;
 
 use crate::consts::DEFAULT_HOSTNAME;
 use crate::detlog;

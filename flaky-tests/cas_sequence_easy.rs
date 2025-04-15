@@ -10,9 +10,9 @@
 //! if a specific interleaving occurs via a CAS handoff.
 
 use std::ptr::read_volatile;
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
-use std::sync::Arc;
 
 const WORK_AMT: usize = 10000;
 const FINAL_VALUE: usize = 4;

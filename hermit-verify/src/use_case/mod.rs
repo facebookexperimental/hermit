@@ -14,10 +14,10 @@ pub use run_hermit::run_hermit;
 pub use run_usecase::run_use_case;
 pub use split_branches::split_branches_in_file;
 
+use crate::CommonOpts;
 use crate::common::RunEnvironment;
 use crate::common::TemporaryEnvironment;
 use crate::common::TemporaryEnvironmentBuilder;
-use crate::CommonOpts;
 
 pub struct UseCaseOptions {
     pub output_stdout: bool,

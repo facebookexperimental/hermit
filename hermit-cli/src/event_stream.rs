@@ -11,13 +11,13 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use reverie::Tid;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
-use reverie::Tid;
 use serde::Deserialize;
 use serde::Serialize;
 

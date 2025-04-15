@@ -6,10 +6,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use reverie::syscalls::Getrandom;
-use reverie::syscalls::MemoryAccess;
 use reverie::Errno;
 use reverie::Guest;
+use reverie::syscalls::Getrandom;
+use reverie::syscalls::MemoryAccess;
 
 use super::Replayer;
 

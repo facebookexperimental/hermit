@@ -10,9 +10,9 @@
 #![feature(thread_id_value)]
 
 use std::env;
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::thread;
 const NUM_ELEMENTS: usize = 20_000_000;
 

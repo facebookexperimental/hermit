@@ -6,12 +6,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::sync::Arc;
 /// Let two child threads race, and arbitrarily define one order as correct and the other as error.
 /// This is roughly the same as the C version by the same name, but Rust generates different code
 /// provides us another test and in particular another test of stacktrace printing.
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
-use std::sync::Arc;
 
 fn sleep(milli: i64) {
     let tp = libc::timespec {

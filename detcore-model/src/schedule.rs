@@ -12,10 +12,10 @@ use std::str::FromStr;
 
 use nix::sys::signal::Signal;
 use reverie_syscalls::Sysno;
-use serde::de;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::Serializer;
+use serde::de;
 
 use crate::pid::DetTid;
 use crate::time::DetTime;

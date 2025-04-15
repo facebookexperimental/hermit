@@ -6,12 +6,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use reverie::Errno;
+use reverie::Guest;
 use reverie::syscalls::ClockGettime;
 use reverie::syscalls::Gettimeofday;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Time;
-use reverie::Errno;
-use reverie::Guest;
 
 use super::Replayer;
 

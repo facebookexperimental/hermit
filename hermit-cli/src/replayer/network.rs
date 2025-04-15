@@ -6,12 +6,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use reverie::syscalls::family::SockOptFamily;
+use reverie::Errno;
+use reverie::Guest;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Poll;
 use reverie::syscalls::Recvfrom;
-use reverie::Errno;
-use reverie::Guest;
+use reverie::syscalls::family::SockOptFamily;
 
 use super::Replayer;
 

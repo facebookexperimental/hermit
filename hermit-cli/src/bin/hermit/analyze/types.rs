@@ -13,8 +13,8 @@ use std::str::FromStr;
 
 use clap::Parser;
 use regex::Regex;
-use reverie::process::ExitStatus;
 use reverie::PrettyBacktrace;
+use reverie::process::ExitStatus;
 use serde::Deserialize;
 use serde::Serialize;
 use tracing::metadata::LevelFilter;

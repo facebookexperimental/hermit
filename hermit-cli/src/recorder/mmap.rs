@@ -6,12 +6,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use reverie::Errno;
+use reverie::Guest;
 use reverie::syscalls::Addr;
 use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Mmap;
-use reverie::Errno;
-use reverie::Guest;
 
 use super::Recorder;
 use crate::event::MmapEvent;

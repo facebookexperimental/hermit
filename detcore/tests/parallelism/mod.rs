@@ -32,9 +32,9 @@ fn count_switch_points(shared_data: &Arc<[u64]>) -> u64 {
 
 /// Race on memory access.
 mod mem_race {
+    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
-    use std::sync::Arc;
     use std::thread;
 
     use detcore_testutils::det_test_fn_with_config;
@@ -143,9 +143,9 @@ mod mem_race {
 
 /// Race both memory ops and prints.
 mod mem_print_race {
+    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
-    use std::sync::Arc;
     use std::thread;
 
     use detcore::Detcore;
@@ -227,9 +227,9 @@ mod mem_print_race {
 
 /// Parent thread waits on futex
 mod futex_wait_parent {
+    use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
     use std::sync::atomic::Ordering;
-    use std::sync::Arc;
     use std::thread;
 
     #[cfg(not(sanitized))]
