@@ -44,7 +44,7 @@ fn split_one(event: SchedEvent) -> Vec<SchedEvent> {
 fn split_branches(
     event: SchedEvent,
     cursor: &ReplayCursor<SchedEvent>,
-) -> impl IntoIterator<Item = SchedEvent> {
+) -> impl IntoIterator<Item = SchedEvent> + use<> {
     match (&event, cursor.peek_nth(0), cursor.peek_nth(1)) {
         (
             SchedEvent {

@@ -199,7 +199,7 @@ impl HermitData {
     /// Returns an iterator over the recordings.
     ///
     /// Use [`recording_metadata`] to get more information about a recording.
-    pub fn recordings(&self) -> impl Iterator<Item = Id> {
+    pub fn recordings(&self) -> impl Iterator<Item = Id> + use<> {
         fs::read_dir(&self.data_dir)
             .ok()
             .into_iter()

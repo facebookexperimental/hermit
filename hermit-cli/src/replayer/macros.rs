@@ -16,7 +16,7 @@
 ///
 /// The return type in this example will be `Result<ReadEvent, Errno>`.
 macro_rules! next_event {
-    ($guest:expr, $event:ident) => {
+    ($guest:expr_2021, $event:ident) => {
         $guest
             .thread_state_mut()
             .next_event()

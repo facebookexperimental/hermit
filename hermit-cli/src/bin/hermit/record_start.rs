@@ -121,7 +121,8 @@ impl StartOpts {
         // FIXME: This is a little hacky. This should be configured via a config
         // value instead. That's not done because there is no nesting of global
         // state yet.
-        std::env::set_var("HERMIT_VERIFY", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HERMIT_VERIFY", "1") };
 
         // Replay the recording.
         let replay = container
@@ -168,7 +169,8 @@ impl StartOpts {
         // FIXME: This is a little hacky. This should be configured via a config
         // value instead. That's not done because there is no nesting of global
         // state yet.
-        std::env::set_var("HERMIT_VERIFY", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HERMIT_VERIFY", "1") };
 
         // Find the path to the executable so that GDB can use it to resolve
         // symbols.

@@ -38,7 +38,7 @@ pub struct ChaosStressOpts {
 impl ChaosStressOpts {
     fn run_hermit(&self, common_args: &CommonOpts) -> anyhow::Result<bool> {
         let mut rng = rand::thread_rng();
-        let random_seed: u16 = rng.gen();
+        let random_seed: u16 = rng.r#gen();
         let hermit_cli_args = Hermit::new()
             .run(self.guest_program.clone(), self.args.clone())
             .hermit_args(self.hermit_arg.clone())

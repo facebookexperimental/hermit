@@ -55,7 +55,7 @@ impl GlobalOpts {
     /// Initalizes tracing. If using a container, this must be done *inside* of
     /// the container because the tracer may create a new thread.
     #[must_use = "This function returns a guard that should not be immediately dropped"]
-    pub fn init_tracing(&self) -> Option<impl Drop> {
+    pub fn init_tracing(&self) -> Option<impl Drop + use<>> {
         if let Some(path) = &self.log_file {
             let file_writer = File::create(path).expect("Failed to open log file");
             Some(init_file_tracing(self.log, file_writer))

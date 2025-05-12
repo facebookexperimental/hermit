@@ -575,7 +575,7 @@ impl RunOpts {
                 }
                 SeedFrom::SystemRandom => {
                     let mut rng = rand::thread_rng();
-                    let seed: u64 = rng.gen();
+                    let seed: u64 = rng.r#gen();
                     seed
                 }
             };

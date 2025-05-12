@@ -238,16 +238,20 @@ unsafe impl Sync for OvercommitBumpAlloc {}
 
 unsafe impl GlobalAlloc for OvercommitBumpAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: layout.align() is guaranteed to be a power of two
-        self.allocate(layout.size(), layout.align())
+        unsafe {
+            // SAFETY: layout.align() is guaranteed to be a power of two
+            self.allocate(layout.size(), layout.align())
+        }
     }
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
         // do nothing
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: layout.align() is guaranteed to be a power of two
-        // SAFETY: MAP_ANONYMOUS pages are guaranteed to be zero
-        self.allocate(layout.size(), layout.align())
+        unsafe {
+            // SAFETY: layout.align() is guaranteed to be a power of two
+            // SAFETY: MAP_ANONYMOUS pages are guaranteed to be zero
+            self.allocate(layout.size(), layout.align())
+        }
     }
 }
 
@@ -285,16 +289,16 @@ pub static GLOBAL: OvercommitBumpAlloc =
 pub struct Global;
 unsafe impl GlobalAlloc for Global {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        GLOBAL.alloc(layout)
+        unsafe { GLOBAL.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        GLOBAL.dealloc(ptr, layout)
+        unsafe { GLOBAL.dealloc(ptr, layout) }
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        GLOBAL.alloc_zeroed(layout)
+        unsafe { GLOBAL.alloc_zeroed(layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        GLOBAL.realloc(ptr, layout, new_size)
+        unsafe { GLOBAL.realloc(ptr, layout, new_size) }
     }
 }
 

@@ -53,128 +53,136 @@ impl<'a> Ord for Dirent64<'a> {
 }
 
 pub unsafe fn deserialize_dirents64(bytes: &[u8]) -> Vec<Dirent64> {
-    let mut res = Vec::new();
+    unsafe {
+        let mut res = Vec::new();
 
-    let dirp: *const u8 = bytes.as_ptr();
-    let nb = bytes.len();
-    let mut k = 0;
+        let dirp: *const u8 = bytes.as_ptr();
+        let nb = bytes.len();
+        let mut k = 0;
 
-    while k < nb as isize {
-        let dirp = dirp.offset(k);
-        let mut j: isize = 0;
-        let ino = ptr::read(dirp.offset(j).cast::<u64>());
-        j += std::mem::size_of::<u64>() as isize;
-        let off = ptr::read(dirp.offset(j).cast::<i64>());
-        j += std::mem::size_of::<i64>() as isize;
-        let reclen = ptr::read(dirp.offset(j).cast::<u16>());
-        j += std::mem::size_of::<u16>() as isize;
-        let ty = ptr::read(dirp.offset(j).cast::<u8>());
-        j += std::mem::size_of::<u8>() as isize;
-        let name = std::slice::from_raw_parts(dirp.offset(j), 1 + reclen as usize - j as usize);
-        let ent = Dirent64 {
-            ino,
-            off,
-            reclen,
-            ty,
-            name,
-        };
-        res.push(ent);
-        k += reclen as isize;
+        while k < nb as isize {
+            let dirp = dirp.offset(k);
+            let mut j: isize = 0;
+            let ino = ptr::read(dirp.offset(j).cast::<u64>());
+            j += std::mem::size_of::<u64>() as isize;
+            let off = ptr::read(dirp.offset(j).cast::<i64>());
+            j += std::mem::size_of::<i64>() as isize;
+            let reclen = ptr::read(dirp.offset(j).cast::<u16>());
+            j += std::mem::size_of::<u16>() as isize;
+            let ty = ptr::read(dirp.offset(j).cast::<u8>());
+            j += std::mem::size_of::<u8>() as isize;
+            let name = std::slice::from_raw_parts(dirp.offset(j), 1 + reclen as usize - j as usize);
+            let ent = Dirent64 {
+                ino,
+                off,
+                reclen,
+                ty,
+                name,
+            };
+            res.push(ent);
+            k += reclen as isize;
+        }
+        res
     }
-    res
 }
 
 pub unsafe fn serialize_dirents64(dents: &[Dirent64], bytes: &mut [u8]) -> usize {
-    let nb = bytes.len();
-    let mut k = 0;
-    let mut i = 0;
+    unsafe {
+        let nb = bytes.len();
+        let mut k = 0;
+        let mut i = 0;
 
-    while k < nb as isize && i < dents.len() {
-        let ent = &dents[i];
-        let dirp = bytes.as_mut_ptr().offset(k);
-        let mut j: isize = 0;
-        ptr::write(dirp.offset(j).cast::<u64>(), ent.ino);
-        j += std::mem::size_of::<u64>() as isize;
-        ptr::write(dirp.offset(j).cast::<i64>(), ent.off);
-        j += std::mem::size_of::<i64>() as isize;
-        ptr::write(dirp.offset(j).cast::<u16>(), ent.reclen);
-        j += std::mem::size_of::<u16>() as isize;
-        ptr::write(dirp.offset(j).cast::<u8>(), ent.ty);
-        j += std::mem::size_of::<u8>() as isize;
-        let reclen = ent.reclen;
-        ptr::copy_nonoverlapping(
-            ent.name.as_ptr(),
-            dirp.offset(j),
-            // NOTE: name is null-terminated with the man page
-            // explicitly warning against other methods to read
-            // d_name besides strlen(): https://man7.org/linux/man-pages/man3/readdir.3.html
-            strlen(ent.name.as_ptr() as *const i8),
-        );
-        k += reclen as isize;
-        i += 1;
+        while k < nb as isize && i < dents.len() {
+            let ent = &dents[i];
+            let dirp = bytes.as_mut_ptr().offset(k);
+            let mut j: isize = 0;
+            ptr::write(dirp.offset(j).cast::<u64>(), ent.ino);
+            j += std::mem::size_of::<u64>() as isize;
+            ptr::write(dirp.offset(j).cast::<i64>(), ent.off);
+            j += std::mem::size_of::<i64>() as isize;
+            ptr::write(dirp.offset(j).cast::<u16>(), ent.reclen);
+            j += std::mem::size_of::<u16>() as isize;
+            ptr::write(dirp.offset(j).cast::<u8>(), ent.ty);
+            j += std::mem::size_of::<u8>() as isize;
+            let reclen = ent.reclen;
+            ptr::copy_nonoverlapping(
+                ent.name.as_ptr(),
+                dirp.offset(j),
+                // NOTE: name is null-terminated with the man page
+                // explicitly warning against other methods to read
+                // d_name besides strlen(): https://man7.org/linux/man-pages/man3/readdir.3.html
+                strlen(ent.name.as_ptr() as *const i8),
+            );
+            k += reclen as isize;
+            i += 1;
+        }
+        dents.len()
     }
-    dents.len()
 }
 
 pub unsafe fn deserialize_dirents(bytes: &[u8]) -> Vec<Dirent64> {
-    let mut res = Vec::new();
+    unsafe {
+        let mut res = Vec::new();
 
-    let dirp: *const u8 = bytes.as_ptr();
-    let nb = bytes.len();
-    let mut k = 0;
+        let dirp: *const u8 = bytes.as_ptr();
+        let nb = bytes.len();
+        let mut k = 0;
 
-    while k < nb as isize {
-        let dirp = dirp.offset(k);
-        let mut j: isize = 0;
-        let ino = ptr::read(dirp.offset(j).cast::<u64>());
-        j += std::mem::size_of::<u64>() as isize;
-        let off = ptr::read(dirp.offset(j).cast::<i64>());
-        j += std::mem::size_of::<i64>() as isize;
-        let reclen = ptr::read(dirp.offset(j).cast::<u16>());
-        j += std::mem::size_of::<u16>() as isize;
-        let name = std::slice::from_raw_parts(dirp.offset(j), reclen as usize - j as usize);
-        j = reclen as isize - 1;
-        let ty = ptr::read(dirp.offset(j).cast::<u8>());
-        let ent = Dirent64 {
-            ino,
-            off,
-            reclen,
-            ty,
-            name,
-        };
-        res.push(ent);
-        k += reclen as isize;
+        while k < nb as isize {
+            let dirp = dirp.offset(k);
+            let mut j: isize = 0;
+            let ino = ptr::read(dirp.offset(j).cast::<u64>());
+            j += std::mem::size_of::<u64>() as isize;
+            let off = ptr::read(dirp.offset(j).cast::<i64>());
+            j += std::mem::size_of::<i64>() as isize;
+            let reclen = ptr::read(dirp.offset(j).cast::<u16>());
+            j += std::mem::size_of::<u16>() as isize;
+            let name = std::slice::from_raw_parts(dirp.offset(j), reclen as usize - j as usize);
+            j = reclen as isize - 1;
+            let ty = ptr::read(dirp.offset(j).cast::<u8>());
+            let ent = Dirent64 {
+                ino,
+                off,
+                reclen,
+                ty,
+                name,
+            };
+            res.push(ent);
+            k += reclen as isize;
+        }
+        res
     }
-    res
 }
 
 pub unsafe fn serialize_dirents(dents: &[Dirent64], bytes: &mut [u8]) -> usize {
-    let nb = bytes.len();
-    let mut k = 0;
-    let mut i = 0;
+    unsafe {
+        let nb = bytes.len();
+        let mut k = 0;
+        let mut i = 0;
 
-    while k < nb as isize && i < dents.len() {
-        let ent = &dents[i];
-        let dirp = bytes.as_mut_ptr().offset(k);
-        let mut j: isize = 0;
-        ptr::write(dirp.offset(j).cast::<u64>(), ent.ino);
-        j += std::mem::size_of::<u64>() as isize;
-        ptr::write(dirp.offset(j).cast::<i64>(), ent.off);
-        j += std::mem::size_of::<i64>() as isize;
-        ptr::write(dirp.offset(j).cast::<u16>(), ent.reclen);
-        j += std::mem::size_of::<u16>() as isize;
-        let reclen = ent.reclen;
-        ptr::copy_nonoverlapping(
-            ent.name.as_ptr(),
-            dirp.offset(j),
-            strlen(ent.name.as_ptr() as *const i8),
-        );
-        j = reclen as isize - 1;
-        ptr::write(dirp.offset(j).cast::<u8>(), ent.ty);
-        k += reclen as isize;
-        i += 1;
+        while k < nb as isize && i < dents.len() {
+            let ent = &dents[i];
+            let dirp = bytes.as_mut_ptr().offset(k);
+            let mut j: isize = 0;
+            ptr::write(dirp.offset(j).cast::<u64>(), ent.ino);
+            j += std::mem::size_of::<u64>() as isize;
+            ptr::write(dirp.offset(j).cast::<i64>(), ent.off);
+            j += std::mem::size_of::<i64>() as isize;
+            ptr::write(dirp.offset(j).cast::<u16>(), ent.reclen);
+            j += std::mem::size_of::<u16>() as isize;
+            let reclen = ent.reclen;
+            ptr::copy_nonoverlapping(
+                ent.name.as_ptr(),
+                dirp.offset(j),
+                strlen(ent.name.as_ptr() as *const i8),
+            );
+            j = reclen as isize - 1;
+            ptr::write(dirp.offset(j).cast::<u8>(), ent.ty);
+            k += reclen as isize;
+            i += 1;
+        }
+        dents.len()
     }
-    dents.len()
 }
 
 #[cfg(test)]

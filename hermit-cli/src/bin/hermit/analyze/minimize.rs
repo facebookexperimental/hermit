@@ -115,7 +115,7 @@ impl AnalyzeOpts {
 
         let min_seed = self.analyze_seed.unwrap_or_else(|| {
             let mut rng0 = rand::thread_rng();
-            let seed: u64 = rng0.gen();
+            let seed: u64 = rng0.r#gen();
             seed
         });
         eprintln!(
