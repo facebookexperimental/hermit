@@ -27,7 +27,7 @@ path = "tests/time/mod.rs"
 anyhow = "1.0.95"
 async-trait = "0.1.86"
 bitflags = { version = "2.6", features = ["serde"], default-features = false }
-chrono = { version = "0.4", features = ["clock", "serde", "std"], default-features = false }
+chrono = { version = "=0.4.39", features = ["clock", "serde", "std"], default-features = false }
 clap = { version = "3.2.25", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
 detcore-model = { version = "0.0.0", path = "../detcore-model" }
 digest = { version = "0.0.0", path = "../common/digest" }
