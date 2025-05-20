@@ -10,7 +10,6 @@
 #include <gtest/gtest.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
-#include <sys/types.h>
 #include <ctime>
 
 static int tcp4_stream(void) {
