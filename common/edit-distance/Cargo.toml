@@ -3,7 +3,7 @@
 [package]
 name = "edit-distance"
 version = "0.0.0"
-edition = "2021"
+edition = "2024"
 repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"
 
