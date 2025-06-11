@@ -10,7 +10,7 @@ license = "BSD-3-Clause"
 [dependencies]
 anyhow = "1.0.95"
 bitvec = { version = "1.0", features = ["atomic", "serde"] }
-bytesize = "1.1"
+bytesize = "2.0"
 chrono = { version = "=0.4.39", features = ["clock", "serde", "std"], default-features = false }
 clap = { version = "3.2.25", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
 libc = "0.2.139"
