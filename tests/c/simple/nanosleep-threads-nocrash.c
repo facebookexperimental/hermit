@@ -7,10 +7,8 @@
  */
 
 #include <pthread.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <sys/prctl.h>
-#include <unistd.h>
 
 int shared_var = 0;
 
