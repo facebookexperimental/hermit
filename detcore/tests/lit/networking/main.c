@@ -12,7 +12,6 @@
 // Use a bogus 'RUN' directive so this test isn't disabled:
 // RUN: true
 
-#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
