@@ -11,7 +11,6 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <sys/sysinfo.h>
-#include <unistd.h>
 
 static long long x = 0;
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;

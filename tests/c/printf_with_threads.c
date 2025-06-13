@@ -6,12 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <locale.h>
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdio.h>
-#include <sys/sysinfo.h>
-#include <unistd.h>
 
 /*
   For some reason this triggers registry divergence under trace/replay usecase

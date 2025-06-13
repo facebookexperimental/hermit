@@ -7,9 +7,7 @@
  */
 
 #include <pthread.h>
-#include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 
 static long x = 0;
 
