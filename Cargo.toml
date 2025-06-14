@@ -12,3 +12,7 @@ members = [
   "tests",
 ]
 resolver = "2"
+
+[workspace.package]
+license = "BSD-3-Clause"
+repository = "https://github.com/facebookexperimental/hermit"
