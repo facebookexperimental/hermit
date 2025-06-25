@@ -9,7 +9,6 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <unistd.h>
 
 // With the right schedule, one thread can replace the value of global_result
 // in-between the others read of the global_data and it's write to

@@ -7,10 +7,8 @@
  */
 
 #include <pthread.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 
 // Though one thread does a lot of work before checking, there's no enforcement
 // that global_str is actually set to a non-null value before use.
