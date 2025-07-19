@@ -176,7 +176,7 @@ impl AnalyzeOpts {
         let dir = tempfile::Builder::new()
             .prefix("hermit_analyze")
             .tempdir()?;
-        let tmpdir_path = dir.into_path(); // For now always keep the temporary results.
+        let tmpdir_path = dir.keep(); // For now always keep the temporary results.
         eprintln!(":: Temp workspace: {}", tmpdir_path.display());
         self.tmp_dir = Some(tmpdir_path);
         Ok(())

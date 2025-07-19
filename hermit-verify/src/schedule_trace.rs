@@ -217,7 +217,7 @@ impl InterpolateOpts {
         let dir = tempfile::Builder::new()
             .prefix("hermit_internal")
             .tempdir()?;
-        let tmpdir_path = dir.into_path();
+        let tmpdir_path = dir.keep();
         eprintln!(":: Temp workspace: {}", tmpdir_path.display());
         let (_swap_dist, _edit_dist, requested_schedule) = {
             let mut bubbles = iterable_bubble_sort(&first_schedule, &second_schedule);

@@ -176,7 +176,7 @@ impl HermitData {
         // Do an atomic rename from the temporary recording directory to the final
         // location. This is the final resting place for our data that will be used
         // during replay.
-        fs::rename(data.into_path(), self.data_dir.join(id.to_string()))?;
+        fs::rename(data.keep(), self.data_dir.join(id.to_string()))?;
 
         self.update_last_id(&id)
             .with_context(|| format!("Failed to update {:?}", self.data_dir.join("last")))?;

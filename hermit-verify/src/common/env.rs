@@ -147,7 +147,7 @@ impl TemporaryEnvironmentBuilder {
 
         if self.keep_temp_dir {
             // Temp dir is persisted now.
-            result.path = EnvPath::Path(root_temp_dir.into_path());
+            result.path = EnvPath::Path(root_temp_dir.keep());
         } else {
             // Store ref to temp dir to bind it lifetime to environment lifetime and prevent it from been cleaned.
             result.path = EnvPath::Temp(root_temp_dir);
