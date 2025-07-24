@@ -78,7 +78,8 @@ static void mask_signal_via_sigaction(void) {
 
 int main(int argc, char* argv[]) {
   mask_signal_via_sigaction();
-  while (atomic_load(&exit_flag) == 0)
+  while (atomic_load(&exit_flag) == 0) {
     ;
+  }
   return 0;
 }

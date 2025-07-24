@@ -46,8 +46,9 @@ static volatile _Atomic unsigned long* pcounter = &counter_loc;
 #define DELAY_CYCLES 10000000
 
 static void delay(void) {
-  for (int i = 0; i < DELAY_CYCLES; i++)
+  for (int i = 0; i < DELAY_CYCLES; i++) {
     atomic_fetch_add(pcounter, 1);
+  }
 }
 
 static void run_parent_process(void) {

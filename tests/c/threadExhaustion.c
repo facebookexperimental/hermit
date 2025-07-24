@@ -15,8 +15,9 @@
 void* PrintHello(void* threadid) {
   printf("Hello");
   int x = 0;
-  while (x < 1000)
+  while (x < 1000) {
     x++;
+  }
   return NULL;
 }
 int main() {
