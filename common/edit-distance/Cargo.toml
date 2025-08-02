@@ -8,7 +8,7 @@ repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"
 
 [dependencies]
-serde = { version = "1.0.185", features = ["derive", "rc"] }
+serde = { version = "1.0.219", features = ["derive", "rc"] }
 
 [dev-dependencies]
 rand = { version = "0.8", features = ["small_rng"] }
