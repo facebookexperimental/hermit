@@ -8,6 +8,9 @@
 
 // RUN: %me
 
+use std::os::fd::IntoRawFd;
+
+use nix::fcntl::AT_FDCWD;
 use nix::fcntl::OFlag;
 use nix::fcntl::openat;
 use nix::sys::stat::Mode;
@@ -18,7 +21,7 @@ fn main() {
     let _ = nix::unistd::close(0);
 
     assert_eq!(
-        openat(None, "/dev/null", OFlag::O_RDONLY, Mode::S_IRUSR),
+        openat(AT_FDCWD, "/dev/null", OFlag::O_RDONLY, Mode::S_IRUSR).map(|fd| fd.into_raw_fd()),
         Ok(0)
     );
 }

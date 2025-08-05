@@ -10,10 +10,15 @@
 
 // FIXME(T103294612): %hermit run --strict --verify -- %me
 
+use std::os::fd::BorrowedFd;
+
 use nix::errno::Errno;
 use nix::unistd::read;
 
 fn main() {
     let mut buf = [0u8; 4];
-    assert_eq!(read(9999, &mut buf), Err(Errno::EBADF));
+    assert_eq!(
+        read(unsafe { BorrowedFd::borrow_raw(9999) }, &mut buf),
+        Err(Errno::EBADF)
+    );
 }

@@ -10,8 +10,6 @@
 
 // FIXME(T96027871): %hermit run --strict -- %me
 
-use std::os::fd::AsRawFd;
-
 use close_err::Closable;
 use nix::sys::wait::WaitStatus;
 use nix::sys::wait::waitpid;
@@ -31,7 +29,7 @@ fn main() {
             // XXX: The following SYS_read would timeout due to detcore issue.
             // add a 5 seconds timeout to abort.
             unsafe { libc::alarm(5) };
-            assert_eq!(read(fdread.as_raw_fd(), &mut buf), Ok(8));
+            assert_eq!(read(&fdread, &mut buf), Ok(8));
             assert_eq!(buf, msg);
             assert_eq!(waitpid(child, None), Ok(WaitStatus::Exited(child, 0)));
             unsafe { libc::syscall(libc::SYS_exit_group, 0) };

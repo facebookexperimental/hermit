@@ -54,7 +54,7 @@ fn main() {
 
             let mut msg = [0u8; 6];
 
-            assert_eq!(read(fdread.as_raw_fd(), &mut msg), Ok(6));
+            assert_eq!(read(&fdread, &mut msg), Ok(6));
             assert_eq!(&msg, b"wassup");
 
             // Wait for the child to exit.

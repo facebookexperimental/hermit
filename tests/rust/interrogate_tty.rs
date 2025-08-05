@@ -42,21 +42,20 @@ fn main() {
         println!("stdout isatty = {:?}", libc::isatty(1));
         println!("stderr isatty = {:?}", libc::isatty(2));
     }
-    println!("fstat(0) = {:?}", fstat(0));
-    println!("fstat(1) = {:?}", fstat(1));
-    println!("fstat(2) = {:?}", fstat(2));
+    println!("fstat(0) = {:?}", fstat(std::io::stdin()));
+    println!("fstat(1) = {:?}", fstat(std::io::stdout()));
+    println!("fstat(2) = {:?}", fstat(std::io::stderr()));
 
     if let Ok(mut tty) = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/tty")
     {
-        let tty_fd = tty.as_raw_fd();
         writeln!(tty, "Hello TTY").unwrap();
         unsafe {
-            println!("/dev/tty isatty = {:?}", libc::isatty(tty_fd));
+            println!("/dev/tty isatty = {:?}", libc::isatty(tty.as_raw_fd()));
         }
-        println!("fstat(/dev/tty) = {:?}", fstat(tty_fd));
+        println!("fstat(/dev/tty) = {:?}", fstat(&tty));
     } else {
         eprintln!("WARNING: This machine does not have /dev/tty available. Skipping part of test.");
     }

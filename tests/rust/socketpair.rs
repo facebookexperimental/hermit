@@ -6,8 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::os::fd::AsRawFd;
-
 use nix::sys::socket::AddressFamily;
 use nix::sys::socket::SockFlag;
 use nix::sys::socket::SockType;
@@ -33,7 +31,7 @@ fn main() {
     nix::unistd::write(&sock1, b"Hello").unwrap();
 
     let mut buf = [0; 5];
-    nix::unistd::read(sock2.as_raw_fd(), &mut buf).unwrap();
+    nix::unistd::read(&sock2, &mut buf).unwrap();
     assert_eq!(&buf[..], b"Hello");
     println!("Received message. Test complete.\n");
 }

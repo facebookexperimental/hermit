@@ -20,7 +20,7 @@ fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rus
 goblin = { version = "0.10", features = ["elf32", "elf64", "endian_fd"] }
 lazy_static = "1.5"
 libc = "0.2.139"
-nix = { version = "0.29.0", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
+nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 num_cpus = "1.16"
 once_cell = "1.21"
 pretty_assertions = { version = "1.2", features = ["alloc"], default-features = false }

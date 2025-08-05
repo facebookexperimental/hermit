@@ -14,7 +14,6 @@
 // the non-determinism bug with st_mtime (see `hermit-run-strict.lit`).
 
 use std::io::Write;
-use std::os::unix::io::AsRawFd;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -22,17 +21,15 @@ use nix::sys::stat::fstat;
 use tempfile::NamedTempFile;
 
 fn main() {
-    let mut file = NamedTempFile::new().unwrap();
+    let mut fd = NamedTempFile::new().unwrap();
 
-    let fd = file.as_raw_fd();
-
-    let stat1 = fstat(fd).unwrap();
+    let stat1 = fstat(&fd).unwrap();
 
     println!("stat1: {:#?}", stat1);
 
     // Make sure nothing changes with subsequent fstat calls.
     for _ in 0..5 {
-        assert_eq!(stat1, fstat(fd).unwrap());
+        assert_eq!(stat1, fstat(&fd).unwrap());
     }
 
     // Sleep to ensure enough real time elapses such that the mod time changes
@@ -41,9 +38,9 @@ fn main() {
 
     // Update the file. There's no buffering, so this should translate to a
     // syscall.
-    file.write_all(b"hello\n").unwrap();
+    fd.write_all(b"hello\n").unwrap();
 
-    let stat2 = fstat(fd).unwrap();
+    let stat2 = fstat(&fd).unwrap();
 
     println!("stat2: {:#?}", stat2);
 

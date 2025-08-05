@@ -14,6 +14,7 @@
 // FIXME(T96027871): %hermit run --strict -- %me
 
 use std::os::fd::AsRawFd;
+use std::os::fd::BorrowedFd;
 use std::ptr;
 
 use close_err::Closable;
@@ -35,7 +36,11 @@ fn main() {
         // This fd shouldn't be valid since it was closed.
         let fdwrite: i32 = fdwrite.parse().unwrap();
 
-        assert_eq!(fstat(fdwrite), Err(Errno::EBADF));
+        assert_eq!(
+            // SAFETY: We're in a single-threaded process and know nothing else is re-using the fd
+            fstat(unsafe { BorrowedFd::borrow_raw(fdwrite) }),
+            Err(Errno::EBADF)
+        );
 
         return;
     }
@@ -54,7 +59,7 @@ fn main() {
             // The child never writes to this fd before calling `execve`. This
             // is a common pattern when spawning processes for smuggling out the
             // `execve` errno.
-            assert_eq!(read(fdread.as_raw_fd(), &mut msg), Ok(0));
+            assert_eq!(read(&fdread, &mut msg), Ok(0));
 
             // Wait for the child to exit.
             assert_eq!(waitpid(child, None), Ok(WaitStatus::Exited(child, 0)));

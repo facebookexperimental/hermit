@@ -8,6 +8,8 @@
 
 // RUN: %me
 
+use std::os::fd::BorrowedFd;
+
 use nix::fcntl::FcntlArg;
 use nix::fcntl::FdFlag;
 use nix::fcntl::fcntl;
@@ -19,6 +21,6 @@ fn main() {
     let dup_fd = unsafe { syscall!(Sysno::dup3, 2, 255, libc::O_CLOEXEC) }.unwrap() as i32;
     assert_eq!(dup_fd, 255);
 
-    let flag = fcntl(dup_fd, FcntlArg::F_GETFD);
+    let flag = fcntl(unsafe { BorrowedFd::borrow_raw(dup_fd) }, FcntlArg::F_GETFD);
     assert_eq!(flag, Ok(FdFlag::FD_CLOEXEC.bits()));
 }

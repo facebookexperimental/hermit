@@ -10,6 +10,7 @@
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -148,7 +149,10 @@ impl FileMetadata {
     fn setup_stdio(mut self, pid: Pid) -> Self {
         // guest stdio can be a pipe, which make things difficult
         // hence use a dummy stat here.
-        let stat: DetStat = stat::fstat(0).unwrap().into();
+        // SAFETY: stating stdin is likely to always be safe
+        let stat: DetStat = stat::fstat(unsafe { BorrowedFd::borrow_raw(0) })
+            .unwrap()
+            .into();
         let stdin = DetFd::new(0, OFlag::empty(), FdType::Regular)
             .with_stat(stat)
             .with_resource(ResourceID::Path(format!("/proc/{}/fd/0", pid).into()));

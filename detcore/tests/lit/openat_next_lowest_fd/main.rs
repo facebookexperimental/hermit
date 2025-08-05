@@ -8,8 +8,10 @@
 
 // RUN: %me
 use std::os::fd::AsRawFd;
+use std::os::fd::IntoRawFd;
 
 use close_err::Closable;
+use nix::fcntl::AT_FDCWD;
 use nix::fcntl::OFlag;
 use nix::fcntl::openat;
 use nix::sys::stat::Mode;
@@ -22,7 +24,7 @@ fn main() {
     fd3.close().expect("close failed");
 
     assert_eq!(
-        openat(None, "/dev/null", OFlag::O_RDONLY, Mode::S_IRUSR),
+        openat(AT_FDCWD, "/dev/null", OFlag::O_RDONLY, Mode::S_IRUSR).map(|f| f.into_raw_fd()),
         Ok(fd3_raw)
     );
 }
