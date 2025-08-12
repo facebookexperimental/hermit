@@ -16,7 +16,7 @@ detcore-model = { version = "0.0.0", path = "../detcore-model" }
 edit-distance = { version = "0.0.0", path = "../common/edit-distance" }
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 rand = { version = "0.8", features = ["small_rng"] }
-serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "unbounded_depth"] }
+serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 similar = { version = "2.2.0", features = ["bytes", "inline"] }
 tempfile = "3.15"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
