@@ -448,7 +448,7 @@ impl<T> ThreadState<T> {
     }
 
     /// get file metadata
-    fn metadata(&self) -> MutexGuard<FileMetadata> {
+    fn metadata(&self) -> MutexGuard<'_, FileMetadata> {
         self.file_metadata.lock().unwrap()
     }
 

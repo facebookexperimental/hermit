@@ -320,7 +320,7 @@ where
 pub fn iterable_bubble_sort_from_perm<T>(
     source: &[T],
     permutation_result: PermutationResult,
-) -> BubbleSortIter<T>
+) -> BubbleSortIter<'_, T>
 where
     T: Hash + Eq,
 {

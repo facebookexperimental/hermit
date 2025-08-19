@@ -52,7 +52,7 @@ impl<'a> Ord for Dirent64<'a> {
     }
 }
 
-pub unsafe fn deserialize_dirents64(bytes: &[u8]) -> Vec<Dirent64> {
+pub unsafe fn deserialize_dirents64(bytes: &[u8]) -> Vec<Dirent64<'_>> {
     unsafe {
         let mut res = Vec::new();
 
@@ -120,7 +120,7 @@ pub unsafe fn serialize_dirents64(dents: &[Dirent64], bytes: &mut [u8]) -> usize
     }
 }
 
-pub unsafe fn deserialize_dirents(bytes: &[u8]) -> Vec<Dirent64> {
+pub unsafe fn deserialize_dirents(bytes: &[u8]) -> Vec<Dirent64<'_>> {
     unsafe {
         let mut res = Vec::new();
 

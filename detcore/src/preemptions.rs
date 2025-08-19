@@ -96,7 +96,7 @@ impl PreemptionRecord {
     }
 
     /// Iterate over the schedevents.
-    pub fn schedevents_iter_mut(&mut self) -> std::slice::IterMut<SchedEvent> {
+    pub fn schedevents_iter_mut(&mut self) -> std::slice::IterMut<'_, SchedEvent> {
         self.global.iter_mut()
     }
 

@@ -607,7 +607,7 @@ impl RunOpts {
         }
     }
 
-    fn tmpfs(&self) -> Result<Tmpfs, Error> {
+    fn tmpfs(&self) -> Result<Tmpfs<'_>, Error> {
         match self.tmp.as_ref() {
             Some(path) => {
                 let path = path.as_path();
