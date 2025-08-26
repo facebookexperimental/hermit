@@ -272,16 +272,16 @@ macro_rules! basic_det_test {
     ( $fn:path ) => {
         $crate::basic_det_test!($fn, |_| true);
     };
-    ( $fn:path, $f:expr_2021 ) => {
+    ( $fn:path, $f:expr ) => {
         $crate::basic_det_test!(@gendef $fn, $f);
         $crate::make_det_test_variants!(detcore, "all");
     };
-    ( $fn:path, $f:expr_2021, $($variants:tt),+ ) => {
+    ( $fn:path, $f:expr, $($variants:tt),+ ) => {
         $crate::basic_det_test!(@gendef $fn, $f);
         $crate::make_det_test_variants!(detcore $(,$variants)* );
     };
 
-    (@gendef $fn:path, $f:expr_2021 ) => {
+    (@gendef $fn:path, $f:expr ) => {
         fn detcore(cfg: & ::detcore::Config) {
             $crate::det_test_fn_with_config(
                 $f(cfg),

@@ -398,7 +398,7 @@ mod tests {
         );
     }
     macro_rules! assert_sortable_range_eq {
-        ([$($full:expr_2021),*], [$($expected_sortable_range:expr_2021),*]; where max_index = $max_index:expr_2021) => {
+        ([$($full:expr),*], [$($expected_sortable_range:expr),*]; where max_index = $max_index:expr) => {
             let full_perm : &[usize] = &[$($full),*];
             let range = find_sortable_range(full_perm, $max_index);
             let actual_sortable_range = &full_perm[range];
@@ -421,7 +421,7 @@ mod tests {
     }
 
     macro_rules! assert_perm_eq {
-        ($expected:expr_2021, $perm:expr_2021) => {
+        ($expected:expr, $perm:expr) => {
             assert_eq!(
                 Ok($expected),
                 from_utf8(&$perm.cloned().collect::<Vec<u8>>())
@@ -490,7 +490,7 @@ mod tests {
     /// produced expanded perm against the actual after mapping unmatched
     /// characters in the target to `_`
     macro_rules! assert_expanded_target_eq {
-        ($expected:expr_2021, expand_target($src:expr_2021, $target:expr_2021)) => {
+        ($expected:expr, expand_target($src:expr, $target:expr)) => {
             assert_eq!(
                 Ok($expected),
                 from_utf8(
