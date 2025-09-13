@@ -18,7 +18,7 @@ fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rus
 rand = { version = "0.8", features = ["small_rng"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 similar = { version = "2.2.0", features = ["bytes", "inline"] }
-tempfile = "3.15"
+tempfile = "3.22"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
