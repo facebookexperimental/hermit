@@ -37,4 +37,4 @@ tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.20", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }
-uuid = { version = "1.2", features = ["serde", "v4", "v5", "v6", "v7", "v8"] }
+uuid = { version = "1.17", features = ["serde", "v4", "v5", "v6", "v7", "v8"] }
