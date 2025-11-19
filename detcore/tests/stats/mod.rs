@@ -8,7 +8,7 @@
 
 //! Tests stat related syscall functionality of detcore.
 
-// Fend off the RUSTFIXDEPS dependency linter:
+// Fend off the RUSTUNUSEDDEPS dependency linter:
 use detcore as _;
 use detcore_testutils as _;
 use libc as _;
