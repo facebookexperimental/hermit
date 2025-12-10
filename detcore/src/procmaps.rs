@@ -77,5 +77,5 @@ where
     let mut buf = vec![0; size];
     let start = Addr::<u8>::from_raw(map.address.0 as usize).unwrap();
     memory.read_values(start, buf.as_mut_slice())?;
-    return Ok(Digest::new(buf.as_slice()));
+    Ok(Digest::new(buf.as_slice()))
 }
