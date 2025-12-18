@@ -46,7 +46,7 @@ fn thread1(var: Arc<AtomicUsize>) {
     do_work(4 * WORK_AMT);
     // Provide a little extra context so we can judge the accuracy of the pinpointing result.
     let fin = rdtsc(); // last intercepted instruction
-    if fin % 2 == 0
+    if fin.is_multiple_of(2)
     // last branch before critical event
     {
         var.store(1, SeqCst); // critical event
@@ -62,7 +62,7 @@ fn thread2(var: Arc<AtomicUsize>) {
 
     // Provide a little extra context so we can judge the accuracy of the pinpointing result.
     let fin = rdtsc(); // last intercepted instruction
-    if fin % 2 == 0
+    if fin.is_multiple_of(2)
     // last branch before critical event
     {
         var.store(2, SeqCst); // critical event
