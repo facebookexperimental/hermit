@@ -128,8 +128,7 @@ impl TryFrom<&Pedigree> for i32 {
             || len >= 2_usize.pow(RUN_LENGTH_BITS as u32)
             || sequence.len() - len > TREE_BITS
         {
-            Err(Self::Error::new(
-                io::ErrorKind::Other,
+            Err(Self::Error::other(
                 "Pedigree is too large or complex to be deterministically converted into virtual PID.",
             ))
         } else {
