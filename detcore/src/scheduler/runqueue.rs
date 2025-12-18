@@ -481,7 +481,7 @@ impl RunQueue {
     }
 
     fn check_poll_upgrade(&mut self) {
-        if self.turn_counter() % POLLING_UPGRADE_INTERVAL == 0 {
+        if self.turn_counter().is_multiple_of(POLLING_UPGRADE_INTERVAL) {
             self.do_poll_upgrade()
         }
     }
