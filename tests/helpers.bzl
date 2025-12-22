@@ -10,7 +10,7 @@ load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_sh_test")
 load("@fbcode_macros//build_defs:python_binary.bzl", "python_binary")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
-load("@fbsource//tools/build_defs:testpilot_defs.bzl", "special_tags")
+load("@fbsource//tools/build_defs:testpilot_defs.bzl", "tpx_labels")
 
 def build_test(name, bin_target, raw, run, no_sequentialize_threads, no_deterministic_io, record_and_replay, chaos, chaosreplay, tracereplay, tracereplay_chaos):
     # Used only by shell tests.
@@ -45,7 +45,7 @@ def build_test(name, bin_target, raw, run, no_sequentialize_threads, no_determin
             ],
             env = common_env,
             test = "//hermetic_infra/hermit/hermit-cli:hermit",
-            labels = [special_tags.enable_artifact_reporting],
+            labels = [tpx_labels.enable_artifact_reporting],
         )
 
     # if strict:
@@ -130,7 +130,7 @@ def build_test(name, bin_target, raw, run, no_sequentialize_threads, no_determin
                 HERMIT_MODE = "record",
             ),
             test = "//hermetic_infra/hermit/hermit-cli:hermit",
-            labels = [special_tags.enable_artifact_reporting],
+            labels = [tpx_labels.enable_artifact_reporting],
         )
 
 def resolve_target_name(path, kind):
@@ -159,7 +159,7 @@ def hermit_verify(name, guest, guest_args = [], args = [], hermit_args = [], env
             [guest] +
             guest_args,
         env = env,
-        labels = [special_tags.enable_artifact_reporting],
+        labels = [tpx_labels.enable_artifact_reporting],
         test = "//hermetic_infra/hermit/hermit-verify:hermit-verify",
     )
 
