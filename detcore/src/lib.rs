@@ -1012,7 +1012,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Futimesat(_s) => Err(Error::Errno(Errno::ENOSYS)),
             Syscall::Socket(s) => self.handle_socket(guest, s).await.map_err(Into::into),
             Syscall::Socketpair(s) => self.handle_socketpair(guest, s).await.map_err(Into::into),
-            Syscall::Connect(s) => self.handle_connect(guest, s).await.map_err(Into::into),
+            Syscall::Connect(s) => self.handle_connect(guest, s).await,
             Syscall::Bind(s) => self.handle_bind(guest, s).await,
             Syscall::Eventfd(s) => self
                 .handle_eventfd2(guest, s.into())
