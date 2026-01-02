@@ -1030,10 +1030,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Accept(s) => self.handle_accept4(guest, s.into()).await,
             Syscall::Accept4(s) => self.handle_accept4(guest, s).await,
 
-            Syscall::Nanosleep(s) => self
-                .handle_nanosleep_family(guest, s.into())
-                .await
-                .map_err(Into::into),
+            Syscall::Nanosleep(s) => self.handle_nanosleep_family(guest, s.into()).await,
             Syscall::ClockNanosleep(s) => self
                 .handle_nanosleep_family(guest, s.into())
                 .await
