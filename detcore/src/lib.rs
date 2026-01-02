@@ -1023,7 +1023,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 .await
                 .map_err(Into::into),
             Syscall::MemfdCreate(s) => self.handle_memfd_create(guest, s).await,
-            Syscall::Userfaultfd(s) => self.handle_userfaultfd(guest, s).await.map_err(Into::into),
+            Syscall::Userfaultfd(s) => self.handle_userfaultfd(guest, s).await,
             Syscall::Accept(s) => self.handle_accept4(guest, s.into()).await,
             Syscall::Accept4(s) => self.handle_accept4(guest, s).await,
 
