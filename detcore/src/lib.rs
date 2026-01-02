@@ -1031,10 +1031,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Accept4(s) => self.handle_accept4(guest, s).await,
 
             Syscall::Nanosleep(s) => self.handle_nanosleep_family(guest, s.into()).await,
-            Syscall::ClockNanosleep(s) => self
-                .handle_nanosleep_family(guest, s.into())
-                .await
-                .map_err(Into::into),
+            Syscall::ClockNanosleep(s) => self.handle_nanosleep_family(guest, s.into()).await,
             Syscall::SchedYield(s) => self.handle_sched_yield(guest, s).await,
 
             // NB: getdents is not recommended, (g)libc should call getdents64 only
