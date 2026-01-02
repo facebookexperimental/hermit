@@ -1016,10 +1016,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Syscall::Bind(s) => self.handle_bind(guest, s).await,
             Syscall::Eventfd(s) => self.handle_eventfd2(guest, s.into()).await,
             Syscall::Eventfd2(s) => self.handle_eventfd2(guest, s).await.map_err(Into::into),
-            Syscall::Signalfd(s) => self
-                .handle_signalfd4(guest, s.into())
-                .await
-                .map_err(Into::into),
+            Syscall::Signalfd(s) => self.handle_signalfd4(guest, s.into()).await,
             Syscall::Signalfd4(s) => self.handle_signalfd4(guest, s).await.map_err(Into::into),
             Syscall::TimerfdCreate(s) => self
                 .handle_timerfd_create(guest, s)
