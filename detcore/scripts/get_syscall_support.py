@@ -47,4 +47,4 @@ for syscall_id in range(0, total_syscalls + 1):
             print(f"Fail || syscall: {syscall_id} -> {failed_at_syscall}")
 
 print(f"Failed syscalls: {failures}")
-print(f"Handled syscalls: {total_syscalls-failures}")
+print(f"Handled syscalls: {total_syscalls - failures}")
