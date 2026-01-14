@@ -127,9 +127,8 @@ impl Recorder {
     ) -> Result<i64, Errno> {
         let request = syscall.request();
 
-        let ret = guest.inject(syscall).await.map_err(|err| {
+        let ret = guest.inject(syscall).await.inspect_err(|&err| {
             self.record_event(guest, Err(err));
-            err
         })?;
 
         if let Some(output) = request.read_output(&guest.memory()).transpose() {
