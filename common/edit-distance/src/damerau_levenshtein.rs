@@ -215,7 +215,7 @@ mod tests {
 
         const COUNT: usize = 1_000;
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut source: Vec<u8> = Vec::with_capacity(COUNT);
 
         let mut x = 0;
