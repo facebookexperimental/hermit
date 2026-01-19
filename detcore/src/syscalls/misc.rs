@@ -50,7 +50,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // FIXME: It should be possible to remove this once all tests
                 // are also using namespaces.
                 un.nodename = from_str(DEFAULT_HOSTNAME);
-                un.domainname = from_str(DEFAULT_HOSTNAME.split('.').last().unwrap_or(""));
+                un.domainname = from_str(DEFAULT_HOSTNAME.split('.').next_back().unwrap_or(""));
             }
 
             un.release = from_str("5.2.0");
