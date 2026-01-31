@@ -17,7 +17,7 @@ libc = "0.2.139"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 reverie-syscalls = { version = "0.1.0", git = "https://github.com/facebookexperimental/reverie.git", branch = "main" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
-shell-words = "1.1.0"
+shell-words = "1.1.1"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
