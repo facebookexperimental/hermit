@@ -59,13 +59,7 @@ pub struct AnalyzeOpts {
     pub target_exit_code: ExitStatusConstraint,
 
     /// What level of logging to enable for the guest runs.
-    #[clap(
-        short,
-        long,
-        value_name = "LEVEL",
-        env = "HERMIT_LOG",
-        possible_values = &["off", "error", "warn", "info", "debug", "trace"]
-    )]
+    #[clap(short, long, value_name = "LEVEL", env = "HERMIT_LOG")]
     pub guest_log: Option<LevelFilter>,
 
     /// Insist on perfect determinism before proceeding with the analysis.
@@ -85,9 +79,9 @@ pub struct AnalyzeOpts {
     /// the subsequent binary search.
     #[clap(
         long,
-        conflicts_with = "run2-seed",
-        conflicts_with = "run2-preemptions",
-        conflicts_with = "run2-schedule"
+        conflicts_with = "run2_seed",
+        conflicts_with = "run2_preemptions",
+        conflicts_with = "run2_schedule"
     )]
     pub minimize: bool,
 
@@ -101,8 +95,8 @@ pub struct AnalyzeOpts {
     /// It is an error if this execution does not meet the indicated target criteria.
     #[clap(
         long,
-        conflicts_with = "run1-preemptions",
-        conflicts_with = "run1-schedule",
+        conflicts_with = "run1_preemptions",
+        conflicts_with = "run1_schedule",
         value_name = "NUM"
     )]
     pub run1_seed: Option<u64>,
@@ -110,8 +104,8 @@ pub struct AnalyzeOpts {
     /// Load target execution from hermit run --record-preemptions-to.
     #[clap(
         long,
-        conflicts_with = "run1-seed",
-        conflicts_with = "run1-schedule",
+        conflicts_with = "run1_seed",
+        conflicts_with = "run1_schedule",
         value_name = "PATH"
     )]
     pub run1_preemptions: Option<PathBuf>,
@@ -119,8 +113,8 @@ pub struct AnalyzeOpts {
     /// Load target execution from hermit run --record-schedule-to.
     #[clap(
         long,
-        conflicts_with = "run1-seed",
-        conflicts_with = "run1-preemptions",
+        conflicts_with = "run1_seed",
+        conflicts_with = "run1_preemptions",
         value_name = "PATH"
     )]
     pub run1_schedule: Option<PathBuf>,
@@ -129,8 +123,8 @@ pub struct AnalyzeOpts {
     /// does NOT meet the target criteria.
     #[clap(
         long,
-        conflicts_with = "run2-preemptions",
-        conflicts_with = "run2-schedule",
+        conflicts_with = "run2_preemptions",
+        conflicts_with = "run2_schedule",
         value_name = "NUM"
     )]
     pub run2_seed: Option<u64>,
@@ -138,8 +132,8 @@ pub struct AnalyzeOpts {
     /// Load baseline execution from hermit run --record-preemptions-to.
     #[clap(
         long,
-        conflicts_with = "run2-seed",
-        conflicts_with = "run2-schedule",
+        conflicts_with = "run2_seed",
+        conflicts_with = "run2_schedule",
         value_name = "PATH"
     )]
     pub run2_preemptions: Option<PathBuf>,
@@ -147,8 +141,8 @@ pub struct AnalyzeOpts {
     /// Load baseline execution from hermit run --record-schedule-to.
     #[clap(
         long,
-        conflicts_with = "run2-seed",
-        conflicts_with = "run2-preemptions",
+        conflicts_with = "run2_seed",
+        conflicts_with = "run2_preemptions",
         value_name = "PATH"
     )]
     pub run2_schedule: Option<PathBuf>,

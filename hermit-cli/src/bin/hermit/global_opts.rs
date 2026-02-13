@@ -37,17 +37,11 @@ use super::tracing::init_stderr_tracing;
 #[derive(Debug, Parser, Clone)]
 pub struct GlobalOpts {
     /// The verbosity level of log output.
-    #[clap(
-        short,
-        long,
-        value_name = "LEVEL",
-        env = "HERMIT_LOG",
-        possible_values = &["off", "error", "warn", "info", "debug", "trace"]
-    )]
+    #[clap(short, long, value_name = "LEVEL", env = "HERMIT_LOG")]
     pub log: Option<LevelFilter>,
 
     /// Log to a file instead of the terminal.
-    #[clap(long, value_name = "FILE", env = "HERMIT_LOG_FILE", parse(from_os_str))]
+    #[clap(long, value_name = "FILE", env = "HERMIT_LOG_FILE")]
     pub log_file: Option<PathBuf>,
 }
 

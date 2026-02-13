@@ -21,7 +21,7 @@ pub struct CommonOpts {
     pub test_result_artifact_dir: Option<PathBuf>,
 
     // Allows to ignore TEST_RESULT_ARTIFACTS_DIR when running in test environment
-    #[clap(long, default_value = "false", parse(try_from_str))]
+    #[clap(long, default_value = "false")]
     pub ignore_test_result_artifacts_dir: bool,
 
     // Specify root directory with produced artifacts

@@ -353,7 +353,7 @@ impl RunData {
         for arg in &aopts.run_args {
             run_cmd.push(arg.to_string());
         }
-        RunOpts::from_iter(run_cmd.iter())
+        RunOpts::parse_from(run_cmd.iter())
     }
 
     /// Extract the (initial) RunOpts for target/run1 that are implied by all of hermit analyze's arguments.

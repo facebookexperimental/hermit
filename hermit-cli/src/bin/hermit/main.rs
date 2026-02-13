@@ -27,7 +27,6 @@ mod tracing;
 mod verify;
 mod version;
 
-use clap::AppSettings;
 use clap::Parser;
 use colored::*;
 use hermit::Error;
@@ -45,7 +44,6 @@ use self::version::Version;
 #[clap(
     name = "hermit",
     version = Version::get(),
-    global_settings(&[AppSettings::ColoredHelp]),
 )]
 struct Args {
     #[clap(flatten)]
@@ -58,15 +56,15 @@ struct Args {
 #[derive(Debug, Parser)]
 enum Subcommand {
     /// Run a program sandboxed and fully deterministically (unless external networking is allowed).
-    #[clap(name = "run", setting = AppSettings::TrailingVarArg)]
+    #[clap(name = "run", trailing_var_arg = true)]
     Run(Box<RunOpts>),
 
     /// Record the execution of a program (EXPERIMENTAL).
-    #[clap(name = "record", setting = AppSettings::TrailingVarArg)]
+    #[clap(name = "record", trailing_var_arg = true)]
     Record(RecordOpts),
 
     /// Replay the execution of a program.
-    #[clap(name = "replay", setting = AppSettings::TrailingVarArg)]
+    #[clap(name = "replay", trailing_var_arg = true)]
     Replay(ReplayOpts),
 
     /// Take the difference of two (run/record) logs written to files.
@@ -93,7 +91,7 @@ fn main() {
     let Args {
         global,
         mut command,
-    } = Args::from_args();
+    } = Args::parse();
 
     command
         .main(&global)

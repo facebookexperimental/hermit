@@ -49,7 +49,7 @@ fn main() -> Result<()> {
     let Args {
         command,
         common_opts,
-    } = Args::from_args();
+    } = Args::parse();
 
     let mut print_success = true;
     let result = match command {

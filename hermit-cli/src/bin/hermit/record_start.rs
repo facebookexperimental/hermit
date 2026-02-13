@@ -51,11 +51,7 @@ pub struct StartOpts {
     /// recording was successful with gdbserver enabled.
     ///
     /// The recording is deleted if the replay was successful.
-    #[clap(
-        long = "verify-with-gdbex",
-        value_delimiter = ';',
-        use_delimiter = true
-    )]
+    #[clap(long = "verify-with-gdbex", value_delimiter = ';')]
     gdbex: Vec<String>,
 }
 impl StartOpts {

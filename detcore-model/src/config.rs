@@ -28,11 +28,11 @@ use crate::schedule::SigWrapper;
 #[derive(Debug, Serialize, Deserialize, Clone, Parser)]
 pub struct Config {
     /// Disable virtual/logical time. Note that virtual time is required for virtual metadata.
-    #[clap(long = "no-virtualize-time", parse(from_flag = std::ops::Not::not))]
+    #[clap(long = "no-virtualize-time", action = clap::ArgAction::SetFalse)]
     pub virtualize_time: bool,
 
     /// Disable virtual cpuid
-    #[clap(long = "no-virtualize-cpuid", parse(from_flag = std::ops::Not::not))]
+    #[clap(long = "no-virtualize-cpuid", action = clap::ArgAction::SetFalse)]
     pub virtualize_cpuid: bool,
 
     /// Epoch of the logical time.
@@ -77,7 +77,7 @@ pub struct Config {
 
     /// Disable substitution of virtual (deterministic) file metadata, in lieu
     /// of the real metadata returned by `fstat`, implies `virtualize_time`.
-    #[clap(long = "no-virtualize-metadata", parse(from_flag = std::ops::Not::not))]
+    #[clap(long = "no-virtualize-metadata", action = clap::ArgAction::SetFalse)]
     pub virtualize_metadata: bool,
 
     /// Sequentialize thread execution deterministically.
@@ -114,7 +114,7 @@ pub struct Config {
 
     /// JSON file to read recorded preemptions from.  When `--chaos` mode is activated, these
     /// recorded preemption points take the place of randomized scheduling decisions.
-    #[clap(long, value_name = "filepath", conflicts_with = "replay-schedule-from")]
+    #[clap(long, value_name = "filepath", conflicts_with = "replay_schedule_from")]
     pub replay_preemptions_from: Option<PathBuf>,
 
     /// File to read recorded schedule trace from. This execution will replay the schedule verbatim
@@ -122,7 +122,7 @@ pub struct Config {
     #[clap(
         long,
         value_name = "filepath",
-        conflicts_with = "replay-preemptions-from"
+        conflicts_with = "replay_preemptions_from"
     )]
     pub replay_schedule_from: Option<PathBuf>,
 
@@ -142,13 +142,13 @@ pub struct Config {
     #[clap(long,
            short = 's',
            value_name = "index[,path]",
-           parse(try_from_str = parse_index_with_path))]
+           value_parser = parse_index_with_path)]
     pub stacktrace_event: Vec<(u64, Option<PathBuf>)>,
 
     /// Internal feature used to signal the guest with SIGINT at every `--stacktrace-event`, this is
     /// in-lieu of using hermit's internal stacktrace printing facility, to instead have an external
     /// debugger handle it.  Accepts either signal names or numbers.
-    #[clap(long, value_name = "signame", parse(try_from_str))]
+    #[clap(long, value_name = "signame")]
     pub stacktrace_signal: Option<SigWrapper>,
 
     /// [DEPRECATED] Print a stacktrace each time the program is preempted.  Only makes sense in `--chaos` mode
@@ -209,7 +209,7 @@ pub struct Config {
     #[clap(long,
                 value_name = "uint64|'disabled'",
                 default_value = "200000000",
-                parse(try_from_str = parse_preemption_timeout))]
+                value_parser = parse_preemption_timeout)]
     pub preemption_timeout: MaybePreemptionTimeout,
 
     /// Shut down immediately upon SIGINT, rather than letting the guest handle it.
@@ -293,13 +293,13 @@ pub struct Config {
     /// Configure memory available for the container.  Takes a number of bytes, or shorthand (e.g.
     /// "1GB"). Right now this doesn't enforce an upper bound, but does affect the amount of memory
     /// reported to the guest.
-    #[clap(long, default_value = "1GB", parse(try_from_str = try_parse_memory), value_name = "bytesize")]
+    #[clap(long, default_value = "1GB", value_parser = try_parse_memory, value_name = "bytesize")]
     pub memory: u64,
 
     /// Configure extra interrupt points based on thread id and rcb counter. Detcore will raise a precise
     /// timer for this RCB whenever it detects that current current thread timeslice intercects any of the
     /// interrupt points specified
-    #[clap(long, value_name = "tid:rcbs", parse(try_from_str = try_parse_numbers_with_colon))]
+    #[clap(long, value_name = "tid:rcbs", value_parser = try_parse_numbers_with_colon)]
     pub interrupt_at: Vec<(DetTid, u64)>,
 }
 
@@ -744,7 +744,7 @@ impl Config {
             OsString::from("CMD"), // Silly/unused.
             OsString::from(format!("--epoch={}", DEFAULT_EPOCH_STR)),
         ];
-        Config::from_iter(args.iter())
+        Config::parse_from(args.iter())
     }
 
     /// Returns effective "rng-seed" parameter taking in account "seed"
@@ -771,6 +771,6 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         let v: Vec<String> = vec![];
-        Config::from_iter(v.iter())
+        Config::parse_from(v.iter())
     }
 }

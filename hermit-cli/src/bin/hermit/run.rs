@@ -125,10 +125,10 @@ pub struct RunOpts {
     #[clap(
         long,
         conflicts_with = "chaos",
-        conflicts_with = "namespace-only",
+        conflicts_with = "namespace_only",
         conflicts_with = "seed",
-        conflicts_with = "seed-from",
-        conflicts_with = "analyze-networking"
+        conflicts_with = "seed_from",
+        conflicts_with = "analyze_networking"
     )]
     strace_only: bool,
 
@@ -182,12 +182,12 @@ pub struct RunOpts {
     /// The base environment that is presented to the guest. "Empty" is completely empty, and "Host"
     /// allows through all the environment variables in hermit's own environment.
     /// "Minimal" provides a minimal deterministic environment, setting only PATH, HOSTNAME, and HOME.
-    #[clap(long, default_value = "host", value_name = "str", possible_values = &["empty", "minimal", "host"])]
+    #[clap(long, default_value = "host", value_name = "str")]
     base_env: BaseEnv,
 
     /// Additionally append one or more environment variables to the container environment. If a
     /// name is provided without a value, pass that variable through from the host.
-    #[clap(short = 'e', long, parse(try_from_str = parse_assignment), value_name="name[=val]")]
+    #[clap(short = 'e', long, value_parser = parse_assignment, value_name="name[=val]")]
     env: Vec<(String, Option<String>)>,
 
     /// An option to set current directory for the guest process.
@@ -460,7 +460,7 @@ impl fmt::Display for RunOpts {
 #[test]
 fn display_runopts1() {
     let vec: Vec<&str> = vec!["fakehermit", "fakeprog", "arg1", "arg2"];
-    let mut ro = RunOpts::from_iter(vec.iter());
+    let mut ro = RunOpts::parse_from(vec.iter());
     ro.validate_args();
     assert_eq!(format!("{}", ro), " -- fakeprog arg1 arg2");
 }
@@ -474,7 +474,7 @@ fn display_runopts2() {
         "arg1",
         "arg2",
     ];
-    let mut ro = RunOpts::from_iter(vec.iter());
+    let mut ro = RunOpts::parse_from(vec.iter());
     ro.validate_args();
     assert_eq!(format!("{}", ro), " -- fakeprog arg1 arg2");
 }
@@ -490,7 +490,7 @@ fn display_runopts3() {
         "arg1",
         "arg2",
     ];
-    let mut ro = RunOpts::from_iter(vec.iter());
+    let mut ro = RunOpts::parse_from(vec.iter());
     ro.validate_args();
     assert_eq!(
         format!("{}", ro),
@@ -501,7 +501,7 @@ fn display_runopts3() {
 #[test]
 fn display_runopts4() {
     let vec: Vec<&str> = vec!["fakehermit", "--sequentialize-threads", "fakeprog", "arg1"];
-    let mut ro = RunOpts::from_iter(vec.iter());
+    let mut ro = RunOpts::parse_from(vec.iter());
     ro.validate_args();
     assert_eq!(format!("{}", ro), " -- fakeprog arg1");
 }

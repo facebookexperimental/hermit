@@ -43,7 +43,7 @@ pub struct ReplayOpts {
     autopilot: bool,
 
     /// Additional gdb command passed by `-ex`
-    #[clap(long, value_delimiter = ';', use_delimiter = true)]
+    #[clap(long, value_delimiter = ';')]
     gdbex: Vec<String>,
 }
 

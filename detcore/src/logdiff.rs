@@ -107,7 +107,7 @@ impl LogDiffOpts {
 }
 
 /// Indicates which DETLOG entries to be used for log-diff comparison
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DetLogFilter {
     ///the start of syscall will be used for logdiff
     Syscall,
@@ -138,7 +138,7 @@ impl FromStr for DetLogFilter {
 impl Default for LogDiffOpts {
     fn default() -> Self {
         let v: Vec<String> = vec![];
-        LogDiffOpts::from_iter(v.iter())
+        LogDiffOpts::parse_from(v.iter())
     }
 }
 

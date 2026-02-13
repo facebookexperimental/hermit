@@ -28,7 +28,7 @@ anyhow = "1.0.98"
 async-trait = "0.1.86"
 bitflags = { version = "2.9", features = ["serde"], default-features = false }
 chrono = { version = "0.4.41", features = ["clock", "serde", "std"], default-features = false }
-clap = { version = "3.2.25", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
+clap = { version = "4.5.42", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 detcore-model = { version = "0.0.0", path = "../detcore-model" }
 digest = { version = "0.0.0", path = "../common/digest" }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
