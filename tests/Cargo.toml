@@ -165,5 +165,5 @@ close-err = "1.0.2"
 detcore = { version = "0.0.0", path = "../detcore" }
 libc = "0.2.139"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
-regex = "1.12.2"
+regex = "1.12.3"
 tempfile = "3.22"
