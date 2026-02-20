@@ -8,7 +8,7 @@ repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.101"
 bitvec = { version = "1.0", features = ["atomic", "serde"] }
 bytesize = "2.0"
 chrono = { version = "0.4.41", features = ["clock", "serde", "std"], default-features = false }
