@@ -59,8 +59,8 @@ where
     match procfs::process::Process::new(pid.as_raw()) {
         Ok(process) => match process.maps() {
             Ok(mut maps) => {
-                maps.memory_maps.retain(filter);
-                Ok(maps.memory_maps)
+                maps.0.retain(filter);
+                Ok(maps.0)
             }
             Err(err) => Err(map_error(err)),
         },
