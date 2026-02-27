@@ -37,7 +37,7 @@ libc = "0.2.139"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 pretty = "0.12.5"
 pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
-procfs = "0.16.0"
+procfs = "0.17.0"
 rand = { version = "0.8", features = ["small_rng"] }
 rand_distr = "0.4"
 rand_pcg = { version = "0.3", features = ["serde1"] }
