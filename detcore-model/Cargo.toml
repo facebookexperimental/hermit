@@ -13,7 +13,7 @@ bitvec = { version = "1.0", features = ["atomic", "serde"] }
 bytesize = "2.3.1"
 chrono = { version = "0.4.44", features = ["clock", "serde", "std"], default-features = false }
 clap = { version = "4.5.42", features = ["derive", "env", "string", "unicode", "wrap_help"] }
-libc = "0.2.139"
+libc = "0.2.183"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 reverie-syscalls = { version = "0.1.0", git = "https://github.com/facebookexperimental/reverie.git", branch = "main" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
