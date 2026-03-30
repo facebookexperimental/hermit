@@ -9,7 +9,7 @@ license = "BSD-3-Clause"
 
 [dependencies]
 anyhow = "1.0.102"
-clap = { version = "4.5.42", features = ["derive", "env", "string", "unicode", "wrap_help"] }
+clap = { version = "4.6.0", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 colored = "2.1.0"
 detcore = { version = "0.0.0", path = "../detcore" }
 detcore-model = { version = "0.0.0", path = "../detcore-model" }
