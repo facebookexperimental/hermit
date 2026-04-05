@@ -116,7 +116,7 @@ mod non_sanitized_tests {
         fn raw() {
             use rand::Rng;
             let mut prefix = "raw_".to_string();
-            let num: u128 = rand::thread_rng().gen();
+            let num: u128 = rand::random();
             prefix.push_str(&num.to_string());
             prefix.push_str("_");
             run_test(&prefix)
@@ -127,7 +127,7 @@ mod non_sanitized_tests {
             // If this runs deterministically, it will collide, so a unique value is
             // generated outside the deterministic section:
             let mut prefix = "detcore_".to_string();
-            let num: u128 = rand::thread_rng().gen();
+            let num: u128 = rand::random();
             prefix.push_str(&num.to_string());
             prefix.push_str("_");
             detcore_testutils::det_test_fn_with_config(
