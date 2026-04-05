@@ -24,7 +24,6 @@ use hermit::Context;
 use hermit::DetConfig;
 use hermit::Error;
 use lazy_static::lazy_static;
-use rand::Rng;
 use reverie::process::Bind;
 use reverie::process::Command;
 use reverie::process::Container;
@@ -573,11 +572,7 @@ impl RunOpts {
                     self.program.hash(&mut hasher);
                     hasher.finish()
                 }
-                SeedFrom::SystemRandom => {
-                    let mut rng = rand::thread_rng();
-                    let seed: u64 = rng.r#gen();
-                    seed
-                }
+                SeedFrom::SystemRandom => rand::random::<u64>(),
             };
             // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
             eprintln!(

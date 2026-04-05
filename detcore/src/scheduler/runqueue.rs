@@ -51,7 +51,7 @@ use std::fmt::Display;
 
 use rand::Rng;
 use rand::SeedableRng;
-use rand::distributions::uniform::SampleUniform;
+use rand::distr::uniform::SampleUniform;
 use rand_pcg::Pcg64Mcg;
 
 use crate::config::SchedHeuristic;
@@ -369,7 +369,7 @@ impl RunQueue {
     where
         T: SampleUniform + Display + PartialOrd + Copy,
     {
-        let r = self.prng.gen_range(start..end);
+        let r = self.prng.random_range(start..end);
         detlog!("SCHEDRAND: [{},{}) => {}", start, end, r);
         r
     }

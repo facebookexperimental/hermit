@@ -9,8 +9,6 @@
 use hermit::Context;
 use hermit::Error;
 use hermit::SerializableError;
-use rand::Rng;
-use rand::thread_rng;
 use reverie::process::Container;
 use reverie::process::Mount;
 use reverie::process::Namespace;
@@ -25,8 +23,7 @@ pub fn default_container(pin_threads: bool) -> Container {
         .mount(Mount::proc());
 
     if pin_threads {
-        let mut rng = thread_rng();
-        let rand_core: usize = rng.gen_range(0..num_cpus::get());
+        let rand_core: usize = rand::random_range(0..num_cpus::get());
         tracing::info!("Pinning tracer and guest threads to core {}", rand_core);
         container.affinity(rand_core);
     }

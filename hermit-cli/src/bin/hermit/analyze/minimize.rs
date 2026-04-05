@@ -113,11 +113,7 @@ impl AnalyzeOpts {
         let all_threads = pr.all_threads();
         let mut remaining_threads = Vec::new();
 
-        let min_seed = self.analyze_seed.unwrap_or_else(|| {
-            let mut rng0 = rand::thread_rng();
-            let seed: u64 = rng0.r#gen();
-            seed
-        });
+        let min_seed = self.analyze_seed.unwrap_or_else(rand::random::<u64>);
         eprintln!(
             ":: {}",
             format!("Minimization search using RNG seed {}", min_seed)
@@ -180,7 +176,7 @@ impl AnalyzeOpts {
                 }
             }
 
-            let selected_ix = rng.gen_range(0..remaining_threads.len());
+            let selected_ix = rng.random_range(0..remaining_threads.len());
             let selected_tid = *remaining_threads.get(selected_ix).unwrap();
             let mut cut = {
                 let batch = batch_sizes.get_mut(&selected_tid).unwrap();

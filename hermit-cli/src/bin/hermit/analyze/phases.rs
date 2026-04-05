@@ -849,8 +849,7 @@ impl AnalyzeOpts {
     /// Search for a target run. Return the run when found.
     fn do_search(&self) -> RunData {
         let search_seed = self.analyze_seed.unwrap_or_else(|| {
-            let mut rng0 = rand::thread_rng();
-            let seed: u64 = rng0.r#gen();
+            let seed: u64 = rand::random();
             yellow_msg(&format!("WARNING: performing --search with system randomness, use --analyze-seed={} to repro.", seed));
             seed
         });
@@ -859,7 +858,7 @@ impl AnalyzeOpts {
 
         let mut round = 0;
         loop {
-            let sched_seed = rng.r#gen();
+            let sched_seed = rng.random();
             if let Some(mut rundat) = self
                 .launch_search(round, sched_seed)
                 .unwrap_or_else(|e| panic!("Error: {}", e))
