@@ -14,7 +14,7 @@ use std::hash::Hasher;
 
 use chrono::DateTime;
 use chrono::Local;
-use rand::Rng;
+use rand::RngExt as _;
 use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls;

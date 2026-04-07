@@ -23,7 +23,7 @@ use detcore::preemptions::PreemptionReader;
 use detcore::preemptions::PreemptionRecord;
 use detcore::types::LogicalTime;
 use detcore::util::truncated;
-use rand::Rng;
+use rand::RngExt as _;
 use rand::SeedableRng;
 use rand_pcg::Pcg64Mcg;
 

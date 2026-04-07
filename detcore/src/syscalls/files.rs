@@ -16,7 +16,7 @@ use std::net::Ipv6Addr;
 use std::path::PathBuf;
 
 use nix::fcntl::OFlag;
-use rand::Rng;
+use rand::RngExt as _;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;

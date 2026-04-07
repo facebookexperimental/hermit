@@ -21,7 +21,7 @@ use nix::fcntl::AtFlags;
 use nix::fcntl::OFlag;
 use nix::sys::stat;
 use nix::unistd::Pid;
-use rand::RngCore;
+use rand::Rng as _;
 use rand::SeedableRng;
 use rand_distr::Distribution;
 use rand_distr::Exp;

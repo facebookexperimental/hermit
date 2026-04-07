@@ -49,7 +49,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Display;
 
-use rand::Rng;
+use rand::RngExt as _;
 use rand::SeedableRng;
 use rand::distr::uniform::SampleUniform;
 use rand_pcg::Pcg64Mcg;

@@ -45,7 +45,7 @@ use std::time::Duration;
 pub use config::BlockingMode;
 pub use config::Config;
 pub use config::SchedHeuristic;
-use rand::Rng;
+use rand::RngExt as _;
 use raw_cpuid::CpuIdResult;
 use raw_cpuid::cpuid;
 pub use record_or_replay::RecordOrReplay;

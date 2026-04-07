@@ -20,7 +20,7 @@ use detcore::preemptions::PreemptionRecord;
 use detcore::types::SchedEvent;
 use detcore::util::truncated;
 use hermit::Error;
-use rand::Rng;
+use rand::RngExt as _;
 use rand::SeedableRng;
 use rand_pcg::Pcg64Mcg;
 use reverie::PrettyBacktrace;
