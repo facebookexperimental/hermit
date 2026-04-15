@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use colored::Colorize;
-use rand::Rng;
+use rand::RngExt as _;
 
 use crate::CommonOpts;
 use crate::cli_wrapper::display_cmd;
