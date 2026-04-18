@@ -97,13 +97,16 @@ impl EventReader {
 
     /// Reads the next event from the stream. Returns an error if there are no
     /// more events to consume.
-    pub fn next_event(&mut self) -> bincode::Result<Event> {
-        bincode::deserialize_from(&mut self.reader)
+    pub fn next_event(&mut self) -> Result<Event, bincode::error::DecodeError> {
+        bincode::serde::decode_from_std_read(&mut self.reader, bincode::config::legacy())
     }
 
     /// Reads the next syscall from the syscall stream.
-    pub fn next_debug_event(&mut self) -> bincode::Result<DebugEvent> {
-        let debug_event = bincode::deserialize_from(&mut self.debug_events)?;
+    pub fn next_debug_event(&mut self) -> Result<DebugEvent, bincode::error::DecodeError> {
+        let debug_event = bincode::serde::decode_from_std_read(
+            &mut self.debug_events,
+            bincode::config::legacy(),
+        )?;
         self.count += 1;
         Ok(debug_event)
     }
@@ -151,13 +154,22 @@ impl EventWriter {
     }
 
     /// Writes an event to the end of the stream.
-    pub fn push_event(&mut self, event: Event) -> bincode::Result<()> {
-        bincode::serialize_into(&mut self.writer, &event)
+    pub fn push_event(&mut self, event: Event) -> Result<(), bincode::error::EncodeError> {
+        bincode::serde::encode_into_std_write(&event, &mut self.writer, bincode::config::legacy())
+            .map(|_| ())
     }
 
     /// Writes a debug event to the end of the stream.
-    pub fn push_debug_event(&mut self, event: DebugEvent) -> bincode::Result<()> {
-        bincode::serialize_into(&mut self.debug_events, &event)
+    pub fn push_debug_event(
+        &mut self,
+        event: DebugEvent,
+    ) -> Result<(), bincode::error::EncodeError> {
+        bincode::serde::encode_into_std_write(
+            &event,
+            &mut self.debug_events,
+            bincode::config::legacy(),
+        )
+        .map(|_| ())
     }
 }
 
