@@ -38,7 +38,7 @@ nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "
 pretty = "0.12.5"
 pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
 procfs = "0.18.0"
-rand = "0.10"
+rand = "0.10.1"
 rand_distr = "0.6"
 rand_pcg = { version = "0.10.1", features = ["serde"] }
 raw-cpuid = "10.7.0"
