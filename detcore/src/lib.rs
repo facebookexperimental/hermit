@@ -621,7 +621,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 )
                 .await;
             }
-            intercepted.cpuid(eax).unwrap()
+            intercepted.cpuid(eax).unwrap_or_else(|| {
+                warn!(
+                    "[dtid {}] cpuid leaf 0x{:x} not in deterministic table; returning zero result",
+                    dettid, eax
+                );
+                CpuIdResult {
+                    eax: 0,
+                    ebx: 0,
+                    ecx: 0,
+                    edx: 0,
+                }
+            })
         } else {
             cpuid!(eax, ecx)
         };
