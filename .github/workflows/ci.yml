@@ -20,3 +20,5 @@ jobs:
       run: sudo apt-get install -y libunwind-dev
     - name: Build
       run: cargo build
+    - name: Run basic tests.
+      run: ./scripts/basic_oss_tests.sh
