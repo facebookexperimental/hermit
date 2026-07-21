@@ -22,7 +22,9 @@ jobs:
     - name: Build
       run: cargo build --workspace
     - name: Test regular workspace crates
-      run: cargo test --workspace --exclude detcore
+      run: cargo test --workspace --exclude detcore --exclude hermit
+    - name: Test Hermit without namespace-dependent integration tests
+      run: cargo test -p hermit --lib --bins
     - name: Test Detcore without hardware-dependent integration tests
       run: |
         cargo test -p detcore --lib --bins
@@ -37,7 +39,7 @@ jobs:
       run: cargo fmt --all -- --check
 
   hardware:
-    name: Hardware-dependent tests (self-hosted, disabled)
+    name: Host-dependent tests (self-hosted, disabled)
     if: ${{ false }} # Enable after a compatible runner is available.
     runs-on: [self-hosted, linux, x64]
 
@@ -49,3 +51,5 @@ jobs:
       run: cargo test -p detcore --test tests_misc
     - name: PMU preemption and CPU instruction tests
       run: cargo test -p detcore --test tests_parallelism --test tests_time
+    - name: Hermit user namespace integration tests
+      run: cargo test -p hermit --test hermit_modes
