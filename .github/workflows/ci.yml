@@ -52,4 +52,6 @@ jobs:
     - name: PMU preemption and CPU instruction tests
       run: cargo test -p detcore --test tests_parallelism --test tests_time
     - name: Hermit user namespace integration tests
-      run: cargo test -p hermit --test hermit_modes
+      run: cargo test -p hermit --test hermit_modes --test chaos_verify
+    - name: Hermit PMU chaos integration tests
+      run: cargo test -p hermit --test chaos_verify -- --ignored
