@@ -239,7 +239,7 @@ mod test {
 
         let path = env.path.path().display().to_string();
 
-        let result: Vec<_> = env
+        let mut result: Vec<_> = env
             .runs()
             .iter()
             .map(|run| std::fs::read_dir(run.temp_dir.as_path()))
@@ -259,7 +259,8 @@ mod test {
             })
             .collect();
 
-        let expected = vec![
+        result.sort();
+        let mut expected = vec![
             "/1/workdir",
             "/1/log",
             "/1/std_out",
@@ -276,6 +277,7 @@ mod test {
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
+        expected.sort();
 
         assert_eq!(result, expected);
 
