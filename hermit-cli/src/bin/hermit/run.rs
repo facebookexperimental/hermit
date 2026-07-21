@@ -459,7 +459,7 @@ impl fmt::Display for RunOpts {
 fn display_runopts1() {
     let vec: Vec<&str> = vec!["fakehermit", "fakeprog", "arg1", "arg2"];
     let mut ro = RunOpts::parse_from(vec.iter());
-    ro.validate_args();
+    ro.validate_args_with_perf_support(true);
     assert_eq!(format!("{}", ro), " -- fakeprog arg1 arg2");
 }
 
@@ -473,7 +473,7 @@ fn display_runopts2() {
         "arg2",
     ];
     let mut ro = RunOpts::parse_from(vec.iter());
-    ro.validate_args();
+    ro.validate_args_with_perf_support(true);
     assert_eq!(format!("{}", ro), " -- fakeprog arg1 arg2");
 }
 
@@ -489,7 +489,7 @@ fn display_runopts3() {
         "arg2",
     ];
     let mut ro = RunOpts::parse_from(vec.iter());
-    ro.validate_args();
+    ro.validate_args_with_perf_support(true);
     assert_eq!(
         format!("{}", ro),
         " --no-sequentialize-threads --no-virtualize-metadata --epoch=2000-12-31T23:59:59+00:00 -- fakeprog arg1 arg2"
@@ -500,8 +500,18 @@ fn display_runopts3() {
 fn display_runopts4() {
     let vec: Vec<&str> = vec!["fakehermit", "--sequentialize-threads", "fakeprog", "arg1"];
     let mut ro = RunOpts::parse_from(vec.iter());
-    ro.validate_args();
+    ro.validate_args_with_perf_support(true);
     assert_eq!(format!("{}", ro), " -- fakeprog arg1");
+}
+
+#[test]
+fn display_runopts_without_perf_support() {
+    let mut ro = RunOpts::parse_from(["fakehermit", "fakeprog", "arg1"]);
+    ro.validate_args_with_perf_support(false);
+    assert_eq!(
+        format!("{}", ro),
+        " --preemption-timeout=disabled -- fakeprog arg1"
+    );
 }
 
 /// Create two logging destinations and two global configs. Returns non-zero exit
@@ -529,6 +539,10 @@ impl RunOpts {
     /// Some arguments imply others. This is the place where that validation occurs.
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
     pub fn validate_args(&mut self) {
+        self.validate_args_with_perf_support(reverie_ptrace::is_perf_supported());
+    }
+
+    fn validate_args_with_perf_support(&mut self, perf_supported: bool) {
         let config = &mut self.det_opts.det_config;
 
         config.has_uts_namespace = true;
@@ -553,7 +567,7 @@ impl RunOpts {
 
         // This is a Detcore Config-internal matter, but relies on reverie_ptrace, which detcore is
         // allowed to depend on:
-        if config.preemption_timeout.is_some() && !reverie_ptrace::is_perf_supported() {
+        if config.preemption_timeout.is_some() && !perf_supported {
             // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
             eprintln!(
                 "WARNING: --preemption-timout requires hardware perf counters \
