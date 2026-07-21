@@ -6,7 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Checks that we can observe mod time changes.
+// Checks that we can observe mod time changes.
 
 // RUN: %me
 

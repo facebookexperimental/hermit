@@ -37,6 +37,7 @@ fn diff_nanos(t1: DateTime<Utc>, t2: DateTime<Utc>) -> i64 {
 }
 
 #[test]
+#[ignore = "requires PMU support for RCB counting"]
 fn tod_from_epoch() {
     let config = detcore::Config {
         virtualize_time: true,
@@ -56,6 +57,7 @@ fn tod_from_epoch() {
 }
 
 #[test]
+#[ignore = "requires PMU support for RCB counting"]
 fn tod_is_stable() {
     let config = detcore::Config {
         virtualize_time: true,
@@ -79,6 +81,7 @@ fn tod_is_stable() {
 }
 
 #[test]
+#[ignore = "requires PMU support for RCB counting"]
 fn tod_gettimeofday() {
     let mut tp: MaybeUninit<libc::timeval> = MaybeUninit::uninit();
     let config = detcore::Config {
@@ -142,6 +145,7 @@ mod tod_gettimeofday_delta {
 }
 
 #[test]
+#[ignore = "requires PMU support for RCB counting"]
 fn tod_time() {
     let mut tloc: i64 = 0;
     let config = detcore::Config {
@@ -165,6 +169,7 @@ fn tod_time() {
 /// Check that the initially observed time is still epoch.  This is a bit fragile, because
 /// it requires that the clock_gettime call be the VERY first instruction/syscall counted
 /// within the new process.
+#[ignore = "requires PMU support for RCB counting"]
 fn tod_clock_gettime() {
     let mut tp: MaybeUninit<libc::timespec> = MaybeUninit::uninit();
     let config = detcore::Config {
@@ -190,6 +195,7 @@ fn tod_clock_gettime() {
 }
 
 #[test]
+#[ignore = "requires PMU support for RCB counting"]
 fn tod_clock_getres() {
     let mut tp: MaybeUninit<libc::timespec> = MaybeUninit::uninit();
     let config = detcore::Config {
@@ -213,6 +219,7 @@ fn tod_clock_getres() {
 }
 
 #[test]
+#[ignore = "requires PMU support for RCB counting"]
 fn tod_clock_getres_2() {
     let multiplier = 1000.0;
     let config = detcore::Config {
@@ -243,6 +250,7 @@ fn tod_clock_getres_2() {
 }
 
 #[test]
+#[ignore = "requires PMU support for RCB counting"]
 fn rdtsc_deltas() {
     let config = detcore::Config {
         clock_multiplier: Some(12345.0),

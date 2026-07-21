@@ -6,8 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Threads racing to write the same file, dup'ing the file descriptor. Exercises
-//! SYS_fcntl with F_DUPFD_CLOEXEC.
+// Threads racing to write the same file, dup'ing the file descriptor. Exercises
+// SYS_fcntl with F_DUPFD_CLOEXEC.
 
 // RUN: %me | FileCheck %s
 // CHECK: {{([12]{20})}}

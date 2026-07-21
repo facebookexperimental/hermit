@@ -18,7 +18,7 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - name: Dependencies
-      run: sudo apt-get install -y libunwind-dev liblzma-dev
+      run: sudo apt-get install -y golang-go libunwind-dev liblzma-dev
     - name: Build
       run: cargo build --workspace
     - name: Test regular workspace crates
@@ -44,8 +44,10 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - name: Dependencies
-      run: sudo apt-get install -y libunwind-dev liblzma-dev
+      run: sudo apt-get install -y golang-go libunwind-dev liblzma-dev
     - name: CPUID and RDRAND/RDSEED tests
       run: cargo test -p detcore --test tests_misc
     - name: PMU preemption and CPU instruction tests
-      run: cargo test -p detcore --test tests_parallelism --test tests_time
+      run: |
+        cargo test -p detcore --test tests_parallelism --test tests_time -- --ignored --test-threads=1
+        cargo test -p hermit --test detcore_lit -- --ignored --test-threads=1

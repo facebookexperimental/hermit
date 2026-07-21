@@ -6,8 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Tests that a file descriptor is automatically closed after execve if
-//! O_CLOEXEC was specified. See also the `no_close_on_exec` test.
+// Tests that a file descriptor is automatically closed after execve if
+// O_CLOEXEC was specified. See also the `no_close_on_exec` test.
 
 // RUN: %me
 
@@ -67,14 +67,19 @@ fn main() {
         ForkResult::Child => {
             fdread.close().expect("close failed");
 
-            let proc_self = "/proc/self/exe\0".as_ptr() as *const libc::c_char;
+            let proc_self = c"/proc/self/exe".as_ptr();
 
             // Execute thyself, passing in the pipe's file descriptor.
             unsafe {
+                let fixture_env = b"HERMIT_LIT_FIXTURE=close_on_exec\0";
+                let env = [
+                    fixture_env.as_ptr() as *const libc::c_char,
+                    ptr::null(),
+                ];
                 libc::execve(
                     proc_self,
                     &[proc_self, fdwrite_str.as_ptr() as *const _, ptr::null()] as *const *const _,
-                    &[ptr::null()] as *const *const _,
+                    env.as_ptr(),
                 )
             };
 

@@ -230,24 +230,28 @@ macro_rules! make_det_test_variants {
 
     ( @one_variant "bottom", $fn:path ) => {
         #[test]
+        #[ignore = "requires PMU support for RCB counting"]
         fn bottom_detcore() {
             $fn(& $crate::BOTTOM_CFG);
         }
     };
     ( @one_variant "middle", $fn:path ) => {
         #[test]
+        #[ignore = "requires PMU support for RCB counting"]
         fn middle_detcore() {
             $fn(& $crate::MIDDLE_CFG);
         }
     };
     ( @one_variant "default", $fn:path ) => {
         #[test]
+        #[ignore = "requires PMU support for RCB counting"]
         fn default_detcore() {
             $fn(& ::core::default::Default::default());
         }
     };
     ( @one_variant "top", $fn:path ) => {
         #[test]
+        #[ignore = "requires PMU support for RCB counting"]
         fn top_detcore() {
             $fn(& $crate::TOP_CFG);
         }
