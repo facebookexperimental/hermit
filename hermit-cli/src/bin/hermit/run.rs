@@ -7,12 +7,16 @@
  */
 
 use std::collections::hash_map::DefaultHasher;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::fs::File;
 use std::hash::Hash;
 use std::hash::Hasher;
+use std::io::Read;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -21,6 +25,7 @@ use std::sync::LazyLock;
 use ::tracing::metadata::LevelFilter;
 use clap::Parser;
 use colored::Colorize;
+use hermit::Backend;
 use hermit::Context;
 use hermit::DetConfig;
 use hermit::Error;
@@ -32,14 +37,18 @@ use reverie::process::Mount;
 use reverie::process::Namespace;
 use reverie::process::Output;
 
+use super::container::apply_affinity;
 use super::container::default_container;
 use super::container::with_container;
 use super::global_opts::GlobalOpts;
 use super::tracing::init_file_tracing;
+use super::verify::ComparedRun;
+use super::verify::ComparisonOptions;
 use super::verify::compare_two_runs;
 use super::verify::temp_log_files;
 
 const TMP_DIR: &str = "/tmp";
+const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
 
 // Just a place to put the clap(flatten) directive..
 #[derive(Debug, Parser, Clone)]
@@ -52,7 +61,12 @@ pub(crate) struct DetOptions {
 /// Command-line options for the "run" subcommand.
 #[derive(Debug, Parser, Clone)]
 pub struct RunOpts {
-    /// Program to run.
+    /// Select the process instrumentation backend.
+    #[clap(long, value_enum)]
+    backend: Option<Backend>,
+
+    /// Program to run. Bare names are resolved using the guest PATH. Paths under host `/tmp` are
+    /// hidden by Hermit's isolated `/tmp` unless `--tmp=/tmp` or an explicit mount exposes them.
     #[clap(value_name = "PROGRAM")]
     program: PathBuf,
 
@@ -63,16 +77,19 @@ pub struct RunOpts {
     #[clap(flatten)]
     pub(crate) det_opts: DetOptions,
 
-    /// Enables strict mode. Currently this implies default mode plus
-    /// --sequentialize-threads, and --deterministic-io.
-    // #[clap(long, short)]
-    // strict: bool,
+    /// Enable strict deterministic mode. This is currently the default; the flag is retained for
+    /// command-line compatibility.
+    #[clap(
+        long,
+        conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io"]
+    )]
+    strict: bool,
 
-    // Disables sequentialize threads. On by default
+    /// Disable deterministic sequential thread execution.
     #[clap(long)]
     pub(crate) no_sequentialize_threads: bool,
 
-    // Disables deterministic io. On by default
+    /// Disable deterministic I/O behavior.
     #[clap(long)]
     no_deterministic_io: bool,
 
@@ -83,18 +100,18 @@ pub struct RunOpts {
     #[clap(long)]
     pin_threads: bool,
 
-    /// Mount a file or directory. This uses the same syntax as the Docker
-    /// `--mount` option. For simple bind-mount cases, use `bind` instead.
+    /// Mount a file or directory. This uses the same syntax as Docker's `--mount` option. The
+    /// source must exist on the host. For simple bind mounts into guest `/tmp`, use `--bind`.
     #[clap(long, value_name = "path")]
     mount: Vec<Mount>,
 
-    /// Bind-mounts the provided path to the same path inside of the container if
-    /// it is not already available.
+    /// Bind-mount a host file or directory into guest `/tmp`. Use `SOURCE` to preserve its path or
+    /// `SOURCE:TARGET` to choose a target under `/tmp`; the source must already exist.
     #[clap(long, value_name = "path")]
     pub(crate) bind: Vec<Bind>,
 
-    /// Whether to allow expose a network device to the guest, which of course compromises isolation
-    /// and deterministic reproducibility.
+    /// Select guest networking. `local` creates an isolated loopback interface; `host` exposes the
+    /// host network and compromises isolation and deterministic reproducibility.
     #[clap(
         long,
         alias = "net",
@@ -103,24 +120,44 @@ pub struct RunOpts {
     )]
     network: NetworkingMode,
 
-    /// Runs the given program only with namespaces, not syscall interception.  In this mode, a PID
-    /// namespace is created and `/tmp` is isolated, but nothing is done to determinize execution.
-    /// This can be combined with any of the network isolation levels, and is useful for a quick
-    /// smoke test of whether something runs under hermit at all.
+    /// Run with namespaces but without ptrace, seccomp interception, or determinization. This is a
+    /// useful smoke test when diagnosing ptrace/seccomp policy failures; PID and `/tmp` isolation
+    /// still apply.
     #[clap(
         long,
         alias = "lite",
         conflicts_with = "chaos",
-        conflicts_with = "verify"
+        conflicts_with = "verify",
+        conflicts_with = "backend"
     )]
     namespace_only: bool,
 
-    /// Run the program in the minimally invasive mode which still intercepts syscalls.
-    /// It should be combined with activating logging at the INFO level or higher (`hermit
-    /// --log=info`), in order to print out those syscalls like strace.
+    /// Run syscall interception directly on the host without creating Linux namespaces or
+    /// mounting an isolated `/tmp`. This is not a sandbox and must only be used with trusted
+    /// guests. Host process, filesystem, and network state are shared, reducing determinism.
+    /// Schedule and preemption replay require stable namespace PIDs and are not supported.
+    #[clap(
+        long,
+        visible_alias = "core-only",
+        conflicts_with_all = [
+            "mount",
+            "bind",
+            "network",
+            "tmp",
+            "namespace_only",
+            "analyze_networking",
+            "replay_schedule_from",
+            "replay_preemptions_from"
+        ]
+    )]
+    no_namespace: bool,
+
+    /// Run in a minimally invasive syscall-interception mode. Combine with `hermit --log=info` to
+    /// print intercepted syscalls.
     ///
-    /// This does not determinize execution.  It is a shorthand for
-    /// --tmp=/tmp --network=host --no-virtualize-cpuid --no-virtualize-time --no-virtualize-metadata --no-sequentialize-threads --no-deterministic-io --no-rcb-time /bin/date
+    /// This does not determinize execution. It is shorthand for `--tmp=/tmp --network=host
+    /// --no-virtualize-cpuid --no-virtualize-time --no-virtualize-metadata
+    /// --no-sequentialize-threads --no-deterministic-io --no-rcb-time`.
     #[clap(
         long,
         conflicts_with = "chaos",
@@ -159,6 +196,12 @@ pub struct RunOpts {
     #[clap(long)]
     verify: bool,
 
+    /// Compare complete, unnormalized TRACE logs and show detailed differences.
+    /// This detects internal timing and other trace-only divergence at the cost
+    /// of substantially larger logs and stricter comparison.
+    #[clap(long, requires = "verify")]
+    verify_verbose: bool,
+
     /// If --verify is specified, indicates what guest exit status is required for
     /// hermit to consider the verification successful.  Both runs must satisfy this criteria,
     /// and hermit does not perform the second run if the first does not.
@@ -173,8 +216,8 @@ pub struct RunOpts {
     #[clap(long)]
     pub(crate) summary_json: Option<PathBuf>,
 
-    /// Containarize networking and warn for non-zero bindings. Implies
-    /// an isolated network nampespace and thus conflicts with `--network=host`.
+    /// Diagnose non-zero network binds. Implies an isolated network namespace and conflicts with
+    /// `--network=host`.
     #[clap(long)]
     analyze_networking: bool,
 
@@ -189,8 +232,8 @@ pub struct RunOpts {
     #[clap(short = 'e', long, value_parser = parse_assignment, value_name="name[=val]")]
     env: Vec<(String, Option<String>)>,
 
-    /// An option to set current directory for the guest process.
-    /// Note that the directory is relative to the guest. i.e. all mounted directories will be respected (e.g /tmp)
+    /// Set the guest working directory. The path is resolved after guest mounts are applied, so an
+    /// isolated path such as `/tmp` refers to the guest view.
     #[clap(long, value_name = "path")]
     workdir: Option<String>,
 
@@ -352,6 +395,9 @@ impl fmt::Display for RunOpts {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let dop = &self.det_opts.det_config;
 
+        if let Some(backend) = self.backend {
+            write!(f, " --backend={}", backend.as_str())?;
+        }
         if self.no_sequentialize_threads {
             write!(f, " --no-sequentialize-threads")?;
         }
@@ -367,6 +413,9 @@ impl fmt::Display for RunOpts {
         if self.namespace_only {
             write!(f, " --namespace-only")?;
         }
+        if self.no_namespace {
+            write!(f, " --no-namespace")?;
+        }
         if self.summary {
             write!(f, " --summary")?;
         }
@@ -379,6 +428,9 @@ impl fmt::Display for RunOpts {
         }
         if self.verify {
             write!(f, " --verify")?;
+        }
+        if self.verify_verbose {
+            write!(f, " --verify-verbose")?;
         }
         if let Some(p) = &self.tmp {
             let s = p.to_str().expect("valid unicode path");
@@ -455,12 +507,111 @@ impl fmt::Display for RunOpts {
     }
 }
 
+/// Returns true if `program` names a hardware emulator / virtual machine
+/// monitor whose emulated guest runs its own clock calibration. Such programs
+/// (notably the `qemu-system-*` family) are sensitive to Hermit's host-time
+/// virtualization. This is a filename heuristic used only to surface an advisory
+/// warning; it never changes Hermit's behavior.
+fn is_vmm_program(program: &Path) -> bool {
+    program
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("qemu-system-"))
+}
+
+/// Advisory warning for running a VMM under Hermit's host-time virtualization.
+///
+/// QEMU and similar emulators derive the emulated PIT, PM timer, APIC timer,
+/// RTC, and TSC from several different host clocks. Hermit virtualizes RDTSC and
+/// `clock_gettime` from separate logical-time bases that are not mutually
+/// coherent (especially under `--no-sequentialize-threads`), so the nested guest
+/// observes inconsistent clock domains and its calibration breaks. See issue #6
+/// and `docs/QEMU_BOOT.md`. Returns the message to print, or `None` when no
+/// warning applies.
+fn vmm_time_virtualization_warning(program: &Path, virtualize_time: bool) -> Option<String> {
+    if virtualize_time && is_vmm_program(program) {
+        Some(format!(
+            "WARNING: {} looks like a hardware emulator (VMM). Hermit's host-time \
+             virtualization exposes mutually inconsistent clock sources (a synthetic RDTSC \
+             versus a virtualized clock_gettime) to the emulated guest, which can corrupt its \
+             clock calibration (for example \"Unable to calibrate against PIT\", TSC marked \
+             unstable, or \"No current clocksource\") and stall boot. If the nested guest \
+             misbehaves, either disable Hermit's virtual clock with \
+             --no-virtualize-time --no-virtualize-metadata, or make the emulator use a single \
+             instruction-derived clock (for QEMU: -icount shift=0,sleep=off). \
+             See docs/QEMU_BOOT.md.",
+            program.display()
+        ))
+    } else {
+        None
+    }
+}
+
+#[test]
+fn vmm_time_warning_fires_for_qemu_with_virtual_time() {
+    // A qemu-system-* emulator under virtual time gets the advisory.
+    for program in [
+        "qemu-system-x86_64",
+        "/usr/bin/qemu-system-x86_64",
+        "qemu-system-aarch64",
+    ] {
+        let warning = vmm_time_virtualization_warning(Path::new(program), true);
+        let message = warning
+            .unwrap_or_else(|| panic!("expected a warning for {program} under virtual time"));
+        assert!(message.contains("--no-virtualize-time"));
+        assert!(message.contains("-icount"));
+    }
+}
+
+#[test]
+fn vmm_time_warning_silent_without_virtual_time() {
+    // The workaround (disabling virtual time) must not itself warn.
+    assert!(
+        vmm_time_virtualization_warning(Path::new("qemu-system-x86_64"), false).is_none(),
+        "no warning is expected once virtual time is disabled"
+    );
+}
+
+#[test]
+fn vmm_time_warning_silent_for_non_vmm_programs() {
+    for program in ["ls", "/bin/echo", "qemu-img", "my-qemu-wrapper"] {
+        assert!(
+            vmm_time_virtualization_warning(Path::new(program), true).is_none(),
+            "unexpected VMM warning for {program}"
+        );
+    }
+}
+
 #[test]
 fn display_runopts1() {
     let vec: Vec<&str> = vec!["fakehermit", "fakeprog", "arg1", "arg2"];
     let mut ro = RunOpts::parse_from(vec.iter());
-    ro.validate_args();
+    ro.validate_args_with_perf_support(true).unwrap();
     assert_eq!(format!("{}", ro), " -- fakeprog arg1 arg2");
+}
+
+#[test]
+fn backend_defaults_to_ptrace() {
+    let mut ro = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    ro.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(ro.backend, None);
+    assert_eq!(ro.selected_backend(), Backend::Ptrace);
+    assert_eq!(format!("{}", ro), " -- fakeprog");
+}
+
+#[test]
+fn backend_values_parse_and_round_trip() {
+    for (value, expected) in [
+        ("ptrace", Backend::Ptrace),
+        ("dbi", Backend::Dbi),
+        ("kvm", Backend::Kvm),
+    ] {
+        let mut ro = RunOpts::parse_from(["fakehermit", "--backend", value, "fakeprog"]);
+        ro.validate_args_with_perf_support(true).unwrap();
+        assert_eq!(ro.backend, Some(expected));
+        assert_eq!(ro.selected_backend(), expected);
+        assert_eq!(format!("{}", ro), format!(" --backend={value} -- fakeprog"));
+    }
 }
 
 #[test]
@@ -473,7 +624,7 @@ fn display_runopts2() {
         "arg2",
     ];
     let mut ro = RunOpts::parse_from(vec.iter());
-    ro.validate_args();
+    ro.validate_args_with_perf_support(true).unwrap();
     assert_eq!(format!("{}", ro), " -- fakeprog arg1 arg2");
 }
 
@@ -489,7 +640,7 @@ fn display_runopts3() {
         "arg2",
     ];
     let mut ro = RunOpts::parse_from(vec.iter());
-    ro.validate_args();
+    ro.validate_args_with_perf_support(true).unwrap();
     assert_eq!(
         format!("{}", ro),
         " --no-sequentialize-threads --no-virtualize-metadata --epoch=2000-12-31T23:59:59+00:00 -- fakeprog arg1 arg2"
@@ -500,21 +651,278 @@ fn display_runopts3() {
 fn display_runopts4() {
     let vec: Vec<&str> = vec!["fakehermit", "--sequentialize-threads", "fakeprog", "arg1"];
     let mut ro = RunOpts::parse_from(vec.iter());
-    ro.validate_args();
+    ro.validate_args_with_perf_support(true).unwrap();
     assert_eq!(format!("{}", ro), " -- fakeprog arg1");
+}
+
+#[test]
+fn strict_flag_preserves_deterministic_defaults() {
+    let mut ro = RunOpts::parse_from(["fakehermit", "--strict", "fakeprog"]);
+    ro.validate_args_with_perf_support(true).unwrap();
+
+    assert!(ro.det_opts.det_config.sequentialize_threads);
+    assert!(ro.det_opts.det_config.deterministic_io);
+    assert!(!ro.det_opts.det_config.passthru_opt);
+    assert_eq!(format!("{}", ro), " -- fakeprog");
+}
+
+#[test]
+fn passthru_optimization_requires_explicit_opt_in() {
+    let mut ro = RunOpts::parse_from(["fakehermit", "--passthru-opt", "fakeprog"]);
+    ro.validate_args_with_perf_support(true).unwrap();
+
+    assert!(ro.det_opts.det_config.passthru_opt);
+    assert_eq!(format!("{}", ro), " --passthru-opt -- fakeprog");
+}
+
+#[test]
+fn strict_flag_rejects_determinism_opt_outs() {
+    for opt_out in ["--no-sequentialize-threads", "--no-deterministic-io"] {
+        let error =
+            RunOpts::try_parse_from(["fakehermit", "--strict", opt_out, "fakeprog"]).unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let message = error.to_string();
+        assert!(message.contains("--strict"));
+        assert!(message.contains(opt_out));
+    }
+}
+
+#[test]
+fn gdbserver_forces_host_networking() {
+    // Without --gdbserver the default networking stays local.
+    let mut plain = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    plain.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(plain.network, NetworkingMode::Local);
+
+    // With --gdbserver the isolated network namespace would hide the gdbserver
+    // port from a host gdb client, so networking is forced to host.
+    let mut opts = RunOpts::parse_from(["fakehermit", "--gdbserver", "fakeprog"]);
+    assert_eq!(opts.network, NetworkingMode::Local);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert!(opts.det_opts.det_config.gdbserver);
+    assert_eq!(opts.network, NetworkingMode::Host);
+}
+
+#[test]
+fn gdbserver_respects_explicit_host_networking() {
+    let mut opts = RunOpts::parse_from(["fakehermit", "--gdbserver", "--network=host", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(opts.network, NetworkingMode::Host);
+}
+
+#[test]
+fn gdbserver_conflicts_with_analyze_networking() {
+    let mut opts = RunOpts::parse_from([
+        "fakehermit",
+        "--gdbserver",
+        "--analyze-networking",
+        "fakeprog",
+    ]);
+    let error = opts.validate_args_with_perf_support(true).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("--gdbserver"), "message: {message}");
+    assert!(
+        message.contains("--analyze-networking"),
+        "message: {message}"
+    );
+}
+
+#[test]
+fn no_namespace_uses_host_resources_and_disables_uts_assumption() {
+    let mut opts = RunOpts::parse_from(["fakehermit", "--core-only", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+
+    assert!(opts.no_namespace);
+    assert_eq!(opts.network, NetworkingMode::Host);
+    assert_eq!(opts.tmp.as_deref(), Some(Path::new(TMP_DIR)));
+    assert!(!opts.det_opts.det_config.has_uts_namespace);
+    assert!(opts.pin_threads);
+    assert_eq!(
+        format!("{}", opts),
+        " --network=host --no-namespace --tmp=/tmp -- fakeprog"
+    );
+}
+
+#[test]
+fn strict_help_describes_compatibility_and_opt_outs() {
+    use clap::CommandFactory;
+
+    let help = RunOpts::command().render_long_help().to_string();
+    for expected in [
+        "--strict",
+        "This is currently the default",
+        "command-line compatibility",
+        "--no-sequentialize-threads",
+        "Disable deterministic sequential thread execution",
+        "--no-deterministic-io",
+        "Disable deterministic I/O behavior",
+        "--passthru-opt",
+        "optimized partial syscall subscription set",
+        "--backend <BACKEND>",
+        "Select the process instrumentation backend",
+        "ptrace",
+        "dbi",
+        "kvm",
+    ] {
+        assert!(
+            help.contains(expected),
+            "missing {expected:?} in run help:\n{help}"
+        );
+    }
+}
+
+#[test]
+fn display_runopts_without_perf_support() {
+    let mut ro = RunOpts::parse_from(["fakehermit", "fakeprog", "arg1"]);
+    ro.validate_args_with_perf_support(false).unwrap();
+    assert_eq!(
+        format!("{}", ro),
+        " --preemption-timeout=disabled -- fakeprog arg1"
+    );
+}
+
+fn shebang_interpreter(path: &Path) -> Option<PathBuf> {
+    let mut file = File::open(path).ok()?;
+    let mut bytes = [0_u8; 256];
+    let count = file.read(&mut bytes).ok()?;
+    let bytes = &bytes[..count];
+    if !bytes.starts_with(b"#!") {
+        return None;
+    }
+
+    let start = bytes[2..]
+        .iter()
+        .position(|byte| !matches!(byte, b' ' | b'\t'))?
+        + 2;
+    let end = bytes[start..]
+        .iter()
+        .position(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        .map_or(bytes.len(), |offset| start + offset);
+    Some(PathBuf::from(OsStr::from_bytes(&bytes[start..end])))
+}
+
+fn validate_executable(path: &Path, requested: &Path) -> Result<(), Error> {
+    let metadata = fs::metadata(path).with_context(|| {
+        format!(
+            "Program {} does not exist or is not accessible. Check the path and any --mount or \
+             --bind target.",
+            requested.display()
+        )
+    })?;
+    if metadata.is_dir() {
+        anyhow::bail!(
+            "Program {} is a directory; provide the path to an executable file",
+            requested.display()
+        );
+    }
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "Program {} is not a regular executable file",
+            requested.display()
+        );
+    }
+    if metadata.permissions().mode() & 0o111 == 0 {
+        anyhow::bail!(
+            "Program {} is not executable. Add execute permission (for example, `chmod +x {}`) \
+             or select another file.",
+            requested.display(),
+            requested.display()
+        );
+    }
+
+    if let Some(interpreter) = shebang_interpreter(path) {
+        if interpreter.as_os_str().is_empty() {
+            anyhow::bail!(
+                "Program {} has an empty shebang interpreter",
+                requested.display()
+            );
+        }
+        let interpreter_metadata = fs::metadata(&interpreter).with_context(|| {
+            format!(
+                "Program {} uses shebang interpreter {}, but that interpreter does not exist. \
+                 Install it or update the script's #! line.",
+                requested.display(),
+                interpreter.display()
+            )
+        })?;
+        if !interpreter_metadata.is_file() || interpreter_metadata.permissions().mode() & 0o111 == 0
+        {
+            anyhow::bail!(
+                "Program {} uses shebang interpreter {}, but it is not an executable file",
+                requested.display(),
+                interpreter.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn mapped_path(path: &Path, source: &Path, target: &Path) -> Option<PathBuf> {
+    path.strip_prefix(target)
+        .ok()
+        .map(|suffix| source.join(suffix))
 }
 
 /// Create two logging destinations and two global configs. Returns non-zero exit
 /// status if there was a difference in any component of the output.
 impl RunOpts {
+    fn selected_backend(&self) -> Backend {
+        self.backend.unwrap_or_default()
+    }
+
     pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         // Set up an early tracing option before we're ready to set the global default:
+
+        // The backend may be given in the preferred global position
+        // (`hermit --backend X run ...`) or, for backwards compatibility, after the
+        // subcommand (`hermit run --backend X ...`). An explicit subcommand-level
+        // value wins; otherwise fall back to the global one.
+        self.backend = self.backend.or(global.backend);
 
         // TODO(T124429978): temporarily disabling this because it inexplicably clobbers our
         // subsequent tracing_subscriber::fmt::init() call.
         // tracing::subscriber::with_default(super::tracing::stderr_subscriber(global.log), || {
-        self.validate_args();
+        self.validate_args()?;
+        let backend = self.selected_backend();
+        if self.namespace_only {
+            if let Some(explicit_backend) = self.backend {
+                anyhow::bail!(
+                    "--backend={} cannot be used with --namespace-only because namespace-only mode \
+                     bypasses instrumentation",
+                    explicit_backend.as_str()
+                );
+            }
+        } else if backend != Backend::Kvm {
+            // The KVM backend reaches real reverie-kvm code from its dispatch
+            // path and reports an accurate, program-specific error there, so it
+            // is not pre-empted by the generic availability probe here.
+            backend.ensure_available()?;
+        }
+        self.validate_mount_sources()?;
+        self.validate_program()?;
         // });
+
+        // Dispatch to an alternative Reverie backend if one was requested. The
+        // DBI prototype is handled entirely outside the ptrace container
+        // machinery below. KVM falls through to the normal run/verify path: it
+        // skips `ensure_available()` above and reaches `hermit::run_with_backend`
+        // (via `run_in_container`), whose own dispatch routes it to `run_kvm`
+        // and returns an accurate, program-specific error.
+        match backend {
+            Backend::Ptrace | Backend::Kvm => {}
+            Backend::Dbi => return super::backends::run_dbi(&self.program, &self.args),
+        }
+
+        if self.no_namespace {
+            eprintln!(
+                "WARNING: --no-namespace is not a sandbox; run trusted guests only. The guest \
+                 inherits the caller UID/GID/capabilities and shares host /proc, filesystem, /tmp, \
+                 localhost/network, ports, Unix sockets, and mutable state between runs. Unsupported \
+                 syscalls can mutate host state; --verify may be less deterministic due to shared state."
+            );
+        }
 
         if self.namespace_only {
             self.run_with_namespace_only(global)
@@ -528,37 +936,58 @@ impl RunOpts {
 
     /// Some arguments imply others. This is the place where that validation occurs.
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
-    pub fn validate_args(&mut self) {
+    pub fn validate_args(&mut self) -> Result<(), Error> {
+        let perf_supported = match self.selected_backend() {
+            Backend::Ptrace => reverie_ptrace::is_perf_supported(),
+            Backend::Dbi | Backend::Kvm => true,
+        };
+        self.validate_args_with_perf_support(perf_supported)
+    }
+
+    fn validate_args_with_perf_support(&mut self, perf_supported: bool) -> Result<(), Error> {
         let config = &mut self.det_opts.det_config;
 
-        config.has_uts_namespace = true;
+        config.has_uts_namespace = !self.no_namespace;
+
+        if self.no_namespace {
+            self.network = NetworkingMode::Host;
+            self.tmp = Some(PathBuf::from(TMP_DIR));
+        }
 
         if self.analyze_networking {
             config.warn_non_zero_binds = true;
         }
 
-        config.sequentialize_threads = !self.no_sequentialize_threads;
-        config.deterministic_io = !self.no_deterministic_io;
+        config.sequentialize_threads = self.strict || !self.no_sequentialize_threads;
+        config.deterministic_io = self.strict || !self.no_deterministic_io;
 
         // virtualize_metadata implies virtualize_time
         if config.virtualize_metadata && !config.virtualize_time {
-            panic!(
-                "virtualize-metadata can only be activated if virtualize-time is as well.  Conversely, --no-virtualize-time requires --no-virtualize-metadata."
+            anyhow::bail!(
+                "--no-virtualize-time also requires --no-virtualize-metadata; metadata timestamps \
+                 cannot be virtualized without virtual time"
+            );
+        }
+        if !(0.0..=1.0).contains(&config.sched_sticky_random_param) {
+            anyhow::bail!(
+                "--sched-sticky-random-param must be between 0 and 1 inclusive (received {})",
+                config.sched_sticky_random_param
             );
         }
 
         // Perform internal validation on the Config args, before taking into account the
-        // hermit run args:
+        // hermit run args. User-controlled panic conditions are checked above.
         config.validate();
 
         // This is a Detcore Config-internal matter, but relies on reverie_ptrace, which detcore is
         // allowed to depend on:
-        if config.preemption_timeout.is_some() && !reverie_ptrace::is_perf_supported() {
+        if config.preemption_timeout.is_some() && !perf_supported {
             // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
             eprintln!(
-                "WARNING: --preemption-timout requires hardware perf counters \
-                which is not supported on this host, resetting \
-                preemption-timeout to 0"
+                "WARNING: --preemption-timeout requires user-space perf counters, but \
+                 perf_event_open is unavailable; continuing with \
+                 --preemption-timeout=disabled. Check the host perf_event_paranoid value and \
+                 container seccomp policy."
             );
             config.preemption_timeout = None;
         }
@@ -599,6 +1028,121 @@ impl RunOpts {
                 self.tmp = Some(PathBuf::from("/tmp"));
             }
         }
+
+        // The gdbserver listens on a TCP port that is bound inside the guest's
+        // network namespace. With the default isolated (`local`) networking, that
+        // port lives in the guest's unshared netns and is unreachable from a host
+        // gdb client, so `hermit run --gdbserver` silently hangs waiting for a
+        // connection that can never arrive. Fall back to host networking so the
+        // debugger can attach. This mirrors how replay-mode gdbserver already
+        // works: replay never unshares the network namespace, which is exactly why
+        // its gdbserver is reachable from the host.
+        if self.det_opts.det_config.gdbserver && self.network == NetworkingMode::Local {
+            if self.analyze_networking {
+                anyhow::bail!(
+                    "--gdbserver requires host networking so a host gdb client can reach the \
+                     gdbserver port, but --analyze-networking forces an isolated network \
+                     namespace. Run these two modes separately."
+                );
+            }
+            // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
+            eprintln!(
+                "WARNING: --gdbserver requires host networking so a host gdb client can reach \
+                 the gdbserver port; overriding --network=local with --network=host for this \
+                 debug session. Network isolation and deterministic networking are disabled \
+                 while the gdbserver is attached."
+            );
+            self.network = NetworkingMode::Host;
+        }
+
+        // Advise when running a VMM (e.g. QEMU) under host-time virtualization,
+        // whose emulated guest clock calibration this corrupts (issue #6).
+        // Checked last so it reflects any overrides above that disable virtual
+        // time (e.g. --strace-only).
+        let virtualize_time = self.det_opts.det_config.virtualize_time;
+        if let Some(warning) = vmm_time_virtualization_warning(&self.program, virtualize_time) {
+            // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
+            eprintln!("{warning}");
+        }
+
+        Ok(())
+    }
+
+    fn validate_mount_sources(&self) -> Result<(), Error> {
+        for bind in &self.bind {
+            let source = Path::new(OsStr::from_bytes(bind.source.to_bytes()));
+            if !source.exists() {
+                anyhow::bail!(
+                    "--bind source {} does not exist. Create it or correct the source path before \
+                     starting Hermit.",
+                    source.display()
+                );
+            }
+        }
+        for mount in &self.mount {
+            if let Some(source) = mount.get_source()
+                && !source.exists()
+            {
+                anyhow::bail!(
+                    "--mount source {} does not exist. Create it or correct the source path \
+                     before starting Hermit.",
+                    source.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn mapped_host_program(&self, program: &Path) -> Option<PathBuf> {
+        for bind in &self.bind {
+            let source = Path::new(OsStr::from_bytes(bind.source.to_bytes()));
+            let target = Path::new(OsStr::from_bytes(bind.target.to_bytes()));
+            if let Some(path) = mapped_path(program, source, target) {
+                return Some(path);
+            }
+        }
+        for mount in &self.mount {
+            if let Some(source) = mount.get_source()
+                && let Some(path) = mapped_path(program, source, mount.get_target())
+            {
+                return Some(path);
+            }
+        }
+        self.tmp.as_ref().and_then(|tmp| {
+            program
+                .strip_prefix(TMP_DIR)
+                .ok()
+                .map(|suffix| tmp.join(suffix))
+        })
+    }
+
+    fn validate_program(&self) -> Result<(), Error> {
+        let command = self.guest_command()?;
+        let requested = Path::new(command.get_program());
+
+        if requested.is_absolute() {
+            if let Some(host_path) = self.mapped_host_program(requested) {
+                return validate_executable(&host_path, requested);
+            }
+            if requested.starts_with(TMP_DIR) && self.tmp.is_none() && requested.exists() {
+                anyhow::bail!(
+                    "Program {} is under host /tmp, but Hermit replaces guest /tmp with an \
+                     isolated directory. Pass --tmp=/tmp to expose host /tmp or bind the program \
+                     to a guest path under /tmp.",
+                    requested.display()
+                );
+            }
+            return validate_executable(requested, requested);
+        }
+
+        let resolved = command.find_program().with_context(|| {
+            format!(
+                "Could not resolve program {:?} in the guest PATH. Check PATH or use an absolute \
+                 executable path.",
+                requested
+            )
+        })?;
+        validate_executable(&resolved, requested)
     }
 
     fn tmpfs(&self) -> Result<Tmpfs<'_>, Error> {
@@ -617,6 +1161,14 @@ impl RunOpts {
         global: &GlobalOpts,
         capture_output: bool,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
+        if self.no_namespace {
+            let mut process = Container::new();
+            apply_affinity(&mut process, self.pin_threads);
+            return with_container(&mut process, || {
+                self.run_in_container(global, capture_output)
+            });
+        }
+
         let tmpfs = self.tmpfs()?;
 
         let mut container = self.container(tmpfs.path())?;
@@ -681,12 +1233,19 @@ impl RunOpts {
         let out2 = self.run_verify(log2_file, global)?;
 
         compare_two_runs(
-            &out1,
-            log1_path,
-            &out2,
-            log2_path,
-            "Success: deterministic.",
-            "Failure: nondeterministic.",
+            ComparedRun {
+                output: &out1,
+                log: log1_path,
+            },
+            ComparedRun {
+                output: &out2,
+                log: log2_path,
+            },
+            ComparisonOptions {
+                success_message: "Success: deterministic. Determinism verified.",
+                failure_message: "Failure: nondeterministic.",
+                verbose: self.verify_verbose,
+            },
         )
     }
 
@@ -713,10 +1272,10 @@ impl RunOpts {
                 let target = tmpfs.join(relative_path);
                 mounts.push(mount.target(target).touch_target());
             } else {
-                tracing::warn!(
-                    "The path {:?} is not in {}, --bind currently has no effect",
-                    bind,
-                    TMP_DIR
+                eprintln!(
+                    "WARNING: --bind target {} is outside guest /tmp, so this option has no \
+                     effect; files outside /tmp are already visible unless another mount hides them",
+                    bind.target.to_string_lossy()
                 );
             }
         }
@@ -751,9 +1310,18 @@ impl RunOpts {
     }
 
     pub fn run_verify(&self, log_file: fs::File, global: &GlobalOpts) -> Result<Output, Error> {
-        // TODO: Get this working with `--tmp`? Each run could use a separate
-        // subdirectory. Only preserve the temporary directory if verify failed?
-        let tmpfs = tempfile::TempDir::new()?;
+        if self.no_namespace {
+            // Verify initializes a process-global tracing subscriber for each run. Keep a plain
+            // child-process boundary between runs, but do not configure any namespaces or mounts.
+            let mut process = Container::new();
+            apply_affinity(&mut process, self.pin_threads);
+            let mut log_file = Some(log_file);
+            return with_container(&mut process, || {
+                self.run_verify_in_container(&mut log_file, global)
+            });
+        }
+
+        let tmpfs = self.tmpfs()?;
 
         let mut container = self.container(tmpfs.path())?;
 
@@ -779,21 +1347,7 @@ impl RunOpts {
         Ok(())
     }
 
-    fn save_config_to_disk(&self) -> Result<(), Error> {
-        if let Some(path) = &self.save_config {
-            let mut file = File::create(path)?;
-            file.write_all(format!("{:#?}\n", self).as_bytes())?;
-        }
-        Ok(())
-    }
-
-    fn run_in_container(
-        &self,
-        global: &GlobalOpts,
-        capture_output: bool,
-    ) -> Result<(ExitStatus, Option<Output>), Error> {
-        let _guard = global.init_tracing();
-
+    fn guest_command(&self) -> Result<Command, Error> {
         let mut command = Command::new(&self.program);
         command.args(&self.args);
         if let Some(current_dir) = &self.workdir {
@@ -814,20 +1368,57 @@ impl RunOpts {
                 command.env("HOME", "/root");
                 self.merge_from_env_settings(&mut command)?
             }
-            BaseEnv::Host => {
-                // Let it all through.
-                self.merge_from_env_settings(&mut command)?
-            }
+            BaseEnv::Host => self.merge_from_env_settings(&mut command)?,
         }
 
-        let config = self.det_opts.det_config.clone();
+        Ok(command)
+    }
+
+    fn save_config_to_disk(&self) -> Result<(), Error> {
+        if let Some(path) = &self.save_config {
+            let mut file = File::create(path)?;
+            file.write_all(format!("{:#?}\n", self).as_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn effective_det_config(&self) -> DetConfig {
+        let mut config = self.det_opts.det_config.clone();
+        if std::env::var(FAIL_CLOSED_ENV).is_ok_and(|value| value == "1") {
+            config.panic_on_unsupported_syscalls = true;
+        }
+        config
+    }
+
+    fn run_in_container(
+        &self,
+        global: &GlobalOpts,
+        capture_output: bool,
+    ) -> Result<(ExitStatus, Option<Output>), Error> {
+        let _guard = global.init_tracing();
+
+        let command = self.guest_command()?;
+
+        let config = self.effective_det_config();
         self.save_config_to_disk()?;
 
         if capture_output {
-            let out = hermit::run_with_output(command, config, self.summary, &self.summary_json)?;
+            let out = hermit::run_with_output_backend(
+                command,
+                config,
+                self.summary,
+                &self.summary_json,
+                self.selected_backend(),
+            )?;
             Ok((out.status, Some(out)))
         } else {
-            let status = hermit::run(command, config, self.summary, &self.summary_json)?;
+            let status = hermit::run_with_backend(
+                command,
+                config,
+                self.summary,
+                &self.summary_json,
+                self.selected_backend(),
+            )?;
             Ok((status, None))
         }
     }
@@ -841,26 +1432,27 @@ impl RunOpts {
         // `log_file` by value. Guaranteed by caller to never panic.
         let log_file = log_file.take().unwrap();
 
-        // Ensure at least a minimum DEBUG level.
-        let level = if let Some(requested) = global.log {
-            requested
+        let minimum_level = if self.verify_verbose {
+            LevelFilter::TRACE
         } else {
             LevelFilter::DEBUG
         };
+        let level = global.log.unwrap_or(minimum_level).max(minimum_level);
 
         let _guard = init_file_tracing(Some(level), log_file);
 
-        let mut command = Command::new(&self.program);
-        command.args(&self.args);
+        let command = self.guest_command()?;
 
-        if let Some(current_dir) = &self.workdir {
-            command.current_dir(current_dir);
-        }
-
-        let config = self.det_opts.det_config.clone();
+        let config = self.effective_det_config();
         self.save_config_to_disk()?;
 
-        hermit::run_with_output(command, config, self.summary, &self.summary_json)
+        hermit::run_with_output_backend(
+            command,
+            config,
+            self.summary,
+            &self.summary_json,
+            self.selected_backend(),
+        )
     }
 }
 

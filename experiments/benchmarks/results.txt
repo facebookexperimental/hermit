@@ -1,0 +1,12 @@
+hermit: ./target/release/hermit
+host:   Linux 6.13.2-0_fbk13_hardened_0_g02230262e956 x86_64 | AMD EPYC 9D85 158-Core Processor
+input:  bzip2 data = 2.0M at /home/newton/hbench_2m.bin
+date:   2026-07-22T05:48:01Z
+
+workload     | run |  native s | --strict s (x)     | non-strict s (x)  
+-------------|-----|-----------|--------------------|-------------------
+true         |  20 |    0.0027 |    0.0098 (  3.6x) |    0.0092 (  3.3x)
+echo         |  20 |    0.0031 |    0.0131 (  4.2x) |    0.0141 (  4.5x)
+ls           |  20 |    0.0103 |    0.0837 (  8.1x) |    0.0755 (  7.3x)
+bzip2-2MB    |   3 |    0.1283 |    6.2549 ( 48.7x) |    5.1290 ( 39.9x)
+procx200     |   5 |    0.1039 |    1.1008 ( 10.5x) |    0.6652 (  6.3x)

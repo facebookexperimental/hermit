@@ -10,6 +10,7 @@ use std::fs::File;
 use std::path::PathBuf;
 
 use clap::Parser;
+use hermit::Backend;
 use tracing::metadata::LevelFilter;
 
 use super::tracing::init_file_tracing;
@@ -43,6 +44,12 @@ pub struct GlobalOpts {
     /// Log to a file instead of the terminal.
     #[clap(long, value_name = "FILE", env = "HERMIT_LOG_FILE")]
     pub log_file: Option<PathBuf>,
+
+    /// Select the process instrumentation backend. This is the preferred, global
+    /// position (e.g. `hermit --backend ptrace run ...`); for backwards
+    /// compatibility `run` also accepts `--backend` after the subcommand.
+    #[clap(long, value_enum, value_name = "BACKEND")]
+    pub backend: Option<Backend>,
 }
 
 impl GlobalOpts {

@@ -14,7 +14,11 @@ max_iters="${4:-1000}"
 
 RANDOM=42 # Set random seed
 
-perf list hardware | grep -i "Hardware event" > /dev/null || {
+# Chaos mode requires usable hardware performance counters. Probe for them by
+# actually opening the retired-branch counter (see perf_supported.sh) rather
+# than matching presentation text from `perf list`, which produced false skips
+# on PMU-capable hosts (GH #21).
+"$(dirname "$0")/perf_supported.sh" || {
   >&2 echo "It seems that perf is not supported, so this chaos test will be skipped."
   >&2 echo "Chaos mode requires hardware performance counters."
   exit 0

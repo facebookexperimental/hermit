@@ -12,10 +12,7 @@ use core::fmt::Display;
 use core::fmt::Formatter;
 use core::fmt::Result;
 use std::cmp::Ordering;
-use std::cmp::Reverse;
-use std::collections::BTreeMap;
 use std::io::Write;
-use std::ops::Bound;
 use std::path::Path;
 use std::process::Command;
 use std::str::FromStr;
@@ -26,6 +23,16 @@ use clap::Parser;
 use regex::Regex;
 use tempfile::NamedTempFile;
 
+/// Selects the set of log messages compared for determinism.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum LogComparisonMode {
+    /// Compare deterministic Detcore and scheduler messages.
+    #[default]
+    Deterministic,
+    /// Compare every captured log message without filtering.
+    FullTrace,
+}
+
 /// Options for calling `log_diff`.
 #[derive(Debug, Parser)]
 pub struct LogDiffOpts {
@@ -33,7 +40,11 @@ pub struct LogDiffOpts {
     /// presence of (limited) nondeterminism.
     #[clap(long)]
     pub strip_lines: bool,
-    /// Limit the number of differences printed.  Set to 0 for no limit.
+
+    /// The internal message set to compare.
+    #[clap(skip)]
+    pub comparison: LogComparisonMode,
+    /// Limit the number of differences printed. Set to 0 for no limit.
     #[clap(long, default_value = "20")]
     pub limit: u64,
 
@@ -41,18 +52,19 @@ pub struct LogDiffOpts {
     #[clap(long)]
     pub ignore_lines: Vec<String>,
 
-    /// Show specified number of syscall prior to a divergence point in the diff view. Set to 0 for ommiting the history
+    /// Show this many completed syscalls before each run-specific divergence point.
+    /// Set to 0 to omit history.
     #[clap(long, default_value = "0")]
     pub syscall_history: u64,
-    /// Disables colored console output for line diffs
+    /// Disable colored console output for line diffs.
     #[clap(long)]
     pub no_color: bool,
 
-    /// Do not consider "COMMIT" messages for deterministic check
+    /// Do not consider "COMMIT" messages for deterministic checks.
     #[clap(long)]
     pub skip_commit: bool,
 
-    /// Do not consider "DETLOG" messages for deterministic check
+    /// Do not consider "DETLOG" messages for deterministic checks.
     #[clap(long)]
     pub skip_detlog: bool,
 
@@ -61,7 +73,7 @@ pub struct LogDiffOpts {
     pub git_diff: bool,
 
     /// In case --skip-detlog=false this parameter further filters which
-    /// "DETLOG" messages will be included for determnistic check
+    /// "DETLOG" messages will be included for deterministic checks
     #[clap(long, default_values = &["syscall", "syscallresult", "other"])]
     pub include_detlogs: Vec<DetLogFilter>,
 }
@@ -96,7 +108,9 @@ impl LogDiffOpts {
     fn filter_deterministic<'a>(&self, v: &[(usize, &'a str)]) -> Vec<(usize, &'a str)> {
         v.iter()
             .filter_map(|(i, s)| {
-                if (is_detlog(s) && !self.skip_detlog(s)) || (is_commit(s) && !self.skip_commit) {
+                if (is_detlog(s) && !self.skip_detlog(s) && !is_scheduler_committed_time(s))
+                    || (is_commit(s) && !self.skip_commit && !is_internal_io_poll_commit(s))
+                {
                     Some((*i, *s))
                 } else {
                     None
@@ -169,7 +183,9 @@ pub fn strip_log_entry(log: &str) -> String {
     // not the full and proper setup.  In contrast, for all command tests, and for `hermit
     // run` itself, the full contents of the COMMIT line should be deterministic and this
     // hack should not be needed.
-    static RE1: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[\d]+\b").unwrap()); // This one is terrible overkill.
+    // Include common duration suffixes so fractional timing jitter is not left behind.
+    static RE1: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b[\d][\d_]*(?:\.[\d][\d_]*)?(?:ns|us|µs|ms)?\b").unwrap()); // This one is terrible overkill.
 
     // TODO: only strip this information if the config specified to the host /tmp through.
     // Otherwise we can determinize /tmp access fully.
@@ -226,6 +242,38 @@ fn is_detlog(line: &str) -> bool {
     line.contains(" DETLOG ")
 }
 
+/// A scheduler COMMIT turn that only grants the `InternalIOPolling` resource, i.e. a
+/// granted retry of a nonblocking poll (poll/epoll_wait/wait4/futex/recv/send...). These
+/// grants are internal bookkeeping of Hermit's blocking-via-polling mechanism: how many
+/// times a thread is re-granted permission to re-attempt a nonblocking syscall before it
+/// stops returning would-block depends on when a concurrent external-IO action (e.g. a
+/// child linker process writing to a pipe) becomes ready on the host, which is wall-clock
+/// dependent and not tied to the (RCB-deterministic) logical schedule. The corresponding
+/// `NONCOMMIT ... polling resource` skips are already excluded from comparison (they are
+/// not tagged `COMMIT`); excluding the matching grant-COMMITs keeps the deterministic
+/// comparison consistent and focused on guest-observable events (the actual syscall
+/// results, still compared via their DETLOG entries).
+///
+/// The scheduler additionally suppresses the per-retry "advance global time for scheduler
+/// turn" DETLOG line for these turns at the source (see `Scheduler::bump_global_time`), so
+/// the two mechanisms together make the deterministic comparison insensitive to how many
+/// times a would-block syscall was retried.
+fn is_internal_io_poll_commit(line: &str) -> bool {
+    is_commit(line) && line.contains("{InternalIOPolling: ")
+}
+
+/// The scheduler's per-turn `committed_time` advance bookkeeping. `committed_time` tracks
+/// the global logical clock, which still moves forward when an `InternalIOPolling` retry
+/// (see `is_internal_io_poll_commit`) advances time -- and the number of those retries is
+/// host-timing nondeterministic. That makes the *presence* of this line on a given turn
+/// retry-count sensitive, so we exclude it from the deterministic comparison. No
+/// guest-observable signal is lost: the value is redundant with the (retained,
+/// retry-count-insensitive) "advance global time for scheduler turn" DETLOG line and with
+/// the per-turn committed time echoed on each COMMIT line.
+fn is_scheduler_committed_time(line: &str) -> bool {
+    line.contains("advancing committed_time from ")
+}
+
 fn is_detcore(line: &str) -> bool {
     static PREFIX: LazyLock<Regex> =
         LazyLock::new(|| Regex::new("^(ERROR|WARN|INFO|DEBUG|TRACE).* detcore:").unwrap());
@@ -270,18 +318,78 @@ fn filter_ignored<'a>(lines: Vec<(usize, &'a str)>, omits: &Vec<String>) -> Vec<
         .collect()
 }
 
-fn collect_syscalls<'a>(v: &[(usize, &'a str)]) -> BTreeMap<Reverse<usize>, &'a str> {
-    // here we order syscalls by their original indices in logfile.
-    // we want a non-increasing order to be able to efficiently take(#number_of_recent_calls) using range_search
+fn collect_syscalls<'a>(v: &[(usize, &'a str)]) -> Vec<(usize, &'a str)> {
     v.iter()
-        .filter_map(|(i, s)| {
-            if is_detlog_syscall_result(s) {
-                Some((Reverse(*i), *s))
-            } else {
-                None
-            }
-        })
+        .filter(|(_, entry)| is_detlog_syscall(entry))
+        .copied()
         .collect()
+}
+
+fn syscall_at_or_before<'a>(
+    syscalls: &[(usize, &'a str)],
+    index: usize,
+) -> Option<(usize, &'a str)> {
+    syscalls
+        .iter()
+        .rev()
+        .find(|(syscall_index, _)| *syscall_index <= index)
+        .copied()
+}
+
+fn write_syscall_context(
+    w: &mut impl std::io::Write,
+    left_index: usize,
+    right_index: usize,
+    left_syscalls: &[(usize, &str)],
+    right_syscalls: &[(usize, &str)],
+    history_count: u64,
+) -> std::io::Result<()> {
+    if history_count == 0 {
+        return Ok(());
+    }
+
+    let left_current = syscall_at_or_before(left_syscalls, left_index);
+    let right_current = syscall_at_or_before(right_syscalls, right_index);
+    if left_current.is_none() && right_current.is_none() {
+        return Ok(());
+    }
+
+    writeln!(w, "Divergent syscall context:")?;
+    for (label, current) in [("run 1", left_current), ("run 2", right_current)] {
+        if let Some((index, syscall)) = current {
+            writeln!(w, "  {label}, log message {index}: {syscall}")?;
+        } else {
+            writeln!(w, "  {label}: <no syscall observed>")?;
+        }
+    }
+
+    let history_limit = usize::try_from(history_count).unwrap_or(usize::MAX);
+    for (label, index, syscalls) in [
+        ("run 1", left_index, left_syscalls),
+        ("run 2", right_index, right_syscalls),
+    ] {
+        let history_boundary =
+            syscall_at_or_before(syscalls, index).map_or(index, |(current_index, _)| current_index);
+        let mut history = syscalls
+            .iter()
+            .rev()
+            .filter(|(syscall_index, entry)| {
+                *syscall_index < history_boundary && is_detlog_syscall_result(entry)
+            })
+            .take(history_limit)
+            .copied()
+            .collect::<Vec<_>>();
+        history.reverse();
+        if !history.is_empty() {
+            writeln!(w, "  Prior completed syscalls for {label}:")?;
+            for (_, syscall) in history {
+                writeln!(w, "    {syscall}")?;
+            }
+        }
+    }
+    writeln!(w)?;
+
+    Ok(())
 }
 
 /// A comparison of two strings.
@@ -332,96 +440,87 @@ fn diff_vecs(
     v2: &[(usize, &str)],
     opts: &LogDiffOpts,
     w: &mut impl std::io::Write,
-    syscalls: &BTreeMap<Reverse<usize>, &str>,
+    left_syscalls: &[(usize, &str)],
+    right_syscalls: &[(usize, &str)],
 ) -> std::io::Result<bool> {
-    writeln!(w, "  Comparing {} messages...\n", which)?;
+    writeln!(w, "  Comparing {which} messages...\n")?;
     if v1.is_empty() && v2.is_empty() {
-        Ok(false)
-    } else {
-        let mut diff_count = 0;
-        for ((oix, ox), (_, oy)) in v1.iter().zip(v2.iter()) {
-            let (x, y) = if opts.strip_lines {
-                (strip_log_entry(ox), strip_log_entry(oy))
-            } else {
-                (ox.to_string(), oy.to_string())
-            };
-            if x != y {
-                write!(
-                    w,
-                    "({}) Mismatch in log entries, line {}: {}",
-                    which,
-                    oix,
-                    Comparison::new(opts.no_color, &x, &y)
-                )?;
-                if opts.strip_lines {
-                    write!(
-                        w,
-                        "({}) Original entries, before stripping {}: {}",
-                        which,
-                        oix,
-                        Comparison::new(opts.no_color, ox, oy)
-                    )?;
-                }
-                if opts.syscall_history > 0 {
-                    let mut syscall_history: Vec<_> = syscalls
-                        .range((Bound::Excluded(Reverse(*oix)), Bound::Unbounded))
-                        .take(5)
-                        .collect();
-                    syscall_history.reverse();
-
-                    writeln!(w, "Recent syscalls: ")?;
-                    if !syscall_history.is_empty() {
-                        for (_, s) in syscall_history {
-                            writeln!(w, "{}", s)?;
-                        }
-                        writeln!(w)?;
-                    } else {
-                        writeln!(w, "None\n")?;
-                    }
-                }
-
-                diff_count += 1;
-                if diff_count > opts.limit && opts.limit != 0 {
-                    writeln!(
-                        w,
-                        "More than {} differences, eliding the rest...",
-                        opts.limit
-                    )?;
-                    break;
-                }
-            }
-        }
-
-        match v1.len().cmp(&v2.len()) {
-            Ordering::Less => {
-                writeln!(
-                    w,
-                    "second log contains {} extra lines not matched in log two. Displaying up to 10 of those:",
-                    v2.len() - v1.len()
-                )?;
-                diff_count += 1;
-                let start = v2.len() - std::cmp::min(10, v2.len() - v1.len());
-                for ln in v2[start..v2.len()].iter() {
-                    writeln!(w, "{}", ln.1)?;
-                }
-            }
-            Ordering::Greater => {
-                writeln!(
-                    w,
-                    "First log contains {} extra lines not matched in log two.  Displaying up to 10 of those:",
-                    v1.len() - v2.len()
-                )?;
-                diff_count += 1;
-                let start = v1.len() - std::cmp::min(10, v1.len() - v2.len());
-                for ln in v1[start..v1.len()].iter() {
-                    writeln!(w, "{}", ln.1)?;
-                }
-            }
-            Ordering::Equal => {}
-        }
-
-        Ok(diff_count > 0)
+        return Ok(false);
     }
+
+    let mut diff_count = 0;
+    for ((left_index, left), (right_index, right)) in v1.iter().zip(v2.iter()) {
+        let (left_compared, right_compared) = if opts.strip_lines {
+            (strip_log_entry(left), strip_log_entry(right))
+        } else {
+            (left.to_string(), right.to_string())
+        };
+        if left_compared == right_compared {
+            continue;
+        }
+
+        if diff_count >= opts.limit && opts.limit != 0 {
+            writeln!(
+                w,
+                "More than {} differences, eliding the rest...",
+                opts.limit
+            )?;
+            break;
+        }
+
+        write!(
+            w,
+            "({which}) Mismatch at log messages {left_index} (run 1) and {right_index} (run 2): {}",
+            Comparison::new(opts.no_color, &left_compared, &right_compared)
+        )?;
+        if opts.strip_lines {
+            write!(
+                w,
+                "({which}) Original entries before normalization: {}",
+                Comparison::new(opts.no_color, left, right)
+            )?;
+        }
+        write_syscall_context(
+            w,
+            *left_index,
+            *right_index,
+            left_syscalls,
+            right_syscalls,
+            opts.syscall_history,
+        )?;
+
+        diff_count += 1;
+    }
+
+    match v1.len().cmp(&v2.len()) {
+        Ordering::Less => {
+            writeln!(
+                w,
+                "Run 2 contains {} extra messages not matched in run 1. Displaying up to 10:",
+                v2.len() - v1.len()
+            )?;
+            diff_count += 1;
+            let start = v2.len() - std::cmp::min(10, v2.len() - v1.len());
+            for (_, message) in &v2[start..] {
+                writeln!(w, "{message}")?;
+            }
+        }
+        Ordering::Greater => {
+            writeln!(
+                w,
+                "Run 1 contains {} extra messages not matched in run 2. Displaying up to 10:",
+                v1.len() - v2.len()
+            )?;
+            diff_count += 1;
+            let start = v1.len() - std::cmp::min(10, v1.len() - v2.len());
+            for (_, message) in &v1[start..] {
+                writeln!(w, "{message}")?;
+            }
+        }
+        Ordering::Equal => {}
+    }
+
+    Ok(diff_count > 0)
 }
 
 fn git_diff(
@@ -430,21 +529,21 @@ fn git_diff(
     v2: &[(usize, &str)],
     opts: &LogDiffOpts,
     w: &mut impl std::io::Write,
-    syscalls: &BTreeMap<Reverse<usize>, &str>,
+    left_syscalls: &[(usize, &str)],
+    right_syscalls: &[(usize, &str)],
 ) -> std::io::Result<bool> {
-    writeln!(w, "  Comparing {} messages...\n", which)?;
+    writeln!(w, "  Comparing {which} messages...\n")?;
 
     let mut file1 = NamedTempFile::new()?;
     let mut file2 = NamedTempFile::new()?;
 
-    for (_, ln) in v1 {
-        writeln!(file1, "{}", ln)?;
+    for (_, line) in v1 {
+        writeln!(file1, "{line}")?;
     }
-    for (_, ln) in v2 {
-        writeln!(file2, "{}", ln)?;
+    for (_, line) in v2 {
+        writeln!(file2, "{line}")?;
     }
 
-    // git diff --color --color-words -w
     match Command::new("git")
         .args(["diff", "--color", "--color-words", "-w"])
         .arg(file1.path())
@@ -452,9 +551,9 @@ fn git_diff(
         .status()
     {
         Ok(code) => Ok(!code.success()),
-        Err(err) => {
-            eprintln!("Error launching git, falling back to basic diff: {}", err);
-            diff_vecs(which, v1, v2, opts, w, syscalls)
+        Err(error) => {
+            eprintln!("Error launching git, falling back to basic diff: {error}");
+            diff_vecs(which, v1, v2, opts, w, left_syscalls, right_syscalls)
         }
     }
 }
@@ -489,31 +588,35 @@ fn log_diff_from_strs(
     opts: &LogDiffOpts,
     w: &mut impl std::io::Write,
 ) -> std::io::Result<bool> {
-    let vec_a = extract_log_messages(file_a_str.as_ref());
-    let vec_b = extract_log_messages(file_b_str.as_ref());
-
-    let vec_a = filter_ignored(vec_a, &opts.ignore_lines);
-    let vec_b = filter_ignored(vec_b, &opts.ignore_lines);
+    let all_a = filter_ignored(
+        extract_log_messages(file_a_str.as_ref()),
+        &opts.ignore_lines,
+    );
+    let all_b = filter_ignored(
+        extract_log_messages(file_b_str.as_ref()),
+        &opts.ignore_lines,
+    );
 
     writeln!(
         w,
         "Logs contain {} | {} messages total",
-        vec_a.len(),
-        vec_b.len(),
+        all_a.len(),
+        all_b.len(),
     )?;
 
-    let vec_a = filter_detcore(&vec_a);
-    let vec_b = filter_detcore(&vec_b);
-    let infos_a = filter_infos(&vec_a);
-    let infos_b = filter_infos(&vec_b);
-    let detlogs_a = opts.filter_deterministic(&vec_a);
-    let detlogs_b = opts.filter_deterministic(&vec_b);
-    let syscalls = collect_syscalls(&vec_a);
+    let detcore_a = filter_detcore(&all_a);
+    let detcore_b = filter_detcore(&all_b);
+    let infos_a = filter_infos(&detcore_a);
+    let infos_b = filter_infos(&detcore_b);
+    let detlogs_a = opts.filter_deterministic(&detcore_a);
+    let detlogs_b = opts.filter_deterministic(&detcore_b);
+    let left_syscalls = collect_syscalls(&all_a);
+    let right_syscalls = collect_syscalls(&all_b);
     writeln!(
         w,
         "Logs contain {} | {} detcore-specific messages",
-        vec_a.len(),
-        vec_b.len(),
+        detcore_a.len(),
+        detcore_b.len(),
     )?;
     writeln!(
         w,
@@ -529,20 +632,38 @@ fn log_diff_from_strs(
     )?;
 
     if opts.strip_lines {
-        writeln!(w, "Stripping entries of numerical data before comparison..")?;
+        writeln!(
+            w,
+            "Normalizing known nondeterministic numerical data before comparison..."
+        )?;
     }
 
-    let mut diff_found = false;
+    let (which, compared_a, compared_b) = match opts.comparison {
+        LogComparisonMode::Deterministic => ("DETLOG", &detlogs_a, &detlogs_b),
+        LogComparisonMode::FullTrace => ("full trace", &all_a, &all_b),
+    };
 
-    if opts.git_diff {
-        diff_found |= git_diff("DETLOGs", &detlogs_a, &detlogs_b, opts, w, &syscalls)?;
+    let diff_found = if opts.git_diff {
+        git_diff(
+            which,
+            compared_a,
+            compared_b,
+            opts,
+            w,
+            &left_syscalls,
+            &right_syscalls,
+        )?
     } else {
-        diff_found |= diff_vecs("DETLOGs", &detlogs_a, &detlogs_b, opts, w, &syscalls)?;
-    }
-
-    // The TRACE level lines will generally include reorderings from racing threads.
-    // So not doing any comparisons here for now:
-    // diff_found |= diff_vecs("ALL", &vec_a, &vec_b);
+        diff_vecs(
+            which,
+            compared_a,
+            compared_b,
+            opts,
+            w,
+            &left_syscalls,
+            &right_syscalls,
+        )?
+    };
 
     if diff_found {
         writeln!(w, "Done processing logs, differences found.")?;
@@ -564,7 +685,7 @@ mod test {
         let str2 = "test2";
 
         assert_eq!(
-            format!("{}", &super::Comparison::new(true, str1, str2))
+            format!("{}", super::Comparison::new(true, str1, str2))
                 .split('\n')
                 .collect::<Vec<&str>>(),
             ["Diff < left / right > :", "<\"test1\"", ">\"test2\"", "",]
@@ -577,7 +698,7 @@ mod test {
         let str2 = "test2";
 
         assert_eq!(
-            format!("{}", &super::Comparison::new(false, str1, str2))
+            format!("{}", super::Comparison::new(false, str1, str2))
                 .split('\n')
                 .collect::<Vec<&str>>(),
             [
@@ -601,6 +722,7 @@ mod test {
             &super::LogDiffOpts {
                 limit: 1,
                 strip_lines: false,
+                comparison: super::LogComparisonMode::Deterministic,
                 syscall_history: 5,
                 no_color: false,
                 skip_commit: false,
@@ -616,99 +738,84 @@ mod test {
             &mut result,
         )?;
 
-        assert_eq!(
-            String::from_utf8_lossy(&result)
-                .as_ref()
-                .split('\n')
-                .collect::<Vec<&str>>(),
-            vec![
-                "Logs contain 1 | 1 messages total",
-                "Logs contain 1 | 1 detcore-specific messages",
-                "Logs contain 1 | 1 INFO messages",
-                "Logs contain 1 | 1 DETLOG & scheduler COMMIT messages",
-                "  Comparing DETLOGs messages...",
-                "",
-                "(DETLOGs) Mismatch in log entries, line 0: \u{1b}[1mDiff\u{1b}[0m \u{1b}[31m< left\u{1b}[0m / \u{1b}[32mright >\u{1b}[0m :",
-                "\u{1b}[31m<\"INFO detcore: DETLOG [syscall][detcore, dtid 3]  finish syscall #1\u{1b}[0m\u{1b}[1;48;5;52;31m1\u{1b}[0m\u{1b}[31m: mmap(NULL, 3954880, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_DENYWRITE, 3, 0) = Ok(140737347883008)\"\u{1b}[0m",
-                "\u{1b}[32m>\"INFO detcore: DETLOG [syscall][detcore, dtid 3]  finish syscall #1\u{1b}[0m\u{1b}[1;48;5;22;32m5\u{1b}[0m\u{1b}[32m: mmap(NULL, 3954880, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_DENYWRITE, 3, 0) = Ok(140737347883008)\"\u{1b}[0m",
-                "Recent syscalls: ",
-                "None",
-                "",
-                "Done processing logs, differences found.",
-                "",
-            ]
-        );
+        let output = String::from_utf8(result).unwrap();
+        assert!(output.contains("  Comparing DETLOG messages..."));
+        assert!(output.contains("Mismatch at log messages 0 (run 1) and 0 (run 2)"));
+        assert!(output.contains("run 1, log message 0: INFO detcore: DETLOG [syscall][detcore, dtid 3]  finish syscall #11"));
+        assert!(output.contains("run 2, log message 0: INFO detcore: DETLOG [syscall][detcore, dtid 3]  finish syscall #15"));
+        assert!(!output.contains("eliding the rest"));
 
         Ok(())
     }
 
     #[test]
-    fn test_log_diff_syscalls() -> std::io::Result<()> {
-        let log_file_a = r#"2022-09-06T14:15:47.891501Z  INFO detcore: DETLOG [memory][detcore, dtid 3] 0x602000-0x623000 rw-p 0 0:0 0 [heap] -> 74b43faf7b78ace9443772ef63a30f66feaf9bd320256c82b8bd880634d19d46
-2022-09-06T14:15:48.904049Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall: write(1, 0x6022a0, 70) = 1
-2022-09-06T14:15:48.903997Z  INFO detcore: DETLOG [memory][detcore, dtid 3] 0x7ffffffdd000-0x7ffffffff000 rw-p 0 0:0 0 [stack] -> 7984d1aaf386fce67eaa926624ecc1d5a4105828e4f286ee59cc69c0491cd5fe
-2022-09-06T14:15:48.904049Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall: write(1, 0x6022a0, 70) = 2
-2022-09-06T14:15:48.904049Z  INFO detcore: COMMIT 2
-2022-09-06T14:15:48.904782Z  INFO detcore::scheduler: [sched-step5] >>>>>>>"#;
+    fn test_log_diff_reports_each_runs_syscall_context() -> std::io::Result<()> {
+        let log_a = r#"2022-09-06T14:15:47.000000Z INFO detcore: DETLOG [syscall] finish syscall #1: read(3, 0x1000, 1) = Ok(1)
+2022-09-06T14:15:48.000000Z INFO detcore: DETLOG [syscall] finish syscall #2: write(1, 0x2000, 1) = Ok(1)"#;
+        let log_b = r#"2022-09-06T14:15:47.000000Z INFO detcore: DETLOG [syscall] finish syscall #1: read(3, 0x1000, 1) = Ok(1)
+2022-09-06T14:15:48.000000Z INFO detcore: DETLOG [syscall] finish syscall #2: write(1, 0x3000, 1) = Ok(1)"#;
+        let mut result = Vec::new();
+        let options = super::LogDiffOpts {
+            no_color: true,
+            syscall_history: 1,
+            ..Default::default()
+        };
 
-        let log_file_b = r#"2022-09-06T14:15:47.891501Z  INFO detcore: DETLOG [memory][detcore, dtid 3] 0x602000-0x623000 rw-p 0 0:0 0 [heap] -> 74b43faf7b78ace9443772ef63a30f66feaf9bd320256c82b8bd880634d19d46
-2022-09-06T14:15:48.904049Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall: write(1, 0x6022a0, 70) = 1
-2022-09-06T14:15:47.903997Z  INFO detcore: DETLOG [memory][detcore, dtid 3] 0x7ffffffdd000-0x7ffffffff000 rw-p 0 0:0 0 [stack] -> 1984d1aaf386fce67eaa926624ecc1d5a4105828e4f286ee59cc69c0491cd5fe
-2022-09-06T14:15:47.904049Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall: write(1, 0x6022a0, 70) = 3
-2022-09-06T14:15:47.904049Z  INFO detcore: COMMIT 1
-2022-09-06T14:15:47.904782Z  INFO detcore::scheduler: [sched-step5] >>>>>>>"#;
-        let mut result = Vec::<u8>::new();
+        assert!(super::log_diff_from_strs(
+            log_a,
+            log_b,
+            &options,
+            &mut result
+        )?);
 
-        super::log_diff_from_strs(
-            log_file_a,
-            log_file_b,
-            &super::LogDiffOpts {
-                limit: 1,
-                strip_lines: false,
-                syscall_history: 5,
-                no_color: true,
-                skip_commit: false,
-                skip_detlog: false,
-                git_diff: false,
-                ignore_lines: Vec::new(),
-                include_detlogs: vec![
-                    DetLogFilter::Syscall,
-                    DetLogFilter::SyscallResult,
-                    DetLogFilter::Other,
-                ],
-            },
-            &mut result,
-        )?;
+        let output = String::from_utf8(result).unwrap();
+        assert!(output.contains("Mismatch at log messages 2 (run 1) and 2 (run 2)"));
+        assert!(output.contains("run 1, log message 2: INFO detcore: DETLOG [syscall] finish syscall #2: write(1, 0x2000, 1) = Ok(1)"));
+        assert!(output.contains("run 2, log message 2: INFO detcore: DETLOG [syscall] finish syscall #2: write(1, 0x3000, 1) = Ok(1)"));
+        assert!(output.contains("Prior completed syscalls for run 1:"));
+        assert!(output.contains("Prior completed syscalls for run 2:"));
+        assert_eq!(output.matches("finish syscall #1: read").count(), 2);
+        Ok(())
+    }
 
-        assert_eq!(
-            String::from_utf8_lossy(&result)
-                .as_ref()
-                .split('\n')
-                .collect::<Vec<&str>>(),
-            vec![
-                "Logs contain 6 | 6 messages total",
-                "Logs contain 6 | 6 detcore-specific messages",
-                "Logs contain 6 | 6 INFO messages",
-                "Logs contain 5 | 5 DETLOG & scheduler COMMIT messages",
-                "  Comparing DETLOGs messages...",
-                "",
-                "(DETLOGs) Mismatch in log entries, line 3: Diff < left / right > :",
-                "<\"INFO detcore: DETLOG [memory][detcore, dtid 3] 0x7ffffffdd000-0x7ffffffff000 rw-p 0 0:0 0 [stack] -> 7984d1aaf386fce67eaa926624ecc1d5a4105828e4f286ee59cc69c0491cd5fe\"",
-                ">\"INFO detcore: DETLOG [memory][detcore, dtid 3] 0x7ffffffdd000-0x7ffffffff000 rw-p 0 0:0 0 [stack] -> 1984d1aaf386fce67eaa926624ecc1d5a4105828e4f286ee59cc69c0491cd5fe\"",
-                "Recent syscalls: ",
-                "INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall: write(1, 0x6022a0, 70) = 1",
-                "",
-                "(DETLOGs) Mismatch in log entries, line 4: Diff < left / right > :",
-                "<\"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall: write(1, 0x6022a0, 70) = 2\"",
-                ">\"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall: write(1, 0x6022a0, 70) = 3\"",
-                "Recent syscalls: ",
-                "INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall: write(1, 0x6022a0, 70) = 1",
-                "",
-                "More than 1 differences, eliding the rest...",
-                "Done processing logs, differences found.",
-                ""
-            ]
-        );
+    #[test]
+    fn test_full_trace_detects_unnormalized_timing_difference() -> std::io::Result<()> {
+        let log_a = "INFO detcore: DETLOG [syscall] finish syscall #1: clock_gettime(CLOCK_MONOTONIC, 100) = Ok(0)";
+        let log_b = "INFO detcore: DETLOG [syscall] finish syscall #1: clock_gettime(CLOCK_MONOTONIC, 101) = Ok(0)";
+        let normalized = super::LogDiffOpts {
+            strip_lines: true,
+            no_color: true,
+            ..Default::default()
+        };
+
+        assert!(!super::log_diff_from_strs(
+            log_a,
+            log_b,
+            &normalized,
+            &mut Vec::new()
+        )?);
+
+        let verbose = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::FullTrace,
+            strip_lines: false,
+            syscall_history: 1,
+            no_color: true,
+            ..Default::default()
+        };
+        let mut result = Vec::new();
+        assert!(super::log_diff_from_strs(
+            log_a,
+            log_b,
+            &verbose,
+            &mut result
+        )?);
+
+        let output = String::from_utf8(result).unwrap();
+        assert!(output.contains("Comparing full trace messages"));
+        assert!(output.contains("clock_gettime(CLOCK_MONOTONIC, 100)"));
+        assert!(output.contains("clock_gettime(CLOCK_MONOTONIC, 101)"));
+        assert!(output.contains("run 1"));
+        assert!(output.contains("run 2"));
         Ok(())
     }
 
@@ -734,28 +841,12 @@ mod test {
         };
         super::log_diff_from_strs(log_file_a, log_file_b, &log_options, &mut result)?;
 
-        assert_eq!(
-            String::from_utf8_lossy(&result)
-                .as_ref()
-                .split('\n')
-                .collect::<Vec<&str>>(),
-            vec![
-                "Logs contain 5 | 5 messages total",
-                "Logs contain 5 | 5 detcore-specific messages",
-                "Logs contain 5 | 5 INFO messages",
-                "Logs contain 4 | 4 DETLOG & scheduler COMMIT messages",
-                "  Comparing DETLOGs messages...",
-                "",
-                "(DETLOGs) Mismatch in log entries, line 2: Diff < left / right > :",
-                "<\"INFO detcore: DETLOG [memory][detcore, dtid 3] 0x7ffffffdd000-0x7ffffffff000 rw-p 0 0:0 0 [stack] -> 7984d1aaf386fce67eaa926624ecc1d5a4105828e4f286ee59cc69c0491cd5fe\"",
-                ">\"INFO detcore: DETLOG [memory][detcore, dtid 3] 0x7ffffffdd000-0x7ffffffff000 rw-p 0 0:0 0 [stack] -> 1984d1aaf386fce67eaa926624ecc1d5a4105828e4f286ee59cc69c0491cd5fe\"",
-                "(DETLOGs) Mismatch in log entries, line 4: Diff < left / right > :",
-                "<\"INFO detcore: COMMIT 2\"",
-                ">\"INFO detcore: COMMIT 1\"",
-                "Done processing logs, differences found.",
-                ""
-            ]
-        );
+        let output = String::from_utf8(result).unwrap();
+        assert!(output.contains("Mismatch at log messages 2 (run 1) and 2 (run 2)"));
+        assert!(output.contains("Mismatch at log messages 4 (run 1) and 4 (run 2)"));
+        assert!(output.contains("INFO detcore: COMMIT 2"));
+        assert!(output.contains("INFO detcore: COMMIT 1"));
+
         Ok(())
     }
 
@@ -829,6 +920,88 @@ mod test {
         assert_eq!(v, vec![(2, "INFO DETLOG detcore:[syscall] syscall 1")]);
     }
 
+    /// Regression: the deterministic comparison must ignore the scheduler bookkeeping emitted
+    /// by nonblocking-IO poll retries, whose count is host-timing nondeterministic (e.g. how
+    /// many times a thread re-polls a pipe before a child process makes it ready). Only the
+    /// `{InternalIOPolling: ...}` COMMIT turn and the `advancing committed_time` clock line
+    /// should be dropped; ordinary COMMIT turns and DETLOG entries must be retained.
+    #[test]
+    fn test_filter_deterministic_drops_io_polling_bookkeeping() {
+        let opts = super::LogDiffOpts::default();
+        let v = opts.filter_deterministic(&[
+            (
+                0,
+                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 17, dettid 5 using resources {InternalIOPolling: W}, on previously committed 1s",
+            ),
+            (
+                1,
+                "DEBUG detcore::scheduler: DETLOG [sched-step1] advancing committed_time from 1 to 2",
+            ),
+            (
+                2,
+                "INFO detcore: DETLOG [syscall][detcore, dtid 5] finish syscall #9: read(3, 0x1000, 1) = Ok(1)",
+            ),
+            (
+                3,
+                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Path(\"/proc/5/fd/3\"): R}, on previously committed 2s",
+            ),
+        ]);
+        // The InternalIOPolling COMMIT (0) and the committed_time line (1) are dropped; the
+        // guest-observable syscall (2) and the ordinary COMMIT turn (3) survive.
+        assert_eq!(
+            v,
+            vec![
+                (
+                    2,
+                    "INFO detcore: DETLOG [syscall][detcore, dtid 5] finish syscall #9: read(3, 0x1000, 1) = Ok(1)"
+                ),
+                (
+                    3,
+                    "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Path(\"/proc/5/fd/3\"): R}, on previously committed 2s"
+                ),
+            ]
+        );
+    }
+
+    /// Regression: two runs that differ only in how many nonblocking-IO poll retries occurred
+    /// must compare as deterministic, while a genuine guest-observable divergence must still be
+    /// reported. `run_b` below performs one extra poll retry (an extra InternalIOPolling COMMIT
+    /// plus its committed_time advance) but the guest syscalls are identical.
+    #[test]
+    fn test_log_diff_ignores_extra_io_poll_retries() -> std::io::Result<()> {
+        let common_head = "2022-09-06T14:15:47.000000Z  INFO detcore: DETLOG [syscall][detcore, dtid 5] inbound syscall: poll(0x1000, 1, -1) = ?";
+        let common_tail = "2022-09-06T14:15:47.100000Z  INFO detcore: DETLOG [syscall][detcore, dtid 5] finish syscall #9: poll(0x1000, 1, -1) = Ok(1)";
+        let poll_retry = "2022-09-06T14:15:47.050000Z  INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 17, dettid 5 using resources {InternalIOPolling: W}, on previously committed 1s\n2022-09-06T14:15:47.050000Z DEBUG detcore::scheduler: DETLOG [sched-step1] advancing committed_time from 1 to 2";
+
+        let run_a = format!("{common_head}\n{poll_retry}\n{common_tail}");
+        // run_b polls one extra time before the fd is ready:
+        let run_b = format!("{common_head}\n{poll_retry}\n{poll_retry}\n{common_tail}");
+
+        let opts = super::LogDiffOpts {
+            no_color: true,
+            strip_lines: true,
+            ..Default::default()
+        };
+        // Differ only in retry count -> deterministic (no diff reported):
+        assert!(!super::log_diff_from_strs(
+            &run_a,
+            &run_b,
+            &opts,
+            &mut Vec::new()
+        )?);
+
+        // But a real divergence in the guest-observable syscall result is still caught. (Use a
+        // non-numeric change: numeric-only differences are erased by `strip_lines` normalization.)
+        let run_c = run_a.replace("= Ok(1)", "= Err(Errno(EBADF))");
+        assert!(super::log_diff_from_strs(
+            &run_a,
+            &run_c,
+            &opts,
+            &mut Vec::new()
+        )?);
+        Ok(())
+    }
+
     #[test]
     fn test_filter_infos() {
         let v = super::filter_infos(&[
@@ -873,6 +1046,9 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
     #[test]
     fn test_strip_log() {
         assert_eq!(super::strip_log_entry("800.709_180s"), "<NANOSECONDS>");
+        assert_eq!(super::strip_log_entry("98.91618ms"), "<NUM>");
+        assert_eq!(super::strip_log_entry("98.91619ms"), "<NUM>");
+        assert_eq!(super::strip_log_entry("x86_64"), "x86_64");
         assert_eq!(
             super::strip_log_entry(
                 "COMMIT turn 66, dettid 2 using resources {Path(\"/proc/2/fd/1\"): W} at time 946_684_800.709_180_000s"

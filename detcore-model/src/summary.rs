@@ -22,11 +22,11 @@ pub struct RunSummary {
     /// Internal number of steps taken by the scheduler.
     pub sched_turns: u64,
 
-    /// [tracereplay] SchedEvents read and replayed from the input recording.
+    /// **Trace replay:** SchedEvents read and replayed from the input recording.
     pub schedevent_replayed: u64,
-    /// [tracereplay] SchedEvents recorded to disk during execution.
+    /// **Trace replay:** SchedEvents recorded to disk during execution.
     pub schedevent_recorded: u64,
-    /// [tracereplay] Desync events that occured while replaying SchedEvents.
+    /// **Trace replay:** Desync events that occurred while replaying SchedEvents.
     pub schedevent_desynced: u64,
 
     /// A human-readable summary of the desyncs that occurred.
@@ -48,7 +48,7 @@ pub struct RunSummary {
     /// Absolute (virtual) time in nanoseconds since epoch at program completion.
     pub virttime_final: u64,
 
-    /// [Nondeterministic] Realtime in nanoseconds, i.e. wall-clock time elapsed.
+    /// **Nondeterministic:** Realtime in nanoseconds, i.e. wall-clock time elapsed.
     pub realtime_elapsed: Option<Duration>,
 }
 

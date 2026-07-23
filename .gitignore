@@ -3,3 +3,10 @@ pkg
 .tmp*
 target/
 *.preempts
+
+# pr-dag-health.sh report artifact (regenerate with the script)
+pr-dag-health.json
+
+# validate.sh live working-envelope measurement (regenerate with --envelope-only).
+# The committed baseline lives in envelope-baseline.json; this is the fresh run.
+envelope.json

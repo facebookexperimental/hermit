@@ -1,0 +1,10 @@
+field,value
+leveldb_version,1.23
+threads,8
+ops_per_thread,50
+native_runs,6
+native_distinct,6
+hermit_runs,4
+hermit_distinct,1
+assert1_native_nondeterministic,PASS
+assert2_hermit_deterministic,PASS

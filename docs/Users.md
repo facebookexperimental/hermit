@@ -25,6 +25,11 @@ $ ./hermit run --strict ./examples/race.sh
 abababab (... deterministic racing processes...)
 ```
 
+Strict deterministic execution is the default: `./hermit run ./examples/race.sh`
+behaves the same as the `--strict` form above. The `--strict` flag is retained
+for command-line compatibility and does not make the default any stricter. See
+[USER_GUIDE.md](USER_GUIDE.md) for the full set of mode-selection options.
+
 ## Further reading
 
 * Find hermit [CLI examples here](https://fb.workplace.com/notes/hermetic-infra-fyi/hermit-tech-preview-a-linux-reproducibility-tool/244656753248444/)

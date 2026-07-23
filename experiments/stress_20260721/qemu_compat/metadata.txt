@@ -1,0 +1,10 @@
+schema_version=1
+started_at_utc=2026-07-22T01:49:54Z
+repository_commit=96261f618dda654fb87ffacd0e178c4bf743faaf
+hermit=./experiments/stress_20260721/hermit_compat_adapter.sh
+hermit_log=error
+hermit_sha256=56f50be661e18a9d50a15d098d50ddf88fe18bb694071be06144e63c8411081a
+program=/usr/local/bin/qemu-system-x86_64
+program_sha256=ea7cb62100804058a4e97fca129c77b77487a3d175d04551466b4e44f094f3ca
+runs=3
+command=/usr/local/bin/qemu-system-x86_64 -accel tcg -cpu max -m 256M -smp 1 -kernel /boot/vmlinuz-6.13.2-0_fbk15_hardened_0_g33ebba20e5e4 -initrd /boot/kdump-initramfs.img -append console=ttyS0\ rd.shell=0\ rd.emergency=reboot\ panic=1 -display none -serial stdio -monitor none -no-reboot

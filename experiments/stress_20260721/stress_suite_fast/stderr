@@ -1,0 +1,17 @@
+   Compiling hermit v0.0.0 (/home/newton/work/dev-hermit/worktrees/slot06/hermit/hermit-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.38s
+     Running tests/stress_suite.rs (target/debug/deps/stress_suite-565b8c6ab3ae83af)
+
+thread 'fast_chaos_matrix' (3862158) panicked at hermit-cli/tests/stress_suite.rs:182:14:
+atomic-lost-update, threads=2, seed=0 failed unexpectedly: "timeout" "10s" "/home/newton/work/dev-hermit/worktrees/slot06/hermit/target/debug/hermit" "run" "--base-env=minimal" "--chaos" "--sched-heuristic=random" "--preemption-timeout=disabled" "--no-virtualize-cpuid" "--seed=0" "/home/newton/work/dev-hermit/worktrees/slot06/hermit/target/tmp/hermit-stress-workloads/concurrency" "atomic-lost-update" "2"
+status: signal: 6 (SIGABRT)
+stdout:
+
+stderr:
+2026-07-22T01:56:36.681310Z  WARN reverie_ptrace::task: Unable to intercept CPUID: Underlying hardware does not support CPUID faulting
+2026-07-22T01:56:36.683161Z  WARN reverie_ptrace::task: Unable to intercept CPUID: Underlying hardware does not support CPUID faulting
+The futex facility returned an unexpected error code.
+timeout: the monitored command dumped core
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test failed, to rerun pass `-p hermit --test stress_suite`

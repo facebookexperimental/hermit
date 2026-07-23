@@ -84,6 +84,19 @@ pub struct Config {
     #[clap(long)]
     pub sequentialize_threads: bool,
 
+    /// Choose which side of an ordinary fork/clone runs first after the child is registered.
+    /// Random choices are deterministic under `--sched-seed`.
+    #[serde(default)]
+    #[clap(long, default_value = "child", value_name = "child|parent|random")]
+    pub runs_post_fork: RunsPostFork,
+
+    /// Use the optimized partial syscall subscription set instead of intercepting every syscall.
+    /// This permits unlisted syscalls to bypass Detcore and therefore weakens deterministic
+    /// accounting; leave it disabled for fail-closed execution.
+    #[serde(default)]
+    #[clap(long)]
+    pub passthru_opt: bool,
+
     /// In chaos mode, uses much cheaper approximate preemption timers.  Only makes sense
     /// when recording preemptions for later (precise) replay.
     #[clap(long)]
@@ -102,6 +115,16 @@ pub struct Config {
     /// Uses the `--fuzz-seed` to generate randomness and fuzz nondeterminism in the futex semantics.
     #[clap(long)]
     pub fuzz_futexes: bool,
+
+    /// Targeted chaos: bias scheduling toward known concurrency race patterns
+    /// instead of exploring interleavings uniformly. At the scheduler's existing
+    /// nondeterminism points it uses `--fuzz-seed` to (a) deliver a
+    /// process-directed signal to a randomly chosen thread in the group (signal
+    /// timing races) and (b) randomize the requeue position of a force-unblocked
+    /// thread (lock-ordering / wakeup races). Only takes effect with `--chaos`;
+    /// like the rest of chaos mode it remains reproducible under a fixed seed.
+    #[clap(long)]
+    pub chaos_target_races: bool,
 
     /// Record the timing of preemption events for future replay or experimentation.
     /// This is only useful in chaos modes.
@@ -151,7 +174,7 @@ pub struct Config {
     #[clap(long, value_name = "signame")]
     pub stacktrace_signal: Option<SigWrapper>,
 
-    /// [DEPRECATED] Print a stacktrace each time the program is preempted.  Only makes sense in `--chaos` mode
+    /// **Deprecated:** Print a stacktrace each time the program is preempted.  Only makes sense in `--chaos` mode
     /// and typically goes with preemption recording/replaying.
     #[clap(long)]
     pub preemption_stacktrace: bool,
@@ -173,12 +196,12 @@ pub struct Config {
     #[clap(long)]
     pub panic_on_unsupported_syscalls: bool,
 
-    /// [Internal] Set to `true` if we're inside a UTS namespace.
+    /// **Internal:** Set to `true` if we're inside a UTS namespace.
     // FIXME: This can be removed once spawn_fn-based tests support namespaces.
     #[clap(skip)]
     pub has_uts_namespace: bool,
 
-    /// [Internal] Path to the replay data folder.
+    /// **Internal:** Path to the replay data folder.
     #[clap(skip)]
     pub replay_data: Option<PathBuf>,
 
@@ -238,29 +261,29 @@ pub struct Config {
     #[clap(long, default_value = "0.0", value_name = "double")]
     pub sched_sticky_random_param: f64,
 
-    /// [Internal] An internal flag for indicating to Detcore whether we are in `hermit record` or
+    /// **Internal:** An internal flag for indicating to Detcore whether we are in `hermit record` or
     /// `hermit replay` mode.  This is necessary because there are DIFFERENT global
     /// invariants in record mode (e.g. files dont exist).  If we move to a chroot model
     /// and reproduce more, recording less, then this flag should become obsolete.
     #[clap(skip = false)]
     pub recordreplay_modes: bool,
 
-    /// [Internal] debugging option to stop execution after a specific scheduler commit, aka turn number
+    /// **Internal:** debugging option to stop execution after a specific scheduler commit, aka turn number
     /// (non-negative integer). This only makes sense if `--sequentialize-threads` is specified, as the scheduler is otherwise not engaged.
     #[clap(long, value_name = "turn_N")]
     pub stop_after_turn: Option<u64>,
 
-    /// [Internal] debugging option to stop execution after a scheduler loop iteration (non-negative integer).
+    /// **Internal:** debugging option to stop execution after a scheduler loop iteration (non-negative integer).
     /// This only makes sense if `--sequentialize-threads` is specified, as the scheduler is otherwise not engaged.
     #[clap(long, value_name = "iter_N")]
     pub stop_after_iter: Option<u64>,
 
-    /// [Internal] Debugging option to treat all sockets as mysterious external, nondeterministic
+    /// **Internal:** Debugging option to treat all sockets as mysterious external, nondeterministic
     /// entities, rather than container-internal and determinstically scheduled.
     #[clap(long)]
     pub debug_externalize_sockets: bool,
 
-    /// [Internal] Debugging option to change how futexes are implemented, either precisely modeled
+    /// **Internal:** Debugging option to change how futexes are implemented, either precisely modeled
     /// by hermit, by polling the kernel with non-blocking futex operations, or treated as external
     /// (nondeterministic) operations which unblock at imprecise times.
     #[clap(
@@ -437,6 +460,14 @@ impl fmt::Display for Config {
         if !self.virtualize_metadata {
             write!(f, " --no-virtualize-metadata")?;
         }
+        if self.passthru_opt {
+            write!(f, " --passthru-opt")?;
+        }
+        match self.runs_post_fork {
+            RunsPostFork::Child => {}
+            RunsPostFork::Parent => write!(f, " --runs-post-fork=parent")?,
+            RunsPostFork::Random => write!(f, " --runs-post-fork=random")?,
+        }
         let default_epoch: DateTime<Utc> = DEFAULT_EPOCH_STR.parse::<DateTime<Utc>>().unwrap();
         if self.epoch != default_epoch {
             write!(f, " --epoch={}", self.epoch.to_rfc3339())?;
@@ -454,6 +485,9 @@ impl fmt::Display for Config {
 
         if self.fuzz_futexes {
             write!(f, " --fuzz-futexes")?;
+        }
+        if self.chaos_target_races {
+            write!(f, " --chaos-target-races")?;
         }
         if let Some(m) = self.clock_multiplier {
             write!(f, " --clock-multiplier={}", m)?;
@@ -586,6 +620,44 @@ impl fmt::Display for Config {
     }
 }
 
+/// Which side of an ordinary fork/clone receives the first post-registration turn.
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    Parser,
+    PartialEq,
+    Eq
+)]
+pub enum RunsPostFork {
+    /// Run the newly registered child before its parent resumes.
+    #[default]
+    Child,
+    /// Allow the parent to resume before the newly registered child starts.
+    Parent,
+    /// Deterministically choose child-first or parent-first from the scheduler seed.
+    Random,
+}
+
+impl FromStr for RunsPostFork {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "child" => Ok(Self::Child),
+            "parent" => Ok(Self::Parent),
+            "random" => Ok(Self::Random),
+            _ => Err(format!(
+                "Expected Child|Parent|Random, could not parse: {:?}",
+                s
+            )),
+        }
+    }
+}
+
 /// How should we handle syscalls which may block, but are internal to the hermit container?
 /// These syscalls are determinizable, but there are multiple methods of doing so.
 /// These choices *do not* apply to blocking syscalls that wait for external conditions outside the
@@ -607,7 +679,7 @@ pub enum BlockingMode {
     /// (and the backoff policy there on) is decided by the scheduler.
     /// See NOTE [Blocking Syscalls via Internal Polling] in this folder.
     Polling,
-    /// Precisely model the [un]blocking behavior inside hermit.
+    /// Precisely model the blocking and unblocking behavior inside hermit.
     /// TODO: This work is not completed yet for all forms of blocking syscalls.
     Precise,
 }
@@ -772,5 +844,34 @@ impl Default for Config {
     fn default() -> Self {
         let v: Vec<String> = vec![];
         Config::parse_from(v.iter())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runs_post_fork_parses_all_modes_and_defaults_to_child() {
+        assert_eq!(Config::default().runs_post_fork, RunsPostFork::Child);
+        assert_eq!(
+            Config::parse_from(["detcore", "--runs-post-fork=parent"]).runs_post_fork,
+            RunsPostFork::Parent
+        );
+        assert_eq!(
+            Config::parse_from(["detcore", "--runs-post-fork=random"]).runs_post_fork,
+            RunsPostFork::Random
+        );
+        assert!(Config::try_parse_from(["detcore", "--runs-post-fork=invalid"]).is_err());
+    }
+
+    #[test]
+    fn config_display_preserves_nondefault_post_fork_modes() {
+        let mut config = Config::default();
+        config.runs_post_fork = RunsPostFork::Parent;
+        assert!(config.to_string().contains(" --runs-post-fork=parent"));
+
+        config.runs_post_fork = RunsPostFork::Random;
+        assert!(config.to_string().contains(" --runs-post-fork=random"));
     }
 }

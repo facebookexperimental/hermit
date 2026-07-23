@@ -1,0 +1,10 @@
+schema_version=1
+started_at_utc=2026-07-22T00:37:17Z
+repository_commit=3f3c31c45b1d6a750b716bc3efd96efb2a575e76
+hermit=./target/debug/hermit
+hermit_log=error
+hermit_sha256=e7b3863ecd47ef8a40c2e6dba978c1617a86d889fcfd7c4e15133cf7f0b03661
+program=/bin/echo
+program_sha256=3e435b4ffe3558f649f0e24abed5adbdabed7631eca6666fa2339976b17189f4
+runs=5
+command=/bin/echo deterministic-baseline

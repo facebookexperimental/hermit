@@ -66,6 +66,8 @@ use crate::scheduler::Scheduler;
 use crate::scheduler::Seconds;
 use crate::scheduler::ThreadNextTurn;
 use crate::scheduler::entropy_to_priority;
+use crate::scheduler::runqueue::FIRST_PRIORITY;
+use crate::scheduler::runqueue::LAST_PRIORITY;
 use crate::scheduler::runqueue::REPLAY_DEFERRED_PRIORITY;
 use crate::scheduler::runqueue::REPLAY_FOREGROUND_PRIORITY;
 use crate::scheduler::runqueue::is_ordinary_priority;
@@ -86,6 +88,20 @@ struct InodePool {
 struct DetInodeInfo {
     raw: RawInode,
     mtime: LogicalTime,
+}
+
+/// Everything the global scheduler needs to register a new child thread. A
+/// normal clone is registered by the parent; a `CLONE_VFORK` child registers
+/// itself (with `parent_is_kernel_blocked` set) because its parent is blocked
+/// inside the kernel until the child execs or exits.
+struct ChildRegistration {
+    parent_dettid: DetTid,
+    parent_detpid: DetPid,
+    child_dettid: DetTid,
+    child_tid_addr: usize,
+    flags: Option<CloneFlags>,
+    maybe_priority: Option<Priority>,
+    parent_is_kernel_blocked: bool,
 }
 
 impl Default for InodePool {
@@ -157,8 +173,8 @@ pub struct GlobalState {
     // used ports
     used_ports: Mutex<HashSet<u16>>,
 
-    // fd to port
-    fd_to_port: Mutex<HashMap<i32, u16>>,
+    // Open file description to bound port.
+    open_file_to_port: Mutex<HashMap<OpenFileId, u16>>,
 
     port_start_range: AtomicU16,
     port_end_range: AtomicU16,
@@ -355,7 +371,7 @@ impl GlobalTool for GlobalState {
             used_ports: Mutex::new(HashSet::new()),
             port_start_range: AtomicU16::new(range[0]),
             port_end_range: AtomicU16::new(range[1]),
-            fd_to_port: Mutex::new(HashMap::new()),
+            open_file_to_port: Mutex::new(HashMap::new()),
             past_first_execve: AtomicBool::new(false),
             inodes: Arc::new(Mutex::new(InodePool::new())),
             sched_handle: handle,
@@ -401,21 +417,48 @@ impl GlobalTool for GlobalState {
                 R::CreateChildThread(
                     self.recv_create_child_thread(
                         from,
-                        parent_detpid,
-                        dettid,
-                        ctid,
-                        flags,
-                        priority,
+                        ChildRegistration {
+                            parent_dettid: DetTid::from_raw(from.into()),
+                            parent_detpid,
+                            child_dettid: dettid,
+                            child_tid_addr: ctid,
+                            flags,
+                            maybe_priority: priority,
+                            parent_is_kernel_blocked: false,
+                        },
                     )
                     .await,
                 )
             }
+            // Requested by the vfork child on behalf of its kernel-blocked parent:
+            GlobalRequest::CreateVforkChildThread(
+                parent_dettid,
+                parent_detpid,
+                child_dettid,
+                ctid,
+                flags,
+                priority,
+            ) => R::CreateChildThread(
+                self.recv_create_child_thread(
+                    from,
+                    ChildRegistration {
+                        parent_dettid,
+                        parent_detpid,
+                        child_dettid,
+                        child_tid_addr: ctid,
+                        flags: Some(flags),
+                        maybe_priority: priority,
+                        parent_is_kernel_blocked: true,
+                    },
+                )
+                .await,
+            ),
             // Requested by the child thread itself:
             GlobalRequest::StartNewThread(dettid, detpid) => {
                 R::StartNewThread(self.recv_start_new_thread(from, dettid, detpid).await)
             }
-            GlobalRequest::DeregisterThread(dettid, detpid) => {
-                R::DeregisterThread(self.recv_deregister_thread(from, dettid, detpid).await)
+            GlobalRequest::DeregisterThread(dettid, detpid, mm) => {
+                R::DeregisterThread(self.recv_deregister_thread(from, dettid, detpid, mm).await)
             }
             GlobalRequest::FutexAction(dettid, action, futexid, init_read, mask) => R::FutexAction(
                 self.recv_futex_action(from, dettid, action, futexid, init_read, mask)
@@ -444,7 +487,7 @@ impl GlobalTool for GlobalState {
                 self.force_shutdown_with_error();
                 R::UnrecoverableShutdown(())
             }
-            GlobalRequest::RequestPort(sock_fd) => {
+            GlobalRequest::RequestPort(open_file_id) => {
                 let mut mut_used_ports = self.used_ports.lock().unwrap();
                 self.update_port_range();
                 let total_available =
@@ -464,31 +507,26 @@ impl GlobalTool for GlobalState {
                     R::PortFull
                 } else {
                     (*mut_used_ports).insert(self.next_port.load(SeqCst));
-                    let mut mut_fd_to_port = self.fd_to_port.lock().unwrap();
-                    (*mut_fd_to_port).insert(sock_fd, self.next_port.load(SeqCst));
+                    let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
+                    open_file_to_port.insert(open_file_id, self.next_port.load(SeqCst));
                     R::RequestPort(self.next_port.load(SeqCst))
                 }
             }
-            GlobalRequest::AddUsedPort(port, sock_fd) => {
-                let mut mut_used_ports = self.used_ports.lock().unwrap();
-                (*mut_used_ports).insert(port);
-                let mut mut_fd_to_port = self.fd_to_port.lock().unwrap();
-                (*mut_fd_to_port).insert(sock_fd, self.next_port.load(SeqCst));
+            GlobalRequest::AddUsedPort(port, open_file_id) => {
+                let mut used_ports = self.used_ports.lock().unwrap();
+                used_ports.insert(port);
+                let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
+                open_file_to_port.insert(open_file_id, port);
                 R::AddUsedPort
             }
-            GlobalRequest::FreePort(port) => {
-                let mut mut_used_ports = self.used_ports.lock().unwrap();
-                (*mut_used_ports).remove(&port);
-                R::FreePort
-            }
-            GlobalRequest::FreePortByFd(sock_fd) => {
-                let mut mut_fd_to_port = self.fd_to_port.lock().unwrap();
-                let port = (*mut_fd_to_port).remove(&sock_fd);
-                if let Some(x) = port {
-                    let mut mut_used_ports = self.used_ports.lock().unwrap();
-                    (*mut_used_ports).remove(&x);
+            GlobalRequest::ReleasePort(open_file_id) => {
+                let mut used_ports = self.used_ports.lock().unwrap();
+                let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
+                let port = open_file_to_port.remove(&open_file_id);
+                if let Some(port) = port {
+                    used_ports.remove(&port);
                 }
-                R::FreePort
+                R::ReleasePort(port)
             }
         };
 
@@ -533,7 +571,7 @@ impl GlobalState {
             dettid, &resp2, rs
         );
         let answer = resp2.get().await; // Block on the scheduler allowing our guest to proceed.
-        if rs.resources.contains_key(&ResourceID::Exit(true)) {
+        if let Some((true, process, mm)) = rs.exit_identity() {
             info!(
                 "Scheduler authorized an exit-group scenario, from dettid {} / detpid {}",
                 dettid, detpid
@@ -550,7 +588,7 @@ impl GlobalState {
                     // We don't need to do anything extra for our own thread. That can use the
                     // same mechanics as a normal exit:
                     if tid != dettid {
-                        sched.logically_kill_thread(&tid, &dettid);
+                        sched.logically_kill_thread(&tid, &process, mm);
                     }
                 }
             }
@@ -598,16 +636,19 @@ impl GlobalState {
         trace!("[detcore] All resources held by pid {} released", from);
     }
 
-    /// Global portion of parent-forking-child protocol.  Called by the parent thread.
-    async fn recv_create_child_thread(
-        &self,
-        from_parent: Tid,
-        parent_detpid: DetPid,
-        child_dettid: DetTid,
-        ctid: usize,
-        flags: Option<CloneFlags>,
-        maybe_priority: Option<Priority>,
-    ) {
+    /// Global portion of parent-forking-child protocol.  Called by the parent
+    /// thread for an ordinary clone, or by the child itself for a vfork whose
+    /// parent is blocked inside the kernel (`parent_is_kernel_blocked`).
+    async fn recv_create_child_thread(&self, rpc_sender: Tid, registration: ChildRegistration) {
+        let ChildRegistration {
+            parent_dettid,
+            parent_detpid,
+            child_dettid,
+            child_tid_addr: ctid,
+            flags,
+            maybe_priority,
+            parent_is_kernel_blocked,
+        } = registration;
         let initial_priority = if let Some(pr) = &self.preemptions_to_replay {
             assert!(maybe_priority.is_none());
             let prio = pr
@@ -655,7 +696,6 @@ impl GlobalState {
                 });
 
             {
-                let parent_dettid = DetTid::from_raw(from_parent.into()); // TODO(T78538674)
                 let is_group_leader = if let Some(f) = flags {
                     !f.contains(CloneFlags::CLONE_THREAD)
                 } else {
@@ -673,9 +713,11 @@ impl GlobalState {
             } else {
                 // In replay mode, the context switch point will already have initialized the priority.
                 // UNLESS this is the root thread, in which case we need to fill it in:
-                if sched.priorities.get(&child_dettid).is_none() {
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    sched.priorities.entry(child_dettid)
+                {
                     assert_eq!(parent_detpid, ROOT_DETPID);
-                    let _ = sched.priorities.insert(child_dettid, initial_priority);
+                    entry.insert(initial_priority);
                 }
             }
 
@@ -683,18 +725,36 @@ impl GlobalState {
                 pr.register_thread(child_dettid, initial_priority);
             }
 
-            let pos = sched.runqueue_push_back(child_dettid);
+            let child_first = self.cfg.sequentialize_threads
+                && !parent_is_kernel_blocked
+                && sched.child_runs_first_post_fork(self.cfg.runs_post_fork);
+            let pos = if child_first {
+                sched.runqueue_push_front(child_dettid)
+            } else {
+                sched.runqueue_push_back(child_dettid)
+            };
             debug!(
-                "[detcore] CreateChildThread with dtid {}: Added child to back of queue, position {}.",
-                child_dettid, pos,
+                "[detcore] CreateChildThread with dtid {}: Added child to {} of priority band, position {}.",
+                child_dettid,
+                if child_first { "front" } else { "back" },
+                pos,
             );
             sched.started_up.try_put(());
         }
-        // Parent thread yields so child can run (if it is higher priority).
-        if self.cfg.sequentialize_threads {
+        // The child queue position above determines which equal-priority side
+        // gets the first turn when the parent requests ParentContinue.
+        // A vfork parent is already blocked by the kernel and is not in the run
+        // queue, so it must not issue a ParentContinue request here.
+        if self.cfg.sequentialize_threads && !parent_is_kernel_blocked {
             let mut rs = Resources::new(parent_detpid);
-            rs.insert(ResourceID::ParentContinue(), Permission::W);
-            self.recv_request_resources(from_parent, parent_detpid, rs)
+            rs.insert(
+                ResourceID::ParentContinue {
+                    parent: parent_dettid,
+                    child: child_dettid,
+                },
+                Permission::W,
+            );
+            self.recv_request_resources(rpc_sender, parent_detpid, rs)
                 .await;
         }
     }
@@ -787,13 +847,13 @@ impl GlobalState {
 
     /// Warning: this happens completely asynchronously, whenever the guest exit hook fires.
     /// Its timing is not coordinated by the scheduler.
-    async fn recv_deregister_thread(&self, _from: Tid, dettid: DetTid, detpid: DetPid) {
+    async fn recv_deregister_thread(&self, _from: Tid, dettid: DetTid, detpid: DetPid, mm: MmId) {
         // Invariant: will only be called when sequentialize-threads is on.
         assert!(self.cfg.sequentialize_threads);
         self.sched
             .lock()
             .unwrap()
-            .logically_kill_thread(&dettid, &detpid);
+            .logically_kill_thread(&dettid, &detpid, mm);
         trace!(
             "[detcore, dtid {}] thread deregistered, removed from sched structures.",
             dettid
@@ -807,7 +867,7 @@ impl GlobalState {
         action: FutexAction,
         futexid: FutexID,
         _init_read: i32,
-        _mask: i32,
+        mask: u32,
     ) -> Option<SchedValue> {
         trace!("[detcore, dtid {}] Futex action: {:?}", &dettid, action);
         let response_iv = {
@@ -820,14 +880,14 @@ impl GlobalState {
                 .clone();
             match action {
                 FutexAction::WaitRequest(maybe_timeout) => {
-                    sched.sleep_futex_waiter(&dettid, futexid, maybe_timeout);
+                    sched.sleep_futex_waiter(&dettid, futexid, maybe_timeout, mask);
                     // block on ivar, below
                 }
                 FutexAction::WaitFinished => {
                     return None;
                 }
                 FutexAction::WakeRequest(num_threads) => {
-                    let num = sched.wake_futex_waiters(dettid, futexid, num_threads);
+                    let num = sched.wake_futex_waiters(dettid, futexid, num_threads, mask);
                     return Some(SchedValue::Value(num));
                 }
                 FutexAction::WakeFinished(_num_threads) => {
@@ -977,19 +1037,19 @@ impl GlobalState {
             }
         };
 
-        if result.print_stack_strace.is_some() {
-            if let Some(sig) = &self.cfg.stacktrace_signal {
-                trace!(
-                    "[dtid {}] signaling thread with {} at the point of stack trace printing.",
-                    ev.dettid, sig.0
-                );
-                let tid = Pid::from_raw(ev.dettid.as_raw());
-                // TODO(T78538674): virtualize pid/tid:
-                // We send a raw signal here and let the guest pick it up WHENEVER it resumes.
-                // We don't use the "signal_guest" method because we don't necessarily respect that
-                // protocol here.
-                signal::kill(tid, sig.0).unwrap();
-            }
+        if result.print_stack_strace.is_some()
+            && let Some(sig) = &self.cfg.stacktrace_signal
+        {
+            trace!(
+                "[dtid {}] signaling thread with {} at the point of stack trace printing.",
+                ev.dettid, sig.0
+            );
+            let tid = Pid::from_raw(ev.dettid.as_raw());
+            // TODO(T78538674): virtualize pid/tid:
+            // We send a raw signal here and let the guest pick it up WHENEVER it resumes.
+            // We don't use the "signal_guest" method because we don't necessarily respect that
+            // protocol here.
+            signal::kill(tid, sig.0).unwrap();
         }
 
         result
@@ -1061,17 +1121,23 @@ pub enum GlobalRequest {
     /// initial priority.
     CreateChildThread(DetTid, DetPid, usize, Option<CloneFlags>, Option<Priority>),
 
+    /// A vfork child registering itself while its parent is blocked inside the
+    /// kernel. Contains the (real) parent dettid and detpid, the child dettid,
+    /// the child TID address, the clone flags, and the starting priority (absent
+    /// only when replaying preemptions).
+    CreateVforkChildThread(DetTid, DetPid, DetTid, usize, CloneFlags, Option<Priority>),
+
     /// New thread is alive and waiting to run its first instruction.  Contains the dettid
     /// and detpid of the new child.
     StartNewThread(DetTid, DetPid),
 
     /// Remove thread from scheduler data structure, guaranteeing it will consume no
     /// further turns.
-    DeregisterThread(DetTid, DetPid),
+    DeregisterThread(DetTid, DetPid, MmId),
 
     /// Notify scheduler before/after futex action.
     /// The last two arguments are the initial contents of the memory word, and the mask.
-    FutexAction(DetTid, FutexAction, FutexID, i32, i32),
+    FutexAction(DetTid, FutexAction, FutexID, i32, u32),
 
     /// Translate nondeterministic to deterministic inode.
     DeterminizeInode(RawInode),
@@ -1094,16 +1160,14 @@ pub enum GlobalRequest {
     /// The container is shutting down.  Exit the scheduler "thread".
     UnrecoverableShutdown,
 
-    // Request a port
-    RequestPort(i32),
+    // Request a port for an open file description.
+    RequestPort(OpenFileId),
 
-    // Add port to used ports list
-    AddUsedPort(u16, i32),
+    // Add a port to the used-port list for an open file description.
+    AddUsedPort(u16, OpenFileId),
 
-    // FreePort
-    FreePort(u16),
-
-    FreePortByFd(i32),
+    // Release the port when the last alias of its open file description closes.
+    ReleasePort(OpenFileId),
 }
 
 /// Responses from the global object
@@ -1130,7 +1194,7 @@ pub enum GlobalResponse {
 
     RequestPort(u16),
     AddUsedPort,
-    FreePort,
+    ReleasePort(Option<u16>),
     PortFull,
 }
 
@@ -1267,11 +1331,23 @@ pub async fn create_child_thread<G, T>(
             Some(REPLAY_DEFERRED_PRIORITY)
         }
     } else if guest.config().chaos {
-        Some(entropy_to_priority(
-            guest
-                .thread_state_mut()
-                .chaos_prng_next_u64("child_priority"),
-        ))
+        let entropy = guest
+            .thread_state_mut()
+            .chaos_prng_next_u64("child_priority");
+        if guest.config().chaos_target_races {
+            // Targeted chaos: bias a freshly created child to an extreme priority
+            // so it either runs before the parent resumes or strictly after it,
+            // instead of landing at a uniformly random priority. This maximizes
+            // parent/child ordering divergence to surface fork/exec races.
+            // Reproducible under `--fuzz-seed`/`--sched-seed`.
+            if entropy.is_multiple_of(2) {
+                Some(FIRST_PRIORITY)
+            } else {
+                Some(LAST_PRIORITY)
+            }
+        } else {
+            Some(entropy_to_priority(entropy))
+        }
     } else {
         Some(DEFAULT_PRIORITY)
     };
@@ -1281,6 +1357,60 @@ pub async fn create_child_thread<G, T>(
     let resp = send_and_update_time(
         guest,
         GlobalRequest::CreateChildThread(child_dettid, detpid, ctid, flags, starting_priority),
+    )
+    .await;
+    match resp.1 {
+        GlobalResponse::CreateChildThread(x) => x,
+        _ => unreachable!(),
+    }
+}
+
+/// Register a vfork child while its parent is blocked inside `clone(2)`.
+///
+/// Unlike an ordinary clone, the parent cannot perform this registration
+/// because the kernel has blocked it until the child execs or exits. The child
+/// therefore registers itself, carrying the inherited parent identity, flags,
+/// and starting priority. The starting priority is derived the same way as an
+/// ordinary clone so that chaos and replay scheduling stay deterministic.
+pub async fn create_vfork_child_thread<G, T>(
+    guest: &mut G,
+    child_dettid: DetTid,
+    vfork: crate::tool_local::PendingVfork,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let starting_priority = if guest.config().replay_preemptions_from.is_some() {
+        None
+    } else if guest.config().replay_schedule_from.is_some() {
+        Some(if child_dettid <= DetTid::from_raw(3) {
+            REPLAY_FOREGROUND_PRIORITY
+        } else {
+            REPLAY_DEFERRED_PRIORITY
+        })
+    } else if guest.config().chaos {
+        Some(entropy_to_priority(vfork.child_priority_entropy.expect(
+            "vfork child priority entropy missing in chaos mode",
+        )))
+    } else {
+        // POSIX vfork suspends the parent until the child execs or _exits. Give
+        // the vfork child a strictly higher priority (lower number) than the
+        // parent's DEFAULT_PRIORITY so the deterministic scheduler always runs
+        // the child first, rather than round-robining the parent and child at
+        // equal priority (which leaves fork/exec ordering nondeterministic).
+        Some(DEFAULT_PRIORITY - 1)
+    };
+
+    let resp = send_and_update_time(
+        guest,
+        GlobalRequest::CreateVforkChildThread(
+            vfork.parent_dettid,
+            vfork.parent_detpid,
+            child_dettid,
+            vfork.child_tid_addr,
+            vfork.flags,
+            starting_priority,
+        ),
     )
     .await;
     match resp.1 {
@@ -1299,6 +1429,7 @@ pub async fn deregister_thread<R>(
     cfg: &Config,
     reverie: &R,
     detpid: DetPid,
+    mm: MmId,
 ) where
     // Note, this is called from a context where we DON'T have a full, operable `Guest`.
     R: GlobalRPC<GlobalState>,
@@ -1308,7 +1439,7 @@ pub async fn deregister_thread<R>(
         let resp = reverie
             .send_rpc((
                 threads_time,
-                GlobalRequest::DeregisterThread(dettid, detpid),
+                GlobalRequest::DeregisterThread(dettid, detpid, mm),
             ))
             .await;
         // We can't update the thread time here.  But it's dead anyway!
@@ -1339,7 +1470,7 @@ pub async fn futex_action<G, T>(
     futex_action: FutexAction,
     futexid: &FutexID,
     init_read: i32,
-    mask: i32,
+    mask: u32,
 ) -> Option<SchedValue>
 where
     G: Guest<Detcore<T>>,
@@ -1513,9 +1644,11 @@ where
                 write_backtrace(guest, m_path.as_ref());
             }
 
-            if timeslice.is_some() && guest.thread_state().past_global_first_execve {
+            if let Some(timeslice) = timeslice
+                && guest.thread_state().past_global_first_execve
+            {
                 let end_of_timeslice =
-                    guest.thread_state().thread_logical_time.as_nanos() + timeslice.unwrap();
+                    guest.thread_state().thread_logical_time.as_nanos() + timeslice;
                 trace!(
                     "[detcore][dettid {}] setting end_of_timeslice to {:?} as instructed by replayer",
                     guest.thread_state().dettid,

@@ -482,12 +482,54 @@ impl AnalyzeOpts {
             cfg.max_jitter_editdist = dist;
             cfg.max_jitter_swapdist = dist * dist;
         }
-        let crit = search_for_critical_schedule(test_fn, baseline, target, &cfg);
+        let crit = search_for_critical_schedule(test_fn, baseline, target, &cfg)?;
         eprintln!(
             "Critical event of final on-target schedule is {}",
             crit.critical_event_index
         );
         Ok(crit)
+    }
+
+    /// Bisect a known passing/failing schedule pair and report the critical event ordering.
+    pub fn bisect_schedule_pair(
+        &mut self,
+        good: Vec<SchedEvent>,
+        bad: Vec<SchedEvent>,
+    ) -> anyhow::Result<ExitStatus> {
+        self.phase0_initialize()?;
+        eprintln!(
+            ":: Beginning schedule bisection using good/bad endpoints ({} / {} events)",
+            good.len(),
+            bad.len(),
+        );
+
+        let critical = self.phase5_bisect_traces(&bad, &good)?;
+        let index = critical.critical_event_index;
+        if index == 0 || index >= critical.failing_schedule.len() {
+            bail!("schedule search returned an invalid critical event index {index}");
+        }
+
+        println!("\n---------------- hermit bisect result ----------------");
+        println!("Schedule divergence localized at bad event #{index}:");
+        println!(
+            "  preceding event #{}: {}",
+            index - 1,
+            critical.failing_schedule[index - 1]
+        );
+        println!(
+            "  critical event  #{index}: {}",
+            critical.failing_schedule[index]
+        );
+        println!("Swapping these adjacent events reproduces the good outcome.");
+
+        let report = self.phase6_record_outputs(critical)?;
+        if let Some(path) = &self.report_file {
+            let text = serde_json::to_string_pretty(&report)?;
+            std::fs::write(path, text)?;
+            eprintln!(":: Final bisection report written to {}", path.display());
+        }
+
+        Ok(ExitStatus::SUCCESS)
     }
 
     fn generate_context(
@@ -710,7 +752,7 @@ impl AnalyzeOpts {
         let normalized_preempts = min_run.preempts_out().clone();
         eprintln!(
             ":: {}\n {}",
-            &format!(
+            format!(
                 "Normalized, that preemption record ({}) becomes:",
                 min_run
                     .preempts_path_out()

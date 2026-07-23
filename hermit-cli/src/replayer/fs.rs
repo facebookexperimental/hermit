@@ -8,6 +8,8 @@
 
 use reverie::Errno;
 use reverie::Guest;
+use reverie::syscalls::Addr;
+use reverie::syscalls::AddrMut;
 use reverie::syscalls::Getdents;
 use reverie::syscalls::Getdents64;
 use reverie::syscalls::Ioctl;
@@ -23,7 +25,63 @@ use reverie::syscalls::ioctl;
 
 use super::Replayer;
 
+/// Scatter the recorded flat output `bytes` of a vectored read back into the
+/// guest's `iovec` array, filling each buffer in order until the bytes are
+/// exhausted. Returns the number of bytes written (the syscall return value).
+fn scatter_iovec_output<M: MemoryAccess>(
+    memory: &mut M,
+    iov_addr: Option<usize>,
+    iovcnt: usize,
+    bytes: &[u8],
+) -> Result<usize, Errno> {
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    let addr = iov_addr
+        .and_then(Addr::<libc::iovec>::from_raw)
+        .ok_or(Errno::EFAULT)?;
+    let mut iovecs = vec![
+        libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        };
+        iovcnt
+    ];
+    memory.read_values(addr, &mut iovecs)?;
+
+    let mut written = 0;
+    for iovec in iovecs {
+        if written == bytes.len() {
+            break;
+        }
+        let take = (bytes.len() - written).min(iovec.iov_len);
+        if take == 0 {
+            continue;
+        }
+        let dst = AddrMut::<u8>::from_raw(iovec.iov_base as usize).ok_or(Errno::EFAULT)?;
+        memory.write_exact(dst, &bytes[written..written + take])?;
+        written += take;
+    }
+    // The recorded byte count must fit within the guest's provided iovecs.
+    assert_eq!(written, bytes.len());
+    Ok(written)
+}
+
 impl Replayer {
+    /// Replays the vectored read family (`readv`/`preadv`/`preadv2`) by
+    /// scattering the recorded flattened output bytes across the guest's current
+    /// `iovec` buffers, without touching any live descriptor.
+    pub(super) async fn handle_readv_family<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        iov_addr: Option<usize>,
+        iovcnt: usize,
+    ) -> Result<i64, Errno> {
+        let bytes = next_event!(guest, Readv)?;
+        let written = scatter_iovec_output(&mut guest.memory(), iov_addr, iovcnt, &bytes)?;
+        Ok(written as i64)
+    }
+
     // FIXME: Generalize the read-family of syscalls with `ReadFamily`.
     pub(super) async fn handle_read<G: Guest<Self>>(
         &self,
@@ -95,6 +153,19 @@ impl Replayer {
         })
     }
 
+    pub(super) async fn handle_statfs<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        buf: Option<AddrMut<'_, libc::statfs>>,
+    ) -> Result<i64, Errno> {
+        let bytes = next_event!(guest, Statfs)?;
+        assert_eq!(bytes.len(), std::mem::size_of::<libc::statfs>());
+        guest
+            .memory()
+            .write_exact(buf.ok_or(Errno::EFAULT)?.cast(), &bytes)?;
+        Ok(0)
+    }
+
     pub(super) async fn handle_statx<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -115,7 +186,14 @@ impl Replayer {
     ) -> Result<i64, Errno> {
         let request = syscall.request();
 
-        if request.direction() == ioctl::Direction::Read {
+        if matches!(
+            request,
+            ioctl::Request::FIOCLEX | ioctl::Request::FIONCLEX | ioctl::Request::FIONBIO(_)
+        ) {
+            // Replayed opens do not necessarily create host file descriptors.
+            // Detcore updates the logical descriptor metadata after this returns.
+            next_event!(guest, Return)
+        } else if request.direction() == ioctl::Direction::Read {
             let output = next_event!(guest, Ioctl)?;
             request.write_output(&mut guest.memory(), &output)?;
             Ok(0)

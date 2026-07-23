@@ -1,0 +1,5 @@
+result=TIMEOUT
+exit_code=124
+timeout_seconds=240
+last_output=:: Run1...
+command=./target/debug/hermit --log error run --verify --base-env=minimal --no-sequentialize-threads --no-deterministic-io --preemption-timeout=disabled -- /usr/local/bin/qemu-system-x86_64 -accel tcg -cpu max -m 256M -smp 1 -kernel /boot/vmlinuz-6.13.2-0_fbk15_hardened_0_g33ebba20e5e4 -initrd /boot/kdump-initramfs.img -append 'console=ttyS0 rd.shell=0 rd.emergency=reboot panic=1' -display none -serial stdio -monitor none -no-reboot

@@ -32,6 +32,28 @@ use tracing_subscriber::fmt::MakeWriter;
 /// How many runs for each test when confirming determinism.
 static TEST_REPS: u64 = 3;
 
+fn test_trace_level() -> String {
+    std::env::var("DETCORE_TEST_RUST_LOG").unwrap_or_else(|_| {
+        // This is a compromise. We don't want to slow things down too much, but it's nice
+        // if we print some logs for failures on Sandcastle.
+        "detcore=info".into()
+    })
+}
+
+fn install_global_test_subscriber<W>(trace_level: &str, writer: W) -> bool
+where
+    W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
+{
+    let collector = tracing_subscriber::fmt()
+        .with_env_filter(trace_level)
+        .with_writer(writer)
+        .finish();
+    tracing::subscriber::set_global_default(collector).is_ok()
+}
+
+static GLOBAL_TEST_SUBSCRIBER: LazyLock<()> =
+    LazyLock::new(|| _ = install_global_test_subscriber(&test_trace_level(), std::io::stderr));
+
 /// Run a function multiple times, instrumenting it with DetCore and ensuring
 /// the outputs are the same on each run.
 #[derive(Default)]
@@ -52,6 +74,8 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     virtualize_time: false,
     virtualize_metadata: false,
     sequentialize_threads: false,
+    runs_post_fork: DEFAULT_CFG.runs_post_fork,
+    passthru_opt: false,
     imprecise_timers: false,
     chaos: false,
     clock_multiplier: DEFAULT_CFG.clock_multiplier,
@@ -94,6 +118,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     memory: 1024 * 1024 * 1024, //1 GiB
     interrupt_at: vec![],
     fuzz_futexes: false,
+    chaos_target_races: false,
 });
 
 /// Standardized test config: common options on.
@@ -103,6 +128,8 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     virtualize_time: true, // stat* could depends on this
     virtualize_metadata: true,
     sequentialize_threads: false,
+    runs_post_fork: DEFAULT_CFG.runs_post_fork,
+    passthru_opt: false,
     imprecise_timers: false,
     chaos: false,
     clock_multiplier: DEFAULT_CFG.clock_multiplier,
@@ -145,6 +172,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     memory: 1024 * 1024 * 1024, //1 GiB
     interrupt_at: vec![],
     fuzz_futexes: false,
+    chaos_target_races: false,
 });
 
 /// Standardized test config: all options on.
@@ -154,6 +182,8 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     virtualize_time: true,
     virtualize_metadata: true,
     sequentialize_threads: true,
+    runs_post_fork: DEFAULT_CFG.runs_post_fork,
+    passthru_opt: false,
     imprecise_timers: false,
     chaos: false,
     clock_multiplier: DEFAULT_CFG.clock_multiplier,
@@ -196,6 +226,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     memory: 1024 * 1024 * 1024, //1 GiB
     interrupt_at: vec![],
     fuzz_futexes: false,
+    chaos_target_races: false,
 });
 
 /// A basic oracle, which expects a success exit code.
@@ -258,10 +289,10 @@ macro_rules! make_det_test_variants {
 /// as a separate unit test. This is in contrast with `det_test_all_configs` which runs
 /// multiple modes sequentially under one test target.
 ///
-/// Arguments are `basic_det_test(function, predicate, modes...)`, wWhere:
+/// Arguments are `basic_det_test(function, predicate, modes...)`, where:
 ///   - `function` is the procedure under test.
 ///   - `predicate` is a function that accepts a Config and returns true if the test should
-///      run deterministically in that configuration.
+///     run deterministically in that configuration.
 ///
 /// This generates calls to `det_test_fn_with_config`.
 #[macro_export]
@@ -392,11 +423,8 @@ where
     T: Tool + 'static,
     F: FnOnce(),
 {
-    let trace_level = std::env::var("DETCORE_TEST_RUST_LOG").unwrap_or_else(|_| {
-        // This is a compromise. We don't want to slow things down too much, but it's nice
-        // if we print some logs for failures on Sandcastle.
-        "detcore=info".into()
-    });
+    LazyLock::force(&GLOBAL_TEST_SUBSCRIBER);
+    let trace_level = test_trace_level();
     let bufwriter = BufWriter::new();
     let collector = tracing_subscriber::fmt()
         .with_env_filter(trace_level)
@@ -430,6 +458,40 @@ where
     Ok((out, state, bufwriter.get_strings()))
 }
 
+/// Runs a function as a guest with Detcore's test log filter applied both to
+/// the calling thread and to tracer work performed on other threads.
+pub fn test_fn_with_config<T, F>(
+    f: F,
+    config: <T::GlobalState as GlobalTool>::Config,
+    capture_output: bool,
+) -> Result<(Output, T::GlobalState), Error>
+where
+    T: Tool + 'static,
+    F: FnOnce(),
+{
+    test_fn_with_logs::<T, F>(f, config, capture_output)
+        .map(|(output, state, _logs)| (output, state))
+}
+
+/// Runs a function as a guest with Detcore's test log filter and requires a
+/// successful guest exit status.
+pub fn check_fn_with_config<T, F>(
+    f: F,
+    config: <T::GlobalState as GlobalTool>::Config,
+    capture_output: bool,
+) -> T::GlobalState
+where
+    T: Tool + 'static,
+    F: FnOnce(),
+{
+    let (output, state) = test_fn_with_config::<T, F>(f, config, capture_output).unwrap();
+    if output.status != ExitStatus::Exited(0) {
+        print_tracee_output(&output);
+        panic!("Got exit status {:?}", output.status);
+    }
+    state
+}
+
 /// Runs a function multiple times and checks to see if the output was
 /// deterministic between runs. Expect successful exit code.
 pub fn det_test_fn<F>(f: F)
@@ -447,13 +509,29 @@ where
     F: Fn(),
     O: Fn(&Output, <Detcore as Tool>::GlobalState),
 {
+    det_test_fn_with_config_repetitions(TEST_REPS - 1, isdet, f, config, oracle)
+}
+
+/// Like [`det_test_fn_with_config`], but runs and compares exactly `repetitions` times.
+pub fn det_test_fn_with_config_repetitions<F, O>(
+    repetitions: u64,
+    isdet: bool,
+    f: F,
+    config: Config,
+    oracle: O,
+) where
+    F: Fn(),
+    O: Fn(&Output, <Detcore as Tool>::GlobalState),
+{
+    assert!(repetitions > 0, "at least one test repetition is required");
+
     if isdet {
         println!("Expecting determinism:");
     } else {
         println!("Not expecting determinism, but still performing multiple test runs:");
     }
     let mut dts = DetTestState::default();
-    for ix in 1..(TEST_REPS - 1) {
+    for ix in 1..repetitions {
         println!("Test Run {}:", ix);
         let (output, state, logs) =
             test_fn_with_logs::<Detcore, _>(&f, config.clone(), true).unwrap();
@@ -465,7 +543,7 @@ where
             check_output(&output, logs, &mut dts);
         }
     }
-    println!("Test Run {}:", TEST_REPS - 1);
+    println!("Test Run {}:", repetitions);
     let (output, state, logs) = test_fn_with_logs::<Detcore, _>(f, config, true).unwrap();
     println!("({} log lines captured.)", logs.len());
     oracle(&output, state);
@@ -493,6 +571,7 @@ pub fn det_test_cmd_with_config<O>(program: &str, args: &[&str], oracle: O, conf
 where
     O: Fn(&Output, <Detcore as Tool>::GlobalState),
 {
+    LazyLock::force(&GLOBAL_TEST_SUBSCRIBER);
     let mut dts = DetTestState::default();
     for _ in 1..(TEST_REPS - 1) {
         let (output, state) =
@@ -566,7 +645,7 @@ fn check_output(output: &Output, logs: Vec<String>, dts: &mut DetTestState) {
             if let [_pref, suffix] = vec[..] {
                 suffix.to_string()
             } else {
-                panic!("Unexpected form to COMMIT log line: {}", &s);
+                panic!("Unexpected form to COMMIT log line: {}", s);
             }
         })
         .collect();
@@ -598,4 +677,40 @@ fn check_output(output: &Output, logs: Vec<String>, dts: &mut DetTestState) {
         }
     }
     dts.last_log = Some(filtered);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BufWriter;
+    use super::install_global_test_subscriber;
+
+    #[test]
+    fn global_test_filter_applies_on_spawned_threads() {
+        let writer = BufWriter::new();
+        assert!(install_global_test_subscriber(
+            "reverie_ptrace::timer=off,detcore_testutils=trace",
+            writer.clone(),
+        ));
+
+        std::thread::spawn(|| {
+            tracing::trace!(
+                target: "reverie_ptrace::timer",
+                "filtered timer instruction"
+            );
+            tracing::trace!(target: "detcore_testutils", "visible control event");
+        })
+        .join()
+        .unwrap();
+
+        let logs = writer.get_strings();
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("visible control event"))
+        );
+        assert!(
+            !logs
+                .iter()
+                .any(|line| line.contains("filtered timer instruction"))
+        );
+    }
 }

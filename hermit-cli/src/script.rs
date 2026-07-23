@@ -17,7 +17,7 @@ use std::path::PathBuf;
 // Defined in kernel include/linux/binfmts.h
 const BINPRM_BUF_SIZE: usize = 256;
 
-/// Unix shebang, see https://en.wikipedia.org/wiki/Shebang_(Unix)
+/// Unix shebang, see [Wikipedia](https://en.wikipedia.org/wiki/Shebang_(Unix)).
 #[derive(Debug, Eq, PartialEq)]
 pub struct Shebang {
     program: PathBuf,

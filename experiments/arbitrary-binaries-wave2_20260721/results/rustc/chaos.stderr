@@ -1,0 +1,14 @@
+2026-07-22T01:11:59.954561Z  WARN reverie_ptrace::task: Unable to intercept CPUID: Underlying hardware does not support CPUID faulting
+2026-07-22T01:11:59.955990Z  WARN reverie_ptrace::task: Unable to intercept CPUID: Underlying hardware does not support CPUID faulting
+2026-07-22T01:11:59.963660Z  WARN reverie_ptrace::task: Unable to intercept CPUID: Underlying hardware does not support CPUID faulting
+2026-07-22T01:11:59.989494Z  WARN detcore::scheduler: Nondeterministic external actions [DetPid(5)] jumped in the middle of runnable work (2 tasks). Need to record this for reproducibility.
+2026-07-22T01:12:00.119702Z  WARN detcore::scheduler: Nondeterministic external actions [DetPid(13)] jumped in the middle of runnable work (3 tasks). Need to record this for reproducibility.
+2026-07-22T01:12:00.378669Z  WARN reverie_ptrace::task: Unable to intercept CPUID: Underlying hardware does not support CPUID faulting
+2026-07-22T01:12:00.407207Z  WARN reverie_ptrace::task: Unable to intercept CPUID: Underlying hardware does not support CPUID faulting
+2026-07-22T01:12:00.418173Z  WARN reverie_ptrace::task: Unable to intercept CPUID: Underlying hardware does not support CPUID faulting
+2026-07-22T01:12:00.428588Z  WARN reverie_ptrace::task: Unable to intercept CPUID: Underlying hardware does not support CPUID faulting
+2026-07-22T01:12:00.552243Z  WARN detcore::scheduler: Nondeterministic external actions [DetPid(25)] jumped in the middle of runnable work (4 tasks). Need to record this for reproducibility.
+2026-07-22T01:12:00.553639Z  WARN detcore::scheduler: Nondeterministic external actions [DetPid(23)] jumped in the middle of runnable work (3 tasks). Need to record this for reproducibility.
+2026-07-22T01:12:00.555140Z  WARN detcore::scheduler: Nondeterministic external actions [DetPid(9)] jumped in the middle of runnable work (2 tasks). Need to record this for reproducibility.
+2026-07-22T01:12:00.555364Z  WARN detcore::scheduler: Nondeterministic external actions [DetPid(9)] jumped in the middle of runnable work (2 tasks). Need to record this for reproducibility.
+2026-07-22T01:12:00.575373Z  WARN reverie_ptrace::task: Unable to intercept CPUID: Underlying hardware does not support CPUID faulting

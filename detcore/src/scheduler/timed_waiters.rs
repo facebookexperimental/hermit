@@ -85,10 +85,12 @@ impl TimedEvents {
 
     fn clear_old_alarm(&mut self, old: Option<LogicalTime>) {
         if let Some(time) = old {
-            let set = self
-                .map
-                .get_mut(&time)
-                .expect("internal invariant broken, entry missing");
+            // The `map` entry may already be gone if the alarm fired (was
+            // popped by `pop_if_before`) before being cleared. Clearing an
+            // already-fired alarm is a no-op rather than an invariant break.
+            let Some(set) = self.map.get_mut(&time) else {
+                return;
+            };
 
             // Could use a drain_filter here, but it is nightly only:
             let mut to_remove = None;
@@ -100,6 +102,12 @@ impl TimedEvents {
             }
             if let Some(evt) = to_remove {
                 assert!(set.remove(&evt));
+            }
+
+            // Preserve the invariant that `map` never holds an empty set, which
+            // `is_empty()` and `iter()` rely on.
+            if set.is_empty() {
+                self.map.remove(&time);
             }
         }
     }
@@ -125,11 +133,22 @@ impl TimedEvents {
             let time_ns = *entry.key();
             if time_ns <= current_time {
                 let set = entry.get_mut();
-                let dettid = set.pop_first().expect("inner set cannot be empty");
+                let evt = set.pop_first().expect("inner set cannot be empty");
                 if set.is_empty() {
                     entry.remove();
                 }
-                Some((time_ns, dettid))
+                // Once an alarm fires it is no longer pending, so drop its
+                // `alarm_times` bookkeeping. Otherwise that entry would dangle,
+                // pointing at a `map` time that no longer exists: the next
+                // `insert_alarm`/`remove_alarm` for this process would panic in
+                // `clear_old_alarm`, and `register_alarm` would report a bogus
+                // "seconds remaining" for the already-fired alarm.
+                if let TimedEvent::AlarmEvt(dp, _, _) = evt
+                    && self.alarm_times.get(&dp) == Some(&time_ns)
+                {
+                    self.alarm_times.remove(&dp);
+                }
+                Some((time_ns, evt))
             } else {
                 None
             }
@@ -180,5 +199,84 @@ impl TimedEvents {
         self.map
             .iter()
             .flat_map(|(key, set)| set.iter().map(|dtid| (*key, *dtid)))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn pid(n: i32) -> DetPid {
+        DetPid::from_raw(n)
+    }
+    fn tid(n: i32) -> DetTid {
+        DetTid::from_raw(n)
+    }
+    fn at(ns: u64) -> LogicalTime {
+        LogicalTime::from_nanos(ns)
+    }
+
+    /// Regression: an alarm that fires (is popped) must clear its `alarm_times`
+    /// bookkeeping so a subsequent alarm for the same process does not panic in
+    /// `clear_old_alarm`. This reproduces the openssl-speed crash, where a
+    /// SIGALRM fires and then the next timing round arms another alarm.
+    #[test]
+    fn reregister_after_fire_does_not_panic() {
+        let mut ev = TimedEvents::default();
+        let p = pid(100);
+
+        assert_eq!(
+            ev.insert_alarm(at(1000), p, tid(100), Signal::SIGALRM),
+            None
+        );
+
+        // The alarm fires: the scheduler pops the due event.
+        assert_eq!(
+            ev.pop(),
+            Some((at(1000), TimedEvent::AlarmEvt(p, tid(100), Signal::SIGALRM)))
+        );
+        assert!(ev.is_empty());
+
+        // Arming a new alarm must see no stale previous alarm (the old one has
+        // already fired) and must not panic.
+        assert_eq!(
+            ev.insert_alarm(at(2000), p, tid(100), Signal::SIGALRM),
+            None
+        );
+        assert_eq!(ev.len(), 1);
+    }
+
+    /// Cancelling (`alarm(0)`) after a fire must be a no-op, not a panic.
+    #[test]
+    fn cancel_after_fire_does_not_panic() {
+        let mut ev = TimedEvents::default();
+        let p = pid(100);
+        ev.insert_alarm(at(1000), p, tid(100), Signal::SIGALRM);
+        let _ = ev.pop(); // fire
+        assert_eq!(ev.remove_alarm(p), None);
+        assert!(ev.is_empty());
+    }
+
+    /// Replacing a still-pending alarm reports the old target time and must not
+    /// leave an empty set behind in `map` (which would break `is_empty()`).
+    #[test]
+    fn replace_pending_alarm_reports_old_and_leaves_no_empty_sets() {
+        let mut ev = TimedEvents::default();
+        let p = pid(100);
+        assert_eq!(
+            ev.insert_alarm(at(1000), p, tid(100), Signal::SIGALRM),
+            None
+        );
+        assert_eq!(
+            ev.insert_alarm(at(2000), p, tid(100), Signal::SIGALRM),
+            Some(at(1000))
+        );
+        // Only the replacement remains; the emptied 1000ns slot is gone.
+        assert_eq!(ev.len(), 1);
+        assert_eq!(
+            ev.pop(),
+            Some((at(2000), TimedEvent::AlarmEvt(p, tid(100), Signal::SIGALRM)))
+        );
+        assert!(ev.is_empty());
     }
 }

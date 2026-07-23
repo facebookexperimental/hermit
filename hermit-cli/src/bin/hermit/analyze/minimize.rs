@@ -36,14 +36,14 @@ fn sanity_preempts(vec: &[(LogicalTime, Priority)]) -> anyhow::Result<()> {
 
     let mut time_last = None;
     for (ns, prio) in vec {
-        if let Some(last) = time_last {
-            if *ns <= last {
-                bail!(
-                    "Timestamps failed to monotonically increase ({}), in series:\n {:?}",
-                    ns,
-                    vec
-                );
-            }
+        if let Some(last) = time_last
+            && *ns <= last
+        {
+            bail!(
+                "Timestamps failed to monotonically increase ({}), in series:\n {:?}",
+                ns,
+                vec
+            );
         }
         assert!(*prio >= FIRST_PRIORITY);
         assert!(*prio <= LAST_PRIORITY);

@@ -13,6 +13,14 @@ use reverie::process::Container;
 use reverie::process::Mount;
 use reverie::process::Namespace;
 
+pub(super) fn apply_affinity(container: &mut Container, pin_threads: bool) {
+    if pin_threads {
+        let rand_core: usize = rand::random_range(0..num_cpus::get());
+        tracing::info!("Pinning tracer and guest threads to core {}", rand_core);
+        container.affinity(rand_core);
+    }
+}
+
 pub fn default_container(pin_threads: bool) -> Container {
     let mut container = Container::new();
     container
@@ -22,11 +30,7 @@ pub fn default_container(pin_threads: bool) -> Container {
         .domainname("local")
         .mount(Mount::proc());
 
-    if pin_threads {
-        let rand_core: usize = rand::random_range(0..num_cpus::get());
-        tracing::info!("Pinning tracer and guest threads to core {}", rand_core);
-        container.affinity(rand_core);
-    }
+    apply_affinity(&mut container, pin_threads);
     container
 }
 

@@ -1,0 +1,25 @@
+tested_at_local=2026-07-21
+hermit_commit=ffdc1280e33c1c7d0f905ee630865e1b30d63e05
+hermit_ref=origin/main (detached checkout)
+reverie_commit=96693397ed60aa07c59ffeed4df3deed89b183e2
+os=CentOS Stream 9
+kernel=Linux 6.13.2-0_fbk13_hardened_0_g02230262e956 x86_64
+cpu=AMD EPYC 9D85 158-Core Processor
+cpuid_faulting=unavailable; tests used --no-virtualize-cpuid
+nginx=1.20.1
+redis=6.2.20
+sqlite=3.34.1
+python_system=3.9.25
+python_meta=3.12.13+meta
+java=OpenJDK 1.8.0_492
+node=v16.20.2
+gcc=11.5.0 20240719 (Red Hat 11.5.0-14)
+rustc_direct=1.99.0-nightly (be8e82435 2026-07-11)
+java_fixture_sha256=a35dbed470e7a8206b31002e9829496a0aaddfcc077ed95a8d22abcc5e81200a
+common_flags=run --base-env=minimal --no-virtualize-cpuid --preemption-timeout=disabled --bind FIXTURES:/tmp/wave2
+verify_flag=--verify
+chaos_flags=--chaos --seed=1
+normal_timeout_seconds=30 (180 for long Java/Node verify diagnosis)
+known_hang_timeout_seconds=10
+node_chaos_diagnostic_timeout_seconds=60
+initial_timeout_leak=18 Hermit roots / 75 total processes; manually terminated; runner now kills process group

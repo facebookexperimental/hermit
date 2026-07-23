@@ -20,7 +20,35 @@ use crate::types::DetInode;
 use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
+use crate::types::MmId;
 use crate::types::SigWrapper;
+
+/// Identity of one syscall executing outside Hermit's serialized guest turns.
+#[derive(
+    PartialEq,
+    Debug,
+    Eq,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    Hash,
+    PartialOrd,
+    Ord
+)]
+pub struct ExternalOpId {
+    /// Thread that started the operation.
+    pub tid: DetTid,
+    /// Per-thread syscall sequence number.
+    pub sequence: u64,
+}
+
+impl ExternalOpId {
+    /// Construct an external operation identity.
+    pub const fn new(tid: DetTid, sequence: u64) -> Self {
+        Self { tid, sequence }
+    }
+}
 
 /*
 NOTE [Blocking Syscalls via Internal Polling]
@@ -166,12 +194,19 @@ pub enum ResourceID {
 
     /// Wait for go-ahead to Exit or ExitGroup.  True indicates "group".
     /// Does not need to be released/returned once granted.
-    Exit(bool),
+    Exit {
+        /// Whether this is `exit_group` rather than `exit`.
+        group: bool,
+        /// Process whose lifecycle state is affected.
+        process: DetPid,
+        /// Address space used by clear-child-tid futex wakeups.
+        mm: MmId,
+    },
 
     /// A thread checks in with the scheduler before it continues executing after cloning
     /// a child thread.  This allows it to be prioritized correctly vis-a-vis its child
     /// thread.
-    ParentContinue(),
+    ParentContinue { parent: DetTid, child: DetTid },
 
     /// Wait for permission to wake up. This is parameterized by an *absolute* time
     /// (i.e. global time).
@@ -190,11 +225,11 @@ pub enum ResourceID {
 
     /// Permission to perform blocking IO with an endpoint outside the deterministic container.
     /// In general these should be recorded if strict reproducibility is to be achieved.
-    BlockingExternalIO,
+    BlockingExternalIO(ExternalOpId),
 
     /// Permission to CONTINUE execution after returning from a potentially-blocking
     /// operation that reaches outside the container.
-    BlockedExternalContinue,
+    BlockedExternalContinue(ExternalOpId),
 
     /// Permission to continue beyond a priority change point. Used for chaotic
     /// scheduling. Could also be considered less of a resource and more of a
@@ -297,21 +332,31 @@ impl Resources {
     // Test if the request corresponds to an exit or exit_group.
     // If it does, return a synthetic copy of the syscall which would generate this resource request.
     pub fn as_exit_syscall(&self) -> Option<Syscall> {
-        let is_exit_group = self.resources.contains_key(&ResourceID::Exit(true));
-        let is_exit = self.resources.contains_key(&ResourceID::Exit(false));
-        if (is_exit_group || is_exit) && self.resources.len() > 1 {
+        let exit = self.resources.keys().find_map(|resource| match resource {
+            ResourceID::Exit { group, process, mm } => Some((*group, *process, *mm)),
+            _ => None,
+        });
+        if exit.is_some() && self.resources.len() > 1 {
             panic!(
                 "is_polling_turn: not expecting an InternalIOPolling mixed in with other resource requests: {:?}",
                 self
             );
         }
-        if is_exit_group {
+        if exit.is_some_and(|(group, _, _)| group) {
             Some(Syscall::ExitGroup(Default::default())) // This status code is dummy.
-        } else if is_exit {
+        } else if exit.is_some() {
             Some(Syscall::Exit(Default::default())) // This status code is dummy.
         } else {
             None
         }
+    }
+
+    /// Return lifecycle identity when this is an exit request.
+    pub fn exit_identity(&self) -> Option<(bool, DetPid, MmId)> {
+        self.resources.keys().find_map(|resource| match resource {
+            ResourceID::Exit { group, process, mm } => Some((*group, *process, *mm)),
+            _ => None,
+        })
     }
 }
 
@@ -338,5 +383,30 @@ impl Permission {
             (RW, _) => RW,
             (_, RW) => RW,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_tokens_do_not_alias_unrelated_operations() {
+        let tid1 = DetTid::from_raw(1);
+        let tid2 = DetTid::from_raw(2);
+        assert_ne!(
+            ResourceID::BlockingExternalIO(ExternalOpId::new(tid1, 7)),
+            ResourceID::BlockingExternalIO(ExternalOpId::new(tid2, 7))
+        );
+        assert_ne!(
+            ResourceID::ParentContinue {
+                parent: tid1,
+                child: tid2,
+            },
+            ResourceID::ParentContinue {
+                parent: tid2,
+                child: tid1,
+            }
+        );
     }
 }

@@ -1,0 +1,11 @@
+test_name	ptrace	dbi	kvm	dbi_reason	kvm_reason
+hello_stdout	pass	pass	pass	-	-
+argument_forwarding	pass	pass	gap	-	KVM prototype runs a built-in guest and does not forward ELF arguments
+exit_zero	pass	pass	gap	-	KVM prototype does not execute the requested ELF
+exit_status	pass	pass	gap	-	KVM prototype does not propagate the requested ELF exit status
+file_read	pass	pass	gap	-	KVM prototype has no Linux filesystem or ELF loader
+pthread_lifecycle	pass	pass	gap	-	KVM prototype has one real-mode vCPU and no Linux thread lifecycle
+cpuid_policy	pass	pass	gap	-	KVM applies a deterministic vCPU policy but the CLI cannot execute the probe ELF
+virtual_clock	pass	gap	gap	DBI observes syscalls but does not route clock calls through Detcore virtual time	KVM prototype has no Linux clock implementation
+random_sources	pass	gap	gap	DBI observes syscalls but does not route random sources through Detcore	KVM prototype has no Linux random-source implementation
+virtual_pid	pass	gap	gap	DBI uses the host process identity and has no Detcore PID model	KVM prototype has no Linux process lifecycle

@@ -41,7 +41,7 @@ impl Record {
         //
         // TODO: Handle shebang lines.
         fs::copy(&metadata.exe, &exe)
-            .with_context(|| format!("Failed to record {:?}", &metadata.exe))?;
+            .with_context(|| format!("Failed to record {:?}", metadata.exe))?;
 
         serde_json::to_writer_pretty(fs::File::create(dir.join(METADATA_NAME))?, &metadata)
             .context("Failed to serialize metadata")?;

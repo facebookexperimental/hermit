@@ -1,0 +1,8 @@
+workload,environment,runs,passes,exit_status,marker,conclusion
+node_worker,hermit_release,3,3,0,SHARED_FUTEX_NODE_OK workers=4,pass
+threaded_java,hermit_release,3,3,0,SHARED_FUTEX_JAVA_OK threads=8 count=80000,pass
+pthread_private_and_pshared,hermit_release,5,5,0,SHARED_FUTEX_PTHREAD_OK threads=8 process_shared=1,pass
+detcore_shared_anonymous,detcore_test,2,2,0,Oracle passed,pass
+qemu_kernel_initramfs,native_tcg,1,1,0,SHARED_FUTEX_QEMU_KERNEL_OK,pass
+qemu_kernel_initramfs,hermit_release_tcg,1,1,124,no EOPNOTSUPP or SIGABRT before host timeout,shared-futex blocker cleared; full boot not reached
+qemu_shared_futex_trace,hermit_release_tcg,1,1,124,shared WAIT Ok(0) and WAKE Ok(1),pass

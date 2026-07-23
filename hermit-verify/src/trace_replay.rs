@@ -121,7 +121,12 @@ impl UseCase for TraceReplayOpts {
             verify_stderr: true,
             verify_detlog_syscalls: true,
             verify_detlog_syscall_results: true,
-            verify_detlog_others: !self.split_branches,
+            // A chaos recording uses precise ptrace single-stepping while schedule replay does
+            // not. On x86, syscall saves RFLAGS in r11, so the tracer-owned Trap Flag (0x100)
+            // appears only in the recording's register DETLOGs. Scheduler bookkeeping also
+            // differs by design. Keep comparing guest-visible syscall traffic and results, but
+            // exclude these instrumentation-only entries for chaos trace replay.
+            verify_detlog_others: !self.split_branches && !self.chaos,
             verify_commits: false,
             verify_exit_statuses: true,
             verify_desync: true,
@@ -130,6 +135,10 @@ impl UseCase for TraceReplayOpts {
                 vec![
                     "CHAOSRAND".to_string(),
                     "advance global time for scheduler turn".to_string(),
+                    // exit_group has no result, and schedule replay can finish at the end of the
+                    // recorded schedule without re-entering its syscall callback. Exit status is
+                    // compared separately.
+                    "inbound syscall: exit_group".to_string(),
                 ]
             } else {
                 Vec::new()
@@ -164,5 +173,50 @@ impl UseCase for TraceReplayOpts {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::TraceReplayOpts;
+    use crate::use_case::UseCase;
+
+    fn trace_replay_opts(chaos: bool) -> TraceReplayOpts {
+        TraceReplayOpts {
+            keep_temp_dir: false,
+            isolate_workdir: false,
+            chaos,
+            strip_times: false,
+            hermit_arg: Vec::new(),
+            guest_program: PathBuf::from("/bin/true"),
+            split_branches: false,
+            args: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn non_chaos_replay_compares_all_detlogs() {
+        let options = trace_replay_opts(false).options();
+
+        assert!(options.verify_detlog_syscalls);
+        assert!(options.verify_detlog_syscall_results);
+        assert!(options.verify_detlog_others);
+    }
+
+    #[test]
+    fn chaos_replay_excludes_instrumentation_only_detlogs() {
+        let options = trace_replay_opts(true).options();
+
+        assert!(options.verify_detlog_syscalls);
+        assert!(options.verify_detlog_syscall_results);
+        assert!(!options.verify_detlog_others);
+        assert!(
+            options
+                .ignore_lines
+                .iter()
+                .any(|line| line == "inbound syscall: exit_group")
+        );
     }
 }

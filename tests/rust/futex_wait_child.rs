@@ -7,7 +7,6 @@
  */
 
 /// Child thread waits on futex.
-
 fn main() {
     let layout = std::alloc::Layout::from_size_align(4, 4).unwrap(); // u32
     let ptr: *mut u8 = unsafe { std::alloc::alloc_zeroed(layout) };

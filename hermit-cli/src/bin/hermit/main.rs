@@ -9,8 +9,14 @@
 // Treat all Clippy warnings as errors.
 #![deny(clippy::all)]
 #![allow(clippy::uninlined_format_args)]
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
 
 mod analyze;
+mod backends;
+mod bisect;
 mod bnz;
 mod clean;
 mod container;
@@ -33,6 +39,7 @@ use hermit::Error;
 use hermit::ExitStatus;
 
 use self::analyze::AnalyzeOpts;
+use self::bisect::BisectOpts;
 use self::global_opts::GlobalOpts;
 use self::logdiff::LogDiffCLIOpts;
 use self::record::RecordOpts;
@@ -64,7 +71,7 @@ enum Subcommand {
     Record(RecordOpts),
 
     /// Replay the execution of a program.
-    #[clap(name = "replay", trailing_var_arg = true)]
+    #[clap(name = "replay")]
     Replay(ReplayOpts),
 
     /// Take the difference of two (run/record) logs written to files.
@@ -72,6 +79,10 @@ enum Subcommand {
 
     /// Analyze Pass and failing runs
     Analyze(Box<AnalyzeOpts>),
+
+    /// Bisect passing and failing schedules to localize a race.
+    #[clap(name = "bisect", trailing_var_arg = true)]
+    Bisect(Box<BisectOpts>),
 }
 
 impl Subcommand {
@@ -82,6 +93,7 @@ impl Subcommand {
             Subcommand::Replay(x) => x.main(global),
             Subcommand::LogDiff(x) => Ok(x.main(global)),
             Subcommand::Analyze(x) => x.main(global),
+            Subcommand::Bisect(x) => x.main(global),
         }
     }
 }
@@ -111,5 +123,90 @@ fn display_error(error: Error) {
 
     for cause in chain {
         eprintln!("     {} {}", ">".dimmed().bold(), cause);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+    use clap::Parser;
+
+    use super::Args;
+    use super::Subcommand;
+
+    #[test]
+    fn clap_configuration_is_valid() {
+        Args::command().debug_assert();
+    }
+
+    #[test]
+    fn replay_accepts_an_optional_id_and_options() {
+        let args = Args::try_parse_from([
+            "hermit",
+            "replay",
+            "--autopilot",
+            "--data-dir",
+            "/tmp/recordings",
+            "0123456789abcdef0123456789abcdef",
+        ])
+        .unwrap();
+
+        assert!(matches!(args.command, Subcommand::Replay(_)));
+    }
+
+    #[test]
+    fn bisect_accepts_schedule_endpoints_and_run_args() {
+        let args = Args::try_parse_from([
+            "hermit",
+            "bisect",
+            "--good",
+            "good.json",
+            "--bad",
+            "bad.json",
+            "--",
+            "--preemption-timeout=disabled",
+            "/bin/true",
+        ])
+        .unwrap();
+
+        assert!(matches!(args.command, Subcommand::Bisect(_)));
+    }
+
+    #[test]
+    fn backend_parses_in_global_position() {
+        use hermit::Backend;
+
+        let args = Args::try_parse_from(["hermit", "--backend", "kvm", "run", "prog"])
+            .expect("global-position --backend should parse");
+        assert_eq!(args.global.backend, Some(Backend::Kvm));
+        assert!(matches!(args.command, Subcommand::Run(_)));
+    }
+
+    #[test]
+    fn record_accepts_a_positive_timeout() {
+        Args::try_parse_from([
+            "hermit",
+            "record",
+            "start",
+            "--record-timeout=1",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn record_rejects_a_zero_timeout() {
+        assert!(
+            Args::try_parse_from([
+                "hermit",
+                "record",
+                "start",
+                "--record-timeout=0",
+                "--",
+                "/bin/true",
+            ])
+            .is_err()
+        );
     }
 }

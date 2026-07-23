@@ -10,10 +10,13 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
+use rand::Rng;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Pid;
+use reverie::Stack;
 use reverie::syscalls;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
@@ -24,30 +27,120 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::WaitPidFlag;
 use tracing::debug;
-use tracing::error;
 use tracing::info;
 use tracing::trace;
 
-use crate::FileMetadata;
 use crate::config::BlockingMode;
+use crate::memory::MemoryMetadata;
 use crate::record_or_replay::RecordOrReplay;
+use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::SchedValue;
-use crate::syscalls::helpers::nanos_duration_to_absolute_timeout;
 use crate::syscalls::helpers::retry_nonblocking_syscall;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::tool_global::FutexAction;
 use crate::tool_global::create_child_thread;
 use crate::tool_global::futex_action;
 use crate::tool_global::resource_request;
+use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
-use crate::types::DetPid;
+use crate::tool_local::PendingVfork;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FutexTimeout {
+    Relative(u64),
+    Absolute(LogicalTime),
+}
+
+fn parse_futex_timeout(futex_op: i32, timeout: Timespec) -> Result<FutexTimeout, Errno> {
+    let seconds = u64::try_from(timeout.tv_sec).map_err(|_| Errno::EINVAL)?;
+    let nanoseconds = u64::try_from(timeout.tv_nsec).map_err(|_| Errno::EINVAL)?;
+    if nanoseconds >= 1_000_000_000 {
+        return Err(Errno::EINVAL);
+    }
+
+    let timeout_nanos = seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|nanos| nanos.checked_add(nanoseconds))
+        .ok_or(Errno::EINVAL)?;
+    // Mask off FUTEX_PRIVATE_FLAG / FUTEX_CLOCK_REALTIME before matching the
+    // command: FUTEX_WAIT_BITSET measures its timeout as an *absolute* deadline,
+    // whereas plain FUTEX_WAIT uses a *relative* one. A private-flagged
+    // FUTEX_WAIT_BITSET (e.g. 0x89) must still be recognized as the BITSET
+    // command; comparing the raw op would misclassify it as relative and add
+    // the absolute deadline to the current time (leaking the epoch).
+    if futex_op & libc::FUTEX_CMD_MASK == libc::FUTEX_WAIT_BITSET {
+        Ok(FutexTimeout::Absolute(LogicalTime::from_nanos(
+            timeout_nanos,
+        )))
+    } else {
+        Ok(FutexTimeout::Relative(timeout_nanos))
+    }
+}
+
+fn rebase_absolute_timeout(
+    deadline: LogicalTime,
+    clock_now: LogicalTime,
+    logical_now: LogicalTime,
+) -> LogicalTime {
+    logical_now + Duration::from_nanos(deadline.as_nanos().saturating_sub(clock_now.as_nanos()))
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
+    async fn futex_timeout_deadline<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        futex_flags: i32,
+        timeout: Option<Addr<'_, Timespec>>,
+    ) -> Result<Option<LogicalTime>, Error> {
+        let Some(timeout) = timeout else {
+            return Ok(None);
+        };
+        let timeout = parse_futex_timeout(futex_flags, guest.memory().read_value(timeout)?)?;
+        match timeout {
+            FutexTimeout::Relative(nanos) => {
+                let now = thread_observe_time(guest).await;
+                Ok(Some(now + Duration::from_nanos(nanos)))
+            }
+            FutexTimeout::Absolute(deadline) if self.cfg.virtualize_time => Ok(Some(deadline)),
+            FutexTimeout::Absolute(deadline) => {
+                let clockid = if futex_flags & libc::FUTEX_CLOCK_REALTIME != 0 {
+                    syscalls::ClockId::CLOCK_REALTIME
+                } else {
+                    syscalls::ClockId::CLOCK_MONOTONIC
+                };
+
+                let mut stack = guest.stack().await;
+                let clock_output = syscalls::TimespecMutPtr(stack.reserve());
+                let _stack_guard = stack.commit()?;
+                self.record_or_replay(
+                    guest,
+                    syscalls::ClockGettime::new()
+                        .with_clockid(clockid)
+                        .with_tp(Some(clock_output)),
+                )
+                .await?;
+                let clock_now = match parse_futex_timeout(
+                    libc::FUTEX_WAIT_BITSET,
+                    guest.memory().read_value(clock_output.0)?,
+                )? {
+                    FutexTimeout::Absolute(time) => time,
+                    FutexTimeout::Relative(_) => unreachable!(),
+                };
+                let logical_now = thread_observe_time(guest).await;
+                Ok(Some(rebase_absolute_timeout(
+                    deadline,
+                    clock_now,
+                    logical_now,
+                )))
+            }
+        }
+    }
+
     /// Clone, clone3, fork, vfork system calls
     pub async fn handle_clone_family<G: Guest<Self>>(
         &self,
@@ -56,24 +149,77 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let flags = clone_family.flags(&guest.memory());
         let ctid = clone_family.child_tid(&guest.memory());
+        let is_vfork = flags.contains(CloneFlags::CLONE_VFORK);
 
         let ts = guest.thread_state_mut();
         assert_eq!(ts.clone_flags, None);
+        assert!(ts.pending_vfork.is_none());
         ts.clone_flags = Some(flags);
 
-        // TODO(T94530014):
-        if flags.contains(CloneFlags::CLONE_VFORK) {
-            error!(
-                "hermit: clone() with CLONE_VFORK argument.  This is not currently supported and will not work."
-            )
+        let parent_dettid = ts.dettid;
+        let child_priority_entropy = if is_vfork
+            && self.cfg.chaos
+            && self.cfg.replay_preemptions_from.is_none()
+            && self.cfg.replay_schedule_from.is_none()
+        {
+            let mut parent_chaos_prng = ts.chaos_prng.clone();
+            Some(parent_chaos_prng.next_u64())
+        } else {
+            None
+        };
+        if is_vfork {
+            ts.pending_vfork = Some(PendingVfork {
+                parent_dettid,
+                parent_detpid: ts.detpid.expect("detpid unset"),
+                child_tid_addr: ctid,
+                flags,
+                child_priority_entropy,
+            });
         }
 
-        let parent_dettid = ts.dettid;
         trace!("[detcore, dtid {}] parent invoking clone.", parent_dettid);
+        let vfork_op_id =
+            ExternalOpId::new(parent_dettid, guest.thread_state().stats.syscall_count);
+
+        // The kernel blocks a CLONE_VFORK parent until its child execs or exits.
+        // Remove it from Detcore's run queue before entering that blocking call.
+        if is_vfork && self.cfg.sequentialize_threads {
+            let mut resources = Resources::new(parent_dettid);
+            resources.insert(ResourceID::BlockingExternalIO(vfork_op_id), Permission::RW);
+            resources.fyi("clone_vfork");
+            resource_request(guest, resources).await;
+        }
+
         let maybe_res = guest.inject(Syscall::from(clone_family)).await;
-        guest.thread_state_mut().clone_flags = None; // Unset, now that it has been read by the child.
+
+        if is_vfork && self.cfg.sequentialize_threads {
+            let mut resources = Resources::new(parent_dettid);
+            resources.insert(
+                ResourceID::BlockedExternalContinue(vfork_op_id),
+                Permission::RW,
+            );
+            resources.fyi("clone_vfork");
+            resource_request(guest, resources).await;
+        }
+
+        let ts = guest.thread_state_mut();
+        ts.clone_flags = None; // Unset, now that it has been read by the child.
+        ts.pending_vfork = None;
 
         let res = maybe_res?;
+
+        // Match ordinary clone: the parent consumes the priority entropy after
+        // the child has inherited the parent state.
+        if is_vfork
+            && self.cfg.chaos
+            && self.cfg.replay_preemptions_from.is_none()
+            && self.cfg.replay_schedule_from.is_none()
+        {
+            let _ = guest
+                .thread_state_mut()
+                .chaos_prng_next_u64("child_priority");
+        }
+
         let child_tid = Pid::from_raw(res as i32);
         let child_dettid = DetTid::from_raw(child_tid.into()); // TODO(T78538674), virtualized tid/pid
         trace!(
@@ -81,7 +227,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             child_dettid
         );
 
-        create_child_thread(guest, child_dettid, ctid, Some(flags)).await;
+        if !is_vfork {
+            create_child_thread(guest, child_dettid, ctid, Some(flags)).await;
+        }
 
         {
             // The child will have updated their pedigree, we update ours before continuing.
@@ -102,9 +250,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Exit,
     ) -> Result<i64, Error> {
-        let request = guest
-            .thread_state()
-            .mk_request(ResourceID::Exit(false), Permission::RW);
+        let request = guest.thread_state().mk_request(
+            ResourceID::Exit {
+                group: false,
+                process: guest.thread_state().detpid.expect("detpid unset"),
+                mm: guest.thread_state().mm_id,
+            },
+            Permission::RW,
+        );
         resource_request(guest, request).await;
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
@@ -116,9 +269,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::ExitGroup,
     ) -> Result<i64, Error> {
-        let request = guest
-            .thread_state()
-            .mk_request(ResourceID::Exit(true), Permission::RW);
+        let request = guest.thread_state().mk_request(
+            ResourceID::Exit {
+                group: true,
+                process: guest.thread_state().detpid.expect("detpid unset"),
+                mm: guest.thread_state().mm_id,
+            },
+            Permission::RW,
+        );
         resource_request(guest, request).await;
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
@@ -164,14 +322,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Futex,
         init_val: i32,
     ) -> Result<i64, Error> {
-        let detpid = DetPid::from_raw(guest.pid().into()); // TODO(T78538674): virtualize pid/tid
         let ptr = call.uaddr().unwrap();
-        let futexid = (detpid, AddrMut::as_raw(ptr));
+        let futexid = guest.thread_state().futex_id(
+            AddrMut::as_raw(ptr),
+            call.futex_op() & libc::FUTEX_PRIVATE_FLAG != 0,
+        );
         let futex_op = call.futex_op() & libc::FUTEX_CMD_MASK;
-        let mask = match futex_op {
-            libc::FUTEX_WAKE_BITSET | libc::FUTEX_WAIT_BITSET => call.val3(),
-            _ => !0,
+        let bitset = match futex_op {
+            libc::FUTEX_WAKE_BITSET | libc::FUTEX_WAIT_BITSET => call.val3() as u32,
+            _ => u32::MAX,
         };
+        if bitset == 0 {
+            return Err(Error::Errno(Errno::EINVAL));
+        }
         let dettid = guest.thread_state().dettid;
         match futex_op {
             libc::FUTEX_WAKE | libc::FUTEX_WAKE_BITSET => {
@@ -180,7 +343,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     FutexAction::WakeRequest(call.val()),
                     &futexid,
                     init_val,
-                    mask,
+                    bitset,
                 )
                 .await
                 .expect("futex wake must return value")
@@ -199,21 +362,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     FutexAction::WakeFinished(0),
                     &futexid,
                     init_val,
-                    mask,
+                    bitset,
                 )
                 .await;
                 Ok(num as i64)
             }
             libc::FUTEX_WAIT | libc::FUTEX_WAIT_BITSET => {
-                // For futex_wait, timeout is a RELATIVE value.
-                let ts_ptr: Option<Addr<Timespec>> = call.timeout();
-                let timeout_nanos: Option<u128> = if let Some(addr) = ts_ptr {
-                    let ts = guest.memory().read_value(addr)?;
-                    Some(ts.tv_sec as u128 * 1000 + ts.tv_nsec as u128)
-                } else {
-                    None
-                };
-
                 if init_val != call.val() {
                     info!(
                         "[detcore, dtid {}] Futex wait running immediately because it will fizzle ({} != {}).",
@@ -223,17 +377,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                     );
                     Err(Error::Errno(Errno::EAGAIN))
                 } else {
-                    let maybe_timeout_lt = if let Some(ns) = timeout_nanos {
-                        nanos_duration_to_absolute_timeout(guest, ns).await
-                    } else {
-                        None
-                    };
+                    let maybe_timeout_lt = self
+                        .futex_timeout_deadline(guest, call.futex_op(), call.timeout())
+                        .await?;
                     let ans = futex_action(
                         guest,
                         FutexAction::WaitRequest(maybe_timeout_lt),
                         &futexid,
                         init_val,
-                        mask,
+                        bitset,
                     )
                     .await;
                     let res = if ans != Some(SchedValue::TimeOut) {
@@ -253,7 +405,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                         trace!("[detcore, dtid {}] futex wait timed out", &dettid);
                         Err(Error::Errno(Errno::ETIMEDOUT))
                     };
-                    futex_action(guest, FutexAction::WaitFinished, &futexid, init_val, mask).await;
+                    futex_action(guest, FutexAction::WaitFinished, &futexid, init_val, bitset)
+                        .await;
                     res
                 }
             }
@@ -310,44 +463,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let res = guest.inject(call).await;
                     Ok(res?)
                 } else {
-                    // For futex_wait, timeout is a RELATIVE value.
-                    let ts_ptr: Option<Addr<Timespec>> = call.timeout();
-                    let timeout_nanos: Option<u128> = if let Some(addr) = ts_ptr {
-                        let ts = guest.memory().read_value(addr)?;
-                        Some(ts.tv_sec as u128 * 1000 + ts.tv_nsec as u128)
-                    } else {
-                        None
-                    };
-
-                    if timeout_nanos == Some(0) {
-                        info!(
-                            "[detcore, dtid {}] Letting Futex wait through because it's nonblocking ({} != {}).",
-                            dettid,
-                            init_val,
-                            call.val()
-                        );
-                        Ok(guest.inject(call).await?) // Already non-blocking.
-                    } else {
-                        let rsrc = make_futex_wait_request(dettid);
-                        let maybe_timeout_ns = if let Some(ns) = timeout_nanos {
-                            nanos_duration_to_absolute_timeout(guest, ns).await
-                        } else {
-                            None
-                        };
-                        let res = retry_nonblocking_syscall_with_timeout(
-                            guest,
-                            call,
-                            rsrc,
-                            maybe_timeout_ns,
-                        )
+                    let rsrc = make_futex_wait_request(dettid);
+                    let deadline = self
+                        .futex_timeout_deadline(guest, call.futex_op(), call.timeout())
                         .await?;
-                        trace!(
-                            "[detcore, dtid {}] after futex wait, memory value is {}",
-                            &dettid,
-                            guest.memory().read_value(call.uaddr().unwrap()).unwrap()
-                        );
-                        Ok(res)
-                    }
+                    let res =
+                        retry_nonblocking_syscall_with_timeout(guest, call, rsrc, deadline).await?;
+                    trace!(
+                        "[detcore, dtid {}] after futex wait, memory value is {}",
+                        &dettid,
+                        guest.memory().read_value(call.uaddr().unwrap()).unwrap()
+                    );
+                    Ok(res)
                 }
             }
             libc::FUTEX_FD => {
@@ -365,32 +492,52 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Execveat,
     ) -> Result<i64, Error> {
-        let metadata: FileMetadata = {
-            let guard = guest.thread_state().file_metadata.lock().unwrap();
-            (*guard).clone()
+        let (old_metadata, old_memory_metadata, table_is_shared, dettid, old_mm_id) = {
+            let thread_state = guest.thread_state();
+            (
+                Arc::clone(&thread_state.file_metadata),
+                Arc::clone(&thread_state.memory_metadata),
+                Arc::strong_count(&thread_state.file_metadata) > 1,
+                thread_state.dettid,
+                thread_state.mm_id,
+            )
         };
-        let new_metadata = FileMetadata {
-            file_handles: metadata
-                .file_handles
-                .iter()
-                .filter_map(|(&k, v)| {
-                    if v.flags & libc::O_CLOEXEC == libc::O_CLOEXEC {
-                        None
-                    } else {
-                        Some((k, v.clone()))
-                    }
-                })
-                .collect(),
+        let (new_metadata, closed_open_files) = {
+            let metadata = old_metadata.lock().unwrap();
+            (
+                metadata.for_exec(dettid),
+                metadata.open_files_closed_on_exec(table_is_shared),
+            )
         };
 
-        // close fds with O_CLOEXEC
-        guest.thread_state_mut().file_metadata = Arc::new(Mutex::new(new_metadata));
+        {
+            let thread_state = guest.thread_state_mut();
+            thread_state.file_metadata = Arc::new(Mutex::new(new_metadata));
+            thread_state.memory_metadata = Arc::new(Mutex::new(MemoryMetadata::new()));
+            thread_state.mm_id = old_mm_id.for_exec(dettid);
+        }
+
+        let mut released_ports = Vec::new();
+        for open_file_id in closed_open_files {
+            if let Some(port) = self.release_port_for_open_file(guest, open_file_id).await {
+                released_ports.push((open_file_id, port));
+            }
+        }
 
         // execve(2) doesn't return upon success.
         let errno = self.record_or_replay(guest, call).await.unwrap_err();
 
-        // execve failed, restore fds
-        guest.thread_state_mut().file_metadata = Arc::new(Mutex::new(metadata));
+        for (open_file_id, port) in released_ports {
+            self.restore_port_for_open_file(guest, open_file_id, port)
+                .await;
+        }
+
+        {
+            let thread_state = guest.thread_state_mut();
+            thread_state.file_metadata = old_metadata;
+            thread_state.memory_metadata = old_memory_metadata;
+            thread_state.mm_id = old_mm_id;
+        }
 
         Err(errno.into())
     }
@@ -402,10 +549,34 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::SchedYield,
     ) -> Result<i64, Error> {
         if self.cfg.sequentialize_threads {
-            let resource = ResourceID::SleepUntil(LogicalTime::from_nanos(0));
-            let request = guest.thread_state().mk_request(resource, Permission::W);
-            resource_request(guest, request).await;
-            trace!("sched_yield resources granted from scheduler; NOT performing actual syscall",);
+            // In chaos mode, thread-interleaving diversity (and thus fairness)
+            // comes entirely from re-randomizing thread priorities at
+            // preemption-timer expirations. When timer preemption is disabled
+            // (`--preemption-timeout disabled`), priorities are fixed at thread
+            // creation and never change. A plain yield only re-enqueues the
+            // caller at the back of its own (fixed) priority level, so a thread
+            // that spins on sched_yield while holding the numerically-lowest
+            // priority is always reselected first and starves every thread it is
+            // waiting on (GH #81). Treat sched_yield as an explicit chaos
+            // reprioritization point: draw a fresh random priority for the
+            // caller so it cedes the CPU and other runnable threads can make
+            // progress. This mirrors what `end_timeslice` does at a timer-driven
+            // preemption point, and is recorded for chaos replay.
+            if self.cfg.chaos && self.cfg.preemption_timeout.is_none() {
+                let change_time = guest.thread_state().thread_logical_time.as_nanos();
+                let request = Self::random_priority_changepoint_request(guest, change_time);
+                resource_request(guest, request).await;
+                trace!(
+                    "sched_yield: chaos reprioritization applied (timer preemption disabled); NOT performing actual syscall",
+                );
+            } else {
+                let resource = ResourceID::SleepUntil(LogicalTime::from_nanos(0));
+                let request = guest.thread_state().mk_request(resource, Permission::W);
+                resource_request(guest, request).await;
+                trace!(
+                    "sched_yield resources granted from scheduler; NOT performing actual syscall",
+                );
+            }
             Ok(0)
         } else {
             Ok(self.record_or_replay(guest, call).await?)
@@ -433,7 +604,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
             Ok(guest.inject_with_retry(call).await?)
         } else {
-            retry_nonblocking_syscall(guest, call, rsrc).await
+            // wait4 is a scheduler poll, not a record/replay data read (see doc above),
+            // so it is not routed through the record/replay subtool.
+            retry_nonblocking_syscall(guest, call, rsrc, None).await
         }
     }
 
@@ -481,5 +654,84 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             Err(Error::Errno(Errno::EFAULT))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn futex_timeout_units_and_modes_match_linux() {
+        let timeout = Timespec {
+            tv_sec: 2,
+            tv_nsec: 3,
+        };
+        assert_eq!(
+            parse_futex_timeout(libc::FUTEX_WAIT, timeout),
+            Ok(FutexTimeout::Relative(2_000_000_003))
+        );
+        assert_eq!(
+            parse_futex_timeout(libc::FUTEX_WAIT_BITSET, timeout),
+            Ok(FutexTimeout::Absolute(LogicalTime::from_nanos(
+                2_000_000_003
+            )))
+        );
+        // The command bits must be matched after masking off FUTEX_PRIVATE_FLAG
+        // (and FUTEX_CLOCK_REALTIME): a private FUTEX_WAIT_BITSET still uses an
+        // absolute deadline, and a private FUTEX_WAIT still uses a relative one.
+        assert_eq!(
+            parse_futex_timeout(libc::FUTEX_WAIT_BITSET | libc::FUTEX_PRIVATE_FLAG, timeout),
+            Ok(FutexTimeout::Absolute(LogicalTime::from_nanos(
+                2_000_000_003
+            )))
+        );
+        assert_eq!(
+            parse_futex_timeout(libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG, timeout),
+            Ok(FutexTimeout::Relative(2_000_000_003))
+        );
+    }
+
+    #[test]
+    fn absolute_futex_timeout_is_rebased_to_logical_time() {
+        let logical_now = LogicalTime::from_secs(100);
+        let clock_now = LogicalTime::from_secs(5_000);
+        let deadline = clock_now + Duration::from_millis(100);
+        assert_eq!(
+            rebase_absolute_timeout(deadline, clock_now, logical_now),
+            logical_now + Duration::from_millis(100)
+        );
+        assert_eq!(
+            rebase_absolute_timeout(
+                clock_now - LogicalTime::from_nanos(1),
+                clock_now,
+                logical_now
+            ),
+            logical_now
+        );
+    }
+
+    #[test]
+    fn futex_timeout_rejects_invalid_timespecs() {
+        assert_eq!(
+            parse_futex_timeout(
+                libc::FUTEX_WAIT,
+                Timespec {
+                    tv_sec: -1,
+                    tv_nsec: 0,
+                },
+            ),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            parse_futex_timeout(
+                libc::FUTEX_WAIT_BITSET,
+                Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 1_000_000_000,
+                },
+            ),
+            Err(Errno::EINVAL)
+        );
     }
 }

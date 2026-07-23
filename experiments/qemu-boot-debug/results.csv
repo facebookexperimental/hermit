@@ -1,0 +1,7 @@
+mode,virtual_time,sequentialize_threads,preemption_timeout,qemu_icount,host_bound_seconds,wall_seconds,exit_status,serial_progress,clock_result,conclusion
+default_virtual_trace,true,true,200000000,none,20,20.006,124,none,not_reached,scheduler_and_time_polling_bottleneck
+no_virtual_time_control,false,true,200000000,none,90,90,124,none,host_time,virtual_time_not_sole_cause
+virtual_no_sequentialization,true,false,200000000,none,30,30,124,SeaBIOS,not_reached,disabling_scheduler_restores_serial
+virtual_sequentialized_no_preemption,true,true,disabled,shift0_sleepoff,30,30,forced_SIGKILL,none,not_reached,cpu_bound_vcpu_starves_other_threads
+virtual_minimal_no_icount,true,false,disabled,none,30,30,124,kernel_console,no_current_clocksource,local_global_time_domains_diverge
+virtual_minimal_fixed_icount,true,false,disabled,shift0_sleepoff,90,13.25,0,initramfs_marker,coherent_1000.031MHz,complete_boot

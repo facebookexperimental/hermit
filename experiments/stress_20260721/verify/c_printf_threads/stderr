@@ -1,0 +1,13 @@
+:: Run1...
+:: Run2...
+:: Comparing logs... /tmp/run1_log_fmX2m and /tmp/run2_log_iSe7h
+Logs contain 530 | 530 messages total
+Logs contain 432 | 432 detcore-specific messages
+Logs contain 240 | 240 INFO messages
+Logs contain 376 | 376 DETLOG & scheduler COMMIT messages
+Stripping entries of numerical data before comparison..
+  Comparing DETLOGs messages...
+
+Done processing logs, no substantive differences found.
+:: Success: deterministic. Determinism verified.
+timeout: the monitored command dumped core

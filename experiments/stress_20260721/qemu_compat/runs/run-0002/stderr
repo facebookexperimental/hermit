@@ -1,0 +1,2 @@
+qemu-system-x86_64: warning: Machine type 'pc-i440fx-rhel7.6.0' is deprecated: machines from the previous RHEL major release are subject to deletion in the next RHEL major release
+qemu-system-x86_64: terminating on signal 15

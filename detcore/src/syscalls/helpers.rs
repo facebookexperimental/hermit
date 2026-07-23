@@ -20,10 +20,13 @@ use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::WaitPidFlag;
 
+use crate::fd::FdType;
 use crate::record_or_replay::RecordOrReplay;
+use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::tool_global::ResumeStatus;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_global::trace_schedevent;
@@ -47,11 +50,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: Syscall,
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
+        let op_id = ExternalOpId::new(dettid, guest.thread_state().stats.syscall_count);
+        // Internal-vs-external fd classification happens at the call sites that hold the
+        // typed, nonblockize-able syscall (see execute_nonblockable_fd_syscall):
+        // container-internal pipes are routed to the InternalIOPolling nonblockize-retry
+        // path and must NOT reach this external-blocking protocol. BlockingExternalIO
+        // deschedules the thread to run in the background and rejoin nondeterministically,
+        // which is unsafe for a pipe whose reader and writer are interdependent -- doing
+        // so is the root cause of the record/replay pipe deadlock. The remaining callers
+        // (external poll, wait4) are external by construction (their fd is not a single
+        // extractable internal pipe). Guard the invariant in debug builds.
+        debug_assert!(
+            !syscall_targets_internal_fd(guest, call),
+            "record_or_replay_blocking (BlockingExternalIO) reached for an internal pipe fd \
+             on syscall {}; internal fds must use the InternalIOPolling path",
+            call.name()
+        );
         {
             let mut rsrcs = Resources::new(dettid);
-            // TODO: check if the file descriptors include anything EXTERNAL before
-            // asking for this resource:
-            rsrcs.insert(ResourceID::BlockingExternalIO, Permission::RW);
+            // Only truly EXTERNAL endpoints (host fds / network sockets) reach here.
+            rsrcs.insert(ResourceID::BlockingExternalIO(op_id), Permission::RW);
             rsrcs.fyi(call.name());
             resource_request(guest, rsrcs).await;
         }
@@ -64,7 +82,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // explicitly here:
         {
             let mut rsrcs = Resources::new(dettid);
-            rsrcs.insert(ResourceID::BlockedExternalContinue, Permission::RW);
+            rsrcs.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
             rsrcs.fyi(call.name());
             resource_request(guest, rsrcs).await;
         }
@@ -89,8 +107,20 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let action = ioaction_based_on_fd_status(guest, call);
 
+        // Is this operation on a container-INTERNAL fd (currently: pipes)? Internal
+        // pipes are made physically nonblocking even in record/replay (see
+        // handle_pipe2), so they can take the deterministic InternalIOPolling
+        // nonblockize-and-retry path. They must NOT be forced onto the
+        // BlockingExternalIO path in R/R: a pipe reader and its paired writer are not
+        // independent, so descheduling the reader as "external blocking IO" deadlocks
+        // the sequentialized scheduler (the documented R/R pipe hang). Truly external
+        // endpoints (host fds, network sockets) still use BlockingExternalIO. Sockets
+        // are left external for now: there is no internal-vs-external socket detection
+        // yet (see the handle_accept4 comment).
+        let internal_fd = syscall_targets_internal_fd(guest, wrapped);
+
         if !self.cfg.sequentialize_threads
-            || self.cfg.recordreplay_modes
+            || (self.cfg.recordreplay_modes && !internal_fd)
             || action == IOAction::Blocking
         {
             tracing::trace!(
@@ -110,7 +140,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut rsrc = Resources::new(guest.thread_state().dettid);
             rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
             rsrc.fyi(call.name());
-            Ok(retry_nonblocking_syscall(guest, call, rsrc).await?)
+            // In record/replay mode, route an internal-fd (pipe) read/write through the
+            // record/replay subtool so its data is captured on record and reproduced on
+            // replay (see retry_nonblocking_syscall). In plain `hermit run` there is no
+            // recorder, so execute directly (subtool = None).
+            let subtool = (self.cfg.recordreplay_modes && internal_fd).then_some(self);
+            Ok(retry_nonblocking_syscall(guest, call, rsrc, subtool).await?)
         } else {
             assert!(action == IOAction::PassThru);
             tracing::trace!(
@@ -128,7 +163,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest
                 .thread_state()
                 .with_detfd(fd, |detfd| {
-                    detfd.physically_nonblocking = true;
+                    detfd.set_physically_nonblocking();
                 })
                 .unwrap();
         }
@@ -160,7 +195,7 @@ pub fn ioaction_based_on_fd_status<
     let (phys, virt) = guest
         .thread_state()
         .with_detfd(fd, |detfd| {
-            (detfd.physically_nonblocking, detfd.is_nonblocking())
+            (detfd.physically_nonblocking(), detfd.is_nonblocking())
         })
         .unwrap();
     tracing::trace!(
@@ -184,6 +219,34 @@ pub fn ioaction_based_on_fd_status<
     } else {
         // FT: Need to simulate blocking on top of nonblocking.
         IOAction::NonblockizeRetry
+    }
+}
+
+/// Does this single-fd syscall operate on a container-INTERNAL file descriptor?
+///
+/// Currently this recognizes pipes, whose two endpoints are always both owned by guest
+/// processes inside the deterministic container. Internal pipes are made physically
+/// nonblocking (see `handle_pipe2`) so a potentially-blocking op on them can use the
+/// deterministic `InternalIOPolling` nonblockize-and-retry strategy instead of
+/// `BlockingExternalIO`. Treating an internal pipe as external blocking IO deadlocks
+/// the sequentialized scheduler in record/replay, because a pipe reader and its paired
+/// writer are not independent.
+///
+/// Sockets are intentionally NOT classified as internal here: there is no reliable
+/// internal-vs-external socket detection yet (loopback / AF_UNIX-to-another-guest vs a
+/// real host peer), so sockets conservatively remain external. Syscalls whose fd is not
+/// directly extractable (e.g. poll/ppoll, which carry a pointer to an fd array) return
+/// false and keep their existing handling.
+pub fn syscall_targets_internal_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    call: Syscall,
+) -> bool {
+    match get_fd(call) {
+        Some(fd) => guest
+            .thread_state()
+            .with_detfd(fd, |detfd| matches!(detfd.ty(), FdType::Pipe))
+            .unwrap_or(false),
+        None => false,
     }
 }
 
@@ -320,6 +383,22 @@ pub trait NonblockableSyscall: SyscallInfo {
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Ok(0)
     }
+
+    /// Return the errno used when a signal interrupts this internally polled syscall.
+    /// Most blocking I/O is restartable when its handler uses `SA_RESTART`.
+    fn signal_interrupt_errno(&self) -> Errno {
+        Errno::ERESTARTSYS
+    }
+
+    /// Convert a physical nonblocking completion into the result expected by the guest.
+    /// `retried` is true after a prior result was classified as blocked.
+    fn normalize_nonblocking_result(
+        &self,
+        res: Result<i64, Errno>,
+        _retried: bool,
+    ) -> Result<i64, Errno> {
+        res
+    }
 }
 
 /// A system call which can logically timeout and then would return a given value
@@ -337,6 +416,10 @@ impl NonblockableSyscall for reverie::syscalls::Poll {
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
         (self.with_timeout(0), None)
     }
+
+    fn signal_interrupt_errno(&self) -> Errno {
+        Errno::EINTR
+    }
 }
 
 impl TimeoutableSyscall for reverie::syscalls::Poll {
@@ -352,6 +435,10 @@ impl NonblockableSyscall for reverie::syscalls::EpollWait {
         _guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
         (self.with_timeout(0), None)
+    }
+
+    fn signal_interrupt_errno(&self) -> Errno {
+        Errno::EINTR
     }
 }
 
@@ -430,11 +517,19 @@ impl NonblockableSyscall for reverie::syscalls::RtSigtimedwait {
         let (tp, guard) = zero_timespec(guest).await;
         (self.with_timeout(Some(tp)), Some(guard))
     }
+
+    fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
+        res == Err(Errno::EAGAIN)
+    }
+
+    fn signal_interrupt_errno(&self) -> Errno {
+        Errno::EINTR
+    }
 }
 
 impl TimeoutableSyscall for reverie::syscalls::RtSigtimedwait {
     fn timeout_return_val(&self) -> Result<i64, Errno> {
-        Ok(0)
+        Err(Errno::EAGAIN)
     }
 }
 
@@ -492,7 +587,7 @@ fn network_comm_syscall<T: RecordOrReplay, G: Guest<Detcore<T>>, C: SyscallInfo 
         .thread_state()
         .with_detfd(fd, |detfd| {
             assert!(
-                detfd.physically_nonblocking,
+                detfd.physically_nonblocking(),
                 "expecting sockets/pipes to be physically nonblocking"
             );
         })
@@ -616,23 +711,48 @@ impl NonblockableSyscall for reverie::syscalls::Connect {
     }
 
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
-        res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
+        res == Err(Errno::EAGAIN)
+            || res == Err(Errno::EWOULDBLOCK)
+            || res == Err(Errno::EINPROGRESS)
+            || res == Err(Errno::EALREADY)
+    }
+
+    fn normalize_nonblocking_result(
+        &self,
+        res: Result<i64, Errno>,
+        retried: bool,
+    ) -> Result<i64, Errno> {
+        match (retried, res) {
+            (true, Err(Errno::EISCONN)) => Ok(0),
+            (_, res) => res,
+        }
     }
 }
 
 /// Transform a syscall to nonblocking, then retry it until it returns a successful result.
+/// Retry a nonblockizable syscall (e.g. a pipe/socket read or write) until it succeeds.
+///
+/// `subtool` selects how each poll iteration executes the underlying syscall. Pass
+/// `Some(detcore)` in record/replay mode for a container-INTERNAL fd (currently pipes):
+/// each iteration is then routed through `Detcore::record_or_replay`, so the read's
+/// bytes (and every intervening `EAGAIN`) are captured in the recording and reproduced
+/// verbatim on replay. Without this, an internal-pipe read on the InternalIOPolling path
+/// bypasses the recorder and replay reads live from a pipe whose cross-process writer
+/// schedule is not reproduced -- the reader sees EOF instead of the recorded data and
+/// replay desyncs. Pass `None` for plain `hermit run` (no recording) or for external fds.
 pub async fn retry_nonblocking_syscall<T, G, C>(
     guest: &mut G,
     call: C,
     rsrc: Resources,
+    subtool: Option<&Detcore<T>>,
 ) -> Result<i64, Error>
 where
-    C: NonblockableSyscall,
+    C: NonblockableSyscall + Into<Syscall>,
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
     // Bogus 99 return value is dead code below:
-    retry_nonblocking_syscall_helper(guest, call, rsrc, None).await
+    retry_nonblocking_syscall_helper(guest, call, rsrc, None, subtool).await
 }
 
 /// Retry a non-blocking syscall until it succeeds. Set the timeout to zero for the actual
@@ -646,12 +766,15 @@ pub async fn retry_nonblocking_syscall_with_timeout<T, G, C>(
     maybe_timeout: Option<LogicalTime>,
 ) -> Result<i64, Error>
 where
-    C: NonblockableSyscall + TimeoutableSyscall,
+    C: NonblockableSyscall + TimeoutableSyscall + Into<Syscall>,
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
     let maybe_tup = maybe_timeout.map(|t| (t, call.timeout_return_val()));
-    retry_nonblocking_syscall_helper(guest, call, rsrc, maybe_tup).await
+    // poll/epoll_wait/futex/rt_sigtimedwait keep their existing execution (raw
+    // inject_with_retry): their record/replay handling is out of scope for the internal
+    // pipe data-ordering fix, and their fds are not necessarily internal pipes.
+    retry_nonblocking_syscall_helper(guest, call, rsrc, maybe_tup, None).await
 }
 
 // Private helper.
@@ -660,9 +783,10 @@ async fn retry_nonblocking_syscall_helper<T, G, C>(
     call0: C,
     rsrc: Resources,
     maybe_timeout: Option<(LogicalTime, Result<i64, Errno>)>,
+    subtool: Option<&Detcore<T>>,
 ) -> Result<i64, Error>
 where
-    C: NonblockableSyscall,
+    C: NonblockableSyscall + Into<Syscall>,
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
@@ -672,8 +796,22 @@ where
     let mut rsrc = rsrc.clone();
 
     loop {
-        resource_request(guest, rsrc.clone()).await;
-        let res = guest.inject_with_retry(call).await;
+        if resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled {
+            let errno = call.signal_interrupt_errno();
+            tracing::trace!(
+                "retry_nonblocking_syscall: interrupted by signal before retrying {}: {:?}",
+                call.display(&guest.memory()),
+                errno
+            );
+            return Err(errno.into());
+        }
+        // Route through the record/replay subtool for internal pipes so each poll (an
+        // EAGAIN, or the final data-bearing read) becomes one recorded event that replay
+        // reproduces deterministically; otherwise execute the syscall directly.
+        let res = match subtool {
+            Some(detcore) => detcore.record_or_replay(guest, call).await,
+            None => guest.inject_with_retry(call).await,
+        };
         if call.syscall_would_have_blocked(res) {
             rsrc.poll_attempt += 1;
             if let Some((timeout, timeout_result)) = maybe_timeout {
@@ -705,7 +843,9 @@ where
                 record_retry_event(guest, call).await;
             }
         } else {
-            let res = res.map_err(|e| e.into());
+            let res = call
+                .normalize_nonblocking_result(res, rsrc.poll_attempt > 0)
+                .map_err(|e| e.into());
             tracing::trace!(
                 "retry_nonblocking_syscall: syscall completed after {} retries: {} = {:?}",
                 rsrc.poll_attempt,
@@ -788,5 +928,49 @@ pub async fn nanos_duration_to_absolute_timeout<G: Guest<Detcore<T>>, T: RecordO
         Some(target_time)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connect_nonblocking_results() {
+        let call = reverie::syscalls::Connect::new();
+        assert!(call.syscall_would_have_blocked(Err(Errno::EINPROGRESS)));
+        assert!(call.syscall_would_have_blocked(Err(Errno::EALREADY)));
+        assert_eq!(
+            call.normalize_nonblocking_result(Err(Errno::EISCONN), true),
+            Ok(0)
+        );
+        assert_eq!(
+            call.normalize_nonblocking_result(Err(Errno::EISCONN), false),
+            Err(Errno::EISCONN)
+        );
+    }
+
+    #[test]
+    fn signal_interruption_errno_matches_linux_restart_policy() {
+        assert_eq!(
+            reverie::syscalls::Poll::new().signal_interrupt_errno(),
+            Errno::EINTR
+        );
+        assert_eq!(
+            reverie::syscalls::EpollWait::new().signal_interrupt_errno(),
+            Errno::EINTR
+        );
+        let sigtimedwait = reverie::syscalls::RtSigtimedwait::new();
+        assert_eq!(sigtimedwait.signal_interrupt_errno(), Errno::EINTR);
+        assert!(sigtimedwait.syscall_would_have_blocked(Err(Errno::EAGAIN)));
+        assert_eq!(sigtimedwait.timeout_return_val(), Err(Errno::EAGAIN));
+        assert_eq!(
+            reverie::syscalls::Read::new().signal_interrupt_errno(),
+            Errno::ERESTARTSYS
+        );
+        assert_eq!(
+            reverie::syscalls::Futex::new().signal_interrupt_errno(),
+            Errno::ERESTARTSYS
+        );
     }
 }

@@ -90,7 +90,7 @@ impl<T: Debug> Ivar<T> {
         }
         panic!(
             "Ivar multiple put exception! Attempted to write {:?} to {}.",
-            val, &self
+            val, self
         );
     }
 

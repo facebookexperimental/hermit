@@ -38,7 +38,7 @@ impl fmt::Display for DetPid {
     }
 }
 
-#[cfg(disabled)]
+#[cfg(any())]
 impl From<reverie_syscalls::Pid> for DetPid {
     fn from(p: reverie_syscalls::Pid) -> Self {
         DetPid(p.into())

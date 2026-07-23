@@ -1,0 +1,9 @@
+field,value
+ruby_version,ruby 3.0.7p220 (2024-04-23 revision 724a071175) [x86_64-linux]
+program,thread_order.rb
+threads,24
+native_runs,5
+native_distinct,4
+strict_status,DEADLOCK/TIMEOUT
+strict_timeout_s,45
+nonstrict_rc,0

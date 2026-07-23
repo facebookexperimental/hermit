@@ -23,6 +23,7 @@ use tracing::error;
 use tracing::info;
 use tracing::trace;
 
+use crate::detlog;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
@@ -48,6 +49,22 @@ fn time_from_resources(rsrcs: &Resources) -> Option<LogicalTime> {
         }
     }
     None
+}
+
+/// Flatten a `timespec` to nanoseconds. Negative fields are not valid for the
+/// timer syscalls we handle; treat them as zero rather than panicking.
+fn timespec_to_ns(ts: libc::timespec) -> u64 {
+    let secs = ts.tv_sec.max(0) as u64;
+    let nsec = ts.tv_nsec.max(0) as u64;
+    secs.saturating_mul(1_000_000_000).saturating_add(nsec)
+}
+
+/// Inverse of [`timespec_to_ns`].
+fn ns_to_timespec(ns: u64) -> libc::timespec {
+    libc::timespec {
+        tv_sec: (ns / 1_000_000_000) as libc::time_t,
+        tv_nsec: (ns % 1_000_000_000) as libc::c_long,
+    }
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -287,6 +304,147 @@ impl<T: RecordOrReplay> Detcore<T> {
         Timespec {
             tv_sec: relative_logical.as_secs() as i64,
             tv_nsec: relative_logical.subsec_nanos() as i64,
+        }
+    }
+
+    /// timer_create: allocate a per-process POSIX timer and hand back a
+    /// deterministic id. The timer's arming is tracked (in the process-local
+    /// `PosixTimers` table) but expiration signals are not delivered.
+    pub async fn handle_timer_create<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::TimerCreate,
+    ) -> Result<i64, Error> {
+        // The kernel writes the new timer id here; a null pointer is EFAULT.
+        let timerid_ptr = call.timerid().ok_or(Errno::EFAULT)?;
+        let clockid = call.clockid();
+        let id = {
+            let mut timers = guest.thread_state().posix_timers.lock().unwrap();
+            timers.create()
+        };
+        guest
+            .memory()
+            .write_value(timerid_ptr, &(id as libc::c_int))?;
+        detlog!(
+            "[dtid {}] timer_create(clockid={:?}) => deterministic timer id {} (arming tracked; signal delivery not emulated)",
+            guest.thread_state().dettid,
+            clockid,
+            id,
+        );
+        Ok(0)
+    }
+
+    /// timer_settime: arm or disarm a timer against the deterministic virtual
+    /// clock. The old arming is reported through `old_value` when requested.
+    pub async fn handle_timer_settime<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::TimerSettime,
+    ) -> Result<i64, Error> {
+        let id = call.timerid();
+        let new_ptr = call.new_value().ok_or(Errno::EINVAL)?;
+        let new: libc::itimerspec = guest.memory().read_value(new_ptr)?;
+        let interval_ns = timespec_to_ns(new.it_interval);
+        let value_ns = timespec_to_ns(new.it_value);
+
+        let now = thread_observe_time(guest).await;
+        let deadline = if value_ns == 0 {
+            None
+        } else if call.flags() & libc::TIMER_ABSTIME != 0 {
+            // Absolute expiration is interpreted against the same virtual clock.
+            Some(LogicalTime::from_nanos(value_ns))
+        } else {
+            Some(now + Duration::from_nanos(value_ns))
+        };
+
+        let old = {
+            let mut timers = guest.thread_state().posix_timers.lock().unwrap();
+            timers.settime(id, interval_ns, deadline, now)
+        };
+        let (old_remaining_ns, old_interval_ns) = old.ok_or(Errno::EINVAL)?;
+
+        if let Some(old_ptr) = call.old_value() {
+            let old_spec = libc::itimerspec {
+                it_interval: ns_to_timespec(old_interval_ns),
+                it_value: ns_to_timespec(old_remaining_ns),
+            };
+            guest.memory().write_value(old_ptr, &old_spec)?;
+        }
+
+        detlog!(
+            "[dtid {}] timer_settime(id={}, interval_ns={}, value_ns={}) armed against virtual clock (not delivered)",
+            guest.thread_state().dettid,
+            id,
+            interval_ns,
+            value_ns,
+        );
+        Ok(0)
+    }
+
+    /// timer_gettime: report the time remaining until the next expiration and
+    /// the reload interval, both computed from the virtual clock.
+    pub async fn handle_timer_gettime<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::TimerGettime,
+    ) -> Result<i64, Error> {
+        let id = call.timerid();
+        let value_ptr = call.value().ok_or(Errno::EFAULT)?;
+        let now = thread_observe_time(guest).await;
+        let cur = {
+            let timers = guest.thread_state().posix_timers.lock().unwrap();
+            timers.gettime(id, now)
+        };
+        let (remaining_ns, interval_ns) = cur.ok_or(Errno::EINVAL)?;
+        let spec = libc::itimerspec {
+            it_interval: ns_to_timespec(interval_ns),
+            it_value: ns_to_timespec(remaining_ns),
+        };
+        guest.memory().write_value(value_ptr, &spec)?;
+        Ok(0)
+    }
+
+    /// timer_getoverrun: we never deliver expirations, so the overrun count is
+    /// always 0 for a live timer.
+    pub async fn handle_timer_getoverrun<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::TimerGetoverrun,
+    ) -> Result<i64, Error> {
+        let id = call.timerid();
+        let exists = guest
+            .thread_state()
+            .posix_timers
+            .lock()
+            .unwrap()
+            .contains(id);
+        if exists {
+            Ok(0)
+        } else {
+            Err(Errno::EINVAL.into())
+        }
+    }
+
+    /// timer_delete: destroy a timer created by `timer_create`.
+    pub async fn handle_timer_delete<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::TimerDelete,
+    ) -> Result<i64, Error> {
+        let id = call.timerid();
+        let existed = {
+            let mut timers = guest.thread_state().posix_timers.lock().unwrap();
+            timers.remove(id)
+        };
+        if existed {
+            detlog!(
+                "[dtid {}] timer_delete(id={})",
+                guest.thread_state().dettid,
+                id,
+            );
+            Ok(0)
+        } else {
+            Err(Errno::EINVAL.into())
         }
     }
 }

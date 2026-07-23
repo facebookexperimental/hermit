@@ -1,0 +1,51 @@
+name: Docs
+
+# Build the rustdoc API documentation for the workspace and publish it to the
+# `gh-pages` branch, which GitHub Pages serves at
+# https://rrnewton.github.io/hermit/. The redirect written below sends the site
+# root to the primary `hermit` crate.
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+# Serialize deployments so overlapping pushes cannot race on the gh-pages
+# branch, but never cancel a deploy that is already in flight.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+# peaceiris/actions-gh-pages pushes the built docs to the gh-pages branch using
+# GITHUB_TOKEN, which needs write access to repository contents.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings -C link-arg=-llzma
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  build-and-deploy:
+    name: Build rustdoc and deploy to GitHub Pages
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+    - name: Dependencies
+      run: sudo apt-get install -y libunwind-dev liblzma-dev
+    - name: Build documentation
+      run: cargo doc --workspace --no-deps
+    - name: Add root redirect to the hermit crate
+      run: echo '<meta http-equiv="refresh" content="0; url=hermit/index.html">' > target/doc/index.html
+    - name: Deploy to GitHub Pages
+      # Only publish from the canonical branch, not from manual dispatch on a
+      # feature branch.
+      if: github.ref == 'refs/heads/main'
+      uses: peaceiris/actions-gh-pages@v4
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: ./target/doc
+        # Overwrite the branch each run instead of accumulating history.
+        force_orphan: true

@@ -1,0 +1,78 @@
+{
+  "task": "research-qemu-virtual-time-boot",
+  "date_utc": "2026-07-22",
+  "repository": "rrnewton/hermit",
+  "branch": "impl-shared-futex-support-slot09",
+  "head_before_report": "a40bf685ab5cddce77c7ce81209a5577bc8f83fc",
+  "shared_futex_implementation": "b44d9396418c316abdbc38e9e41e5809da936c49",
+  "host": {
+    "name": "devbig030.atn3.facebook.com",
+    "architecture": "x86_64",
+    "kernel": "6.13.2-0_fbk13_hardened_0_g02230262e956"
+  },
+  "tools": {
+    "qemu": "10.1.0 (qemu-kvm-10.1.0-21.el9)",
+    "hermit_profile": "release"
+  },
+  "artifacts": {
+    "hermit_sha256": "fb464663d3628a87e779138886e67fd210ef0b550f38928641f4c7f09ab9d233",
+    "kernel_path": "/boot/vmlinuz-6.13.2-0_fbk15_hardened_0_g33ebba20e5e4",
+    "kernel_sha256": "ce6aae1633026f6d43fe01ddb847247b8a522aaf1f6a612a8d2c49e3c43b22c0",
+    "initramfs_sha256": "10fc5872a8ced8835da21a5e608b3f8aa02a6ae018e868a58131b05a4a66fed2"
+  },
+  "default_virtual_trace": {
+    "wall_seconds": 20.00608609,
+    "trace_lines": 261555,
+    "completed_syscalls": 19546,
+    "scheduler_turns": 120,
+    "turns_by_dtid": {
+      "3_main": 104,
+      "5_helper": 11,
+      "7_vcpu": 5
+    },
+    "clock_gettime_calls": 15900,
+    "gettimeofday_calls": 2879,
+    "final_virtual_global_cpu_ns": 574359370,
+    "serial_output": false
+  },
+  "no_virtual_time_control": {
+    "host_timeout_seconds": 90,
+    "serial_output": false,
+    "trace_wall_seconds_including_teardown": 28.66260313,
+    "trace_completed_syscalls": 719,
+    "trace_scheduler_turns": 124
+  },
+  "no_icount_control": {
+    "virtual_time": true,
+    "sequentialize_threads": false,
+    "preemption_timeout": "disabled",
+    "host_timeout_seconds": 30,
+    "pit_calibration": "failed",
+    "detected_tsc_mhz": 304.009,
+    "watchdog_reference_ns": 495924608,
+    "tsc_skew_ns": -374910756,
+    "final_clock_state": "No current clocksource",
+    "marker_reached": false
+  },
+  "successful_boot": {
+    "virtual_time": true,
+    "sequentialize_threads": false,
+    "preemption_timeout": "disabled",
+    "qemu_icount": "shift=0,sleep=off",
+    "qemu_accelerator": "tcg,thread=single",
+    "qemu_cpus": 1,
+    "qemu_memory_mib": 256,
+    "host_timeout_seconds": 90,
+    "wall_seconds": 13.25,
+    "exit_status": 0,
+    "detected_tsc_mhz": 1000.031,
+    "marker": "SHARED_FUTEX_QEMU_KERNEL_OK release=6.13.2-0_fbk15_hardened_0_g33ebba20e5e4 machine=x86_64",
+    "clock_warning_matches": 0
+  },
+  "conclusion": {
+    "silent_boot": "deterministic QEMU thread scheduling and PMU preemption throughput collapse",
+    "guest_clock_failure": "thread-local synthetic RDTSC versus aggregated global CLOCK_MONOTONIC",
+    "operational_workaround": "disable Hermit thread sequentialization and PMU preemption; use fixed QEMU icount",
+    "determinism_limit": "QEMU host threads are not deterministically sequentialized in the working configuration"
+  }
+}

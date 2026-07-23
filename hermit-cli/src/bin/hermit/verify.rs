@@ -21,6 +21,17 @@ use tracing::metadata::LevelFilter;
 
 use super::global_opts::GlobalOpts;
 
+pub(crate) struct ComparedRun<'a> {
+    pub output: &'a Output,
+    pub log: TempPath,
+}
+
+pub(crate) struct ComparisonOptions<'a> {
+    pub success_message: &'a str,
+    pub failure_message: &'a str,
+    pub verbose: bool,
+}
+
 pub fn temp_log_files(name1: &str, name2: &str) -> io::Result<(NamedTempFile, NamedTempFile)> {
     let file1 = tempfile::Builder::new()
         .prefix(&format!("{}_log_", name1))
@@ -56,18 +67,23 @@ pub fn setup_double_run(
 }
 
 pub fn compare_two_runs(
-    out1: &Output,
-    log1: TempPath,
-    out2: &Output,
-    log2: TempPath,
-    success_msg: &str,
-    failure_msg: &str,
+    first: ComparedRun<'_>,
+    second: ComparedRun<'_>,
+    options: ComparisonOptions<'_>,
 ) -> Result<ExitStatus, Error> {
+    let ComparedRun {
+        output: out1,
+        log: log1,
+    } = first;
+    let ComparedRun {
+        output: out2,
+        log: log2,
+    } = second;
     let mut failed = false;
 
     if out1.stdout != out2.stdout {
         failed = true;
-        eprintln!("Mismatch in stdout between runs:",);
+        eprintln!("Mismatch in stdout between run 1 and run 2:");
         let str1 = String::from_utf8_lossy(&out1.stdout);
         let str2 = String::from_utf8_lossy(&out2.stdout);
         if str1.lines().count() > 1 {
@@ -79,7 +95,7 @@ pub fn compare_two_runs(
 
     if out1.stderr != out2.stderr {
         failed = true;
-        eprintln!("Mismatch in stderr between runs:",);
+        eprintln!("Mismatch in stderr between run 1 and run 2:");
         let str1 = String::from_utf8_lossy(&out1.stderr);
         let str2 = String::from_utf8_lossy(&out2.stderr);
         if str1.lines().count() > 1 {
@@ -96,16 +112,18 @@ pub fn compare_two_runs(
         log2.display()
     );
 
-    // TODO(T103558443) stripping logs until this task is completely closed:
-    if logdiff::log_diff(
-        log1.as_ref(),
-        log2.as_ref(),
-        &logdiff::LogDiffOpts {
-            strip_lines: true,
-            syscall_history: 5,
-            ..Default::default()
-        },
-    ) {
+    let mut diff_options = logdiff::LogDiffOpts {
+        strip_lines: true,
+        syscall_history: 5,
+        ..Default::default()
+    };
+    if options.verbose {
+        diff_options.comparison = logdiff::LogComparisonMode::FullTrace;
+        diff_options.strip_lines = false;
+        diff_options.syscall_history = 10;
+    }
+
+    if logdiff::log_diff(log1.as_ref(), log2.as_ref(), &diff_options) {
         failed = true;
         eprintln!(":: {}", "Log differences found between runs.".red().bold());
         eprintln!(
@@ -119,21 +137,21 @@ pub fn compare_two_runs(
     if out1.status != out2.status {
         failed = true;
         eprintln!(
-            "Mismatch in exit status between runs: {}",
+            "Mismatch in exit status between run 1 and run 2: {}",
             Comparison::new(&out1.status, &out2.status)
         );
     }
 
     if failed {
-        eprintln!(":: {}", failure_msg.red().bold());
+        eprintln!(":: {}", options.failure_message.red().bold());
         let _ = log1.keep()?;
         let _ = log2.keep()?;
         Err(Error::msg(
-            "Mismatch between run1 and run2 outputs (logs retained).",
+            "Mismatch between run 1 and run 2 outputs (logs retained).",
         ))
     } else {
         // Allow the NamedTempFiles to be deleted in this case:
-        eprintln!(":: {}", success_msg.green().bold());
+        eprintln!(":: {}", options.success_message.green().bold());
         Ok(out2.status)
     }
 }
@@ -150,6 +168,82 @@ fn display_diff(left: &str, right: &str) {
             diff::Result::Both(s, _) => {
                 eprintln!("  {}", s);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    fn output(status: i32, stdout: &[u8], stderr: &[u8]) -> Output {
+        Output {
+            status: ExitStatus::Exited(status),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        }
+    }
+
+    fn empty_logs() -> (TempPath, TempPath) {
+        let (left, right) = temp_log_files("verify_left", "verify_right").unwrap();
+        (left.into_temp_path(), right.into_temp_path())
+    }
+
+    fn compare(
+        left: &Output,
+        left_log: TempPath,
+        right: &Output,
+        right_log: TempPath,
+    ) -> Result<ExitStatus, Error> {
+        compare_two_runs(
+            ComparedRun {
+                output: left,
+                log: left_log,
+            },
+            ComparedRun {
+                output: right,
+                log: right_log,
+            },
+            ComparisonOptions {
+                success_message: "verified",
+                failure_message: "failed",
+                verbose: false,
+            },
+        )
+    }
+
+    #[test]
+    fn identical_outputs_verify_successfully() {
+        let left = output(0, b"hello\n", b"");
+        let right = left.clone();
+        let (log1, log2) = empty_logs();
+
+        assert_eq!(
+            compare(&left, log1, &right, log2).unwrap(),
+            ExitStatus::Exited(0)
+        );
+    }
+
+    #[test]
+    fn stdout_stderr_and_status_mismatches_fail_verification() {
+        let baseline = output(0, b"hello\n", b"");
+        let mismatches = [
+            output(0, b"different\n", b""),
+            output(0, b"hello\n", b"different\n"),
+            output(1, b"hello\n", b""),
+        ];
+
+        for mismatch in mismatches {
+            let (log1, log2) = empty_logs();
+            let path1 = log1.to_path_buf();
+            let path2 = log2.to_path_buf();
+
+            assert!(compare(&baseline, log1, &mismatch, log2).is_err());
+
+            let _ = fs::remove_file(path1);
+            let _ = fs::remove_file(path2);
         }
     }
 }

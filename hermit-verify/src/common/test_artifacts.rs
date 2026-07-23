@@ -26,14 +26,12 @@ impl TestArtifacts {
         if !Path::new(&self.test_result_artifact_dir).exists() {
             std::fs::create_dir_all(&self.test_result_artifact_dir)?;
         }
-        let mut env_number = 1;
-        for env in tmp_env.runs().iter() {
+        for (env_number, env) in (1..).zip(tmp_env.runs().iter()) {
             self.copy_file(&env.log_file_path, env_number)?;
             self.copy_file(&env.std_out_file_path, env_number)?;
             self.copy_file(&env.std_err_file_path, env_number)?;
             self.copy_file(&env.exit_status_file_path, env_number)?;
             self.copy_file(&env.schedule_file, env_number)?;
-            env_number += 1;
         }
 
         Ok(())
@@ -71,7 +69,7 @@ mod test {
         artifacts.copy_run_results(&env)?;
 
         let files = std::fs::read_dir(artifactd_dir.path())?;
-        let expected_artifacts = vec![
+        let mut expected_artifacts = vec![
             format!("{}/1_log", artifactd_dir.path().display()),
             format!("{}/1_std_out", artifactd_dir.path().display()),
             format!("{}/1_std_err", artifactd_dir.path().display()),
@@ -83,11 +81,13 @@ mod test {
             format!("{}/2_exit_status", artifactd_dir.path().display()),
             format!("{}/2_sched", artifactd_dir.path().display()),
         ];
+        expected_artifacts.sort();
 
-        let copied_artifacts: Vec<String> = files
+        let mut copied_artifacts: Vec<String> = files
             .into_iter()
             .map(|p| format!("{}", p.unwrap().path().display()))
             .collect();
+        copied_artifacts.sort();
 
         assert_eq!(expected_artifacts, copied_artifacts);
         Ok(())

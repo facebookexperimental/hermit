@@ -151,18 +151,19 @@ impl BnzTool {
             } else {
                 None
             };
-            if let Some(sa) = sa {
-                if sa.port() != 0 {
-                    let config = guest.config().clone();
-                    let errno = res.map_or_else(Some, |_| None);
-                    let _ = write_bnz_result(&BnzResult::new(guest.pid(), sa, errno));
-                    if config.assert_on_non_zero_bind {
-                        BnzTool::inject_fatal_error(guest).await;
-                    } else if let Some(eaddrinuse) = errno {
-                        if eaddrinuse == Errno::EADDRINUSE && config.assert_on_eaddrinuse {
-                            BnzTool::inject_fatal_error(guest).await;
-                        }
-                    }
+            if let Some(sa) = sa
+                && sa.port() != 0
+            {
+                let config = guest.config().clone();
+                let errno = res.map_or_else(Some, |_| None);
+                let _ = write_bnz_result(&BnzResult::new(guest.pid(), sa, errno));
+                if config.assert_on_non_zero_bind {
+                    BnzTool::inject_fatal_error(guest).await;
+                } else if let Some(eaddrinuse) = errno
+                    && eaddrinuse == Errno::EADDRINUSE
+                    && config.assert_on_eaddrinuse
+                {
+                    BnzTool::inject_fatal_error(guest).await;
                 }
             }
         }

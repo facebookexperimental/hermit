@@ -1,0 +1,33 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+nextest-version = "0.9.100"
+
+[profile.default]
+fail-fast = false
+test-threads = "num-cpus"
+status-level = "pass"
+final-status-level = "slow"
+failure-output = "immediate-final"
+success-output = "never"
+
+[profile.ci]
+inherits = "default"
+status-level = "slow"
+final-status-level = "slow"
+
+[profile.ci.junit]
+path = "junit.xml"
+
+# Cargo runs integration test binaries one after another, and these binaries
+# also use process-local mutexes to serialize Hermit executions. Nextest runs
+# each test in a separate process, so keep their shared contract explicit.
+[test-groups.hermit-serialized]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = "package(=hermit) & kind(=test)"
+test-group = "hermit-serialized"

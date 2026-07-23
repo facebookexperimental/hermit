@@ -11,7 +11,8 @@
 //! Tasks are selected from the queue based on 2 factors:
 //! 1. Their priority
 //! 2. Their round-robin order.
-//! compared in that order. Round-robin orders monotinically increase across
+//!
+//! The factors are compared in that order. Round-robin orders monotonically increase across
 //! the entire queue; a task is assigned an order at insertion time.
 //!
 //! Round-robin orders can also be negative when the `push_front` method is
@@ -183,9 +184,9 @@ impl fmt::Display for RunQueue {
         writeln!(
             f,
             "Run queue, size={}, last_back_turn={}, last_front_turn={}:",
-            &self.queue.len(),
-            &self.last_back_turn,
-            &self.last_front_turn,
+            self.queue.len(),
+            self.last_back_turn,
+            self.last_front_turn,
         )?;
         for x in self.queue.iter() {
             writeln!(f, "    {:.500?}", x)?;
