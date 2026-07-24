@@ -270,6 +270,33 @@ fn run_record_replay(name: &str) {
 }
 
 #[test]
+fn record_strict_direct_cli_records_and_replays_echo() {
+    let _guard = hermit_record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create strict recording directory");
+
+    let mut record = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    record
+        .args(["--log=off", "record", "--strict", "--data-dir"])
+        .arg(data_dir.path())
+        .args(["--", "/bin/echo", "hello"]);
+    let record_output = command_output(record, "strict direct CLI recording");
+    assert_eq!(
+        record_output.stdout, b"hello\n",
+        "recorded guest stdout changed"
+    );
+
+    let mut replay = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    replay
+        .args(["--log=off", "replay", "--autopilot", "--data-dir"])
+        .arg(data_dir.path());
+    let replay_output = command_output(replay, "strict direct CLI replay");
+    assert_eq!(
+        replay_output.stdout, b"hello\n",
+        "replayed guest stdout did not match recording"
+    );
+}
+
+#[test]
 fn record_replay_matrix() {
     // Record/replay does not enable PMU-backed preemption, so these workloads
     // also run on GitHub-hosted runners without performance-counter access.

@@ -1024,10 +1024,14 @@ fn record_help_lists_management_commands() {
     assert_success(&output, &args);
     let help = stdout(&output);
 
-    assert!(help.contains("Usage: hermit record <COMMAND>"));
+    assert!(help.contains("Usage: hermit record"));
     for command in ["list", "rm", "clean", "start"] {
         assert!(help.contains(command), "missing {command:?} in:\n{help}");
     }
+    assert!(
+        help.contains("--strict"),
+        "missing direct strict option in:\n{help}"
+    );
 }
 
 #[test]

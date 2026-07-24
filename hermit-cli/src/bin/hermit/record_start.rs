@@ -14,7 +14,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::Args;
 use colored::Colorize;
 use hermit::Context;
 use hermit::Error;
@@ -148,11 +148,16 @@ fn with_recording_deadline<T>(
     record()
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Args)]
 pub struct StartOpts {
     /// Program to run.
-    #[clap(value_name = "PROGRAM")]
-    program: PathBuf,
+    #[clap(value_name = "PROGRAM", required = true)]
+    program: Option<PathBuf>,
+
+    /// Enable strict deterministic recording. Recording is already strict; this flag is retained
+    /// for command-line compatibility with `hermit run --strict`.
+    #[clap(long = "strict")]
+    _strict: bool,
 
     /// Arguments for the program.
     #[clap(value_name = "ARGS")]
@@ -185,6 +190,12 @@ pub struct StartOpts {
 }
 
 impl StartOpts {
+    fn program(&self) -> &PathBuf {
+        self.program
+            .as_ref()
+            .expect("Clap requires PROGRAM unless a record management subcommand is selected")
+    }
+
     fn record_timeout(&self) -> Option<Duration> {
         self.record_timeout
             .map(|seconds| Duration::from_secs(seconds.get()))
@@ -207,7 +218,7 @@ impl StartOpts {
                     let exit_status = container
                         .run(|| {
                             let _guard = global.init_tracing();
-                            let mut command = Command::new(&self.program);
+                            let mut command = Command::new(self.program());
                             command.args(&self.args);
                             with_recording_deadline(timeout, || {
                                 hermit::record_to(command, &data_path)
@@ -220,7 +231,7 @@ impl StartOpts {
                 None => container
                     .run(|| {
                         let _guard = global.init_tracing();
-                        let mut command = Command::new(&self.program);
+                        let mut command = Command::new(self.program());
                         command.args(&self.args);
                         hermit.record(command).map_err(SerializableError::from)
                     })
@@ -254,7 +265,7 @@ impl StartOpts {
             .run(|| {
                 let _guard = global1.init_tracing();
 
-                let mut command = Command::new(&self.program);
+                let mut command = Command::new(self.program());
                 command.args(&self.args);
 
                 match record_timeout {
@@ -307,7 +318,7 @@ impl StartOpts {
             .run(|| {
                 let _guard = global.init_tracing();
 
-                let mut command = Command::new(&self.program);
+                let mut command = Command::new(self.program());
                 command.args(&self.args);
 
                 match record_timeout {

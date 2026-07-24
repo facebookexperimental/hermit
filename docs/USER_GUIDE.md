@@ -234,6 +234,14 @@ The command prints a recording ID. Recordings default to
 `$XDG_CACHE_HOME/hermit`, normally `~/.cache/hermit`. Select another directory
 with `--data-dir=DIR` or the `HERMIT_DATA_DIR` environment variable.
 
+For command-line compatibility with `hermit run --strict`, recording also accepts
+`--strict`. Record/replay already uses a single serialized configuration, so the flag
+does not change recording semantics. The direct form is an alias for `record start`:
+
+```bash
+hermit record --strict -- /bin/echo recorded
+```
+
 List recordings:
 
 ```bash

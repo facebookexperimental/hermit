@@ -228,6 +228,25 @@ mod tests {
     }
 
     #[test]
+    fn record_accepts_strict_direct_and_start_forms() {
+        for args in [
+            vec!["hermit", "record", "--strict", "--", "/bin/echo", "hello"],
+            vec![
+                "hermit",
+                "record",
+                "start",
+                "--strict",
+                "--",
+                "/bin/echo",
+                "hello",
+            ],
+        ] {
+            let parsed = Args::try_parse_from(args).expect("record --strict should parse");
+            assert!(matches!(parsed.command, Subcommand::Record(_)));
+        }
+    }
+
+    #[test]
     fn record_accepts_a_positive_timeout() {
         Args::try_parse_from([
             "hermit",
