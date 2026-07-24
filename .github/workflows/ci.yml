@@ -142,6 +142,10 @@ jobs:
       with:
         go-version: stable
         cache: false
+    - uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '8'
     - name: Repair runner hostname resolution
       run: |
         runner_hostname="$(hostname)"
@@ -153,21 +157,26 @@ jobs:
       run: |
         # libunwind + lzma are required for linking (RUSTFLAGS=-C link-arg=-llzma),
         # and g++ builds the C fixtures. cmake + zlib build DynamoRIO drsyms_static;
-        # Redis, SQLite, curl, nginx, and a JDK are required by fail-closed e2e tests.
+        # Redis, SQLite, curl, nginx, and Temurin 8 are required by fail-closed e2e tests.
         if command -v dnf >/dev/null; then
           sudo dnf makecache
           sudo dnf install -y \
-            cmake curl gcc-c++ java-17-openjdk-devel libunwind-devel nginx \
+            cmake curl gcc-c++ libunwind-devel nginx \
             redis sqlite xz-devel zlib-devel
         elif command -v apt-get >/dev/null; then
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            cmake curl default-jdk-headless g++ liblzma-dev libunwind-dev nginx \
+            cmake curl g++ liblzma-dev libunwind-dev nginx \
             redis-server redis-tools sqlite3 zlib1g-dev
         else
           echo "::error::Unsupported package manager"
           exit 1
         fi
+        sudo install -d /usr/local/bin
+        sudo ln -sf "$(command -v java)" /usr/local/bin/java
+        sudo ln -sf "$(command -v javac)" /usr/local/bin/javac
+        /usr/local/bin/java -version
+        /usr/local/bin/javac -version
         for tool in cmake curl g++ go java javac nginx redis-cli redis-server sqlite3; do
           command -v "$tool"
         done
