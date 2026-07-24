@@ -21,6 +21,7 @@ mod bnz;
 mod clean;
 mod container;
 mod global_opts;
+mod instruction_map;
 mod list;
 mod logdiff;
 mod record;
@@ -86,6 +87,7 @@ use hermit::ExitStatus;
 use self::analyze::AnalyzeOpts;
 use self::bisect::BisectOpts;
 use self::global_opts::GlobalOpts;
+use self::instruction_map::InstructionMapOpts;
 use self::logdiff::LogDiffCLIOpts;
 use self::record::RecordOpts;
 use self::replay::ReplayOpts;
@@ -128,6 +130,10 @@ enum Subcommand {
     /// Bisect passing and failing schedules to localize a race.
     #[clap(name = "bisect", trailing_var_arg = true)]
     Bisect(Box<BisectOpts>),
+
+    /// Generate a JSON map of nondeterministic instructions in an ELF binary.
+    #[clap(name = "instruction-map")]
+    InstructionMap(InstructionMapOpts),
 }
 
 impl Subcommand {
@@ -139,6 +145,7 @@ impl Subcommand {
             Subcommand::LogDiff(x) => Ok(x.main(global)),
             Subcommand::Analyze(x) => x.main(global),
             Subcommand::Bisect(x) => x.main(global),
+            Subcommand::InstructionMap(x) => x.main(global),
         }
     }
 }
@@ -272,5 +279,19 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn instruction_map_accepts_binary_and_cache_directory() {
+        let args = Args::try_parse_from([
+            "hermit",
+            "instruction-map",
+            "--cache-dir",
+            "/tmp/instruction-maps",
+            "/bin/ls",
+        ])
+        .unwrap();
+
+        assert!(matches!(args.command, Subcommand::InstructionMap(_)));
     }
 }

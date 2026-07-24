@@ -18,6 +18,7 @@ mod event;
 mod event_stream;
 mod fd;
 mod id;
+pub mod instruction_map;
 mod interp;
 mod metadata;
 mod record;
