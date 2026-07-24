@@ -628,6 +628,57 @@ function run_strict_compatibility_envelope {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe expr expr 2 + 2 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe dd bash -c \
+        'printf "hermit-dd\n" | dd bs=1 count=10 status=none' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe df /usr/bin/df -P / \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe du /usr/bin/du -sk README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe hostname /usr/bin/hostname \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe whoami /usr/bin/whoami \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    # An explicit user avoids host-specific supplementary GIDs without names.
+    strict_compatibility_probe groups /usr/bin/groups root \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    # The compatibility harness supplies /dev/null, so tty should report the
+    # expected non-terminal result while the wrapper preserves a zero exit.
+    # shellcheck disable=SC2016
+    strict_compatibility_probe tty bash -c \
+        'output=$(tty 2>&1); status=$?; printf "%s\n" "$output"; test "$status" -eq 1' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe nproc /usr/bin/nproc \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe arch /usr/bin/arch \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe realpath /usr/bin/realpath README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe readlink /usr/bin/readlink -f README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    # shellcheck disable=SC2016
+    strict_compatibility_probe mktemp bash -c \
+        'd=$(mktemp -d /tmp/hermit-compat.XXXXXX) && basename "$d" && rmdir "$d"' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe sha256sum /usr/bin/sha256sum README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe sha1sum /usr/bin/sha1sum README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe md5sum /usr/bin/md5sum README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe wc-lines /usr/bin/wc -l README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe nl bash -c \
+        'printf "alpha\nbeta\n" | nl -ba' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe expand bash -c \
+        'printf "a\tb\n" | expand -t 4' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe unexpand bash -c \
+        'printf "a   b\n" | unexpand -a -t 4' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    # free is intentionally absent: its live /proc/meminfo values differ
+    # between otherwise identical strict runs.
 
     total=$((passed + failed))
     if ((failed == 0)); then
