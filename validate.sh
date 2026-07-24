@@ -765,6 +765,9 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe node /bin/node -e 'console.log(42)' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    # Avoid the PATH fbpython wrapper and exercise the system CPython ELF.
+    strict_compatibility_probe python3 /usr/bin/python3 -c 'print(42)' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
     # Avoid the PATH Git wrapper: its telemetry sidecar pipes are nondeterministic.
     strict_compatibility_probe git /usr/local/bin/git.meta.real --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
