@@ -1046,7 +1046,8 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe bc bash -c 'printf "6*7\n" | bc' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe sqlite3 sqlite3 :memory: 'SELECT 1+1;' \
+    strict_compatibility_probe sqlite3 sqlite3 :memory: \
+        'CREATE TABLE values_under_test(value INTEGER NOT NULL); WITH RECURSIVE sequence(value) AS (VALUES(1) UNION ALL SELECT value + 1 FROM sequence WHERE value < 100) INSERT INTO values_under_test SELECT value FROM sequence; SELECT count(*), sum(value) FROM values_under_test;' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Expand $i inside the guest shell, not here.
     # shellcheck disable=SC2016

@@ -13,6 +13,10 @@ cargo build -p hermit
 ./experiments/run_experiment.sh /bin/echo 10 hello
 ```
 
+Workloads that download/build large applications or can exceed 60 seconds are
+kept out of every validation profile. See [HEAVYWEIGHT.md](HEAVYWEIGHT.md) for
+exact manual commands for SQLite `veryquick`, large LULESH, Redis, and LevelDB.
+
 By default, the script uses `target/debug/hermit` and creates a timestamped
 directory beside the script. Use explicit paths when collecting evidence for a
 review:
