@@ -45,6 +45,16 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Enable unprivileged user namespaces
+        run: |
+          # Ubuntu 24.04 (ubuntu-latest) restricts unprivileged user namespaces
+          # via AppArmor, which makes reverie-process container setup fail and
+          # panics the hermit smoke tests. The self-hosted merge gate does a
+          # namespace preflight instead; hosted PR runners need the AppArmor
+          # restriction lifted so `hermit run` can unshare a user namespace.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Dependencies
         run: |
           sudo apt-get update
