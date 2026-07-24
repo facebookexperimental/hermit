@@ -1585,8 +1585,9 @@ function envelope_compare {
     return "$regressed"
 }
 
-# Auto-apply the `locally-validated` PR label after a fully-green full run, then
-# cancel the redundant in-flight CI run for the exact validated commit.
+# Auto-apply the `locally-validated` PR label after a fully-green full run, add
+# an audit comment with the validation results, then cancel the redundant
+# in-flight CI run for the exact validated commit.
 # Landing gate policy is: validate.sh passes locally -> PR carries the
 # `locally-validated` label. Label application and CI cancellation are
 # best-effort so GitHub or proxy failures never change the validation result.
@@ -1600,6 +1601,10 @@ function apply_locally_validated_label {
     local pr=$PR_NUMBER
     local pr_head=""
     local local_head
+    local comment_body=""
+    local host_name=""
+    local passed_checks=0
+    local timestamp=""
     local run_id=""
     local -a gh_cmd=(gh)
 
@@ -1649,6 +1654,25 @@ function apply_locally_validated_label {
         --repo "$LOCALLY_VALIDATED_REPOSITORY" \
         >>"$LOG_FILE" 2>&1; then
         printf "🏷️  Applied '%s' label to PR #%s\n" "$LOCALLY_VALIDATED_LABEL" "$pr"
+
+        host_name=$(hostname -f 2>/dev/null) || \
+            host_name=$(hostname 2>/dev/null) || host_name="unknown"
+        timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ') || timestamp="unknown"
+        passed_checks=$((checks - failures))
+        # Single quotes keep the Markdown backticks literal in the comment body.
+        # shellcheck disable=SC2016
+        printf -v comment_body \
+            '[impl agent, validate.sh]\n\nLocal validation passed.\n\n- SHA: `%s`\n- Profile: `%s`\n- Results: %d checks passed, 0 failed\n- Hostname: `%s`\n- Timestamp (UTC): `%s`' \
+            "$local_head" "$VALIDATION_PROFILE" "$passed_checks" \
+            "$host_name" "$timestamp"
+        if "${gh_cmd[@]}" pr comment "$pr" \
+            --repo "$LOCALLY_VALIDATED_REPOSITORY" \
+            --body "$comment_body" >>"$LOG_FILE" 2>&1; then
+            printf "💬 Added local validation results to PR #%s\n" "$pr"
+        else
+            printf "⚠️  failed to comment validation results on PR #%s (full log: %s)\n" \
+                "$pr" "$LOG_FILE" >&2
+        fi
 
         if ! run_id=$("${gh_cmd[@]}" api \
             "repos/${LOCALLY_VALIDATED_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${local_head}&per_page=100" \
