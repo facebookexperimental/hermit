@@ -89,6 +89,14 @@ jobs:
       DETCORE_TEST_RUST_LOG: "off"
       VALIDATE_GATE_TIMEOUT_SECONDS: "1200"
     steps:
+      # AUTONOMOUS-BOT-IMPLEMENTED
+      # TODO-HUMAN-REVIEW(#647)
+      - name: Remove stale checkout locks
+        run: |
+          if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+            find "$GITHUB_WORKSPACE/.git" -type f -name "*.lock" -print -delete
+          fi
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -152,6 +160,14 @@ jobs:
       SUPER_REPETITIONS: "20"
       VALIDATE_GATE_TIMEOUT_SECONDS: "1200"
     steps:
+      # AUTONOMOUS-BOT-IMPLEMENTED
+      # TODO-HUMAN-REVIEW(#647)
+      - name: Remove stale checkout locks
+        run: |
+          if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+            find "$GITHUB_WORKSPACE/.git" -type f -name "*.lock" -print -delete
+          fi
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
