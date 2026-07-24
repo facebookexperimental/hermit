@@ -216,7 +216,7 @@ jobs:
     - name: Standard command strict-verify compatibility tests
       if: steps.namespaces.outputs.available == 'true'
       run: cargo test -p hermit --test command_strict_verify -- --ignored --test-threads=1
-    - name: Strict compatibility envelope (nonblocking)
+    - name: Functional strict compatibility workloads (nonblocking)
       if: steps.namespaces.outputs.available == 'true'
       continue-on-error: true
       run: ./validate.sh --strict-compat-only

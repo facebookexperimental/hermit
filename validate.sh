@@ -209,6 +209,8 @@ readonly HERMIT_SMOKE_TIMEOUT="30s"
 readonly SMOKE_MARKER="hermit-validation-smoke"
 readonly STRICT_COMPAT_HERMIT_BIN="$ROOT_DIR/target/release/hermit"
 readonly STRICT_COMPAT_TIMEOUT=60
+readonly REAL_COMPAT_FIXTURES="$ROOT_DIR/target/real-compat-fixtures-$$"
+readonly REAL_COMPAT_WORKLOAD="$ROOT_DIR/tests/compat/real_compat_workload.sh"
 RR_COMPAT_PHASE_TIMEOUT_SECONDS=${RR_COMPAT_PHASE_TIMEOUT_SECONDS:-60}
 if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     echo "validate.sh: RR_COMPAT_PHASE_TIMEOUT_SECONDS must be a positive integer" >&2
@@ -309,6 +311,7 @@ function cleanup {
     done
     wait 2>/dev/null || true
     rm -rf "$VALIDATION_TMP_DIR"
+    rm -rf "$REAL_COMPAT_FIXTURES"
 }
 
 function interrupted {
@@ -984,6 +987,21 @@ function strict_compatibility_probe {
 
 # Strict compatibility remains an observation gate in full validation. The
 # focused SaBRe and record/replay modes enforce their measured blocking floors.
+# Strict mode replaces banner probes with functional workloads so an
+# executable that merely starts cannot be counted as compatible at L2.
+function functional_compatibility_probe {
+    local label=$1
+    shift
+
+    if [[ $COMPATIBILITY_MODE != strict ]]; then
+        strict_compatibility_probe "$label" "$@"
+        return $?
+    fi
+
+    strict_compatibility_probe "$label" env \
+        REAL_COMPAT_FIXTURES="$REAL_COMPAT_FIXTURES" \
+        bash "$REAL_COMPAT_WORKLOAD" "$label"
+}
 function run_compatibility_corpus {
     local passed=0
     local failed=0
@@ -1035,11 +1053,11 @@ function run_compatibility_corpus {
     strict_compatibility_probe bash bash -c \
         'for i in 1 2 3; do echo "$i"; done' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe cargo cargo --version \
+    functional_compatibility_probe cargo cargo --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe rustc rustc --version \
+    functional_compatibility_probe rustc rustc --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe java java -version \
+    functional_compatibility_probe java java -version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe node /bin/node -e 'console.log(42)' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1047,45 +1065,45 @@ function run_compatibility_corpus {
     strict_compatibility_probe python3 /usr/bin/python3 -c 'print(42)' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Avoid the PATH Git wrapper: its telemetry sidecar pipes are nondeterministic.
-    strict_compatibility_probe git /usr/local/bin/git.meta.real --version \
+    functional_compatibility_probe git /usr/local/bin/git.meta.real --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe gcc gcc --version \
+    functional_compatibility_probe gcc gcc --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe g++ g++ --version \
+    functional_compatibility_probe g++ g++ --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe make make --version \
+    functional_compatibility_probe make make --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe ar /usr/bin/ar --version \
+    functional_compatibility_probe ar /usr/bin/ar --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe as /usr/bin/as --version \
+    functional_compatibility_probe as /usr/bin/as --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe ld /usr/bin/ld --version \
+    functional_compatibility_probe ld /usr/bin/ld --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe nm /usr/bin/nm --version \
+    functional_compatibility_probe nm /usr/bin/nm --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe objcopy /usr/bin/objcopy --version \
+    functional_compatibility_probe objcopy /usr/bin/objcopy --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe objdump /usr/bin/objdump --version \
+    functional_compatibility_probe objdump /usr/bin/objdump --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe ranlib /usr/bin/ranlib --version \
+    functional_compatibility_probe ranlib /usr/bin/ranlib --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe readelf /usr/bin/readelf --version \
+    functional_compatibility_probe readelf /usr/bin/readelf --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe size /usr/bin/size --version \
+    functional_compatibility_probe size /usr/bin/size --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe strip /usr/bin/strip --version \
+    functional_compatibility_probe strip /usr/bin/strip --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe addr2line /usr/bin/addr2line --version \
+    functional_compatibility_probe addr2line /usr/bin/addr2line --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe c++filt /usr/bin/c++filt --version \
+    functional_compatibility_probe c++filt /usr/bin/c++filt --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe elfedit /usr/bin/elfedit --version \
+    functional_compatibility_probe elfedit /usr/bin/elfedit --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe gprof /usr/bin/gprof --version \
+    functional_compatibility_probe gprof /usr/bin/gprof --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe cpp /usr/bin/cpp --version \
+    functional_compatibility_probe cpp /usr/bin/cpp --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe gcov /usr/bin/gcov --version \
+    functional_compatibility_probe gcov /usr/bin/gcov --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe bzip2 bash -c \
         'bzip2 -c README.md | sha256sum' \
@@ -1420,6 +1438,13 @@ function run_compatibility_corpus {
 }
 
 function run_strict_compatibility_envelope {
+    if ! "$ROOT_DIR/tests/compat/prepare_real_compat_fixtures.sh" \
+        "$REAL_COMPAT_FIXTURES" >>"$LOG_FILE" 2>&1; then
+        printf "❌ Unable to prepare functional compatibility fixtures (log: %s)\n" \
+            "$LOG_FILE"
+        return 1
+    fi
+
     COMPATIBILITY_MODE=strict
     run_compatibility_corpus
 }
