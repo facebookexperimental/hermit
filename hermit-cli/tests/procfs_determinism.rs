@@ -104,6 +104,8 @@ fn proc_self_status_is_deterministic() {
             .parse::<u32>()
             .expect("status PID should be numeric");
         assert!(pid > 0);
+        assert!(text.contains("Cpus_allowed:\t00000000,00000000,00000000,00000001\n"));
+        assert!(text.contains("Cpus_allowed_list:\t0\n"));
         assert!(text.contains("voluntary_ctxt_switches:\t0\n"));
         assert!(text.contains("nonvoluntary_ctxt_switches:\t0\n"));
     });

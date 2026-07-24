@@ -5,9 +5,16 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      qemu_l2:
+        description: Run the optional heavyweight QEMU strict-L2 boot gate
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
@@ -59,6 +66,39 @@ jobs:
       run: cargo clippy --workspace --all-targets -- -D warnings
     - name: Format
       run: cargo fmt --all -- --check
+
+  # AUTONOMOUS-BOT-IMPLEMENTED
+  # TODO-HUMAN-REVIEW(#553)
+  qemu-l2:
+    name: QEMU strict L2 boot (optional heavyweight)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.qemu_l2 }}
+    runs-on: [self-hosted, Linux, X64, hermit, pmu]
+    timeout-minutes: 60
+
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        submodules: recursive
+    - name: Dependencies
+      run: |
+        if command -v dnf >/dev/null; then
+          sudo dnf install -y cmake gcc-c++ libunwind-devel xz-devel zlib-devel cpio gzip qemu-system-x86-core
+        elif command -v apt-get >/dev/null; then
+          sudo apt-get install -y cmake g++ libunwind-dev liblzma-dev zlib1g-dev cpio gzip qemu-system-x86
+        else
+          echo "::error::Unsupported package manager; QEMU L2 dependencies are unavailable"
+          exit 1
+        fi
+    - name: QEMU and namespace preflight
+      run: |
+        command -v qemu-system-x86_64
+        test -r /boot/vmlinuz
+        unshare --user --map-root-user --pid --fork --uts --net --mount \
+          sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp'
+    - name: Validate QEMU strict L2 boot
+      env:
+        KERNEL_IMAGE: /boot/vmlinuz
+      run: ./validate.sh --qemu-l2-only --no-label-pr
 
   hardware:
     name: Host-dependent tests (self-hosted)

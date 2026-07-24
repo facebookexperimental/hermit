@@ -568,8 +568,9 @@ approach for a small allow-list of volatile files (`detcore/src/procfs.rs`):
   counters, `utime`/`stime`/`cutime`/`cstime`, `itrealvalue`, `starttime`, the
   last-run `processor`, and the trailing delay/guest-time accounting fields) are
   rewritten to `0`, while the `comm` string and structural fields are preserved.
-- `/proc/self/status` — `voluntary_ctxt_switches` and
-  `nonvoluntary_ctxt_switches` are pinned to `0`.
+- `/proc/self/status` — the CPU affinity mask/list are pinned to virtual CPU 0,
+  and `voluntary_ctxt_switches` and `nonvoluntary_ctxt_switches` are pinned to
+  `0`.
 - `/proc/cpuinfo` — the `cpu MHz` line is pinned to `0.000`.
 
 The mechanism rides on the FD model. When `open`/`openat` resolves to one of

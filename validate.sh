@@ -24,6 +24,7 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --envelope-compare FILE    # measure, then fail if any count
 #                                            # regressed below FILE's baseline
 #   ./validate.sh --strict-compat-only        # run the nonblocking L2 app matrix
+#   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
 #   ./validate.sh --verbose                  # stream each gate's command, PID,
 #                                            # elapsed time, and subprocess output
 # A fully-green full run labels the current PR `locally-validated` by default.
@@ -32,6 +33,7 @@ cd "$ROOT_DIR" || exit 1
 ENVELOPE_MODE="full"          # full | only
 ENVELOPE_BASELINE=""
 STRICT_COMPAT_ONLY=0
+QEMU_L2_ONLY=0
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
 VERBOSE=0
@@ -45,6 +47,7 @@ while [[ $# -gt 0 ]]; do
             [[ -n $ENVELOPE_BASELINE ]] || { echo "validate.sh: --envelope-compare needs a FILE" >&2; exit 2; }
             shift 2 ;;
         --strict-compat-only) STRICT_COMPAT_ONLY=1; shift ;;
+        --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
         --no-label-pr) LABEL_PR=0; shift ;;
@@ -54,7 +57,29 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-GATE_TIMEOUT_SECONDS=${VALIDATE_GATE_TIMEOUT_SECONDS:-600}
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#553)
+only_modes=0
+[[ $ENVELOPE_MODE == only ]] && ((only_modes += 1))
+((STRICT_COMPAT_ONLY == 1)) && ((only_modes += 1))
+((QEMU_L2_ONLY == 1)) && ((only_modes += 1))
+if ((only_modes > 1)); then
+    echo "validate.sh: choose only one of --envelope-only/--envelope-compare, --strict-compat-only, or --qemu-l2-only" >&2
+    exit 2
+fi
+
+default_gate_timeout_seconds=600
+if ((QEMU_L2_ONLY == 1)); then
+    qemu_phase_timeout_seconds=${QEMU_L2_PHASE_TIMEOUT_SECONDS:-300}
+    if [[ ! $qemu_phase_timeout_seconds =~ ^[1-9][0-9]*$ ]]; then
+        echo "validate.sh: QEMU_L2_PHASE_TIMEOUT_SECONDS must be a positive integer" >&2
+        exit 2
+    fi
+    # One boot-oracle phase plus run1/run2/compare, with five minutes for
+    # process startup, teardown, and reporting outside those phase budgets.
+    default_gate_timeout_seconds=$((4 * qemu_phase_timeout_seconds + 300))
+fi
+GATE_TIMEOUT_SECONDS=${VALIDATE_GATE_TIMEOUT_SECONDS:-$default_gate_timeout_seconds}
 TIMEOUT_KILL_GRACE_SECONDS=${VALIDATE_TIMEOUT_KILL_GRACE_SECONDS:-5}
 VERBOSE_INTERVAL_SECONDS=${VALIDATE_VERBOSE_INTERVAL_SECONDS:-10}
 if [[ ! $GATE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
@@ -70,7 +95,7 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
-readonly STRICT_COMPAT_ONLY
+readonly STRICT_COMPAT_ONLY QEMU_L2_ONLY
 
 checks=0
 failures=0
@@ -877,6 +902,20 @@ if ((STRICT_COMPAT_ONLY == 1)); then
         exit 1
     fi
     run_strict_compatibility_envelope
+    exit $?
+fi
+
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#553)
+if ((QEMU_L2_ONLY == 1)); then
+    run_check "Build release Hermit for QEMU L2" \
+        cargo build --release -p hermit
+    if ((failures == 0)); then
+        run_check "QEMU strict L2 boot (heavyweight)" \
+            ./experiments/qemu-boot-debug/strict_l2_test.sh
+    fi
+    print_summary
+    ((failures == 0))
     exit $?
 fi
 

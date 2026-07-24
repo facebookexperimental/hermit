@@ -91,7 +91,11 @@ fn sanitize_stat(contents: &[u8]) -> Vec<u8> {
     format!("{} {}\n", comm, fields.join(" ")).into_bytes()
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#553)
 fn sanitize_status(contents: &[u8]) -> Vec<u8> {
+    const CPUS_ALLOWED: &[u8] = b"Cpus_allowed:";
+    const CPUS_ALLOWED_LIST: &[u8] = b"Cpus_allowed_list:";
     const VOLUNTARY: &[u8] = b"voluntary_ctxt_switches:";
     const NONVOLUNTARY: &[u8] = b"nonvoluntary_ctxt_switches:";
 
@@ -99,7 +103,13 @@ fn sanitize_status(contents: &[u8]) -> Vec<u8> {
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
         let has_newline = line.last() == Some(&b'\n');
         let body = line.strip_suffix(b"\n").unwrap_or(line);
-        if body.starts_with(VOLUNTARY) {
+        if body.starts_with(CPUS_ALLOWED) {
+            normalized.extend_from_slice(CPUS_ALLOWED);
+            normalized.extend_from_slice(b"\t00000000,00000000,00000000,00000001");
+        } else if body.starts_with(CPUS_ALLOWED_LIST) {
+            normalized.extend_from_slice(CPUS_ALLOWED_LIST);
+            normalized.extend_from_slice(b"\t0");
+        } else if body.starts_with(VOLUNTARY) {
             normalized.extend_from_slice(VOLUNTARY);
             normalized.extend_from_slice(b"\t0");
         } else if body.starts_with(NONVOLUNTARY) {
@@ -175,12 +185,14 @@ mod tests {
         assert!(output.starts_with("3 (name with spaces) R "));
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#553)
     #[test]
-    fn status_normalizes_context_switches() {
-        let input = b"Name:\tcat\nvoluntary_ctxt_switches:\t120\nnonvoluntary_ctxt_switches:\t3\n";
+    fn status_normalizes_affinity_and_context_switches() {
+        let input = b"Name:\tcat\nCpus_allowed:\tffffffff,ffffffff\nCpus_allowed_list:\t0-63\nvoluntary_ctxt_switches:\t120\nnonvoluntary_ctxt_switches:\t3\n";
         assert_eq!(
             sanitize_status(input),
-            b"Name:\tcat\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
+            b"Name:\tcat\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
         );
     }
 
