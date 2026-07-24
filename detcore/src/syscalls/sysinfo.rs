@@ -164,7 +164,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
-    async fn calculate_uptime<G: Guest<Self>>(&self, guest: &mut G) -> Result<u64, Error> {
+    pub(super) async fn calculate_uptime<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<u64, Error> {
         let global_time = thread_observe_time(guest).await;
         Ok(self.cfg.sysinfo_uptime_offset + global_time.as_secs()
             - crate::types::DetTime::new(&self.cfg).as_nanos().as_secs())

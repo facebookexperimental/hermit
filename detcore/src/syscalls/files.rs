@@ -235,8 +235,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_snapshot())?;
         if needs_procfs_snapshot {
             let contents = self.snapshot_procfs(guest, call).await?;
+            let virtual_uptime_seconds = self.calculate_uptime(guest).await?;
             guest.thread_state().with_detfd(call.fd(), |detfd| {
-                detfd.initialize_procfs(contents.clone());
+                detfd.initialize_procfs(contents.clone(), virtual_uptime_seconds);
             })?;
         }
 

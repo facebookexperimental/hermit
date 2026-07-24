@@ -18,6 +18,8 @@ enum ProcfsKind {
     Stat,
     Status,
     Cpuinfo,
+    Loadavg,
+    Uptime,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -35,6 +37,8 @@ impl ProcfsFile {
             "/proc/self/stat" => ProcfsKind::Stat,
             "/proc/self/status" => ProcfsKind::Status,
             "/proc/cpuinfo" => ProcfsKind::Cpuinfo,
+            "/proc/loadavg" => ProcfsKind::Loadavg,
+            "/proc/uptime" => ProcfsKind::Uptime,
             _ => return None,
         };
         Some(Self {
@@ -50,11 +54,13 @@ impl ProcfsFile {
     }
 
     /// Normalizes and stores a complete snapshot captured from the kernel.
-    pub(crate) fn initialize(&mut self, contents: Vec<u8>) {
+    pub(crate) fn initialize(&mut self, contents: Vec<u8>, virtual_uptime_seconds: u64) {
         self.contents = Some(match self.kind {
             ProcfsKind::Stat => sanitize_stat(&contents),
             ProcfsKind::Status => sanitize_status(&contents),
             ProcfsKind::Cpuinfo => sanitize_cpuinfo(&contents),
+            ProcfsKind::Loadavg => sanitize_loadavg(&contents),
+            ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
         });
         self.offset = 0;
     }
@@ -144,6 +150,22 @@ fn sanitize_cpuinfo(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
+fn sanitize_loadavg(contents: &[u8]) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        b"0.00 0.00 0.00 1/1 1\n".to_vec()
+    }
+}
+
+fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        format!("{virtual_uptime_seconds}.00 0.00\n").into_bytes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +189,18 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Cpuinfo
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/loadavg"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Loadavg
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/uptime"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Uptime
         );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
@@ -206,9 +240,21 @@ mod tests {
     }
 
     #[test]
+    fn loadavg_and_uptime_use_virtual_values() {
+        assert_eq!(
+            sanitize_loadavg(b"344.01 369.71 375.04 526/107858 512196\n"),
+            b"0.00 0.00 0.00 1/1 1\n"
+        );
+        assert_eq!(
+            sanitize_uptime(b"156980.56 37990755.08\n", 120),
+            b"120.00 0.00\n"
+        );
+    }
+
+    #[test]
     fn snapshot_supports_partial_reads() {
         let mut file = ProcfsFile::from_path(Path::new("/proc/self/status")).unwrap();
-        file.initialize(b"voluntary_ctxt_switches:\t12\n".to_vec());
+        file.initialize(b"voluntary_ctxt_switches:\t12\n".to_vec(), 120);
         assert_eq!(file.take(5).unwrap(), b"volun");
         assert_eq!(file.take(128).unwrap(), b"tary_ctxt_switches:\t0\n");
         assert!(file.take(1).unwrap().is_empty());

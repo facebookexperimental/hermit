@@ -140,6 +140,20 @@ fn proc_cpuinfo_is_deterministic() {
 }
 
 #[test]
+fn proc_loadavg_uses_virtual_values() {
+    assert_deterministic("/proc/loadavg", |contents| {
+        assert_eq!(contents, b"0.00 0.00 0.00 1/1 1\n");
+    });
+}
+
+#[test]
+fn proc_uptime_uses_virtual_time() {
+    assert_deterministic("/proc/uptime", |contents| {
+        assert_eq!(contents, b"120.00 0.00\n");
+    });
+}
+
+#[test]
 fn proc_entropy_available_is_deterministic() {
     assert_deterministic("/proc/sys/kernel/random/entropy_avail", |contents| {
         let _entropy = std::str::from_utf8(contents)
