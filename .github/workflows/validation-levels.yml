@@ -79,6 +79,11 @@ jobs:
         )
       }}
     runs-on: [self-hosted, Linux, X64, hermit, pmu]
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#646)
+    concurrency:
+      group: hermit-self-hosted-pmu
+      cancel-in-progress: false
     timeout-minutes: 180
     env:
       DETCORE_TEST_RUST_LOG: "off"
@@ -136,6 +141,11 @@ jobs:
         )
       }}
     runs-on: [self-hosted, Linux, X64, hermit, pmu]
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#646)
+    concurrency:
+      group: hermit-self-hosted-pmu
+      cancel-in-progress: false
     timeout-minutes: 180
     env:
       DETCORE_TEST_RUST_LOG: "off"

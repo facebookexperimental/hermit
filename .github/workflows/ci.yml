@@ -78,6 +78,11 @@ jobs:
         inputs.qemu_l2
       }}
     runs-on: [self-hosted, Linux, X64, hermit, pmu]
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#646)
+    concurrency:
+      group: hermit-self-hosted-pmu
+      cancel-in-progress: false
     timeout-minutes: 60
 
     steps:
@@ -130,6 +135,11 @@ jobs:
         )
       }}
     runs-on: [self-hosted, Linux, X64, hermit, pmu]
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#646)
+    concurrency:
+      group: hermit-self-hosted-pmu
+      cancel-in-progress: false
     timeout-minutes: 30
     env:
       DETCORE_TEST_RUST_LOG: "off"
