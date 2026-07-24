@@ -22,7 +22,9 @@ use std::path::PathBuf;
 use std::pin::pin;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::OnceLock;
+use std::sync::RwLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::task::Context;
@@ -89,6 +91,7 @@ struct ThreadRuntime {
     tid: Pid,
     state: DetcoreThreadState,
     initialized: bool,
+    post_exec_pending: bool,
 }
 
 #[repr(C)]
@@ -99,11 +102,23 @@ struct NativeThreadScratch {
     runtime_state: *mut ThreadRuntime,
 }
 
-static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+static RUNTIME: LazyLock<RwLock<Option<Arc<Runtime>>>> = LazyLock::new(|| RwLock::new(None));
+static IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static READY_IMAGE: AtomicU64 = AtomicU64::new(0);
 static TOTAL_BRANCHES: AtomicU64 = AtomicU64::new(0);
 static TOTAL_SYSCALLS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_REWRITTEN: AtomicU64 = AtomicU64::new(0);
 static MEMORY_HASH: AtomicU64 = AtomicU64::new(FNV_OFFSET);
+
+fn current_runtime() -> Arc<Runtime> {
+    Arc::clone(
+        RUNTIME
+            .read()
+            .expect("Detcore DBI runtime lock poisoned")
+            .as_ref()
+            .expect("Detcore DBI runtime was not initialized"),
+    )
+}
 
 fn update_memory_hash(sysnum: i64, args: &[u64], read_memory: MemoryReader) {
     if sysnum != libc::SYS_write {
@@ -182,16 +197,25 @@ fn lock_native_client_build(directory: &std::path::Path) -> io::Result<fs::File>
 /// Builds the DynamoRIO native client against the Detcore runtime if needed.
 pub fn prepare_native_client() -> io::Result<(PathBuf, PathBuf)> {
     let runtime = runtime_library_path()?;
+    let source = reverie_dbi::native_client_source_dir();
+    let source_identity = source
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::file_name)
+        .unwrap_or_else(|| std::ffi::OsStr::new("source"));
     let directory = runtime
         .parent()
         .expect("runtime library path must have a parent")
-        .join("detcore-dbi-native");
+        .join(format!(
+            "detcore-dbi-native-{}",
+            source_identity.to_string_lossy()
+        ));
     fs::create_dir_all(&directory)?;
     let _build_lock = lock_native_client_build(&directory)?;
 
     let configure = Command::new("cmake")
         .arg("-S")
-        .arg(reverie_dbi::native_client_source_dir())
+        .arg(source)
         .arg("-B")
         .arg(&directory)
         .arg("-DCMAKE_BUILD_TYPE=Release")
@@ -230,6 +254,12 @@ pub fn prepare_native_client() -> io::Result<(PathBuf, PathBuf)> {
     Ok((reverie_dbi::bundled_drrun_path().to_path_buf(), client))
 }
 
+/// Begins a new DynamoRIO application image and returns its generation.
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_dbi_runtime_image_init() -> u64 {
+    IMAGE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
 /// Runs Detcore's async global scheduler on a DynamoRIO-managed client thread.
 ///
 /// The native client starts this entry point before registering guest events
@@ -240,29 +270,34 @@ pub fn prepare_native_client() -> io::Result<(PathBuf, PathBuf)> {
 /// `argument` must encode a valid `Emitter` callback pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_void) {
+    let image_generation = IMAGE_GENERATION.load(Ordering::SeqCst);
     let emit: Emitter = unsafe { std::mem::transmute(argument) };
     emit_marker(emit, b"detcore-dbi: background client thread entered\n");
-    emit_marker(emit, b"detcore-dbi: constructing Detcore Config\n");
-    let mut config = Config {
-        sequentialize_threads: true,
-        deterministic_io: true,
-        preemption_timeout: None,
-        ..Config::default()
-    };
-    config.validate();
+    let runtime = {
+        let mut slot = RUNTIME.write().expect("Detcore DBI runtime lock poisoned");
+        if slot.is_none() {
+            emit_marker(emit, b"detcore-dbi: constructing Detcore Config\n");
+            let mut config = Config {
+                sequentialize_threads: true,
+                deterministic_io: true,
+                preemption_timeout: None,
+                ..Config::default()
+            };
+            config.validate();
 
-    emit_marker(emit, b"detcore-dbi: initializing Detcore GlobalState\n");
-    let global = GlobalState::init_for_external_scheduler(&config);
-    emit_marker(emit, b"detcore-dbi: GlobalState initialized\n");
-    RUNTIME
-        .set(Runtime {
-            config,
-            global,
-            tool: OnceLock::new(),
-        })
-        .unwrap_or_else(|_| panic!("Detcore DBI runtime initialized twice"));
+            emit_marker(emit, b"detcore-dbi: initializing Detcore GlobalState\n");
+            let global = GlobalState::init_for_external_scheduler(&config);
+            emit_marker(emit, b"detcore-dbi: GlobalState initialized\n");
+            *slot = Some(Arc::new(Runtime {
+                config,
+                global,
+                tool: OnceLock::new(),
+            }));
+        }
+        Arc::clone(slot.as_ref().expect("Detcore DBI runtime was initialized"))
+    };
     emit_marker(emit, b"detcore-dbi: background scheduler ready\n");
-    let runtime = RUNTIME.get().expect("Detcore DBI runtime was initialized");
+    READY_IMAGE.store(image_generation, Ordering::SeqCst);
     let log_scheduler = info_logging_enabled();
     let observer = Arc::new(move |event: &'static str| {
         if log_scheduler {
@@ -274,10 +309,10 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
     emit_marker(emit, b"detcore-dbi: background scheduler completed\n");
 }
 
-/// Reports whether the Detcore global scheduler is ready for guest callbacks.
+/// Reports whether the Detcore global scheduler is ready for this image.
 #[unsafe(no_mangle)]
-pub extern "C" fn reverie_dbi_runtime_ready() -> i32 {
-    i32::from(RUNTIME.get().is_some())
+pub extern "C" fn reverie_dbi_runtime_ready(image_generation: u64) -> i32 {
+    i32::from(READY_IMAGE.load(Ordering::SeqCst) == image_generation)
 }
 
 /// Initializes native per-thread scratch state. Detcore state is initialized
@@ -316,10 +351,11 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_exit(scratch: *mut c_void) {
         tid,
         state,
         initialized,
+        ..
     } = *unsafe { Box::from_raw(scratch.runtime_state) };
     scratch.runtime_state = std::ptr::null_mut();
     if initialized {
-        let runtime = RUNTIME.get().expect("Detcore DBI runtime was initialized");
+        let runtime = current_runtime();
         let tool = runtime
             .tool
             .get()
@@ -335,6 +371,25 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_exit(scratch: *mut c_void) {
     }
 }
 
+/// Replaces terminal per-image state after the kernel rejects an exec.
+///
+/// # Safety
+///
+/// `scratch` must be the current thread's initialized native scratch pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbi_runtime_exec_failed(scratch: *mut c_void, _pid: i32) {
+    let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
+    assert!(
+        scratch.runtime_state.is_null(),
+        "failed exec scratch still owns Detcore state"
+    );
+    let previous = RUNTIME
+        .write()
+        .expect("Detcore DBI runtime lock poisoned")
+        .take();
+    assert!(previous.is_some(), "failed exec had no Detcore runtime");
+}
+
 /// Dispatches one DynamoRIO syscall event through the real Detcore Tool.
 ///
 /// # Safety
@@ -348,6 +403,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     scratch: *mut c_void,
     tid: i32,
     pid: i32,
+    _image_generation: u64,
     sysnum: i64,
     args: *const u64,
     branches: u64,
@@ -365,9 +421,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
     TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
     update_memory_hash(sysnum, raw_args, read_memory);
-    let runtime = RUNTIME
-        .get()
-        .expect("native client dispatched before Detcore runtime initialization");
+    let runtime = current_runtime();
     let tool = runtime
         .tool
         .get_or_init(|| Detcore::new(Pid::from_raw(pid), &runtime.config));
@@ -404,6 +458,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             tid,
             state,
             initialized: false,
+            post_exec_pending: true,
         }));
     }
     let thread = unsafe { &mut *scratch.runtime_state };
@@ -428,6 +483,9 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
             return 1;
         }
+        thread.initialized = true;
+    }
+    if thread.post_exec_pending {
         if first_event {
             let message = b"detcore-dbi: thread-start hook completed; running post-exec\n";
             unsafe { emit(message.as_ptr(), message.len()) };
@@ -452,13 +510,14 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             let message = b"detcore-dbi: post-exec hook completed\n";
             unsafe { emit(message.as_ptr(), message.len()) };
         }
-        thread.initialized = true;
+        thread.post_exec_pending = false;
     }
 
     if first_event {
         let message = b"detcore-dbi: dispatching first syscall through Detcore\n";
         unsafe { emit(message.as_ptr(), message.len()) };
     }
+    let is_exec = matches!(sysnum, libc::SYS_execve | libc::SYS_execveat);
     let outcome = reverie_dbi::run_tool_syscall(
         tool,
         context as usize,
@@ -478,7 +537,28 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
             1
         }
-        Ok(DbiSyscallOutcome::AllowOriginal) => 0,
+        Ok(DbiSyscallOutcome::AllowOriginal) => {
+            if is_exec {
+                let ThreadRuntime {
+                    tid,
+                    state,
+                    initialized,
+                    ..
+                } = *unsafe { Box::from_raw(scratch.runtime_state) };
+                scratch.runtime_state = std::ptr::null_mut();
+                if initialized {
+                    let _ = reverie_dbi::run_tool_thread_exit(
+                        tool,
+                        tid,
+                        state,
+                        &runtime.global,
+                        &runtime.config,
+                        ExitStatus::SUCCESS,
+                    );
+                }
+            }
+            0
+        }
         Err(error) => {
             unsafe { result.write(error_result(error)) };
             TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
