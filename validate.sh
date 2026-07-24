@@ -24,6 +24,7 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --envelope-compare FILE    # measure, then fail if any count
 #                                            # regressed below FILE's baseline
 #   ./validate.sh --strict-compat-only        # run the nonblocking L2 app matrix
+#   ./validate.sh --rr-compat-only            # gate the known-passing R/R matrix
 #   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
 #   ./validate.sh --verbose                  # stream each gate's command, PID,
 #                                            # elapsed time, and subprocess output
@@ -33,6 +34,7 @@ cd "$ROOT_DIR" || exit 1
 ENVELOPE_MODE="full"          # full | only
 ENVELOPE_BASELINE=""
 STRICT_COMPAT_ONLY=0
+RR_COMPAT_ONLY=0
 QEMU_L2_ONLY=0
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
@@ -47,6 +49,7 @@ while [[ $# -gt 0 ]]; do
             [[ -n $ENVELOPE_BASELINE ]] || { echo "validate.sh: --envelope-compare needs a FILE" >&2; exit 2; }
             shift 2 ;;
         --strict-compat-only) STRICT_COMPAT_ONLY=1; shift ;;
+        --rr-compat-only) RR_COMPAT_ONLY=1; shift ;;
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
@@ -62,9 +65,10 @@ done
 only_modes=0
 [[ $ENVELOPE_MODE == only ]] && ((only_modes += 1))
 ((STRICT_COMPAT_ONLY == 1)) && ((only_modes += 1))
+((RR_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((QEMU_L2_ONLY == 1)) && ((only_modes += 1))
 if ((only_modes > 1)); then
-    echo "validate.sh: choose only one of --envelope-only/--envelope-compare, --strict-compat-only, or --qemu-l2-only" >&2
+    echo "validate.sh: choose only one focused validation mode" >&2
     exit 2
 fi
 
@@ -95,7 +99,7 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
-readonly STRICT_COMPAT_ONLY QEMU_L2_ONLY
+readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY QEMU_L2_ONLY
 
 checks=0
 failures=0
@@ -143,6 +147,44 @@ readonly HERMIT_SMOKE_TIMEOUT="30s"
 readonly SMOKE_MARKER="hermit-validation-smoke"
 readonly STRICT_COMPAT_HERMIT_BIN="$ROOT_DIR/target/release/hermit"
 readonly STRICT_COMPAT_TIMEOUT=60
+RR_COMPAT_PHASE_TIMEOUT_SECONDS=${RR_COMPAT_PHASE_TIMEOUT_SECONDS:-60}
+if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
+    echo "validate.sh: RR_COMPAT_PHASE_TIMEOUT_SECONDS must be a positive integer" >&2
+    exit 2
+fi
+readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
+readonly RR_COMPAT_EXPECTED=99
+COMPATIBILITY_MODE=strict
+
+# Exact label ratchet measured at Hermit 349fc6d. Commands remain owned by the
+# strict corpus below; this set only selects the rows known to pass R/R.
+declare -Ar RR_COMPAT_PASSING_LABELS=(
+    [echo]=1 [seq]=1 [cat]=1 [wc]=1 [head]=1 [base64]=1 [id]=1
+    [lua]=1 [perl]=1 [awk]=1 [bc]=1 [sqlite3]=1 [bash]=1
+    [gcc]=1 [g++]=1 [make]=1 [bzip2]=1 [gzip]=1 [xz]=1 [zstd]=1
+    [openssl]=1 [sort]=1 [uniq]=1 [tr]=1 [cut]=1 [tee]=1
+    [paste]=1 [comm]=1 [join]=1 [find]=1 [stat]=1 [file]=1
+    [basename]=1 [dirname]=1 [env]=1 [printenv]=1 [uname]=1
+    [factor]=1 [expr]=1 [dd]=1 [df]=1 [du]=1 [hostname]=1
+    [whoami]=1 [groups]=1 [tty]=1 [nproc]=1 [arch]=1 [realpath]=1
+    [readlink]=1 [sha256sum]=1 [sha1sum]=1 [md5sum]=1 [wc-lines]=1
+    [nl]=1 [expand]=1 [unexpand]=1 [test]=1 [bracket]=1 [printf]=1
+    [sleep]=1 [stdbuf]=1 [nohup]=1 [nice]=1 [ionice]=1 [taskset]=1
+    [chrt]=1 [flock]=1 [logger]=1 [getopt]=1 [column]=1 [hexdump]=1
+    [xxd]=1 [strings]=1 [od]=1 [sum]=1 [cksum]=1 [b2sum]=1
+    [tsort]=1 [ptx]=1 [pinky]=1 [logname]=1 [users]=1 [uptime]=1
+    [grep]=1 [egrep]=1 [fgrep]=1 [sed]=1 [date]=1 [cal]=1 [yes]=1
+    [tac]=1 [rev]=1 [fold]=1 [fmt]=1 [shuf]=1 [numfmt]=1
+    [split]=1 [cmp]=1
+)
+if ((${#RR_COMPAT_PASSING_LABELS[@]} != RR_COMPAT_EXPECTED)); then
+    echo "validate.sh: R/R compatibility label set must contain exactly $RR_COMPAT_EXPECTED rows" >&2
+    exit 2
+fi
+RR_COMPAT_PASSED=0
+RR_COMPAT_FAILED=0
+RR_COMPAT_TOTAL=0
+RR_COMPAT_SKIPPED=0
 declare -ar HERMIT_RUN_ARGS=(
     run
     --base-env=minimal
@@ -505,12 +547,133 @@ function hermit_verify_smoke {
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#567): Review the blocking R/R compatibility ratchet.
+# Run one record or replay phase with a private process group so a regression
+# cannot leave tracees behind after the per-phase deadline.
+function run_rr_compatibility_phase {
+    local stdout_file=$1
+    local stderr_file=$2
+    shift 2
+
+    local started_at=$SECONDS
+    local pid
+    local status
+
+    setsid "$@" </dev/null >"$stdout_file" 2>"$stderr_file" &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if ((SECONDS - started_at >= RR_COMPAT_PHASE_TIMEOUT_SECONDS)); then
+            kill -TERM -- "-$pid" 2>/dev/null || true
+            if ((TIMEOUT_KILL_GRACE_SECONDS > 0)); then
+                sleep "$TIMEOUT_KILL_GRACE_SECONDS"
+            fi
+            kill -KILL -- "-$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 0.2
+    done
+
+    if wait "$pid"; then
+        status=0
+    else
+        status=$?
+    fi
+    return "$status"
+}
+
+function rr_compatibility_probe {
+    local label=$1
+    shift
+
+    if [[ -z ${RR_COMPAT_PASSING_LABELS[$label]+selected} ]]; then
+        RR_COMPAT_SKIPPED=$((RR_COMPAT_SKIPPED + 1))
+        return 0
+    fi
+
+    local case_dir="$VALIDATION_TMP_DIR/rr-$label"
+    local data_dir="$case_dir/recording"
+    local started_at=$SECONDS
+    local output_start
+    local record_status
+    local replay_status=125
+    local stdout_equal=no
+    local summary
+
+    RR_COMPAT_TOTAL=$((RR_COMPAT_TOTAL + 1))
+    mkdir -p "$case_dir"
+    {
+        printf "=== R/R compatibility: %s ===\n" "$label"
+        printf "Record:"
+        printf " %q" "$STRICT_COMPAT_HERMIT_BIN" record start --data-dir "$data_dir" -- "$@"
+        printf "\nReplay: %q replay --autopilot --data-dir %q\n" \
+            "$STRICT_COMPAT_HERMIT_BIN" "$data_dir"
+    } >>"$LOG_FILE"
+    output_start=$(($(wc -l <"$LOG_FILE") + 1))
+
+    if ((VERBOSE == 1)); then
+        printf "  R/R compatibility probe: %s\n" "$label"
+    fi
+
+    run_rr_compatibility_phase "$case_dir/record.stdout" "$case_dir/record.stderr" \
+        "$STRICT_COMPAT_HERMIT_BIN" record start --data-dir "$data_dir" -- "$@"
+    record_status=$?
+    if ((record_status == 0)); then
+        run_rr_compatibility_phase "$case_dir/replay.stdout" "$case_dir/replay.stderr" \
+            "$STRICT_COMPAT_HERMIT_BIN" replay --autopilot --data-dir "$data_dir"
+        replay_status=$?
+        if cmp -s "$case_dir/record.stdout" "$case_dir/replay.stdout"; then
+            stdout_equal=yes
+        else
+            diff -u "$case_dir/record.stdout" "$case_dir/replay.stdout" \
+                >"$case_dir/stdout.diff" || true
+        fi
+    fi
+
+    if ((record_status == 0 && replay_status == 0)) && [[ $stdout_equal == yes ]]; then
+        RR_COMPAT_PASSED=$((RR_COMPAT_PASSED + 1))
+        printf "  ✅ %-12s PASS R/R (%ss)\n" "$label" "$((SECONDS - started_at))"
+        printf "Record exit: 0\nReplay exit: 0\nStdout equal: yes\n\n" >>"$LOG_FILE"
+        rm -rf "$case_dir"
+        return 0
+    fi
+
+    RR_COMPAT_FAILED=$((RR_COMPAT_FAILED + 1))
+    {
+        printf "Record exit: %s\nReplay exit: %s\nStdout equal: %s\n" \
+            "$record_status" "$replay_status" "$stdout_equal"
+        if [[ -s $case_dir/record.stderr ]]; then
+            printf '%s\n' "--- record stderr ---"
+            tail -n 120 "$case_dir/record.stderr"
+        fi
+        if [[ -s $case_dir/replay.stderr ]]; then
+            printf '%s\n' "--- replay stderr ---"
+            tail -n 120 "$case_dir/replay.stderr"
+        fi
+        if [[ -s $case_dir/stdout.diff ]]; then
+            printf '%s\n' "--- stdout diff ---"
+            sed -n '1,120p' "$case_dir/stdout.diff"
+        fi
+        printf "\n"
+    } >>"$LOG_FILE"
+    summary=$(failure_summary "$output_start")
+    printf "  ❌ %-12s FAIL R/R (record %s, replay %s, stdout %s: %s)\n" \
+        "$label" "$record_status" "$replay_status" "$stdout_equal" "$summary"
+    return 0
+}
+
+# AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(#521): Review the initial nonblocking compatibility policy.
 # Run one known-compatible application at L2. Each row has its own hard timeout
 # so a regression cannot stall the rest of the matrix.
 function strict_compatibility_probe {
     local label=$1
     shift
+
+    if [[ $COMPATIBILITY_MODE == rr ]]; then
+        rr_compatibility_probe "$label" "$@"
+        return 0
+    fi
 
     local started_at=$SECONDS
     local output_start
@@ -552,13 +715,18 @@ function strict_compatibility_probe {
 # but does not add it to the fatal failure count. --strict-compat-only exposes
 # the real aggregate status so CI can mark the step while continue-on-error
 # keeps the lane nonblocking until the matrix is ratcheted.
-function run_strict_compatibility_envelope {
+function run_compatibility_corpus {
     local passed=0
     local failed=0
     local total=0
 
-    printf "\n== Strict compatibility envelope (L2, nonblocking) ==\n"
-    printf "=== Strict compatibility envelope (L2, nonblocking) ===\n" >>"$LOG_FILE"
+    if [[ $COMPATIBILITY_MODE == rr ]]; then
+        printf "\n== Record/replay compatibility baseline (blocking gate) ==\n"
+        printf "=== Record/replay compatibility baseline (blocking gate) ===\n" >>"$LOG_FILE"
+    else
+        printf "\n== Strict compatibility envelope (L2, nonblocking) ==\n"
+        printf "=== Strict compatibility envelope (L2, nonblocking) ===\n" >>"$LOG_FILE"
+    fi
 
     strict_compatibility_probe echo /bin/echo hermit-compat \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -878,6 +1046,23 @@ function run_strict_compatibility_envelope {
     # free is intentionally absent: its live /proc/meminfo values differ
     # between otherwise identical strict runs.
 
+    if [[ $COMPATIBILITY_MODE == rr ]]; then
+        if ((RR_COMPAT_TOTAL != RR_COMPAT_EXPECTED)); then
+            printf "❌ Record/replay compatibility baseline selected %s rows; expected %s (%s skipped)\n" \
+                "$RR_COMPAT_TOTAL" "$RR_COMPAT_EXPECTED" "$RR_COMPAT_SKIPPED"
+            return 1
+        fi
+        if ((RR_COMPAT_FAILED == 0)); then
+            printf "✅ Record/replay compatibility baseline (%s/%s passed R/R; %s unselected)\n" \
+                "$RR_COMPAT_PASSED" "$RR_COMPAT_TOTAL" "$RR_COMPAT_SKIPPED"
+            return 0
+        fi
+        printf "❌ Record/replay compatibility baseline (%s/%s passed R/R, %s regressed; %s unselected)\n" \
+            "$RR_COMPAT_PASSED" "$RR_COMPAT_TOTAL" "$RR_COMPAT_FAILED" \
+            "$RR_COMPAT_SKIPPED"
+        return 1
+    fi
+
     total=$((passed + failed))
     if ((failed == 0)); then
         printf "✅ Strict compatibility envelope (%s/%s passed L2)\n" "$passed" "$total"
@@ -887,6 +1072,24 @@ function run_strict_compatibility_envelope {
     printf "❌ Strict compatibility envelope (%s/%s passed L2, %s regressed; nonblocking)\n" \
         "$passed" "$total" "$failed"
     return 1
+}
+
+function run_strict_compatibility_envelope {
+    COMPATIBILITY_MODE=strict
+    run_compatibility_corpus
+}
+
+function run_rr_compatibility_envelope {
+    local status=0
+
+    RR_COMPAT_PASSED=0
+    RR_COMPAT_FAILED=0
+    RR_COMPAT_TOTAL=0
+    RR_COMPAT_SKIPPED=0
+    COMPATIBILITY_MODE=rr
+    run_compatibility_corpus || status=$?
+    COMPATIBILITY_MODE=strict
+    return "$status"
 }
 
 # Run one probe at one assurance level. $1 = extra run flags (space-split on
@@ -1078,6 +1281,18 @@ if ((STRICT_COMPAT_ONLY == 1)); then
     exit $?
 fi
 
+if ((RR_COMPAT_ONLY == 1)); then
+    run_check "Build release Hermit for record/replay compatibility" \
+        cargo build --release -p hermit
+    if ((failures == 0)); then
+        run_check "Record/replay compatibility baseline (99 programs)" \
+            run_rr_compatibility_envelope
+    fi
+    print_summary
+    ((failures == 0))
+    exit $?
+fi
+
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(#553)
 if ((QEMU_L2_ONLY == 1)); then
@@ -1123,6 +1338,8 @@ run_check "Hermit verify-mode smoke test" hermit_verify_smoke
 if ! run_strict_compatibility_envelope; then
     printf "⚠️  Strict compatibility regressions are informational and do not fail full validation yet.\n"
 fi
+run_check "Record/replay compatibility baseline (99 programs)" \
+    run_rr_compatibility_envelope
 # Nextest runs most package unit and Cargo integration targets in parallel.
 # Detcore's PMU tests depend on same-binary coordination; nextest would launch
 # them as separate processes. Keep detcore and rustdoc tests as Cargo phases.
