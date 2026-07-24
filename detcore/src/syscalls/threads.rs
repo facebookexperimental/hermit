@@ -647,6 +647,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// wait4 system call
     /// This is handled by the scheduler and not passed to the record/replay layer.
+    // TODO-HUMAN-REVIEW(PR-587): Confirm wait4 rusage canonicalization boundaries.
     pub async fn handle_wait4<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -657,19 +658,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("wait4");
 
-        let opts1 = call.options();
-        if opts1.contains(WaitPidFlag::WNOHANG) {
+        let value = if call.options().contains(WaitPidFlag::WNOHANG) {
             resource_request(guest, rsrc.clone()).await;
             info!(
                 "[dtid {}] Executing non-blocking wait4 in one shot.",
                 dettid
             );
-            Ok(guest.inject_with_retry(call).await?)
+            guest.inject_with_retry(call).await?
         } else {
             // wait4 is a scheduler poll, not a record/replay data read (see doc above),
             // so it is not routed through the record/replay subtool.
-            retry_nonblocking_syscall(guest, call, rsrc, None).await
+            retry_nonblocking_syscall(guest, call, rsrc, None).await?
+        };
+        if value > 0
+            && let Some(rusage) = call.rusage()
+        {
+            // Host CPU and scheduling counters are not deterministic.
+            let usage: libc::rusage = unsafe { std::mem::zeroed() };
+            guest.memory().write_value(rusage, &usage)?;
         }
+        Ok(value)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
