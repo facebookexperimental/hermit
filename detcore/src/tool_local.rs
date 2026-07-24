@@ -48,7 +48,6 @@ use crate::resources::Resources;
 use crate::scheduler::Priority;
 use crate::stat::*;
 use crate::types::*;
-use crate::util::rcbs_to_duration;
 
 /// The detcore tool and its per-process state.
 #[derive(Debug, Serialize, Deserialize)]
@@ -777,7 +776,7 @@ impl ThreadStats {
 
     /// Reset counters for a new timeslice.
     /// Increases the count of completed timeslices.
-    fn reset_timeslice(&mut self) {
+    pub(crate) fn reset_timeslice(&mut self) {
         self.timeslice_syscall_count = 0;
         self.timeslice_signal_count = 0;
         self.timeslice_count += 1;
@@ -883,10 +882,18 @@ pub struct ThreadState<T> {
     /// not a relative duration.
     pub end_of_timeslice: Option<LogicalTime>,
 
+    /// Absolute deadline enforced by the PMU-backed `--max-timeslice` timer. This is separate from
+    /// `end_of_timeslice` so syscall-heavy workloads can use a shorter, cheap target deadline.
+    pub max_timeslice_end: Option<LogicalTime>,
+
     /// Track what our last timer was set for, just to double check that RCB timers are behaving
     /// as expected and see if we went over.  (For exmaple, this behaves badly if threads are not
     /// pinned and our we migrate between cores.)
     pub last_rcb_timer: Option<u64>,
+
+    /// Whether `last_rcb_timer` represents the maximum deadline rather than a manual interrupt.
+    #[serde(default)]
+    pub last_rcb_timer_is_max: bool,
 
     /// Are we past the global moment when the guest's first execve of its root binary completes
     /// (with a successful exit code).
@@ -912,7 +919,9 @@ impl<T> std::fmt::Debug for ThreadState<T> {
             .field("thread_logical_time", &self.thread_logical_time)
             .field("committed_clock_value", &self.committed_clock_value)
             .field("end_of_timeslice", &self.end_of_timeslice)
+            .field("max_timeslice_end", &self.max_timeslice_end)
             .field("last_rcb_timer", &self.last_rcb_timer)
+            .field("last_rcb_timer_is_max", &self.last_rcb_timer_is_max)
             .finish()
     }
 }
@@ -987,7 +996,9 @@ impl<T> ThreadState<T> {
             thread_logical_time: DetTime::new(cfg),
             committed_clock_value: 0,
             end_of_timeslice: None, // Temporary/bogus.
+            max_timeslice_end: None,
             last_rcb_timer: None,
+            last_rcb_timer_is_max: false,
             record_or_replay,
             preemption_points: None,
             past_global_first_execve: false,
@@ -1129,19 +1140,30 @@ impl<T> ThreadState<T> {
         &mut self.prng
     }
 
-    /// Choose an amount of time (RCBs) for our next timeslice based on various settings.
+    /// Whether this thread has consumed its current logical timeslice.
+    pub(crate) fn timeslice_expired(&self) -> bool {
+        let current_time = self.thread_logical_time.as_nanos();
+        self.end_of_timeslice
+            .is_some_and(|end_of_timeslice| current_time >= end_of_timeslice)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    /// Choose the logical target and PMU maximum deadlines for the next timeslice.
     ///
     /// Effects:
     /// - Sets `end_of_timeslice` for the new timeslice.
+    /// - Sets `max_timeslice_end` when PMU-backed preemption is enabled.
     /// - Resets the statistics for the timeslice.
     ///
     /// Returns: an optional new priority.
     pub fn next_timeslice(&mut self, cfg: &Config) -> Option<Priority> {
-        // If the preemption feature is disabled, this fizzles:
-        if let Some(timeout_ns) = cfg.preemption_timeout {
+        let logical_timeslice = cfg.target_timeslice.or(cfg.max_timeslice);
+        if let Some(timeout_ns) = logical_timeslice {
             let current_ns = self.thread_logical_time.as_nanos();
 
             let mut result = None;
+            let replay_controls_deadline =
+                self.preemption_points.is_some() || cfg.replay_schedule_from.is_some();
 
             // Preemption-point replay from recorded --chaos configuration.
             if let Some(thi) = &mut self.preemption_points {
@@ -1188,14 +1210,22 @@ impl<T> ThreadState<T> {
                 }
             } else if !cfg.chaos {
                 if cfg.replay_schedule_from.is_some() {
-                    // This will be over written based on Branch count replayed IF needed.
-                    debug!(
-                        "[dtid {}] next timeslice (T{}), in replay mode setting timeslice to max (current time {})",
-                        self.dettid,
-                        self.stats.timeslice_count + 1,
-                        current_ns
-                    );
-                    self.end_of_timeslice = Some(LogicalTime::MAX);
+                    if cfg.no_rcb_time {
+                        let max_timeslice = cfg
+                            .max_timeslice
+                            .expect("schedule replay with PMU requires a maximum");
+                        self.end_of_timeslice =
+                            Some(current_ns + Duration::from_nanos(u64::from(max_timeslice)));
+                    } else {
+                        // Branch-event replay will overwrite this deadline when needed.
+                        debug!(
+                            "[dtid {}] next timeslice (T{}), in replay mode setting timeslice to max (current time {})",
+                            self.dettid,
+                            self.stats.timeslice_count + 1,
+                            current_ns
+                        );
+                        self.end_of_timeslice = Some(LogicalTime::MAX);
+                    }
                 } else {
                     // In non-chaos mode, we only care about preemption for breaking busy-waits,
                     // and we can safely reset the clock every time we get control back from the
@@ -1211,7 +1241,8 @@ impl<T> ThreadState<T> {
                     );
                 }
             } else {
-                let target_timeout_rcbs = u64::from(timeout_ns) as f64 / NANOS_PER_RCB;
+                let nanos_per_rcb = NANOS_PER_RCB * cfg.clock_multiplier.unwrap_or(1.0);
+                let target_timeout_rcbs = u64::from(timeout_ns) as f64 / nanos_per_rcb;
                 let next_rcbs: u64 = if cfg.chaos {
                     // Average frequency of preemptions per nanosecond:
                     let lambda = 1.0 / target_timeout_rcbs;
@@ -1225,7 +1256,10 @@ impl<T> ThreadState<T> {
                 };
                 assert!(next_rcbs > 0);
                 self.last_rcb_timer = None;
-                self.end_of_timeslice = Some(current_ns + rcbs_to_duration(next_rcbs));
+                self.end_of_timeslice = Some(
+                    current_ns
+                        + Duration::from_nanos((next_rcbs as f64 * nanos_per_rcb).ceil() as u64),
+                );
                 debug!(
                     "[dtid {}] next timeslice (T{}) chosen as {} rcbs, end of slice = {} (current {})",
                     self.dettid,
@@ -1235,9 +1269,43 @@ impl<T> ThreadState<T> {
                     current_ns
                 );
             }
+
+            let configured_max_end = cfg
+                .max_timeslice
+                .map(|max_timeslice| current_ns + Duration::from_nanos(u64::from(max_timeslice)));
+            self.max_timeslice_end = if replay_controls_deadline {
+                if cfg.max_timeslice.is_some() {
+                    self.end_of_timeslice
+                } else {
+                    None
+                }
+            } else if cfg.target_timeslice.is_none() {
+                match (self.end_of_timeslice, configured_max_end) {
+                    (Some(logical_end), Some(configured_end)) => {
+                        Some(logical_end.min(configured_end))
+                    }
+                    (_, configured_end) => configured_end,
+                }
+            } else {
+                configured_max_end
+            };
+
+            if let (Some(target_end), Some(max_end)) =
+                (self.end_of_timeslice, self.max_timeslice_end)
+                && target_end > max_end
+            {
+                self.end_of_timeslice = Some(max_end);
+            }
+
+            self.last_rcb_timer = None;
+            self.last_rcb_timer_is_max = false;
             self.reset_timeslice_stats(current_ns);
             result
         } else {
+            self.end_of_timeslice = None;
+            self.max_timeslice_end = None;
+            self.last_rcb_timer = None;
+            self.last_rcb_timer_is_max = false;
             None
         }
     }
@@ -1269,6 +1337,126 @@ impl<T> ThreadState<T> {
     /// guarantee determinism!
     pub fn guest_past_first_execve(&self) -> bool {
         self.past_global_first_execve
+    }
+}
+
+#[cfg(test)]
+mod timeslice_tests {
+    use std::num::NonZeroU64;
+
+    use super::*;
+
+    fn nz(value: u64) -> Option<NonZeroU64> {
+        NonZeroU64::new(value)
+    }
+
+    #[test]
+    fn target_and_pmu_deadlines_are_independent() {
+        let config = Config {
+            target_timeslice: nz(20_000),
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let now = state.thread_logical_time.as_nanos();
+
+        state.next_timeslice(&config);
+
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(now + Duration::from_nanos(20_000))
+        );
+        assert_eq!(
+            state.max_timeslice_end,
+            Some(now + Duration::from_nanos(100_000))
+        );
+    }
+
+    #[test]
+    fn target_only_mode_does_not_create_a_pmu_deadline() {
+        let config = Config {
+            target_timeslice: nz(20_000),
+            max_timeslice: None,
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let now = state.thread_logical_time.as_nanos();
+
+        state.next_timeslice(&config);
+
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(now + Duration::from_nanos(20_000))
+        );
+        assert_eq!(state.max_timeslice_end, None);
+    }
+
+    #[test]
+    fn max_timeslice_caps_a_larger_target() {
+        let config = Config {
+            target_timeslice: nz(100_000),
+            max_timeslice: nz(20_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let now = state.thread_logical_time.as_nanos();
+
+        state.next_timeslice(&config);
+
+        let max_end = now + Duration::from_nanos(20_000);
+        assert_eq!(state.end_of_timeslice, Some(max_end));
+        assert_eq!(state.max_timeslice_end, Some(max_end));
+    }
+
+    #[test]
+    fn chaos_without_target_caps_randomized_deadline_at_maximum() {
+        let config = Config {
+            chaos: true,
+            target_timeslice: None,
+            max_timeslice: nz(100_000),
+            clock_multiplier: Some(1.05),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let now = state.thread_logical_time.as_nanos();
+        let configured_max = now + Duration::from_nanos(100_000);
+        let minimum_progress = now + Duration::from_nanos(11);
+
+        state.next_timeslice(&config);
+
+        assert_eq!(state.max_timeslice_end, state.end_of_timeslice);
+        assert!(state.max_timeslice_end.unwrap() <= configured_max);
+        assert!(state.max_timeslice_end.unwrap() >= minimum_progress);
+    }
+
+    #[test]
+    fn schedule_replay_without_rcb_time_arms_pmu_maximum() {
+        let config = Config {
+            no_rcb_time: true,
+            max_timeslice: nz(100_000),
+            replay_schedule_from: Some(std::path::PathBuf::from("schedule.json")),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let now = state.thread_logical_time.as_nanos();
+
+        state.next_timeslice(&config);
+
+        let expected = now + Duration::from_nanos(100_000);
+        assert_eq!(state.end_of_timeslice, Some(expected));
+        assert_eq!(state.max_timeslice_end, Some(expected));
+    }
+
+    #[test]
+    fn timeslice_expiry_is_inclusive() {
+        let config = Config::default();
+        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let now = state.thread_logical_time.as_nanos();
+
+        state.end_of_timeslice = Some(now + Duration::from_nanos(1));
+        assert!(!state.timeslice_expired());
+        state.end_of_timeslice = Some(now);
+        assert!(state.timeslice_expired());
     }
 }
 

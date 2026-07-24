@@ -182,10 +182,16 @@ The seed options have distinct roles:
 - `--seed-from=Args` derives a stable seed from the guest command and arguments.
 
 Chaos scheduling is most effective when hardware performance counters are
-available. `--preemption-timeout=N` controls the longest uninterrupted virtual
+available. `--max-timeslice=N` controls the longest uninterrupted virtual
 time slice. Smaller values create more scheduling opportunities at additional
-runtime cost. `--preemption-timeout=disabled` avoids PMU use but can miss bugs
-in CPU-bound code that rarely makes system calls.
+runtime cost; positive values must be at least one RCB, which is 10 virtual
+nanoseconds at the default clock multiplier and scales with that multiplier.
+`--target-timeslice=N` adds a cheaper logical deadline checked at syscall
+boundaries; it is useful for workloads that enter the kernel frequently.
+`--max-timeslice=disabled` avoids PMU use but can miss bugs in
+CPU-bound code that rarely makes system calls. The old
+`--preemption-timeout` spelling is a deprecated alias for
+`--max-timeslice`.
 
 Advanced investigations can save preemption decisions with
 `--record-preemptions-to=FILE` and replay them with
@@ -307,8 +313,10 @@ reproducible target condition.
 | `--no-deterministic-io` | Disables Hermit's deterministic short-I/O completion behavior. |
 | `--chaos` | Uses seeded randomized deterministic scheduling. |
 | `--sched-seed=N` | Selects a reproducible chaos schedule. |
-| `--preemption-timeout=N` | Sets the maximum virtual time slice and requires PMU support. |
-| `--preemption-timeout=disabled` | Disables PMU timer preemption. |
+| `--target-timeslice=N` | Ends a logical turn at the first syscall boundary after N virtual nanoseconds. |
+| `--max-timeslice=N` | Sets the maximum virtual time slice (minimum one scaled RCB) and requires PMU support. |
+| `--max-timeslice=disabled` | Disables PMU timer preemption. |
+| `--preemption-timeout=N` | Deprecated alias for `--max-timeslice=N`. |
 
 `--no-sequentialize-threads` is useful for compatibility experiments and
 workloads such as virtual machines that need real host parallelism. It removes
@@ -330,7 +338,7 @@ all user-space locking policies are writer-fair. Blocked threads are absent from
 the run queue, higher priorities run first, polling operations use deterministic
 backoff, and external I/O completion can add delay. Hermit does not change a
 standard library's reader/writer-lock preference policy. PMU preemption bounds a CPU-only
-time slice; with `--preemption-timeout=disabled`, a thread that never reaches an
+time slice; with `--max-timeslice=disabled`, a thread that never reaches an
 intercepted event can starve its peers. No separate fairness flag is needed for
 the default equal-priority policy.
 
@@ -460,7 +468,7 @@ cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || true
 
 ### Performance Counters Are Unavailable
 
-Hermit prints a warning and continues with `--preemption-timeout=disabled`
+Hermit prints a warning and continues with `--max-timeslice=disabled`
 when `perf_event_open` is unavailable. Check:
 
 ```bash
@@ -469,7 +477,7 @@ cat /proc/sys/kernel/perf_event_paranoid
 
 The host setting, VM PMU exposure, and container seccomp policy can all block
 performance counters. Enable them when precise scheduling preemption matters.
-Otherwise pass `--preemption-timeout=disabled` explicitly and understand that
+Otherwise pass `--max-timeslice=disabled` explicitly and understand that
 CPU-bound threads may run until another intercepted event.
 
 ### Unsupported System Calls

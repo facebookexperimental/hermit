@@ -415,7 +415,7 @@ initramfs (`rdinit=/init`).
 
 | Mode | Command flags | Result |
 |---|---|---|
-| **Relaxed (working)** | `--no-sequentialize-threads --preemption-timeout disabled --no-virtualize-cpuid` + QEMU `-accel tcg,thread=single -smp 1 -icount shift=0,sleep=off` | **BOOTS TO USERSPACE** — kernel comes up (e820/ACPI/`smpboot CPU0`/clocksource tsc/btrfs/ima) → `Run /init` → busybox shell; `exit 0` with an auto-`poweroff` init |
+| **Relaxed (working)** | `--no-sequentialize-threads --max-timeslice disabled --no-virtualize-cpuid` + QEMU `-accel tcg,thread=single -smp 1 -icount shift=0,sleep=off` | **BOOTS TO USERSPACE** — kernel comes up (e820/ACPI/`smpboot CPU0`/clocksource tsc/btrfs/ima) → `Run /init` → busybox shell; `exit 0` with an auto-`poweroff` init |
 | Relaxed, **repeated ×2** | same, `hermit_autotest` on cmdline (auto-poweroff) | **BYTE-IDENTICAL** — two independent boots produced identical 22908-byte serial logs, `sha256 564e1ba4…` (kernel printk timestamps included). Determinism confirmed by direct 2-run comparison |
 | `--strict` / `--strict --verify` | strict re-enables sequentialize-threads + PMU-preemption single-stepping + cpuid virtualization | **DOES NOT COMPLETE** — QEMU launches but the guest kernel emits **zero** serial output within 240s (no `[0.000000] Linux version`); timeout SIGKILL. Not a crash/syscall gap — precise-preemption single-stepping is catastrophically slow for a CPU-bound emulator |
 
@@ -423,7 +423,7 @@ Notes:
 - Determinism here is established by a **manual two-run byte comparison**, not by `--strict
   --verify` (which cannot complete in-window). The relaxations are documented **requirements**,
   not conveniences — see [`docs/QEMU_BOOT.md`](docs/QEMU_BOOT.md): `--no-sequentialize-threads`
-  (QEMU needs concurrent host threads), `--preemption-timeout disabled` (no PMU single-step),
+  (QEMU needs concurrent host threads), `--max-timeslice disabled` (no PMU single-step),
   `--no-virtualize-cpuid` (CPUID faulting on this host), `-icount shift=0,sleep=off` (single
   instruction-derived guest clock; the alternative is Hermit-side `--no-virtualize-time
   --no-virtualize-metadata`).

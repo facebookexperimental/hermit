@@ -30,7 +30,7 @@
 //!
 //! This file also covers the Go runtime and the JVM. The results below were
 //! measured with the ptrace backend, `--log=off`, and relaxations
-//! `--no-virtualize-cpuid --preemption-timeout=disabled` (which keep strict
+//! `--no-virtualize-cpuid --max-timeslice=disabled` (which keep strict
 //! determinism; they only accommodate hosts without CPUID/PMU interception),
 //! using Go 1.26.4 (Red Hat 1.26.4-1.el9) and OpenJDK 1.8.0_492.
 //!
@@ -119,7 +119,7 @@ fn assert_l2_under_strict_verify(program: &Path, args: &[&str]) {
             // keep the test usable on VMs without CPUID interception without
             // weakening determinism (they do not disable strict mode).
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "--",
         ])
         .arg(program)
@@ -335,7 +335,7 @@ fn run_once_under_strict(program: &Path, args: &[&str]) -> Output {
             "run",
             "--strict",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "--",
         ])
         .arg(program)

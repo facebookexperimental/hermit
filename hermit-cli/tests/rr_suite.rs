@@ -24,7 +24,7 @@
 //! and runs it as:
 //!
 //! ```text
-//! hermit run --base-env=minimal --preemption-timeout=80000000 -- <program> [args]
+//! hermit run --base-env=minimal --max-timeslice=80000000 -- <program> [args]
 //! ```
 //!
 //! The programs are ptrace-heavy and rely on PMU branch counters plus working
@@ -197,7 +197,7 @@ fn run_rr_test(basename: &str, expected_exit: i32, args: &[&str], success_marker
         .args([
             "run",
             "--base-env=minimal",
-            "--preemption-timeout=80000000",
+            "--max-timeslice=80000000",
             "--",
         ])
         .arg(&binary)

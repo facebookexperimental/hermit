@@ -152,7 +152,7 @@ cc -std=c11 -O2 -pthread tests/chaos/order_violation.c \
   -o target/chaos-demo/order-violation
 
 for run in 1 2; do
-  target/release/hermit run --preemption-timeout=disabled -- \
+  target/release/hermit run --max-timeslice=disabled -- \
     ./target/chaos-demo/order-violation
 done
 ```
@@ -163,7 +163,7 @@ schedules; this bounded search reports the guest status for each seed:
 ```bash
 for seed in {0..15}; do
   target/release/hermit run --chaos --sched-heuristic=random \
-    --preemption-timeout=disabled --seed="$seed" -- \
+    --max-timeslice=disabled --seed="$seed" -- \
     ./target/chaos-demo/order-violation
   printf 'seed=%s status=%s\n' "$seed" "$?"
 done
@@ -175,7 +175,7 @@ reproduces the same failure:
 
 ```bash
 target/release/hermit run --chaos --sched-heuristic=random \
-  --preemption-timeout=disabled --seed=9 -- \
+  --max-timeslice=disabled --seed=9 -- \
   ./target/chaos-demo/order-violation
 ```
 

@@ -82,7 +82,7 @@ fn run_clock_matrix(iteration: usize) -> Vec<u8> {
         "run",
         "--base-env=minimal",
         "--no-virtualize-cpuid",
-        "--preemption-timeout=disabled",
+        "--max-timeslice=disabled",
         "--",
     ]);
     command.arg(clock_guest());

@@ -168,14 +168,14 @@ Match observed output to a cause before filing a bug. Exact strings live in
 
 ### Missing or blocked PMU / perf permissions
 
-- `--preemption-timeout requires user-space perf counters ... continuing with timer preemption disabled`
-- `perf_event_open is unavailable; continuing with --preemption-timeout=disabled. Check the host perf_event_paranoid value ...` (`hermit-cli/src/bin/hermit/run.rs`)
+- `--max-timeslice requires user-space perf counters ... continuing with timer preemption disabled`
+- `perf_event_open is unavailable; continuing with --max-timeslice=disabled. Check the host perf_event_paranoid value ...` (`hermit-cli/src/bin/hermit/run.rs`)
 - `Hardware perf counters are not supported on this machine. Records/Replays may randomly fail`
 - Guest **hangs after a PMU warning**: timer preemption is disabled and a
   CPU-bound thread reaches no scheduling event.
 
 **Action:** lower `/proc/sys/kernel/perf_event_paranoid`, grant PMU access, or
-accept `--preemption-timeout=disabled` (weaker scheduling fidelity). This is an
+accept `--max-timeslice=disabled` (weaker scheduling fidelity). This is an
 **environment** condition, not a Hermit bug.
 
 ### Unsupported / unrecognized CPU model

@@ -26,7 +26,7 @@ fn read_procfs(path: &str) -> Vec<u8> {
         "run",
         "--base-env=minimal",
         "--no-virtualize-cpuid",
-        "--preemption-timeout=disabled",
+        "--max-timeslice=disabled",
         "--",
         "/bin/cat",
         path,

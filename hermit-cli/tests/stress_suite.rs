@@ -183,7 +183,7 @@ fn stress_command(category: &str, threads: usize, seed: u64) -> Command {
             "--base-env=minimal",
             "--chaos",
             "--sched-heuristic=random",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "--no-virtualize-cpuid",
         ])
         .arg(format!("--seed={seed}"))
@@ -198,7 +198,7 @@ fn chaos_demo_command(seed: Option<u64>) -> Command {
     command.args([
         "run",
         "--base-env=minimal",
-        "--preemption-timeout=disabled",
+        "--max-timeslice=disabled",
         "--no-virtualize-cpuid",
     ]);
     if let Some(seed) = seed {
@@ -217,7 +217,7 @@ fn chaos_demo_command_targeted(seed: u64, targeted: bool) -> Command {
     command.args([
         "run",
         "--base-env=minimal",
-        "--preemption-timeout=disabled",
+        "--max-timeslice=disabled",
         "--no-virtualize-cpuid",
         "--chaos",
         "--sched-heuristic=random",
@@ -431,7 +431,7 @@ fn publish_ordering_schedule_command(seed: u64, schedule: &Path) -> Command {
             "--base-env=minimal",
             "--chaos",
             "--sched-heuristic=random",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "--no-virtualize-cpuid",
         ])
         .arg(format!("--seed={seed}"))
@@ -479,7 +479,7 @@ fn schedule_bisect_localizes_publish_ordering_race() {
         .arg("--")
         .args([
             "--base-env=minimal",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "--no-virtualize-cpuid",
         ])
         .arg(&stress_binaries().concurrency)
@@ -519,7 +519,7 @@ fn cas_search_command(seed: u64, schedule: &Path) -> Command {
             "--base-env=minimal",
             "--chaos",
             "--imprecise-timers",
-            "--preemption-timeout=10000000",
+            "--max-timeslice=10000000",
             "--no-virtualize-cpuid",
         ])
         .arg(format!("--seed={seed}"))
@@ -535,7 +535,7 @@ fn cas_replay_command(seed: u64, schedule: &Path) -> Command {
             "run",
             "--base-env=minimal",
             "--chaos",
-            "--preemption-timeout=10000000",
+            "--max-timeslice=10000000",
             "--no-virtualize-cpuid",
         ])
         .arg(format!("--seed={seed}"))

@@ -38,7 +38,7 @@ fn run_guest(guest: &Path, seed: u64) -> Vec<u8> {
             "run",
             "--base-env=minimal",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
         ])
         .arg(format!("--rng-seed={seed}"))
         .arg(guest)

@@ -51,7 +51,7 @@ runs exit zero with 17 expected skips and byte-identical stdout and stderr.
 
 Each Hermit execution is bounded to 120 seconds, followed by a 10-second kill
 grace period. Hermit uses `--no-virtualize-cpuid` and
-`--preemption-timeout=disabled` for this host-compatible validation. Strict
+`--max-timeslice=disabled` for this host-compatible validation. Strict
 thread serialization and deterministic I/O remain enabled.
 
 ## Reproduce

@@ -90,7 +90,7 @@ fn run_under_hermit_strict() -> Output {
         // Match the other strict e2e tests: these relaxations keep the test
         // usable on VMs without CPUID interception without weakening strict mode.
         "--no-virtualize-cpuid",
-        "--preemption-timeout=disabled",
+        "--max-timeslice=disabled",
         "--base-env=minimal",
         "--",
     ]);

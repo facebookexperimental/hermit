@@ -13,7 +13,7 @@ const MAX_ATTEMPTS: usize = 100_000;
 fn run_five_times(guest: fn()) {
     let config = Config {
         sequentialize_threads: true,
-        preemption_timeout: None,
+        max_timeslice: None,
         ..Default::default()
     };
     let mut expected = None;

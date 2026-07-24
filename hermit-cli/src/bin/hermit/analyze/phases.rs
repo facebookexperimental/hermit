@@ -737,7 +737,7 @@ impl AnalyzeOpts {
             let dummy = RunData::new_baseline(self, "dummy".to_string())?;
             if !dummy.runopts.det_opts.det_config.chaos {
                 eprintln!(
-                    ":: {} You may want to turn it on explicitly, along with a --preemption-timeout that works well for this program.",
+                    ":: {} You may want to turn it on explicitly, along with a --max-timeslice that works well for this program.",
                     "WARNING: implicitly activating --chaos.".yellow().bold()
                 );
             }

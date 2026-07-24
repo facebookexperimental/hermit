@@ -993,7 +993,7 @@ mod tests {
 
         // Minimal deterministic Detcore config with RCB preemption disabled.
         let mut config =
-            super::DetConfig::parse_from(["hermit-kvm-test", "--preemption-timeout=disabled"]);
+            super::DetConfig::parse_from(["hermit-kvm-test", "--max-timeslice=disabled"]);
         config.validate();
 
         let runtime = tokio::runtime::Builder::new_current_thread()

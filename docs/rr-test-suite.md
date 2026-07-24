@@ -22,7 +22,7 @@ This mirrors the fbsource `RR_TEST_TARGETS` set defined in
   (`-D_FILE_OFFSET_BITS=64 -pthread -std=gnu11 -g3 -O0`, linked against
   `-ldl -lrt`), and runs it as:
   ```sh
-  hermit run --base-env=minimal --preemption-timeout=80000000 -- <program> [args]
+  hermit run --base-env=minimal --max-timeslice=80000000 -- <program> [args]
   ```
   asserting the expected exit code. Each invocation uses a unique temporary
   working directory that is removed after the test.

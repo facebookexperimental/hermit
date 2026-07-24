@@ -70,7 +70,7 @@ fn run_pattern(pattern: &str, iteration: usize) -> String {
             "run",
             "--base-env=minimal",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "--",
         ])
         .arg(ipc_guest())

@@ -17,7 +17,7 @@
 #
 # The assurance probes deliberately mirror validate.sh's host-capability-matched
 # flags (NOT full --strict): --base-env=minimal --no-virtualize-cpuid
-# --preemption-timeout=disabled. This runs on hosts without PMU access or CPUID
+# --max-timeslice=disabled. This runs on hosts without PMU access or CPUID
 # faulting, so the counts are comparable to the working-envelope rubric.
 #
 #   L1  deterministic run            run ... -- PROG
@@ -78,7 +78,7 @@ if [[ ! -x $HERMIT_BIN ]]; then
 fi
 
 # Host-matched run flags shared by every assurance level (see header).
-declare -ar RUN_FLAGS=(run --base-env=minimal --no-virtualize-cpuid --preemption-timeout=disabled)
+declare -ar RUN_FLAGS=(run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled)
 
 # System binaries probed on the ptrace backend, each with a stable,
 # side-effect-free, exit-0 invocation (filter tools use a version probe, matching

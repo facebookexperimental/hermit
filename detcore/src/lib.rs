@@ -153,6 +153,20 @@ fn report_rcb_overshoot(
     error!("{}", message);
 }
 
+fn choose_rcb_timer(
+    max_rcbs_remaining: u64,
+    current_rcbs: u64,
+    next_interrupt: Option<u64>,
+) -> (u64, bool) {
+    if let Some(next_interrupt) = next_interrupt {
+        let interrupt_rcbs = next_interrupt - current_rcbs;
+        if interrupt_rcbs < max_rcbs_remaining {
+            return (interrupt_rcbs, false);
+        }
+    }
+    (max_rcbs_remaining, true)
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     async fn passthrough<G: Guest<Self>>(
         &self,
@@ -234,7 +248,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         precise_branch: bool,
     ) -> Option<Vec<SchedEvent>> {
-        if self.cfg.use_rcb_time() {
+        if self.cfg.max_timeslice.is_some() {
             let precise_timers = !guest.config().imprecise_timers;
             // TODO(T86591083): we might need to not always increment as a hack fix
             // for deterministic virtual time without sequentialize threads.
@@ -246,12 +260,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             let dettid = thread_state.dettid;
             assert!(thread_state.committed_clock_value <= clock_value);
             let delta_rcbs: u64 = clock_value - thread_state.committed_clock_value;
-            thread_state.thread_logical_time.add_rcbs(delta_rcbs);
+            if self.cfg.use_rcb_time() {
+                thread_state.thread_logical_time.add_rcbs(delta_rcbs);
+            }
             thread_state.committed_clock_value = clock_value;
 
             if thread_state.end_of_timeslice.is_some() {
                 if let Some(last_timer) = thread_state.last_rcb_timer
-                    && delta_rcbs > last_timer
+                    && delta_rcbs >= last_timer
                     && precise_timers
                 {
                     report_rcb_overshoot(
@@ -281,7 +297,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .map_or_else(|| "".to_string(), |x| format!("{}", x)),
                 clock_value,
             );
-            if self.cfg.should_trace_schedevent() {
+            if self.cfg.use_rcb_time() && self.cfg.should_trace_schedevent() {
                 let mut vec = Vec::new();
                 let ev = with_guest_time(
                     guest,
@@ -353,96 +369,97 @@ impl<T: RecordOrReplay> Detcore<T> {
             "prehook [dtid {}] Updating rcbs and checking time remaining.",
             dettid
         );
-        let thread_state = guest.thread_state();
-        if let Some(slice_end) = thread_state.end_of_timeslice {
-            let now_ns = thread_state.thread_logical_time.as_nanos();
-            if slice_end < now_ns {
-                trace!(
-                    "prehook [dtid {}] Time {} is beyond end of slice {}",
-                    dettid, now_ns, slice_end
-                );
-                self.end_timeslice(guest).await;
-            }
-        }
-
         if let Some(vec) = evs {
             for ev in vec {
                 trace_schedevent(guest, ev, false).await;
             }
         }
+
+        self.end_timeslice_if_needed(guest).await;
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    /// Yield when accumulated logical time reaches the syscall-boundary target deadline.
+    async fn end_timeslice_if_needed<G: Guest<Self>>(&self, guest: &mut G) {
+        let thread_state = guest.thread_state();
+        let Some(slice_end) = thread_state.end_of_timeslice else {
+            return;
+        };
+        if !thread_state.timeslice_expired() {
+            return;
+        }
+
+        trace!(
+            "[dtid {}] logical time {} reached timeslice target {}",
+            thread_state.dettid,
+            thread_state.thread_logical_time.as_nanos(),
+            slice_end
+        );
+        self.end_timeslice(guest).await;
     }
 
     /// A common hook called at the end of *every* handler, just before returning control
-    /// to the guest. This resets the preemption timeout for the next timeslice.
+    /// to the guest. This enforces the logical target and resets the PMU maximum timer.
     ///
     /// However, note that the thread's timeslice (turn) may have expired DURING this handler.
     /// Therefore the timeslice can end in the posthook as well as in the prehook.
     async fn post_handler_hook<G: Guest<Self>>(&self, guest: &mut G) {
+        self.end_timeslice_if_needed(guest).await;
+
         let dettid = guest.thread_state().dettid;
-        let timeout_delta_ns = guest.config().preemption_timeout;
-        let current_time = guest.thread_state_mut().thread_logical_time.as_nanos();
+        let mut current_time = guest.thread_state().thread_logical_time.as_nanos();
 
-        // If the preemption timeout is set, then end_of_timeslice must always be.
-        if let Some(slice_end) = guest.thread_state().end_of_timeslice {
-            let mut slice_end = slice_end;
-            assert!(timeout_delta_ns.is_some());
+        if let Some(mut max_timeslice_end) = guest.thread_state().max_timeslice_end {
+            assert!(guest.config().max_timeslice.is_some());
             // TODO: get rid of fractional NANOS_PER_RCB so it's clear that this does not lose precision:
-            let epsilon = Duration::from_nanos(NANOS_PER_RCB as u64);
+            let clock_multiplier = guest.config().clock_multiplier.unwrap_or(1.0);
+            let epsilon = Duration::from_nanos((NANOS_PER_RCB * clock_multiplier).ceil() as u64);
 
-            // If there is less than a single RCB worth of time left... we call it.
-            if current_time + epsilon > slice_end {
-                // Our timeslice wasn't over yet at the start of the handler.  But the
-                // elapse of time during the handler (e.g. executing a logical syscall)
-                // has pushed us over the threshold to where our time is used up.
-                // Therefore, we don't let the guest/mutator proceed executing more code yet.
-                // Rather, we go back to the scheduler and wait for our turn again.
+            if current_time + epsilon > max_timeslice_end {
                 trace!(
-                    "posthook [dtid {}] Time {} beyond (or close enough to) end of slice {}! Ending slice.",
-                    dettid, current_time, slice_end
+                    "posthook [dtid {}] less than one RCB remains before PMU maximum {}; ending slice",
+                    dettid, max_timeslice_end
                 );
-                let current_slice = guest.thread_state().stats.timeslice_count;
                 self.end_timeslice(guest).await;
-                // After ending time slice, need to reread this:
-                slice_end = guest
+                max_timeslice_end = guest
                     .thread_state()
-                    .end_of_timeslice
-                    .expect("internal invariant");
-                let current_time = guest.thread_state().thread_logical_time.as_nanos();
-                trace!(
-                    "posthook [dtid {}] after ending timeslice T{}, next end is {}, current time {}",
-                    dettid, current_slice, slice_end, current_time,
-                );
+                    .max_timeslice_end
+                    .expect("ending a PMU-backed timeslice must install a new maximum");
+                current_time = guest.thread_state().thread_logical_time.as_nanos();
             }
-            if current_time + epsilon > slice_end {
+            if current_time + epsilon > max_timeslice_end {
                 panic!(
-                    "Unhandled! Ended time slice, but current time {} is still beyond (or too near) timeslice end {}",
-                    current_time, slice_end
+                    "Ended time slice, but current time {} is still beyond PMU maximum {}",
+                    current_time, max_timeslice_end
                 );
             }
 
-            let ns_remaining = slice_end - current_time;
-            let mut rcbs_remaining = ns_remaining.into_rcbs();
-
-            if !guest.thread_state().interrupt_at.is_empty() {
-                let current_rcbs = guest.thread_state().thread_logical_time.rcbs();
-
-                if let Some(next_interrupt) = guest
-                    .thread_state()
-                    .interrupt_at
-                    .range((current_rcbs + 1)..)
-                    .next()
-                {
-                    rcbs_remaining = next_interrupt - current_rcbs;
-
-                    debug!(
-                        "[dtid: {}] current rcbs: {}, next interrupt_at: {}",
-                        dettid, current_rcbs, next_interrupt
-                    )
-                }
+            let ns_remaining = max_timeslice_end - current_time;
+            let max_rcbs_remaining = ns_remaining.into_rcbs_with_multiplier(clock_multiplier);
+            let current_rcbs = guest.thread_state().thread_logical_time.rcbs();
+            let next_interrupt = self
+                .cfg
+                .use_rcb_time()
+                .then(|| {
+                    guest
+                        .thread_state()
+                        .interrupt_at
+                        .range((current_rcbs + 1)..)
+                        .next()
+                        .copied()
+                })
+                .flatten();
+            let (rcbs_remaining, timer_is_max) =
+                choose_rcb_timer(max_rcbs_remaining, current_rcbs, next_interrupt);
+            if let Some(next_interrupt) = next_interrupt {
+                debug!(
+                    "[dtid: {}] current rcbs: {}, next interrupt_at: {}",
+                    dettid, current_rcbs, next_interrupt
+                )
             }
 
             trace!(
-                "posthook [dtid {}] After time consumed by handler/injection, {} remaining in slice ({} rcbs).",
+                "posthook [dtid {}] {} remaining before PMU maximum ({} rcbs).",
                 dettid, ns_remaining, rcbs_remaining,
             );
 
@@ -458,7 +475,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 rcbs_remaining,
                 guest.thread_state().thread_logical_time.rcbs()
             );
-            guest.thread_state_mut().last_rcb_timer = Some(rcbs_remaining);
+            {
+                let thread_state = guest.thread_state_mut();
+                thread_state.last_rcb_timer = Some(rcbs_remaining);
+                thread_state.last_rcb_timer_is_max = timer_is_max;
+            }
 
             if guest.config().imprecise_timers {
                 guest
@@ -470,7 +491,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .expect("Failed to set timer");
             }
         } else {
-            assert!(timeout_delta_ns.is_none());
+            assert!(guest.config().max_timeslice.is_none());
+            guest.thread_state_mut().last_rcb_timer = None;
+            guest.thread_state_mut().last_rcb_timer_is_max = false;
         }
 
         if guest.thread_state().guest_past_first_execve() {
@@ -486,7 +509,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// End this logical timeslice and talk to the scheduler before continuing.
     ///
     /// Effects
-    ///  - ends timeslice (mutating thread stats, end_of_timeslice)
+    ///  - ends timeslice (mutating thread stats and both deadlines)
     ///  - priority change / yield RPC
     async fn end_timeslice<G: Guest<Self>>(&self, guest: &mut G) {
         self.end_timeslice_with_sched_yield(guest, false).await;
@@ -568,6 +591,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     /// Constructor for Detcore process-local state.
     fn new(pid: Pid, cfg: &Config) -> Self {
         let detpid = DetPid::from_raw(pid.into()); // TODO(T78538674): virtualize pid.
+        cfg.validate_invariants();
         Self {
             detpid,
             cfg: cfg.clone(),
@@ -988,7 +1012,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     committed_clock_value: 0,
 
                     end_of_timeslice: None,
+                    max_timeslice_end: None,
                     last_rcb_timer: None,
+                    last_rcb_timer_is_max: false,
 
                     record_or_replay,
                     preemption_points: None,
@@ -1109,6 +1135,52 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // the prehook.  All the timer has to do is interrupt the guest and generate an extra call
         // to this prehook.
         self.pre_handler_hook(guest, true).await;
+        if guest.config().no_rcb_time && guest.thread_state().last_rcb_timer_is_max {
+            let max_timeslice_end = guest
+                .thread_state()
+                .max_timeslice_end
+                .expect("PMU maximum timer requires a deadline");
+            guest
+                .thread_state_mut()
+                .thread_logical_time
+                .advance_to(max_timeslice_end);
+            if self.cfg.should_trace_schedevent() {
+                let dettid = guest.thread_state().dettid;
+                let ev = with_guest_time(
+                    guest,
+                    SchedEvent {
+                        dettid,
+                        op: Op::OtherInstructions,
+                        count: 1,
+                        start_rip: None,
+                        end_rip: None,
+                        end_time: None,
+                    },
+                );
+                let ev = with_guest_rip(guest, ev).await;
+                trace_schedevent(guest, ev, false).await;
+            }
+            if self.cfg.replay_schedule_from.is_some() {
+                let fallback_deadline = max_timeslice_end
+                    + Duration::from_nanos(u64::from(
+                        self.cfg
+                            .max_timeslice
+                            .expect("PMU maximum must be configured"),
+                    ));
+                let thread_state = guest.thread_state_mut();
+                let replay_deadline = thread_state
+                    .end_of_timeslice
+                    .filter(|deadline| *deadline > max_timeslice_end)
+                    .unwrap_or(fallback_deadline);
+                thread_state.end_of_timeslice = Some(replay_deadline);
+                thread_state.max_timeslice_end = Some(replay_deadline);
+                thread_state.last_rcb_timer = None;
+                thread_state.last_rcb_timer_is_max = false;
+                thread_state.stats.reset_timeslice();
+            } else {
+                self.end_timeslice(guest).await;
+            }
+        }
         self.post_handler_hook(guest).await;
     }
 
@@ -1675,5 +1747,39 @@ mod rcb_overshoot_tests {
     #[should_panic(expected = "PMU RCB overshoot")]
     fn opt_in_overshoot_policy_panics() {
         report_rcb_overshoot(true, 16_249, 139, 100);
+    }
+}
+
+#[cfg(test)]
+mod timeslice_timer_tests {
+    use super::*;
+
+    #[test]
+    fn manual_interrupts_can_shorten_but_not_extend_maximum() {
+        assert_eq!(choose_rcb_timer(100, 100, Some(150)), (50, false));
+        assert_eq!(choose_rcb_timer(100, 100, Some(250)), (100, true));
+        assert_eq!(choose_rcb_timer(100, 100, None), (100, true));
+    }
+
+    #[test]
+    fn pmu_duration_conversion_applies_clock_multiplier() {
+        let duration = crate::types::LogicalTime::from_nanos(100);
+        assert_eq!(duration.into_rcbs_with_multiplier(2.0), 5);
+        assert_eq!(duration.into_rcbs_with_multiplier(0.5), 20);
+        assert_eq!(
+            crate::types::LogicalTime::from_nanos(101).into_rcbs_with_multiplier(2.0),
+            5
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "max_timeslice must be at least one RCB")]
+    fn detcore_constructor_validates_programmatic_config() {
+        let config = Config {
+            max_timeslice: std::num::NonZeroU64::new(1),
+            ..Default::default()
+        };
+
+        let _ = <Detcore as Tool>::new(Pid::from_raw(1), &config);
     }
 }

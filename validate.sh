@@ -262,7 +262,7 @@ declare -ar HERMIT_RUN_ARGS=(
     run
     --base-env=minimal
     --no-virtualize-cpuid
-    --preemption-timeout=disabled
+    --max-timeslice=disabled
 )
 
 # --- Working-envelope measurement -------------------------------------------

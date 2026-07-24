@@ -23,7 +23,7 @@ Hermit was built with `cargo build -p hermit`. Run-mode probes used:
 target/debug/hermit run \
   --base-env=minimal \
   --no-virtualize-cpuid \
-  --preemption-timeout=disabled \
+  --max-timeslice=disabled \
   -- PROGRAM ARGS...
 ```
 

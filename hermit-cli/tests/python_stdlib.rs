@@ -121,7 +121,7 @@ fn run_stdlib_tests(python: &Path) -> Output {
             "--strict",
             "--base-env=minimal",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "--",
         ])
         .arg(python)

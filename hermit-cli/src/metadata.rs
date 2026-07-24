@@ -169,7 +169,8 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         gdbserver: false,
         gdbserver_port: default_config.gdbserver_port,
         kill_daemons: default_config.kill_daemons,
-        preemption_timeout: default_config.preemption_timeout,
+        max_timeslice: default_config.max_timeslice,
+        target_timeslice: default_config.target_timeslice,
         seed: default_config.seed,
         rng_seed: default_config.rng_seed,
         imprecise_timers: false,
@@ -204,11 +205,11 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         chaos_target_races: false,
         fuzz_seed: None,
     };
-    if config.preemption_timeout.is_some() && !reverie_ptrace::is_perf_supported() {
+    if config.max_timeslice.is_some() && !reverie_ptrace::is_perf_supported() {
         tracing::warn!(
             "Hardware perf counters are not supported on this machine. Records/Replays may randomly fail!"
         );
-        config.preemption_timeout = None;
+        config.max_timeslice = None;
     }
     config
 }

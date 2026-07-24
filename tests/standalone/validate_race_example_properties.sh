@@ -26,7 +26,7 @@ function run() {
     local schedseed="$2"
     local log="$3"
     "$hermit" --log=info run \
-       --base-env=empty --chaos --preemption-timeout=20000 --summary \
+       --base-env=empty --chaos --max-timeslice=20000 --summary \
        --seed="$seed" --sched-seed="$schedseed" examples/race.sh 200 2> "$log"
 }
 

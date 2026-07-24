@@ -178,7 +178,7 @@ say "initramfs built: $(du -h "$INITRD" | cut -f1) ($INITRD)"
 #                                onto one logical CPU starves the helpers and the
 #                                guest kernel makes ~no progress. (This is also
 #                                exactly why --strict does NOT boot QEMU today.)
-#   --preemption-timeout 10^10   set the PMU-RCB preemption slice larger than the
+#   --max-timeslice 10^10   set the PMU-RCB preemption slice larger than the
 #                                whole boot, i.e. effectively "don't preempt the
 #                                vCPU thread mid-boot" (meaningful preemption
 #                                stalls the boot).
@@ -194,7 +194,7 @@ say "initramfs built: $(du -h "$INITRD" | cut -f1) ($INITRD)"
 #   -serial stdio                guest console on our stdout (what you see below).
 #   -no-reboot                   turn the guest's power-off into a QEMU exit(0).
 #   -append '...rdinit=/init'    boot straight into our busybox /init.
-HERMIT_FLAGS=( --log error run --no-sequentialize-threads --preemption-timeout 10000000000 )
+HERMIT_FLAGS=( --log error run --no-sequentialize-threads --max-timeslice 10000000000 )
 QEMU_FLAGS=( -m 256M -accel tcg,thread=single -smp 1 -icount shift=0,sleep=off
              -kernel "$KERNEL_REAL" -initrd "$INITRD"
              -display none -serial stdio -monitor none -no-reboot
@@ -232,7 +232,7 @@ else
 fi
 rule
 echo "  ASSURANCE: virtual-time COMPATIBILITY boot (backend: ptrace; relaxations:"
-echo "  --no-sequentialize-threads, high --preemption-timeout). This is NOT a"
+echo "  --no-sequentialize-threads, high --max-timeslice). This is NOT a"
 echo "  --strict/--verify (L2) determinism claim: with concurrency relaxed, QEMU's"
 echo "  host-thread interleavings are uncontrolled. Fully deterministic VM boot"
 echo "  (removing --no-sequentialize-threads) is the known next milestone."

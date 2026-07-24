@@ -95,7 +95,7 @@ pub struct RunOpts {
 
     /// Pin all guest threads to one or more cores, so that they do not migrate
     /// during execution. This is off by default, but it is implied by setting
-    /// `preemption_timeout` which requires stable RCB counters. RCB counters are
+    /// `max_timeslice` which requires stable RCB counters. RCB counters are
     /// not maintained consistently when Linux migrates a thread between cores.
     #[clap(long)]
     pin_threads: bool,
@@ -688,6 +688,101 @@ fn passthru_optimization_requires_explicit_opt_in() {
 }
 
 #[test]
+fn timeslice_flags_parse_and_round_trip() {
+    let mut ro = RunOpts::parse_from([
+        "fakehermit",
+        "--max-timeslice=100000",
+        "--target-timeslice=20000",
+        "fakeprog",
+    ]);
+    ro.validate_args_with_perf_support(true).unwrap();
+
+    assert_eq!(
+        ro.det_opts.det_config.max_timeslice,
+        std::num::NonZeroU64::new(100_000)
+    );
+    assert_eq!(
+        ro.det_opts.det_config.target_timeslice,
+        std::num::NonZeroU64::new(20_000)
+    );
+    let rendered = format!("{}", ro);
+    assert_eq!(
+        rendered,
+        " --max-timeslice=100000 --target-timeslice=20000 -- fakeprog"
+    );
+
+    let mut reparsed_args = vec!["fakehermit".to_owned()];
+    reparsed_args.extend(shell_words::split(&rendered).unwrap());
+    let mut reparsed = RunOpts::parse_from(reparsed_args);
+    reparsed.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(
+        reparsed.det_opts.det_config.max_timeslice,
+        ro.det_opts.det_config.max_timeslice
+    );
+    assert_eq!(
+        reparsed.det_opts.det_config.target_timeslice,
+        ro.det_opts.det_config.target_timeslice
+    );
+}
+
+#[test]
+fn deprecated_preemption_timeout_alias_round_trips_canonically() {
+    let mut ro = RunOpts::parse_from(["fakehermit", "--preemption-timeout=100000", "fakeprog"]);
+    ro.validate_args_with_perf_support(true).unwrap();
+
+    assert_eq!(
+        ro.det_opts.det_config.max_timeslice,
+        std::num::NonZeroU64::new(100_000)
+    );
+    assert_eq!(format!("{}", ro), " --max-timeslice=100000 -- fakeprog");
+}
+
+#[test]
+fn deprecated_preemption_timeout_disabled_values_round_trip_canonically() {
+    for value in ["disabled", "0"] {
+        let flag = format!("--preemption-timeout={value}");
+        let mut ro = RunOpts::parse_from(["fakehermit", &flag, "fakeprog"]);
+        ro.validate_args_with_perf_support(true).unwrap();
+
+        assert_eq!(ro.det_opts.det_config.max_timeslice, None);
+        assert_eq!(format!("{}", ro), " --max-timeslice=disabled -- fakeprog");
+    }
+}
+
+#[test]
+fn max_timeslice_rejects_less_than_one_rcb() {
+    let error =
+        RunOpts::try_parse_from(["fakehermit", "--max-timeslice=9", "fakeprog"]).unwrap_err();
+
+    assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    assert!(error.to_string().contains("at least one RCB"));
+
+    let mut ro = RunOpts::parse_from(["fakehermit", "--max-timeslice=10", "fakeprog"]);
+    ro.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(
+        ro.det_opts.det_config.max_timeslice,
+        std::num::NonZeroU64::new(10)
+    );
+
+    let mut scaled = RunOpts::parse_from([
+        "fakehermit",
+        "--max-timeslice=10",
+        "--clock-multiplier=2",
+        "fakeprog",
+    ]);
+    let error = scaled.validate_args_with_perf_support(true).unwrap_err();
+    assert!(error.to_string().contains("at least one RCB"));
+
+    let mut zero = RunOpts::parse_from(["fakehermit", "--clock-multiplier=0", "fakeprog"]);
+    assert!(
+        zero.validate_args_with_perf_support(true)
+            .unwrap_err()
+            .to_string()
+            .contains("finite and positive")
+    );
+}
+
+#[test]
 fn strict_flag_rejects_determinism_opt_outs() {
     for opt_out in ["--no-sequentialize-threads", "--no-deterministic-io"] {
         let error =
@@ -772,6 +867,10 @@ fn strict_help_describes_compatibility_and_opt_outs() {
         "--passthru-opt",
         "optimized partial syscall subscription set",
         "--panic-on-rbc-overshoot",
+        "--max-timeslice",
+        "--preemption-timeout",
+        "--target-timeslice",
+        "syscall boundaries",
         "--backend <BACKEND>",
         "Select the process instrumentation backend",
         "ptrace",
@@ -791,7 +890,7 @@ fn display_runopts_without_perf_support() {
     ro.validate_args_with_perf_support(false).unwrap();
     assert_eq!(
         format!("{}", ro),
-        " --preemption-timeout=disabled -- fakeprog arg1"
+        " --max-timeslice=disabled -- fakeprog arg1"
     );
 }
 
@@ -1006,6 +1105,23 @@ impl RunOpts {
                 config.sched_sticky_random_param
             );
         }
+        if let Some(multiplier) = config.clock_multiplier
+            && (!multiplier.is_finite() || multiplier <= 0.0)
+        {
+            anyhow::bail!(
+                "--clock-multiplier must be finite and positive (received {})",
+                multiplier
+            );
+        }
+        let minimum_max_timeslice = config.minimum_max_timeslice_nanos();
+        if let Some(max_timeslice) = config.max_timeslice
+            && u64::from(max_timeslice) < minimum_max_timeslice
+        {
+            anyhow::bail!(
+                "--max-timeslice must be at least one RCB ({} virtual nanoseconds at this clock multiplier)",
+                minimum_max_timeslice
+            );
+        }
 
         // Perform internal validation on the Config args, before taking into account the
         // hermit run args. User-controlled panic conditions are checked above.
@@ -1013,15 +1129,15 @@ impl RunOpts {
 
         // This is a Detcore Config-internal matter, but relies on reverie_ptrace, which detcore is
         // allowed to depend on:
-        if config.preemption_timeout.is_some() && !perf_supported {
+        if config.max_timeslice.is_some() && !perf_supported {
             // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
             eprintln!(
-                "WARNING: --preemption-timeout requires user-space perf counters, but \
+                "WARNING: --max-timeslice requires user-space perf counters, but \
                  perf_event_open is unavailable; continuing with \
-                 --preemption-timeout=disabled. Check the host perf_event_paranoid value and \
+                 --max-timeslice=disabled. Check the host perf_event_paranoid value and \
                  container seccomp policy."
             );
-            config.preemption_timeout = None;
+            config.max_timeslice = None;
         }
 
         if let Some(sf) = &self.seed_from {
@@ -1044,7 +1160,7 @@ impl RunOpts {
 
         // Deterministic RCB counts requires thread pinning.  But this only matters if
         // we're expecting full determinstic execution (sequentialize_threads).
-        if config.preemption_timeout.is_some() && config.sequentialize_threads {
+        if config.max_timeslice.is_some() && config.sequentialize_threads {
             self.pin_threads = true;
         }
 

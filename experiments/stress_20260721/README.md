@@ -71,7 +71,7 @@ and memory-map hashing enabled:
 
 ```sh
 ./target/debug/hermit run --verify \
-  --detlog-heap --detlog-stack --preemption-timeout=disabled -- PROGRAM ARGS...
+  --detlog-heap --detlog-stack --max-timeslice=disabled -- PROGRAM ARGS...
 ```
 
 | Workload | Messages per run | Detlog/scheduler entries | Log comparison | Operational result |
@@ -141,7 +141,7 @@ strict boot.
 
 ```text
 --no-sequentialize-threads --no-deterministic-io
---preemption-timeout=disabled
+--max-timeslice=disabled
 ```
 
 and a 30-second host timeout. All three compatibility runs reached Linux

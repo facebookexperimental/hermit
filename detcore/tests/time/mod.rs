@@ -10,6 +10,10 @@
 
 use std::mem::MaybeUninit;
 use std::ptr;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::thread;
 use std::time;
 
 use chrono::DateTime;
@@ -190,6 +194,100 @@ fn tod_clock_gettime() {
 }
 
 #[test]
+fn target_timeslice_yields_at_syscall_boundaries_without_pmu() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        max_timeslice: None,
+        target_timeslice: std::num::NonZeroU64::new(100_000),
+        sequentialize_threads: true,
+        no_rcb_time: true,
+        // Cancel no_rcb_time's 500x fallback so the target is literal virtual nanoseconds.
+        clock_multiplier: Some(1.0 / 500.0),
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let read_time = || {
+                let mut now = MaybeUninit::<libc::timespec>::uninit();
+                let result = unsafe {
+                    libc::syscall(
+                        libc::SYS_clock_gettime,
+                        libc::CLOCK_MONOTONIC,
+                        now.as_mut_ptr(),
+                    )
+                };
+                assert_eq!(result, 0);
+                unsafe { now.assume_init() }
+            };
+
+            let done = Arc::new(AtomicBool::new(false));
+            let worker_done = Arc::clone(&done);
+            let worker = thread::spawn(move || {
+                thread::sleep(time::Duration::from_millis(1));
+                worker_done.store(true, Ordering::Release);
+            });
+
+            let mut calls = 0;
+            while !done.load(Ordering::Acquire) && calls < 1_000 {
+                read_time();
+                calls += 1;
+            }
+
+            assert!(
+                done.load(Ordering::Acquire),
+                "clock_gettime loop starved its peer for {calls} calls"
+            );
+            worker.join().unwrap();
+        },
+        config,
+        true,
+    );
+}
+
+#[test]
+fn max_timeslice_preempts_cpu_bound_code_without_rcb_logical_time() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        max_timeslice: std::num::NonZeroU64::new(1_000_000),
+        target_timeslice: None,
+        sequentialize_threads: true,
+        no_rcb_time: true,
+        clock_multiplier: Some(1.0),
+        record_preemptions: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let start = Arc::new(AtomicBool::new(false));
+            let done = Arc::new(AtomicBool::new(false));
+            let worker_start = Arc::clone(&start);
+            let worker_done = Arc::clone(&done);
+            let worker = thread::spawn(move || {
+                while !worker_start.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                worker_done.store(true, Ordering::Release);
+            });
+
+            start.store(true, Ordering::Release);
+            let mut spins = 0;
+            while !done.load(Ordering::Acquire) && spins < 50_000_000 {
+                std::hint::spin_loop();
+                spins += 1;
+            }
+
+            assert!(
+                done.load(Ordering::Acquire),
+                "PMU maximum did not schedule the peer after {spins} spins"
+            );
+            worker.join().unwrap();
+        },
+        config,
+        true,
+    );
+}
+
+#[test]
 fn tod_clock_getres() {
     let mut tp: MaybeUninit<libc::timespec> = MaybeUninit::uninit();
     let config = detcore::Config {
@@ -221,7 +319,7 @@ fn tod_clock_getres_2() {
         ..Default::default()
     };
     let sequentialize = config.sequentialize_threads;
-    let timeout_disabled = config.preemption_timeout.is_none();
+    let timeout_disabled = config.max_timeslice.is_none();
     check_fn_with_config::<Detcore, _>(
         || {
             let now = time::Instant::now();

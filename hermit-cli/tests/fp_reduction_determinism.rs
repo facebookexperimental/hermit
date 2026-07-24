@@ -98,7 +98,7 @@ fn run_strict(iteration: usize) -> Vec<u8> {
         "--strict",
         "--base-env=minimal",
         "--no-virtualize-cpuid",
-        "--preemption-timeout=disabled",
+        "--max-timeslice=disabled",
         "--",
     ]);
     command.arg(fp_reduction_guest());

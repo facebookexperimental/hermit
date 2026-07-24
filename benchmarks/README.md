@@ -42,7 +42,7 @@ Hermit uses a hardware-independent deterministic configuration:
 
 ```text
 --log=error run --base-env=minimal --env=LC_ALL=C
---no-virtualize-cpuid --preemption-timeout=disabled
+--no-virtualize-cpuid --max-timeslice=disabled
 ```
 
 Disabling PMU preemption makes the suite portable across supported Linux hosts

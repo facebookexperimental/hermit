@@ -23,6 +23,7 @@ use serde::Serialize;
 
 use crate::pid::DetTid;
 use crate::schedule::SigWrapper;
+use crate::time::NANOS_PER_RCB;
 
 const fn default_true() -> bool {
     true
@@ -119,8 +120,8 @@ pub struct Config {
     /// Schedule threads chaotically.
     ///
     /// The behavior of this flag is subject to change. Current behavior is to randomize thread
-    /// priorities at every timeout caused by the `--preemption-timeout`.  Other randomization
-    /// strategies are possible with `--sched-heuristic`.
+    /// priorities at every logical timeslice. Other randomization strategies are possible with
+    /// `--sched-heuristic`.
     ///
     /// Thread scheduling remains deterministic, determined by the random seed.
     #[clap(long)]
@@ -246,17 +247,28 @@ pub struct Config {
     )]
     pub gdbserver_port: u16,
 
-    /// Configure the longest time slice for which a guest thread should be allowed to run
-    /// uninterrupted. This uses the unit of "virtual nanoseconds", and is implemented using
-    /// retired conditional branche (RCB) counting.
+    /// Configure the maximum time a guest thread may run without returning to Detcore. This is
+    /// measured in virtual nanoseconds and enforced with retired conditional branch (RCB)
+    /// counting. `--preemption-timeout` is retained as a deprecated alias.
     ///
-    /// To disable preemption based on RCB count, set`preemption_timeout` to "disabled" or "0".
-    /// Note: Set `preemption_timeout` to a non-zero value requires hardware performance counters.
-    #[clap(long,
+    /// Set this to `disabled` or `0` to disable PMU-backed preemption. Positive values must be at
+    /// least one RCB (10 virtual nanoseconds at the default clock multiplier) and require
+    /// user-space hardware performance counters.
+    #[serde(alias = "preemption_timeout")]
+    #[clap(
+                long,
+                visible_alias = "preemption-timeout",
                 value_name = "uint64|'disabled'",
                 default_value = "200000000",
-                value_parser = parse_preemption_timeout)]
-    pub preemption_timeout: MaybePreemptionTimeout,
+                value_parser = parse_timeslice)]
+    pub max_timeslice: MaybeTimeslice,
+
+    /// Target logical timeslice checked at syscall boundaries, in virtual nanoseconds. This avoids
+    /// PMU preemption for workloads that enter the kernel frequently. Omit this option to use only
+    /// `--max-timeslice`.
+    #[serde(default)]
+    #[clap(long, value_name = "virtual-nanoseconds")]
+    pub target_timeslice: Option<NonZeroU64>,
 
     /// Shut down immediately upon SIGINT, rather than letting the guest handle it.
     #[clap(long)]
@@ -319,7 +331,7 @@ pub struct Config {
     /// Do not count the retired conditional branches (RCBs) of each thread towards its logical
     /// time.  Instead, count each checkin with the scheduler as a fixed increment to logical time.
     /// Even when this option is set, HW RCB performance counters may still be enabled if a
-    /// preemption-timeout is specified.
+    /// max-timeslice is specified.
     #[clap(long)]
     pub no_rcb_time: bool,
 
@@ -372,10 +384,34 @@ fn try_parse_memory(from_str: &str) -> anyhow::Result<u64> {
 }
 
 impl Config {
-    /// Sanity check the flags, and update any wherever flag B is implied by A.
-    pub fn validate(&mut self) {
+    /// Smallest PMU-backed maximum representable by one RCB at this clock multiplier.
+    pub fn minimum_max_timeslice_nanos(&self) -> u64 {
+        let multiplier = self.clock_multiplier.unwrap_or(1.0);
+        ((NANOS_PER_RCB * multiplier).ceil() as u64).max(NANOS_PER_RCB as u64)
+    }
+
+    /// Check invariants that must hold at every execution boundary without mutating the config.
+    pub fn validate_invariants(&self) {
         assert!(self.sched_sticky_random_param >= 0.0);
         assert!(self.sched_sticky_random_param <= 1.0);
+        if let Some(multiplier) = self.clock_multiplier {
+            assert!(
+                multiplier.is_finite() && multiplier > 0.0,
+                "clock_multiplier must be finite and positive"
+            );
+        }
+        let minimum_max_timeslice = self.minimum_max_timeslice_nanos();
+        assert!(
+            self.max_timeslice
+                .is_none_or(|timeslice| u64::from(timeslice) >= minimum_max_timeslice),
+            "max_timeslice must be at least one RCB ({} virtual nanoseconds)",
+            minimum_max_timeslice
+        );
+    }
+
+    /// Sanity check the flags, and update any wherever flag B is implied by A.
+    pub fn validate(&mut self) {
+        self.validate_invariants();
 
         // TODO(T124429978) Restore the eprintln! calls below to tracing::warn! when the tracing
         // subscriber is set up early enough for these warnings to print.
@@ -441,9 +477,9 @@ impl Config {
     /// Should we use RCB in computing logical time?
     ///
     /// The answer is NO either if `--no-rcb-time` is specified or if HW counters are disabled by
-    /// setting `--preemption-timeout=disabled`.
+    /// setting `--max-timeslice=disabled`.
     pub fn use_rcb_time(&self) -> bool {
-        self.preemption_timeout.is_some() && !self.no_rcb_time
+        self.max_timeslice.is_some() && !self.no_rcb_time
     }
 
     /// Should we convert sockets to SOCK_NONBLOCK?
@@ -568,15 +604,18 @@ impl fmt::Display for Config {
         if self.gdbserver_port != /* default */ 1234u16 {
             write!(f, " --gdbserver-port={}", self.gdbserver_port)?;
         }
-        match &self.preemption_timeout {
+        match &self.max_timeslice {
             Some(x) => {
                 if *x != NonZeroU64::new(200_000_000).unwrap() {
-                    write!(f, " --preemption-timeout={}", x)?;
+                    write!(f, " --max-timeslice={}", x)?;
                 }
             }
             None => {
-                write!(f, " --preemption-timeout=disabled")?;
+                write!(f, " --max-timeslice=disabled")?;
             }
+        }
+        if let Some(target_timeslice) = self.target_timeslice {
+            write!(f, " --target-timeslice={}", target_timeslice)?;
         }
         if self.sigint_instakill {
             write!(f, " --sigint-instakill")?;
@@ -772,21 +811,27 @@ impl FromStr for SchedHeuristic {
     }
 }
 
-/// If this is set to None, the RCB (retired conditional branch) hardware counter feature is disabled.
-///
-/// Limitations with clap require a type alias here.
-pub type MaybePreemptionTimeout = Option<NonZeroU64>;
+/// An optional virtual-timeslice duration. `None` disables that preemption mechanism.
+pub type MaybeTimeslice = Option<NonZeroU64>;
 
-fn parse_preemption_timeout(
-    src: &str,
-) -> Result<MaybePreemptionTimeout, ParsePreemptionTimeoutError> {
+/// Deprecated name for an optional PMU-backed virtual-timeslice duration.
+#[deprecated(note = "use MaybeTimeslice")]
+pub type MaybePreemptionTimeout = MaybeTimeslice;
+
+fn parse_timeslice(src: &str) -> Result<MaybeTimeslice, ParseTimesliceError> {
     if let Ok(n) = src.parse::<u64>() {
-        Ok(NonZeroU64::new(n))
+        if n != 0 && n < NANOS_PER_RCB as u64 {
+            Err(ParseTimesliceError::new(
+                "PMU-backed timeslices must be at least one RCB (10 virtual nanoseconds)",
+            ))
+        } else {
+            Ok(NonZeroU64::new(n))
+        }
     } else {
         match src {
             "disabled" => Ok(None),
-            _ => Err(ParsePreemptionTimeoutError::new(
-                "Unable to parse string as preemption-timeout, expected 'disabled' or an non-negative integer",
+            _ => Err(ParseTimesliceError::new(
+                "Unable to parse timeslice, expected disabled or a non-negative integer",
             )),
         }
     }
@@ -805,25 +850,25 @@ fn parse_index_with_path(src: &str) -> Result<(u64, Option<PathBuf>), String> {
 }
 
 #[derive(Debug)]
-struct ParsePreemptionTimeoutError {
+struct ParseTimesliceError {
     details: String,
 }
 
-impl fmt::Display for ParsePreemptionTimeoutError {
+impl fmt::Display for ParseTimesliceError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.details)
     }
 }
 
-impl ParsePreemptionTimeoutError {
-    fn new(msg: &str) -> ParsePreemptionTimeoutError {
-        ParsePreemptionTimeoutError {
+impl ParseTimesliceError {
+    fn new(msg: &str) -> ParseTimesliceError {
+        ParseTimesliceError {
             details: msg.to_string(),
         }
     }
 }
 
-impl std::error::Error for ParsePreemptionTimeoutError {
+impl std::error::Error for ParseTimesliceError {
     fn description(&self) -> &str {
         &self.details
     }
@@ -913,5 +958,47 @@ mod tests {
 
         config.runs_post_fork = RunsPostFork::Random;
         assert!(config.to_string().contains(" --runs-post-fork=random"));
+    }
+
+    #[test]
+    #[should_panic(expected = "max_timeslice must be at least one RCB")]
+    fn validate_rejects_max_timeslice_below_one_rcb() {
+        let mut config = Config {
+            max_timeslice: NonZeroU64::new(NANOS_PER_RCB as u64 - 1),
+            ..Default::default()
+        };
+
+        config.validate();
+    }
+
+    #[test]
+    fn validate_accepts_one_rcb_max_timeslice() {
+        let mut config = Config {
+            max_timeslice: NonZeroU64::new(NANOS_PER_RCB as u64),
+            ..Default::default()
+        };
+
+        config.validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "clock_multiplier must be finite and positive")]
+    fn validate_rejects_invalid_clock_multiplier() {
+        let mut config = Config {
+            clock_multiplier: Some(0.0),
+            ..Default::default()
+        };
+        config.validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "max_timeslice must be at least one RCB")]
+    fn validate_scales_one_rcb_minimum_with_clock_multiplier() {
+        let mut config = Config {
+            max_timeslice: NonZeroU64::new(10),
+            clock_multiplier: Some(2.0),
+            ..Default::default()
+        };
+        config.validate();
     }
 }

@@ -313,7 +313,8 @@ fn run_help_exposes_determinism_modes() {
         "--verify-verbose",
         "--record-preemptions",
         "--replay-preemptions-from",
-        "--preemption-timeout",
+        "--max-timeslice",
+        "--target-timeslice",
         "--backend <BACKEND>",
         "ptrace",
         "dbi",
@@ -333,13 +334,13 @@ fn run_strict_flag_is_accepted_and_runs() {
     // Regression test for GH #12: `docs/Users.md` documents
     // `hermit run --strict ...`, and the CLI must accept that spelling and run
     // the guest to completion. Strict determinism is the default, so `--strict`
-    // is a compatibility no-op over the defaults. `--preemption-timeout=disabled`
+    // is a compatibility no-op over the defaults. `--max-timeslice=disabled`
     // and `--no-virtualize-cpuid` keep this runnable on hosts without accessible
     // PMU counters or CPUID faulting; neither weakens what `--strict` controls.
     let args = [
         "run",
         "--strict",
-        "--preemption-timeout=disabled",
+        "--max-timeslice=disabled",
         "--no-virtualize-cpuid",
         "--",
         "/bin/true",
@@ -1178,7 +1179,7 @@ fn no_namespace_runs_without_container_setup() {
     let args = [
         "run",
         "--no-namespace",
-        "--preemption-timeout=disabled",
+        "--max-timeslice=disabled",
         "--",
         "/bin/echo",
         "hello",
@@ -1206,7 +1207,7 @@ fn no_namespace_preserves_affinity_for_run_and_verify() {
         "run",
         "--no-namespace",
         "--pin-threads",
-        "--preemption-timeout=disabled",
+        "--max-timeslice=disabled",
         "--",
         "/usr/bin/nproc",
     ];
@@ -1219,7 +1220,7 @@ fn no_namespace_preserves_affinity_for_run_and_verify() {
         "--no-namespace",
         "--verify",
         "--pin-threads",
-        "--preemption-timeout=disabled",
+        "--max-timeslice=disabled",
         "--",
         "/bin/sh",
         "-c",
@@ -1365,7 +1366,7 @@ fn run_reports_denied_ptrace_and_seccomp_capabilities() {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
         command.args([
             "run",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "--no-virtualize-cpuid",
             "--",
             "/bin/true",

@@ -109,7 +109,7 @@ is:
 ```bash
 timeout --signal=KILL 90s target/release/hermit --log error run \
   --no-sequentialize-threads \
-  --preemption-timeout disabled \
+  --max-timeslice disabled \
   --no-virtualize-cpuid -- \
   qemu-system-x86_64 \
   -m 256M \
@@ -152,7 +152,7 @@ relaxation was used.
 The faster compatibility profile still uses both:
 
 - `--no-sequentialize-threads`, so QEMU's host threads can run concurrently;
-- `--preemption-timeout disabled`, so Hermit does not apply PMU preemption to
+- `--max-timeslice disabled`, so Hermit does not apply PMU preemption to
   this compatibility run.
 
 That profile trades deterministic QEMU host-thread scheduling for lower wall

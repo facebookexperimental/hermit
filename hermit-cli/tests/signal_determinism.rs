@@ -83,7 +83,7 @@ fn run_signal_scenario(scenario: &str, expected_stdout: &str) {
             "run",
             "--base-env=minimal",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "--",
         ]);
         command.arg(signal_guest()).arg(scenario);

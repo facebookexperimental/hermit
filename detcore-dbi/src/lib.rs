@@ -324,7 +324,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
             let mut config = Config {
                 sequentialize_threads: true,
                 deterministic_io: true,
-                preemption_timeout: None,
+                max_timeslice: None,
                 ..Config::default()
             };
             config.validate();

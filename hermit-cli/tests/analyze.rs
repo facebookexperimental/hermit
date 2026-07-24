@@ -153,7 +153,7 @@ fn run_analyze(label: &str, guest: &Path, analyze_opts: &[&str], expected_output
         .arg(format!("--report-file={}", report_file.display()))
         .args(["--analyze-seed=0", "--search", "--"])
         // Arguments forwarded to the underlying `hermit run` invocations:
-        .args(["--chaos", "--summary", "--preemption-timeout=400000", "--"])
+        .args(["--chaos", "--summary", "--max-timeslice=400000", "--"])
         .arg(guest);
 
     let output = command_output(command, label);

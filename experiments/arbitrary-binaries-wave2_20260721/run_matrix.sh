@@ -58,7 +58,7 @@ for workload in "${workloads[@]}"; do
         setsid timeout -k 5s "${case_timeout}s" "$HERMIT" run \
             --base-env=minimal \
             --no-virtualize-cpuid \
-            --preemption-timeout=disabled \
+            --max-timeslice=disabled \
             --bind "$FIXTURES:/tmp/wave2" \
             "${mode_flags[@]}" \
             -- /bin/sh -c "$command" >"$stdout" 2>"$stderr" &

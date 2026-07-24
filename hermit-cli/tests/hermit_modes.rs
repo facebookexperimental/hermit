@@ -328,7 +328,7 @@ fn hermit_command(base_env: &str) -> Command {
     command
         .arg("run")
         .arg(format!("--base-env={base_env}"))
-        .args(["--no-virtualize-cpuid", "--preemption-timeout=disabled"]);
+        .args(["--no-virtualize-cpuid", "--max-timeslice=disabled"]);
     command
 }
 
@@ -348,7 +348,7 @@ fn verify_guest_command(tmp: &Path, script: &str, extra_options: &[&str]) -> Com
         .args([
             "--base-env=minimal",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
         ])
         .arg(format!("--tmp={}", tmp.display()))
         .arg("/tmp/guest");
@@ -416,7 +416,7 @@ fn run_buck_chaos_workload(name: &str) {
             "--verify",
             "--chaos",
             "--base-env=empty",
-            "--preemption-timeout=1000000",
+            "--max-timeslice=1000000",
             "--env=HERMIT_MODE=chaos",
             "--",
         ])
@@ -769,7 +769,7 @@ fn no_hardware_stacktrace_signal() {
         "--record-preemptions",
         "--base-env=minimal",
         "--no-virtualize-cpuid",
-        "--preemption-timeout=disabled",
+        "--max-timeslice=disabled",
         "--",
         "/bin/date",
     ]);
@@ -816,7 +816,7 @@ fn verify_captures_debug_logs_when_a_lower_level_is_requested() {
         "--verify",
         "--base-env=minimal",
         "--no-virtualize-cpuid",
-        "--preemption-timeout=disabled",
+        "--max-timeslice=disabled",
         "--",
         "/bin/true",
     ]);
@@ -941,7 +941,7 @@ printf 'configured\n'
             "--base-env=empty",
             "--env=VERIFY_CONFIGURED=expected",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
         ])
         .arg(format!("--tmp={}", tmp.path().display()))
         .arg("/tmp/guest")
@@ -962,7 +962,7 @@ fn hello_race_chaos_verify() {
             "--chaos",
             "--base-env=minimal",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "--env=HERMIT_MODE=chaos",
         ])
         .arg(&workload.path);

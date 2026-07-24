@@ -45,7 +45,7 @@ in `demo.sh` and in [`docs/QEMU_BOOT.md`](../../docs/QEMU_BOOT.md)):
 * `--no-sequentialize-threads` — QEMU has a CPU-bound TCG vCPU thread plus
   main-loop/helper threads; serializing them onto one logical CPU starves the
   helpers and the boot makes ~no progress.
-* `--preemption-timeout 10000000000` — a preemption slice larger than the whole
+* `--max-timeslice 10000000000` — a preemption slice larger than the whole
   boot, i.e. effectively "don't preempt the vCPU mid-boot" (meaningful
   preemption stalls it).
 * QEMU `-icount shift=0,sleep=off` — one instruction-derived clock for the whole
@@ -55,7 +55,7 @@ in `demo.sh` and in [`docs/QEMU_BOOT.md`](../../docs/QEMU_BOOT.md)):
 ## Assurance level
 
 This is a **virtual-time compatibility boot** (backend: ptrace; relaxations:
-`--no-sequentialize-threads`, high `--preemption-timeout`). It is **not** a
+`--no-sequentialize-threads`, high `--max-timeslice`). It is **not** a
 `--strict`/`--verify` (L2) determinism claim: with concurrency relaxed, QEMU's
 host-thread interleavings are uncontrolled. A fully deterministic VM boot
 (removing `--no-sequentialize-threads`) is the known next milestone — today

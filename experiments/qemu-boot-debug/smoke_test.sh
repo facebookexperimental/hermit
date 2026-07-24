@@ -56,7 +56,7 @@ set +e
 timeout --signal=KILL "${timeout_seconds}s" \
   "$hermit_bin" --log error run \
   --no-sequentialize-threads \
-  --preemption-timeout disabled \
+  --max-timeslice disabled \
   --no-virtualize-cpuid -- \
   "$qemu_bin" \
   -m 256M \

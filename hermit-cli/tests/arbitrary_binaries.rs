@@ -224,7 +224,7 @@ fn hermit_run(tool: &Tool) -> Output {
             "run",
             "--base-env=minimal",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "--",
         ])
         .arg(&tool.path)

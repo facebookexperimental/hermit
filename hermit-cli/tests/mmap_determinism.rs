@@ -68,7 +68,7 @@ fn run_scenario(scenario: &str, run: usize) -> Vec<u8> {
             "run",
             "--base-env=minimal",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "--",
         ])
         .arg(mmap_guest())

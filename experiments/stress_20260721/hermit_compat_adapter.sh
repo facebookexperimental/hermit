@@ -14,5 +14,5 @@ shift 4
 exec timeout 30s "$repo_root/target/debug/hermit" --log "$log_level" run \
   --no-sequentialize-threads \
   --no-deterministic-io \
-  --preemption-timeout=disabled \
+  --max-timeslice=disabled \
   -- "$@"

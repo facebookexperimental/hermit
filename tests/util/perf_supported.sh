@@ -6,7 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 #
 # Probe whether user-space retired-branch hardware performance counters are
-# actually usable on this host. Hermit's chaos mode and --preemption-timeout
+# actually usable on this host. Hermit's chaos mode and --max-timeslice
 # depend on these counters.
 #
 # We probe by *opening* the retired-branch counter with a minimal

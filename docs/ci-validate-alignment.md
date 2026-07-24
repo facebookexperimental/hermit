@@ -78,7 +78,7 @@ identical; only reporting (JUnit output, retries) differs.
 
 | `validate.sh` step | Command | CI counterpart | Status |
 | --- | --- | --- | --- |
-| Hermit run smoke test | `hermit run --base-env=minimal --no-virtualize-cpuid --preemption-timeout=disabled -- /bin/echo …` | envelope L1 (`--strict`) approximates it | ⚠️ partial |
+| Hermit run smoke test | `hermit run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled -- /bin/echo …` | envelope L1 (`--strict`) approximates it | ⚠️ partial |
 | Hermit output determinism | run twice, diff stdout | — | ❌ gap D |
 | Hermit verify-mode smoke test | `hermit run … --verify -- /bin/echo …` | envelope L2 (`--strict --verify`) approximates it | ⚠️ partial |
 | Fast concurrency stress suite | `cargo nextest run -p hermit --test stress_suite --run-ignored only -E 'test(=fast_chaos_matrix)'` | — | ❌ gap E |

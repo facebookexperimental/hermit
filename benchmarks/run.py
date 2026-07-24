@@ -206,7 +206,7 @@ def hermit_command(hermit: Path, benchmark: Benchmark) -> tuple[str, ...]:
         "--base-env=minimal",
         "--env=LC_ALL=C",
         "--no-virtualize-cpuid",
-        "--preemption-timeout=disabled",
+        "--max-timeslice=disabled",
         "--",
         *benchmark.command,
     )

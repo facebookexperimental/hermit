@@ -102,7 +102,7 @@ fn run_hermit_strict(python: &Path, script: &Path) -> String {
             "--strict",
             "--base-env=minimal",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "--",
         ])
         .arg(python)

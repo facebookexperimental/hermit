@@ -157,6 +157,12 @@ impl LogicalTime {
         (self.0 as f64 / NANOS_PER_RCB) as u64
     }
 
+    /// Convert a virtual duration to RCBs after applying a logical clock multiplier.
+    pub fn into_rcbs_with_multiplier(self, multiplier: f64) -> u64 {
+        debug_assert!(multiplier > 0.0);
+        (self.0 as f64 / (NANOS_PER_RCB * multiplier)).floor() as u64
+    }
+
     /// Test if the quantity is zero nanoseconds.
     pub fn is_zero(&self) -> bool {
         self.0 == 0
@@ -349,6 +355,10 @@ pub struct DetTime {
     /// Number of nondeterministic instructions (rdtsc, cpuid)
     nondet_instrs: u64,
 
+    /// Explicit virtual-time advances, such as a PMU maximum when RCB accounting is disabled.
+    #[serde(default)]
+    extra_nanos: u64,
+
     /// Baseline amount of time to add.
     starting_micros: Microseconds,
 
@@ -363,6 +373,7 @@ impl Default for DetTime {
             syscalls: 0,
             rcbs: 0,
             nondet_instrs: 0,
+            extra_nanos: 0,
             starting_micros: 0,
             multiplier: 1.0,
         }
@@ -399,6 +410,7 @@ impl From<&DateTime<Utc>> for DetTime {
             syscalls: 0,
             rcbs: 0,
             nondet_instrs: 0,
+            extra_nanos: 0,
             starting_micros: micros_from_utc(dt),
             multiplier: 1.0,
         }
@@ -443,6 +455,7 @@ impl DetTime {
             syscalls: 0,
             rcbs: 0,
             nondet_instrs: 0,
+            extra_nanos: 0,
             starting_micros: 0,
             multiplier: 1.0,
         }
@@ -472,6 +485,13 @@ impl DetTime {
         self.rcbs += count;
     }
 
+    /// Advance this local clock to an explicit virtual deadline.
+    pub fn advance_to(&mut self, deadline: LogicalTime) {
+        let current = self.as_nanos();
+        assert!(deadline >= current);
+        self.extra_nanos += (deadline - current).as_nanos();
+    }
+
     /// Return current rcbs
     pub fn rcbs(&self) -> u64 {
         self.rcbs
@@ -483,6 +503,7 @@ impl DetTime {
         // representation.  But currently we leave them separate for debuggability.
         LogicalTime(
             (self.starting_micros * 1000)
+                + self.extra_nanos
                 + ((self.syscalls as f64 * NANOS_PER_SYSCALL * self.multiplier) as u64)
                 + ((self.rcbs as f64 * NANOS_PER_RCB * self.multiplier) as u64)
                 + ((self.nondet_instrs as f64 * NANOS_PER_NONDET_INSTR * self.multiplier) as u64),

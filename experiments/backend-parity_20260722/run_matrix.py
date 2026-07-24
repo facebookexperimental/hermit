@@ -179,7 +179,7 @@ def hermit_command(
     command.extend(
         [
             "--base-env=minimal",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
             "--tmp=/tmp",
         ]
     )

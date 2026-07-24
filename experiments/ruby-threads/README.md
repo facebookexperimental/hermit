@@ -35,7 +35,7 @@ multithreading livelocks under hermit's strict (sequentialized) scheduler.**
 
 - 1 Ruby thread completes under `--strict` in ~1s.
 - 2+ Ruby threads never complete (observed >60s, no output), with or without
-  `--preemption-timeout=disabled`.
+  `--max-timeslice=disabled`.
 - The same program completes instantly under hermit **non-strict**, isolating the
   problem to the sequentialized deterministic scheduler (not ptrace/exec).
 

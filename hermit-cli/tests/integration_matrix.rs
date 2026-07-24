@@ -336,7 +336,7 @@ fn run_case(case: &Case, fixture: &Fixture) -> TimedRun {
             "run",
             "--base-env=minimal",
             "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--max-timeslice=disabled",
         ])
         .arg(format!("--bind={}:{GUEST_FIXTURE}", fixture.root.display()))
         .arg("--")
