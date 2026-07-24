@@ -710,6 +710,96 @@ function run_strict_compatibility_envelope {
     strict_compatibility_probe unexpand bash -c \
         'printf "a   b\n" | unexpand -a -t 4' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    # Filesystem fixtures use distinct fixed paths and clean them before and
+    # after each run so both sides of --verify begin from equivalent state.
+    strict_compatibility_probe diff bash -c \
+        'set -euo pipefail; rm -rf /tmp/hermit-compat-diff; mkdir /tmp/hermit-compat-diff; printf "alpha\nbeta\n" >/tmp/hermit-compat-diff/a; cp /tmp/hermit-compat-diff/a /tmp/hermit-compat-diff/b; diff -u /tmp/hermit-compat-diff/a /tmp/hermit-compat-diff/b; rm -rf /tmp/hermit-compat-diff; printf "diff-ok\n"' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe patch bash -c \
+        'set -euo pipefail; rm -rf /tmp/hermit-compat-patch; mkdir /tmp/hermit-compat-patch; printf "old\n" >/tmp/hermit-compat-patch/file; printf "%s\n" "--- file" "+++ file" "@@ -1 +1 @@" "-old" "+new" | (cd /tmp/hermit-compat-patch && patch -s file); cat /tmp/hermit-compat-patch/file; rm -rf /tmp/hermit-compat-patch' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe grep bash -c \
+        'set -euo pipefail; printf "alpha\nbeta\ngamma\n" | grep -x alpha' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe egrep bash -c \
+        'set -euo pipefail; printf "alpha\nbeta\ngamma\n" | egrep "alpha|gamma"' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe fgrep bash -c \
+        'set -euo pipefail; printf "alpha.beta\nalphaXbeta\n" | fgrep "alpha.beta"' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe sed bash -c \
+        'set -euo pipefail; printf "alpha beta\n" | sed "s/alpha/omega/"' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe tar bash -c \
+        'set -euo pipefail; rm -rf /tmp/hermit-compat-tar; mkdir /tmp/hermit-compat-tar; printf "archive-data\n" >/tmp/hermit-compat-tar/input; touch -t 200001010000 /tmp/hermit-compat-tar/input; tar -cf /tmp/hermit-compat-tar/archive.tar -C /tmp/hermit-compat-tar input; tar -tf /tmp/hermit-compat-tar/archive.tar; rm -rf /tmp/hermit-compat-tar' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe cp bash -c \
+        'set -euo pipefail; rm -rf /tmp/hermit-compat-cp; mkdir /tmp/hermit-compat-cp; printf "copy-data\n" >/tmp/hermit-compat-cp/source; cp /tmp/hermit-compat-cp/source /tmp/hermit-compat-cp/copy; cmp /tmp/hermit-compat-cp/source /tmp/hermit-compat-cp/copy; cat /tmp/hermit-compat-cp/copy; rm -rf /tmp/hermit-compat-cp' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe mv bash -c \
+        'set -euo pipefail; rm -rf /tmp/hermit-compat-mv; mkdir /tmp/hermit-compat-mv; printf "move-data\n" >/tmp/hermit-compat-mv/source; mv /tmp/hermit-compat-mv/source /tmp/hermit-compat-mv/moved; test ! -e /tmp/hermit-compat-mv/source; cat /tmp/hermit-compat-mv/moved; rm -rf /tmp/hermit-compat-mv' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe rm bash -c \
+        'set -euo pipefail; rm -rf /tmp/hermit-compat-rm; mkdir /tmp/hermit-compat-rm; printf "remove-data\n" >/tmp/hermit-compat-rm/file; rm /tmp/hermit-compat-rm/file; test ! -e /tmp/hermit-compat-rm/file; rmdir /tmp/hermit-compat-rm; printf "rm-ok\n"' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe mkdir bash -c \
+        'set -euo pipefail; rm -rf /tmp/hermit-compat-mkdir; mkdir -p /tmp/hermit-compat-mkdir/a/b; test -d /tmp/hermit-compat-mkdir/a/b; printf "mkdir-ok\n"; rm -rf /tmp/hermit-compat-mkdir' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe rmdir bash -c \
+        'set -euo pipefail; rm -rf /tmp/hermit-compat-rmdir; mkdir /tmp/hermit-compat-rmdir; rmdir /tmp/hermit-compat-rmdir; test ! -e /tmp/hermit-compat-rmdir; printf "rmdir-ok\n"' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe touch bash -c \
+        'set -euo pipefail; rm -f /tmp/hermit-compat-touch; touch -t 200001010000 /tmp/hermit-compat-touch; stat -c "%Y %s" /tmp/hermit-compat-touch; rm -f /tmp/hermit-compat-touch' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe chmod bash -c \
+        'set -euo pipefail; rm -f /tmp/hermit-compat-chmod; printf "mode\n" >/tmp/hermit-compat-chmod; chmod 640 /tmp/hermit-compat-chmod; stat -c "%a" /tmp/hermit-compat-chmod; rm -f /tmp/hermit-compat-chmod' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe chown bash -c \
+        'set -euo pipefail; rm -f /tmp/hermit-compat-chown; printf "owner\n" >/tmp/hermit-compat-chown; chown --reference=README.md /tmp/hermit-compat-chown; stat -c "%u:%g" /tmp/hermit-compat-chown; rm -f /tmp/hermit-compat-chown' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe ln bash -c \
+        'set -euo pipefail; rm -rf /tmp/hermit-compat-ln; mkdir /tmp/hermit-compat-ln; printf "link-data\n" >/tmp/hermit-compat-ln/source; ln /tmp/hermit-compat-ln/source /tmp/hermit-compat-ln/hard; ln -s source /tmp/hermit-compat-ln/sym; stat -c "%h" /tmp/hermit-compat-ln/source; cat /tmp/hermit-compat-ln/hard /tmp/hermit-compat-ln/sym; rm -rf /tmp/hermit-compat-ln' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe date /usr/bin/date -u +'%Y-%m-%dT%H:%M:%SZ' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe cal /usr/bin/cal 1 2000 \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe yes bash -c \
+        'set -eu; yes hermit | head -n 3' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe tac bash -c \
+        'set -euo pipefail; printf "first\nsecond\nthird\n" | tac' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe rev bash -c \
+        'set -euo pipefail; printf "Hermit\ndeterminism\n" | rev' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe fold bash -c \
+        'set -euo pipefail; printf "abcdefghijklmnopqrstuvwxyz\n" | fold -w 8' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe fmt bash -c \
+        'set -euo pipefail; printf "Hermit formats this deterministic paragraph into narrow lines for validation.\n" | fmt -w 24' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe shuf bash -c \
+        'set -euo pipefail; printf "alpha\nbeta\ngamma\ndelta\n" | shuf' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe numfmt /usr/bin/numfmt --to=iec 1048576 \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe csplit bash -c \
+        'set -euo pipefail; rm -rf /tmp/hermit-compat-csplit; mkdir /tmp/hermit-compat-csplit; printf "alpha\nbeta\ngamma\n" >/tmp/hermit-compat-csplit/input; (cd /tmp/hermit-compat-csplit && csplit -s input "/^beta$/" && cat xx00 xx01); rm -rf /tmp/hermit-compat-csplit' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe split bash -c \
+        'set -euo pipefail; rm -rf /tmp/hermit-compat-split; mkdir /tmp/hermit-compat-split; printf "one\ntwo\nthree\nfour\n" >/tmp/hermit-compat-split/input; split -l 2 /tmp/hermit-compat-split/input /tmp/hermit-compat-split/part-; cat /tmp/hermit-compat-split/part-*; rm -rf /tmp/hermit-compat-split' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe install bash -c \
+        'set -euo pipefail; rm -rf /tmp/hermit-compat-install; mkdir /tmp/hermit-compat-install; install -m 640 README.md /tmp/hermit-compat-install/copied; stat -c "%a %s" /tmp/hermit-compat-install/copied; rm -rf /tmp/hermit-compat-install' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe mkfifo bash -c \
+        'set -euo pipefail; rm -f /tmp/hermit-compat-fifo; mkfifo /tmp/hermit-compat-fifo; stat -c "%F" /tmp/hermit-compat-fifo; rm -f /tmp/hermit-compat-fifo' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    # The task named 29 utilities; cmp completes the requested 30-row push.
+    strict_compatibility_probe cmp bash -c \
+        'set -euo pipefail; rm -rf /tmp/hermit-compat-cmp; mkdir /tmp/hermit-compat-cmp; printf "same\n" >/tmp/hermit-compat-cmp/a; printf "same\n" >/tmp/hermit-compat-cmp/b; cmp -s /tmp/hermit-compat-cmp/a /tmp/hermit-compat-cmp/b; printf "cmp-ok\n"; rm -rf /tmp/hermit-compat-cmp' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
     # free is intentionally absent: its live /proc/meminfo values differ
     # between otherwise identical strict runs.
 
