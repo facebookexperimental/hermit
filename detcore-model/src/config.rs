@@ -210,6 +210,15 @@ pub struct Config {
     #[clap(long)]
     pub panic_on_unsupported_syscalls: bool,
 
+    /// Panic when a precise PMU timer overshoots its expected RCB target instead of logging an
+    /// error and continuing through normal timer handling. Intended for Detcore debugging.
+    #[serde(default)]
+    #[clap(
+        long = "panic-on-rbc-overshoot",
+        visible_alias = "panic-on-rcb-overshoot"
+    )]
+    pub panic_on_rcb_overshoot: bool,
+
     /// **Internal:** Set to `true` if we're inside a UTS namespace.
     // FIXME: This can be removed once spawn_fn-based tests support namespaces.
     #[clap(skip)]
@@ -547,6 +556,9 @@ impl fmt::Display for Config {
         if self.panic_on_unsupported_syscalls {
             write!(f, " --panic-on-unsupported-syscalls")?;
         }
+        if self.panic_on_rcb_overshoot {
+            write!(f, " --panic-on-rbc-overshoot")?;
+        }
         if self.kill_daemons {
             write!(f, " --kill-daemons")?;
         }
@@ -877,6 +889,18 @@ mod tests {
             RunsPostFork::Random
         );
         assert!(Config::try_parse_from(["detcore", "--runs-post-fork=invalid"]).is_err());
+    }
+
+    #[test]
+    fn panic_on_rcb_overshoot_is_opt_in_and_round_trips() {
+        assert!(!Config::default().panic_on_rcb_overshoot);
+
+        let config = Config::parse_from(["detcore", "--panic-on-rbc-overshoot"]);
+        assert!(config.panic_on_rcb_overshoot);
+        assert!(config.to_string().contains(" --panic-on-rbc-overshoot"));
+
+        let alias = Config::parse_from(["detcore", "--panic-on-rcb-overshoot"]);
+        assert!(alias.panic_on_rcb_overshoot);
     }
 
     #[test]

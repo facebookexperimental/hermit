@@ -667,6 +667,17 @@ fn strict_flag_preserves_deterministic_defaults() {
 }
 
 #[test]
+fn panic_on_rbc_overshoot_flag_wires_to_detcore_config() {
+    let default = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    assert!(!default.det_opts.det_config.panic_on_rcb_overshoot);
+
+    let mut opts = RunOpts::parse_from(["fakehermit", "--panic-on-rbc-overshoot", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert!(opts.det_opts.det_config.panic_on_rcb_overshoot);
+    assert_eq!(format!("{}", opts), " --panic-on-rbc-overshoot -- fakeprog");
+}
+
+#[test]
 fn passthru_optimization_requires_explicit_opt_in() {
     let mut ro = RunOpts::parse_from(["fakehermit", "--passthru-opt", "fakeprog"]);
     ro.validate_args_with_perf_support(true).unwrap();
@@ -759,6 +770,7 @@ fn strict_help_describes_compatibility_and_opt_outs() {
         "Disable deterministic I/O behavior",
         "--passthru-opt",
         "optimized partial syscall subscription set",
+        "--panic-on-rbc-overshoot",
         "--backend <BACKEND>",
         "Select the process instrumentation backend",
         "ptrace",

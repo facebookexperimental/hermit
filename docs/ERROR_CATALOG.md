@@ -153,6 +153,7 @@ the first passthrough candidate.
 | `Failed to open preemption stacktrace log file` | Configuration | `--preemption-stacktrace-log-file` is unwritable. | Correct the path/permissions or remove the file option to log to stderr. |
 | `Sequentializing but not virtualizing ... absolute clock_nanosleep ... just yielding` | Unsupported | Serialized scheduling was combined with host time for an absolute sleep Hermit cannot model. | Keep virtual time enabled, or use `--no-sequentialize-threads` only as a nondeterministic compatibility test. |
 | `Deadlock detected: thread(s) waiting on futex, but no runnable threads left` | Configuration | Every modeled thread is asleep on a futex and no modeled wake is possible. | Check the guest synchronization protocol first. Compare `--strace-only`; if the native guest progresses, report the minimized program as a Detcore bug. |
+| `prehook: PMU RCB overshoot! ...` | Environment | A precise PMU timer trapped after its expected retired-conditional-branch target. Detcore logs ERROR, preserves the timer state, and continues through normal timer handling. | Capture the host CPU/kernel details if this repeats. Add `--panic-on-rbc-overshoot` (or `--panic-on-rcb-overshoot`) to stop at the detection point and collect a backtrace. |
 | guest hangs after PMU warning | Configuration | Timer preemption is disabled and a CPU-bound thread reaches no intercepted scheduling event. | Enable PMU access or add explicit guest synchronization/yields. `--no-sequentialize-threads` is diagnostic and weakens determinism. |
 
 ## Internal Bug Panics
@@ -165,7 +166,7 @@ Do not work around them by trusting the output of the failed run.
 | Message family | Trigger |
 | --- | --- |
 | `LogicalTime::duration_since ... future`, `update_global_time ... before start`, `Attempted to update ... time ... already ...`, or `Trying to extract time for thread ... no entry` | Detcore's logical clock moved backward or lost a registered thread. |
-| `Couldn't read clock`, `Missed expected preemption`, `end_of_timeslice is None`, `Ended time slice ... still beyond`, `Timer invariant broken`, or `Failed to set timer` | PMU/RCB timeslice state violated an invariant or the backend rejected a timer. |
+| `Couldn't read clock`, `end_of_timeslice is None`, `Ended time slice ... still beyond`, `Timer invariant broken`, or `Failed to set timer` | PMU/RCB timeslice state violated an invariant or the backend rejected a timer. |
 | `Cannot set end of timeslice ... current ... already ...` | A replayed preemption point is not later than current thread time. This can originate in a mismatched/corrupt preemption record; regenerate it before reporting. |
 | `thread time should never go down`, `Global time is before epoch start`, or `bump_global_time ... went backwards` | Global and per-thread logical clocks disagree. |
 | `Detcore Default impl should not be called` or `Detcore GlobalState Default impl should not be called` | Reverie initialized Detcore through an invalid default path. |

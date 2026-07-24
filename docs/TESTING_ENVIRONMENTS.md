@@ -149,14 +149,17 @@ accept `--preemption-timeout=disabled` (weaker scheduling fidelity). This is an
 
 ### Unsupported / unrecognized CPU model
 
+- `prehook: PMU RCB overshoot! ...` at ERROR means a precise PMU timer trapped
+  after its expected RCB target. Detcore preserves the timer state and continues
+  through normal timer handling. Add `--panic-on-rbc-overshoot` (also accepted
+  as `--panic-on-rcb-overshoot`) to stop at the detection point for debugging.
 - Startup timer/perf invariant errors such as `Couldn't read clock`,
-  `Missed expected preemption`, `end_of_timeslice is None`,
-  `Timer invariant broken`, or `Failed to set timer`, on a host that *does* have
-  a PMU.
+  `end_of_timeslice is None`, `Timer invariant broken`, or `Failed to set timer`,
+  on a host that *does* have a PMU.
 
 **Action:** capture `lscpu` and the exact message. A PMU-capable bare-metal host
-that still rejects the model is a **CPU-support bug** worth filing (include the
-diagnostic block below).
+that repeatedly overshoots or rejects the model is a **CPU-support bug** worth
+filing (include the diagnostic block below).
 
 ### CPUID interception / RDRAND/RDSEED mismatch
 

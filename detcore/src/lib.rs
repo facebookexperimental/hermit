@@ -136,6 +136,23 @@ use crate::types::SigWrapper;
 #[macro_use]
 extern crate bitflags;
 
+#[cold]
+fn report_rcb_overshoot(
+    panic_on_rcb_overshoot: bool,
+    clock_value: u64,
+    delta_rcbs: u64,
+    last_timer: u64,
+) {
+    let message = format!(
+        "prehook: PMU RCB overshoot! Clock_value: {}. Stepped forward {} RCBs, but should have trapped at {}",
+        clock_value, delta_rcbs, last_timer
+    );
+    if panic_on_rcb_overshoot {
+        panic!("{}", message);
+    }
+    error!("{}", message);
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     async fn passthrough<G: Guest<Self>>(
         &self,
@@ -237,18 +254,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                     && delta_rcbs > last_timer
                     && precise_timers
                 {
-                    panic!(
-                        "prehook: Missed expected preemption! Clock_value: {}. Stepped forward {:?} RCBs, but should have trapped at {:?}",
-                        clock_value, delta_rcbs, last_timer
+                    report_rcb_overshoot(
+                        self.cfg.panic_on_rcb_overshoot,
+                        clock_value,
+                        delta_rcbs,
+                        last_timer,
                     );
-                    // TODO: turn the above panic into a warning again if we see any weirdness
-                    // on certain platforms.
-                    // We can repair the state and keep going, using the below:
-                    /*
-                    thread_state.end_of_timeslice = None;
-                    thread_state.last_rcb_timer = None;
-                    thread_state.next_timeslice(&self.cfg);
-                    */
+                    // Preserve timer state. `pre_handler_hook` will yield through the normal
+                    // scheduler path if the slice expired; `post_handler_hook` will otherwise
+                    // re-arm an overshot `interrupt_at` timer.
                 }
                 // Otherwise we're very early, at the prehook of handle_thread_start.
             } else {
@@ -1585,5 +1599,81 @@ mod subscription_tests {
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::writev)
         );
+    }
+}
+
+#[cfg(test)]
+mod rcb_overshoot_tests {
+    use std::fmt::Write;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use tracing::Event;
+    use tracing::Id;
+    use tracing::Level;
+    use tracing::Metadata;
+    use tracing::Subscriber;
+    use tracing::field::Field;
+    use tracing::field::Visit;
+    use tracing::span::Attributes;
+    use tracing::span::Record;
+    use tracing::subscriber::with_default;
+
+    use super::report_rcb_overshoot;
+
+    struct ErrorSubscriber(Arc<Mutex<Option<String>>>);
+
+    struct EventVisitor(String);
+
+    impl Visit for EventVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let _ = write!(self.0, "{}={:?}", field.name(), value);
+        }
+    }
+
+    impl Subscriber for ErrorSubscriber {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() == Level::ERROR
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            if *event.metadata().level() == Level::ERROR {
+                let mut visitor = EventVisitor(String::new());
+                event.record(&mut visitor);
+                *self.0.lock().unwrap() = Some(visitor.0);
+            }
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    #[test]
+    fn default_overshoot_policy_emits_error_and_returns() {
+        let error = Arc::new(Mutex::new(None));
+        with_default(ErrorSubscriber(error.clone()), || {
+            report_rcb_overshoot(false, 16_249, 139, 100);
+        });
+
+        let error = error.lock().unwrap().take().expect("missing ERROR event");
+        assert!(error.contains("PMU RCB overshoot"), "{error}");
+        assert!(error.contains("16249"), "{error}");
+        assert!(error.contains("139"), "{error}");
+        assert!(error.contains("100"), "{error}");
+    }
+
+    #[test]
+    #[should_panic(expected = "PMU RCB overshoot")]
+    fn opt_in_overshoot_policy_panics() {
+        report_rcb_overshoot(true, 16_249, 139, 100);
     }
 }
