@@ -183,12 +183,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Close,
     ) -> Result<i64, Error> {
         let fd = call.fd();
-        let res = self.record_or_replay(guest, call).await?;
-        if let Some(open_file_id) = guest.thread_state_mut().remove_fd(fd) {
-            self.release_port_for_open_file(guest, open_file_id).await;
+        let res = self.record_or_replay(guest, call).await;
+        let fd_was_released = !matches!(res, Err(Errno::EBADF) | Err(Errno::ERESTARTSYS));
+        if fd_was_released {
+            if let Some(open_file_id) = guest.thread_state_mut().remove_fd(fd) {
+                self.release_port_for_open_file(guest, open_file_id).await;
+            }
+            trace!("Closed {}", fd);
         }
-        trace!("Closed {}", fd);
-        Ok(res)
+        res.map_err(Error::from)
     }
 
     async fn snapshot_procfs<G: Guest<Self>>(

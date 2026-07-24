@@ -52,6 +52,61 @@ fn read_iovecs<M: MemoryAccess>(
     Ok(iovecs)
 }
 
+fn cmsg_align(length: usize) -> Option<usize> {
+    let alignment = std::mem::size_of::<usize>();
+    length
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
+}
+
+fn scm_rights_fds(control: &[u8]) -> Vec<i32> {
+    let header_size = std::mem::size_of::<libc::cmsghdr>();
+    let data_offset = cmsg_align(header_size).unwrap();
+    let mut offset: usize = 0;
+    let mut fds = Vec::new();
+
+    while offset
+        .checked_add(header_size)
+        .is_some_and(|end| end <= control.len())
+    {
+        // The recorded control buffer has native cmsghdr layout but may not be
+        // aligned as a Vec<u8>, so read the header without assuming alignment.
+        let header = unsafe {
+            std::ptr::read_unaligned(control.as_ptr().add(offset).cast::<libc::cmsghdr>())
+        };
+        let length = header.cmsg_len;
+        let Some(end) = offset.checked_add(length) else {
+            break;
+        };
+        if length < data_offset || end > control.len() {
+            break;
+        }
+
+        if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_RIGHTS {
+            let (fd_bytes, _) =
+                control[offset + data_offset..end].as_chunks::<{ std::mem::size_of::<i32>() }>();
+            for bytes in fd_bytes {
+                let fd = i32::from_ne_bytes(*bytes);
+                if fd >= 0 {
+                    fds.push(fd);
+                }
+            }
+        }
+
+        let Some(aligned_length) = cmsg_align(length) else {
+            break;
+        };
+        let Some(next) = offset.checked_add(aligned_length) else {
+            break;
+        };
+        if next <= offset {
+            break;
+        }
+        offset = next;
+    }
+    fds
+}
+
 impl Replayer {
     pub(super) async fn handle_epoll_wait<G: Guest<Self>>(
         &self,
@@ -149,6 +204,11 @@ impl Replayer {
         syscall: Recvmsg,
     ) -> Result<i64, Errno> {
         let event = next_event!(guest, Recvmsg)?;
+        let cloexec = syscall.flags() & libc::MSG_CMSG_CLOEXEC != 0;
+        for fd in scm_rights_fds(&event.control) {
+            self.reserve_replay_fd(guest, fd, cloexec).await;
+        }
+
         let message_address = syscall.msg().ok_or(Errno::EFAULT)?;
         let mut message: libc::msghdr = guest.memory().read_value(message_address)?;
         let iovecs = read_iovecs(&guest.memory(), &message)?;

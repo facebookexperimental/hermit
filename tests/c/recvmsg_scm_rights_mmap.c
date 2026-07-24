@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#define _GNU_SOURCE
+
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -76,6 +78,14 @@ int main(void) {
 
   int received;
   memcpy(&received, CMSG_DATA(receive_cmsg), sizeof(received));
+  const int later_memfd = memfd_create("after-scm-rights", MFD_CLOEXEC);
+  if (later_memfd < 0) {
+    fail("memfd_create(after SCM_RIGHTS)");
+  }
+  if (later_memfd == received) {
+    fputs("SCM_RIGHTS descriptor slots collided\n", stderr);
+    return EXIT_FAILURE;
+  }
   unsigned char *mapping =
       mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, received, 0);
   if (mapping == MAP_FAILED) {
@@ -91,8 +101,8 @@ int main(void) {
   if (munmap(mapping, 4096) != 0) {
     fail("munmap");
   }
-  if (close(received) != 0 || close(source) != 0 || close(sockets[0]) != 0 ||
-      close(sockets[1]) != 0) {
+  if (close(later_memfd) != 0 || close(received) != 0 || close(source) != 0 ||
+      close(sockets[0]) != 0 || close(sockets[1]) != 0) {
     fail("close");
   }
 

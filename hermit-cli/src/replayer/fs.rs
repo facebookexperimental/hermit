@@ -26,6 +26,7 @@ use reverie::syscalls::Readlink;
 use reverie::syscalls::RtSigtimedwait;
 use reverie::syscalls::RtTgsigqueueinfo;
 use reverie::syscalls::Statx;
+use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::family::StatFamily;
 use reverie::syscalls::family::WriteFamily;
@@ -536,9 +537,8 @@ impl Replayer {
             request,
             ioctl::Request::FIOCLEX | ioctl::Request::FIONCLEX | ioctl::Request::FIONBIO(_)
         ) {
-            // Replayed opens do not necessarily create host file descriptors.
-            // Detcore updates the logical descriptor metadata after this returns.
-            next_event!(guest, Return)
+            self.handle_replayed_fd_operation(guest, Syscall::from(syscall))
+                .await
         } else if request.direction() == ioctl::Direction::Read {
             let output = next_event!(guest, Ioctl)?;
             request.write_output(&mut guest.memory(), &output)?;

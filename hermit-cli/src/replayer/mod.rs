@@ -27,6 +27,11 @@ use reverie::RdtscResult;
 use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
+use reverie::syscalls::Close;
+use reverie::syscalls::EfdFlags;
+use reverie::syscalls::Eventfd2;
+use reverie::syscalls::FcntlCmd;
+use reverie::syscalls::OFlag;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Sysno;
 use serde::Deserialize;
@@ -169,24 +174,40 @@ impl Tool for Replayer {
             Syscall::Getdents64(syscall) => self.handle_getdents64(guest, syscall).await,
             Syscall::Mmap(syscall) => self.handle_mmap(guest, syscall).await,
             Syscall::Munmap(_) => self.let_through(guest, syscall).await,
-            Syscall::Open(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Openat(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Close(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Open(call) => {
+                self.handle_virtual_fd_create(guest, call.flags().contains(OFlag::O_CLOEXEC))
+                    .await
+            }
+            Syscall::Openat(call) => {
+                self.handle_virtual_fd_create(guest, call.flags().contains(OFlag::O_CLOEXEC))
+                    .await
+            }
+            Syscall::Close(_) => self.handle_close(guest, syscall).await,
             Syscall::Fchdir(_) => self.handle_simple(guest, syscall).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
             Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
             Syscall::Ftruncate(syscall) => self.handle_ftruncate(guest, syscall),
-            Syscall::Dup(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Dup(_) => self.handle_replayed_fd_operation(guest, syscall).await,
             Syscall::Dup2(_) => self.handle_dup2(guest, syscall).await,
-            Syscall::Dup3(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Dup3(_) => self.handle_replayed_fd_operation(guest, syscall).await,
             Syscall::Ioctl(syscall) => self.handle_ioctl(guest, syscall).await,
-            Syscall::Socket(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Socket(_) => self.handle_replayed_fd_operation(guest, syscall).await,
             Syscall::ClockGettime(syscall) => self.handle_clock_gettime(guest, syscall).await,
             Syscall::Gettimeofday(syscall) => self.handle_gettimeofday(guest, syscall).await,
             Syscall::Settimeofday(_) => self.handle_simple(guest, syscall).await,
             Syscall::Time(syscall) => self.handle_time(guest, syscall).await,
             Syscall::Setsockopt(_) => self.handle_simple(guest, syscall).await,
-            // FIXME: Not all fcntl cases are simple.
+            Syscall::Fcntl(call)
+                if matches!(
+                    call.cmd(),
+                    FcntlCmd::F_DUPFD(_) | FcntlCmd::F_DUPFD_CLOEXEC(_)
+                ) =>
+            {
+                self.handle_replayed_fd_operation(guest, syscall).await
+            }
+            Syscall::Fcntl(call) if matches!(call.cmd(), FcntlCmd::F_SETFD(_)) => {
+                self.handle_replayed_fd_operation(guest, syscall).await
+            }
             Syscall::Fcntl(_) => self.handle_simple(guest, syscall).await,
             Syscall::Connect(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendto(_) => self.handle_simple(guest, syscall).await,
@@ -222,6 +243,99 @@ impl Tool for Replayer {
 }
 
 impl Replayer {
+    pub(super) async fn reserve_replay_fd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: i32,
+        cloexec: bool,
+    ) {
+        let flags = if cloexec {
+            EfdFlags::EFD_CLOEXEC
+        } else {
+            EfdFlags::empty()
+        };
+        let placeholder = guest
+            .inject_with_retry(Eventfd2::new().with_count(0).with_flags(flags))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("could not reserve replay FD {fd} with an eventfd: {error}")
+            });
+        if placeholder != i64::from(fd) {
+            let _ = guest.inject(Close::new().with_fd(placeholder as i32)).await;
+            panic!(
+                "replay FD namespace diverged: expected slot {fd}, placeholder returned {placeholder}"
+            );
+        }
+    }
+
+    async fn handle_virtual_fd_create<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        cloexec: bool,
+    ) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Return);
+        if let Ok(fd) = recorded {
+            self.reserve_replay_fd(guest, fd as i32, cloexec).await;
+        }
+        recorded
+    }
+
+    async fn handle_replayed_fd_operation<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Return);
+        if let Ok(expected) = recorded {
+            let actual = guest
+                .inject_with_retry(syscall)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "replayed FD operation {:?} failed after recording returned {expected}: {error}",
+                        syscall
+                    )
+                });
+            if actual != expected {
+                panic!(
+                    "replay FD namespace diverged for {:?}: recorded {expected}, replayed {actual}",
+                    syscall
+                );
+            }
+        }
+        recorded
+    }
+
+    /// Replays the recorded result of `close` while preserving its physical FD
+    /// namespace effect.
+    async fn handle_close<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Return);
+
+        // Linux releases a descriptor even when close reports EINTR, EIO,
+        // ENOSPC, or EDQUOT. EBADF leaves the namespace unchanged, while
+        // ERESTARTSYS means Reverie must restart the injection first.
+        if !matches!(recorded, Err(Errno::EBADF | Errno::ERESTARTSYS))
+            && let Err(error) = guest.inject(syscall).await
+        {
+            if error == Errno::EBADF {
+                // Some replayed descriptor sources, notably SCM_RIGHTS,
+                // currently have no physical peer.
+                tracing::debug!(?syscall, "replayed close had no physical descriptor");
+            } else {
+                tracing::warn!(
+                    ?error,
+                    "physical close during replay differed from the recorded result"
+                );
+            }
+        }
+
+        recorded
+    }
+
     // Check if we received the expected syscall or not.
     fn expect_syscall<G: Guest<Self>>(&self, guest: &mut G, syscall: Syscall) {
         let thread = guest.tid();
