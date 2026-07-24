@@ -142,32 +142,37 @@ jobs:
       with:
         go-version: stable
         cache: false
+    - name: Repair runner hostname resolution
+      run: |
+        runner_hostname="$(hostname)"
+        if ! getent hosts "$runner_hostname" >/dev/null 2>&1; then
+          printf '127.0.1.1 %s\n' "$runner_hostname" | sudo tee -a /etc/hosts >/dev/null
+        fi
+        getent hosts "$runner_hostname"
     - name: Dependencies
       run: |
         # libunwind + lzma are required for linking (RUSTFLAGS=-C link-arg=-llzma),
         # and g++ builds the C fixtures. cmake + zlib build DynamoRIO drsyms_static;
-        # redis/sqlite back specific tests; Java and nginx are required by
-        # app_strict_verify; the Go toolchain is optional
-        # (hermit-cli/tests/arbitrary_binaries.rs skips the `go` tool when absent).
-        # The self-hosted runner's package index is PARTIAL and was missing
-        # cmake/redis/sqlite3/zlib1g-dev, so a single `apt-get install` of the whole
-        # list exited 100 ("Unable to locate package ...") and failed the entire job
-        # before any test ran. Refresh the index first, install the hard link deps
-        # strictly, then install the rest best-effort (per package) so a package the
-        # runner cannot locate degrades coverage instead of failing the whole job.
+        # Redis, SQLite, curl, nginx, and a JDK are required by fail-closed e2e tests.
         if command -v dnf >/dev/null; then
-          sudo dnf makecache || echo "::notice::dnf makecache failed; using existing metadata"
-          sudo dnf install -y gcc-c++ libunwind-devel xz-devel
-          for pkg in cmake zlib-devel redis sqlite golang java-17-openjdk-devel nginx curl; do
-            sudo dnf install -y "$pkg" || echo "::notice::$pkg unavailable; skipping"
-          done
+          sudo dnf makecache
+          sudo dnf install -y \
+            cmake curl gcc-c++ java-17-openjdk-devel libunwind-devel nginx \
+            redis sqlite xz-devel zlib-devel
         elif command -v apt-get >/dev/null; then
-          sudo apt-get update || echo "::notice::apt-get update failed; using existing package index"
-          sudo apt-get install -y g++ libunwind-dev liblzma-dev
-          for pkg in cmake zlib1g-dev redis-server redis-tools sqlite3 golang-go default-jdk-headless nginx curl; do
-            sudo apt-get install -y "$pkg" || echo "::notice::$pkg unavailable; skipping"
-          done
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            cmake curl default-jdk-headless g++ liblzma-dev libunwind-dev nginx \
+            redis-server redis-tools sqlite3 zlib1g-dev
+        else
+          echo "::error::Unsupported package manager"
+          exit 1
         fi
+        for tool in cmake curl g++ go java javac nginx redis-cli redis-server sqlite3; do
+          command -v "$tool"
+        done
+        ldconfig -p | grep -q 'libunwind\.so'
+        ldconfig -p | grep -q 'liblzma\.so'
     - name: CPUID and RDRAND/RDSEED tests
       run: |
         cargo test -p detcore --test tests_misc has_rdrand_without_detcore -- --exact
