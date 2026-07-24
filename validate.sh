@@ -32,6 +32,7 @@ cd "$ROOT_DIR" || exit 1
 #                                            # regressed below FILE's baseline
 #   ./validate.sh --strict-compat-only        # run the nonblocking L2 app matrix
 #   ./validate.sh --rr-compat-only            # gate the known-passing R/R matrix
+#   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix
 #   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
 #   ./validate.sh --verbose                  # stream each gate's command, PID,
 #                                            # elapsed time, and subprocess output
@@ -44,6 +45,7 @@ VALIDATION_LEVEL="full"       # quick | full | super
 VALIDATION_LEVEL_EXPLICIT=0
 STRICT_COMPAT_ONLY=0
 RR_COMPAT_ONLY=0
+SABRE_COMPAT_ONLY=0
 QEMU_L2_ONLY=0
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
@@ -67,6 +69,9 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         --strict-compat-only) STRICT_COMPAT_ONLY=1; shift ;;
         --rr-compat-only) RR_COMPAT_ONLY=1; shift ;;
+        # AUTONOMOUS-BOT-IMPLEMENTED
+        # TODO-HUMAN-REVIEW(#589): Review the focused SaBRe compatibility CLI.
+        --sabre-compat-only) SABRE_COMPAT_ONLY=1; shift ;;
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
@@ -83,6 +88,7 @@ only_modes=0
 [[ $ENVELOPE_MODE == only ]] && ((only_modes += 1))
 ((STRICT_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((RR_COMPAT_ONLY == 1)) && ((only_modes += 1))
+((SABRE_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((QEMU_L2_ONLY == 1)) && ((only_modes += 1))
 if ((only_modes > 1)); then
     echo "validate.sh: choose only one focused validation mode" >&2
@@ -96,6 +102,7 @@ VALIDATION_PROFILE=$VALIDATION_LEVEL
 [[ $ENVELOPE_MODE == only ]] && VALIDATION_PROFILE="envelope-only"
 ((STRICT_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="strict-compat-only"
 ((RR_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="rr-compat-only"
+((SABRE_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="sabre-compat-only"
 ((QEMU_L2_ONLY == 1)) && VALIDATION_PROFILE="qemu-l2-only"
 
 default_gate_timeout_seconds=600
@@ -125,7 +132,7 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
-readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY QEMU_L2_ONLY
+readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY SABRE_COMPAT_ONLY QEMU_L2_ONLY
 readonly VALIDATION_LEVEL VALIDATION_PROFILE
 
 SUPER_REPETITIONS=${SUPER_REPETITIONS:-20}
@@ -209,6 +216,10 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
 readonly RR_COMPAT_EXPECTED=128
+# The prior 115/121 floor plus 25 passing additions in the current corpus.
+# This is a compatibility floor, not a Detcore determinism claim.
+readonly SABRE_COMPAT_EXPECTED=140
+readonly SABRE_COMPAT_TOTAL=147
 COMPATIBILITY_MODE=strict
 
 # Exact label ratchet measured at Hermit a919cce. Commands remain owned by the
@@ -915,8 +926,8 @@ function rr_compatibility_probe {
 
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(#521): Review the initial nonblocking compatibility policy.
-# Run one known-compatible application at L2. Each row has its own hard timeout
-# so a regression cannot stall the rest of the matrix.
+# Run one application through strict L2 or the SaBRe compatibility path. Each
+# row has its own hard timeout so a regression cannot stall the rest of the matrix.
 function strict_compatibility_probe {
     local label=$1
     shift
@@ -930,29 +941,38 @@ function strict_compatibility_probe {
     local output_start
     local status
     local summary
+    local assurance=L2
+    local -a run_args=(run --strict --verify --)
+    if [[ $COMPATIBILITY_MODE == sabre ]]; then
+        assurance=SaBRe
+        run_args=(run --backend sabre --strict --verify --)
+    fi
 
     {
-        printf "=== Strict compatibility: %s ===\n" "$label"
-        printf "Command: timeout %s %q run --strict --verify --" \
+        printf "=== %s compatibility: %s ===\n" "$assurance" "$label"
+        printf "Command: timeout %s %q" \
             "$STRICT_COMPAT_TIMEOUT" "$STRICT_COMPAT_HERMIT_BIN"
+        printf " %q" "${run_args[@]}"
         printf " %q" "$@"
         printf "\n"
     } >>"$LOG_FILE"
     output_start=$(($(wc -l <"$LOG_FILE") + 1))
 
     if ((VERBOSE == 1)); then
-        printf "  compatibility probe: %s\n" "$label"
+        printf "  %s compatibility probe: %s\n" "$assurance" "$label"
     fi
 
     if timeout "$STRICT_COMPAT_TIMEOUT" \
-        "$STRICT_COMPAT_HERMIT_BIN" run --strict --verify -- "$@" \
+        "$STRICT_COMPAT_HERMIT_BIN" "${run_args[@]}" "$@" \
         </dev/null >>"$LOG_FILE" 2>&1; then
         status=0
-        printf "  ✅ %-12s PASS L2 (%ss)\n" "$label" "$((SECONDS - started_at))"
+        printf "  ✅ %-12s PASS %s (%ss)\n" \
+            "$label" "$assurance" "$((SECONDS - started_at))"
     else
         status=$?
         summary=$(failure_summary "$output_start")
-        printf "  ❌ %-12s FAIL (exit %s: %s)\n" "$label" "$status" "$summary"
+        printf "  ❌ %-12s FAIL %s (exit %s: %s)\n" \
+            "$label" "$assurance" "$status" "$summary"
     fi
 
     {
@@ -962,10 +982,8 @@ function strict_compatibility_probe {
     return "$status"
 }
 
-# This is an observation gate for now: full validation prints every regression
-# but does not add it to the fatal failure count. --strict-compat-only exposes
-# the real aggregate status so CI can mark the step while continue-on-error
-# keeps the lane nonblocking until the matrix is ratcheted.
+# Strict compatibility remains an observation gate in full validation. The
+# focused SaBRe and record/replay modes enforce their measured blocking floors.
 function run_compatibility_corpus {
     local passed=0
     local failed=0
@@ -974,6 +992,9 @@ function run_compatibility_corpus {
     if [[ $COMPATIBILITY_MODE == rr ]]; then
         printf "\n== Record/replay compatibility baseline (blocking gate) ==\n"
         printf "=== Record/replay compatibility baseline (blocking gate) ===\n" >>"$LOG_FILE"
+    elif [[ $COMPATIBILITY_MODE == sabre ]]; then
+        printf "\n== SaBRe compatibility ratchet (blocking floor) ==\n"
+        printf "=== SaBRe compatibility ratchet (blocking floor) ===\n" >>"$LOG_FILE"
     else
         printf "\n== Strict compatibility envelope (L2, nonblocking) ==\n"
         printf "=== Strict compatibility envelope (L2, nonblocking) ===\n" >>"$LOG_FILE"
@@ -1372,6 +1393,22 @@ function run_compatibility_corpus {
     fi
 
     total=$((passed + failed))
+    if [[ $COMPATIBILITY_MODE == sabre ]]; then
+        if ((total != SABRE_COMPAT_TOTAL)); then
+            printf "❌ SaBRe compatibility corpus selected %s rows; expected %s\n" \
+                "$total" "$SABRE_COMPAT_TOTAL"
+            return 1
+        fi
+        if ((passed < SABRE_COMPAT_EXPECTED)); then
+            printf "❌ SaBRe compatibility ratchet regressed (%s/%s passed; floor %s)\n" \
+                "$passed" "$total" "$SABRE_COMPAT_EXPECTED"
+            return 1
+        fi
+        printf "✅ SaBRe compatibility ratchet (%s/%s passed; floor %s)\n" \
+            "$passed" "$total" "$SABRE_COMPAT_EXPECTED"
+        return 0
+    fi
+
     if ((failed == 0)); then
         printf "✅ Strict compatibility envelope (%s/%s passed L2)\n" "$passed" "$total"
         return 0
@@ -1385,6 +1422,26 @@ function run_compatibility_corpus {
 function run_strict_compatibility_envelope {
     COMPATIBILITY_MODE=strict
     run_compatibility_corpus
+}
+
+function run_sabre_compatibility_envelope {
+    local status=0
+
+    COMPATIBILITY_MODE=sabre
+    run_compatibility_corpus || status=$?
+    COMPATIBILITY_MODE=strict
+    return "$status"
+}
+
+function require_sabre_artifacts {
+    local variable
+    for variable in HERMIT_SABRE_RUNNER HERMIT_SABRE_BINARY HERMIT_SABRE_PLUGIN; do
+        if [[ -z ${!variable:-} || ! -f ${!variable} ]]; then
+            printf "validate.sh: %s must name a regular file for SaBRe compatibility\n" \
+                "$variable" >&2
+            return 1
+        fi
+    done
 }
 
 function run_rr_compatibility_envelope {
@@ -1652,6 +1709,21 @@ if ((STRICT_COMPAT_ONLY == 1)); then
         exit 1
     fi
     run_strict_compatibility_envelope
+    exit $?
+fi
+
+if ((SABRE_COMPAT_ONLY == 1)); then
+    run_check "SaBRe artifacts configured" require_sabre_artifacts
+    if ((failures == 0)); then
+        run_check "Build release Hermit for SaBRe compatibility" \
+            cargo build --release -p hermit
+    fi
+    if ((failures == 0)); then
+        run_check "SaBRe compatibility ratchet (147 programs)" \
+            run_sabre_compatibility_envelope
+    fi
+    print_summary
+    ((failures == 0))
     exit $?
 fi
 

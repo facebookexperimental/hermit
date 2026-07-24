@@ -37,7 +37,7 @@ impl StraceOpts {
             anyhow::bail!("the SaBRe strace backend does not support --log or --log-file");
         }
         match global.backend {
-            Some(Backend::Sabre) => super::backends::run_sabre(&self.program, &self.args),
+            Some(Backend::Sabre) => super::backends::run_sabre_strace(&self.program, &self.args),
             Some(backend) => anyhow::bail!(
                 "the M1 strace command requires `--backend sabre`, not `--backend {}`",
                 backend.as_str()
