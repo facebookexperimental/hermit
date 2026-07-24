@@ -1,0 +1,99 @@
+{
+  "bzip2_bytes": 2097152,
+  "cpu": 41,
+  "cpu_governor": "performance",
+  "cpu_model": "AMD EPYC 9D85 158-Core Processor",
+  "cpu_selection": "least-busy-250ms",
+  "fork_iterations": 16,
+  "git_commit": "5e66b600097deefb09c78510228815a0cbd2f83c",
+  "git_worktree_dirty": true,
+  "hermit": "/home/newton/work/dev-hermit/worktrees/slot57/target/release/hermit",
+  "hermit_sha256": "e981f212b38a8b2af62683e326866a6545a2aaaf6f520a220c57a073a8962a85",
+  "kernel": "6.17.13-0_fbk0_crackerjackhost_0_g2b4321c50d79",
+  "leveldb_bench": "/home/newton/work/dev-hermit/worktrees/slot57/target/backend-benchmarks/deps/leveldb-build-bench/db_bench",
+  "leveldb_bench_sha256": "c089818a4c8b7d22f109d989a267f44feded9970394a0cd97395ffa2b9f6cde6",
+  "leveldb_operations": 2000,
+  "leveldb_source_commit": "99b3c03b3284f5886f9ef9a4ef703d57373e61be",
+  "load_average": [
+    343.6,
+    402.04,
+    418.66
+  ],
+  "machine": "x86_64",
+  "measurement": "GNU time per process group plus perf_counter_ns wall clock",
+  "modes": [
+    "native",
+    "ptrace",
+    "dbi",
+    "kvm"
+  ],
+  "ninja": "/home/newton/work/dev-hermit/worktrees/slot57/target/backend-benchmarks/deps/ninja/ninja",
+  "ninja_jobs": 32,
+  "ninja_sha256": "73816b5d88c6f7d9e2f52427e6a9e7e5dd10b6306e1a68ec327f1615862b4433",
+  "ninja_source_commit": "79feac0f3e3bc9da9effc586cd5fea41e7550051",
+  "runner_sha256": "9aaa62b87b50d0243d4a0abd461002627f6942744fa55c9012ff27a72301104b",
+  "samples": 7,
+  "shared_hermit_flags": [
+    "--log=off",
+    "run",
+    "--backend=MODE",
+    "--strict",
+    "--base-env=minimal",
+    "--tmp=/tmp"
+  ],
+  "sqlite_rows": 20000,
+  "syscall_iterations": 2000,
+  "timeout_seconds": 30.0,
+  "timestamp_utc": "2026-07-24T20:07:37.394548+00:00",
+  "warmups": 1,
+  "workloads": {
+    "bzip2-2m": [
+      "/usr/bin/bzip2",
+      "-9",
+      "-c",
+      "/home/newton/work/dev-hermit/worktrees/slot57/target/backend-benchmark-fixtures-3hhy9oc3/bzip2-input.bin"
+    ],
+    "fork-baseline": [
+      "/home/newton/work/dev-hermit/worktrees/slot57/target/backend-benchmark-fixtures-3hhy9oc3/fork_exec_loop",
+      "0"
+    ],
+    "fork-exec": [
+      "/home/newton/work/dev-hermit/worktrees/slot57/target/backend-benchmark-fixtures-3hhy9oc3/fork_exec_loop",
+      "16"
+    ],
+    "leveldb-fillread": [
+      "/home/newton/work/dev-hermit/worktrees/slot57/target/backend-benchmarks/deps/leveldb-build-bench/db_bench",
+      "--benchmarks=fillseq,readrandom",
+      "--num=2000",
+      "--reads=2000",
+      "--threads=1",
+      "--value_size=100",
+      "--compression_ratio=0.5",
+      "--db=/home/newton/work/dev-hermit/worktrees/slot57/target/backend-benchmark-fixtures-3hhy9oc3/leveldb-data",
+      "--use_existing_db=0"
+    ],
+    "ninja-graph": [
+      "/home/newton/work/dev-hermit/worktrees/slot57/target/backend-benchmarks/deps/ninja/ninja",
+      "--quiet",
+      "-j1",
+      "-C",
+      "/home/newton/work/dev-hermit/worktrees/slot57/target/backend-benchmark-fixtures-3hhy9oc3/ninja-graph"
+    ],
+    "sqlite-insert-index": [
+      "/usr/bin/sqlite3",
+      "/home/newton/work/dev-hermit/worktrees/slot57/target/backend-benchmark-fixtures-3hhy9oc3/sqlite-benchmark.db",
+      "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; CREATE TABLE bench(id INTEGER PRIMARY KEY, payload TEXT); WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < 20000) INSERT INTO bench SELECT x, printf('%08d-payload', x) FROM n; CREATE INDEX bench_payload ON bench(payload); SELECT count(*), sum(length(payload)) FROM bench;"
+    ],
+    "syscall-baseline": [
+      "/home/newton/work/dev-hermit/worktrees/slot57/target/backend-benchmark-fixtures-3hhy9oc3/syscall_loop",
+      "0"
+    ],
+    "syscall-loop": [
+      "/home/newton/work/dev-hermit/worktrees/slot57/target/backend-benchmark-fixtures-3hhy9oc3/syscall_loop",
+      "2000"
+    ],
+    "true": [
+      "/bin/true"
+    ]
+  }
+}

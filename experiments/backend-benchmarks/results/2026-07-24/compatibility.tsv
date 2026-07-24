@@ -1,0 +1,37 @@
+workload	category	mode	status	exit_code	wall_ms	stdout_sha256	detail
+true	startup	native	pass	0	5.457592	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit and semantic output checks passed
+true	startup	ptrace	pass	0	64.848737	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit and semantic output checks passed
+true	startup	dbi	pass	0	6018.167036	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit and semantic output checks passed
+true	startup	kvm	pass	0	259.518593	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit and semantic output checks passed
+syscall-baseline	microbaseline	native	pass	0	4.687217	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit and semantic output checks passed
+syscall-baseline	microbaseline	ptrace	pass	0	64.073433	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit and semantic output checks passed
+syscall-baseline	microbaseline	dbi	pass	0	5910.823584	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit and semantic output checks passed
+syscall-baseline	microbaseline	kvm	pass	0	216.653437	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit and semantic output checks passed
+syscall-loop	micro	native	pass	0	4.907971	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit and semantic output checks passed
+syscall-loop	micro	ptrace	pass	0	1138.943802	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit and semantic output checks passed
+syscall-loop	micro	dbi	pass	0	13384.642579	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit and semantic output checks passed
+syscall-loop	micro	kvm	pass	0	232.225684	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit and semantic output checks passed
+fork-baseline	microbaseline	native	pass	0	3.88257	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit and semantic output checks passed
+fork-baseline	microbaseline	ptrace	pass	0	90.024373	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit and semantic output checks passed
+fork-baseline	microbaseline	dbi	pass	0	645.418593	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit and semantic output checks passed
+fork-baseline	microbaseline	kvm	pass	0	129.006898	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit and semantic output checks passed
+fork-exec	micro	native	pass	0	12.943421	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit and semantic output checks passed
+fork-exec	micro	ptrace	pass	0	987.315689	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit and semantic output checks passed
+fork-exec	micro	dbi	pass	0	3571.172561	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit and semantic output checks passed
+fork-exec	micro	kvm	failed	1	128.414503	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit 1: fork: Function not implemented
+bzip2-2m	macro	native	pass	0	356.940282	cdd0d984772c7a300d1625709647cf72600cce8f5eff58ccd7c09b19352a3ec6	exit and semantic output checks passed
+bzip2-2m	macro	ptrace	pass	0	24322.613492	cdd0d984772c7a300d1625709647cf72600cce8f5eff58ccd7c09b19352a3ec6	exit and semantic output checks passed
+bzip2-2m	macro	dbi	pass	0	4051.279704	cdd0d984772c7a300d1625709647cf72600cce8f5eff58ccd7c09b19352a3ec6	exit and semantic output checks passed
+bzip2-2m	macro	kvm	pass	0	430.622374	cdd0d984772c7a300d1625709647cf72600cce8f5eff58ccd7c09b19352a3ec6	exit and semantic output checks passed
+ninja-graph	macro	native	pass	0	72.3459	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit and semantic output checks passed
+ninja-graph	macro	ptrace	pass	0	9532.066421	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit and semantic output checks passed
+ninja-graph	macro	dbi	timeout	NA	30032.456682	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exceeded 30.0s and process group was terminated
+ninja-graph	macro	kvm	failed	1	110.665312	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit 1: ninja: fatal: chdir to '/home/newton/work/dev-hermit/worktrees/slot57/target/backend-benchmark-fixtures-3hhy9oc3/ninja-graph' - Function not implemented
+leveldb-fillread	macro	native	pass	0	1098.444057	fba6ad240ffdb6b95683f124f9eddf2f9e7c42b3317dbe7c3026cc1c1248d781	exit and semantic output checks passed
+leveldb-fillread	macro	ptrace	pass	0	2179.803652	07fe6bd9c24bfbb778ed12773aa12e62852f89ef99c898196f1a3730efd80168	exit and semantic output checks passed
+leveldb-fillread	macro	dbi	timeout	NA	30033.85558	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exceeded 30.0s and process group was terminated
+leveldb-fillread	macro	kvm	failed	1	54.160404	c030ca0095764db06f1d30d892e51096ad57a210c7c6f4b7678c6989851a269f	exit 1: LevelDB: version 1.23 Date: Fri Dec 31 15:59:59 2021 open error: NotFound: /home/newton/work/dev-hermit/worktrees/slot57/target/backend-benchmark-fixtures-3hhy9oc3/leveldb-data/LOCK: No such file or directory
+sqlite-insert-index	macro	native	pass	0	33.266411	a6803fad410819abcb75c70d7eab7f2086c20c80498d02e58107bc440e9a194f	exit and semantic output checks passed
+sqlite-insert-index	macro	ptrace	pass	0	3166.570573	a6803fad410819abcb75c70d7eab7f2086c20c80498d02e58107bc440e9a194f	exit and semantic output checks passed
+sqlite-insert-index	macro	dbi	pass	0	795.25869	a6803fad410819abcb75c70d7eab7f2086c20c80498d02e58107bc440e9a194f	exit and semantic output checks passed
+sqlite-insert-index	macro	kvm	failed	10	50.99012	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	exit 10: Error: disk I/O error
