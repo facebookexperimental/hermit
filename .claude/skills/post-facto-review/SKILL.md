@@ -5,6 +5,19 @@ description: "Land reviewed, CI-green Hermit changes before human review and mar
 
 # Post-Facto-Review Mode
 
+## PR Comment Convention
+
+Every PR description and comment created under this workflow MUST start with
+the applicable role tag:
+
+- `[impl agent, MODEL]` for implementation agents
+- `[adversarial-reviewer agent, MODEL]` for review agents
+- `[coordinator, MODEL]` for coordinator agents
+- `[Human]` for the human owner
+
+Examples: `[impl agent, gpt-5.6-sol]`,
+`[adversarial-reviewer agent, opus-4.8]`.
+
 The **currently-active** landing discipline for autonomous multi-agent work.
 Changes land as soon as they are reviewed and CI-green; the human reviews them
 *after* they are on `main` and fixes forward. This is the fast counterpart to

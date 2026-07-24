@@ -5,6 +5,19 @@ description: "Gate key Hermit changes on adversarial review and explicit human a
 
 # Human-Review-First Mode
 
+## PR Comment Convention
+
+Every PR description and comment created under this workflow MUST start with
+the applicable role tag:
+
+- `[impl agent, MODEL]` for implementation agents
+- `[adversarial-reviewer agent, MODEL]` for review agents
+- `[coordinator, MODEL]` for coordinator agents
+- `[Human]` for the human owner
+
+Examples: `[impl agent, gpt-5.6-sol]`,
+`[adversarial-reviewer agent, opus-4.8]`.
+
 A landing discipline for autonomous multi-agent work in which **no KEY
 change reaches `main` until a human has approved it.** (Key changes
 defined below.) This is the *cautious* counterpart to

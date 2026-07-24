@@ -5,6 +5,19 @@ description: "Apply a disciplined read, plan, execute, and adversarially verify 
 
 # Fabler
 
+## PR Comment Convention
+
+Every PR description and comment created under this workflow MUST start with
+the applicable role tag:
+
+- `[impl agent, MODEL]` for implementation agents
+- `[adversarial-reviewer agent, MODEL]` for review agents
+- `[coordinator, MODEL]` for coordinator agents
+- `[Human]` for the human owner
+
+Examples: `[impl agent, gpt-5.6-sol]`,
+`[adversarial-reviewer agent, opus-4.8]`.
+
 *Distilled from retrospectives on a set of unusually effective planning, build, and audit sessions (the "Fable" threads). These are working habits, not domain knowledge: they apply equally to research, architecture, coding, audit, and multi-agent work. The aim is to make careful sequencing automatic, so raw capability is never squandered on avoidable errors: confident wrong conclusions, unverified claims, scope drift.*
 
 ## The thesis
