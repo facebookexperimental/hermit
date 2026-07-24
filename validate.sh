@@ -710,6 +710,76 @@ function run_strict_compatibility_envelope {
     strict_compatibility_probe unexpand bash -c \
         'printf "a   b\n" | unexpand -a -t 4' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe test /usr/bin/test 42 -eq 42 \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe bracket /usr/bin/[ 42 -eq 42 ']' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe printf /usr/bin/printf '%s=%d\n' hermit 42 \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe sleep /usr/bin/sleep 0 \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe stdbuf /usr/bin/stdbuf -o0 \
+        /usr/bin/printf 'stdbuf-ok\n' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe nohup /usr/bin/nohup /bin/echo nohup-ok \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe nice /usr/bin/nice -n 1 /bin/echo nice-ok \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe ionice /usr/bin/ionice -c 3 /bin/echo ionice-ok \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    # Query the virtualized guest PID rather than setting a host CPU/policy.
+    # shellcheck disable=SC2016
+    strict_compatibility_probe taskset bash -c 'taskset -p $$' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    # shellcheck disable=SC2016
+    strict_compatibility_probe chrt bash -c 'chrt -p $$' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe flock bash -c \
+        'set -euo pipefail; rm -f /tmp/hermit-compat-flock; flock -x /tmp/hermit-compat-flock -c "printf \"flock-ok\\n\""; rm -f /tmp/hermit-compat-flock' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    # Exercise logger formatting without writing to a host logging service.
+    strict_compatibility_probe logger /usr/bin/logger --stderr --no-act \
+        -t hermit-compat logger-ok \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe getopt /usr/bin/getopt -o ab: -- -a -b value \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe column bash -c \
+        'set -euo pipefail; printf "alpha:1\nbeta:22\n" | column -t -s :' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe hexdump bash -c \
+        'set -euo pipefail; printf "Hermit\n" | hexdump -C' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe xxd bash -c \
+        'set -euo pipefail; printf "Hermit\n" | xxd' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe strings bash -c \
+        'set -euo pipefail; printf "\0Hermit\0" | strings -n 5' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe od bash -c \
+        'set -euo pipefail; printf "Hermit\n" | od -An -tx1' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe sum /usr/bin/sum README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe cksum /usr/bin/cksum README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe b2sum /usr/bin/b2sum README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe tsort bash -c \
+        'set -euo pipefail; printf "alpha beta\nbeta gamma\n" | tsort' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe ptx bash -c \
+        'set -euo pipefail; printf "alpha beta\n" | ptx -f' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe pinky /usr/bin/pinky -l root \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe logname /usr/bin/logname \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe users /usr/bin/users \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe uptime /usr/bin/uptime -p \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    # timeout is intentionally absent: "timeout 1 true" hangs in Run1 while
+    # the parent waits in rt_sigsuspend for its delayed child.
     # Filesystem fixtures use distinct fixed paths and clean them before and
     # after each run so both sides of --verify begin from equivalent state.
     strict_compatibility_probe diff bash -c \
