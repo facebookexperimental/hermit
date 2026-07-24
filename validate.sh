@@ -17,8 +17,15 @@ readonly ROOT_DIR
 cd "$ROOT_DIR" || exit 1
 
 # --- Argument parsing -------------------------------------------------------
-# Default (no args): run the full validation suite, which also prints the
-# working-envelope vector at the end. The envelope path is factored out so CI
+# Usage: ./validate.sh [quick|full|super] [options]
+# Default (no level): run the full validation suite, which also prints the
+# working-envelope vector at the end.
+#   quick  Core ptrace run/verify/record smoke tests; no alternate backends.
+#   full   Everything in quick plus the complete suite and DBI/KVM gates.
+#   super  Repeat stress probes (20x by default) under moderate oversubscription
+#          and report a pass rate for every probe.
+#
+# The envelope path is factored out so CI
 # can call the *identical* measurement code and produce matching numbers:
 #   ./validate.sh --envelope-only            # measure + emit vector (JSON+human)
 #   ./validate.sh --envelope-compare FILE    # measure, then fail if any count
@@ -33,6 +40,8 @@ cd "$ROOT_DIR" || exit 1
 # VALIDATE_LABEL_PR=0 to disable the non-fatal GitHub update.
 ENVELOPE_MODE="full"          # full | only
 ENVELOPE_BASELINE=""
+VALIDATION_LEVEL="full"       # quick | full | super
+VALIDATION_LEVEL_EXPLICIT=0
 STRICT_COMPAT_ONLY=0
 RR_COMPAT_ONLY=0
 QEMU_L2_ONLY=0
@@ -43,6 +52,14 @@ VERBOSE=0
 PR_NUMBER=${PR_NUMBER:-}
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        quick|full|super)
+            if ((VALIDATION_LEVEL_EXPLICIT == 1)); then
+                echo "validate.sh: choose only one validation level" >&2
+                exit 2
+            fi
+            VALIDATION_LEVEL=$1
+            VALIDATION_LEVEL_EXPLICIT=1
+            shift ;;
         --envelope-only) ENVELOPE_MODE="only"; shift ;;
         --envelope-compare)
             ENVELOPE_MODE="only"; ENVELOPE_BASELINE=${2:-}
@@ -71,6 +88,15 @@ if ((only_modes > 1)); then
     echo "validate.sh: choose only one focused validation mode" >&2
     exit 2
 fi
+if ((VALIDATION_LEVEL_EXPLICIT == 1 && only_modes > 0)); then
+    echo "validate.sh: validation levels cannot be combined with focused validation modes" >&2
+    exit 2
+fi
+VALIDATION_PROFILE=$VALIDATION_LEVEL
+[[ $ENVELOPE_MODE == only ]] && VALIDATION_PROFILE="envelope-only"
+((STRICT_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="strict-compat-only"
+((RR_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="rr-compat-only"
+((QEMU_L2_ONLY == 1)) && VALIDATION_PROFILE="qemu-l2-only"
 
 default_gate_timeout_seconds=600
 if ((QEMU_L2_ONLY == 1)); then
@@ -100,6 +126,29 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
 readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY QEMU_L2_ONLY
+readonly VALIDATION_LEVEL VALIDATION_PROFILE
+
+SUPER_REPETITIONS=${SUPER_REPETITIONS:-20}
+if [[ ! $SUPER_REPETITIONS =~ ^[1-9][0-9]*$ ]]; then
+    echo "validate.sh: SUPER_REPETITIONS must be a positive integer" >&2
+    exit 2
+fi
+host_cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)
+if [[ ! $host_cpus =~ ^[1-9][0-9]*$ ]]; then
+    host_cpus=1
+fi
+SUPER_JOBS=${SUPER_JOBS:-$(((host_cpus * 3 + 1) / 2))}
+if [[ ! $SUPER_JOBS =~ ^[1-9][0-9]*$ ]]; then
+    echo "validate.sh: SUPER_JOBS must be a positive integer" >&2
+    exit 2
+fi
+readonly SUPER_REPETITIONS SUPER_JOBS host_cpus
+
+HOST_OS=$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | head -n 1)
+HOST_OS=${HOST_OS#\"}
+HOST_OS=${HOST_OS%\"}
+[[ -n $HOST_OS ]] || HOST_OS="unknown Linux"
+readonly HOST_OS
 
 checks=0
 failures=0
@@ -122,7 +171,13 @@ if [[ -z $LOG_FILE ]]; then
     exit 1
 fi
 readonly LOG_FILE
-printf "Hermit validation log\nRoot: %s\n\n" "$ROOT_DIR" >"$LOG_FILE"
+printf "Hermit validation log\nRoot: %s\nLevel: %s\nHost OS: %s\n\n" \
+    "$ROOT_DIR" "$VALIDATION_PROFILE" "$HOST_OS" >"$LOG_FILE"
+printf "Validation level: %s (host OS: %s)\n" "$VALIDATION_PROFILE" "$HOST_OS"
+if [[ $VALIDATION_LEVEL == super ]]; then
+    printf "Super stress: %s repetitions/probe, up to %s concurrent jobs (%s online CPUs)\n" \
+        "$SUPER_REPETITIONS" "$SUPER_JOBS" "$host_cpus"
+fi
 if ((VERBOSE == 1)); then
     printf "Verbose validation enabled\n"
     printf "  root: %s\n" "$ROOT_DIR"
@@ -549,6 +604,197 @@ function hermit_verify_smoke {
     timeout "$HERMIT_SMOKE_TIMEOUT" \
         "$HERMIT_BIN" "${HERMIT_RUN_ARGS[@]}" --verify -- \
         /bin/echo "$SMOKE_MARKER"
+}
+
+function hermit_record_replay_smoke {
+    local case_dir="$VALIDATION_TMP_DIR/record-smoke"
+    local data_dir="$case_dir/recording"
+    local record_stdout="$case_dir/record.stdout"
+    local replay_stdout="$case_dir/replay.stdout"
+
+    rm -rf "$case_dir"
+    mkdir -p "$case_dir"
+    timeout "$HERMIT_SMOKE_TIMEOUT" \
+        "$HERMIT_BIN" record start --data-dir "$data_dir" -- \
+        /bin/echo "$SMOKE_MARKER" >"$record_stdout" || return
+    timeout "$HERMIT_SMOKE_TIMEOUT" \
+        "$HERMIT_BIN" replay --autopilot --data-dir "$data_dir" \
+        >"$replay_stdout" || return
+    grep -Fxq "$SMOKE_MARKER" "$record_stdout" &&
+        cmp -s "$record_stdout" "$replay_stdout"
+}
+
+function backend_selector_supported {
+    "$HERMIT_BIN" run --help 2>&1 | grep -q -- '--backend'
+}
+
+function kvm_backend_available {
+    [[ -r /dev/kvm && -w /dev/kvm ]]
+}
+
+function dbi_backend_available {
+    timeout "$HERMIT_SMOKE_TIMEOUT" \
+        "$HERMIT_BIN" run --backend dbi -- /bin/true \
+        </dev/null >/dev/null 2>&1
+}
+
+function note_backend_skip {
+    local backend=$1
+    local reason=$2
+    printf "SKIP: %s backend gate (%s)\n" "$backend" "$reason"
+    printf "SKIP: %s backend gate (%s)\n" "$backend" "$reason" >>"$LOG_FILE"
+}
+
+function run_full_backend_gates {
+    if ! backend_selector_supported; then
+        note_backend_skip "DBI/KVM" "backend selector is unavailable"
+        return
+    fi
+
+    if kvm_backend_available; then
+        run_check "KVM backend parity ratchet" \
+            python3 experiments/backend-parity_20260722/run_matrix.py \
+            --backend kvm --require-backend
+    else
+        note_backend_skip "KVM" "/dev/kvm is not readable and writable"
+    fi
+
+    if dbi_backend_available; then
+        run_check "DBI backend parity ratchet" \
+            python3 experiments/backend-parity_20260722/run_matrix.py \
+            --backend dbi --require-backend
+    else
+        note_backend_skip "DBI" "backend smoke did not complete successfully"
+    fi
+}
+
+function super_probe_command {
+    local probe=$1
+    local iteration=$2
+    local data_dir
+    local status
+
+    case "$probe" in
+        ptrace-strict-verify)
+            timeout "$STRICT_COMPAT_TIMEOUT" \
+                "$STRICT_COMPAT_HERMIT_BIN" run --strict --verify -- \
+                /bin/echo "hermit-super-$iteration" ;;
+        ptrace-pipeline)
+            timeout "$STRICT_COMPAT_TIMEOUT" \
+                "$STRICT_COMPAT_HERMIT_BIN" run --strict --verify -- \
+                bash -c 'yes hermit | head -n 64 | sha256sum' ;;
+        ptrace-record-replay)
+            data_dir="$VALIDATION_TMP_DIR/super-record-$iteration"
+            rm -rf "$data_dir"
+            timeout "$STRICT_COMPAT_TIMEOUT" \
+                "$STRICT_COMPAT_HERMIT_BIN" record start --verify \
+                --data-dir "$data_dir" -- /bin/echo "hermit-super-record-$iteration"
+            status=$?
+            rm -rf "$data_dir"
+            return "$status" ;;
+        kvm-verify)
+            timeout "$STRICT_COMPAT_TIMEOUT" \
+                "$HERMIT_BIN" run --backend kvm --verify -- \
+                /bin/echo "hermit-super-kvm-$iteration" ;;
+        dbi-verify)
+            timeout "$STRICT_COMPAT_TIMEOUT" \
+                "$HERMIT_BIN" run --backend dbi --verify -- \
+                /bin/echo "hermit-super-dbi-$iteration" ;;
+        *)
+            echo "validate.sh: unknown super probe: $probe" >&2
+            return 2 ;;
+    esac
+}
+
+function run_super_probe {
+    local probe=$1
+    local passed=0
+    local iteration=1
+    local batch_size
+    local i
+    local status
+    local log_file
+    local -a pids=()
+    local -a iterations=()
+    local -a logs=()
+
+    while ((iteration <= SUPER_REPETITIONS)); do
+        batch_size=$SUPER_JOBS
+        if ((batch_size > SUPER_REPETITIONS - iteration + 1)); then
+            batch_size=$((SUPER_REPETITIONS - iteration + 1))
+        fi
+        pids=()
+        iterations=()
+        logs=()
+        for ((i = 0; i < batch_size; i += 1)); do
+            log_file="$VALIDATION_TMP_DIR/super-${probe}-$iteration.log"
+            super_probe_command "$probe" "$iteration" >"$log_file" 2>&1 &
+            pids+=("$!")
+            iterations+=("$iteration")
+            logs+=("$log_file")
+            iteration=$((iteration + 1))
+        done
+
+        for i in "${!pids[@]}"; do
+            if wait "${pids[$i]}"; then
+                passed=$((passed + 1))
+            else
+                status=$?
+                {
+                    printf '%s\n' \
+                        "--- super $probe iteration ${iterations[$i]} failed (exit $status) ---"
+                    tail -n 120 "${logs[$i]}"
+                } >>"$LOG_FILE"
+            fi
+        done
+    done
+
+    if ((passed == SUPER_REPETITIONS)); then
+        printf "  ✅ %-24s %s/%s (100%%)\n" \
+            "$probe" "$passed" "$SUPER_REPETITIONS" |
+            tee -a "$VALIDATION_TMP_DIR/super-report"
+        return 0
+    fi
+
+    printf "  ⚠️  %-24s %s/%s (%s%%) FLAKY/FAILING\n" \
+        "$probe" "$passed" "$SUPER_REPETITIONS" \
+        "$((100 * passed / SUPER_REPETITIONS))" |
+        tee -a "$VALIDATION_TMP_DIR/super-report"
+    return 1
+}
+
+function run_super_stress_suite {
+    local failed=0
+    local -a probes=(
+        ptrace-strict-verify
+        ptrace-pipeline
+        ptrace-record-replay
+    )
+    local probe
+
+    : >"$VALIDATION_TMP_DIR/super-report"
+    if backend_selector_supported && kvm_backend_available; then
+        probes+=(kvm-verify)
+    else
+        note_backend_skip "KVM super stress" "backend unavailable"
+        printf "  SKIP KVM super stress (backend unavailable)\n" \
+            >>"$VALIDATION_TMP_DIR/super-report"
+    fi
+    if backend_selector_supported && dbi_backend_available; then
+        probes+=(dbi-verify)
+    else
+        note_backend_skip "DBI super stress" "backend unavailable"
+        printf "  SKIP DBI super stress (backend unavailable)\n" \
+            >>"$VALIDATION_TMP_DIR/super-report"
+    fi
+
+    printf "\n== Super stress pass rates ==\n"
+    printf "Repetitions: %s; concurrency: %s; online CPUs: %s\n" \
+        "$SUPER_REPETITIONS" "$SUPER_JOBS" "$host_cpus"
+    for probe in "${probes[@]}"; do
+        run_super_probe "$probe" || failed=$((failed + 1))
+    done
+    ((failed == 0))
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -1323,11 +1569,77 @@ function apply_locally_validated_label {
 function print_summary {
     local passed=$((checks - failures))
     if ((failures == 0)); then
-        printf "✅ Validation summary (%s passed, 0 failed; full log: %s)\n" \
-            "$passed" "$LOG_FILE"
+        printf "✅ Validation summary [%s] (%s passed, 0 failed; full log: %s)\n" \
+            "$VALIDATION_PROFILE" "$passed" "$LOG_FILE"
     else
-        printf "❌ Validation summary (%s passed, %s failed; full log: %s)\n" \
-            "$passed" "$failures" "$LOG_FILE"
+        printf "❌ Validation summary [%s] (%s passed, %s failed; full log: %s)\n" \
+            "$VALIDATION_PROFILE" "$passed" "$failures" "$LOG_FILE"
+    fi
+}
+
+function run_quick_suite {
+    run_check "Build workspace" cargo build --workspace
+    run_check "Detcore core unit tests" cargo test -p detcore --lib
+    run_check "Hermit run smoke test" hermit_run_smoke
+    run_check "Hermit output determinism" hermit_determinism_check
+    run_check "Hermit verify-mode smoke test" hermit_verify_smoke
+    run_check "Hermit record/replay smoke test" hermit_record_replay_smoke
+}
+
+function run_full_suite {
+    run_check "cargo-nextest available" ensure_cargo_nextest
+    run_quick_suite
+    run_check "Build release Hermit" cargo build --release -p hermit
+
+    # Cargo supports concurrent commands in one target directory. Run checks that
+    # do not execute Hermit guests alongside the ordered runtime and PMU gates.
+    start_check "Test workspace documentation" cargo test --workspace --doc
+    start_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
+    start_check "Rustfmt" cargo fmt --all -- --check
+    start_check "Documentation" cargo doc --workspace --no-deps
+
+    if ! run_strict_compatibility_envelope; then
+        printf "⚠️  Strict compatibility regressions are informational and do not fail full validation yet.\n"
+    fi
+    run_check "Record/replay compatibility baseline (128 programs)" \
+        run_rr_compatibility_envelope
+    # Nextest runs most package unit and Cargo integration targets in parallel.
+    # Detcore's PMU tests depend on same-binary coordination; nextest would launch
+    # them as separate processes. Keep detcore and rustdoc tests as Cargo phases.
+    run_check "Test workspace and integrations" \
+        "${NEXTEST_RUN[@]}" --workspace --exclude detcore \
+        --exclude hermetic_infra_hermit_flaky-tests
+    run_check "Test detcore package" cargo test -p detcore
+    run_check "Fast concurrency stress suite" \
+        "${NEXTEST_RUN[@]}" -p hermit --test stress_suite \
+        --run-ignored only -E 'test(=fast_chaos_matrix)'
+    # rr's syscall edge-case programs (third-party/rr submodule) run under Hermit.
+    if [[ -f "$ROOT_DIR/third-party/rr/src/test/util.h" ]]; then
+        run_check "rr syscall suite" \
+            cargo test -p hermit --test rr_suite -- --ignored
+    else
+        echo "SKIP: rr syscall suite (run 'git submodule update --init third-party/rr' to enable)"
+    fi
+    # `hermit analyze` root-cause search over chaotic schedules (Buck analyze_* targets).
+    run_check "Hermit analyze scenarios" \
+        cargo test -p hermit --test analyze -- --ignored
+    run_check "Schedule search E2E (requires PMU)" \
+        ./tests/util/hermit_analyze_e2e.sh
+
+    run_full_backend_gates
+    wait_for_background_checks
+
+    # Measure and report the working-envelope vector (informational; does not gate).
+    run_envelope
+}
+
+function run_super_suite {
+    run_check "Build workspace" cargo build --workspace
+    run_check "Build release Hermit" cargo build --release -p hermit
+    run_check "Super repeated determinism probes" run_super_stress_suite
+    if [[ -s $VALIDATION_TMP_DIR/super-report ]]; then
+        printf "\n== Super stress pass rates ==\n"
+        cat "$VALIDATION_TMP_DIR/super-report"
     fi
 }
 
@@ -1382,59 +1694,17 @@ if [[ $ENVELOPE_MODE == only ]]; then
     exit 0
 fi
 
-run_check "cargo-nextest available" ensure_cargo_nextest
-run_check "Build workspace" cargo build --workspace
-run_check "Build release Hermit for strict compatibility" \
-    cargo build --release -p hermit
-
-# Cargo supports concurrent commands in one target directory. Run checks that
-# do not execute Hermit guests alongside the ordered runtime and PMU gates.
-start_check "Test workspace documentation" cargo test --workspace --doc
-start_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
-start_check "Rustfmt" cargo fmt --all -- --check
-start_check "Documentation" cargo doc --workspace --no-deps
-
-run_check "Hermit run smoke test" hermit_run_smoke
-run_check "Hermit output determinism" hermit_determinism_check
-run_check "Hermit verify-mode smoke test" hermit_verify_smoke
-if ! run_strict_compatibility_envelope; then
-    printf "⚠️  Strict compatibility regressions are informational and do not fail full validation yet.\n"
-fi
-run_check "Record/replay compatibility baseline (128 programs)" \
-    run_rr_compatibility_envelope
-# Nextest runs most package unit and Cargo integration targets in parallel.
-# Detcore's PMU tests depend on same-binary coordination; nextest would launch
-# them as separate processes. Keep detcore and rustdoc tests as Cargo phases.
-run_check "Test workspace and integrations" \
-    "${NEXTEST_RUN[@]}" --workspace --exclude detcore \
-    --exclude hermetic_infra_hermit_flaky-tests
-run_check "Test detcore package" cargo test -p detcore
-run_check "Fast concurrency stress suite" \
-    "${NEXTEST_RUN[@]}" -p hermit --test stress_suite \
-    --run-ignored only -E 'test(=fast_chaos_matrix)'
-# rr's syscall edge-case programs (third-party/rr submodule) run under Hermit.
-if [[ -f "$ROOT_DIR/third-party/rr/src/test/util.h" ]]; then
-    run_check "rr syscall suite" \
-        cargo test -p hermit --test rr_suite -- --ignored
-else
-    echo "SKIP: rr syscall suite (run 'git submodule update --init third-party/rr' to enable)"
-fi
-# `hermit analyze` root-cause search over chaotic schedules (Buck analyze_* targets).
-run_check "Hermit analyze scenarios" \
-    cargo test -p hermit --test analyze -- --ignored
-run_check "Schedule search E2E (requires PMU)" \
-    ./tests/util/hermit_analyze_e2e.sh
-
-wait_for_background_checks
-
-# Measure and report the working-envelope vector (informational; does not gate).
-run_envelope
+case "$VALIDATION_LEVEL" in
+    quick) run_quick_suite ;;
+    full) run_full_suite ;;
+    super) run_super_suite ;;
+esac
 
 print_summary
 
 # On a fully-green full run, tag the PR unless explicitly disabled. GitHub
 # failures are warnings and never affect the final validation exit status.
-if ((failures == 0)) && ((LABEL_PR == 1)); then
+if [[ $VALIDATION_LEVEL == full ]] && ((failures == 0)) && ((LABEL_PR == 1)); then
     apply_locally_validated_label
 fi
 

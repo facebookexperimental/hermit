@@ -106,7 +106,7 @@ class Fixtures:
             ),
             "random_sources": (
                 REPOSITORY / "tests/c/random_sources.c",
-                ("-pthread",),
+                ("-D_GNU_SOURCE", "-pthread"),
             ),
             "pid_probe": (local / "pid_probe.c", ()),
         }
@@ -148,18 +148,21 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
         raise MatrixError(f"matrix has no implementation for {name}") from error
 
 
-def backend_block(backend: str) -> str | None:
+def backend_block(backend: str, hermit: Path) -> str | None:
     if backend == "dbi":
-        missing = [
-            name
-            for name in ("DYNAMORIO_HOME", "HERMIT_DRRUN", "HERMIT_DBI_CLIENT")
-            if not os.environ.get(name)
-        ]
-        if missing:
-            return "missing " + ", ".join(missing)
-        for name in ("HERMIT_DRRUN", "HERMIT_DBI_CLIENT"):
-            if not Path(os.environ[name]).is_file():
-                return f"{name} does not name a file: {os.environ[name]}"
+        try:
+            smoke = subprocess.run(
+                [str(hermit), "run", "--backend", "dbi", "--", "/bin/true"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return "DBI smoke timed out"
+        if smoke.returncode != 0:
+            diagnostic = smoke.stderr.decode(errors="replace").strip()
+            return f"DBI smoke exited {smoke.returncode}: {diagnostic[-300:]}"
     elif backend == "kvm":
         kvm = Path("/dev/kvm")
         if not kvm.exists() or not os.access(kvm, os.R_OK | os.W_OK):
@@ -325,7 +328,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="hermit-backend-parity-") as tempdir:
         fixtures = Fixtures(Path(tempdir))
         for backend in backends:
-            block = backend_block(backend)
+            block = backend_block(backend, hermit)
             if block:
                 print(f"BLOCKED {backend}: {block}")
                 if args.require_backend:
