@@ -82,6 +82,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Run rt_sigsuspend without holding the deterministic scheduler turn.
+    ///
+    /// The kernel must perform the temporary mask swap atomically and restore the
+    /// original mask after signal delivery, so execute the real blocking syscall
+    /// while marking this thread as blocked outside the runnable set.
+    pub async fn handle_rt_sigsuspend<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::RtSigsuspend,
+    ) -> Result<i64, Error> {
+        self.record_or_replay_blocking(guest, call.into()).await
+    }
+
     /// rt_sigaction
     pub async fn handle_rt_sigaction<G: Guest<Self>>(
         &self,

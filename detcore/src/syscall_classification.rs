@@ -111,6 +111,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::rt_sigaction
         | Sysno::rt_sigprocmask
         | Sysno::rt_sigtimedwait
+        | Sysno::rt_sigsuspend
         | Sysno::sched_getaffinity
         | Sysno::sched_setaffinity
         | Sysno::sched_yield
@@ -367,7 +368,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::restart_syscall
         | Sysno::rt_sigpending
         | Sysno::rt_sigqueueinfo
-        | Sysno::rt_sigsuspend
         | Sysno::rt_tgsigqueueinfo
         | Sysno::sched_get_priority_max
         | Sysno::sched_get_priority_min
@@ -460,7 +460,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [109, 39, 225]);
+        assert_eq!(counts, [110, 39, 224]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
