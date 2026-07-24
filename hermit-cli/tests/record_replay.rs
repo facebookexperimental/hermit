@@ -202,6 +202,7 @@ fn workloads() -> &'static [Workload] {
             ("c_ioctl_fioclex", "ioctl_fioclex.c"),
             ("c_ioctl_siocethtool", "ioctl_siocethtool.c"),
             ("c_recvmsg_scm_rights_mmap", "recvmsg_scm_rights_mmap.c"),
+            ("c_sigpipe_siginfo", "sigpipe_siginfo.c"),
             ("c_ppoll_readv", "ppoll_readv.c"),
             ("c_uname", "uname.c"),
             ("c_sysinfo", "sysinfo.c"),
@@ -240,9 +241,12 @@ fn workload(name: &str) -> &Workload {
 
 fn record_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
     let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    // Bound replay as well as recording: --record-timeout only covers the first phase.
+    let mut command = Command::new("timeout");
     command
         .env("HERMIT_MODE", "record")
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
         .args(["record", "start", "--verify", "--record-timeout=30"])
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .arg("--")
@@ -358,6 +362,80 @@ fn record_shell_forked_external_command() {
         "shell-fork-exec",
         shell,
         &[OsStr::new("-c"), OsStr::new(&script)],
+    );
+}
+
+/// Regression test for issue #535: replay must reproduce the SIGPIPE side
+/// effect of a recorded write returning EPIPE. Returning the recorded errno
+/// without executing the write left `yes` alive after `head` exited, causing
+/// excess output and a replay hang.
+#[test]
+fn record_shell_sigpipe_pipeline() {
+    let _guard = hermit_record_lock();
+
+    let shell = [Path::new("/bin/sh"), Path::new("/usr/bin/sh")]
+        .into_iter()
+        .find(|path| path.is_file());
+    let Some(shell) = shell else {
+        eprintln!("sh is not installed; skipping SIGPIPE record coverage");
+        return;
+    };
+
+    let yes = [Path::new("/usr/bin/yes"), Path::new("/bin/yes")]
+        .into_iter()
+        .find(|path| path.is_file());
+    let head = [Path::new("/usr/bin/head"), Path::new("/bin/head")]
+        .into_iter()
+        .find(|path| path.is_file());
+    let (Some(yes), Some(head)) = (yes, head) else {
+        eprintln!("coreutils yes/head are not installed; skipping SIGPIPE record coverage");
+        return;
+    };
+
+    let script = format!("{} | {} -n 1", yes.display(), head.display());
+    record_replay_command(
+        "shell-sigpipe-pipeline",
+        shell,
+        &[OsStr::new("-c"), OsStr::new(&script)],
+    );
+}
+
+#[test]
+fn record_shell_redirected_stdout_stays_hidden() {
+    let _guard = hermit_record_lock();
+
+    let shell = Path::new("/bin/sh");
+    assert!(
+        shell.is_file(),
+        "POSIX shell is missing at {}",
+        shell.display()
+    );
+    record_replay_command(
+        "shell-redirected-stdout",
+        shell,
+        &[OsStr::new("-c"), OsStr::new("printf FILE_ONLY >/dev/null")],
+    );
+}
+
+#[test]
+fn record_shell_original_output_aliases_and_swaps() {
+    let _guard = hermit_record_lock();
+
+    let shell = Path::new("/bin/sh");
+    assert!(
+        shell.is_file(),
+        "POSIX shell is missing at {}",
+        shell.display()
+    );
+    record_replay_command(
+        "shell-output-aliases-and-swaps",
+        shell,
+        &[
+            OsStr::new("-c"),
+            OsStr::new(
+                "exec 3>&1; printf ALIAS >&3; exec 1>&2 2>&3 3>&-; printf TO_STDERR; printf TO_STDOUT >&2",
+            ),
+        ],
     );
 }
 
@@ -630,6 +708,7 @@ macro_rules! record_replay_tests {
 
 record_replay_tests! {
     record_c_getsockopt_null => "c_getsockopt_null",
+    record_c_sigpipe_siginfo => "c_sigpipe_siginfo",
     record_rs_clock_total_order => "rustbin_clock_total_order",
     record_rs_exit_group => "rustbin_exit_group",
     record_rs_sched_yield => "rustbin_sched_yield",

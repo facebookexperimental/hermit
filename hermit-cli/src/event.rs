@@ -86,6 +86,48 @@ pub enum SyscallEvent {
     Poll(PollEvent),
     SockOpt(SockOptEvent),
     EpollWait(EpollWaitEvent),
+    // TODO-HUMAN-REVIEW(#557): Audit the V2 record/replay event schema.
+    WriteV2(WriteEvent),
+    ReadV2(ReadEvent),
+    ReadvV2(ReadEvent),
+    FtruncateV2(FtruncateEvent),
+}
+
+/// Recorded output and signal side effects of a read syscall.
+// TODO-HUMAN-REVIEW(#557): Audit the recorded signalfd side-effect API.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReadEvent {
+    /// Bytes returned to the guest.
+    pub bytes: Vec<u8>,
+    /// Number of pending SIGPIPE instances consumed by this signalfd read.
+    pub consumed_sigpipe_count: u64,
+}
+
+/// Recorded result and side effects of a write-family syscall.
+// TODO-HUMAN-REVIEW(#557): Audit the recorded output and SIGPIPE API.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WriteEvent {
+    pub result: Result<i64, Errno>,
+    /// Original captured output stream aliased by the descriptor, if any.
+    pub output_fd: Option<i32>,
+    /// Byte offset used when the captured output endpoint is a regular file.
+    pub output_offset: Option<i64>,
+    /// Whether the write advances the captured open-file description offset.
+    pub advances_output_offset: bool,
+    /// Whether the kernel generated SIGPIPE together with EPIPE.
+    pub generated_sigpipe: bool,
+}
+
+/// Recorded result and captured-output side effect of ftruncate.
+// TODO-HUMAN-REVIEW(#557): Audit the recorded ftruncate side-effect API.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FtruncateEvent {
+    /// Recorded syscall result.
+    pub result: Result<i64, Errno>,
+    /// Original captured output stream aliased by the descriptor, if any.
+    pub output_fd: Option<i32>,
+    /// Requested file length.
+    pub length: libc::off_t,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

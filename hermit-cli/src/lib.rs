@@ -16,6 +16,7 @@ mod desync;
 mod error;
 mod event;
 mod event_stream;
+mod fd;
 mod id;
 mod interp;
 mod metadata;

@@ -83,7 +83,7 @@ fn kernel_arg_count(sysno: Sysno) -> Option<u8> {
         | mkdir | statfs | fstatfs => 2,
         mprotect | read | readv | write | writev | lseek | getdents | getdents64 | dup3 | ioctl
         | socket | fcntl | connect | sendmsg | poll | getpeername | getsockname | getrandom
-        | readlink | unlinkat | open | execve => 3,
+        | readlink | unlinkat | open | execve | close_range => 3,
         pread64 | pwrite64 | newfstatat | fadvise64 | openat => 4,
         statx | pwritev | preadv | ppoll | setsockopt | getsockopt | execveat => 5,
         recvfrom | sendto | pwritev2 | preadv2 | mmap => 6,
@@ -265,6 +265,26 @@ mod tests {
             normalize_unused_args(garbage),
             "normalized statfs must ignore unused argument registers"
         );
+    }
+
+    #[test]
+    fn close_range_ignores_unused_args() {
+        let clean = raw(
+            Sysno::close_range,
+            SyscallArgs::new(3, 9, libc::CLOSE_RANGE_CLOEXEC as usize, 0, 0, 0),
+        );
+        let garbage = raw(
+            Sysno::close_range,
+            SyscallArgs::new(
+                3,
+                9,
+                libc::CLOSE_RANGE_CLOEXEC as usize,
+                0xdead,
+                0xbeef,
+                0xcafe,
+            ),
+        );
+        assert_eq!(normalize_unused_args(clean), normalize_unused_args(garbage));
     }
 
     #[test]

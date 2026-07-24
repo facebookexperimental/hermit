@@ -28,8 +28,16 @@ use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::Sysno;
 use serde::Deserialize;
 use serde::Serialize;
+fn capture_guest_fd(pid: Pid, fd: libc::c_int) -> (Option<std::os::fd::OwnedFd>, Option<String>) {
+    match crate::fd::duplicate_guest_fd(pid, fd) {
+        Ok(duplicate) => (Some(duplicate), None),
+        Err(error) if error.raw_os_error() == Some(libc::EBADF) => (None, None),
+        Err(error) => (None, Some(error.to_string())),
+    }
+}
 
 use crate::desync::DesyncError;
 use crate::event_stream::DebugEvent;
@@ -43,6 +51,15 @@ pub struct Replayer {
     // Keep track of the data directory. Each thread uses this path to open its
     // event stream.
     data: PathBuf,
+    /// Duplicates of this guest process's captured output endpoints.
+    #[serde(skip)]
+    stdout: Option<std::os::fd::OwnedFd>,
+    #[serde(skip)]
+    stderr: Option<std::os::fd::OwnedFd>,
+    #[serde(skip)]
+    stdout_error: Option<String>,
+    #[serde(skip)]
+    stderr_error: Option<String>,
 }
 
 #[reverie::tool]
@@ -50,9 +67,15 @@ impl Tool for Replayer {
     type GlobalState = detcore::GlobalState;
     type ThreadState = EventReader;
 
-    fn new(_pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
+    fn new(pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
+        let (stdout, stdout_error) = capture_guest_fd(pid, libc::STDOUT_FILENO);
+        let (stderr, stderr_error) = capture_guest_fd(pid, libc::STDERR_FILENO);
         Self {
             data: cfg.replay_data.as_ref().unwrap().clone(),
+            stdout,
+            stderr,
+            stdout_error,
+            stderr_error,
         }
     }
 
@@ -152,7 +175,7 @@ impl Tool for Replayer {
             Syscall::Fchdir(_) => self.handle_simple(guest, syscall).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
             Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Ftruncate(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Ftruncate(syscall) => self.handle_ftruncate(guest, syscall),
             Syscall::Dup(_) => self.handle_simple(guest, syscall).await,
             Syscall::Dup2(_) => self.handle_simple(guest, syscall).await,
             Syscall::Dup3(_) => self.handle_simple(guest, syscall).await,
@@ -183,6 +206,8 @@ impl Tool for Replayer {
             Syscall::Mkdir(_) => self.handle_simple(guest, syscall).await,
             Syscall::Unlink(_) => self.handle_simple(guest, syscall).await,
             Syscall::Unlinkat(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Syscall::Other(Sysno::close_range, _) => self.handle_close_range(guest, syscall).await,
             unsupported => return Ok(guest.inject_with_retry(unsupported).await?),
         }?)
     }
@@ -299,5 +324,19 @@ impl Replayer {
         _syscall: Syscall,
     ) -> Result<i64, Errno> {
         next_event!(guest, Return)
+    }
+
+    // TODO-HUMAN-REVIEW(#557): Audit close_range fd-table replay semantics.
+    async fn handle_close_range<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Return);
+        if recorded.is_ok() {
+            let actual = guest.inject_with_retry(syscall).await;
+            assert_eq!(actual, recorded, "close_range side effects diverged");
+        }
+        recorded
     }
 }
