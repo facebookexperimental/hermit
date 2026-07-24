@@ -153,10 +153,10 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
-readonly RR_COMPAT_EXPECTED=99
+readonly RR_COMPAT_EXPECTED=128
 COMPATIBILITY_MODE=strict
 
-# Exact label ratchet measured at Hermit 349fc6d. Commands remain owned by the
+# Exact label ratchet measured at Hermit a919cce. Commands remain owned by the
 # strict corpus below; this set only selects the rows known to pass R/R.
 declare -Ar RR_COMPAT_PASSING_LABELS=(
     [echo]=1 [seq]=1 [cat]=1 [wc]=1 [head]=1 [base64]=1 [id]=1
@@ -176,6 +176,11 @@ declare -Ar RR_COMPAT_PASSING_LABELS=(
     [grep]=1 [egrep]=1 [fgrep]=1 [sed]=1 [date]=1 [cal]=1 [yes]=1
     [tac]=1 [rev]=1 [fold]=1 [fmt]=1 [shuf]=1 [numfmt]=1
     [split]=1 [cmp]=1
+    [java]=1 [python3]=1 [git]=1 [true]=1 [pwd]=1 [base32]=1
+    [sha224sum]=1 [sha384sum]=1 [sha512sum]=1 [pr]=1 [ls]=1
+    [xargs]=1 [iconv]=1 [ar]=1 [as]=1 [ld]=1 [nm]=1 [objcopy]=1
+    [objdump]=1 [ranlib]=1 [readelf]=1 [size]=1 [strip]=1 [addr2line]=1
+    [c++filt]=1 [elfedit]=1 [gprof]=1 [cpp]=1 [gcov]=1
 )
 if ((${#RR_COMPAT_PASSING_LABELS[@]} != RR_COMPAT_EXPECTED)); then
     echo "validate.sh: R/R compatibility label set must contain exactly $RR_COMPAT_EXPECTED rows" >&2
@@ -730,6 +735,10 @@ function run_compatibility_corpus {
 
     strict_compatibility_probe echo /bin/echo hermit-compat \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe true /usr/bin/true \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe pwd /usr/bin/pwd \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe seq /usr/bin/seq 10 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe cat /bin/cat README.md \
@@ -739,6 +748,8 @@ function run_compatibility_corpus {
     strict_compatibility_probe head /usr/bin/head -n 3 README.md \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe base64 /usr/bin/base64 README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe base32 /usr/bin/base32 README.md \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe id /usr/bin/id -u \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -776,6 +787,38 @@ function run_compatibility_corpus {
     strict_compatibility_probe g++ g++ --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe make make --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe ar /usr/bin/ar --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe as /usr/bin/as --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe ld /usr/bin/ld --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe nm /usr/bin/nm --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe objcopy /usr/bin/objcopy --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe objdump /usr/bin/objdump --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe ranlib /usr/bin/ranlib --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe readelf /usr/bin/readelf --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe size /usr/bin/size --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe strip /usr/bin/strip --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe addr2line /usr/bin/addr2line --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe c++filt /usr/bin/c++filt --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe elfedit /usr/bin/elfedit --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe gprof /usr/bin/gprof --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe cpp /usr/bin/cpp --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe gcov /usr/bin/gcov --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe bzip2 bash -c \
         'bzip2 -c README.md | sha256sum' \
@@ -875,6 +918,12 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe md5sum /usr/bin/md5sum README.md \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe sha224sum /usr/bin/sha224sum README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe sha384sum /usr/bin/sha384sum README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe sha512sum /usr/bin/sha512sum README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe wc-lines /usr/bin/wc -l README.md \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe nl bash -c \
@@ -891,6 +940,16 @@ function run_compatibility_corpus {
     strict_compatibility_probe bracket /usr/bin/[ 42 -eq 42 ']' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe printf /usr/bin/printf '%s=%d\n' hermit 42 \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe pr /usr/bin/pr -t README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe ls /usr/bin/ls -1 README.md \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe xargs bash -c \
+        'printf "one\ntwo\n" | /usr/bin/xargs -n1 /bin/echo' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe iconv bash -c \
+        'printf "hermit\n" | /usr/bin/iconv -f UTF-8 -t UTF-8' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe sleep /usr/bin/sleep 0 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1288,7 +1347,7 @@ if ((RR_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit for record/replay compatibility" \
         cargo build --release -p hermit
     if ((failures == 0)); then
-        run_check "Record/replay compatibility baseline (99 programs)" \
+        run_check "Record/replay compatibility baseline (128 programs)" \
             run_rr_compatibility_envelope
     fi
     print_summary
@@ -1341,7 +1400,7 @@ run_check "Hermit verify-mode smoke test" hermit_verify_smoke
 if ! run_strict_compatibility_envelope; then
     printf "⚠️  Strict compatibility regressions are informational and do not fail full validation yet.\n"
 fi
-run_check "Record/replay compatibility baseline (99 programs)" \
+run_check "Record/replay compatibility baseline (128 programs)" \
     run_rr_compatibility_envelope
 # Nextest runs most package unit and Cargo integration targets in parallel.
 # Detcore's PMU tests depend on same-binary coordination; nextest would launch
