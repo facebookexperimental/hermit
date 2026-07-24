@@ -10,3 +10,8 @@ pr-dag-health.json
 # validate.sh live working-envelope measurement (regenerate with --envelope-only).
 # The committed baseline lives in envelope-baseline.json; this is the fresh run.
 envelope.json
+
+# Local backup and Python cache files.
+*.orig
+**/__pycache__/
+**/.mypy_cache/
