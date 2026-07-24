@@ -22,6 +22,10 @@ on:
 # CI workflow succeeds or after a fully green local validate.sh run applies the
 # locally-validated label. Merge-group checks inspect their constituent PR heads
 # instead of trusting the synthetic queue commit.
+#
+# The gate is fork-only because facebookexperimental/hermit has no access to the
+# fork self-hosted runners and fork pull requests receive a read-only token in
+# that repository. Upstream relies on the GitHub-hosted Rust job instead.
 permissions:
   actions: read
   contents: read
@@ -30,7 +34,7 @@ permissions:
 jobs:
   refire-on-ci-completion:
     name: refire-on-ci-completion
-    if: github.event_name == 'workflow_run'
+    if: github.repository == 'rrnewton/hermit' && github.event_name == 'workflow_run'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -73,7 +77,10 @@ jobs:
 
   invalidate-local-validation:
     name: invalidate-local-validation
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize'
+    if: >-
+      github.repository == 'rrnewton/hermit' &&
+      github.event_name == 'pull_request' &&
+      github.event.action == 'synchronize'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -99,7 +106,10 @@ jobs:
   merge-gate:
     name: merge-gate
     needs: [invalidate-local-validation]
-    if: always() && github.event_name != 'workflow_run'
+    if: >-
+      always() &&
+      github.repository == 'rrnewton/hermit' &&
+      github.event_name != 'workflow_run'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
