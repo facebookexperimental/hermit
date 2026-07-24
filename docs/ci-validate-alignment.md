@@ -34,10 +34,11 @@ whole thing in one `./validate.sh` invocation.
 | `regular` | `ubuntu-latest` (GitHub-hosted) | No | Build, lint, format, docs, and all host-independent unit/integration tests. |
 | `hardware` | self-hosted `[Linux, X64, hermit, pmu]` | Yes | PMU-backed determinism, record/replay, mount-namespace integration tests, and the working-envelope gate. |
 
-`validate.sh` does not have this split: it assumes the developer host has PMU
-and namespace support and runs both tiers. Checks that need hardware the host
-lacks fail loudly rather than silently skipping (see "Host-capability
-differences").
+The default `full` profile combines both tiers and assumes the developer host
+has PMU and namespace support. `VALIDATE_LEVEL=hosted-only ./validate.sh` (or
+`./validate.sh --hosted`) runs only the portable `regular` tier. Checks that
+need hardware still fail loudly in `full` rather than silently skipping (see
+"Host-capability differences").
 
 ## Mapping table
 
@@ -46,12 +47,13 @@ Status legend: ✅ identical / superset · ⚠️ same test, different mode ·
 
 ### Host-independent checks (CI `regular` job)
 
-| CI `regular` step | Command | `validate.sh` counterpart | Status |
+| CI `regular` step | Command | `hosted-only` counterpart | Status |
 | --- | --- | --- | --- |
+| Backend abstraction | `./scripts/check-detcore-backend-abstraction.sh` | "Detcore backend-abstraction check" | ✅ |
 | Build | `cargo build --workspace` | "Build workspace" — `cargo build --workspace` | ✅ |
-| Test regular workspace crates | `cargo nextest run --profile ci --workspace --exclude detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests` | "Test workspace and integrations" — `cargo nextest run [--profile ci] --workspace --exclude detcore --exclude hermetic_infra_hermit_flaky-tests` (also includes `hermit`) | ✅ superset (validate additionally runs `hermit` integration tests here) |
-| Test Hermit (no namespace tests) | `cargo test -p hermit --lib --bins` | covered by validate's workspace nextest run | ✅ |
-| Test Detcore (no hardware tests) | `cargo test -p detcore --lib --bins` + `tests_misc getrandom_intercepted --exact` | "Test detcore package" — `cargo test -p detcore` | ✅ superset |
+| Test regular workspace crates | `cargo nextest run --profile ci --workspace --exclude detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests` | "Test portable workspace crates" with the same exclusions; add `NEXTEST_PROFILE=ci` locally for CI reporting/retries | ✅ |
+| Test Hermit (no namespace tests) | `cargo test -p hermit --lib --bins` | "Test Hermit libraries and binaries" | ✅ |
+| Test Detcore (no hardware tests) | `cargo test -p detcore --lib --bins` | "Test Detcore libraries and binaries" | ✅ |
 | Documentation | `cargo test --workspace --doc` + `cargo doc --workspace --no-deps` | "Test workspace documentation" + "Documentation" | ✅ |
 | Clippy | `cargo clippy --workspace --all-targets -- -D warnings` | "Clippy" | ✅ |
 | Format | `cargo fmt --all -- --check` | "Rustfmt" | ✅ |

@@ -17,13 +17,17 @@ readonly ROOT_DIR
 cd "$ROOT_DIR" || exit 1
 
 # --- Argument parsing -------------------------------------------------------
-# Usage: ./validate.sh [quick|full|super] [options]
+# Usage: ./validate.sh [quick|hosted-only|full|super] [options]
 # Default (no level): run the full validation suite, which also prints the
-# working-envelope vector at the end.
-#   quick  Core ptrace run/verify/record smoke tests; no alternate backends.
-#   full   Everything in quick plus the complete suite and DBI/KVM gates.
-#   super  Repeat stress probes (20x by default) under moderate oversubscription
-#          and report a pass rate for every probe.
+# working-envelope vector at the end. VALIDATE_LEVEL may select the same level.
+#   quick        Core ptrace run/verify/record smoke tests; no alternate backends.
+#   hosted-only  Portable build, test, lint, format, and documentation gates
+#                matching GitHub-hosted CI; no PMU or namespace requirements.
+#   full         Everything in quick plus the complete suite and DBI/KVM gates.
+#   super        Repeat stress probes (20x by default) under moderate
+#                oversubscription and report a pass rate for every probe.
+#   --quick      Alias for the quick level.
+#   --hosted     Alias for the hosted-only level.
 #
 # The envelope path is factored out so CI
 # can call the *identical* measurement code and produce matching numbers:
@@ -41,8 +45,27 @@ cd "$ROOT_DIR" || exit 1
 # VALIDATE_LABEL_PR=0 to disable the non-fatal GitHub update.
 ENVELOPE_MODE="full"          # full | only
 ENVELOPE_BASELINE=""
-VALIDATION_LEVEL="full"       # quick | full | super
+VALIDATION_LEVEL=${VALIDATE_LEVEL:-full} # quick | hosted-only | full | super
 VALIDATION_LEVEL_EXPLICIT=0
+if [[ -n ${VALIDATE_LEVEL:-} ]]; then
+    case "$VALIDATION_LEVEL" in
+        quick|hosted-only|full|super) ;;
+        *)
+            echo "validate.sh: invalid VALIDATE_LEVEL: $VALIDATION_LEVEL" >&2
+            exit 2 ;;
+    esac
+    VALIDATION_LEVEL_EXPLICIT=1
+fi
+
+function select_validation_level {
+    local level=$1
+    if ((VALIDATION_LEVEL_EXPLICIT == 1)); then
+        echo "validate.sh: choose only one validation level" >&2
+        exit 2
+    fi
+    VALIDATION_LEVEL=$level
+    VALIDATION_LEVEL_EXPLICIT=1
+}
 STRICT_COMPAT_ONLY=0
 RR_COMPAT_ONLY=0
 SABRE_COMPAT_ONLY=0
@@ -54,13 +77,14 @@ VERBOSE=0
 PR_NUMBER=${PR_NUMBER:-}
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        quick|full|super)
-            if ((VALIDATION_LEVEL_EXPLICIT == 1)); then
-                echo "validate.sh: choose only one validation level" >&2
-                exit 2
-            fi
-            VALIDATION_LEVEL=$1
-            VALIDATION_LEVEL_EXPLICIT=1
+        quick|hosted-only|full|super)
+            select_validation_level "$1"
+            shift ;;
+        --quick)
+            select_validation_level quick
+            shift ;;
+        --hosted|--hosted-only)
+            select_validation_level hosted-only
             shift ;;
         --envelope-only) ENVELOPE_MODE="only"; shift ;;
         --envelope-compare)
@@ -104,6 +128,19 @@ VALIDATION_PROFILE=$VALIDATION_LEVEL
 ((RR_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="rr-compat-only"
 ((SABRE_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="sabre-compat-only"
 ((QEMU_L2_ONLY == 1)) && VALIDATION_PROFILE="qemu-l2-only"
+
+case "$VALIDATION_PROFILE" in
+    quick) VALIDATION_ESTIMATE="about 3 minutes" ;;
+    hosted-only) VALIDATION_ESTIMATE="about 8 minutes" ;;
+    full) VALIDATION_ESTIMATE="about 20-70 minutes; R/R fails fast if its canary is broken" ;;
+    super) VALIDATION_ESTIMATE="about 30-90 minutes, depending on repetitions and backends" ;;
+    strict-compat-only) VALIDATION_ESTIMATE="about 5-15 minutes" ;;
+    rr-compat-only) VALIDATION_ESTIMATE="about 5-65 minutes when healthy; fails fast on canary failure" ;;
+    sabre-compat-only) VALIDATION_ESTIMATE="about 10-20 minutes" ;;
+    qemu-l2-only) VALIDATION_ESTIMATE="about 30-60 minutes" ;;
+    envelope-only) VALIDATION_ESTIMATE="about 5 minutes" ;;
+esac
+readonly VALIDATION_ESTIMATE
 
 default_gate_timeout_seconds=600
 if ((QEMU_L2_ONLY == 1)); then
@@ -181,6 +218,7 @@ readonly LOG_FILE
 printf "Hermit validation log\nRoot: %s\nLevel: %s\nHost OS: %s\n\n" \
     "$ROOT_DIR" "$VALIDATION_PROFILE" "$HOST_OS" >"$LOG_FILE"
 printf "Validation level: %s (host OS: %s)\n" "$VALIDATION_PROFILE" "$HOST_OS"
+printf "Estimated time: %s\n" "$VALIDATION_ESTIMATE"
 if [[ $VALIDATION_LEVEL == super ]]; then
     printf "Super stress: %s repetitions/probe, up to %s concurrent jobs (%s online CPUs)\n" \
         "$SUPER_REPETITIONS" "$SUPER_JOBS" "$host_cpus"
@@ -258,6 +296,9 @@ RR_COMPAT_PASSED=0
 RR_COMPAT_FAILED=0
 RR_COMPAT_TOTAL=0
 RR_COMPAT_SKIPPED=0
+RR_COMPAT_FAIL_FAST_SKIPPED=0
+RR_COMPAT_CANARY_FAILED=0
+RR_COMPAT_CANARY_LABEL=""
 declare -ar HERMIT_RUN_ARGS=(
     run
     --base-env=minimal
@@ -855,6 +896,10 @@ function rr_compatibility_probe {
         RR_COMPAT_SKIPPED=$((RR_COMPAT_SKIPPED + 1))
         return 0
     fi
+    if ((RR_COMPAT_CANARY_FAILED == 1)); then
+        RR_COMPAT_FAIL_FAST_SKIPPED=$((RR_COMPAT_FAIL_FAST_SKIPPED + 1))
+        return 0
+    fi
 
     local case_dir="$VALIDATION_TMP_DIR/rr-$label"
     local data_dir="$case_dir/recording"
@@ -904,6 +949,11 @@ function rr_compatibility_probe {
     fi
 
     RR_COMPAT_FAILED=$((RR_COMPAT_FAILED + 1))
+    if ((RR_COMPAT_TOTAL == 1)); then
+        RR_COMPAT_CANARY_FAILED=1
+        RR_COMPAT_CANARY_LABEL=$label
+        printf "  ⚠️  R/R canary %s failed; skipping the remaining selected probes\n" "$label"
+    fi
     {
         printf "Record exit: %s\nReplay exit: %s\nStdout equal: %s\n" \
             "$record_status" "$replay_status" "$stdout_equal"
@@ -1395,6 +1445,12 @@ function run_compatibility_corpus {
     # between otherwise identical strict runs.
 
     if [[ $COMPATIBILITY_MODE == rr ]]; then
+        if ((RR_COMPAT_CANARY_FAILED == 1)); then
+            printf "❌ Record/replay compatibility canary %s failed; executed %s selected probe and skipped %s remaining selected probes (%s unselected)\n" \
+                "$RR_COMPAT_CANARY_LABEL" "$RR_COMPAT_TOTAL" \
+                "$RR_COMPAT_FAIL_FAST_SKIPPED" "$RR_COMPAT_SKIPPED"
+            return 1
+        fi
         if ((RR_COMPAT_TOTAL != RR_COMPAT_EXPECTED)); then
             printf "❌ Record/replay compatibility baseline selected %s rows; expected %s (%s skipped)\n" \
                 "$RR_COMPAT_TOTAL" "$RR_COMPAT_EXPECTED" "$RR_COMPAT_SKIPPED"
@@ -1477,6 +1533,9 @@ function run_rr_compatibility_envelope {
     RR_COMPAT_FAILED=0
     RR_COMPAT_TOTAL=0
     RR_COMPAT_SKIPPED=0
+    RR_COMPAT_FAIL_FAST_SKIPPED=0
+    RR_COMPAT_CANARY_FAILED=0
+    RR_COMPAT_CANARY_LABEL=""
     COMPATIBILITY_MODE=rr
     run_compatibility_corpus || status=$?
     COMPATIBILITY_MODE=strict
@@ -1710,6 +1769,26 @@ function print_summary {
     fi
 }
 
+function run_hosted_only_suite {
+    run_check "Detcore backend-abstraction check" \
+        ./scripts/check-detcore-backend-abstraction.sh
+    run_check "cargo-nextest available" ensure_cargo_nextest
+    run_check "Build workspace" cargo build --workspace
+
+    start_check "Test workspace documentation" cargo test --workspace --doc
+    start_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
+    start_check "Rustfmt" cargo fmt --all -- --check
+    start_check "Documentation" cargo doc --workspace --no-deps
+
+    run_check "Test portable workspace crates" \
+        "${NEXTEST_RUN[@]}" --workspace --exclude detcore --exclude hermit \
+        --exclude hermetic_infra_hermit_flaky-tests
+    run_check "Test Hermit libraries and binaries" cargo test -p hermit --lib --bins
+    run_check "Test Detcore libraries and binaries" cargo test -p detcore --lib --bins
+
+    wait_for_background_checks
+}
+
 function run_quick_suite {
     run_check "Build workspace" cargo build --workspace
     run_check "Detcore core unit tests" cargo test -p detcore --lib
@@ -1844,6 +1923,7 @@ fi
 
 case "$VALIDATION_LEVEL" in
     quick) run_quick_suite ;;
+    hosted-only) run_hosted_only_suite ;;
     full) run_full_suite ;;
     super) run_super_suite ;;
 esac

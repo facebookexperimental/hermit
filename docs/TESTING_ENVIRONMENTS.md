@@ -24,11 +24,26 @@ implementation issue and link it here.
 `./validate.sh` accepts one optional validation level. With no level argument,
 it runs `full` for backward compatibility.
 
-| Level | Coverage |
-| --- | --- |
-| `quick` | Builds the workspace, runs Detcore's core unit tests, and exercises ptrace run, repeat-output, verify, record, and replay smoke tests. It does not execute DBI or KVM or build the optimized binary. |
-| `full` (default) | Runs everything in `quick`, the pre-existing workspace, compatibility, record/replay, stress, rr, analyze, documentation, formatting, and lint gates, then runs the KVM and DBI parity ratchets when those backends are available. |
-| `super` | Builds Hermit and repeats each bounded determinism probe 20 times by default. It reports `passed/total` for every probe and fails if any iteration fails. Available KVM and DBI verify probes join the ptrace strict-verify, pipeline, and record/replay probes. |
+| Level | Typical estimate | Coverage |
+| --- | --- | --- |
+| `quick` | About 3 minutes | Builds the workspace, runs Detcore's core unit tests, and exercises ptrace run, repeat-output, verify, record, and replay smoke tests. It does not execute DBI or KVM or build the optimized binary. |
+| `hosted-only` | About 8 minutes | Mirrors the portable GitHub-hosted `regular` job: build, portable workspace tests, Hermit and Detcore library/binary tests, docs, Clippy, and rustfmt. It does not require PMU or guest namespaces. |
+| `full` (default) | About 20-70 minutes | Runs everything in `quick`, the pre-existing workspace, compatibility, record/replay, stress, rr, analyze, documentation, formatting, and lint gates, then runs the KVM and DBI parity ratchets when those backends are available. The R/R matrix stops after its first canary failure instead of repeating a known-broken setup 128 times. |
+| `super` | About 30-90 minutes | Builds Hermit and repeats each bounded determinism probe 20 times by default. It reports `passed/total` for every probe and fails if any iteration fails. Available KVM and DBI verify probes join the ptrace strict-verify, pipeline, and record/replay probes. |
+
+Select a level positionally or with `VALIDATE_LEVEL`. The long-form aliases are
+useful in scripts and make the intended capability tier explicit:
+
+```sh
+./validate.sh --quick
+./validate.sh --hosted
+VALIDATE_LEVEL=hosted-only ./validate.sh
+```
+
+`--quick` is an alias for `quick`; `--hosted` and `--hosted-only` are aliases
+for `hosted-only`. The script prints the selected profile and its estimate
+before starting any gate. Treat estimates as planning guidance: a cold Cargo
+cache and host contention can increase elapsed time.
 
 Super mode defaults to `SUPER_REPETITIONS=20` and a concurrency limit of about
 1.5 times the online CPU count. Override those with positive integers in
@@ -106,9 +121,7 @@ subset**:
 - `cargo nextest run --profile ci --workspace` **excluding** `detcore`,
   `hermit`, and `hermetic_infra_hermit_flaky-tests`
 - `cargo test -p hermit --lib --bins` (no namespace-dependent integration tests)
-- `cargo test -p detcore --lib --bins` and
-  `cargo test -p detcore --test tests_misc getrandom_intercepted -- --exact`
-  (PMU-free: this test calls `reverie_ptrace::ret_without_perf!()`)
+- `cargo test -p detcore --lib --bins`
 - doc tests (`cargo test --workspace --doc`), `cargo doc`, Clippy, rustfmt
 
 GitHub-hosted runners have **no usable PMU and no CPUID faulting**, so the
@@ -146,7 +159,7 @@ root.
 | --- | --- | --- | --- |
 | `has_rdrand_without_detcore` | `detcore/tests/misc/mod.rs` | Host RDRAND | Probes host features; returns early if RDRAND absent |
 | `rdrand_rdseed_is_masked` | `detcore/tests/misc/mod.rs` | RDRAND/RDSEED **and** CPUID faulting | Runs without PMU (`det_test_fn_without_pmu`); skips if faulting unsupported |
-| `getrandom_intercepted` | `detcore/tests/misc/mod.rs` | None (PMU-free) | Uses `ret_without_perf!`; runs on GitHub-hosted CI |
+| `getrandom_intercepted` | `detcore/tests/misc/mod.rs` | None (PMU-free) | Uses `ret_without_perf!`; currently scheduled in self-hosted hardware CI |
 | `tests_time` (`--ignored`) | `detcore/tests/time.rs` | PMU (RCB counters) | |
 | `tests_parallelism` `futex_wait_parent`, `mem_race::`, `mem_print_race::` (`--ignored`) | `detcore/tests/parallelism*` | PMU (RCB counters) | |
 | chaos schedule-bisection tests (`--ignored`) | `hermit-cli/tests/analyze.rs` | PMU **and** mount/user namespaces | `#[ignore]`: "requires PMU branch counters and working mount namespaces" |

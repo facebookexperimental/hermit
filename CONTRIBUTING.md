@@ -38,6 +38,16 @@ host-capability differences — is documented in
 test to only one side: a test that gates CI must be reproducible with
 `validate.sh`, and vice versa.
 
+For a predictable portable iteration loop that mirrors GitHub-hosted CI, run:
+
+```bash
+VALIDATE_LEVEL=hosted-only ./validate.sh
+```
+
+`./validate.sh --hosted` is equivalent, while `./validate.sh --quick` selects
+the smaller ptrace smoke suite. These modes provide fast feedback; use `full`
+for the complete hardware-dependent local gate when the host supports it.
+
 Protocol for every PR:
 
 1. Run `./validate.sh` on your branch and make it pass. The final line reads
