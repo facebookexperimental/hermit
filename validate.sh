@@ -595,7 +595,7 @@ function run_strict_compatibility_envelope {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe java java -version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe node node -e 'console.log(42)' \
+    strict_compatibility_probe node /bin/node -e 'console.log(42)' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe gcc gcc --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
