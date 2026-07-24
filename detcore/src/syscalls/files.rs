@@ -1297,7 +1297,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(res)
     }
 
-    /// socket system call.
+    /// Create and register an event notification counter.
+    ///
+    /// Determinism: strict execution serializes creation, so the initial counter, guest-visible
+    /// flags, and descriptor number depend only on syscall arguments and the reconstructed file
+    /// table. Any internally added nonblocking flag remains hidden from the guest.
     pub async fn handle_eventfd2<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1345,7 +1349,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(signalfd as i64)
     }
 
-    /// timerfd_create system call.
+    /// Create and register a timer notification descriptor.
+    ///
+    /// Determinism: strict execution serializes creation, which exposes only kernel validation,
+    /// guest-visible flags, and a descriptor number; this operation does not read the clock.
     pub async fn handle_timerfd_create<G: Guest<Self>>(
         &self,
         guest: &mut G,

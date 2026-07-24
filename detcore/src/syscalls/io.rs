@@ -326,7 +326,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(fd as i64)
     }
 
-    /// epoll_ctl syscall
+    /// Apply an ADD, MOD, or DEL mutation to an epoll interest list.
+    ///
+    /// Determinism: strict execution serializes this mutation, so its result depends only on the
+    /// operation, event payload, and deterministically reconstructed epoll/file-descriptor state.
+    /// Record/replay rebuilds that state by reinjecting the same control operations.
     pub async fn handle_epoll_ctl<G: Guest<Self>>(
         &self,
         guest: &mut G,

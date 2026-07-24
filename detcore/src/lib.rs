@@ -1324,10 +1324,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     "Not handling deprecated syscall: {}",
                     s.display(&guest.memory())
                 ),
-                Syscall::EpollCtlOld(s) => panic!(
-                    "Not handling deprecated syscall: {}",
-                    s.display(&guest.memory())
-                ),
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#549)
+                // The obsolete x86_64 entry point is absent from modern Linux kernels.
+                Syscall::EpollCtlOld(_) => Err(Error::Errno(Errno::ENOSYS)),
 
                 Syscall::SchedGetaffinity(s) => self.handle_sched_getaffinity(guest, s).await,
                 Syscall::SchedSetaffinity(s) => self.handle_sched_setaffinity(guest, s).await,

@@ -108,6 +108,25 @@ fn assert_scenario_is_deterministic(scenario: &str) {
     }
 }
 
+fn assert_scenario_reaches_l2(scenario: &str) {
+    let _guard = hermit_run_lock();
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after", "10s", "60s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "run", "--strict", "--verify", "--"])
+        .arg(epoll_guest())
+        .arg(scenario);
+
+    let output = command_output(command, &format!("{scenario} strict verification"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("Determinism verified") || stderr.contains("Determinism verified"),
+        "{scenario} exited 0 without Hermit's determinism marker\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 #[test]
 fn multiple_ready_fds_have_deterministic_ordering() {
     assert_scenario_is_deterministic("multi");
@@ -131,6 +150,19 @@ fn mixed_fd_readiness_is_deterministic() {
 #[test]
 fn nested_epoll_delivery_is_deterministic() {
     assert_scenario_is_deterministic("nested");
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#549)
+#[test]
+fn notification_control_syscalls_are_deterministic() {
+    assert_scenario_is_deterministic("control-fds");
+}
+
+#[test]
+#[ignore = "e2e: requires hermit + PMU/mount namespaces"]
+fn notification_control_syscalls_reach_strict_verify_l2() {
+    assert_scenario_reaches_l2("control-fds");
 }
 
 /// Regression test: descriptor-table operations on an epoll fd (F_GETFL,

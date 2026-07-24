@@ -15,9 +15,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
 
@@ -322,6 +324,106 @@ static void run_nested(void) {
   close(inner_epoll);
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#549)
+static void expect_notification_flags(
+    int fd,
+    const char* label,
+    bool expect_nonblocking) {
+  const int descriptor_flags = fcntl(fd, F_GETFD);
+  if (descriptor_flags < 0) {
+    fail_errno("fcntl(F_GETFD) on notification fd");
+  }
+  const int status_flags = fcntl(fd, F_GETFL);
+  if (status_flags < 0) {
+    fail_errno("fcntl(F_GETFL) on notification fd");
+  }
+  const bool is_nonblocking = (status_flags & O_NONBLOCK) != 0;
+  if ((descriptor_flags & FD_CLOEXEC) == 0 ||
+      is_nonblocking != expect_nonblocking) {
+    fprintf(stderr, "%s exposed incorrect CLOEXEC/NONBLOCK flags\n", label);
+    exit(1);
+  }
+}
+
+static void run_control_fds(void) {
+  const int event_fd = eventfd(2, EFD_CLOEXEC | EFD_NONBLOCK);
+  if (event_fd < 0) {
+    fail_errno("eventfd");
+  }
+  const int blocking_event_fd = eventfd(1, EFD_CLOEXEC);
+  if (blocking_event_fd < 0) {
+    fail_errno("blocking eventfd");
+  }
+  const int timer_fd =
+      timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+  if (timer_fd < 0) {
+    fail_errno("timerfd_create");
+  }
+  expect_notification_flags(event_fd, "eventfd", true);
+  expect_notification_flags(blocking_event_fd, "blocking eventfd", false);
+  expect_notification_flags(timer_fd, "timerfd", true);
+
+  const int epoll_fd = create_epoll();
+  const uint64_t add_tag = 401;
+  const uint64_t timer_tag = 402;
+  const uint64_t modified_tag = 403;
+  const uint64_t blocking_tag = 404;
+  const uint64_t add_tags[] = {add_tag, blocking_tag};
+  const uint64_t modified_tags[] = {modified_tag, blocking_tag};
+  control_fd(epoll_fd, EPOLL_CTL_ADD, event_fd, EPOLLIN, add_tag);
+  control_fd(epoll_fd, EPOLL_CTL_ADD, blocking_event_fd, EPOLLIN, blocking_tag);
+  control_fd(epoll_fd, EPOLL_CTL_ADD, timer_fd, EPOLLIN, timer_tag);
+  expect_events(epoll_fd, "control-add", add_tags, ARRAY_SIZE(add_tags));
+
+  control_fd(epoll_fd, EPOLL_CTL_MOD, event_fd, EPOLLIN, modified_tag);
+  expect_events(epoll_fd, "control-mod", modified_tags, ARRAY_SIZE(modified_tags));
+
+  uint64_t counter;
+  read_exact(event_fd, &counter, sizeof(counter));
+  if (counter != 2) {
+    fail("eventfd returned the wrong initial counter");
+  }
+  uint64_t blocking_counter;
+  read_exact(blocking_event_fd, &blocking_counter, sizeof(blocking_counter));
+  if (blocking_counter != 1) {
+    fail("blocking eventfd returned the wrong initial counter");
+  }
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, event_fd, NULL) != 0) {
+    fail_errno("epoll_ctl(DEL eventfd)");
+  }
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, blocking_event_fd, NULL) != 0) {
+    fail_errno("epoll_ctl(DEL blocking eventfd)");
+  }
+
+  const uint64_t one = 1;
+  if (write(event_fd, &one, sizeof(one)) != (ssize_t)sizeof(one)) {
+    fail_errno("write(eventfd)");
+  }
+  expect_no_events(epoll_fd, "control-del");
+
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, timer_fd, NULL) != 0) {
+    fail_errno("epoll_ctl(DEL timerfd)");
+  }
+
+  errno = 0;
+  const long legacy_result =
+      syscall(SYS_epoll_ctl_old, epoll_fd, EPOLL_CTL_ADD, event_fd, NULL);
+  if (legacy_result != -1 || errno != ENOSYS) {
+    fail("epoll_ctl_old did not return ENOSYS");
+  }
+
+  close(epoll_fd);
+  close(timer_fd);
+  close(blocking_event_fd);
+  close(event_fd);
+  printf(
+      "control-fds counter=%llu blocking-counter=%llu flags-ok "
+      "legacy-enosys\n",
+      (unsigned long long)counter,
+      (unsigned long long)blocking_counter);
+}
+
 // Regression test for an epoll fd that was never registered in Detcore's
 // descriptor table. Descriptor-table operations (F_GETFL, F_SETFD, dup,
 // F_DUPFD, F_DUPFD_CLOEXEC) used to fail with EBADF under Hermit even though
@@ -377,7 +479,7 @@ int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(
         stderr,
-        "usage: %s <multi|edge|oneshot|mixed|nested|dupfd>\n",
+        "usage: %s <multi|edge|oneshot|mixed|nested|control-fds|dupfd>\n",
         argv[0]);
     return 2;
   }
@@ -392,6 +494,8 @@ int main(int argc, char** argv) {
     run_mixed();
   } else if (strcmp(argv[1], "nested") == 0) {
     run_nested();
+  } else if (strcmp(argv[1], "control-fds") == 0) {
+    run_control_fds();
   } else if (strcmp(argv[1], "dupfd") == 0) {
     run_dupfd();
   } else {
