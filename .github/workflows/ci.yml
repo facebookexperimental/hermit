@@ -71,7 +71,12 @@ jobs:
   # TODO-HUMAN-REVIEW(#553)
   qemu-l2:
     name: QEMU strict L2 boot (optional heavyweight)
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.qemu_l2 }}
+    if: >-
+      ${{
+        github.repository == 'rrnewton/hermit' &&
+        github.event_name == 'workflow_dispatch' &&
+        inputs.qemu_l2
+      }}
     runs-on: [self-hosted, Linux, X64, hermit, pmu]
     timeout-minutes: 60
 
@@ -104,10 +109,13 @@ jobs:
     name: Host-dependent tests (self-hosted)
     if: >-
       ${{
-        github.event_name == 'push' ||
+        github.repository == 'rrnewton/hermit' &&
         (
-          github.event_name == 'pull_request' &&
-          github.event.pull_request.user.login == 'rrnewton'
+          github.event_name == 'push' ||
+          (
+            github.event_name == 'pull_request' &&
+            github.event.pull_request.user.login == 'rrnewton'
+          )
         )
       }}
     runs-on: [self-hosted, Linux, X64, hermit, pmu]
