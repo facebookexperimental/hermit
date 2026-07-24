@@ -177,7 +177,7 @@ impl Tool for Replayer {
             Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
             Syscall::Ftruncate(syscall) => self.handle_ftruncate(guest, syscall),
             Syscall::Dup(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Dup2(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Dup2(_) => self.handle_dup2(guest, syscall).await,
             Syscall::Dup3(_) => self.handle_simple(guest, syscall).await,
             Syscall::Ioctl(syscall) => self.handle_ioctl(guest, syscall).await,
             Syscall::Socket(_) => self.handle_simple(guest, syscall).await,
@@ -324,6 +324,25 @@ impl Replayer {
         _syscall: Syscall,
     ) -> Result<i64, Errno> {
         next_event!(guest, Return)
+    }
+
+    async fn handle_dup2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Return);
+        if recorded.is_ok() {
+            let actual = guest.inject_with_retry(syscall).await;
+            // Some source descriptors are virtual: open-family syscalls replay
+            // their recorded return value without creating a live kernel fd.
+            // Preserve that behavior when there is nothing to duplicate in the
+            // replay process.
+            if actual != Err(Errno::EBADF) {
+                assert_eq!(actual, recorded, "dup2 fd-table mutation diverged");
+            }
+        }
+        recorded
     }
 
     // TODO-HUMAN-REVIEW(#557): Audit close_range fd-table replay semantics.

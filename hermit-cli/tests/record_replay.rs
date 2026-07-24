@@ -401,6 +401,48 @@ fn record_shell_sigpipe_pipeline() {
 }
 
 #[test]
+fn record_shell_pipeline_stdout_matches() {
+    let _guard = hermit_record_lock();
+
+    let shell = Path::new("/bin/sh");
+    assert!(
+        shell.is_file(),
+        "POSIX shell is missing at {}",
+        shell.display()
+    );
+    let sort = [Path::new("/usr/bin/sort"), Path::new("/bin/sort")]
+        .into_iter()
+        .find(|path| path.is_file())
+        .expect("coreutils sort is missing");
+    let script = format!("printf 'b\\na\\n' | {}", sort.display());
+    record_replay_command(
+        "shell-pipeline-stdout",
+        shell,
+        &[OsStr::new("-c"), OsStr::new(&script)],
+    );
+}
+
+#[test]
+fn record_shell_command_substitution_stdout_matches() {
+    let _guard = hermit_record_lock();
+
+    let shell = Path::new("/bin/sh");
+    assert!(
+        shell.is_file(),
+        "POSIX shell is missing at {}",
+        shell.display()
+    );
+    record_replay_command(
+        "shell-command-substitution-stdout",
+        shell,
+        &[
+            OsStr::new("-c"),
+            OsStr::new("output=$(printf 'captured\\n'); printf '%s\\n' \"$output\""),
+        ],
+    );
+}
+
+#[test]
 fn record_shell_redirected_stdout_stays_hidden() {
     let _guard = hermit_record_lock();
 
