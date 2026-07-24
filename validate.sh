@@ -593,6 +593,14 @@ function run_strict_compatibility_envelope {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe rustc rustc --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe node node -e 'console.log(42)' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe gcc gcc --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe g++ g++ --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe make make --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe bzip2 bash -c \
         'bzip2 -c README.md | sha256sum' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
