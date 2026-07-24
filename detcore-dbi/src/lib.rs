@@ -201,7 +201,9 @@ pub fn runtime_library_path() -> io::Result<PathBuf> {
     })?;
     let direct = directory.join("libhermit.so");
     let deps = directory.join("deps/libhermit.so");
-    [direct, deps]
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#598): Confirm deps-first lookup matches Cargo artifact placement.
+    [deps, direct]
         .into_iter()
         .find(|runtime| runtime.is_file())
         .ok_or_else(|| {

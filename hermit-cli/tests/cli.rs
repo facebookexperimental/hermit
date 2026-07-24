@@ -460,6 +460,32 @@ fn run_dbi_verifies_shell_process_lifecycle() {
     );
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#598): Confirm this captures the host-inherited O_NONBLOCK regression.
+#[test]
+fn run_dbi_verifies_pipe_backpressure() {
+    let args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--strict",
+        "--verify",
+        "--",
+        "/bin/bash",
+        "-c",
+        "printf x | grep x | wc -l",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "1\n");
+    assert!(
+        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
+        "DBI determinism confirmation missing:\n{}",
+        stderr(&output),
+    );
+}
+
 #[test]
 fn run_dbi_recovers_after_failed_exec() {
     let program = dbi_exec_failure_guest()

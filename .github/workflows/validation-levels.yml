@@ -49,8 +49,24 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libunwind-dev liblzma-dev
+      - name: Check namespace support
+        id: namespaces
+        run: |
+          if unshare --user --map-root-user --pid --fork --uts --net --mount true 2>/dev/null; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::User/PID/mount namespaces unavailable; running portable validation"
+          fi
       - name: Core ptrace validation
+        if: steps.namespaces.outputs.available == 'true'
         run: ./validate.sh quick --no-label-pr
+      - name: Portable validation
+        if: steps.namespaces.outputs.available != 'true'
+        run: |
+          cargo build --workspace
+          cargo test -p detcore
+          cargo test -p hermit --lib --bins
 
   full:
     name: Full validation (merge gate)
