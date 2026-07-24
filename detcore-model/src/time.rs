@@ -32,7 +32,7 @@ const MICROS_PER_SEC: u64 = 1_000_000;
 
 // TODO: make all of these integral types to rule out fractional values.
 
-/// Virtual nanoseconds elapsed per system call (uniform for now).
+/// Default virtual nanoseconds elapsed for callers that do not provide a syscall-specific cost.
 pub const NANOS_PER_SYSCALL: f64 = 10000.0;
 
 /// Virtual nanoseconds elapsed per Retired Conditional Branch.
@@ -348,6 +348,13 @@ pub struct DetTime {
     /// The syscalls issued by this thread.
     syscalls: u64,
 
+    /// Accumulated syscall cost before applying `multiplier`.
+    ///
+    /// `None` preserves the uniform-cost interpretation of serialized `DetTime` values created
+    /// before syscall-specific costs were introduced.
+    #[serde(default)]
+    syscall_nanos: Option<u64>,
+
     /// Retired conditional branches, as given "opaquely" by the reverie clock.
     /// Technically, that these are RCBs is an implementation detail of reverie.
     rcbs: u64,
@@ -371,6 +378,7 @@ impl Default for DetTime {
     fn default() -> Self {
         DetTime {
             syscalls: 0,
+            syscall_nanos: Some(0),
             rcbs: 0,
             nondet_instrs: 0,
             extra_nanos: 0,
@@ -408,6 +416,7 @@ impl From<&DateTime<Utc>> for DetTime {
     fn from(dt: &DateTime<Utc>) -> Self {
         DetTime {
             syscalls: 0,
+            syscall_nanos: Some(0),
             rcbs: 0,
             nondet_instrs: 0,
             extra_nanos: 0,
@@ -453,6 +462,7 @@ impl DetTime {
     pub fn zero() -> Self {
         DetTime {
             syscalls: 0,
+            syscall_nanos: Some(0),
             rcbs: 0,
             nondet_instrs: 0,
             extra_nanos: 0,
@@ -463,10 +473,20 @@ impl DetTime {
 
     /// Register that another syscall has executed.
     pub fn add_syscall(&mut self) {
+        self.add_syscall_with_cost(NANOS_PER_SYSCALL as u64);
+    }
+
+    /// Register a syscall with its unscaled virtual-time cost in nanoseconds.
+    pub fn add_syscall_with_cost(&mut self, nanos: u64) {
+        let previous_uniform_nanos = (self.syscalls as f64 * NANOS_PER_SYSCALL) as u64;
         self.syscalls += 1;
+        match &mut self.syscall_nanos {
+            Some(syscall_nanos) => *syscall_nanos += nanos,
+            None => self.syscall_nanos = Some(previous_uniform_nanos + nanos),
+        }
         trace!(
-            "[detcore] added syscall to logical time, yielding: {:?}",
-            self
+            "[detcore] added syscall cost of {}ns to logical time, yielding: {:?}",
+            nanos, self
         );
     }
 
@@ -501,10 +521,13 @@ impl DetTime {
     pub fn as_nanos(&self) -> LogicalTime {
         // Note: these counts could be pre-collapsed into scalar within the DetTime
         // representation.  But currently we leave them separate for debuggability.
+        let syscall_nanos = self
+            .syscall_nanos
+            .unwrap_or((self.syscalls as f64 * NANOS_PER_SYSCALL) as u64);
         LogicalTime(
             (self.starting_micros * 1000)
                 + self.extra_nanos
-                + ((self.syscalls as f64 * NANOS_PER_SYSCALL * self.multiplier) as u64)
+                + ((syscall_nanos as f64 * self.multiplier) as u64)
                 + ((self.rcbs as f64 * NANOS_PER_RCB * self.multiplier) as u64)
                 + ((self.nondet_instrs as f64 * NANOS_PER_NONDET_INSTR * self.multiplier) as u64),
         )

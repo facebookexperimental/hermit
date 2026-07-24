@@ -54,6 +54,7 @@ mod resources;
 mod scheduler;
 mod stat;
 mod syscall_classification;
+mod syscall_time;
 mod syscalls;
 mod tool_global;
 mod tool_local;
@@ -1216,28 +1217,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         let virtualize_time = config.virtualize_time;
+        let syscall_cost_ns = syscall_time::cost_ns(call.number());
         let new_count = {
             // which results from not being able to borrow guest twice.
             let thread_state = guest.thread_state_mut();
             thread_state.stats.count_syscall();
 
-            // Add the syscall to our thread's logical progress, advancing logical time.
-            if config.sequentialize_threads {
-                thread_state.thread_logical_time.add_syscall();
-            } else {
-                let bumpit = matches!(
-                    call,
-                    Syscall::Gettimeofday(_)
-                        | Syscall::Time(_)
-                        | Syscall::ClockGettime(_)
-                        | Syscall::Write(_)
-                        | Syscall::Writev(_)
-                );
-                // TODO(T86591083): remove this conditional to bump logical time unconditionally:
-                if bumpit && virtualize_time {
-                    thread_state.thread_logical_time.add_syscall();
-                }
-            }
+            // Every intercepted syscall advances logical time, including configurations that do
+            // not serialize threads. This keeps virtual clocks productive during syscall loops.
+            thread_state
+                .thread_logical_time
+                .add_syscall_with_cost(syscall_cost_ns);
             thread_state.stats.syscall_count
         };
 

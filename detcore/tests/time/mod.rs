@@ -20,10 +20,12 @@ use chrono::DateTime;
 use chrono::Utc;
 use detcore::Detcore;
 use detcore::types::NANOS_PER_RCB;
-use detcore::types::NANOS_PER_SYSCALL;
 use reverie::Rdtsc;
 use reverie::RdtscResult;
 use reverie_ptrace::testing::check_fn_with_config;
+
+// Keep this synchronized with the clock-query category in `syscall_time`.
+const NANOS_PER_CLOCK_GETTIME: f64 = 10_000.0;
 
 #[global_allocator]
 static ALLOC: test_allocator::Global = test_allocator::Global;
@@ -327,9 +329,9 @@ fn tod_clock_getres_2() {
             let nanos = now.elapsed().as_nanos();
             let expected = if sequentialize && timeout_disabled {
                 // Additional multiplier, see DetTime::new():
-                500 * (multiplier * NANOS_PER_SYSCALL) as u128
+                500 * (multiplier * NANOS_PER_CLOCK_GETTIME) as u128
             } else {
-                (multiplier * NANOS_PER_SYSCALL) as u128
+                (multiplier * NANOS_PER_CLOCK_GETTIME) as u128
             };
             // account for some slop from RCBs
             assert!(nanos >= expected);
