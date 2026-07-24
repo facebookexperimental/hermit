@@ -186,7 +186,9 @@ fn top_level_help_lists_user_facing_commands() {
     let help = stdout(&output);
 
     assert!(help.contains("Usage: hermit [OPTIONS] <COMMAND>"));
-    for command in ["run", "record", "replay", "log-diff", "analyze", "bisect"] {
+    for command in [
+        "run", "strace", "record", "replay", "log-diff", "analyze", "bisect",
+    ] {
         assert!(help.contains(command), "missing {command:?} in:\n{help}");
     }
 }
@@ -869,6 +871,34 @@ fn backend_accepted_in_global_position() {
     }
 }
 
+#[test]
+fn sabre_backend_validation_honors_command_scope() {
+    let non_run = hermit(&["--backend", "sabre", "record", "list"]);
+    assert_failure_contains(&non_run, &["SaBRe backend", "only through", "strace"]);
+
+    let local_override = hermit(&[
+        "--backend",
+        "sabre",
+        "run",
+        "--backend",
+        "ptrace",
+        "--",
+        "/definitely/missing/sabre-backend-override-test",
+    ]);
+    assert_failure_contains(&local_override, &["does not exist or is not accessible"]);
+    assert!(!stderr(&local_override).contains("SaBRe backend"));
+
+    let log = hermit(&[
+        "--backend",
+        "sabre",
+        "--log",
+        "info",
+        "strace",
+        "--",
+        "/bin/true",
+    ]);
+    assert_failure_contains(&log, &["does not support --log or --log-file"]);
+}
 #[test]
 fn global_position_rejects_unknown_backends() {
     let args = ["--backend", "unknown", "run", "--", "/bin/true"];

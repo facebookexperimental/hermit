@@ -304,18 +304,21 @@ pub enum Backend {
     Ptrace,
     /// Use the DynamoRIO backend.
     Dbi,
+    /// Use the SaBRe static binary rewriting backend.
+    Sabre,
     /// Use the KVM backend.
     Kvm,
 }
 
 impl Backend {
-    const ALL: [Self; 3] = [Self::Ptrace, Self::Dbi, Self::Kvm];
+    const ALL: [Self; 4] = [Self::Ptrace, Self::Dbi, Self::Sabre, Self::Kvm];
 
     /// Returns the command-line spelling for this backend.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ptrace => "ptrace",
             Self::Dbi => "dbi",
+            Self::Sabre => "sabre",
             Self::Kvm => "kvm",
         }
     }
@@ -354,6 +357,10 @@ impl Backend {
                     .to_owned(),
             ),
             Self::Dbi => dbi_runtime_unavailable_reason(),
+            Self::Sabre => Some(
+                "the SaBRe backend is available only through `hermit --backend sabre strace`"
+                    .to_owned(),
+            ),
             Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")),
         }
     }
@@ -854,6 +861,7 @@ mod tests {
             available.contains(&Backend::Dbi),
             dynamorio_sdk_available() && dbi_runtime_unavailable_reason().is_none()
         );
+        assert!(!available.contains(&Backend::Sabre));
         assert_eq!(
             available.contains(&Backend::Kvm),
             kvm_device_unavailable_reason(std::path::Path::new("/dev/kvm")).is_none(),
