@@ -86,10 +86,21 @@ jobs:
         submodules: recursive
     - name: Dependencies
       run: |
+        # Refresh the (partial) self-hosted package index first, install the hard
+        # link deps strictly, then the rest best-effort so a missing package does
+        # not fail the step before the preflight can report a clear diagnosis.
         if command -v dnf >/dev/null; then
-          sudo dnf install -y cmake gcc-c++ libunwind-devel xz-devel zlib-devel cpio gzip qemu-system-x86-core
+          sudo dnf makecache || echo "::notice::dnf makecache failed; using existing metadata"
+          sudo dnf install -y gcc-c++ libunwind-devel xz-devel
+          for pkg in cmake zlib-devel cpio gzip qemu-system-x86-core; do
+            sudo dnf install -y "$pkg" || echo "::notice::$pkg unavailable; skipping"
+          done
         elif command -v apt-get >/dev/null; then
-          sudo apt-get install -y cmake g++ libunwind-dev liblzma-dev zlib1g-dev cpio gzip qemu-system-x86
+          sudo apt-get update || echo "::notice::apt-get update failed; using existing package index"
+          sudo apt-get install -y g++ libunwind-dev liblzma-dev
+          for pkg in cmake zlib1g-dev cpio gzip qemu-system-x86; do
+            sudo apt-get install -y "$pkg" || echo "::notice::$pkg unavailable; skipping"
+          done
         else
           echo "::error::Unsupported package manager; QEMU L2 dependencies are unavailable"
           exit 1
@@ -133,19 +144,28 @@ jobs:
         cache: false
     - name: Dependencies
       run: |
-        # libunwind + lzma are required for linking (RUSTFLAGS=-C link-arg=-llzma).
-        # zlib development files are required to build DynamoRIO drsyms_static.
-        # A Go toolchain is OPTIONAL: hermit-cli/tests/arbitrary_binaries.rs skips
-        # the `go` tool when the binary is absent, so no test needs it. The
-        # self-hosted runner has apt (no dnf) but cannot locate `golang-go`, which
-        # previously failed the whole job. Install the required libs and treat Go
-        # as best-effort so a missing golang package no longer blocks CI.
+        # libunwind + lzma are required for linking (RUSTFLAGS=-C link-arg=-llzma),
+        # and g++ builds the C fixtures. cmake + zlib build DynamoRIO drsyms_static;
+        # redis/sqlite back specific tests; the Go toolchain is optional
+        # (hermit-cli/tests/arbitrary_binaries.rs skips the `go` tool when absent).
+        # The self-hosted runner's package index is PARTIAL and was missing
+        # cmake/redis/sqlite3/zlib1g-dev, so a single `apt-get install` of the whole
+        # list exited 100 ("Unable to locate package ...") and failed the entire job
+        # before any test ran. Refresh the index first, install the hard link deps
+        # strictly, then install the rest best-effort (per package) so a package the
+        # runner cannot locate degrades coverage instead of failing the whole job.
         if command -v dnf >/dev/null; then
-          sudo dnf install -y cmake gcc-c++ libunwind-devel redis sqlite xz-devel zlib-devel
-          sudo dnf install -y golang || echo "::notice::golang unavailable; skipping optional Go toolchain"
+          sudo dnf makecache || echo "::notice::dnf makecache failed; using existing metadata"
+          sudo dnf install -y gcc-c++ libunwind-devel xz-devel
+          for pkg in cmake zlib-devel redis sqlite golang; do
+            sudo dnf install -y "$pkg" || echo "::notice::$pkg unavailable; skipping"
+          done
         elif command -v apt-get >/dev/null; then
-          sudo apt-get install -y cmake g++ libunwind-dev liblzma-dev redis-server redis-tools sqlite3 zlib1g-dev
-          sudo apt-get install -y golang-go || echo "::notice::golang-go unavailable; skipping optional Go toolchain"
+          sudo apt-get update || echo "::notice::apt-get update failed; using existing package index"
+          sudo apt-get install -y g++ libunwind-dev liblzma-dev
+          for pkg in cmake zlib1g-dev redis-server redis-tools sqlite3 golang-go; do
+            sudo apt-get install -y "$pkg" || echo "::notice::$pkg unavailable; skipping"
+          done
         fi
     - name: CPUID and RDRAND/RDSEED tests
       run: |
