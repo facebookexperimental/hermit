@@ -17,6 +17,19 @@ This skill is used by hermit-coord to audit backend claims. Every time a backend
 - Merged to main + `hermit run --backend X` works = DONE.
 - Never close a backend milestone task for work on an unlanded branch.
 
+## Deep Code-Path Audit
+
+Before assigning a backend score, trace and record the literal implementation path.
+
+1. Trace `--backend X` from CLI parsing and dispatch to `Detcore<XxxGuest>`; identify any path that bypasses Detcore.
+2. Inspect `run_kvm()` and `run_dbi()`. Each must instantiate `detcore::Config` and construct a real Detcore tool (or the exact shared Detcore construction used by ptrace).
+3. Trace representative syscalls from backend interception into Detcore handlers and back to the guest; determine whether they are determinized or merely passed through to the host.
+4. Capture INFO logs for the same program under ptrace and backend X, then compare whether both paths show equivalent syscall interception and Detcore handling.
+5. **If backend X bypasses Detcore, its score is B0 regardless of test passes, program output, or Guest implementation completeness.**
+6. **A backend milestone is not done until this code is on `main`; a feature branch is in progress and an open PR is in review.** Confirm the command on `main` before closing the milestone.
+
+Record exact `file:line -> symbol -> symbol` paths, commands, and literal output. Do not infer integration from type names, crate names, or a successful process exit.
+
 ## The Test
 
 A backend is REAL if and only if:
@@ -50,6 +63,9 @@ A backend is REAL if and only if:
 | B3 | Passes 50%+ of ptrace strict-verify corpus |
 | B4 | Passes 100% of ptrace strict-verify corpus = DONE |
 
+Detcore integration is a hard prerequisite. A backend that bypasses Detcore is
+B0 even if its observed program tests would otherwise qualify for a higher level.
+
 ## Audit Procedure
 
 Run these commands and record literal output:
@@ -67,10 +83,21 @@ grep -rn 'Detcore<' hermit-cli/src/ detcore/src/
 # 4. Check Cargo.toml linkage
 grep -n 'reverie-' hermit-cli/Cargo.toml
 
-# 5. Try running a real program (if --backend exists)
+# 5. Trace CLI dispatch and real Detcore construction
+rg -n 'run_kvm|run_dbi|detcore::Config|Detcore<' hermit-cli/src/ detcore/src/
+
+# 6. Trace syscall interception, determinization, and possible passthrough
+rg -n 'syscall|intercept|passthrough|forward' hermit-cli/src/ detcore/src/ reverie-*/src/
+
+# 7. Try running real programs (if --backend exists)
 target/release/hermit run --backend X --strict --verify -- echo hello 2>&1
 target/release/hermit run --backend X --strict --verify -- /bin/true 2>&1
 target/release/hermit run --backend X --strict --verify -- cat /dev/null 2>&1
+
+# 8. Capture and compare INFO-level syscall handling with ptrace
+target/release/hermit --log info run --strict --verify -- echo hello > /tmp/hermit-ptrace.out 2> /tmp/hermit-ptrace.info
+target/release/hermit --log info run --backend X --strict --verify -- echo hello > /tmp/hermit-backend-X.out 2> /tmp/hermit-backend-X.info
+diff -u /tmp/hermit-ptrace.info /tmp/hermit-backend-X.info
 ```
 
 ## Report Format
@@ -83,8 +110,13 @@ Score: B[0-4]
 --backend flag on main: YES/NO
 impl Backend: YES/NO
 Detcore<XxxGuest>: YES/NO
+CLI-to-Detcore code path: [file:line -> symbol -> symbol, or BYPASS]
+detcore::Config instantiated by run_X: YES/NO
+Syscalls intercepted and determinized: [evidence or PASSTHROUGH]
+INFO log parity with ptrace: PASS/FAIL, with differences
 Linked in hermit-cli: YES/NO
 Programs tested: [list with PASS/FAIL]
+Code present and tested on main: YES/NO
 GAP TO REAL BACKEND: [numbered list of concrete steps]
 ```
 
