@@ -457,6 +457,48 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         Ok(0)
     }
+
+    /// get_mempolicy under Hermit. The container exposes a single virtual NUMA
+    /// node, so the effective policy is always the default and every address
+    /// resolves to node 0. The result is fully emulated (never injected), so it
+    /// is bitwise-identical across the two --verify runs and under record/replay,
+    /// removing the host-NUMA-topology dependence a passthrough would introduce.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#720)
+    pub async fn handle_get_mempolicy<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::GetMempolicy,
+    ) -> Result<i64, Error> {
+        // Report MPOL_DEFAULT (0) for the current policy / node when requested.
+        // The nodemask output is left untouched: reverie exposes it as an
+        // immutable pointer, and MPOL_DEFAULT carries no node set.
+        if let Some(policy) = call.policy() {
+            guest.memory().write_value(policy, &0)?;
+        }
+        Ok(0)
+    }
+
+    /// move_pages under Hermit. On a single virtual NUMA node nothing can be
+    /// relocated, so report every page as residing on node 0 and succeed. The
+    /// answer is a fixed constant, so it is deterministic across --verify and
+    /// record/replay.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#720)
+    pub async fn handle_move_pages<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::MovePages,
+    ) -> Result<i64, Error> {
+        // When a status buffer is supplied (either a real move request or a
+        // location query with nodes == NULL), report node 0 for every page.
+        if let Some(status) = call.status() {
+            let count = call.nr_pages() as usize;
+            let zeros = vec![0i32; count];
+            guest.memory().write_values(status, &zeros)?;
+        }
+        Ok(0)
+    }
 }
 
 #[cfg(test)]

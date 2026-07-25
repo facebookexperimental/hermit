@@ -893,6 +893,46 @@ impl<T: RecordOrReplay> Detcore<T> {
             Err(Error::Errno(Errno::EFAULT))
         }
     }
+
+    /// sched_getparam under Hermit. Detcore replaces the Linux scheduler with its
+    /// own deterministic one, so a thread's Linux scheduling parameters are
+    /// inert. Report a fixed SCHED_OTHER priority of 0. The value is emulated
+    /// (never injected), so it is identical across --verify runs and
+    /// record/replay.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#720)
+    pub async fn handle_sched_getparam<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::SchedGetparam,
+    ) -> Result<i64, Error> {
+        if let Some(param) = call.param() {
+            let p = libc::sched_param { sched_priority: 0 };
+            guest.memory().write_value(param, &p)?;
+        }
+        Ok(0)
+    }
+
+    /// sched_rr_get_interval under Hermit. The round-robin quantum is a property
+    /// of the Linux scheduler, which Detcore does not use, so report a fixed zero
+    /// interval. Being a constant, it is deterministic across --verify and
+    /// record/replay.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#720)
+    pub async fn handle_sched_rr_get_interval<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::SchedRrGetInterval,
+    ) -> Result<i64, Error> {
+        if let Some(tp) = call.tp() {
+            let t = Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            guest.memory().write_value(tp, &t)?;
+        }
+        Ok(0)
+    }
 }
 
 #[cfg(test)]
