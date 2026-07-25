@@ -1,0 +1,28 @@
+[package]
+name = "hermit-criterion-syscall"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "BSD-3-Clause"
+build = "build.rs"
+
+[workspace]
+
+[dependencies]
+anyhow = "1.0.103"
+plotters = { version = "0.3.7", default-features = false, features = ["line_series", "point_series", "svg_backend"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+libc = "0.2.186"
+tempfile = "3.27.0"
+
+[[bench]]
+name = "marginal_syscalls"
+harness = false
+
+[[bin]]
+name = "summarize"
+path = "src/bin/summarize.rs"
