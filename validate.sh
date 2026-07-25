@@ -259,7 +259,7 @@ readonly RR_COMPAT_EXPECTED=128
 # Require the repaired variable-output probes while retaining one row of headroom.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=145
-readonly SABRE_COMPAT_TOTAL=147
+readonly SABRE_COMPAT_TOTAL=151
 COMPATIBILITY_MODE=strict
 
 # Exact label ratchet measured at Hermit a919cce. Commands remain owned by the
@@ -1099,6 +1099,9 @@ function run_compatibility_corpus {
     strict_compatibility_probe sqlite3 sqlite3 :memory: \
         'CREATE TABLE values_under_test(value INTEGER NOT NULL); WITH RECURSIVE sequence(value) AS (VALUES(1) UNION ALL SELECT value + 1 FROM sequence WHERE value < 100) INSERT INTO values_under_test SELECT value FROM sequence; SELECT count(*), sum(value) FROM values_under_test;' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe jq /usr/bin/jq -c -n \
+        '{sum: ([range(1;6)] | add), evens: [range(1;6) | select(. % 2 == 0)]}' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
     # Expand $i inside the guest shell, not here.
     # shellcheck disable=SC2016
     strict_compatibility_probe bash bash -c \
@@ -1110,10 +1113,16 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     functional_compatibility_probe java java -version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe ruby /usr/bin/ruby --disable-gems -e \
+        'values = (1..5).map { |value| value * value }; raise "unexpected squares" unless values == [1, 4, 9, 16, 25]; puts values.join(",")' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe node /bin/node -e 'console.log(42)' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Avoid the PATH fbpython wrapper and exercise the system CPython ELF.
     strict_compatibility_probe python3 /usr/bin/python3 -c 'print(42)' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe curl /usr/bin/curl --fail --silent --show-error \
+        file:///etc/hostname \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Avoid the PATH Git wrapper: its telemetry sidecar pipes are nondeterministic.
     functional_compatibility_probe git /usr/local/bin/git.meta.real --version \
@@ -1167,6 +1176,9 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe zstd bash -c \
         'zstd -q -c README.md | sha256sum' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe zip-unzip bash -c \
+        'set -euo pipefail; rm -rf /tmp/hermit-compat-zip; mkdir /tmp/hermit-compat-zip; printf "archive-data\n" >/tmp/hermit-compat-zip/input; touch -t 200001010000 /tmp/hermit-compat-zip/input; (cd /tmp/hermit-compat-zip && zip -q archive.zip input); unzip -Z1 /tmp/hermit-compat-zip/archive.zip; unzip -p /tmp/hermit-compat-zip/archive.zip input; rm -rf /tmp/hermit-compat-zip' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe openssl openssl dgst -sha256 /etc/hostname \
         && passed=$((passed + 1)) || failed=$((failed + 1))
