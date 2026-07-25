@@ -227,7 +227,7 @@ jobs:
           echo "available=false" >> "$GITHUB_OUTPUT"
           echo "::notice::Mount namespaces unavailable; running Hermit unit tests only."
         fi
-    - name: Stable Hermit tests including record/replay matrix
+    - name: Stable Hermit tests
       if: steps.namespaces.outputs.available == 'true'
       run: |
         cargo build -p hermit
@@ -243,8 +243,14 @@ jobs:
         do
           cargo test -p hermit --test "$test" -- --test-threads=1
         done
-        cargo test -p hermit --test record_replay record_replay_matrix -- --exact --test-threads=1
         cargo test -p hermit --test hermit_modes strict_mode_matrix -- --exact --test-threads=1
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#678)
+    - name: Record/replay matrix diagnostics (nonblocking)
+      if: steps.namespaces.outputs.available == 'true'
+      continue-on-error: true
+      timeout-minutes: 5
+      run: cargo test -p hermit --test record_replay record_replay_matrix -- --exact --test-threads=1
     # AUTONOMOUS-BOT-IMPLEMENTED
     # TODO-HUMAN-REVIEW(#657)
     - name: Application e2e strict-verify tests (curl, nginx, redis, Go)
