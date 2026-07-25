@@ -127,6 +127,7 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
+use crate::syscall_classification::is_unimplemented_enosys_syscall;
 use crate::syscalls::helpers::with_guest_rip;
 use crate::syscalls::helpers::with_guest_time;
 use crate::tool_global::resource_request;
@@ -1255,6 +1256,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     Syscall::Other(_, args) => Self::handle_process_madvise(args.arg0, args.arg4),
                     _ => unreachable!("process_madvise unexpectedly gained a typed variant"),
                 }
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#715): Deterministic ENOSYS for syscalls the pinned
+            // x86_64 kernel leaves unimplemented (sys_ni_syscall). A fixed -ENOSYS is
+            // deterministic by construction and identical to the modern kernel's own
+            // return, so no guest-visible behavior changes versus the legacy
+            // pass-through. These are untyped (Syscall::Other) in the pinned Reverie,
+            // so dispatch on the Sysno before the typed match below.
+            SyscallClassification::Determinized
+                if is_unimplemented_enosys_syscall(call.number()) =>
+            {
+                Err(Error::Errno(Errno::ENOSYS))
             }
             SyscallClassification::Determinized => match call {
                 Syscall::Write(w) => self.handle_write(guest, w).await,
