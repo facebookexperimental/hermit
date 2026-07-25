@@ -1372,8 +1372,7 @@ function run_compatibility_corpus {
     fi
     strict_compatibility_probe whoami /usr/bin/whoami \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    # An explicit user avoids host-specific supplementary GIDs without names.
-    strict_compatibility_probe groups /usr/bin/groups root \
+    strict_compatibility_probe groups /usr/bin/groups \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # The compatibility harness supplies /dev/null, so tty should report the
     # expected non-terminal result while the wrapper preserves a zero exit.

@@ -50,6 +50,49 @@ use super::verify::temp_log_files;
 
 const TMP_DIR: &str = "/tmp";
 const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
+const GROUP_FILE: &str = "/etc/group";
+const NSCD_DIR: &str = "/var/run/nscd";
+const OVERFLOW_GID: &str = "65534";
+
+// Bind mount sources must outlive Reverie's pre-exec container setup.
+struct IdentitySources {
+    _group_file: tempfile::NamedTempFile,
+    _nscd_dir: Option<tempfile::TempDir>,
+}
+
+struct PreparedMounts {
+    mounts: Vec<Mount>,
+    identity_sources: IdentitySources,
+}
+
+fn frozen_group_file() -> Result<tempfile::NamedTempFile, Error> {
+    let mut contents = fs::read_to_string(GROUP_FILE)
+        .context("Failed to read the host group database for the guest")?;
+    let has_overflow_group = contents.lines().any(|line| {
+        line.split(':')
+            .nth(2)
+            .is_some_and(|gid| gid == OVERFLOW_GID)
+    });
+    if !has_overflow_group {
+        if !contents.ends_with('\n') {
+            contents.push('\n');
+        }
+        contents.push_str("nobody:x:");
+        contents.push_str(OVERFLOW_GID);
+        contents.push_str(":\n");
+    }
+
+    let mut group_file = tempfile::NamedTempFile::new()
+        .context("Failed to create the frozen group database for the guest")?;
+    group_file
+        .write_all(contents.as_bytes())
+        .context("Failed to populate the frozen group database for the guest")?;
+    group_file
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o644))
+        .context("Failed to set permissions on the frozen guest group database")?;
+    Ok(group_file)
+}
 
 #[derive(Debug, Clone)]
 struct E9patchOverlay {
@@ -653,6 +696,7 @@ fn e9patch_preserves_executable_identity_and_uses_ptrace_runtime() {
     let tmpfs = tempfile::tempdir().unwrap();
     let mounts = ro.mounts(tmpfs.path()).unwrap();
     let overlay = mounts
+        .mounts
         .iter()
         .find(|mount| mount.get_source() == Some(Path::new("/cache/patched-echo")))
         .unwrap();
@@ -1908,7 +1952,7 @@ impl RunOpts {
 
         let tmpfs = self.tmpfs()?;
 
-        let mut container = self.container(tmpfs.path())?;
+        let (mut container, _identity_sources) = self.container(tmpfs.path())?;
 
         with_container(&mut container, || {
             self.run_in_container(global, capture_output)
@@ -1921,6 +1965,10 @@ impl RunOpts {
         let _guard = global.init_tracing();
 
         let tmpfs = self.tmpfs()?;
+        let PreparedMounts {
+            mounts,
+            identity_sources: _identity_sources,
+        } = self.mounts(tmpfs.path())?;
 
         let mut command = Command::new(&self.program);
         command
@@ -1930,7 +1978,7 @@ impl RunOpts {
             .hostname("hermetic-container.local")
             .domainname("local")
             .mount(Mount::proc())
-            .mounts(self.mounts(tmpfs.path())?);
+            .mounts(mounts);
 
         match &self.network {
             NetworkingMode::Local => {
@@ -1994,8 +2042,21 @@ impl RunOpts {
     }
 
     /// Returns the mounts to be used with the container.
-    fn mounts(&self, tmpfs: &Path) -> Result<Vec<Mount>, Error> {
+    fn mounts(&self, tmpfs: &Path) -> Result<PreparedMounts, Error> {
+        let group_file = frozen_group_file()?;
+        let group_source = group_file.path().to_path_buf();
         let mut mounts = Vec::new();
+        mounts.push(Mount::bind(group_source, GROUP_FILE).readonly());
+
+        // Host nscd cache readiness is external state and can differ between verify runs.
+        let nscd_dir = if Path::new(NSCD_DIR).is_dir() {
+            let directory = tempfile::TempDir::new()
+                .context("Failed to create the empty guest nscd directory")?;
+            mounts.push(Mount::bind(directory.path(), NSCD_DIR).readonly());
+            Some(directory)
+        } else {
+            None
+        };
 
         for mount in &self.mount {
             if let Ok(path) = mount.get_target().strip_prefix(TMP_DIR) {
@@ -2045,11 +2106,17 @@ impl RunOpts {
         // while hiding the real /tmp.
         mounts.push(Mount::bind(tmpfs, TMP_DIR).rshared());
 
-        Ok(mounts)
+        Ok(PreparedMounts {
+            mounts,
+            identity_sources: IdentitySources {
+                _group_file: group_file,
+                _nscd_dir: nscd_dir,
+            },
+        })
     }
 
     /// Returns a configured container to run a function in.
-    fn container(&self, tmpfs: &Path) -> Result<Container, Error> {
+    fn container(&self, tmpfs: &Path) -> Result<(Container, IdentitySources), Error> {
         let mut container = default_container(self.pin_threads);
 
         match &self.network {
@@ -2064,9 +2131,13 @@ impl RunOpts {
             }
         }
 
-        container.mounts(self.mounts(tmpfs)?);
+        let PreparedMounts {
+            mounts,
+            identity_sources,
+        } = self.mounts(tmpfs)?;
+        container.mounts(mounts);
 
-        Ok(container)
+        Ok((container, identity_sources))
     }
 
     pub fn run_verify(&self, log_file: fs::File, global: &GlobalOpts) -> Result<Output, Error> {
@@ -2083,7 +2154,7 @@ impl RunOpts {
 
         let tmpfs = self.tmpfs()?;
 
-        let mut container = self.container(tmpfs.path())?;
+        let (mut container, _identity_sources) = self.container(tmpfs.path())?;
 
         let mut log_file = Some(log_file);
         with_container(&mut container, || {
