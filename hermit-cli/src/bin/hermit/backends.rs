@@ -40,6 +40,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use detcore::Config;
 use hermit::Error;
 use hermit::ExitStatus;
 use reverie_dbi::DbiRunner;
@@ -80,6 +81,11 @@ impl<R: Read, W: Write> Read for TeeReader<R, W> {
 
 /// Runs `program` through DynamoRIO with the real Detcore Tool.
 ///
+/// `config` is the CLI-derived Detcore configuration (the same value the ptrace
+/// backend receives). It is serialized into [`detcore_dbi::DETCONFIG_ENV`] so
+/// flags such as `--strict`, `--seed`, and the time/CPUID virtualization
+/// switches actually reach the in-guest Detcore Tool instead of being ignored.
+///
 /// When `verify` is true, the guest is executed twice. Both runs must succeed,
 /// produce byte-identical stdout, report `tool=Detcore`, and produce the same
 /// observed guest-memory hash from the native DBI runtime.
@@ -88,7 +94,23 @@ pub fn run_dbi(
     args: &[String],
     verify: bool,
     log: Option<LevelFilter>,
+    config: &Config,
 ) -> Result<ExitStatus, Error> {
+    // The DBI backend drives a single Detcore external scheduler, so it cannot
+    // honor a request to relax thread sequentialization. Fail loudly rather
+    // than silently ignoring the flag.
+    if !config.sequentialize_threads {
+        return Err(Error::msg(
+            "the dbi backend requires sequentialized threads; \
+             remove --no-sequentialize-threads (or --strace-only) to run under --backend dbi",
+        ));
+    }
+    let config_json = serde_json::to_string(config).map_err(|error| {
+        Error::msg(format!(
+            "failed to serialize the Detcore config for the DBI backend: {error}"
+        ))
+    })?;
+
     let stdin_is_terminal = std::io::stdin().is_terminal();
 
     let (drrun, client) = detcore_dbi::prepare_native_client().map_err(|error| {
@@ -115,6 +137,7 @@ pub fn run_dbi(
     if let Some(level) = log {
         guest.env("HERMIT_LOG", level.to_string());
     }
+    guest.env(detcore_dbi::DETCONFIG_ENV, &config_json);
     guest.args(args);
 
     if !verify {

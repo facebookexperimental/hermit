@@ -13,3 +13,4 @@ detcore = { version = "0.0.0", path = "../detcore" }
 libc = "0.2.186"
 reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "0e77d260a84083f462ba10b986c8a72ab8f92758" }
 reverie-dbi = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "0e77d260a84083f462ba10b986c8a72ab8f92758", default-features = false }
+serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }

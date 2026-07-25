@@ -71,6 +71,57 @@ fn info_logging_enabled() -> bool {
     )
 }
 
+/// Environment variable through which `hermit run --backend dbi` hands the
+/// CLI-derived Detcore [`Config`] (JSON) to this in-guest runtime.
+///
+/// The guest process inherits it from `drrun` (see the DBI launcher), so it is
+/// the cross-process channel that lets flags like `--strict`, `--seed`, and the
+/// time/CPUID virtualization switches reach the DBI Detcore Tool the same way
+/// they reach the ptrace backend.
+pub const DETCONFIG_ENV: &str = "HERMIT_DBI_DETCONFIG";
+
+/// Where the effective Detcore [`Config`] came from, for native diagnostics.
+enum ConfigSource {
+    /// Deserialized from [`DETCONFIG_ENV`] provided by `hermit run`.
+    Cli,
+    /// [`DETCONFIG_ENV`] was set but could not be parsed; strict default used.
+    ParseFallback,
+    /// [`DETCONFIG_ENV`] was absent (e.g. a bare `drrun -c client.so` run).
+    Default,
+}
+
+/// A strict, deterministic default configuration for standalone DBI runs.
+fn default_dbi_config() -> Config {
+    Config {
+        sequentialize_threads: true,
+        deterministic_io: true,
+        max_timeslice: None,
+        ..Config::default()
+    }
+}
+
+/// Builds the Detcore [`Config`] for this DBI runtime.
+///
+/// The configuration is taken from the CLI-derived Detcore config serialized
+/// into [`DETCONFIG_ENV`] when present; otherwise a strict default is used.
+/// Regardless of the source, the DBI execution-model invariants are re-asserted:
+/// the backend drives the Detcore global scheduler externally on a branch count
+/// rather than PMU retired-conditional-branch preemption, so timeslice
+/// preemption (`max_timeslice`) is disabled and threads stay sequentialized for
+/// the single external scheduler.
+fn load_dbi_config() -> (Config, ConfigSource) {
+    let (mut config, source) = match std::env::var(DETCONFIG_ENV) {
+        Ok(value) if !value.is_empty() => match serde_json::from_str::<Config>(&value) {
+            Ok(config) => (config, ConfigSource::Cli),
+            Err(_) => (default_dbi_config(), ConfigSource::ParseFallback),
+        },
+        _ => (default_dbi_config(), ConfigSource::Default),
+    };
+    config.max_timeslice = None;
+    config.sequentialize_threads = true;
+    (config, source)
+}
+
 // TODO-HUMAN-REVIEW(PR-587): Confirm DynamoRIO-native process lifecycle boundaries.
 fn requires_native_process_lifecycle(sysnum: i64, args: &[u64], clone3_flags: Option<u64>) -> bool {
     match sysnum {
@@ -323,12 +374,19 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
         let mut slot = RUNTIME.write().expect("Detcore DBI runtime lock poisoned");
         if slot.is_none() {
             emit_marker(emit, b"detcore-dbi: constructing Detcore Config\n");
-            let mut config = Config {
-                sequentialize_threads: true,
-                deterministic_io: true,
-                max_timeslice: None,
-                ..Config::default()
-            };
+            let (mut config, source) = load_dbi_config();
+            match source {
+                ConfigSource::Cli => {
+                    emit_marker(emit, b"detcore-dbi: using CLI-provided Detcore Config\n")
+                }
+                ConfigSource::ParseFallback => emit_marker(
+                    emit,
+                    b"detcore-dbi: WARNING could not parse HERMIT_DBI_DETCONFIG; using strict default\n",
+                ),
+                ConfigSource::Default => {
+                    emit_marker(emit, b"detcore-dbi: using strict default Detcore Config\n")
+                }
+            }
             config.validate();
 
             emit_marker(emit, b"detcore-dbi: initializing Detcore GlobalState\n");

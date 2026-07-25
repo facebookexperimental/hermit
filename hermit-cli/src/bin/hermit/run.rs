@@ -1452,6 +1452,7 @@ impl RunOpts {
                     &self.args,
                     self.verify,
                     global.log,
+                    &self.effective_det_config(),
                 );
             }
             Backend::Liteinst => {
