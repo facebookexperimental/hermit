@@ -1252,6 +1252,12 @@ function run_compatibility_corpus {
     # Avoid the PATH Git wrapper: its telemetry sidecar pipes are nondeterministic.
     functional_compatibility_probe git /usr/local/bin/git.meta.real --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    functional_compatibility_probe cmake /usr/bin/cmake --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    functional_compatibility_probe pkg-config /usr/bin/pkg-config --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    functional_compatibility_probe m4 /usr/bin/m4 --version \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
     functional_compatibility_probe gcc gcc --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     functional_compatibility_probe g++ g++ --version \

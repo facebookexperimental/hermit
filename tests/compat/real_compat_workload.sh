@@ -249,6 +249,52 @@ EOF
         test "$count:$sum" = '3:42'
         printf 'xmllint:valid:count=%s:sum=%s\n' "$count" "$sum"
         ;;
+    cmake)
+        cat >"$WORK_DIR/workload.cmake" <<'EOF'
+math(EXPR product "6 * 7")
+if(NOT product EQUAL 42)
+  message(FATAL_ERROR "unexpected product: ${product}")
+endif()
+file(WRITE "${OUTPUT_PATH}" "cmake=${product}\n")
+EOF
+        /usr/bin/cmake -DOUTPUT_PATH="$WORK_DIR/result.txt" \
+            -P "$WORK_DIR/workload.cmake"
+        grep -Fxq 'cmake=42' "$WORK_DIR/result.txt"
+        printf 'cmake:script-product-42\n'
+        ;;
+    pkg-config)
+        mkdir -p "$WORK_DIR/pkgconfig"
+        cat >"$WORK_DIR/pkgconfig/hermit-compat.pc" <<'EOF'
+prefix=/opt/hermit-compat
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: hermit-compat
+Description: Hermit pkg-config compatibility fixture
+Version: 1.2.3
+Libs: -L${libdir} -lhermit_compat
+Cflags: -I${includedir} -DHERMIT_COMPAT=42
+EOF
+        export PKG_CONFIG_PATH="$WORK_DIR/pkgconfig"
+        version=$(/usr/bin/pkg-config --modversion hermit-compat)
+        flags=$(/usr/bin/pkg-config --cflags --libs hermit-compat)
+        flags=${flags% }
+        test "$version" = '1.2.3'
+        test "$flags" = \
+            '-I/opt/hermit-compat/include -DHERMIT_COMPAT=42 -L/opt/hermit-compat/lib -lhermit_compat'
+        /usr/bin/pkg-config --atleast-version=1.2 hermit-compat
+        printf 'pkg-config:%s:%s\n' "$version" "$flags"
+        ;;
+    m4)
+        cat >"$WORK_DIR/input.m4" <<'EOF'
+define(`PRODUCT', `eval($1 * $2)')dnl
+product=PRODUCT(6, 7)
+EOF
+        /usr/bin/m4 "$WORK_DIR/input.m4" >"$WORK_DIR/output.txt"
+        grep -Fxq 'product=42' "$WORK_DIR/output.txt"
+        printf 'm4:product-42\n'
+        ;;
     gcc)
         cat >"$WORK_DIR/fixture.c" <<'EOF'
 #include <stddef.h>
