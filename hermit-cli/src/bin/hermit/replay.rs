@@ -16,7 +16,7 @@ use hermit::Id;
 use hermit::Shebang;
 use reverie::process::ExitStatus;
 
-use super::container::default_container;
+use super::container::deterministic_container;
 use super::container::with_container;
 use super::global_opts::GlobalOpts;
 
@@ -59,7 +59,7 @@ impl ReplayOpts {
         };
 
         if self.autopilot {
-            let mut container = default_container(true);
+            let (mut container, _identity_guard) = deterministic_container()?;
             with_container(&mut container, || {
                 self.container_main(global, self.autopilot, &hermit, id)
             })
@@ -93,7 +93,7 @@ impl ReplayOpts {
             // to initialize logging inside the container because it may spawn a
             // thread. If we can guarantee that tracing won't spawn a thread, then
             // that restriction be lifted.
-            let mut container = default_container(true);
+            let (mut container, _identity_guard) = deterministic_container()?;
             let result = with_container(&mut container, || {
                 self.container_main(global, self.autopilot, &hermit, id)
             });

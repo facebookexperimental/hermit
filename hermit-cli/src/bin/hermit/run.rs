@@ -39,8 +39,10 @@ use reverie::process::MountFlags;
 use reverie::process::Namespace;
 use reverie::process::Output;
 
+use super::container::IdentityGuard;
 use super::container::apply_affinity;
 use super::container::default_container;
+use super::container::identity_hardening_mounts;
 use super::container::with_container;
 use super::global_opts::GlobalOpts;
 use super::tracing::init_file_tracing;
@@ -51,48 +53,9 @@ use super::verify::temp_log_files;
 
 const TMP_DIR: &str = "/tmp";
 const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
-const GROUP_FILE: &str = "/etc/group";
-const NSCD_DIR: &str = "/var/run/nscd";
-const OVERFLOW_GID: &str = "65534";
-
-// Bind mount sources must outlive Reverie's pre-exec container setup.
-struct IdentitySources {
-    _group_file: tempfile::NamedTempFile,
-    _nscd_dir: Option<tempfile::TempDir>,
-}
-
 struct PreparedMounts {
     mounts: Vec<Mount>,
-    identity_sources: IdentitySources,
-}
-
-fn frozen_group_file() -> Result<tempfile::NamedTempFile, Error> {
-    let mut contents = fs::read_to_string(GROUP_FILE)
-        .context("Failed to read the host group database for the guest")?;
-    let has_overflow_group = contents.lines().any(|line| {
-        line.split(':')
-            .nth(2)
-            .is_some_and(|gid| gid == OVERFLOW_GID)
-    });
-    if !has_overflow_group {
-        if !contents.ends_with('\n') {
-            contents.push('\n');
-        }
-        contents.push_str("nobody:x:");
-        contents.push_str(OVERFLOW_GID);
-        contents.push_str(":\n");
-    }
-
-    let mut group_file = tempfile::NamedTempFile::new()
-        .context("Failed to create the frozen group database for the guest")?;
-    group_file
-        .write_all(contents.as_bytes())
-        .context("Failed to populate the frozen group database for the guest")?;
-    group_file
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o644))
-        .context("Failed to set permissions on the frozen guest group database")?;
-    Ok(group_file)
+    identity_sources: IdentityGuard,
 }
 
 #[derive(Debug, Clone)]
@@ -2065,20 +2028,7 @@ impl RunOpts {
 
     /// Returns the mounts to be used with the container.
     fn mounts(&self, tmpfs: &Path) -> Result<PreparedMounts, Error> {
-        let group_file = frozen_group_file()?;
-        let group_source = group_file.path().to_path_buf();
-        let mut mounts = Vec::new();
-        mounts.push(Mount::bind(group_source, GROUP_FILE).readonly());
-
-        // Host nscd cache readiness is external state and can differ between verify runs.
-        let nscd_dir = if Path::new(NSCD_DIR).is_dir() {
-            let directory = tempfile::TempDir::new()
-                .context("Failed to create the empty guest nscd directory")?;
-            mounts.push(Mount::bind(directory.path(), NSCD_DIR).readonly());
-            Some(directory)
-        } else {
-            None
-        };
+        let (mut mounts, identity_sources) = identity_hardening_mounts()?;
 
         for mount in &self.mount {
             if let Ok(path) = mount.get_target().strip_prefix(TMP_DIR) {
@@ -2130,15 +2080,12 @@ impl RunOpts {
 
         Ok(PreparedMounts {
             mounts,
-            identity_sources: IdentitySources {
-                _group_file: group_file,
-                _nscd_dir: nscd_dir,
-            },
+            identity_sources,
         })
     }
 
     /// Returns a configured container to run a function in.
-    fn container(&self, tmpfs: &Path) -> Result<(Container, IdentitySources), Error> {
+    fn container(&self, tmpfs: &Path) -> Result<(Container, IdentityGuard), Error> {
         let mut container = default_container(self.pin_threads);
 
         match &self.network {

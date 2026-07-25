@@ -36,7 +36,8 @@ use reverie::process::ExitStatus;
 use reverie::process::Mount;
 use reverie::process::MountFlags;
 
-use super::container::default_container;
+use super::container::IdentityGuard;
+use super::container::deterministic_container;
 use super::global_opts::GlobalOpts;
 use super::run::is_elf_file;
 use super::run::path_resolution_visits_prefix;
@@ -291,9 +292,12 @@ impl StartOpts {
         )
     }
 
-    fn recording_container(&self, global: &GlobalOpts) -> Result<Container, Error> {
+    fn recording_container(
+        &self,
+        global: &GlobalOpts,
+    ) -> Result<(Container, IdentityGuard), Error> {
         let overlay = self.prepare_e9patch_overlay(global)?;
-        let mut container = default_container(true);
+        let (mut container, identity_guard) = deterministic_container()?;
         if let Some(overlay) = overlay {
             container.mount(Mount::bind(&overlay.source, &overlay.target).readonly());
             container.mount(
@@ -301,7 +305,7 @@ impl StartOpts {
                     .flags(MountFlags::MS_BIND | MountFlags::MS_REMOUNT | MountFlags::MS_RDONLY),
             );
         }
-        Ok(container)
+        Ok((container, identity_guard))
     }
 
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
@@ -313,7 +317,7 @@ impl StartOpts {
             let hermit = HermitData::from(self.data_dir.as_ref());
             let record_timeout = self.record_timeout();
 
-            let mut container = self.recording_container(global)?;
+            let (mut container, _identity_guard) = self.recording_container(global)?;
 
             let recording = match record_timeout {
                 Some(timeout) => {
@@ -357,7 +361,7 @@ impl StartOpts {
     fn record_verify(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         let ((global1, log1), (global2, log2)) = setup_double_run(global, "record", "replay");
 
-        let mut recording_container = self.recording_container(global)?;
+        let (mut recording_container, _record_identity_guard) = self.recording_container(global)?;
 
         eprintln!(":: {}", "Recording...".yellow().bold());
 
@@ -385,7 +389,7 @@ impl StartOpts {
         eprintln!(":: {}", "Replaying...".yellow().bold());
 
         // Replay the recording.
-        let mut replay_container = default_container(true);
+        let (mut replay_container, _replay_identity_guard) = deterministic_container()?;
         let replay = replay_container
             .run(|| {
                 let _guard = global2.init_tracing();
@@ -411,7 +415,7 @@ impl StartOpts {
     }
     /// This is called when `--verify-with-gdbex` is passed to the command line.
     fn record_verify_debug(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
-        let mut container = self.recording_container(global)?;
+        let (mut container, _identity_guard) = self.recording_container(global)?;
 
         eprintln!(":: {}", "Recording...".yellow().bold());
 
@@ -475,7 +479,7 @@ impl StartOpts {
         // to initialize logging inside the container because it may spawn a
         // thread. If we can guarantee that tracing won't spawn a thread, then
         // that restriction be lifted.
-        let mut container = default_container(true);
+        let (mut container, _identity_guard) = deterministic_container()?;
         let result = container
             .run(|| {
                 let _guard = global.init_tracing();
