@@ -1188,7 +1188,9 @@ function run_compatibility_corpus {
         strict_compatibility_probe bc bash -c 'printf "6*7\n" | bc' \
             && passed=$((passed + 1)) || failed=$((failed + 1))
     fi
-    strict_compatibility_probe awk awk 'BEGIN { print 42 }' \
+    # shellcheck disable=SC2016
+    strict_compatibility_probe awk bash -c \
+        'set -euo pipefail; printf "alpha 2\nbeta 3\nalpha 5\n" | awk "\$1 == \"alpha\" { sum += \$2 } END { print sum }" | diff -u <(printf "7\n") -; printf "awk-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     functional_compatibility_probe sqlite3 sqlite3 :memory: \
         'CREATE TABLE values_under_test(value INTEGER NOT NULL); WITH RECURSIVE sequence(value) AS (VALUES(1) UNION ALL SELECT value + 1 FROM sequence WHERE value < 100) INSERT INTO values_under_test SELECT value FROM sequence; SELECT count(*), sum(value) FROM values_under_test;' \
@@ -1309,25 +1311,25 @@ function run_compatibility_corpus {
         'printf "beta\nalpha\nalpha\n" | sort' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe uniq bash -c \
-        'printf "alpha\nalpha\nbeta\n" | uniq -c' \
+        'set -euo pipefail; printf "alpha\nalpha\nbeta\nbeta\ngamma\n" | uniq -d | diff -u <(printf "alpha\nbeta\n") -; printf "uniq-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe tr bash -c \
         'printf "Hermit\n" | tr "[:upper:]" "[:lower:]"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe cut bash -c \
-        'printf "alpha:beta\n" | cut -d: -f2' \
+        'set -euo pipefail; printf "one:two:three\nfour:five:six\n" | cut -d: -f2 | diff -u <(printf "two\nfive\n") -; printf "cut-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe tee bash -c \
         'printf "tee-through-hermit\n" | tee /dev/null' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe paste bash -c \
-        'paste -d: <(printf "alpha\nbeta\n") <(printf "1\n2\n")' \
+        'set -euo pipefail; paste -d: <(printf "alpha\nbeta\n") <(printf "1\n2\n") | diff -u <(printf "alpha:1\nbeta:2\n") -; printf "paste-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe comm bash -c \
-        'comm <(printf "alpha\nbeta\n") <(printf "beta\ngamma\n")' \
+        'set -euo pipefail; comm -12 <(printf "alpha\nbeta\n") <(printf "beta\ngamma\n") | diff -u <(printf "beta\n") -; printf "comm-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe join bash -c \
-        'join <(printf "1 alpha\n2 beta\n") <(printf "1 one\n2 two\n")' \
+        'set -euo pipefail; join <(printf "1 alpha\n2 beta\n") <(printf "1 one\n2 two\n") | diff -u <(printf "1 alpha one\n2 beta two\n") -; printf "join-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     functional_compatibility_probe find find /etc -maxdepth 1 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1531,16 +1533,16 @@ function run_compatibility_corpus {
         'set -euo pipefail; rm -rf /tmp/hermit-compat-patch; mkdir /tmp/hermit-compat-patch; printf "old\n" >/tmp/hermit-compat-patch/file; printf "%s\n" "--- file" "+++ file" "@@ -1 +1 @@" "-old" "+new" | (cd /tmp/hermit-compat-patch && patch -s file); cat /tmp/hermit-compat-patch/file; rm -rf /tmp/hermit-compat-patch' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe grep bash -c \
-        'set -euo pipefail; printf "alpha\nbeta\ngamma\n" | grep -x alpha' \
+        'set -euo pipefail; printf "alpha\nbeta\ngamma\nalpha\n" | grep -nx alpha | diff -u <(printf "1:alpha\n4:alpha\n") -; printf "grep-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe egrep bash -c \
-        'set -euo pipefail; printf "alpha\nbeta\ngamma\n" | egrep "alpha|gamma"' \
+        'set -euo pipefail; printf "alpha\nbeta\ngamma\n" | egrep "^(alpha|gamma)$" | diff -u <(printf "alpha\ngamma\n") -; printf "egrep-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe fgrep bash -c \
-        'set -euo pipefail; printf "alpha.beta\nalphaXbeta\n" | fgrep "alpha.beta"' \
+        'set -euo pipefail; printf "alpha.beta\nalphaXbeta\n" | fgrep "alpha.beta" | diff -u <(printf "alpha.beta\n") -; printf "fgrep-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe sed bash -c \
-        'set -euo pipefail; printf "alpha beta\n" | sed "s/alpha/omega/"' \
+        'set -euo pipefail; printf "alpha:12\nbeta:3\n" | sed -E "s/^([a-z]+):([0-9]+)$/\\2-\\1/" | diff -u <(printf "12-alpha\n3-beta\n") -; printf "sed-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe tar bash -c \
         'set -euo pipefail; rm -rf /tmp/hermit-compat-tar; mkdir /tmp/hermit-compat-tar; printf "archive-data\n" >/tmp/hermit-compat-tar/input; touch -t 200001010000 /tmp/hermit-compat-tar/input; tar -cf /tmp/hermit-compat-tar/archive.tar -C /tmp/hermit-compat-tar input; tar -tf /tmp/hermit-compat-tar/archive.tar; rm -rf /tmp/hermit-compat-tar' \
