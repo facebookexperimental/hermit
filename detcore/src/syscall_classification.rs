@@ -104,6 +104,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::ppoll
         | Sysno::prlimit64
         | Sysno::pread64
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#683): Confirm positional-write ordering and replay semantics.
+        | Sysno::pwrite64
         | Sysno::read
         | Sysno::recvfrom
         | Sysno::recvmsg
@@ -228,6 +231,47 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::renameat
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::truncate
+        // Stable guest-owned metadata and synchronous writeback operations are
+        // repeatable in Hermit's fixed mount namespace and filesystem image.
+        // TODO-HUMAN-REVIEW(#683): Confirm the metadata/writeback passthrough boundary.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::faccessat
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::fchmod
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::fchmodat2
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::fchown
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::fchownat
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::fgetxattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::flistxattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::fremovexattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::fsetxattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::lchown
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::link
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::listxattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::llistxattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::lremovexattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::lsetxattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::msync
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::readahead
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::symlink
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::sync_file_range
         // Ptrace executes rt_sigreturn directly; DBI has dedicated injected-sigreturn
         // handling, while KVM deterministically reports its current lack of signal support.
         | Sysno::rt_sigreturn => SyscallClassification::PassThrough,
@@ -253,20 +297,11 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::create_module
         | Sysno::delete_module
         | Sysno::epoll_pwait2
-        | Sysno::faccessat
         | Sysno::fanotify_init
         | Sysno::fanotify_mark
-        | Sysno::fchmod
-        | Sysno::fchmodat2
-        | Sysno::fchown
-        | Sysno::fchownat
-        | Sysno::fgetxattr
         | Sysno::finit_module
-        | Sysno::flistxattr
         | Sysno::flock
-        | Sysno::fremovexattr
         | Sysno::fsconfig
-        | Sysno::fsetxattr
         | Sysno::fsmount
         | Sysno::fsopen
         | Sysno::fspick
@@ -308,15 +343,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::landlock_add_rule
         | Sysno::landlock_create_ruleset
         | Sysno::landlock_restrict_self
-        | Sysno::lchown
-        | Sysno::link
         | Sysno::listen
         | Sysno::listmount
-        | Sysno::listxattr
-        | Sysno::llistxattr
         | Sysno::lookup_dcookie
-        | Sysno::lremovexattr
-        | Sysno::lsetxattr
         | Sysno::lsm_get_self_attr
         | Sysno::lsm_list_modules
         | Sysno::lsm_set_self_attr
@@ -345,7 +374,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msgget
         | Sysno::msgrcv
         | Sysno::msgsnd
-        | Sysno::msync
         | Sysno::name_to_handle_at
         | Sysno::nfsservctl
         | Sysno::open_by_handle_at
@@ -370,13 +398,11 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::pselect6
         | Sysno::ptrace
         | Sysno::putpmsg
-        | Sysno::pwrite64
         | Sysno::pwritev
         | Sysno::pwritev2
         | Sysno::query_module
         | Sysno::quotactl
         | Sysno::quotactl_fd
-        | Sysno::readahead
         | Sysno::readv
         | Sysno::reboot
         | Sysno::recvmmsg
@@ -433,9 +459,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::statmount
         | Sysno::swapoff
         | Sysno::swapon
-        | Sysno::symlink
         | Sysno::sync
-        | Sysno::sync_file_range
         | Sysno::syncfs
         | Sysno::sysfs
         | Sysno::syslog
@@ -476,7 +500,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [110, 49, 214]);
+        assert_eq!(counts, [111, 68, 194]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -507,6 +531,10 @@ mod tests {
             SyscallClassification::Determinized
         );
         assert_eq!(
+            classify_syscall(Sysno::pwrite64),
+            SyscallClassification::Determinized
+        );
+        assert_eq!(
             classify_syscall(Sysno::madvise),
             SyscallClassification::Determinized
         );
@@ -519,11 +547,20 @@ mod tests {
             Sysno::capset,
             Sysno::chdir,
             Sysno::chmod,
+            Sysno::faccessat,
             Sysno::faccessat2,
             Sysno::fchdir,
+            Sysno::fchmod,
             Sysno::fchmodat,
+            Sysno::fchmodat2,
+            Sysno::fchown,
+            Sysno::fchownat,
             Sysno::fdatasync,
             Sysno::fallocate,
+            Sysno::fgetxattr,
+            Sysno::flistxattr,
+            Sysno::fremovexattr,
+            Sysno::fsetxattr,
             Sysno::ftruncate,
             Sysno::fsync,
             Sysno::getresgid,
@@ -535,16 +572,26 @@ mod tests {
             Sysno::renameat,
             Sysno::getgroups,
             Sysno::getxattr,
+            Sysno::lchown,
             Sysno::lgetxattr,
+            Sysno::link,
             Sysno::linkat,
+            Sysno::listxattr,
+            Sysno::llistxattr,
+            Sysno::lremovexattr,
+            Sysno::lsetxattr,
             Sysno::mkdir,
             Sysno::mkdirat,
+            Sysno::msync,
             Sysno::removexattr,
+            Sysno::readahead,
             Sysno::renameat2,
             Sysno::rmdir,
             Sysno::rt_sigreturn,
             Sysno::setxattr,
+            Sysno::symlink,
             Sysno::symlinkat,
+            Sysno::sync_file_range,
             Sysno::truncate,
             Sysno::umask,
             Sysno::unlink,
@@ -555,11 +602,8 @@ mod tests {
         for sysno in [
             Sysno::add_key,
             Sysno::keyctl,
-            Sysno::msync,
             Sysno::prctl,
-            Sysno::readahead,
             Sysno::request_key,
-            Sysno::sync_file_range,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Unclassified);
         }

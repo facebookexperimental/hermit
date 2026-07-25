@@ -514,6 +514,84 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#683): Confirm positional-write ordering and replay semantics.
+    /// SYS_pwrite64 system call.
+    pub async fn handle_pwrite64<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        mut call: syscalls::Pwrite64,
+    ) -> Result<i64, Error> {
+        let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
+            (detfd.resource(), detfd.stat().map(|stat| stat.inode))
+        })?;
+        let resource = resource.or_else(|| raw_ino.map(ResourceID::FileContents));
+
+        if let Some(resource) = resource {
+            let request = guest.thread_state().mk_request(resource, Permission::W);
+            resource_request(guest, request).await;
+        }
+
+        let result = if guest.config().deterministic_io {
+            let mut total_written = 0_i64;
+            let mut remaining = call.len();
+
+            loop {
+                match self.record_or_replay(guest, call).await {
+                    Ok(written) => {
+                        let Ok(written) = usize::try_from(written) else {
+                            break Err(Errno::EIO.into());
+                        };
+                        let Ok(written_i64) = i64::try_from(written) else {
+                            break Err(Errno::EIO.into());
+                        };
+                        if written > remaining {
+                            break Err(Errno::EIO.into());
+                        }
+                        remaining -= written;
+                        let Some(next_total) = total_written.checked_add(written_i64) else {
+                            break Err(Errno::EIO.into());
+                        };
+                        total_written = next_total;
+
+                        if written == 0 || remaining == 0 {
+                            break Ok(total_written);
+                        }
+
+                        let Some(old_buf) = call.buf() else {
+                            break Err(Errno::EFAULT.into());
+                        };
+                        let Some(next_buf) = old_buf.as_raw().checked_add(written) else {
+                            break Err(Errno::EFAULT.into());
+                        };
+                        let Some(next_offset) = call.offset().checked_add(written_i64) else {
+                            break Err(Errno::EFBIG.into());
+                        };
+                        let Some(next_buf) = Addr::<u8>::from_raw(next_buf) else {
+                            break Err(Errno::EFAULT.into());
+                        };
+                        call = call
+                            .with_buf(Some(next_buf))
+                            .with_len(remaining)
+                            .with_offset(next_offset);
+                    }
+                    Err(_) if total_written > 0 => break Ok(total_written),
+                    Err(error) => break Err(error.into()),
+                }
+            }
+        } else {
+            self.record_or_replay(guest, call).await.map_err(Into::into)
+        };
+
+        if guest.config().virtualize_metadata && matches!(&result, Ok(written) if *written > 0) {
+            let inode = raw_ino.expect("virtualized metadata requires stat data for tracked fds");
+            touch_file(guest, inode).await;
+        }
+
+        resource_release_all(guest).await;
+        result
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#547)
     /// SYS_writev system call.
     ///
