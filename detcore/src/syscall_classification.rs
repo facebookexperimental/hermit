@@ -202,6 +202,19 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // physical flush latency is outside guest logical time.
         | Sysno::fdatasync
         | Sysno::ftruncate
+        // Fixed credentials, process-local unlocks, and guest-owned filesystem
+        // flushes are repeatable under the fixed-container model.
+        // TODO-HUMAN-REVIEW(PR-654): Verify deterministic passthrough assumptions.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::fsync
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::getresgid
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::getresuid
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::munlock
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::munlockall
         // Ptrace executes rt_sigreturn directly; DBI has dedicated injected-sigreturn
         // handling, while KVM deterministically reports its current lack of signal support.
         | Sysno::rt_sigreturn => SyscallClassification::PassThrough,
@@ -245,7 +258,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::fsmount
         | Sysno::fsopen
         | Sysno::fspick
-        | Sysno::fsync
         | Sysno::futex_requeue
         | Sysno::futex_wait
         | Sysno::futex_waitv
@@ -261,8 +273,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getpmsg
         | Sysno::getppid
         | Sysno::getpriority
-        | Sysno::getresgid
-        | Sysno::getresuid
         | Sysno::getrlimit
         | Sysno::getsid
         | Sysno::getsockname
@@ -324,8 +334,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msgrcv
         | Sysno::msgsnd
         | Sysno::msync
-        | Sysno::munlock
-        | Sysno::munlockall
         | Sysno::name_to_handle_at
         | Sysno::nfsservctl
         | Sysno::open_by_handle_at
@@ -460,7 +468,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [110, 39, 224]);
+        assert_eq!(counts, [110, 44, 219]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -508,6 +516,11 @@ mod tests {
             Sysno::fchmodat,
             Sysno::fdatasync,
             Sysno::ftruncate,
+            Sysno::fsync,
+            Sysno::getresgid,
+            Sysno::getresuid,
+            Sysno::munlock,
+            Sysno::munlockall,
             Sysno::getgroups,
             Sysno::getxattr,
             Sysno::lgetxattr,
