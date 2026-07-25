@@ -255,6 +255,8 @@ readonly HERMIT_SMOKE_TIMEOUT="30s"
 readonly SMOKE_MARKER="hermit-validation-smoke"
 readonly STRICT_COMPAT_HERMIT_BIN="$ROOT_DIR/target/release/hermit"
 readonly STRICT_COMPAT_TIMEOUT=60
+readonly BACKEND_COMPAT_RESULTS="$VALIDATION_TMP_DIR/backend-compat-results.tsv"
+readonly COMPAT_SUMMARY_RESULTS="$VALIDATION_TMP_DIR/compat-summary-results.tsv"
 readonly REAL_COMPAT_FIXTURES="$ROOT_DIR/target/real-compat-fixtures-$$"
 readonly E9PATCH_NSSWITCH_FILE="$VALIDATION_TMP_DIR/e9patch-nsswitch.conf"
 readonly REAL_COMPAT_WORKLOAD="$ROOT_DIR/tests/compat/real_compat_workload.sh"
@@ -279,6 +281,14 @@ E9PATCH_COMPAT_ZERO_SITE=0
 E9PATCH_COMPAT_CANDIDATE_ONLY=0
 E9PATCH_COMPAT_NON_ELF=0
 E9PATCH_COMPAT_NO_DIAGNOSTIC=0
+
+# Tracked compatibility gaps that are intentionally excluded from the
+# executable corpus. They remain in the canonical denominator and table.
+declare -Ar COMPAT_SUMMARY_KNOWN_FAILURES=(
+    [timeout]="parent waits indefinitely in rt_sigsuspend for the delayed child"
+    [free]="live /proc/meminfo values differ between otherwise identical runs"
+)
+declare -A COMPAT_SUMMARY_CELLS=()
 
 # Exact label ratchet measured at Hermit a919cce. Commands remain owned by the
 # strict corpus below; this set only selects the rows known to pass R/R.
@@ -369,6 +379,9 @@ function cleanup {
         kill_process_tree "$pid" TERM
     done
     wait 2>/dev/null || true
+    if declare -F print_compatibility_summary >/dev/null; then
+        print_compatibility_summary
+    fi
     rm -rf "$VALIDATION_TMP_DIR"
     rm -rf "$REAL_COMPAT_FIXTURES"
 }
@@ -719,26 +732,214 @@ function note_backend_skip {
 }
 
 function run_full_backend_gates {
+    local -a backends=(--backend ptrace)
+
     if ! backend_selector_supported; then
-        note_backend_skip "DBI/KVM" "backend selector is unavailable"
+        note_backend_skip "KVM/DBI" "backend selector is unavailable"
+        run_check "Real backend compatibility matrix" \
+            python3 experiments/backend-parity_20260722/run_matrix.py \
+            "${backends[@]}" --probe-gaps --output "$BACKEND_COMPAT_RESULTS"
         return
     fi
 
     if kvm_backend_available; then
-        run_check "KVM backend parity ratchet" \
-            python3 experiments/backend-parity_20260722/run_matrix.py \
-            --backend kvm --require-backend
+        backends+=(--backend kvm)
     else
         note_backend_skip "KVM" "/dev/kvm is not readable and writable"
     fi
 
     if dbi_backend_available; then
-        run_check "DBI backend parity ratchet" \
-            python3 experiments/backend-parity_20260722/run_matrix.py \
-            --backend dbi --require-backend
+        backends+=(--backend dbi)
     else
         note_backend_skip "DBI" "backend smoke did not complete successfully"
     fi
+
+    run_check "Real backend compatibility matrix" \
+        python3 experiments/backend-parity_20260722/run_matrix.py \
+        "${backends[@]}" --probe-gaps --require-backend \
+        --output "$BACKEND_COMPAT_RESULTS"
+}
+
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#706): Review the canonical cross-backend compatibility summary.
+function compat_summary_backend {
+    case "$COMPATIBILITY_MODE" in
+        strict) printf "ptrace" ;;
+        sabre) printf "sabre" ;;
+        *) return 1 ;;
+    esac
+}
+
+function record_compatibility_result {
+    local program=$1
+    local result=$2
+    local detail=${3:-}
+    local backend
+
+    backend=$(compat_summary_backend) || return 0
+    detail=${detail//$'\t'/ }
+    detail=${detail//$'\n'/ }
+    if [[ ! -e $COMPAT_SUMMARY_RESULTS ]]; then
+        printf "program\tbackend\tresult\tdetail\n" >"$COMPAT_SUMMARY_RESULTS"
+    fi
+    printf "%s\t%s\t%s\t%s\n" \
+        "$program" "$backend" "$result" "$detail" >>"$COMPAT_SUMMARY_RESULTS"
+}
+
+function compat_summary_programs {
+    awk '
+        /^function run_compatibility_corpus \{/ { in_corpus = 1; next }
+        in_corpus && /^function / { exit }
+        in_corpus && ($1 == "strict_compatibility_probe" ||
+                      $1 == "functional_compatibility_probe") { print $2 }
+    ' "$ROOT_DIR/validate.sh"
+    printf "%s\n" "${!COMPAT_SUMMARY_KNOWN_FAILURES[@]}"
+}
+
+function backend_parity_program_name {
+    case "$1" in
+        hello_stdout) printf "echo" ;;
+        argument_forwarding) printf "printf" ;;
+        exit_zero) printf "true" ;;
+        file_read) printf "cat" ;;
+        *) return 1 ;;
+    esac
+}
+
+function load_compatibility_results {
+    local test_name
+    local backend
+    local _expectation
+    local result
+    local _seconds
+    local detail
+    local program
+
+    COMPAT_SUMMARY_CELLS=()
+    if [[ -r $BACKEND_COMPAT_RESULTS ]]; then
+        while IFS=$'\t' read -r test_name backend _expectation result _seconds detail; do
+            [[ $test_name != test_name ]] || continue
+            program=$(backend_parity_program_name "$test_name" || true)
+            [[ -n $program ]] || continue
+            COMPAT_SUMMARY_CELLS["$program:$backend"]=$result
+        done <"$BACKEND_COMPAT_RESULTS"
+    fi
+    if [[ -r $COMPAT_SUMMARY_RESULTS ]]; then
+        while IFS=$'\t' read -r program backend result detail; do
+            [[ $program != program ]] || continue
+            COMPAT_SUMMARY_CELLS["$program:$backend"]=$result
+        done <"$COMPAT_SUMMARY_RESULTS"
+    fi
+}
+
+function backend_compatibility_cell {
+    local output_variable=$1
+    local program=$2
+    local backend=$3
+    local result=${COMPAT_SUMMARY_CELLS["$program:$backend"]:-}
+    local cell
+
+    if [[ -z $result && $backend == ptrace &&
+        -n ${COMPAT_SUMMARY_KNOWN_FAILURES[$program]+known} ]]; then
+        result=FAIL
+    fi
+
+    case "$result" in
+        PASS|XPASS) cell=PASS ;;
+        FAIL) cell=FAIL ;;
+        *) cell=N/A ;;
+    esac
+    printf -v "$output_variable" "%s" "$cell"
+}
+
+function compatibility_status {
+    local output_variable=$1
+    local program=$2
+    shift 2
+    local cell
+    local pass_count=0
+    local fail_count=0
+    local backend_index=0
+    local failed_list
+    local rendered_status
+    local -a backend_names=(ptrace KVM DBI SaBRe)
+    local -a failed_backends=()
+
+    for cell in "$@"; do
+        case "$cell" in
+            PASS) pass_count=$((pass_count + 1)) ;;
+            FAIL)
+                fail_count=$((fail_count + 1))
+                failed_backends+=("${backend_names[$backend_index]}")
+                ;;
+        esac
+        backend_index=$((backend_index + 1))
+    done
+    failed_list=${failed_backends[*]}
+    failed_list=${failed_list// /,}
+
+    if [[ -n ${COMPAT_SUMMARY_KNOWN_FAILURES[$program]+known} && $1 == FAIL ]]; then
+        rendered_status="❌ known-fail: ${COMPAT_SUMMARY_KNOWN_FAILURES[$program]}"
+    elif ((pass_count == 4)); then
+        rendered_status="✅"
+    elif ((pass_count > 0 && fail_count > 0)); then
+        rendered_status="⚠️ FAIL: $failed_list"
+    elif ((fail_count > 0)); then
+        rendered_status="❌ FAIL: $failed_list"
+    elif ((pass_count == 1)) && [[ $1 == PASS ]]; then
+        rendered_status="ptrace-only"
+    elif ((pass_count > 0)); then
+        rendered_status="partial"
+    else
+        rendered_status="not measured"
+    fi
+    printf -v "$output_variable" "%s" "$rendered_status"
+}
+
+function print_compatibility_summary {
+    local program
+    local ptrace
+    local kvm
+    local dbi
+    local sabre
+    local status
+    local total=0
+    local ptrace_pass=0
+    local kvm_pass=0
+    local dbi_pass=0
+    local sabre_pass=0
+    local rendered="$VALIDATION_TMP_DIR/compat-summary-rendered.tsv"
+    load_compatibility_results
+
+    : >"$rendered"
+    while read -r program; do
+        [[ -n $program ]] || continue
+        backend_compatibility_cell ptrace "$program" ptrace
+        backend_compatibility_cell kvm "$program" kvm
+        backend_compatibility_cell dbi "$program" dbi
+        backend_compatibility_cell sabre "$program" sabre
+        compatibility_status status "$program" "$ptrace" "$kvm" "$dbi" "$sabre"
+        printf "%s\t%s\t%s\t%s\t%s\t%s\n" \
+            "$program" "$ptrace" "$kvm" "$dbi" "$sabre" "$status" >>"$rendered"
+        total=$((total + 1))
+        [[ $ptrace == PASS ]] && ptrace_pass=$((ptrace_pass + 1))
+        [[ $kvm == PASS ]] && kvm_pass=$((kvm_pass + 1))
+        [[ $dbi == PASS ]] && dbi_pass=$((dbi_pass + 1))
+        [[ $sabre == PASS ]] && sabre_pass=$((sabre_pass + 1))
+    done < <(compat_summary_programs | sort -u)
+
+    printf "\nCOMPAT SUMMARY (%s total programs)\n" "$total"
+    printf "%-24s | %-7s | %-7s | %-7s | %-7s | %s\n" \
+        "Program" "ptrace" "KVM" "DBI" "SaBRe" "Status"
+    printf "%s\n" "-------------------------|---------|---------|---------|---------|----------------"
+    while IFS=$'\t' read -r program ptrace kvm dbi sabre status; do
+        printf "%-24s | %-7s | %-7s | %-7s | %-7s | %s\n" \
+            "$program" "$ptrace" "$kvm" "$dbi" "$sabre" "$status"
+    done <"$rendered"
+    printf "%-24s | %-7s | %-7s | %-7s | %-7s |\n" \
+        "TOTAL" "$ptrace_pass/$total" "$kvm_pass/$total" \
+        "$dbi_pass/$total" "$sabre_pass/$total"
+    printf "N/A means this profile did not measure that backend/program.\n"
 }
 
 function super_probe_command {
@@ -1060,11 +1261,13 @@ function strict_compatibility_probe {
         status=0
         printf "  ✅ %-12s PASS %s (%ss)\n" \
             "$label" "$assurance" "$((SECONDS - started_at))"
+        record_compatibility_result "$label" PASS "$assurance"
     else
         status=$?
         summary=$(failure_summary "$output_start")
         printf "  ❌ %-12s FAIL %s (exit %s: %s)\n" \
             "$label" "$assurance" "$status" "$summary"
+        record_compatibility_result "$label" FAIL "exit $status: $summary"
     fi
 
     {
@@ -1256,6 +1459,7 @@ function run_compatibility_corpus {
                 printf "=== L2 compatibility: socat ===\n"
                 printf "Skipped: /usr/bin/socat is not installed\n\n"
             } >>"$LOG_FILE"
+            record_compatibility_result socat N/A "not installed"
         fi
     fi
     # Avoid the PATH Git wrapper: its telemetry sidecar pipes are nondeterministic.
