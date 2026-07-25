@@ -270,7 +270,7 @@ readonly RR_COMPAT_EXPECTED=128
 readonly SABRE_COMPAT_EXPECTED=151
 readonly SABRE_COMPAT_TOTAL=151
 readonly E9PATCH_COMPAT_TOTAL=151
-readonly E9PATCH_EXTENDED_PROGRAMS=43
+readonly E9PATCH_EXTENDED_PROGRAMS=55
 COMPATIBILITY_MODE=strict
 E9PATCH_COMPAT_REWRITTEN=0
 E9PATCH_COMPAT_ZERO_SITE=0
@@ -1767,6 +1767,20 @@ function run_e9patch_extended_compatibility_envelope {
     optional_e9patch_compatibility_probe nginx nginx -v
     optional_e9patch_compatibility_probe ldconfig ldconfig --version
 
+    # TODO-HUMAN-REVIEW(PR-684): Review the rewritten system-tool coverage rows.
+    optional_e9patch_compatibility_probe buildah buildah --version
+    optional_e9patch_compatibility_probe shellcheck shellcheck --version
+    optional_e9patch_compatibility_probe bat bat --version
+    optional_e9patch_compatibility_probe rg rg --version
+    optional_e9patch_compatibility_probe busybox busybox --help
+    optional_e9patch_compatibility_probe qemu-img qemu-img --version
+    optional_e9patch_compatibility_probe qemu-io qemu-io --version
+    optional_e9patch_compatibility_probe qemu-nbd qemu-nbd --version
+    optional_e9patch_compatibility_probe btrfs btrfs version
+    optional_e9patch_compatibility_probe llvm-exegesis llvm-exegesis --version
+    optional_e9patch_compatibility_probe lto-dump lto-dump --help=common
+    optional_e9patch_compatibility_probe my-print-defaults my_print_defaults --version
+
     classified=$((E9PATCH_COMPAT_REWRITTEN + E9PATCH_COMPAT_ZERO_SITE + \
         E9PATCH_COMPAT_CANDIDATE_ONLY + E9PATCH_COMPAT_NON_ELF + \
         E9PATCH_COMPAT_NO_DIAGNOSTIC))
@@ -2183,7 +2197,7 @@ if ((E9PATCH_COMPAT_ONLY == 1)); then
             run_e9patch_compatibility_envelope
     fi
     if ((failures == 0)); then
-        run_check "e9patch extended installed-program matrix (43 optional programs)" \
+        run_check "e9patch extended installed-program matrix (55 optional programs)" \
             run_e9patch_extended_compatibility_envelope
     fi
     print_summary

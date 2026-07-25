@@ -52,18 +52,19 @@ both passed at L2.
 
 ## 2026-07-24 extended result
 
-All 43 extended programs were installed on the measurement host.
+All 55 extended programs were installed on the measurement host.
 
 | Result | Programs | Meaning |
 | --- | ---: | --- |
-| L2 pass | 43 | Every installed extended probe produced equivalent logs. |
-| Rewritten ELF | 10 | `go`, `gdb`, `rsync`, `lscpu`, `podman`, `perf`, `rustup`, `mysql`, `nginx`, and `ldconfig`. |
+| L2 pass | 55 | Every installed extended probe produced equivalent logs. |
+| Rewritten ELF | 21 | Ten previously measured rows plus the 11 rewritten tools below. |
 | Zero-site ELF | 32 | No candidate instruction sites in the main executable. |
+| Candidate-only ELF | 1 | `shellcheck` had six candidates that e9tool classified as data. |
 | Non-ELF fallback | 1 | `ldd` ran through the explicit ptrace fallback. |
 | Failure | 0 | No failure remained in the blocking extended set. |
 
-Together, the core and extended matrices cover 194 entrypoints at L2 on this
-host, including 16 rewritten rows.
+Together, the core and extended matrices cover 206 entrypoints at L2 on this
+host, including 27 rewritten rows.
 
 The five added cache-miss rewrites recovered and patched `perf` 9/9 sites,
 `rustup` 24/49 candidates, `mysql` 125/125 sites, `nginx` 2/2 sites, and
@@ -72,6 +73,18 @@ e9tool, so its 24/24 recovered instructions are complete coverage. The large
 internal mysql executable took about 95 seconds to preprocess on this host and
 then passed at L2 from cache; its complete row has a 180-second bound. The
 other rows retain the default 60-second bound.
+
+The next system-tool tier recovered and patched `buildah` 54/54 sites, `bat`
+15/15, `rg` 6/6, `busybox` 183/183, `qemu-img`, `qemu-io`, and `qemu-nbd` 5/5
+each, `btrfs` 13/13, `llvm-exegesis` 22/22, `lto-dump` 10/10, and
+`my_print_defaults` 29/29. All 12 rows, including candidate-only `shellcheck`,
+passed three additional L2 repetitions (36/36) before entering the blocking
+matrix.
+
+`gh --version` initially passed with a 48/48 rewrite, but subsequent runs
+exposed an intermittent thread-scheduling divergence that also occurs without
+preprocessing. It remains outside the blocking e9patch matrix until the ptrace
+runtime behavior is stable.
 
 The initial full Go rewrite exposed an e9tool optimizer interaction. The
 default O2 artifact patched all 49 candidates and ran directly on the host, but
