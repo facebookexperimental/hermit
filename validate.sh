@@ -256,9 +256,9 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
 readonly RR_COMPAT_EXPECTED=128
-# Require the repaired variable-output probes while retaining one row of headroom.
+# Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
-readonly SABRE_COMPAT_EXPECTED=145
+readonly SABRE_COMPAT_EXPECTED=151
 readonly SABRE_COMPAT_TOTAL=151
 COMPATIBILITY_MODE=strict
 
@@ -1111,7 +1111,8 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     functional_compatibility_probe rustc rustc --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    functional_compatibility_probe java java -version \
+    functional_compatibility_probe java java \
+        -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe ruby /usr/bin/ruby --disable-gems -e \
         'values = (1..5).map { |value| value * value }; raise "unexpected squares" unless values == [1, 4, 9, 16, 25]; puts values.join(",")' \
@@ -1888,7 +1889,7 @@ if ((SABRE_COMPAT_ONLY == 1)); then
             cargo build --release -p hermit
     fi
     if ((failures == 0)); then
-        run_check "SaBRe compatibility ratchet (147 programs)" \
+        run_check "SaBRe compatibility ratchet (151 programs)" \
             run_sabre_compatibility_envelope
     fi
     print_summary

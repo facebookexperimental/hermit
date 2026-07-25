@@ -124,8 +124,11 @@ class Compat {
     }
 }
 EOF
-        javac -d "$WORK_DIR" "$WORK_DIR/Compat.java"
-        java -cp "$WORK_DIR" Compat
+        # Bound JVM-internal workers while retaining Compat's application thread.
+        javac -J-Xint -J-XX:+UseSerialGC -J-XX:ActiveProcessorCount=1 \
+            -d "$WORK_DIR" "$WORK_DIR/Compat.java"
+        java -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 \
+            -cp "$WORK_DIR" Compat
         ;;
     git)
         readonly GIT=/usr/local/bin/git.meta.real
