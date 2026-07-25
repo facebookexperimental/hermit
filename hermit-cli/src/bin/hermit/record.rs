@@ -18,10 +18,15 @@ use crate::remove::RemoveOpts;
 
 /// Command-line options for the "record" subcommand.
 #[derive(Debug, Parser)]
+#[clap(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 pub struct RecordOpts {
-    ///Subcommands of record
+    /// Subcommands of record.
     #[clap(subcommand)]
-    record_commands: RecordCommand,
+    record_command: Option<RecordCommand>,
+
+    /// Direct recording options. `record start` remains available as an explicit spelling.
+    #[clap(flatten)]
+    start: StartOpts,
 }
 
 #[derive(Debug, Parser)]
@@ -45,11 +50,12 @@ enum RecordCommand {
 
 impl RecordOpts {
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
-        match &self.record_commands {
-            RecordCommand::List(x) => x.main(global),
-            RecordCommand::Remove(x) => x.main(global),
-            RecordCommand::Clean(x) => x.main(global),
-            RecordCommand::Start(x) => x.main(global),
+        match &self.record_command {
+            Some(RecordCommand::List(x)) => x.main(global),
+            Some(RecordCommand::Remove(x)) => x.main(global),
+            Some(RecordCommand::Clean(x)) => x.main(global),
+            Some(RecordCommand::Start(x)) => x.main(global),
+            None => self.start.main(global),
         }
     }
 }

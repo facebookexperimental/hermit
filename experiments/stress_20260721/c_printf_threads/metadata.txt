@@ -1,0 +1,10 @@
+schema_version=1
+started_at_utc=2026-07-22T01:46:24Z
+repository_commit=96261f618dda654fb87ffacd0e178c4bf743faaf
+hermit=./target/debug/hermit
+hermit_log=error
+hermit_sha256=50c7ec20341311b510637216f912cbd7601efc475443cd5c6713a99d05d825cd
+program=./target/stress-guests/printf_with_threads
+program_sha256=6f0955a1bc5b5ee65aa766c12783e325717db6e522434718ca5085fffd6f5ab7
+runs=25
+command=./target/stress-guests/printf_with_threads

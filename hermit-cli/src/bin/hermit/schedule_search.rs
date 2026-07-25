@@ -8,9 +8,11 @@
 
 use std::ops::Range;
 
+use anyhow::bail;
 use colored::Colorize;
 use detcore::types::SchedEvent;
 use edit_distance::NeedlemanWunsch;
+use edit_distance::NeedlemanWunschError;
 use edit_distance::generate_permutation;
 use edit_distance::iterable_bubble_sort;
 
@@ -20,6 +22,12 @@ pub struct Config {
     pub max_jitter_swapdist: usize,
     pub max_event_level_search_passes: usize,
     pub max_unmatched_to_print: usize,
+    /// Bound quadratic traceback work before falling back to event permutation search.
+    pub max_needleman_matrix_cells: usize,
+    /// Number of identical replays required to classify a jittered control schedule.
+    pub max_replay_attempts: usize,
+    /// Try to split a final adjacent event pair into a precise branch boundary.
+    pub refine_sub_events: bool,
     pub verbose: bool,
     /// Activate a search that uses Needleman Wunsch alignment during each step.
     pub needleman_search: bool,
@@ -32,6 +40,9 @@ impl Default for Config {
             max_jitter_swapdist: 0,
             max_event_level_search_passes: 100,
             max_unmatched_to_print: 10,
+            max_needleman_matrix_cells: 4_000_000,
+            max_replay_attempts: 2,
+            refine_sub_events: true,
             verbose: false,
             needleman_search: false,
         }
@@ -80,13 +91,19 @@ pub fn search_for_critical_schedule<F>(
     initial_passing_schedule: Vec<SchedEvent>,
     initial_failing_schedule: Vec<SchedEvent>,
     cfg: &Config,
-) -> CriticalSchedule
+) -> anyhow::Result<CriticalSchedule>
 where
     F: FnMut(&[SchedEvent]) -> (bool, Vec<SchedEvent>),
 {
     eprintln!("Verifying pass/fail endpoints of the search, using schedule-trace replay:");
-    assert!(tester(&initial_passing_schedule).0);
-    assert!(!tester(&initial_failing_schedule).0);
+    let (passing_endpoint_passes, _) = tester(&initial_passing_schedule);
+    if !passing_endpoint_passes {
+        bail!("the passing schedule endpoint did not reproduce a passing outcome");
+    }
+    let (failing_endpoint_passes, _) = tester(&initial_failing_schedule);
+    if failing_endpoint_passes {
+        bail!("the failing schedule endpoint did not reproduce the target failure");
+    }
 
     // Do the first level search at the event level
     let EventLevelSearchResult {
@@ -108,8 +125,16 @@ where
         )
     };
 
-    // TODO: reenable subdividing blocks of event and searching down to unit granularity:
-    // sub_event_search(&mut tester, passing_schedule, failing_schedule)
+    if cfg.refine_sub_events
+        && let Some(critical_schedule) = sub_event_search(
+            &mut tester,
+            passing_schedule.clone(),
+            failing_schedule.clone(),
+        )
+    {
+        return Ok(critical_schedule);
+    }
+
     eprintln!(
         ":: {}",
         "Critical events found which exercise race bug."
@@ -121,17 +146,58 @@ where
         common_prefix.len() + 1
     };
     eprintln!("Critical event index {}", critical_event_index);
-    CriticalSchedule {
+    Ok(CriticalSchedule {
         failing_schedule,
         passing_schedule,
         critical_event_index,
-    }
+    })
 }
 
 // Return edit distance and swap distance.
 fn just_distance(sched1: &[SchedEvent], sched2: &[SchedEvent]) -> (usize, usize) {
     let bubbles = iterable_bubble_sort(sched1, sched2);
     (bubbles.edit_distance(), bubbles.swap_distance())
+}
+
+fn test_and_select_stable_point<F>(
+    tester: &mut F,
+    requested_schedule: &[SchedEvent],
+    cfg: &Config,
+) -> (bool, Vec<SchedEvent>)
+where
+    F: FnMut(&[SchedEvent]) -> (bool, Vec<SchedEvent>),
+{
+    let (passes, actual_schedule) = tester(requested_schedule);
+    let jitter = just_distance(requested_schedule, &actual_schedule);
+    if jitter.0 <= cfg.max_jitter_editdist && jitter.1 <= cfg.max_jitter_swapdist {
+        return (passes, actual_schedule);
+    }
+
+    eprintln!(
+        ":: {}",
+        format!(
+            "Replay jitter {}:{} exceeded threshold {}:{}; checking control-schedule stability",
+            jitter.0, jitter.1, cfg.max_jitter_editdist, cfg.max_jitter_swapdist,
+        )
+        .yellow()
+        .bold(),
+    );
+
+    for attempt in 2..=cfg.max_replay_attempts.max(2) {
+        let (replayed_passes, replayed_actual) = tester(requested_schedule);
+        if replayed_passes == passes && replayed_actual == actual_schedule {
+            eprintln!(
+                ":: Jittered control schedule reproduced the same outcome and realized trace on attempt {}",
+                attempt,
+            );
+            return (passes, requested_schedule.to_vec());
+        }
+    }
+
+    panic!(
+        "Jittered schedule replay was not stable after {} attempts; refusing to attach an outcome to the requested control schedule",
+        cfg.max_replay_attempts.max(2),
+    );
 }
 
 /// Search of the schedule space to find the critical schedule
@@ -144,48 +210,66 @@ fn needleman_level_search<F>(
 where
     F: FnMut(&[SchedEvent]) -> (bool, Vec<SchedEvent>),
 {
-    for _pass_number in 0..cfg.max_event_level_search_passes {
-        let mut needleman = NeedlemanWunsch {
-            first_sequence: passing_schedule.clone(),
-            second_sequence: failing_schedule.clone(),
-            ..Default::default()
-        };
-        let (start_index, global_alignment) =
-            needleman.match_sequences(Some(scoring_function), None, Some(-2));
-        if global_alignment.is_empty() {
-            panic!(
-                "Aborting search, if the swap distance is 0, that means we didn't find ANY matching events between schedules. This is a bad sign."
-            );
-        }
-        // TODO: Find a good stopping condition
-        if global_alignment.len() == 1 {
+    for pass_number in 0..cfg.max_event_level_search_passes {
+        let (edit_distance, swap_distance) = just_distance(&passing_schedule, &failing_schedule);
+        if edit_distance == 1 && swap_distance == 1 {
             return EventLevelSearchResult {
                 passing_schedule,
                 failing_schedule,
             };
         }
+        if edit_distance != swap_distance {
+            eprintln!(
+                ":: Needleman-Wunsch endpoints contain {} insertion/deletion edits; falling back to event permutation search",
+                edit_distance - swap_distance,
+            );
+            return event_level_search(tester, passing_schedule, failing_schedule, cfg);
+        }
+
+        let mut needleman = NeedlemanWunsch {
+            first_sequence: passing_schedule.clone(),
+            second_sequence: failing_schedule.clone(),
+            ..Default::default()
+        };
+        let (start_index, global_alignment) = match needleman.match_sequences_bounded(
+            Some(scoring_function),
+            None,
+            Some(-2),
+            cfg.max_needleman_matrix_cells,
+        ) {
+            Ok(alignment) => alignment,
+            Err(NeedlemanWunschError::MatrixTooLarge { cells, max_cells }) => {
+                eprintln!(
+                    ":: Needleman-Wunsch alignment requires {} cells (limit {}); falling back to event permutation search",
+                    cells, max_cells,
+                );
+                return event_level_search(tester, passing_schedule, failing_schedule, cfg);
+            }
+        };
+        if global_alignment.is_empty() {
+            eprintln!(
+                ":: Needleman-Wunsch produced no alignment difference on pass {}; falling back to event permutation search",
+                pass_number,
+            );
+            return event_level_search(tester, passing_schedule, failing_schedule, cfg);
+        }
         let requested_midpoint_schedule =
             needleman.generate_midpoint_schedule(start_index, global_alignment);
-        let (midpoint_passes, midpoint_actual_schedule) = tester(&requested_midpoint_schedule);
-        let (jitter_edit, jitter_swap) =
-            just_distance(&requested_midpoint_schedule, &midpoint_actual_schedule);
-        eprintln!(
-            ":: THROUGH NEEDLEMAN Jitter was {},{} edit/swap distance (requested synthetic schedule vs actual schedule)",
-            jitter_edit, jitter_swap
-        );
-        let selected_new_point = if jitter_edit > cfg.max_jitter_editdist
-            || jitter_swap > cfg.max_jitter_swapdist
+
+        let distance_from_passing = just_distance(&passing_schedule, &requested_midpoint_schedule);
+        let distance_from_failing = just_distance(&requested_midpoint_schedule, &failing_schedule);
+        if distance_from_passing >= (edit_distance, swap_distance)
+            || distance_from_failing >= (edit_distance, swap_distance)
         {
             eprintln!(
-                ":: {} ({},{})",
-                "Jitter exceeded threshold, proceeding optimistically along original route rather than rerouting the search".red().bold(),
-                jitter_edit,
-                jitter_swap,
+                ":: Needleman-Wunsch midpoint did not strictly reduce both sides of the {}:{} interval; falling back to event permutation search",
+                edit_distance, swap_distance,
             );
-            requested_midpoint_schedule
-        } else {
-            midpoint_actual_schedule
-        };
+            return event_level_search(tester, passing_schedule, failing_schedule, cfg);
+        }
+
+        let (midpoint_passes, selected_new_point) =
+            test_and_select_stable_point(tester, &requested_midpoint_schedule, cfg);
 
         if midpoint_passes {
             passing_schedule = selected_new_point;
@@ -283,22 +367,30 @@ where
 
         if swap_dist == 0 {
             panic!(
-                "Aborting search, if the swap distance is 0, that means we didn't find ANY matching events between schedules. This is a bad sign."
+                "Aborting search: opposite-outcome schedules have no remaining reorderable event distance (edit distance {})",
+                edit_dist,
             );
         }
 
-        if swap_dist == 1 {
+        if swap_dist == 1 && edit_dist == 1 {
             return EventLevelSearchResult {
                 passing_schedule,
                 failing_schedule,
             };
         }
 
-        let (midpoint_passes, midpoint_actual_schedule) = tester(&requested_midpoint_schedule);
+        if swap_dist == 1 {
+            panic!(
+                "Aborting search: schedules are one swap apart but still contain {} unmatched event edits",
+                edit_dist - swap_dist,
+            );
+        }
 
-        let (jitter_edit, jitter_swap) =
-            just_distance(&requested_midpoint_schedule, &midpoint_actual_schedule);
+        let (midpoint_passes, selected_new_point) =
+            test_and_select_stable_point(tester, &requested_midpoint_schedule, cfg);
         if cfg.verbose {
+            let (jitter_edit, jitter_swap) =
+                just_distance(&requested_midpoint_schedule, &selected_new_point);
             if jitter_edit > 0 || jitter_swap > 0 {
                 eprintln!(
                     ":: Jitter was {}:{} edit/swap distance (requested synthetic schedule vs actual schedule)",
@@ -309,8 +401,8 @@ where
                     ":: No jitter in this run (requested synthetic schedule identical to actual schedule)",
                 );
             }
-            let (edit1, swap1) = just_distance(&passing_schedule, &midpoint_actual_schedule);
-            let (edit2, swap2) = just_distance(&midpoint_actual_schedule, &failing_schedule);
+            let (edit1, swap1) = just_distance(&passing_schedule, &selected_new_point);
+            let (edit2, swap2) = just_distance(&selected_new_point, &failing_schedule);
             eprintln!(
                 ":: Including jitter, actual run was {}:{} from passing pole and {}:{} from failing one",
                 edit1, swap1, edit2, swap2
@@ -322,23 +414,6 @@ where
                 edit1, swap1, edit2, swap2
             );
         }
-
-        let selected_new_point = if jitter_edit > cfg.max_jitter_editdist
-            || jitter_swap > cfg.max_jitter_swapdist
-        {
-            eprintln!(
-                ":: {}",
-                format!("Jitter ({}:{}) exceeded threshold ({}:{}), proceeding optimistically along original route rather than rerouting the search",
-                    jitter_edit,
-                    jitter_swap,
-                    cfg.max_jitter_editdist,
-                    cfg.max_jitter_swapdist,
-                ).red().bold(),
-            );
-            requested_midpoint_schedule
-        } else {
-            midpoint_actual_schedule
-        };
 
         if midpoint_passes {
             passing_schedule = selected_new_point;
@@ -406,16 +481,24 @@ where
 /// critical branch in thread B which will (fortunately) be `j`. We will return the critical
 /// schedule in the form that passes and coordinates into the schedule to indicate where a single
 /// flipped pair of branches can cause the test to fail
-#[allow(unused)]
 fn sub_event_search<F>(
     tester: &mut F,
     passing_schedule: Vec<SchedEvent>,
     failing_schedule: Vec<SchedEvent>,
-) -> CriticalSchedule
+) -> Option<CriticalSchedule>
 where
     F: FnMut(&[SchedEvent]) -> (bool, Vec<SchedEvent>),
 {
     let (prefix, postfix) = get_common_pre_and_postfix(&passing_schedule, &failing_schedule);
+    if passing_schedule.len() != failing_schedule.len()
+        || prefix.len() + postfix.len() + 2 != passing_schedule.len()
+    {
+        eprintln!(
+            ":: Skipping sub-event refinement: final schedules are not a single exact adjacent event reversal"
+        );
+        return None;
+    }
+
     let critical_range = Range {
         start: prefix.len(),
         end: prefix.len() + 2,
@@ -431,12 +514,15 @@ where
 
     let passing_critical_events = &passing_schedule[critical_range.clone()];
     let failing_critical_events = &failing_schedule[critical_range];
+    if !same_event_except_count(&passing_critical_events[0], &failing_critical_events[1])
+        || !same_event_except_count(&passing_critical_events[1], &failing_critical_events[0])
+    {
+        eprintln!(
+            ":: Skipping sub-event refinement: adjacent events do not form the same reversed pair"
+        );
+        return None;
+    }
 
-    // Ideally, the two critical pairs have the same count, but nothing guarantees that,
-    // so we are taking the maximum count here. The rationalle for using the max is during
-    // execution, if we specify too few in the count, the program could leave some scheduled
-    // branches unevaluated, but given too many, the program cannot execute more branches than
-    // it has, so it will likely desync and then reaquire later on.
     let critical_pair_passing = [
         sched_event_with_new_count(
             &passing_critical_events[0],
@@ -456,36 +542,47 @@ where
 
     let i_max = critical_pair_passing[0].count;
     let j_max = critical_pair_passing[1].count;
+    if !can_split_event(&critical_pair_passing[0])
+        || !can_split_event(&critical_pair_passing[1])
+        || !critical_pair_passing
+            .iter()
+            .any(|event| event.op == detcore::types::Op::Branch && event.count > 1)
+    {
+        eprintln!(
+            ":: Skipping sub-event refinement: critical pair has no splittable branch interval"
+        );
+        return None;
+    }
 
-    // Once this search is done, i_plus_one will be the minimum number of
-    // branches from the first event in the critical pair where the test passes.
-    // Thereform i will the maximum value where the test fails
+    // Find the first A branch count that passes. Its predecessor is the failing boundary.
     let i_plus_one = binary_search(0..i_max, &mut |i| {
         let schedule =
             create_schedule_with_critical_pair(prefix, postfix, &critical_pair_passing, i, j_max);
 
-        let (passed, _) = tester(&schedule);
+        let passed = test_exact_replay(tester, &schedule)?;
 
         eprintln!("Binary Search of A at sample {} -> passed = {}", i, passed);
 
-        !passed
-    });
+        Some(!passed)
+    })?;
 
-    let i = i_plus_one - 1;
+    let i = i_plus_one.checked_sub(1).or_else(|| {
+        eprintln!(
+            ":: Skipping sub-event refinement: A boundary is already passing at zero branches"
+        );
+        None
+    })?;
 
-    // Once this search is done, j will be the minimum number of branches
-    // from the second event in the critical pair to cause the test to fail.
-    // Therefor j - 1 is the maximum number of branches to allow the test
-    // to pass
+    // Find the first B branch count that fails while holding A at its boundary.
     let j = binary_search(1..j_max, &mut |j| {
         let schedule =
             create_schedule_with_critical_pair(prefix, postfix, &critical_pair_passing, i, j);
 
-        let (passed, _) = tester(&schedule);
+        let passed = test_exact_replay(tester, &schedule)?;
         eprintln!("Binary Search of B at sample {} -> passed = {}", j, passed);
 
-        passed
-    });
+        Some(passed)
+    })?;
 
     // We are defining the critical event as the event index in the passing schedule
     // where the first branch in the event must come after the last branch in the previous
@@ -504,18 +601,69 @@ where
         passing_schedule[critical_event_index - 1] = passing_schedule[critical_event_index].clone();
         passing_schedule[critical_event_index] = tmp;
     }
-    CriticalSchedule {
+
+    if just_distance(&passing_schedule, &failing_schedule) != (1, 1) {
+        eprintln!(
+            ":: Skipping sub-event refinement: final schedules are not one verified adjacent swap apart"
+        );
+        return None;
+    }
+    if !test_exact_replay(tester, &passing_schedule)?
+        || test_exact_replay(tester, &failing_schedule)?
+    {
+        eprintln!(
+            ":: Skipping sub-event refinement: final A/B replay did not preserve passing/failing outcomes"
+        );
+        return None;
+    }
+
+    eprintln!(
+        ":: {}",
+        "Critical branch boundary found and verified."
+            .green()
+            .bold()
+    );
+    Some(CriticalSchedule {
         failing_schedule,
         passing_schedule,
         critical_event_index,
+    })
+}
+
+fn same_event_except_count(first: &SchedEvent, second: &SchedEvent) -> bool {
+    let mut first = first.clone();
+    let mut second = second.clone();
+    first.count = 0;
+    second.count = 0;
+    first == second
+}
+
+fn can_split_event(event: &SchedEvent) -> bool {
+    event.count > 0 && (event.op == detcore::types::Op::Branch || event.count == 1)
+}
+
+fn test_exact_replay<F>(tester: &mut F, requested: &[SchedEvent]) -> Option<bool>
+where
+    F: FnMut(&[SchedEvent]) -> (bool, Vec<SchedEvent>),
+{
+    let (passes, actual) = tester(requested);
+    if actual != requested {
+        eprintln!(
+            ":: Skipping sub-event refinement: replay did not realize a requested branch boundary exactly (requested {} events, realized {})",
+            requested.len(),
+            actual.len(),
+        );
+        None
+    } else {
+        Some(passes)
     }
 }
 
 /// Binary search implementation specific to our problem. This will return the smallest value
 /// where the predicate returns false
-fn binary_search<F>(range: Range<u32>, predicate: &mut F) -> u32
+fn binary_search<F>(range: Range<u32>, predicate: &mut F) -> Option<u32>
 where
-    F: FnMut(u32) -> bool,
+    F: FnMut(u32) -> Option<bool>,
 {
     let mut left = range.start;
     let mut right = range.end;
@@ -523,7 +671,7 @@ where
 
     while size > 0 {
         let mid = left + size / 2;
-        let test_res = predicate(mid);
+        let test_res = predicate(mid)?;
 
         if test_res {
             left = mid + 1;
@@ -534,13 +682,27 @@ where
         size = right - left;
     }
 
-    left
+    Some(left)
 }
 
 /// Create a new SchedEvent with the size replaced with the given value
 fn sched_event_with_new_count(original: &SchedEvent, new_count: u32) -> SchedEvent {
     SchedEvent {
         count: new_count,
+        ..*original
+    }
+}
+
+fn sched_event_fragment(
+    original: &SchedEvent,
+    count: u32,
+    keeps_start: bool,
+    keeps_end: bool,
+) -> SchedEvent {
+    SchedEvent {
+        count,
+        start_rip: keeps_start.then_some(original.start_rip).flatten(),
+        end_rip: keeps_end.then_some(original.end_rip).flatten(),
         ..*original
     }
 }
@@ -564,10 +726,10 @@ fn create_schedule_with_critical_pair(
     let i_remainder = critical_pair_passing[0].count - i;
     let j_remainder = critical_pair_passing[1].count - j;
     let critical_section = [
-        sched_event_with_new_count(&critical_pair_passing[0], i),
-        sched_event_with_new_count(&critical_pair_passing[1], j),
-        sched_event_with_new_count(&critical_pair_passing[0], i_remainder),
-        sched_event_with_new_count(&critical_pair_passing[1], j_remainder),
+        sched_event_fragment(&critical_pair_passing[0], i, true, i_remainder == 0),
+        sched_event_fragment(&critical_pair_passing[1], j, true, j_remainder == 0),
+        sched_event_fragment(&critical_pair_passing[0], i_remainder, i == 0, true),
+        sched_event_fragment(&critical_pair_passing[1], j_remainder, j == 0, true),
     ];
 
     eprintln!(
@@ -587,6 +749,7 @@ fn create_schedule_with_critical_pair(
 mod tests {
 
     use detcore::preemptions::PreemptionRecord;
+    use detcore::types::DetTid;
     use detcore::types::LogicalTime;
     use detcore::types::Op;
     use detcore::types::SyscallPhase;
@@ -607,14 +770,125 @@ mod tests {
         // Check a bunch of close values to make sure we don't have an off-by-one problem.
         // I also did an exhaustive search up to 100,000 because I was sure this wouldn't work,
         // but it does. Thanks, Rust std library
-        assert_eq!(binary_search(0..10, &mut |i| i < 4), 4);
-        assert_eq!(binary_search(0..11, &mut |i| i < 4), 4);
-        assert_eq!(binary_search(0..10, &mut |i| i < 5), 5);
-        assert_eq!(binary_search(0..11, &mut |i| i < 5), 5);
-        assert_eq!(binary_search(1..100, &mut |i| i < 49), 49);
-        assert_eq!(binary_search(2..151, &mut |i| i < 49), 49);
-        assert_eq!(binary_search(3..100, &mut |i| i < 58), 58);
-        assert_eq!(binary_search(4..151, &mut |i| i < 58), 58);
+        assert_eq!(binary_search(0..10, &mut |i| Some(i < 4)), Some(4));
+        assert_eq!(binary_search(0..11, &mut |i| Some(i < 4)), Some(4));
+        assert_eq!(binary_search(0..10, &mut |i| Some(i < 5)), Some(5));
+        assert_eq!(binary_search(0..11, &mut |i| Some(i < 5)), Some(5));
+        assert_eq!(binary_search(1..100, &mut |i| Some(i < 49)), Some(49));
+        assert_eq!(binary_search(2..151, &mut |i| Some(i < 49)), Some(49));
+        assert_eq!(binary_search(3..100, &mut |i| Some(i < 58)), Some(58));
+        assert_eq!(binary_search(4..151, &mut |i| Some(i < 58)), Some(58));
+        assert_eq!(binary_search(0..10, &mut |_| None), None);
+    }
+
+    #[test]
+    fn syscall_pair_stays_at_event_granularity() {
+        let first = SchedEvent::syscall(DetTid::from_raw(3), Sysno::write, SyscallPhase::Prehook);
+        let second = SchedEvent::syscall(DetTid::from_raw(5), Sysno::read, SyscallPhase::Prehook);
+        let passing = vec![first.clone(), second.clone()];
+        let failing = vec![second, first.clone()];
+        let tester =
+            |schedule: &[SchedEvent]| (schedule.first() == Some(&first), schedule.to_vec());
+
+        let critical = search_for_critical_schedule(
+            tester,
+            passing.clone(),
+            failing.clone(),
+            &Config::default(),
+        )
+        .unwrap();
+
+        assert_eq!(critical.passing_schedule, passing);
+        assert_eq!(critical.failing_schedule, failing);
+        assert_eq!(critical.critical_event_index, 1);
+    }
+
+    #[test]
+    fn endpoint_outcomes_are_validated() {
+        let first = SchedEvent::syscall(DetTid::from_raw(3), Sysno::write, SyscallPhase::Prehook);
+        let second = SchedEvent::syscall(DetTid::from_raw(5), Sysno::read, SyscallPhase::Prehook);
+        let good = vec![first.clone(), second.clone()];
+        let bad = vec![second, first];
+
+        let error = search_for_critical_schedule(
+            |schedule| (false, schedule.to_vec()),
+            good.clone(),
+            bad.clone(),
+            &Config::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("passing schedule endpoint"));
+
+        let error = search_for_critical_schedule(
+            |schedule| (true, schedule.to_vec()),
+            good,
+            bad,
+            &Config::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("failing schedule endpoint"));
+    }
+
+    #[test]
+    fn sub_event_search_rejects_jittered_replay() {
+        let branch = SchedEvent::branches(DetTid::from_raw(3), 5);
+        let syscall = SchedEvent::syscall(DetTid::from_raw(5), Sysno::write, SyscallPhase::Prehook);
+        let passing = vec![branch.clone(), syscall.clone()];
+        let failing = vec![syscall, branch];
+        let extra = SchedEvent::syscall(DetTid::from_raw(7), Sysno::read, SyscallPhase::Prehook);
+        let mut tester = |schedule: &[SchedEvent]| {
+            let mut actual = schedule.to_vec();
+            actual.push(extra.clone());
+            (false, actual)
+        };
+
+        assert!(sub_event_search(&mut tester, passing, failing).is_none());
+    }
+
+    #[test]
+    fn jittered_control_point_requires_stable_replay() {
+        let first = SchedEvent::syscall(DetTid::from_raw(3), Sysno::write, SyscallPhase::Prehook);
+        let second = SchedEvent::syscall(DetTid::from_raw(5), Sysno::read, SyscallPhase::Prehook);
+        let requested = vec![first, second];
+        let extra = SchedEvent::syscall(DetTid::from_raw(7), Sysno::getpid, SyscallPhase::Prehook);
+        let mut calls = 0;
+        let mut tester = |schedule: &[SchedEvent]| {
+            calls += 1;
+            let mut actual = schedule.to_vec();
+            actual.push(extra.clone());
+            (true, actual)
+        };
+
+        let (passes, selected) =
+            test_and_select_stable_point(&mut tester, &requested, &Config::default());
+
+        assert!(passes);
+        assert_eq!(selected, requested);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn oversized_needleman_alignment_falls_back() {
+        let first = SchedEvent::syscall(DetTid::from_raw(3), Sysno::write, SyscallPhase::Prehook);
+        let second = SchedEvent::syscall(DetTid::from_raw(5), Sysno::read, SyscallPhase::Prehook);
+        let third = SchedEvent::syscall(DetTid::from_raw(7), Sysno::getpid, SyscallPhase::Prehook);
+        let passing = vec![first.clone(), second.clone(), third.clone()];
+        let failing = vec![third, second, first.clone()];
+        let tester =
+            |schedule: &[SchedEvent]| (schedule.first() == Some(&first), schedule.to_vec());
+        let cfg = Config {
+            max_needleman_matrix_cells: 0,
+            needleman_search: true,
+            refine_sub_events: false,
+            ..Default::default()
+        };
+
+        let critical = search_for_critical_schedule(tester, passing, failing, &cfg).unwrap();
+
+        assert_eq!(
+            just_distance(&critical.passing_schedule, &critical.failing_schedule),
+            (1, 1)
+        );
     }
 
     #[test]
@@ -679,7 +953,8 @@ mod tests {
             passing_sched,
             failing_sched,
             &Default::default(),
-        );
+        )
+        .unwrap();
 
         assert_eq!(critical_event_index, 379);
 
@@ -695,11 +970,10 @@ mod tests {
 
         assert_eq!(thread_7_one_branch.dettid.as_raw(), 7);
         assert_eq!(thread_7_one_branch.op, Op::Branch,);
-        // TODO: restore when sub_event_search is restored:
-        // assert_eq!(thread_7_one_branch.count, 1);
+        assert_eq!(thread_7_one_branch.count, 1);
 
-        // assert_eq!(thread_7_other_branches.dettid.as_raw(), 7);
+        assert_eq!(thread_7_other_branches.dettid.as_raw(), 7);
         assert_eq!(thread_7_other_branches.op, Op::Branch,);
-        // assert_eq!(thread_7_other_branches.count, 16);
+        assert_eq!(thread_7_other_branches.count, 16);
     }
 }

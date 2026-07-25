@@ -1,0 +1,17 @@
+2026-07-22T01:08:06.672915Z  WARN reverie_ptrace::task: Unable to intercept CPUID: Underlying hardware does not support CPUID faulting
+2026-07-22T01:08:06.674781Z  WARN reverie_ptrace::task: Unable to intercept CPUID: Underlying hardware does not support CPUID faulting
+nginx-shell:start
+2026-07-22T01:08:06.688705Z  WARN reverie_ptrace::task: Unable to intercept CPUID: Underlying hardware does not support CPUID faulting
+2026-07-22T01:08:06.707517Z  WARN reverie_ptrace::task: Unable to intercept CPUID: Underlying hardware does not support CPUID faulting
+2026-07-22T01:08:06.709397Z  WARN reverie_ptrace::task: Unable to intercept CPUID: Underlying hardware does not support CPUID faulting
+2021/12/31 16:00:04 [notice] 7#7: using the "epoll" event method
+2021/12/31 16:00:04 [notice] 7#7: nginx/1.20.1
+2021/12/31 16:00:04 [notice] 7#7: built by gcc 11.5.0 20240719 (Red Hat 11.5.0-14) (GCC)
+2021/12/31 16:00:04 [notice] 7#7: OS: Linux 5.2.0
+2021/12/31 16:00:04 [notice] 7#7: getrlimit(RLIMIT_NOFILE): 524288:524288
+nginx-shell:probe
+2026-07-22T01:08:06.740181Z  WARN reverie_ptrace::task: Unable to intercept CPUID: Underlying hardware does not support CPUID faulting
+2026-07-22T01:08:06.775695Z  WARN detcore::scheduler: Nondeterministic external actions [DetPid(3)] jumped in the middle of runnable work (3 tasks). Need to record this for reproducibility.
+2026-07-22T01:08:06.776773Z  WARN detcore::scheduler: Nondeterministic external actions [DetPid(3)] jumped in the middle of runnable work (2 tasks). Need to record this for reproducibility.
+2026-07-22T01:08:06.783127Z  WARN reverie_ptrace::task: Unable to intercept CPUID: Underlying hardware does not support CPUID faulting
+2021/12/31 16:00:12 [notice] 13#13: signal process started

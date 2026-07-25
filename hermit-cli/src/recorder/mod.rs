@@ -12,7 +12,10 @@ mod network;
 mod random;
 mod time;
 
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use reverie::Errno;
 use reverie::Error;
@@ -24,6 +27,7 @@ use reverie::RdtscResult;
 use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
+use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Sysno;
 use serde::Deserialize;
@@ -33,6 +37,65 @@ use crate::event::Event;
 use crate::event::SyscallEvent;
 use crate::event_stream::DebugEvent;
 use crate::event_stream::EventWriter;
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct OutputIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl OutputIdentity {
+    fn for_fd(pid: Pid, fd: i32) -> Option<Self> {
+        let metadata = std::fs::metadata(format!("/proc/{}/fd/{fd}", pid.as_raw())).ok()?;
+        Some(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    fn matches(&self, metadata: &std::fs::Metadata) -> bool {
+        self.device == metadata.dev() && self.inode == metadata.ino()
+    }
+}
+fn duplicate_regular_output(pid: Pid, fd: libc::c_int) -> Option<std::os::fd::OwnedFd> {
+    let metadata = std::fs::metadata(format!("/proc/{}/fd/{fd}", pid.as_raw())).ok()?;
+    metadata
+        .file_type()
+        .is_file()
+        .then(|| crate::fd::duplicate_guest_fd(pid, fd).ok())
+        .flatten()
+}
+fn guest_has_open_file_description(pid: Pid, target: &std::os::fd::OwnedFd) -> bool {
+    let entries = match std::fs::read_dir(format!("/proc/{}/fd", pid.as_raw())) {
+        Ok(entries) => entries,
+        Err(_) => return true,
+    };
+    let mut compared = false;
+    let mut saw_any = false;
+    for entry in entries.flatten() {
+        let Some(fd) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<libc::c_int>().ok())
+        else {
+            continue;
+        };
+        saw_any = true;
+        let Ok(candidate) = crate::fd::duplicate_guest_fd(pid, fd) else {
+            continue;
+        };
+        match crate::fd::same_open_file_description(candidate.as_raw_fd(), target.as_raw_fd()) {
+            Ok(true) => return true,
+            Ok(false) => compared = true,
+            Err(error) => tracing::debug!(
+                %error,
+                fd,
+                "could not compare guest fd while releasing captured output"
+            ),
+        }
+    }
+    saw_any && !compared
+}
 
 /// A Reverie tool that records syscalls. Note that only syscalls that cannot be
 /// made deterministic are forwarded to this tool.
@@ -47,6 +110,14 @@ pub struct Recorder {
     // Keep track of the data directory. Each thread uses this path to open its
     // event stream.
     data: PathBuf,
+    /// Physical output endpoints inherited by the root guest.
+    stdout: Option<OutputIdentity>,
+    stderr: Option<OutputIdentity>,
+    /// Stable regular-file OFDs used for offset aliasing checks.
+    #[serde(skip)]
+    stdout_ofd: Mutex<Option<std::os::fd::OwnedFd>>,
+    #[serde(skip)]
+    stderr_ofd: Mutex<Option<std::os::fd::OwnedFd>>,
 }
 
 #[reverie::tool]
@@ -54,9 +125,13 @@ impl Tool for Recorder {
     type GlobalState = detcore::GlobalState;
     type ThreadState = EventWriter;
 
-    fn new(_pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
+    fn new(pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
         Self {
             data: cfg.replay_data.as_ref().unwrap().clone(),
+            stdout: OutputIdentity::for_fd(pid, libc::STDOUT_FILENO),
+            stderr: OutputIdentity::for_fd(pid, libc::STDERR_FILENO),
+            stdout_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDOUT_FILENO)),
+            stderr_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDERR_FILENO)),
         }
     }
 
@@ -84,7 +159,11 @@ impl Tool for Recorder {
             //Sysno::arch_prctl,
             Sysno::read,
             Sysno::pread64,
+            Sysno::readv,
+            Sysno::preadv,
+            Sysno::preadv2,
             Sysno::recvfrom,
+            Sysno::recvmsg,
             Sysno::write,
             Sysno::pwrite64,
             Sysno::writev,
@@ -96,6 +175,8 @@ impl Tool for Recorder {
             Sysno::fstat,
             Sysno::lstat,
             Sysno::newfstatat,
+            Sysno::statfs,
+            Sysno::fstatfs,
             Sysno::statx,
             Sysno::getdents,
             Sysno::getdents64,
@@ -104,7 +185,11 @@ impl Tool for Recorder {
             Sysno::open,
             Sysno::openat,
             Sysno::close,
+            Sysno::fchdir,
+            Sysno::close_range,
             Sysno::fadvise64,
+            Sysno::flock,
+            Sysno::ftruncate,
             Sysno::dup,
             Sysno::dup2,
             Sysno::dup3,
@@ -120,6 +205,8 @@ impl Tool for Recorder {
             Sysno::sendto,
             Sysno::sendmsg,
             Sysno::poll,
+            Sysno::ppoll,
+            Sysno::epoll_wait,
             Sysno::getsockopt,
             Sysno::getpeername,
             Sysno::getsockname,
@@ -139,6 +226,7 @@ impl Tool for Recorder {
         syscall: Syscall,
     ) -> Result<i64, Error> {
         self.record_raw_syscall(guest, syscall);
+        self.record_exec_path(guest, syscall);
 
         Ok(match syscall {
             // We must let through execve without any modification. Recording
@@ -158,7 +246,38 @@ impl Tool for Recorder {
             }
             Syscall::Read(syscall) => self.handle_read(guest, syscall).await,
             Syscall::Pread64(syscall) => self.handle_pread64(guest, syscall).await,
+            Syscall::Readv(syscall) => {
+                self.handle_readv_family(
+                    guest,
+                    syscall.iov().map(|a| a.as_raw()),
+                    syscall.len(),
+                    syscall.fd(),
+                    syscall.into(),
+                )
+                .await
+            }
+            Syscall::Preadv(syscall) => {
+                self.handle_readv_family(
+                    guest,
+                    syscall.iov().map(|a| a.as_raw()),
+                    syscall.iov_len(),
+                    syscall.fd(),
+                    syscall.into(),
+                )
+                .await
+            }
+            Syscall::Preadv2(syscall) => {
+                self.handle_readv_family(
+                    guest,
+                    syscall.iov().map(|a| a.as_raw()),
+                    syscall.iov_len() as usize,
+                    syscall.fd(),
+                    syscall.into(),
+                )
+                .await
+            }
             Syscall::Recvfrom(syscall) => self.handle_recvfrom(guest, syscall).await,
+            Syscall::Recvmsg(syscall) => self.handle_recvmsg(guest, syscall).await,
             Syscall::Write(syscall) => self.handle_write_family(guest, syscall.into()).await,
             Syscall::Pwrite64(syscall) => self.handle_write_family(guest, syscall.into()).await,
             Syscall::Writev(syscall) => self.handle_write_family(guest, syscall.into()).await,
@@ -170,6 +289,14 @@ impl Tool for Recorder {
             Syscall::Fstat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
             Syscall::Lstat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
             Syscall::Newfstatat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
+            Syscall::Statfs(syscall) => {
+                self.handle_statfs(guest, syscall.into(), syscall.buf())
+                    .await
+            }
+            Syscall::Fstatfs(syscall) => {
+                self.handle_statfs(guest, syscall.into(), syscall.buf())
+                    .await
+            }
             Syscall::Statx(syscall) => self.handle_statx(guest, syscall).await,
             Syscall::Getdents(syscall) => self.handle_getdents(guest, syscall).await,
             Syscall::Getdents64(syscall) => self.handle_getdents64(guest, syscall).await,
@@ -177,11 +304,15 @@ impl Tool for Recorder {
             Syscall::Munmap(_) => self.let_through(guest, syscall).await,
             Syscall::Open(_) => self.handle_simple(guest, syscall).await,
             Syscall::Openat(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Close(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Close(_) => self.handle_fd_table_mutation(guest, syscall).await,
+            Syscall::Fchdir(_) => self.handle_simple(guest, syscall).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Ftruncate(syscall) => self.handle_ftruncate(guest, syscall).await,
             Syscall::Dup(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Dup2(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Dup3(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Dup2(_) | Syscall::Dup3(_) => {
+                self.handle_fd_table_mutation(guest, syscall).await
+            }
             Syscall::Ioctl(syscall) => self.handle_ioctl(guest, syscall).await,
             Syscall::Socket(_) => self.handle_simple(guest, syscall).await,
             Syscall::ClockGettime(syscall) => self.handle_clock_gettime(guest, syscall).await,
@@ -195,6 +326,8 @@ impl Tool for Recorder {
             Syscall::Sendto(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendmsg(_) => self.handle_simple(guest, syscall).await,
             Syscall::Poll(syscall) => self.handle_poll(guest, syscall).await,
+            Syscall::Ppoll(syscall) => self.handle_ppoll(guest, syscall).await,
+            Syscall::EpollWait(syscall) => self.handle_epoll_wait(guest, syscall).await,
             Syscall::Getsockopt(syscall) => self.handle_sockopt_family(guest, syscall.into()).await,
             Syscall::Getpeername(syscall) => {
                 self.handle_sockopt_family(guest, syscall.into()).await
@@ -207,8 +340,15 @@ impl Tool for Recorder {
             Syscall::Mkdir(_) => self.handle_simple(guest, syscall).await,
             Syscall::Unlink(_) => self.handle_simple(guest, syscall).await,
             Syscall::Unlinkat(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Syscall::Other(Sysno::close_range, _) => self.handle_close_range(guest, syscall).await,
             unsupported => return Ok(guest.inject(unsupported).await?),
         }?)
+    }
+
+    async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        self.release_unreferenced_outputs(guest.pid());
+        Ok(())
     }
 
     async fn handle_rdtsc_event<G: Guest<Self>>(
@@ -223,12 +363,136 @@ impl Tool for Recorder {
 }
 
 impl Recorder {
+    pub(super) fn output_ofd_matches(
+        &self,
+        output_fd: libc::c_int,
+        candidate: &std::os::fd::OwnedFd,
+    ) -> bool {
+        let output = match output_fd {
+            libc::STDOUT_FILENO => &self.stdout_ofd,
+            libc::STDERR_FILENO => &self.stderr_ofd,
+            _ => return false,
+        };
+        let output = output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        output.as_ref().is_some_and(|target| {
+            crate::fd::same_open_file_description(candidate.as_raw_fd(), target.as_raw_fd())
+                .unwrap_or(false)
+        })
+    }
+
+    fn release_unreferenced_output(output: &Mutex<Option<std::os::fd::OwnedFd>>, pid: Pid) {
+        let mut output = output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if output
+            .as_ref()
+            .is_some_and(|target| !guest_has_open_file_description(pid, target))
+        {
+            output.take();
+        }
+    }
+
+    fn release_unreferenced_outputs(&self, pid: Pid) {
+        Self::release_unreferenced_output(&self.stdout_ofd, pid);
+        Self::release_unreferenced_output(&self.stderr_ofd, pid);
+    }
+
+    async fn handle_fd_table_mutation<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+        self.release_unreferenced_outputs(guest.pid());
+        self.record_event(guest, result.map(SyscallEvent::Return));
+        result
+    }
+
+    // TODO-HUMAN-REVIEW(#557): Audit close_range fd-table replay semantics.
+    async fn handle_close_range<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let Syscall::Other(Sysno::close_range, args) = syscall else {
+            unreachable!("handle_close_range called for {syscall:?}");
+        };
+
+        if args.arg2 & libc::CLOSE_RANGE_UNSHARE as usize != 0 {
+            let result = Err(Errno::ENOSYS);
+            self.record_event(guest, result.map(SyscallEvent::Return));
+            return result;
+        }
+
+        self.handle_fd_table_mutation(guest, syscall).await
+    }
+
     fn record_raw_syscall<G: Guest<Self>>(&self, guest: &mut G, syscall: Syscall) {
         let debug_event = DebugEvent::new(syscall, &guest.memory());
         guest
             .thread_state_mut()
             .push_debug_event(debug_event)
             .unwrap();
+    }
+
+    /// Records the absolute path of any executable that the guest execs, so that
+    /// the replayer can make the same binary available inside its chroot.
+    ///
+    /// Without this, a guest process that forks and execs another binary (for
+    /// example a shell running an external command) would desynchronize on
+    /// replay: the injected `execve` fails with `ENOENT` inside the chroot,
+    /// causing the guest to take a different code path than it did while
+    /// recording.
+    fn record_exec_path<G: Guest<Self>>(&self, guest: &mut G, syscall: Syscall) {
+        let path = match syscall {
+            Syscall::Execve(call) => call.path().map(|p| p.read(&guest.memory())),
+            // Only AT_FDCWD execveat calls carry a path we can resolve without
+            // reconstructing the guest's fd table; dirfd-relative execs are rare
+            // and are skipped (best effort).
+            Syscall::Execveat(call) if call.dirfd() == libc::AT_FDCWD => {
+                call.path().map(|p| p.read(&guest.memory()))
+            }
+            _ => return,
+        };
+        let Some(Ok(path)) = path else {
+            return;
+        };
+        // Only absolute paths can be reproduced in the chroot without also
+        // knowing the guest's working directory at exec time.
+        if !path.is_absolute() {
+            return;
+        }
+        if let Err(err) = self.append_exec_path(&path) {
+            tracing::warn!("Failed to record exec path {:?}: {}", path, err);
+        }
+    }
+
+    /// Appends a single executable path to the recording's `exec_paths` file.
+    ///
+    /// The file is opened in append mode for every exec so that concurrent guest
+    /// threads each contribute their targets; a single small `write` is atomic
+    /// under `O_APPEND` on Linux. Duplicates are deduplicated by the replayer.
+    fn append_exec_path(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+
+        let bytes = path.as_os_str().as_bytes();
+        // Paths are newline-delimited in the manifest; skip the (pathological)
+        // case of an embedded newline rather than corrupt the file.
+        if bytes.contains(&b'\n') {
+            return Ok(());
+        }
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.data.join(crate::consts::EXEC_PATHS_NAME))?;
+        let mut line = Vec::with_capacity(bytes.len() + 1);
+        line.extend_from_slice(bytes);
+        line.push(b'\n');
+        file.write_all(&line)
     }
 
     fn record_event<G: Guest<Self>>(&self, guest: &mut G, event: Result<SyscallEvent, Errno>) {

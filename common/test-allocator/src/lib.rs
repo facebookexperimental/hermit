@@ -6,6 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![allow(
+    unexpected_cfgs,
+    reason = "`sanitized` is supplied by the internal sanitizer build"
+)]
+
 //! This create provides a simple bump allocator useful for tests of
 //! determinism. Because it never reuses memory, that's just about all it's
 //! useful for.

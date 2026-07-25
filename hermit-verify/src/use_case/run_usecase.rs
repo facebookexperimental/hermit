@@ -107,17 +107,17 @@ pub fn run_use_case<T: UseCase>(use_case: T, common_args: &CommonOpts) -> anyhow
         }
     }
 
-    if !common_args.ignore_test_result_artifacts_dir {
-        if let Some(path) = &common_args.test_result_artifact_dir {
-            println!(
-                "{}",
-                format!(":: Copy artifacts to {}", path.display())
-                    .yellow()
-                    .bold()
-            );
-            let test_artifacts = TestArtifacts::new(path.to_owned());
-            test_artifacts.copy_run_results(&temp_env)?;
-        }
+    if !common_args.ignore_test_result_artifacts_dir
+        && let Some(path) = &common_args.test_result_artifact_dir
+    {
+        println!(
+            "{}",
+            format!(":: Copy artifacts to {}", path.display())
+                .yellow()
+                .bold()
+        );
+        let test_artifacts = TestArtifacts::new(path.to_owned());
+        test_artifacts.copy_run_results(&temp_env)?;
     }
     Ok(result)
 }

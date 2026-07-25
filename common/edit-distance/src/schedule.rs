@@ -67,11 +67,11 @@ pub fn prune_schedule(passing: Schedule, failing: &Schedule) -> Schedule {
     let mut failing_count = count_thread_events(failing);
 
     for event in passing {
-        if let Some(count) = failing_count.get_mut(&event.tid) {
-            if *count > 0 {
-                result.push(event);
-                *count = count.saturating_sub(event.count);
-            }
+        if let Some(count) = failing_count.get_mut(&event.tid)
+            && *count > 0
+        {
+            result.push(event);
+            *count = count.saturating_sub(event.count);
         }
     }
 

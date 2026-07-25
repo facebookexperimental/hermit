@@ -1,0 +1,2 @@
+workload	mode	exit_code	duration_ms	classification	note
+node	chaos_random	0	4591	pass	Issue #20 workaround: --sched-heuristic=random

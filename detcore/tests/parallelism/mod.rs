@@ -8,6 +8,10 @@
 
 #![feature(get_mut_unchecked)]
 #![feature(thread_id_value)]
+#![allow(
+    unexpected_cfgs,
+    reason = "`sanitized` is supplied by the internal sanitizer build"
+)]
 
 use std::sync::Arc;
 
@@ -37,9 +41,9 @@ mod mem_race {
     use std::sync::atomic::Ordering;
     use std::thread;
 
+    use detcore_testutils::check_fn_with_config;
     use detcore_testutils::det_test_fn_with_config;
     use detcore_testutils::expect_success;
-    use reverie_ptrace::testing::check_fn_with_config;
     const NUM_ELEMENTS: usize = 20_000_000;
 
     /// In guest mode two threads will try to fill up half of the data array with their thread id as
@@ -149,9 +153,9 @@ mod mem_print_race {
     use std::thread;
 
     use detcore::Detcore;
+    use detcore_testutils::test_fn_with_config;
     use pretty_assertions::assert_eq;
     use reverie::ExitStatus;
-    use reverie_ptrace::testing::test_fn_with_config;
     const NUM_ELEMENTS: usize = 50_000_000;
     const CHUNKS: usize = 5;
 

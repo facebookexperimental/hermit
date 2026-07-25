@@ -62,6 +62,7 @@ pub fn build_hermit_cmd(
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(run.std_out_file_path.as_path())?,
     ));
     command.stderr(Stdio::from(
@@ -69,6 +70,7 @@ pub fn build_hermit_cmd(
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(run.std_err_file_path.as_path())?,
     ));
     Ok(command)

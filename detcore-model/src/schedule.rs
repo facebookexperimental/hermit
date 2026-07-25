@@ -228,8 +228,8 @@ impl From<Signal> for SigWrapper {
 /// - Therefore the OtherInstructions event itself is only interesting insofar as it signals the
 ///   absence of other events.
 /// - Branches include an implicit prefix of OtherInstructions.  This is because for a branch count
-///   > 1 to make sense, we need to include the full between-branches O's: "..BO*B..". We could
-///   change this design by going to either extreme. (1) removing implicit O's and changing the
+///   greater than 1 to make sense, we need to include the full between-branches O's: "..BO*B..". We
+///   could change this design by going to either extreme. (1) removing implicit O's and changing the
 ///   count mechanism to allow repetition of entire sequences "(O*B)^3" instead of "B^3".  Or (2),
 ///   including implicit O's in all event types, and not recording them explicitly.
 #[derive(PartialEq, Debug, Eq, Copy, Clone, Hash, Serialize, Deserialize)]

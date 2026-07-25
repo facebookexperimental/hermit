@@ -1,0 +1,3 @@
+[submodule "third-party/rr"]
+	path = third-party/rr
+	url = https://github.com/rr-debugger/rr

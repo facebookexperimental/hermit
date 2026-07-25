@@ -321,15 +321,13 @@ impl Replayer {
             }
             self.counts_next_round(mytid, is_desync);
 
-            if is_desync {
-                if let Some(ix) = self.check_fast_forward(observed) {
-                    debug_assert!(ix > 0);
-                    // This counts DELETIONS (missing events from observed stream):
-                    let counts = self.desync_counts.entry(mytid).or_default();
-                    counts.resync_deletions += 1;
-                    in_hard_desync_mode = false;
-                    // is_desync = false; // Logically correct, but... unused_assignments
-                }
+            if is_desync && let Some(ix) = self.check_fast_forward(observed) {
+                debug_assert!(ix > 0);
+                // This counts DELETIONS (missing events from observed stream):
+                let counts = self.desync_counts.entry(mytid).or_default();
+                counts.resync_deletions += 1;
+                in_hard_desync_mode = false;
+                // is_desync = false; // Logically correct, but... unused_assignments
             }
 
             if !in_hard_desync_mode {
@@ -345,23 +343,23 @@ impl Replayer {
             }
 
             let action = self.check_context_switch(observed);
-            if let ReplayAction::ContextSwitch(_, next_tid, _) = action {
-                if in_hard_desync_mode {
-                    tracing::warn!(
-                        "[dtid {}] context switch to {}, but in a desynced state at this event (#{}) in --replay-schedule-from",
-                        &mytid,
-                        next_tid,
-                        current_ix
-                    );
-                    let counts = self.desync_counts.entry(mytid).or_default();
-                    counts.at_context_switch += 1;
-                }
+            if let ReplayAction::ContextSwitch(_, next_tid, _) = action
+                && in_hard_desync_mode
+            {
+                tracing::warn!(
+                    "[dtid {}] context switch to {}, but in a desynced state at this event (#{}) in --replay-schedule-from",
+                    &mytid,
+                    next_tid,
+                    current_ix
+                );
+                let counts = self.desync_counts.entry(mytid).or_default();
+                counts.at_context_switch += 1;
             }
             action
         } else if self.replay_exhausted_panic {
             eprintln!(
                 "[detcore, dtid {}] Replay trace ran out, stopping at unknown event {:?}",
-                &mytid, observed
+                mytid, observed
             );
             ReplayAction::Stop(StopReason::ReplayExausted)
         } else {

@@ -1,0 +1,47 @@
+{
+  "task": "verify-shared-futex-qemu",
+  "date": "2026-07-22",
+  "repository": "rrnewton/hermit",
+  "pull_request": "https://github.com/rrnewton/hermit/pull/53",
+  "branch": "impl-shared-futex-support-slot09",
+  "implementation_sha": "b44d9396418c316abdbc38e9e41e5809da936c49",
+  "dependency_sha": "d694cc4e2921bb5b69bfadfbb2c7aec25d07d540",
+  "host": {
+    "name": "devbig030.atn3.facebook.com",
+    "architecture": "x86_64",
+    "kernel": "6.13.2-0_fbk13_hardened_0_g02230262e956"
+  },
+  "tools": {
+    "qemu": "10.1.0 (qemu-kvm-10.1.0-21.el9)",
+    "node": "v16.20.2",
+    "java": "OpenJDK 1.8.0_492 Temurin",
+    "gcc": "11.5.0 20240719",
+    "rustc": "1.99.0-nightly be8e82435 2026-07-11",
+    "cargo": "1.99.0-nightly 59800466c 2026-07-07"
+  },
+  "configuration": {
+    "hermit_profile": "release",
+    "virtual_time": "enabled by default",
+    "virtualize_cpuid": false,
+    "qemu_accelerator": "tcg,thread=single",
+    "qemu_cpus": 1,
+    "qemu_memory_mib": 256,
+    "qemu_host_timeout_seconds": 180,
+    "qemu_trace_timeout_seconds": 20
+  },
+  "artifacts": {
+    "hermit_sha256": "fb464663d3628a87e779138886e67fd210ef0b550f38928641f4c7f09ab9d233",
+    "kernel_path": "/boot/vmlinuz-6.13.2-0_fbk15_hardened_0_g33ebba20e5e4",
+    "kernel_sha256": "ce6aae1633026f6d43fe01ddb847247b8a522aaf1f6a612a8d2c49e3c43b22c0",
+    "initramfs_sha256": "10fc5872a8ced8835da21a5e608b3f8aa02a6ae018e868a58131b05a4a66fed2",
+    "pthread_sha256": "3437189c6ae6c2c2a10bafa1e118eb5f71a788adcedbbe81ab0db158677a0839",
+    "threaded_jar_sha256": "998762a21abcbd75187867e94da679b8e57e6a7c6b2bd1d4c122e0dd2084531f"
+  },
+  "qemu_trace": {
+    "lines": 261555,
+    "completed_syscalls": 19546,
+    "eopnotsupp_or_sigabrt_matches": 0,
+    "shared_wait_result": "futex(0x555557231ea4, 0, -1, NULL, NULL, 0) = Ok(0)",
+    "shared_wake_result": "futex(0x555557231ea4, 1, 2147483647, NULL, NULL, 0) = Ok(1)"
+  }
+}

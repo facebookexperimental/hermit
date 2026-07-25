@@ -11,7 +11,8 @@
 //! Tasks are selected from the queue based on 2 factors:
 //! 1. Their priority
 //! 2. Their round-robin order.
-//! compared in that order. Round-robin orders monotinically increase across
+//!
+//! The factors are compared in that order. Round-robin orders monotonically increase across
 //! the entire queue; a task is assigned an order at insertion time.
 //!
 //! Round-robin orders can also be negative when the `push_front` method is
@@ -168,6 +169,10 @@ pub struct RunQueue {
     /// cache the result.
     tentative_selection: Option<DetTid>,
 
+    /// A thread that explicitly yielded must not be selected again until some
+    /// other runnable thread receives a turn.
+    yielded_skip: Option<DetTid>,
+
     // TODO: The following fields need to be properly abstracted into separate types of run queues.
     /// Which scheduling strategy shall we use.
     sched_strategy: SchedHeuristic,
@@ -183,9 +188,9 @@ impl fmt::Display for RunQueue {
         writeln!(
             f,
             "Run queue, size={}, last_back_turn={}, last_front_turn={}:",
-            &self.queue.len(),
-            &self.last_back_turn,
-            &self.last_front_turn,
+            self.queue.len(),
+            self.last_back_turn,
+            self.last_front_turn,
         )?;
         for x in self.queue.iter() {
             writeln!(f, "    {:.500?}", x)?;
@@ -205,6 +210,7 @@ impl RunQueue {
             last_front_turn: 0,
             sched_strategy: ss,
             tentative_selection: None,
+            yielded_skip: None,
             prng: Pcg64Mcg::seed_from_u64(seed),
             sticky_random_param: srp,
             sticky_random_selection: None,
@@ -242,6 +248,15 @@ impl RunQueue {
             panic!("This is not an acceptable priority value: {}", priority);
         }
         self.push_back_inner(tid, priority, None)
+    }
+
+    /// Requeue an explicitly yielding thread at its persistent priority while
+    /// excluding it from the next selection. The exclusion, rather than the
+    /// queue key, makes this a one-turn operation under every heuristic.
+    pub fn push_yielded(&mut self, tid: DetTid, priority: Priority) -> PrioritizedOrder {
+        assert!(self.yielded_skip.is_none());
+        self.yielded_skip = Some(tid);
+        self.push_back(tid, priority)
     }
 
     /// Push a polling thread. The priority level is an exponential backoff from
@@ -361,6 +376,9 @@ impl RunQueue {
             kept_all = kept_all && ret;
             ret
         });
+        if self.yielded_skip == Some(tid) {
+            self.yielded_skip = None;
+        }
         !kept_all
     }
 
@@ -380,10 +398,15 @@ impl RunQueue {
     /// Postcondition: if return a `Some` value, the RunQueue enters a *locked* state where
     /// commit or undo must happen before any other mutations to the structure.
     pub fn tentative_pop_next(&mut self) -> Option<DetTid> {
+        let skip = self
+            .yielded_skip
+            .filter(|tid| self.queue.len() > 1 && self.contains_tid(*tid));
         self.tentative_selection = match self.sched_strategy {
-            SchedHeuristic::None | SchedHeuristic::ConnectBind => {
-                self.queue.first_key_value().map(|(_k, v)| v.tid)
-            }
+            SchedHeuristic::None | SchedHeuristic::ConnectBind => self
+                .queue
+                .values()
+                .find(|value| Some(value.tid) != skip)
+                .map(|value| value.tid),
             SchedHeuristic::Random => {
                 if self.queue.is_empty() {
                     return None;
@@ -391,9 +414,14 @@ impl RunQueue {
 
                 // If there is not Tid picked from a previous operation, let's pick one now.
                 if self.tentative_selection.is_none() {
-                    let random_idx = self.random_range(0, self.queue.len());
-                    self.tentative_selection =
-                        self.queue.iter().nth(random_idx).map(|(_k, v)| v.tid);
+                    let eligible = self.queue.len() - usize::from(skip.is_some());
+                    let random_idx = self.random_range(0, eligible);
+                    self.tentative_selection = self
+                        .queue
+                        .values()
+                        .filter(|value| Some(value.tid) != skip)
+                        .nth(random_idx)
+                        .map(|value| value.tid);
                 };
 
                 self.tentative_selection
@@ -403,12 +431,20 @@ impl RunQueue {
                     return None;
                 }
 
+                if self.sticky_random_selection == skip {
+                    self.sticky_random_selection = None;
+                }
                 if self.sticky_random_selection.is_none()
                     || !self.contains_tid(self.sticky_random_selection.unwrap())
                 {
-                    let random_idx = self.random_range(0, self.queue.len());
-                    self.sticky_random_selection =
-                        self.queue.iter().nth(random_idx).map(|(_k, v)| v.tid);
+                    let eligible = self.queue.len() - usize::from(skip.is_some());
+                    let random_idx = self.random_range(0, eligible);
+                    self.sticky_random_selection = self
+                        .queue
+                        .values()
+                        .filter(|value| Some(value.tid) != skip)
+                        .nth(random_idx)
+                        .map(|value| value.tid);
                 }
 
                 self.sticky_random_selection
@@ -429,10 +465,7 @@ impl RunQueue {
             .expect("tentative_pop to already returned a `Some`");
 
         let ret = match self.sched_strategy {
-            SchedHeuristic::None | SchedHeuristic::ConnectBind => {
-                self.queue.first_entry().map(|e| e.remove().tid)
-            }
-            SchedHeuristic::Random => {
+            SchedHeuristic::None | SchedHeuristic::ConnectBind | SchedHeuristic::Random => {
                 let key = *self
                     .queue
                     .iter()
@@ -465,6 +498,20 @@ impl RunQueue {
         // between the peek and tentative_pop and commit_tentative_pop.
         debug_assert!(ret == tentative_selection);
         ret
+    }
+
+    /// Commit a tentative pop for a guest turn that will actually run. A
+    /// yielded thread's one-turn exclusion is consumed only here, not by
+    /// scheduler bookkeeping turns that never unblock a guest.
+    pub fn commit_tentative_pop_completed_turn(&mut self) -> DetTid {
+        let tid = self.commit_tentative_pop();
+        self.consume_yield_exclusion();
+        tid
+    }
+
+    /// Mark that a different guest received execution after an explicit yield.
+    pub fn consume_yield_exclusion(&mut self) {
+        self.yielded_skip = None;
     }
 
     /// Forget the tentative pop as though it never happened.
@@ -511,5 +558,76 @@ impl RunQueue {
 impl Default for RunQueue {
     fn default() -> Self {
         Self::new(SchedHeuristic::None, 0, 0.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn yielded_thread_cedes_exactly_one_turn_under_every_heuristic() {
+        for strategy in [
+            SchedHeuristic::None,
+            SchedHeuristic::ConnectBind,
+            SchedHeuristic::Random,
+            SchedHeuristic::StickyRandom,
+        ] {
+            let yielding = DetTid::from_raw(1);
+            let peer = DetTid::from_raw(2);
+            let mut queue = RunQueue::new(strategy, 0, 1.0);
+
+            queue.push_back(yielding, DEFAULT_PRIORITY - 1);
+            assert_eq!(queue.tentative_pop_next(), Some(yielding));
+            assert_eq!(queue.commit_tentative_pop(), yielding);
+
+            queue.push_yielded(yielding, DEFAULT_PRIORITY - 1);
+            queue.push_back(peer, LAST_PRIORITY);
+            assert_eq!(queue.tentative_pop_next(), Some(peer), "{strategy:?}");
+            assert_eq!(
+                queue.commit_tentative_pop_completed_turn(),
+                peer,
+                "{strategy:?}"
+            );
+
+            assert_eq!(queue.yielded_skip, None, "{strategy:?}");
+            let restored_priority = queue
+                .queue
+                .iter()
+                .find(|(_key, value)| value.tid == yielding)
+                .map(|(key, _value)| key.priority);
+            assert_eq!(
+                restored_priority,
+                Some(DEFAULT_PRIORITY - 1),
+                "{strategy:?}"
+            );
+
+            if matches!(strategy, SchedHeuristic::None | SchedHeuristic::ConnectBind) {
+                queue.push_back(peer, LAST_PRIORITY);
+                assert_eq!(queue.tentative_pop_next(), Some(yielding), "{strategy:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn scheduler_only_commit_does_not_consume_yield_exclusion() {
+        let yielding = DetTid::from_raw(1);
+        let peer = DetTid::from_raw(2);
+        let mut queue = RunQueue::default();
+
+        queue.push_back(yielding, DEFAULT_PRIORITY);
+        assert_eq!(queue.tentative_pop_next(), Some(yielding));
+        assert_eq!(queue.commit_tentative_pop(), yielding);
+
+        queue.push_yielded(yielding, DEFAULT_PRIORITY);
+        queue.push_back(peer, DEFAULT_PRIORITY);
+        assert_eq!(queue.tentative_pop_next(), Some(peer));
+        assert_eq!(queue.commit_tentative_pop(), peer);
+
+        queue.push_back(peer, DEFAULT_PRIORITY);
+        assert_eq!(queue.yielded_skip, Some(yielding));
+        assert_eq!(queue.tentative_pop_next(), Some(peer));
+        assert_eq!(queue.commit_tentative_pop_completed_turn(), peer);
+        assert_eq!(queue.yielded_skip, None);
     }
 }

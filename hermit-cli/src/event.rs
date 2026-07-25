@@ -18,6 +18,22 @@ use reverie::syscalls::ioctl;
 use serde::Deserialize;
 use serde::Serialize;
 
+const SIOCETHTOOL: usize = 0x8946;
+
+/// Returns the stable error used for legacy ioctls whose nested output cannot
+/// be represented by the currently pinned Reverie decoder.
+pub(crate) fn deterministic_ioctl_error(request: &ioctl::Request<'_>) -> Option<Errno> {
+    match request {
+        // SIOCETHTOOL stores its output behind the data pointer nested in an
+        // ifreq. Treating it as an opaque request would lose guest-visible
+        // memory updates, so reject it identically during record and replay.
+        ioctl::Request::SIOCETHTOOL(_) | ioctl::Request::Other(SIOCETHTOOL, _) => {
+            Some(Errno::ENODEV)
+        }
+        _ => None,
+    }
+}
+
 /// An event. This contains everything needed to verify and reproduce the
 /// execution of a syscall.
 #[derive(Debug, Serialize, Deserialize)]
@@ -48,13 +64,20 @@ pub struct Event {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum SyscallEvent {
     Bytes(Vec<u8>),
+    /// The flattened output bytes of a vectored read (`readv`/`preadv`/
+    /// `preadv2`). The bytes are stored contiguously in read order; on replay
+    /// they are scattered back across the guest's `iovec` buffers. The length of
+    /// the vector is exactly the return value of the syscall.
+    Readv(Vec<u8>),
     Write(i64),
     Mmap(MmapEvent),
+    Recvmsg(RecvmsgEvent),
     /// A syscall whose only value we care about is the return value. For many
     /// syscalls, this is often the only output of the syscall and thus it is the
     /// only piece of information that needs to be recorded.
     Return(i64),
     Stat(StatEvent),
+    Statfs(Vec<u8>),
     Statx(StatxBuf),
     Rdtsc(RdtscResult),
     Ioctl(ioctl::Output),
@@ -62,6 +85,49 @@ pub enum SyscallEvent {
     Timeofday((Timeval, Timezone)),
     Poll(PollEvent),
     SockOpt(SockOptEvent),
+    EpollWait(EpollWaitEvent),
+    // TODO-HUMAN-REVIEW(#557): Audit the V2 record/replay event schema.
+    WriteV2(WriteEvent),
+    ReadV2(ReadEvent),
+    ReadvV2(ReadEvent),
+    FtruncateV2(FtruncateEvent),
+}
+
+/// Recorded output and signal side effects of a read syscall.
+// TODO-HUMAN-REVIEW(#557): Audit the recorded signalfd side-effect API.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReadEvent {
+    /// Bytes returned to the guest.
+    pub bytes: Vec<u8>,
+    /// Number of pending SIGPIPE instances consumed by this signalfd read.
+    pub consumed_sigpipe_count: u64,
+}
+
+/// Recorded result and side effects of a write-family syscall.
+// TODO-HUMAN-REVIEW(#557): Audit the recorded output and SIGPIPE API.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WriteEvent {
+    pub result: Result<i64, Errno>,
+    /// Original captured output stream aliased by the descriptor, if any.
+    pub output_fd: Option<i32>,
+    /// Byte offset used when the captured output endpoint is a regular file.
+    pub output_offset: Option<i64>,
+    /// Whether the write advances the captured open-file description offset.
+    pub advances_output_offset: bool,
+    /// Whether the kernel generated SIGPIPE together with EPIPE.
+    pub generated_sigpipe: bool,
+}
+
+/// Recorded result and captured-output side effect of ftruncate.
+// TODO-HUMAN-REVIEW(#557): Audit the recorded ftruncate side-effect API.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FtruncateEvent {
+    /// Recorded syscall result.
+    pub result: Result<i64, Errno>,
+    /// Original captured output stream aliased by the descriptor, if any.
+    pub output_fd: Option<i32>,
+    /// Requested file length.
+    pub length: libc::off_t,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -71,6 +137,17 @@ pub struct MmapEvent {
     /// The contents of the memory map. Note that this may be less than the
     /// requested `length`.
     pub buf: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RecvmsgEvent {
+    pub result: i64,
+    pub iovs: Vec<Vec<u8>>,
+    pub name: Vec<u8>,
+    pub name_len: libc::socklen_t,
+    pub control: Vec<u8>,
+    pub control_len: usize,
+    pub flags: libc::c_int,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -84,6 +161,12 @@ pub struct TimespecEvent {
     pub timespec: Timespec,
 }
 
+/// Records the guest-visible outputs of a `poll` or `ppoll` call. Both syscalls
+/// have identical output semantics (the updated `pollfd` array plus a return
+/// count), so they share this event. `ppoll`'s temporary signal mask only
+/// affects which signals can interrupt the wait; a resulting `EINTR` (or a
+/// timeout returning 0) is captured by the enclosing `Event`'s `Result` and
+/// return count respectively, so no extra fields are needed here.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PollEvent {
     /// The complete list of file descriptors. Note that only the `revents` field
@@ -104,6 +187,14 @@ pub struct PollEvent {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+pub struct EpollWaitEvent {
+    /// Raw initialized epoll_event bytes returned by the kernel.
+    pub events: Vec<u8>,
+    /// The number of initialized events in the buffer.
+    pub updated: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 pub struct SockOptEvent {
     /// The (possibly truncated) value.
     pub value: Vec<u8>,
@@ -111,4 +202,29 @@ pub struct SockOptEvent {
     /// The length of the value. If this is the same as `value.len()`, then
     /// no truncation of the value occurred.
     pub length: libc::socklen_t,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn siocethtool_has_a_deterministic_error() {
+        let request = ioctl::Request::SIOCETHTOOL(None);
+
+        assert_eq!(deterministic_ioctl_error(&request), Some(Errno::ENODEV));
+
+        let legacy_request = ioctl::Request::Other(SIOCETHTOOL, 0x1234);
+        assert_eq!(
+            deterministic_ioctl_error(&legacy_request),
+            Some(Errno::ENODEV)
+        );
+    }
+
+    #[test]
+    fn neighboring_unknown_ioctl_is_not_rejected() {
+        let request = ioctl::Request::Other(SIOCETHTOOL - 1, 0x1234);
+
+        assert_eq!(deterministic_ioctl_error(&request), None);
+    }
 }

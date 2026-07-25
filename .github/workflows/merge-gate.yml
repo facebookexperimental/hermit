@@ -1,0 +1,226 @@
+name: Merge Gate
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
+  merge_group:
+    types: [checks_requested]
+  workflow_run:
+    workflows: ["Rust"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: >-
+          PR number to re-evaluate. Dispatch this workflow with ref set to the
+          pull request's head branch so the check attaches to its head SHA.
+        required: true
+        type: string
+
+# This lightweight required check accepts an exact PR head after the repository
+# CI workflow succeeds or after a fully green local validate.sh run applies the
+# locally-validated label. Merge-group checks inspect their constituent PR heads
+# instead of trusting the synthetic queue commit.
+#
+# The gate is fork-only because facebookexperimental/hermit has no access to the
+# fork self-hosted runners and fork pull requests receive a read-only token in
+# that repository. Upstream relies on the GitHub-hosted Rust job instead.
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+jobs:
+  refire-on-ci-completion:
+    name: refire-on-ci-completion
+    if: github.repository == 'rrnewton/hermit' && github.event_name == 'workflow_run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Re-dispatch the gate for a completed PR CI run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          case "$HEAD_BRANCH" in
+            gh-readonly-queue/*)
+              echo "Merge-group events evaluate queue commits directly."
+              exit 0
+              ;;
+          esac
+
+          owner="${REPO%%/*}"
+          matches="$(
+            gh api "repos/${REPO}/pulls?state=open&base=main&head=${owner}:${HEAD_BRANCH}&per_page=10" |
+              jq -c --arg sha "$HEAD_SHA" 'map({number, current: (.head.sha == $sha)})'
+          )"
+
+          while IFS=$'\t' read -r pr_number current; do
+            if [ "$current" != "true" ]; then
+              echo "PR #${pr_number} advanced beyond $HEAD_SHA; its newer CI run will re-fire the gate."
+              continue
+            fi
+            gh workflow run merge-gate.yml \
+              --repo "$REPO" \
+              --ref "$HEAD_BRANCH" \
+              -f pr_number="$pr_number"
+          done < <(jq -r '.[] | [.number, .current] | @tsv' <<< "$matches")
+
+  invalidate-local-validation:
+    name: invalidate-local-validation
+    if: >-
+      github.repository == 'rrnewton/hermit' &&
+      github.event_name == 'pull_request' &&
+      github.event.action == 'synchronize'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Remove validation inherited from an older PR head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          labels="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name')"
+          if grep -Fxq locally-validated <<< "$labels"; then
+            gh api --method DELETE \
+              "repos/${REPO}/issues/${PR_NUMBER}/labels/locally-validated" \
+              --silent
+            echo "Removed stale locally-validated label from PR #$PR_NUMBER."
+          fi
+
+  merge-gate:
+    name: merge-gate
+    needs: [invalidate-local-validation]
+    if: >-
+      always() &&
+      github.repository == 'rrnewton/hermit' &&
+      github.event_name != 'workflow_run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require successful CI or local validation
+        env:
+          BASE_REF: ${{ github.event.merge_group.base_ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          INVALIDATION_RESULT: ${{ needs.invalidate-local-validation.result }}
+          PR_ACTION: ${{ github.event.action }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = pull_request ] && [ "$PR_ACTION" = synchronize ] &&
+             [ "$INVALIDATION_RESULT" != success ]; then
+            echo "::error::Could not invalidate local validation from the previous PR head."
+            exit 1
+          fi
+
+          if [ "$EVENT_NAME" = pull_request ] || [ "$EVENT_NAME" = workflow_dispatch ]; then
+            if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = null ]; then
+              echo "::error::workflow_dispatch requires a pr_number input."
+              exit 1
+            fi
+            pull_requests="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" | jq -c '
+              [select(.base.ref == "main") | {
+                number,
+                head: {sha: .head.sha},
+                labels
+              }]
+            ')"
+          else
+            owner="${REPO%%/*}"
+            name="${REPO#*/}"
+            base_branch="${BASE_REF#refs/heads/}"
+            pull_requests="$(
+              gh api graphql \
+                -f owner="$owner" \
+                -f name="$name" \
+                -f branch="$base_branch" \
+                -f query='query($owner: String!, $name: String!, $branch: String!) {
+                repository(owner: $owner, name: $name) {
+                  mergeQueue(branch: $branch) {
+                    entries(first: 100) {
+                      nodes {
+                        headCommit { oid }
+                        pullRequest {
+                          number
+                          headRefOid
+                          baseRefName
+                          labels(first: 100) { nodes { name } }
+                        }
+                      }
+                    }
+                  }
+                }
+              }' | jq -c --arg sha "$SHA" --arg base "$base_branch" '
+                .data.repository.mergeQueue.entries.nodes
+                | map(select(
+                    .headCommit.oid == $sha
+                    and .pullRequest.baseRefName == $base
+                  ) | {
+                    number: .pullRequest.number,
+                    head: {sha: .pullRequest.headRefOid},
+                    labels: .pullRequest.labels.nodes
+                  })
+              ')"
+          fi
+
+          if [ "$(jq 'length' <<< "$pull_requests")" -eq 0 ]; then
+            echo "::error::No main-branch pull request is associated with $SHA."
+            exit 1
+          fi
+
+          failed=0
+          while IFS=$'\t' read -r pr_number head_sha locally_validated; do
+            if [ -z "$head_sha" ] || [ "$head_sha" = null ]; then
+              echo "::error::PR #${pr_number} has no head SHA."
+              failed=1
+              continue
+            fi
+            if [ "$locally_validated" = true ]; then
+              echo "PR #${pr_number} is locally validated at $head_sha."
+              continue
+            fi
+
+            runs="$(
+              gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${head_sha}&per_page=100"
+            )"
+            run="$(jq --arg sha "$head_sha" '
+              [.workflow_runs[] | select(.head_sha == $sha)]
+              | sort_by(.created_at)
+              | last // {}
+            ' <<< "$runs")"
+            status="$(jq -r '.status // "missing"' <<< "$run")"
+            conclusion="$(jq -r '.conclusion // ""' <<< "$run")"
+            url="$(jq -r '.html_url // ""' <<< "$run")"
+
+            if [ "$status:$conclusion" = completed:success ]; then
+              echo "CI passed for PR #${pr_number} at $head_sha: $url"
+            else
+              echo "::error::CI for PR #${pr_number} at $head_sha is $status/${conclusion:-none}: ${url:-no run URL}."
+              failed=1
+            fi
+          done < <(jq -r '
+            .[]
+            | [.number, .head.sha, any(.labels[]?; .name == "locally-validated")]
+            | @tsv
+          ' <<< "$pull_requests")
+
+          exit "$failed"

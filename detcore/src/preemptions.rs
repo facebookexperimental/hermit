@@ -68,7 +68,7 @@ impl PreemptionRecord {
     }
     /// TODO: provide a better way to create an empty PreemptionRecord but with entries for a given set of tids.
     pub fn strip_contents(mut self) -> Self {
-        for (_tid, history) in self.per_thread.iter_mut() {
+        for history in self.per_thread.values_mut() {
             history.prio_changes = Vec::new();
             history.final_prio = 1000;
         }
@@ -235,11 +235,9 @@ impl PreemptionRecord {
             }
         }
 
-        let mut cur_prio = DEFAULT_PRIORITY;
-        for val in priomap.values_mut() {
+        for (cur_prio, val) in (DEFAULT_PRIORITY..).zip(priomap.values_mut()) {
             assert!(cur_prio <= LAST_PRIORITY);
             *val = cur_prio;
-            cur_prio += 1;
         }
         for history in clone.per_thread.values_mut() {
             history.final_prio = *priomap.get(&history.final_prio).unwrap();
@@ -723,7 +721,7 @@ impl PreemptionWriter {
         let history = self.inner.per_thread.get_mut(&tid).unwrap_or_else(|| {
             panic!(
                 "PreemptionRecord: Cannot insert a preemption before registering thread {}",
-                &tid
+                tid
             )
         });
         assert_eq!(history.final_prio, prior_prio);
@@ -751,7 +749,7 @@ impl PreemptionWriter {
         let history = self.inner.per_thread.get_mut(&tid).unwrap_or_else(|| {
             panic!(
                 "PreemptionRecord: Cannot set current priority before registering thread {}",
-                &tid
+                tid
             )
         });
         history.final_prio = new_prio;
@@ -783,10 +781,11 @@ impl PreemptionWriter {
 
 impl Drop for PreemptionWriter {
     fn drop(&mut self) {
-        if !self.flushed && self.dest.is_some() {
-            if let Err(e) = self.write_to_disk() {
-                panic!("Error while dropping PreemptionWriter: {}", e);
-            }
+        if !self.flushed
+            && self.dest.is_some()
+            && let Err(e) = self.write_to_disk()
+        {
+            panic!("Error while dropping PreemptionWriter: {}", e);
         }
     }
 }
@@ -807,7 +806,7 @@ pub fn read_trace(path: &Path) -> Vec<SchedEvent> {
 // TODO: we should implement streaming and not read this all at once.
 fn read_preemption_record(path: &Path) -> PreemptionRecord {
     let string = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("Error reading file {:?}:\n {}", &path, e));
+        .unwrap_or_else(|e| panic!("Error reading file {:?}:\n {}", path, e));
     let pr: PreemptionRecord = serde_json::from_str(&string).unwrap_or_else(|e| {
         panic!(
             "Error parsing PreemptionRecord from JSON: {}\nJSON contents:\n{}",

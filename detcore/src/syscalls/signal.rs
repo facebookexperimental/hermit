@@ -64,7 +64,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Pause,
     ) -> Result<i64, Error> {
         if guest.config().sequentialize_threads {
-            let req = Self::sleep_request_abs(guest, LogicalTime::from_nanos(std::u64::MAX)).await;
+            let req = Self::sleep_request_abs(guest, LogicalTime::from_nanos(u64::MAX)).await;
             match resource_request(guest, req).await {
                 ResumeStatus::Normal => {
                     panic!(

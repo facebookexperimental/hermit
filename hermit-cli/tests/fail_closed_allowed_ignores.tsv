@@ -1,0 +1,26 @@
+# Existing ignored fail-closed tests. New ignores are rejected by the ratchet.
+# Columns: target<TAB>test<TAB>reason
+analyze	analyze_hello_race	slow schedule bisection; requires PMU and mount namespaces
+analyze	analyze_nanosleep_threads_nocrash	slow schedule bisection; requires PMU and mount namespaces
+analyze	analyze_racewrite_nostdlib	slow schedule bisection; requires PMU and mount namespaces
+command_strict_verify	common_commands_are_deterministic_under_strict_verify	requires PMU, mount namespaces, and the standard command suite
+hermit_modes	chaos_buck_clone	requires PMU branch counters and working mount namespaces
+hermit_modes	chaos_buck_getpid	requires PMU branch counters and working mount namespaces
+hermit_modes	chaos_buck_hello_alarm	requires PMU branch counters and working mount namespaces
+hermit_modes	chaos_buck_mem_race	requires PMU branch counters and working mount namespaces
+hermit_modes	chaos_buck_nanosleep_parallel	requires PMU branch counters and working mount namespaces
+hermit_modes	chaos_buck_sysinfo	requires PMU branch counters and working mount namespaces
+hermit_modes	chaos_buck_uname	requires PMU branch counters and working mount namespaces
+hermit_modes	chaos_buck_wait_on_child	requires PMU branch counters and working mount namespaces
+hermit_modes	default_cargo_bind_connect_race	racy default mode can block in Hermit connect emulation
+hermit_modes	default_cargo_clock_total_order	default mode can block in clock total-order scheduling
+language_runtime_determinism	go_runtime_entropy_is_determinized	requires the optional Go runtime matrix toolchain
+language_runtime_determinism	jvm_runtime_entropy_is_determinized	requires the optional OpenJDK toolchain
+language_runtime_determinism	node_runtime_entropy_is_determinized	requires the optional Node.js runtime
+language_runtime_determinism	ocaml_runtime_entropy_is_determinized	requires the optional OCaml native compiler
+language_runtime_determinism	python_runtime_entropy_is_determinized	requires an OSS CPython 3 runtime
+language_runtime_determinism	ruby_runtime_entropy_is_determinized	requires the optional Ruby runtime
+python_stdlib	strict_python_stdlib_is_deterministic	requires system CPython with its full Lib/test package
+stress_suite	fast_chaos_matrix	explicit fast stress tier
+stress_suite	slow_cas_search_and_replay	explicit PMU-dependent slow stress tier
+stress_suite	slow_race_matrix	explicit slow stress tier

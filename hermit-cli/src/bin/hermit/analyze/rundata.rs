@@ -182,6 +182,9 @@ impl RunData {
             } else {
                 None
             },
+            // Analyze threads the backend through its own `RunOpts`, so there is no
+            // separate global-position backend to apply here.
+            backend: None,
         };
         let final_record_path = self
             .runopts
@@ -196,7 +199,7 @@ impl RunData {
             self.runopts.det_opts.det_config.record_preemptions_to = Some(temp_path);
         }
 
-        self.runopts.validate_args();
+        self.runopts.validate_args()?;
 
         let repro_file = self.root_path().with_extension("repro");
         std::fs::write(repro_file, self.to_repro() + "\n")?;
@@ -320,7 +323,7 @@ impl RunData {
         // one.
         ro.det_opts.det_config.chaos = true;
 
-        ro.validate_args();
+        ro.validate_args()?;
         assert!(ro.det_opts.det_config.sequentialize_threads);
         if aopts.run1_seed.is_some() && !ro.det_opts.det_config.chaos {
             eprintln!(
@@ -338,7 +341,7 @@ impl RunData {
     fn runopts_add_binds(aopts: &AnalyzeOpts, runopts: &mut RunOpts) -> anyhow::Result<()> {
         let bind_dir: Bind = Bind::from_str(aopts.get_tmp()?.to_str().unwrap())?;
         runopts.bind.push(bind_dir);
-        runopts.validate_args();
+        runopts.validate_args()?;
         Ok(())
     }
 

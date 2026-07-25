@@ -1,0 +1,3 @@
+   Compiling hermit v0.0.0 (/home/newton/work/dev-hermit/worktrees/slot06/hermit/hermit-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.36s
+     Running tests/arbitrary_binaries.rs (target/debug/deps/arbitrary_binaries-da7f55806a00898e)

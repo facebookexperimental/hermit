@@ -1,0 +1,11 @@
+
+running 1 test
+test fast_chaos_matrix ... FAILED
+
+failures:
+
+failures:
+    fast_chaos_matrix
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 1.63s
+

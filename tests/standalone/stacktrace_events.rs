@@ -105,7 +105,7 @@ fn main() {
                     stacktrace_paths[i].display()
                 ));
             }
-            eprintln!(":: Running command: {:?}", &rerun);
+            eprintln!(":: Running command: {:?}", rerun);
             rerun.arg(prog).output().expect("hermit run to succeed")
         };
         eprintln!(":: Final output status: {:?}", output.status);

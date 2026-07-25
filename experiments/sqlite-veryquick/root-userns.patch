@@ -1,0 +1,46 @@
+diff --git a/test/attach.test b/test/attach.test
+--- a/test/attach.test
++++ b/test/attach.test
+@@ -760,22 +760,25 @@ do_test attach-6.1 {
+   }
+ } {0 {}}
+ if {$tcl_platform(platform) eq "unix"} {
+-  do_test attach-6.2 {
+-    sqlite3 dbx cannot-read
+-    dbx eval {CREATE TABLE t1(a,b,c)}
+-    dbx close
+-    file attributes cannot-read -permission 0000
+-    if {[file writable cannot-read]} {
+-      puts "\n**** Tests do not work when run as root ****"
+-      forcedelete cannot-read
+-      exit 1
+-    }
+-    catchsql {
+-      ATTACH DATABASE 'cannot-read' AS noread;
+-    }
+-  } {1 {unable to open database: cannot-read}}
+-  do_test attach-6.2.2 {
+-    db errorcode
+-  } {14}
++  sqlite3 dbx cannot-read
++  dbx eval {CREATE TABLE t1(a,b,c)}
++  dbx close
++  file attributes cannot-read -permission 0000
++  if {[file writable cannot-read]} {
++    # Hermit runs the guest as root in a root-mapped user namespace so that
++    # it can construct the container. Permission-bit denial is not available
++    # in that environment; report the two dependent assertions as omitted.
++    omit_test attach-6.2 {requires non-root filesystem permission semantics}
++    omit_test attach-6.2.2 {requires non-root filesystem permission semantics}
++  } else {
++    do_test attach-6.2 {
++      catchsql {
++        ATTACH DATABASE 'cannot-read' AS noread;
++      }
++    } {1 {unable to open database: cannot-read}}
++    do_test attach-6.2.2 {
++      db errorcode
++    } {14}
++  }
+   forcedelete cannot-read
+ }

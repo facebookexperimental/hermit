@@ -1,0 +1,4 @@
+2026-07-22T01:09:28.830889Z  WARN reverie_ptrace::task: Unable to intercept CPUID: Underlying hardware does not support CPUID faulting
+2026-07-22T01:09:28.832818Z  WARN reverie_ptrace::task: Unable to intercept CPUID: Underlying hardware does not support CPUID faulting
+2026-07-22T01:09:28.841002Z  WARN reverie_ptrace::task: Unable to intercept CPUID: Underlying hardware does not support CPUID faulting
+2026-07-22T01:09:28.882792Z ERROR detcore::syscalls::threads: hermit: clone() with CLONE_VFORK argument.  This is not currently supported and will not work.

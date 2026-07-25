@@ -19,6 +19,7 @@ use reverie::process::Stdio;
 use crate::Shebang;
 use crate::chroot::TempChroot;
 use crate::consts::EXE_NAME;
+use crate::consts::EXEC_PATHS_NAME;
 use crate::consts::METADATA_NAME;
 use crate::error::Context;
 use crate::error::Error;
@@ -81,15 +82,28 @@ impl Replay {
             prepare_chroot(dir, &metadata).context("Failed to create chroot environment")?;
 
         // bind mount fbcode otherwise many program can fail to execve due to missing
-        // shared libraries.
-        command.mount(
-            Mount::bind(
-                Path::new("/usr/local/fbcode"),
-                chroot.path().join("usr/local/fbcode"),
-            )
-            .recursive()
-            .touch_target(),
-        );
+        // shared libraries. This path only exists on Meta hosts; skip it elsewhere
+        // (e.g. generic self-hosted CI runners) where the missing source would make
+        // mount(2) fail with ENOENT.
+        //
+        // The bind-mount target directory is created here, in the parent process,
+        // rather than via `Mount::touch_target()`. `touch_target` defers directory
+        // creation to the cloned child immediately before `execve`, where
+        // reverie-process runs it on a fixed 4 KiB clone stack (see
+        // reverie-process `clone.rs`). Its `create_dir_all`/`touch_path` helpers
+        // each place a `[0; PATH_MAX]` (4 KiB) buffer on that stack, overflowing
+        // it and corrupting the `envp` pointer that the child then passes to
+        // `execve`. That made the guest's initial `execve` fail with `EFAULT` on
+        // every Meta-host replay (recording spawns without mounts, so it was
+        // unaffected), so replay diverged from the recording at syscall #1.
+        // Pre-creating the target keeps the child's pre-exec path allocation-free.
+        let fbcode = Path::new("/usr/local/fbcode");
+        if fbcode.exists() {
+            chroot
+                .create_dir_all(fbcode)
+                .context("Failed to create fbcode bind-mount target in chroot")?;
+            command.mount(Mount::bind(fbcode, chroot.path().join("usr/local/fbcode")).recursive());
+        }
 
         command.chroot(chroot.path());
 
@@ -134,7 +148,26 @@ fn prepare_chroot(dir: &Path, metadata: &Metadata) -> io::Result<TempChroot> {
     // directory and the executable live on the same file system. The executable
     // is also unlikely to be modified during the program's lifetime.
     chroot.hard_link(&exe, &metadata.exe)?;
-    if let Some(shebang) = Shebang::new(&metadata.exe) {
+    add_executable_deps(&chroot, &metadata.exe)?;
+
+    // Make every binary the guest exec'd during recording available inside the
+    // chroot. A guest process that forks and execs another binary (e.g. a shell
+    // running an external command, or a compiler driver spawning its passes)
+    // would otherwise get `ENOENT` from the injected `execve` and desynchronize.
+    populate_recorded_exec_paths(dir, &chroot, &metadata.exe)?;
+
+    // Create the working directory.
+    chroot.create_dir_all(&metadata.current_dir)?;
+
+    Ok(chroot)
+}
+
+/// Copies the shared dependencies an executable needs to run inside the chroot:
+/// its shebang interpreter (if it is a script) and its ELF interpreter (the
+/// dynamic loader). Shared libraries do not need to be copied because their
+/// contents are supplied from the recording during replay.
+fn add_executable_deps(chroot: &TempChroot, exe: &Path) -> io::Result<()> {
+    if let Some(shebang) = Shebang::new(exe) {
         chroot.copy_same(shebang.interpreter())?;
         // check if shebang is wrapped as #! /usr/bin/env <program>, in that
         // case, copy both /usr/bin/env and <program> (resolved)
@@ -164,14 +197,57 @@ fn prepare_chroot(dir: &Path, metadata: &Metadata) -> io::Result<TempChroot> {
     //     program headers until reaching the `INTERP` program header.
     chroot.copy_same(default_ldso)?;
 
-    if let Some(interp) = interp::elf_get_interp(&metadata.exe) {
-        if interp.is_file() && interp != default_ldso {
-            chroot.copy_same(&interp)?;
+    if let Some(interp) = interp::elf_get_interp(exe)
+        && interp.is_file()
+        && interp != default_ldso
+    {
+        chroot.copy_same(&interp)?;
+    }
+
+    Ok(())
+}
+
+/// Populates the chroot with the executables recorded in the `exec_paths`
+/// manifest (written by the recorder for every `execve`/`execveat`). The root
+/// executable is already hard-linked in and is skipped. Missing or unreadable
+/// entries are logged and skipped rather than aborting the whole replay.
+fn populate_recorded_exec_paths(
+    dir: &Path,
+    chroot: &TempChroot,
+    root_exe: &Path,
+) -> io::Result<()> {
+    let manifest = dir.join(EXEC_PATHS_NAME);
+    let contents = match fs::read_to_string(&manifest) {
+        Ok(contents) => contents,
+        // No child ever exec'd another binary; nothing to do.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    for line in contents.lines() {
+        let path = Path::new(line);
+        if line.is_empty() || path == root_exe || !seen.insert(path.to_path_buf()) {
+            continue;
+        }
+        if !path.is_file() {
+            tracing::warn!(
+                "Recorded exec target {:?} is not a file on the replay host; skipping",
+                path
+            );
+            continue;
+        }
+        if let Err(err) = chroot
+            .copy_same(path)
+            .and_then(|()| add_executable_deps(chroot, path))
+        {
+            tracing::warn!(
+                "Failed to stage exec target {:?} into chroot: {}",
+                path,
+                err
+            );
         }
     }
 
-    // Create the working directory.
-    chroot.create_dir_all(&metadata.current_dir)?;
-
-    Ok(chroot)
+    Ok(())
 }

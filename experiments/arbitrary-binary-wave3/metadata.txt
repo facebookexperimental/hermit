@@ -1,0 +1,23 @@
+schema_version=1
+started_at_utc=20260722T030246Z
+repository_commit=299e5b90288de03a6def0d02b83cc76aab8d4717
+repository_branch=impl-arbitrary-binary-wave3-slot08
+hermit=/home/newton/work/dev-hermit/worktrees/slot08/hermit/target/debug/hermit
+hermit_sha256=e534e29908dcef50dee539e8df8edb1329c32ce6b44d007eed8450390b4420c9
+runs_per_program=3
+case_timeout_seconds=20
+host_kernel=Linux 6.13.2-0_fbk13_hardened_0_g02230262e956 x86_64 GNU/Linux
+cpu_model=AMD EPYC 9D85 158-Core Processor
+curl=/usr/bin/curl
+curl_sha256=e9b8561214898b08ecda859e44e3f82c87519b20d073488b7c377fd5bce75efd
+curl_version=curl 7.76.1 (x86_64-redhat-linux-gnu) libcurl/7.76.1 OpenSSL/3.5.7 zlib/1.2.11 brotli/1.0.9 libidn2/2.3.0 libpsl/0.21.1 (+libidn2/2.3.0) libssh/0.10.4/openssl/zlib nghttp2/1.43.0
+git=/usr/local/bin/git
+git_sha256=9fbe3587e2097f99edd24a3954948266b20f41610ba93898fdb55b8cb57cabbe
+git_version=git version 2.53.0-Meta
+nginx=/usr/sbin/nginx
+nginx_sha256=920d19b6d34dce416bccfc784c2fd4d69475d63a907b285a9fa22f5431f187e2
+nginx_version=nginx version: nginx/1.20.1
+redis_server=/usr/bin/redis-server
+redis_server_sha256=ced7b948f4b72a39f45269a67eeba546541742fbbe058c4619fb3da92648dffd
+redis_server_version=Redis server v=6.2.22 sha=00000000:0 malloc=jemalloc-5.1.0 bits=64 build=5d43f02b8d896191
+artifact_root=/home/newton/work/dev-hermit/worktrees/slot08/hermit/experiments/arbitrary-binary-wave3/artifacts/20260722T030246Z

@@ -6,18 +6,22 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::cmp::max;
 use std::cmp::min;
 
 type IndexAndAlignments = (usize, Vec<(Option<usize>, Option<usize>)>);
 
-#[derive(PartialEq, Eq, Clone, Debug)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Trace {
     Stop,
     Left,
     Up,
     MatchDiagonal,
     MisMatchDiagonal,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum NeedlemanWunschError {
+    MatrixTooLarge { cells: usize, max_cells: usize },
 }
 
 fn simple_score<T: PartialEq>(a: T, b: T) -> i32 {
@@ -109,9 +113,26 @@ impl<T: PartialEq + Clone> NeedlemanWunsch<T> {
         gap_penalty: Option<i32>,
         mismatch_penalty: Option<i32>,
     ) -> IndexAndAlignments {
+        self.match_sequences_bounded(scoring_function, gap_penalty, mismatch_penalty, usize::MAX)
+            .expect("Needleman-Wunsch matrix dimensions overflowed")
+    }
+
+    /// Globally align the sequences, refusing work above `max_matrix_cells` before allocating the
+    /// traceback matrix. Scores use two rolling rows, so only traceback storage remains quadratic.
+    pub fn match_sequences_bounded(
+        &mut self,
+        scoring_function: Option<fn(T, T) -> i32>,
+        gap_penalty: Option<i32>,
+        mismatch_penalty: Option<i32>,
+        max_matrix_cells: usize,
+    ) -> Result<IndexAndAlignments, NeedlemanWunschError> {
         let gap_penalty: i32 = gap_penalty.unwrap_or(-1);
         let mismatch_penalty: i32 = mismatch_penalty.unwrap_or(-2);
         let scoring_function = scoring_function.unwrap_or(simple_score);
+
+        self.mismatches.clear();
+        self.num_mismatches = 0;
+
         let mut start_index = 0;
         let max_length: usize = min(self.first_sequence.len(), self.second_sequence.len());
         while start_index < max_length
@@ -124,92 +145,99 @@ impl<T: PartialEq + Clone> NeedlemanWunsch<T> {
         }
         let row = self.first_sequence.len() + 1 - start_index;
         let col = self.second_sequence.len() + 1 - start_index;
-        let mut matrix: Vec<Vec<i32>> = vec![vec![0; col]; row];
-        {
-            let mut i = 0;
-            while i < row {
-                matrix[i][0] = mismatch_penalty * (i as i32);
-                i += 1;
-            }
+        let cells = row
+            .checked_mul(col)
+            .ok_or(NeedlemanWunschError::MatrixTooLarge {
+                cells: usize::MAX,
+                max_cells: max_matrix_cells,
+            })?;
+        if cells > max_matrix_cells {
+            return Err(NeedlemanWunschError::MatrixTooLarge {
+                cells,
+                max_cells: max_matrix_cells,
+            });
         }
 
-        for j in 1..col {
-            matrix[0][j] = mismatch_penalty * (j as i32);
+        let mut previous_scores = (0..col).map(|j| gap_penalty * j as i32).collect::<Vec<_>>();
+        let mut current_scores = vec![0; col];
+        let mut tracing_matrix = vec![Trace::Stop; cells];
+        for trace in tracing_matrix.iter_mut().take(col).skip(1) {
+            *trace = Trace::Left;
         }
-        let mut tracing_matrix: Vec<Vec<Trace>> = vec![vec![Trace::Stop; col]; row];
-
-        let mut max_score: i32 = -1;
-        let mut max_index = (0, 0);
         for i in 1..row {
+            current_scores[0] = gap_penalty * i as i32;
+            tracing_matrix[i * col] = Trace::Up;
             for j in 1..col {
                 let match_value: i32 = scoring_function(
                     self.first_sequence[i - 1 + start_index].clone(),
                     self.second_sequence[j - 1 + start_index].clone(),
                 );
 
-                if match_value > 0 {
-                    let diagonal_score: i32 = matrix[i - 1][j - 1] + match_value;
-                    matrix[i][j] = diagonal_score;
-                    tracing_matrix[i][j] = Trace::MatchDiagonal;
-                } else {
-                    let vertical_score: i32 = matrix[i - 1][j] + gap_penalty;
-                    let horizontal_score: i32 = matrix[i][j - 1] + gap_penalty;
-                    let diagonal_score: i32 = matrix[i - 1][j - 1] + gap_penalty;
-                    matrix[i][j] = max(horizontal_score, max(vertical_score, diagonal_score));
-                    if matrix[i][j] == diagonal_score {
-                        tracing_matrix[i][j] = Trace::MisMatchDiagonal;
-                    } else if matrix[i][j] == horizontal_score {
-                        tracing_matrix[i][j] = Trace::Left;
-                    } else if matrix[i][j] == vertical_score {
-                        tracing_matrix[i][j] = Trace::Up;
-                    }
-                }
+                let diagonal_score = previous_scores[j - 1]
+                    + if match_value > 0 {
+                        match_value
+                    } else {
+                        mismatch_penalty
+                    };
+                let horizontal_score = current_scores[j - 1] + gap_penalty;
+                let vertical_score = previous_scores[j] + gap_penalty;
 
-                // Tracking the cell with the maximum score
-                if matrix[i][j] >= max_score {
-                    max_index = (i, j);
-                    max_score = matrix[i][j];
-                }
+                let (score, trace) =
+                    if diagonal_score >= horizontal_score && diagonal_score >= vertical_score {
+                        (
+                            diagonal_score,
+                            if match_value > 0 {
+                                Trace::MatchDiagonal
+                            } else {
+                                Trace::MisMatchDiagonal
+                            },
+                        )
+                    } else if horizontal_score >= vertical_score {
+                        (horizontal_score, Trace::Left)
+                    } else {
+                        (vertical_score, Trace::Up)
+                    };
+                current_scores[j] = score;
+                tracing_matrix[i * col + j] = trace;
             }
+            std::mem::swap(&mut previous_scores, &mut current_scores);
         }
 
-        // Initialize variables for tracing
         let mut aligned_seq: Vec<(Option<usize>, Option<usize>)> = vec![];
-        let mut current_aligned_seq1: Option<usize> = None;
-        let mut current_aligned_seq2: Option<usize> = None;
-        let (mut max_i, mut max_j) = max_index;
+        let (mut i, mut j) = (row - 1, col - 1);
 
-        while tracing_matrix[max_i][max_j] != Trace::Stop {
-            if tracing_matrix[max_i][max_j] == Trace::MatchDiagonal {
-                current_aligned_seq1 = Some(max_i - 1 + start_index);
-                current_aligned_seq2 = Some(max_j - 1 + start_index);
-                max_i -= 1;
-                max_j -= 1;
-            } else if tracing_matrix[max_i][max_j] == Trace::Up {
-                current_aligned_seq1 = Some(max_i - 1 + start_index);
-                current_aligned_seq2 = None;
-                max_i -= 1;
-                self.num_mismatches += 1;
-            } else if tracing_matrix[max_i][max_j] == Trace::Left {
-                current_aligned_seq1 = None;
-                current_aligned_seq2 = Some(max_j - 1 + start_index);
-                self.num_mismatches += 1;
-                max_j -= 1;
-            } else if tracing_matrix[max_i][max_j] == Trace::MisMatchDiagonal {
-                current_aligned_seq1 = None;
-                current_aligned_seq2 = None;
-                self.num_mismatches += 1;
-                self.mismatches
-                    .push((max_i + start_index, max_j + start_index));
-                max_i -= 1;
-                max_j -= 1;
+        while i > 0 || j > 0 {
+            match tracing_matrix[i * col + j] {
+                Trace::MatchDiagonal => {
+                    aligned_seq.push((Some(i - 1 + start_index), Some(j - 1 + start_index)));
+                    i -= 1;
+                    j -= 1;
+                }
+                Trace::Up => {
+                    aligned_seq.push((Some(i - 1 + start_index), None));
+                    i -= 1;
+                    self.num_mismatches += 1;
+                }
+                Trace::Left => {
+                    aligned_seq.push((None, Some(j - 1 + start_index)));
+                    j -= 1;
+                    self.num_mismatches += 1;
+                }
+                Trace::MisMatchDiagonal => {
+                    aligned_seq.push((None, None));
+                    self.num_mismatches += 2;
+                    self.mismatches
+                        .push((i - 1 + start_index, j - 1 + start_index));
+                    i -= 1;
+                    j -= 1;
+                }
+                Trace::Stop => unreachable!("traceback stopped before reaching matrix origin"),
             }
-            aligned_seq.push((current_aligned_seq1, current_aligned_seq2));
         }
         self.mismatches.reverse();
         aligned_seq.reverse();
 
-        (start_index, aligned_seq)
+        Ok((start_index, aligned_seq))
     }
 }
 
@@ -255,7 +283,9 @@ mod tests {
                     (Some(3), Some(3)),
                     (Some(4), None),
                     (Some(5), Some(4)),
-                    (Some(6), Some(5))
+                    (Some(6), Some(5)),
+                    (None, None),
+                    (None, None)
                 ]
             )
         );
@@ -288,5 +318,31 @@ mod tests {
                 vec![(None, None), (Some(1), Some(1)), (Some(2), Some(2))],
             )
         );
+    }
+
+    #[test]
+    fn bounded_alignment_rejects_large_matrices() {
+        let mut sw_object = NeedlemanWunsch {
+            first_sequence: vec![1; 100],
+            second_sequence: vec![2; 100],
+            ..Default::default()
+        };
+        assert_eq!(
+            sw_object.match_sequences_bounded(None, None, None, 10_000),
+            Err(NeedlemanWunschError::MatrixTooLarge {
+                cells: 10_201,
+                max_cells: 10_000,
+            })
+        );
+    }
+
+    #[test]
+    fn alignment_includes_unmatched_suffix() {
+        let mut sw_object = NeedlemanWunsch {
+            first_sequence: vec![1, 2],
+            second_sequence: vec![1, 2, 3],
+            ..Default::default()
+        };
+        assert_eq!(sw_object.match_sequences_base(), (2, vec![(None, Some(2))]));
     }
 }

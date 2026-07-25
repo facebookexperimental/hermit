@@ -1,0 +1,5 @@
+result=DETERMINISTIC
+runs=5
+unique_fingerprints=1
+reference_fingerprint=e12f6b880e932e1247d425ef75ad7878c632f09341ad9a8258fd0286e9ff79f4
+manifest=runs.tsv

@@ -7,6 +7,7 @@
  */
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -21,22 +22,23 @@
     }                               \
   } while (0);
 
-char* global_str = NULL;
+_Atomic(char*) global_str = NULL;
 
 void* Thread1(void* x) {
   DO_WORK
-  if (!global_str) {
+  char* observed = atomic_load_explicit(&global_str, memory_order_relaxed);
+  if (!observed) {
     // Simulate SEGFAULT, but exit cleanly because hermit doesn't handle this
     // well right now
     printf("ERROR! global_str is null at use.\n");
     exit(1);
   }
-  printf("%s\n", global_str);
+  printf("%s\n", observed);
   return NULL;
 }
 
 void* Thread2(void* x) {
-  global_str = "Hello world!";
+  atomic_store_explicit(&global_str, "Hello world!", memory_order_relaxed);
   return NULL;
 }
 

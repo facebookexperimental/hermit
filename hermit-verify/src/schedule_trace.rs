@@ -85,7 +85,7 @@ pub struct InspectOpts {
 }
 
 /// Return all events which are right before a preemption.
-fn preempt_events(sched: &Vec<SchedEvent>) -> Vec<SchedEvent> {
+fn preempt_events(sched: &[SchedEvent]) -> Vec<SchedEvent> {
     let mut acc = Vec::new();
     for ix in 0..sched.len() - 1 {
         if sched[ix].dettid != sched[ix + 1].dettid {

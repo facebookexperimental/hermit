@@ -11,6 +11,7 @@
 mod files;
 pub mod helpers;
 mod io;
+mod memory;
 mod misc;
 mod signal;
 mod sysinfo;

@@ -12,8 +12,8 @@ use std::iter::FromIterator;
 
 /// This is a queue like data structure used when replaying schedule
 ///
-/// Apart from being an [Iterator] is supports methods [peek] and [peek_nth] to be able to look ahead arbitrary number of events forward
-/// look ahead while replaying.
+/// Apart from being an [`Iterator`], it supports [`ReplayCursor::peek`] and
+/// [`ReplayCursor::peek_nth`] to look ahead an arbitrary number of events while replaying.
 #[derive(Debug)]
 pub struct ReplayCursor<T> {
     inner_data: VecDeque<T>,

@@ -7,6 +7,30 @@
  */
 
 //! Detcore is a Reverie tool that determinizes the execution of a process.
+//!
+//! # Backend-abstraction commandment
+//!
+//! Detcore is a *tool* written against Reverie's **abstract** instrumentation
+//! interface (the `reverie` crate). It depends only on those traits and types
+//! and is deliberately ignorant of how a guest is actually traced.
+//!
+//! Detcore MUST NEVER depend on or import a concrete Reverie backend --
+//! `reverie-ptrace`, `reverie-dbi`, or `reverie-kvm`. Choosing and
+//! instantiating a backend, and running a detcore tool against it, is the sole
+//! responsibility of the `hermit-cli` package. There are no backend-specific
+//! hacks in detcore: any tracing-mechanism-specific behavior belongs behind the
+//! Reverie abstraction, not here.
+//!
+//! Why: Hermit follows Reverie's abstract model. A backend dependency in
+//! detcore would couple the determinism engine to one tracing mechanism and
+//! break the clean abstraction boundary that lets the same tool run over any
+//! backend.
+//!
+//! The one allowed exception is test-only: detcore's own integration tests
+//! (under `detcore/tests/`, wired via the `reverie-ptrace` **dev-dependency**)
+//! drive a real tracer to exercise the tool. That coupling never reaches the
+//! shipped library. This invariant is enforced in CI by
+//! `scripts/check-detcore-backend-abstraction.sh`.
 
 #![deny(clippy::all)]
 #![deny(missing_docs)]
@@ -20,13 +44,16 @@ mod fd;
 #[allow(unused)]
 mod ivar;
 pub mod logdiff;
+mod memory;
 #[allow(unused)]
 mod mvar;
+mod procfs;
 mod procmaps;
 mod record_or_replay;
 mod resources;
 mod scheduler;
 mod stat;
+mod syscall_classification;
 mod syscalls;
 mod tool_global;
 mod tool_local;
@@ -43,6 +70,7 @@ use std::time::Duration;
 
 pub use config::BlockingMode;
 pub use config::Config;
+pub use config::RunsPostFork;
 pub use config::SchedHeuristic;
 use rand::RngExt as _;
 use raw_cpuid::CpuIdResult;
@@ -66,7 +94,7 @@ use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::EpollCreate1;
 use reverie::syscalls::Errno;
-use reverie::syscalls::Fork;
+use reverie::syscalls::InotifyInit1;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
@@ -77,9 +105,11 @@ pub use scheduler::runqueue::FIRST_PRIORITY;
 pub use scheduler::runqueue::LAST_PRIORITY;
 pub use tool_global::GlobalState;
 use tool_global::create_child_thread;
+use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
 pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
+use tool_local::PosixTimers;
 pub use tool_local::ThreadState;
 pub use tool_local::ThreadStats;
 pub use tool_local::thread_rng_from_parent;
@@ -94,6 +124,8 @@ pub use util::punch_out_print;
 
 use crate::resources::Permission;
 use crate::resources::ResourceID;
+use crate::syscall_classification::SyscallClassification;
+use crate::syscall_classification::classify_syscall;
 use crate::syscalls::helpers::with_guest_rip;
 use crate::syscalls::helpers::with_guest_time;
 use crate::tool_global::resource_request;
@@ -104,6 +136,23 @@ use crate::types::SigWrapper;
 #[macro_use]
 extern crate bitflags;
 
+#[cold]
+fn report_rcb_overshoot(
+    panic_on_rcb_overshoot: bool,
+    clock_value: u64,
+    delta_rcbs: u64,
+    last_timer: u64,
+) {
+    let message = format!(
+        "prehook: PMU RCB overshoot! Clock_value: {}. Stepped forward {} RCBs, but should have trapped at {}",
+        clock_value, delta_rcbs, last_timer
+    );
+    if panic_on_rcb_overshoot {
+        panic!("{}", message);
+    }
+    error!("{}", message);
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     async fn passthrough<G: Guest<Self>>(
         &self,
@@ -112,6 +161,67 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         Ok(self.record_or_replay(guest, call).await?)
     }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    /// Applies the legacy policy to an explicitly listed but unclassified syscall.
+    async fn handle_unclassified_syscall<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        dettid: DetTid,
+        panic_on_unsupported_syscalls: bool,
+    ) -> Result<i64, Error> {
+        if panic_on_unsupported_syscalls {
+            error!(
+                "[detcore, dtid {}] inbound syscall: {} = ?",
+                dettid,
+                call.display(&guest.memory()),
+            );
+            panic!("unsupported syscall: {:?}", call);
+        }
+        self.passthrough(guest, call).await
+    }
+
+    /// Defense-in-depth determinism for the registers the syscall instruction
+    /// clobbers.
+    ///
+    /// On x86-64 the `syscall` instruction destroys `%rcx` (which the CPU loads
+    /// with the return instruction pointer) and `%r11` (the saved `RFLAGS`).
+    /// After a syscall these are architecturally "undefined", so hermit must not
+    /// assume a well-behaved guest ignores them: a misbehaving guest that reads
+    /// `%rcx`/`%r11` must still observe deterministic values. Reverie's
+    /// injected-syscall path can otherwise leave its *private trampoline page's*
+    /// RIP/RFLAGS in these registers, which is both nondeterministic and an
+    /// information leak of tracer internals.
+    ///
+    /// This forces both registers to the guest's own (deterministic) RIP and
+    /// RFLAGS, which is exactly what a faithful `SYSRET` would leave there. It is
+    /// a no-op when they already hold the canonical values (the common path), so
+    /// it only writes registers when something diverged. Register-preserved
+    /// arguments (`%rdi`..`%r9`, callee-saved) are deliberately left untouched:
+    /// the Linux ABI preserves them, so zeroing them would break faithful,
+    /// well-behaved programs.
+    #[cfg(target_arch = "x86_64")]
+    async fn canonicalize_syscall_clobbers<G: Guest<Self>>(&self, guest: &mut G) {
+        let mut regs = guest.regs().await;
+        // A faithful SYSRET leaves the return RIP in %rcx and RFLAGS in %r11.
+        if regs.rcx != regs.rip || regs.r11 != regs.eflags {
+            regs.rcx = regs.rip;
+            regs.r11 = regs.eflags;
+            if let Err(err) = guest.set_regs(regs).await {
+                // Best-effort: some backends cannot write registers. Do not fail
+                // the syscall over a defense-in-depth hardening step.
+                debug!(
+                    "canonicalize_syscall_clobbers: set_regs unsupported/failed: {}",
+                    err
+                );
+            }
+        }
+    }
+
+    /// No-op on architectures without the x86-64 `%rcx`/`%r11` syscall clobber.
+    #[cfg(not(target_arch = "x86_64"))]
+    async fn canonicalize_syscall_clobbers<G: Guest<Self>>(&self, _guest: &mut G) {}
 
     /// Update logical thread time with any outstanding ticks of the Reverie clock.  Returns a list
     /// of corresponding Branch/OtherInstructions events if schedule recording is enabled.
@@ -140,23 +250,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             thread_state.committed_clock_value = clock_value;
 
             if thread_state.end_of_timeslice.is_some() {
-                if let Some(last_timer) = thread_state.last_rcb_timer {
-                    if delta_rcbs > last_timer && precise_timers {
-                        panic!(
-                            "prehook: Missed expected preemption! Clock_value: {}. Stepped forward {:?} RCBs, but should have trapped at {:?}",
-                            clock_value, delta_rcbs, last_timer
-                        );
-                        // TODO: turn the above panic into a warning again if we see any weirdness
-                        // on certain platforms.
-                        // We can repair the state and keep going, using the below:
-                        /*
-                        thread_state.end_of_timeslice = None;
-                        thread_state.last_rcb_timer = None;
-                        thread_state.next_timeslice(&self.cfg);
-                        */
-                    }
-                    // Otherwise we're very early, at the prehook of handle_thread_start.
+                if let Some(last_timer) = thread_state.last_rcb_timer
+                    && delta_rcbs > last_timer
+                    && precise_timers
+                {
+                    report_rcb_overshoot(
+                        self.cfg.panic_on_rcb_overshoot,
+                        clock_value,
+                        delta_rcbs,
+                        last_timer,
+                    );
+                    // Preserve timer state. `pre_handler_hook` will yield through the normal
+                    // scheduler path if the slice expired; `post_handler_hook` will otherwise
+                    // re-arm an overshot `interrupt_at` timer.
                 }
+                // Otherwise we're very early, at the prehook of handle_thread_start.
             } else {
                 panic!(
                     "Invariant violation: end_of_timeslice is None during update_logical_time_rcbs..."
@@ -381,6 +489,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///  - ends timeslice (mutating thread stats, end_of_timeslice)
     ///  - priority change / yield RPC
     async fn end_timeslice<G: Guest<Self>>(&self, guest: &mut G) {
+        self.end_timeslice_with_sched_yield(guest, false).await;
+    }
+
+    async fn end_timeslice_for_sched_yield<G: Guest<Self>>(&self, guest: &mut G) {
+        self.end_timeslice_with_sched_yield(guest, true).await;
+    }
+
+    async fn end_timeslice_with_sched_yield<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        explicit_sched_yield: bool,
+    ) {
         let thread_state = guest.thread_state();
         let dettid = thread_state.dettid;
         let chaos = guest.config().chaos;
@@ -399,6 +519,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             Self::priority_changepoint_request(guest, end_time, prio)
         } else if chaos {
             Self::random_priority_changepoint_request(guest, end_time)
+        } else if explicit_sched_yield && self.cfg.replay_schedule_from.is_none() {
+            Self::sched_yield_request(guest)
         } else {
             Self::yield_request(guest)
         };
@@ -459,25 +581,41 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let do_sched =
             config.sched_heuristic != SchedHeuristic::None || config.sequentialize_threads;
 
-        if cfg!(debug_assertions) {
+        if !config.passthru_opt {
+            // Fail closed by default in every build profile. Besides allowing syscall-specific
+            // handlers to run, interception is what charges generic syscall logical time.
             Subscription::all()
         } else {
+            // Explicit performance opt-in: unlisted syscalls bypass Detcore entirely. Keep this
+            // path separate so its allow-list can be tightened without weakening the default.
             let mut subscription = Subscription::none();
             subscription.syscalls([
                 Sysno::write,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#547)
+                Sysno::writev,
                 Sysno::openat,
                 Sysno::open,
                 Sysno::creat,
                 Sysno::close,
                 Sysno::read,
+                Sysno::pread64,
+                Sysno::lseek,
+                Sysno::fadvise64,
                 Sysno::mmap,
+                Sysno::madvise,
+                Sysno::munmap,
+                Sysno::mremap,
                 Sysno::fcntl,
+                Sysno::arch_prctl,
+                Sysno::ioctl,
                 Sysno::futex,
                 Sysno::clone,
                 Sysno::clone3,
                 Sysno::fork,
                 Sysno::vfork,
                 Sysno::wait4,
+                Sysno::waitid,
                 Sysno::setsid,
                 Sysno::uname,
                 Sysno::exit_group,
@@ -501,14 +639,25 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::signalfd,
                 Sysno::signalfd4,
                 Sysno::timerfd_create,
+                Sysno::timerfd_settime,
+                Sysno::timerfd_gettime,
+                Sysno::inotify_init,
+                Sysno::inotify_init1,
+                Sysno::inotify_add_watch,
+                Sysno::inotify_rm_watch,
                 Sysno::memfd_create,
                 Sysno::userfaultfd,
+                Sysno::io_uring_setup,
+                Sysno::io_uring_enter,
+                Sysno::io_uring_register,
                 Sysno::accept,
                 Sysno::accept4,
                 Sysno::nanosleep,
                 Sysno::clock_nanosleep,
                 Sysno::sched_yield,
                 Sysno::poll,
+                Sysno::ppoll,
+                Sysno::prlimit64,
                 Sysno::epoll_create,
                 Sysno::epoll_create1,
                 Sysno::epoll_ctl,
@@ -520,9 +669,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::rt_sigtimedwait,
                 Sysno::execve,
                 Sysno::execveat,
+                Sysno::rseq,
+                Sysno::getpid,
+                Sysno::gettid,
                 Sysno::getcpu,
                 Sysno::rt_sigprocmask,
                 Sysno::rt_sigaction,
+                Sysno::getrusage,
                 Sysno::sysinfo,
                 // TODO(T137258824): add proper Select / PSelect6
                 // Sysno::pselect6,
@@ -620,7 +773,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 )
                 .await;
             }
-            intercepted.cpuid(eax).unwrap()
+            intercepted.cpuid(eax).unwrap_or_else(|| {
+                warn!(
+                    "[dtid {}] cpuid leaf 0x{:x} not in deterministic table; returning zero result",
+                    dettid, eax
+                );
+                CpuIdResult {
+                    eax: 0,
+                    ebx: 0,
+                    ecx: 0,
+                    edx: 0,
+                }
+            })
         } else {
             cpuid!(eax, ecx)
         };
@@ -756,6 +920,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 ThreadState {
                     dettid,
                     detpid: None, // Initialized later.
+                    mm_id: MmId::for_clone(
+                        pts.1.mm_id,
+                        dettid,
+                        clone_flags.contains(CloneFlags::CLONE_VM),
+                    ),
+                    memory_metadata: if clone_flags.contains(CloneFlags::CLONE_VM) {
+                        Arc::clone(&pts.1.memory_metadata)
+                    } else {
+                        Arc::new(Mutex::new(
+                            pts.1
+                                .memory_metadata
+                                .lock()
+                                .expect("memory metadata mutex poisoned")
+                                .clone(),
+                        ))
+                    },
                     pedigree: child_pedigree,
                     stats: ThreadStats::new(),
                     file_metadata: {
@@ -766,10 +946,35 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         if clone_flags.contains(CloneFlags::CLONE_FILES) {
                             pts.1.file_metadata.clone()
                         } else {
-                            Arc::new(Mutex::new(pts.1.file_metadata.lock().unwrap().clone()))
+                            Arc::new(Mutex::new(
+                                pts.1.file_metadata.lock().unwrap().fork_for(dettid),
+                            ))
                         }
                     },
+                    // POSIX timers are shared among threads of a process but are
+                    // NOT inherited across fork(2). Share the table for a new
+                    // thread (CLONE_THREAD); give a new process a fresh, empty
+                    // one.
+                    posix_timers: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                        Arc::clone(&pts.1.posix_timers)
+                    } else {
+                        Arc::new(Mutex::new(PosixTimers::default()))
+                    },
+                    // Resource limits are process state: threads share them,
+                    // while a forked process inherits a snapshot.
+                    resource_limits: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                        Arc::clone(&pts.1.resource_limits)
+                    } else {
+                        Arc::new(Mutex::new(
+                            pts.1
+                                .resource_limits
+                                .lock()
+                                .expect("resource limits mutex poisoned")
+                                .clone(),
+                        ))
+                    },
                     clone_flags: None,
+                    pending_vfork: pts.1.pending_vfork.clone(),
 
                     // For a child thread, we use the parent to initialize our rng state:
                     prng: thread_rng_from_parent("USER RAND", &pts.1.prng, dettid),
@@ -818,6 +1023,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 guest.config()
             );
             create_child_thread(guest, new_dettid, 0, None).await;
+        } else if let Some(vfork) = guest.thread_state_mut().pending_vfork.take() {
+            create_vfork_child_thread(guest, new_dettid, vfork).await;
         }
 
         // Except for the root task, let's block until it's our turn to go:
@@ -846,6 +1053,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         guest.thread_state_mut().past_global_first_execve = true;
+        tool_global::mark_past_first_execve(guest).await;
         self.pre_handler_hook(guest, false).await;
 
         if let Some(ptr) = guest.auxv().at_random() {
@@ -951,6 +1159,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         | Syscall::Time(_)
                         | Syscall::ClockGettime(_)
                         | Syscall::Write(_)
+                        | Syscall::Writev(_)
                 );
                 // TODO(T86591083): remove this conditional to bump logical time unconditionally:
                 if bumpit && virtualize_time {
@@ -960,150 +1169,302 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             thread_state.stats.syscall_count
         };
 
-        let res = match call {
-            Syscall::Write(w) => self.handle_write(guest, w).await,
-            Syscall::Openat(o) => self.handle_openat(guest, o).await,
-            Syscall::Open(o) => self.handle_openat(guest, o.into()).await,
-            Syscall::Creat(o) => self.handle_openat(guest, o.into()).await,
-            Syscall::Close(s) => self.handle_close(guest, s).await,
-            Syscall::Read(s) => self.handle_read(guest, s).await,
-            Syscall::Mmap(s) => self.handle_mmap(guest, s).await,
-            Syscall::Stat(s) => self.handle_stat_family(guest, s.into()).await,
-            Syscall::Lstat(s) => self.handle_stat_family(guest, s.into()).await,
-            Syscall::Fstat(s) => self.handle_stat_family(guest, s.into()).await,
-            Syscall::Newfstatat(s) => self.handle_stat_family(guest, s.into()).await,
-            Syscall::Statx(s) => self.handle_statx(guest, s).await,
-            Syscall::Fcntl(s) => self.handle_fcntl(guest, s).await,
-            Syscall::Futex(s) => self.handle_futex(guest, s).await,
-
-            // TODO(): fix vfork and handle CLONE_VFORK cases here:
-            Syscall::Clone(s) => self.handle_clone_family(guest, s.into()).await,
-            Syscall::Clone3(s) => self.handle_clone_family(guest, s.into()).await,
-            Syscall::Fork(s) => self.handle_clone_family(guest, s.into()).await,
-
-            // Our child-thread-creation protocol doesn't support vfork blocking the parent thread yet:
-            Syscall::Vfork(_s) => self.handle_clone_family(guest, Fork::new().into()).await,
-            Syscall::Wait4(s) => self.handle_wait4(guest, s).await,
-
-            Syscall::Setsid(s) => self.handle_setsid(guest, s).await,
-            Syscall::Gettimeofday(s) if virtualize_time => self.handle_gettimeofday(guest, s).await,
-            Syscall::Time(s) if config.virtualize_time => self.handle_time(guest, s).await,
-            Syscall::ClockGettime(s) if virtualize_time => {
-                self.handle_clock_gettime(guest, s).await
-            }
-            Syscall::ClockGetres(s) if virtualize_time => self.handle_clock_getres(guest, s).await,
-            Syscall::Uname(s) => self.handle_uname(guest, s).await,
-            Syscall::ExitGroup(s) => self.handle_exit_group(guest, s).await,
-            Syscall::Exit(s) => self.handle_exit(guest, s).await,
-
-            Syscall::Dup(w) => self.handle_dup(guest, w).await.map_err(Into::into),
-            Syscall::Dup2(w) => self.handle_dup2(guest, w).await.map_err(Into::into),
-            Syscall::Dup3(w) => self.handle_dup3(guest, w).await.map_err(Into::into),
-            Syscall::Pipe(w) => self.handle_pipe2(guest, w.into()).await.map_err(Into::into),
-            Syscall::Pipe2(w) => self.handle_pipe2(guest, w).await.map_err(Into::into),
-            Syscall::Getrandom(s) => self.handle_getrandom(guest, s).await,
-            Syscall::Utime(s) => self.handle_utime(guest, s).await.map_err(Into::into),
-            Syscall::Utimes(s) => self.handle_utimes(guest, s).await.map_err(Into::into),
-            // NB: lutimes is a libc function not a syscall
-            Syscall::Utimensat(s) => self.handle_utimensat(guest, s).await.map_err(Into::into),
-            // NB: futimes/futimens are libc functions not a syscall,
-            // futimesat is obsolete, return -ENOSYS for simplicity.
-            Syscall::Futimesat(_s) => Err(Error::Errno(Errno::ENOSYS)),
-            Syscall::Socket(s) => self.handle_socket(guest, s).await,
-            Syscall::Socketpair(s) => self.handle_socketpair(guest, s).await,
-            Syscall::Connect(s) => self.handle_connect(guest, s).await,
-            Syscall::Bind(s) => self.handle_bind(guest, s).await,
-            Syscall::Eventfd(s) => self.handle_eventfd2(guest, s.into()).await,
-            Syscall::Eventfd2(s) => self.handle_eventfd2(guest, s).await,
-            Syscall::Signalfd(s) => self.handle_signalfd4(guest, s.into()).await,
-            Syscall::Signalfd4(s) => self.handle_signalfd4(guest, s).await,
-            Syscall::TimerfdCreate(s) => self.handle_timerfd_create(guest, s).await,
-            Syscall::MemfdCreate(s) => self.handle_memfd_create(guest, s).await,
-            Syscall::Userfaultfd(s) => self.handle_userfaultfd(guest, s).await,
-            Syscall::Accept(s) => self.handle_accept4(guest, s.into()).await,
-            Syscall::Accept4(s) => self.handle_accept4(guest, s).await,
-
-            Syscall::Nanosleep(s) => self.handle_nanosleep_family(guest, s.into()).await,
-            Syscall::ClockNanosleep(s) => self.handle_nanosleep_family(guest, s.into()).await,
-            Syscall::SchedYield(s) => self.handle_sched_yield(guest, s).await,
-
-            // NB: getdents is not recommended, (g)libc should call getdents64 only
-            // see: sysdeps/unix/sysv/linux/getdents.c.
-            Syscall::Getdents(s) => self.handle_getdents(guest, s).await,
-            Syscall::Getdents64(s) => self.handle_getdents64(guest, s).await,
-
-            Syscall::Poll(s) => self.handle_poll(guest, s).await,
-            Syscall::EpollCreate(s) => {
-                self.handle_epoll_create1(guest, EpollCreate1::from(s))
-                    .await
-            }
-            Syscall::EpollCreate1(s) => self.handle_epoll_create1(guest, s).await,
-            Syscall::EpollCtl(s) => self.handle_epoll_ctl(guest, s).await,
-            Syscall::EpollPwait(s) => self.handle_epoll_pwait(guest, s).await,
-            Syscall::EpollWait(s) => self.handle_epoll_wait(guest, s).await,
-            Syscall::EpollWaitOld(s) => panic!(
-                "Not handling deprecated syscall: {}",
-                s.display(&guest.memory())
-            ),
-            Syscall::EpollCtlOld(s) => panic!(
-                "Not handling deprecated syscall: {}",
-                s.display(&guest.memory())
-            ),
-
-            Syscall::SchedGetaffinity(s) => self.handle_sched_getaffinity(guest, s).await,
-            Syscall::SchedSetaffinity(s) => self.handle_sched_setaffinity(guest, s).await,
-
-            Syscall::Recvfrom(s) => self.handle_sendrecv(guest, s).await,
-            Syscall::Recvmsg(s) => self.handle_sendrecv(guest, s).await,
-            Syscall::Sendto(s) => self.handle_sendrecv(guest, s).await,
-            Syscall::Sendmsg(s) => self.handle_sendrecv(guest, s).await,
-            Syscall::Sendmmsg(s) => self.handle_sendrecv(guest, s).await,
-
-            // TODO: handle timeout behavior:
-            // Syscall::Recvmmsg(_) => self.handle_recvmmsg(guest, call).await,
-            Syscall::RtSigtimedwait(s) => self.handle_rt_sigtimedwait(guest, s).await,
-
-            Syscall::Execve(s) => self.handle_execveat(guest, s.into()).await,
-            Syscall::Execveat(s) => self.handle_execveat(guest, s).await,
-
-            Syscall::Getcpu(s) => self.handle_getcpu(guest, s).await,
-            Syscall::RtSigprocmask(s) => self.handle_rt_sigprocmask(guest, s).await,
-            Syscall::RtSigaction(s) => self.handle_rt_sigaction(guest, s).await,
-            Syscall::Alarm(s) => self.handle_alarm(guest, s).await,
-            Syscall::Pause(s) => self.handle_pause(guest, s).await,
-
-            // These are to allow execution of a minimal rust executable
-            // (namely //hermetic_infra/detcore:get-syscall-support)
-            Syscall::Brk(_) => self.passthrough(guest, call).await,
-            Syscall::Readlink(_) => self.passthrough(guest, call).await,
-            Syscall::Access(_) => self.passthrough(guest, call).await,
-            Syscall::Mprotect(_) => self.passthrough(guest, call).await,
-            Syscall::ArchPrctl(_) => self.passthrough(guest, call).await,
-            Syscall::SetTidAddress(_) => self.passthrough(guest, call).await,
-            Syscall::SetRobustList(_) => self.passthrough(guest, call).await,
-            Syscall::Prlimit64(_) => self.passthrough(guest, call).await,
-            Syscall::Readlinkat(_) => self.passthrough(guest, call).await,
-            Syscall::Madvise(_) => self.passthrough(guest, call).await,
-            Syscall::Munmap(_) => self.passthrough(guest, call).await,
-            Syscall::Prctl(_) => self.passthrough(guest, call).await,
-            Syscall::Sigaltstack(_) => self.passthrough(guest, call).await,
-            Syscall::Sysinfo(s) => self.handle_sysinfo(guest, s).await,
-
-            // TODO(#30) handle key mgmt syscalls, virtualizing serial numbers:
-            Syscall::AddKey(_) => self.passthrough(guest, call).await,
-            Syscall::Keyctl(_) => self.passthrough(guest, call).await,
-            Syscall::RequestKey(_) => self.passthrough(guest, call).await,
-
-            _ => {
+        let res = match classify_syscall(call.number()) {
+            // Rseq is not type-safe in the pinned Reverie revision. Dispatch by Sysno so a
+            // future typed representation preserves this explicit policy.
+            SyscallClassification::Determinized if call.number() == Sysno::rseq => {
                 if config.panic_on_unsupported_syscalls {
-                    error!(
-                        "[detcore, dtid {}] inbound syscall: {} = ?",
-                        dettid,
-                        call.display(&guest.memory()),
-                    );
-                    panic!("unsupported syscall: {:?}", call);
+                    Err(Error::Errno(Errno::ENOSYS))
+                } else {
+                    self.passthrough(guest, call).await
                 }
+            }
+            SyscallClassification::Determinized => match call {
+                Syscall::Write(w) => self.handle_write(guest, w).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#547)
+                Syscall::Writev(w) => self.handle_writev(guest, w).await,
+                Syscall::Openat(o) => self.handle_openat(guest, o).await,
+                Syscall::Open(o) => self.handle_openat(guest, o.into()).await,
+                Syscall::Creat(o) => self.handle_openat(guest, o.into()).await,
+                Syscall::Close(s) => self.handle_close(guest, s).await,
+                Syscall::Read(s) => self.handle_read(guest, s).await,
+                Syscall::Pread64(s) => self.handle_pread64(guest, s).await,
+                // This syscall is advisory; fixed success preserves its API contract.
+                Syscall::Fadvise64(_) => Ok(0),
+                Syscall::Mmap(s) => self.handle_mmap(guest, s).await,
+                Syscall::Madvise(s) => self.handle_madvise(guest, s).await,
+                Syscall::Munmap(s) => self.handle_munmap(guest, s).await,
+                Syscall::Mremap(s) => self.handle_mremap(guest, s).await,
+                Syscall::Stat(s) => self.handle_stat_family(guest, s.into()).await,
+                Syscall::Lstat(s) => self.handle_stat_family(guest, s.into()).await,
+                Syscall::Fstat(s) => self.handle_stat_family(guest, s.into()).await,
+                Syscall::Newfstatat(s) => self.handle_stat_family(guest, s.into()).await,
+                Syscall::Statx(s) => self.handle_statx(guest, s).await,
+                Syscall::Fcntl(s) => self.handle_fcntl(guest, s).await,
+                Syscall::Ioctl(s) => self.handle_ioctl(guest, s).await,
+                Syscall::Futex(s) => self.handle_futex(guest, s).await,
+
+                Syscall::Clone(s) => self.handle_clone_family(guest, s.into()).await,
+                Syscall::Clone3(s) => self.handle_clone_family(guest, s.into()).await,
+                Syscall::Fork(s) => self.handle_clone_family(guest, s.into()).await,
+
+                // Forward vfork as vfork (rather than rewriting to fork) so the
+                // kernel enforces the CLONE_VFORK parent-blocking contract while the
+                // child registers itself and runs to exec/exit.
+                Syscall::Vfork(s) => self.handle_clone_family(guest, s.into()).await,
+                Syscall::Wait4(s) => self.handle_wait4(guest, s).await,
+                Syscall::Waitid(s) => self.handle_waitid(guest, s).await,
+
+                Syscall::Setsid(s) => self.handle_setsid(guest, s).await,
+                Syscall::Gettimeofday(s) => {
+                    if virtualize_time {
+                        self.handle_gettimeofday(guest, s).await
+                    } else {
+                        self.handle_unclassified_syscall(
+                            guest,
+                            call,
+                            dettid,
+                            config.panic_on_unsupported_syscalls,
+                        )
+                        .await
+                    }
+                }
+                Syscall::Time(s) => {
+                    if virtualize_time {
+                        self.handle_time(guest, s).await
+                    } else {
+                        self.handle_unclassified_syscall(
+                            guest,
+                            call,
+                            dettid,
+                            config.panic_on_unsupported_syscalls,
+                        )
+                        .await
+                    }
+                }
+                Syscall::ClockGettime(s) => {
+                    if virtualize_time {
+                        self.handle_clock_gettime(guest, s).await
+                    } else {
+                        self.handle_unclassified_syscall(
+                            guest,
+                            call,
+                            dettid,
+                            config.panic_on_unsupported_syscalls,
+                        )
+                        .await
+                    }
+                }
+                Syscall::ClockGetres(s) => {
+                    if virtualize_time {
+                        self.handle_clock_getres(guest, s).await
+                    } else {
+                        self.handle_unclassified_syscall(
+                            guest,
+                            call,
+                            dettid,
+                            config.panic_on_unsupported_syscalls,
+                        )
+                        .await
+                    }
+                }
+                Syscall::ArchPrctl(s) => self.handle_arch_prctl(guest, s).await,
+                Syscall::Uname(s) => self.handle_uname(guest, s).await,
+                Syscall::ExitGroup(s) => self.handle_exit_group(guest, s).await,
+                Syscall::Exit(s) => self.handle_exit(guest, s).await,
+
+                Syscall::Dup(w) => self.handle_dup(guest, w).await.map_err(Into::into),
+                Syscall::Dup2(w) => self.handle_dup2(guest, w).await.map_err(Into::into),
+                Syscall::Dup3(w) => self.handle_dup3(guest, w).await.map_err(Into::into),
+                Syscall::Pipe(w) => self.handle_pipe2(guest, w.into()).await.map_err(Into::into),
+                Syscall::Pipe2(w) => self.handle_pipe2(guest, w).await.map_err(Into::into),
+                Syscall::Getrandom(s) => self.handle_getrandom(guest, s).await,
+                Syscall::Utime(s) => self.handle_utime(guest, s).await.map_err(Into::into),
+                Syscall::Utimes(s) => self.handle_utimes(guest, s).await.map_err(Into::into),
+                // NB: lutimes is a libc function not a syscall
+                Syscall::Utimensat(s) => self.handle_utimensat(guest, s).await.map_err(Into::into),
+                // NB: futimes/futimens are libc functions not a syscall,
+                // futimesat is obsolete, return -ENOSYS for simplicity.
+                Syscall::Futimesat(_s) => Err(Error::Errno(Errno::ENOSYS)),
+                // io_uring completion and memory-sharing semantics are not deterministic.
+                Syscall::IoUringSetup(_)
+                | Syscall::IoUringEnter(_)
+                | Syscall::IoUringRegister(_) => Err(Error::Errno(Errno::ENOSYS)),
+                Syscall::Socket(s) => self.handle_socket(guest, s).await,
+                Syscall::Socketpair(s) => self.handle_socketpair(guest, s).await,
+                Syscall::Connect(s) => self.handle_connect(guest, s).await,
+                Syscall::Bind(s) => self.handle_bind(guest, s).await,
+                Syscall::Eventfd(s) => self.handle_eventfd2(guest, s.into()).await,
+                Syscall::Eventfd2(s) => self.handle_eventfd2(guest, s).await,
+                Syscall::Signalfd(s) => self.handle_signalfd4(guest, s.into()).await,
+                Syscall::Signalfd4(s) => self.handle_signalfd4(guest, s).await,
+                Syscall::TimerfdCreate(s) => self.handle_timerfd_create(guest, s).await,
+                Syscall::TimerfdSettime(s) => self.handle_timerfd_settime(guest, s).await,
+                Syscall::TimerfdGettime(s) => self.handle_timerfd_gettime(guest, s).await,
+                Syscall::InotifyInit(s) => {
+                    self.handle_inotify_init1(guest, InotifyInit1::from(s))
+                        .await
+                }
+                Syscall::InotifyInit1(s) => self.handle_inotify_init1(guest, s).await,
+                Syscall::InotifyAddWatch(s) => self.handle_inotify_add_watch(guest, s).await,
+                Syscall::InotifyRmWatch(s) => self.handle_inotify_rm_watch(guest, s).await,
+                Syscall::MemfdCreate(s) => self.handle_memfd_create(guest, s).await,
+                Syscall::Userfaultfd(s) => self.handle_userfaultfd(guest, s).await,
+                Syscall::Accept(s) => self.handle_accept4(guest, s.into()).await,
+                Syscall::Accept4(s) => self.handle_accept4(guest, s).await,
+
+                Syscall::Nanosleep(s) => self.handle_nanosleep_family(guest, s.into()).await,
+                Syscall::ClockNanosleep(s) => self.handle_nanosleep_family(guest, s.into()).await,
+                Syscall::SchedYield(s) => self.handle_sched_yield(guest, s).await,
+
+                // NB: getdents is not recommended, (g)libc should call getdents64 only
+                // see: sysdeps/unix/sysv/linux/getdents.c.
+                Syscall::Getdents(s) => self.handle_getdents(guest, s).await,
+                Syscall::Getdents64(s) => self.handle_getdents64(guest, s).await,
+
+                Syscall::Poll(s) => self.handle_poll(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                Syscall::Ppoll(s) => self.handle_ppoll(guest, s).await,
+                Syscall::EpollCreate(s) => {
+                    self.handle_epoll_create1(guest, EpollCreate1::from(s))
+                        .await
+                }
+                Syscall::EpollCreate1(s) => self.handle_epoll_create1(guest, s).await,
+                Syscall::EpollCtl(s) => self.handle_epoll_ctl(guest, s).await,
+                Syscall::EpollPwait(s) => self.handle_epoll_pwait(guest, s).await,
+                Syscall::EpollWait(s) => self.handle_epoll_wait(guest, s).await,
+                Syscall::EpollWaitOld(s) => panic!(
+                    "Not handling deprecated syscall: {}",
+                    s.display(&guest.memory())
+                ),
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#549)
+                // The obsolete x86_64 entry point is absent from modern Linux kernels.
+                Syscall::EpollCtlOld(_) => Err(Error::Errno(Errno::ENOSYS)),
+
+                Syscall::SchedGetaffinity(s) => self.handle_sched_getaffinity(guest, s).await,
+                Syscall::SchedSetaffinity(s) => self.handle_sched_setaffinity(guest, s).await,
+
+                Syscall::Recvfrom(s) => self.handle_sendrecv(guest, s).await,
+                Syscall::Recvmsg(s) => self.handle_sendrecv(guest, s).await,
+                Syscall::Sendto(s) => self.handle_sendrecv(guest, s).await,
+                Syscall::Sendmsg(s) => self.handle_sendrecv(guest, s).await,
+                Syscall::Sendmmsg(s) => self.handle_sendrecv(guest, s).await,
+
+                // TODO: handle timeout behavior:
+                // Syscall::Recvmmsg(_) => self.handle_recvmmsg(guest, call).await,
+                Syscall::RtSigtimedwait(s) => self.handle_rt_sigtimedwait(guest, s).await,
+
+                Syscall::Execve(s) => self.handle_execveat(guest, s.into()).await,
+                Syscall::Execveat(s) => self.handle_execveat(guest, s).await,
+
+                Syscall::Getcpu(s) => self.handle_getcpu(guest, s).await,
+                Syscall::RtSigprocmask(s) => self.handle_rt_sigprocmask(guest, s).await,
+                Syscall::RtSigaction(s) => self.handle_rt_sigaction(guest, s).await,
+                Syscall::Alarm(s) => self.handle_alarm(guest, s).await,
+                Syscall::Pause(s) => self.handle_pause(guest, s).await,
+
+                Syscall::Getrusage(s) => self.handle_getrusage(guest, s).await,
+                Syscall::Sysinfo(s) => self.handle_sysinfo(guest, s).await,
+                Syscall::Prlimit64(s) => self.handle_prlimit64(guest, s).await,
+
+                // POSIX per-process timers. Arming is tracked against the virtual
+                // clock so these verify deterministically under --strict; timer
+                // expiration signals are not delivered (see handle_timer_create).
+                Syscall::TimerCreate(s) => self.handle_timer_create(guest, s).await,
+                Syscall::TimerSettime(s) => self.handle_timer_settime(guest, s).await,
+                Syscall::TimerGettime(s) => self.handle_timer_gettime(guest, s).await,
+                Syscall::TimerGetoverrun(s) => self.handle_timer_getoverrun(guest, s).await,
+                Syscall::TimerDelete(s) => self.handle_timer_delete(guest, s).await,
+
+                // Serialized threads share a total memory order, so process-wide
+                // memory barriers are trivially satisfied and can be no-ops.
+                Syscall::Membarrier(s) => self.handle_membarrier(guest, s).await,
+
+                // Filesystem statistics: passthrough is record/replay-aware so the
+                // (otherwise host-dependent) result is captured and reproduced.
+                // statfs/fstatfs run the real syscall, then canonicalize the
+                // host-varying fields (free blocks/inodes, fsid) so the result is
+                // deterministic under --verify (a bare passthrough diverged, e.g.
+                // for tar).
+                Syscall::Statfs(s) => self.handle_statfs(guest, s).await,
+                Syscall::Fstatfs(s) => self.handle_fstatfs(guest, s).await,
+
+                unexpected => {
+                    self.handle_unclassified_syscall(
+                        guest,
+                        unexpected,
+                        dettid,
+                        config.panic_on_unsupported_syscalls,
+                    )
+                    .await
+                }
+            },
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#503): Verify untyped and backend-specific dispatch edges.
+            // The pinned Reverie revision lists faccessat2 as an untyped syscall, so
+            // dispatch it by Sysno while retaining typed guards for every represented call.
+            SyscallClassification::PassThrough if call.number() == Sysno::faccessat2 => {
                 self.passthrough(guest, call).await
+            }
+            SyscallClassification::PassThrough => match call {
+                Syscall::Access(_)
+                | Syscall::Brk(_)
+                | Syscall::Capget(_)
+                | Syscall::Capset(_)
+                | Syscall::Chdir(_)
+                | Syscall::Chmod(_)
+                | Syscall::Fchdir(_)
+                | Syscall::Fchmodat(_)
+                | Syscall::Fdatasync(_)
+                | Syscall::Ftruncate(_)
+                | Syscall::Getcwd(_)
+                | Syscall::Getegid(_)
+                | Syscall::Geteuid(_)
+                | Syscall::Getgid(_)
+                | Syscall::Getgroups(_)
+                | Syscall::Getpid(_)
+                | Syscall::Gettid(_)
+                | Syscall::Getuid(_)
+                | Syscall::Getxattr(_)
+                | Syscall::Lgetxattr(_)
+                | Syscall::Linkat(_)
+                | Syscall::Lseek(_)
+                | Syscall::Mkdir(_)
+                | Syscall::Mkdirat(_)
+                | Syscall::Mprotect(_)
+                | Syscall::Readlink(_)
+                | Syscall::Removexattr(_)
+                | Syscall::Renameat2(_)
+                | Syscall::Rmdir(_)
+                | Syscall::RtSigreturn(_)
+                | Syscall::Setxattr(_)
+                | Syscall::SetRobustList(_)
+                | Syscall::SetTidAddress(_)
+                | Syscall::Sigaltstack(_)
+                | Syscall::Symlinkat(_)
+                | Syscall::Umask(_)
+                | Syscall::Unlink(_)
+                | Syscall::Unlinkat(_) => self.passthrough(guest, call).await,
+                unexpected => {
+                    self.handle_unclassified_syscall(
+                        guest,
+                        unexpected,
+                        dettid,
+                        config.panic_on_unsupported_syscalls,
+                    )
+                    .await
+                }
+            },
+            SyscallClassification::Unclassified => {
+                self.handle_unclassified_syscall(
+                    guest,
+                    call,
+                    dettid,
+                    config.panic_on_unsupported_syscalls,
+                )
+                .await
             }
         };
 
@@ -1130,6 +1491,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         self.post_handler_hook(guest).await;
+
+        // Defense-in-depth: before returning to the guest, force the
+        // syscall-clobbered registers (%rcx/%r11 on x86-64) to deterministic
+        // values so that even a misbehaving guest cannot observe nondeterminism
+        // (or Reverie's private trampoline address) through them.
+        self.canonicalize_syscall_clobbers(guest).await;
+
         res
     }
 
@@ -1137,7 +1505,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         &self,
         tid: Tid,
         global_state: &G,
-        thread_state: Self::ThreadState,
+        mut thread_state: Self::ThreadState,
         exit_status: ExitStatus,
     ) -> Result<(), Error> {
         let dettid = thread_state.dettid;
@@ -1145,13 +1513,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             "[detcore, dtid {}] thread exit hook, deregistering from scheduler.",
             dettid
         );
+        // Close the final in-progress timeslice so this thread contributes its
+        // last (partial) slice to the run report, even if it never exhausted a
+        // full slice.
+        let now = thread_state.thread_logical_time.as_nanos();
+        thread_state.stats.close_final_timeslice(now);
         let detpid = thread_state.detpid.expect("Missing DetPid");
+        let mm_id = thread_state.mm_id;
         deregister_thread(
             dettid,
             thread_state.thread_logical_time.clone(),
             &self.cfg,
             global_state,
             detpid,
+            mm_id,
+            thread_state.stats.timeslice_stats,
         )
         .await;
 
@@ -1165,5 +1541,139 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod subscription_tests {
+    use super::*;
+
+    fn strict_config(passthru_opt: bool) -> Config {
+        Config {
+            sequentialize_threads: true,
+            deterministic_io: true,
+            passthru_opt,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn strict_subscriptions_intercept_every_event_by_default() {
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(false));
+
+        assert_eq!(subscriptions, Subscription::all());
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::ppoll)
+        );
+    }
+
+    #[test]
+    fn passthru_opt_uses_the_partial_subscription_set() {
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(true));
+
+        assert_ne!(subscriptions, Subscription::all());
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::clock_gettime)
+        );
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::ppoll)
+        );
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::madvise)
+        );
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::arch_prctl)
+        );
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::writev)
+        );
+    }
+}
+
+#[cfg(test)]
+mod rcb_overshoot_tests {
+    use std::fmt::Write;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use tracing::Event;
+    use tracing::Id;
+    use tracing::Level;
+    use tracing::Metadata;
+    use tracing::Subscriber;
+    use tracing::field::Field;
+    use tracing::field::Visit;
+    use tracing::span::Attributes;
+    use tracing::span::Record;
+    use tracing::subscriber::with_default;
+
+    use super::report_rcb_overshoot;
+
+    struct ErrorSubscriber(Arc<Mutex<Option<String>>>);
+
+    struct EventVisitor(String);
+
+    impl Visit for EventVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let _ = write!(self.0, "{}={:?}", field.name(), value);
+        }
+    }
+
+    impl Subscriber for ErrorSubscriber {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() == Level::ERROR
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            if *event.metadata().level() == Level::ERROR {
+                let mut visitor = EventVisitor(String::new());
+                event.record(&mut visitor);
+                *self.0.lock().unwrap() = Some(visitor.0);
+            }
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    #[test]
+    fn default_overshoot_policy_emits_error_and_returns() {
+        let error = Arc::new(Mutex::new(None));
+        with_default(ErrorSubscriber(error.clone()), || {
+            report_rcb_overshoot(false, 16_249, 139, 100);
+        });
+
+        let error = error.lock().unwrap().take().expect("missing ERROR event");
+        assert!(error.contains("PMU RCB overshoot"), "{error}");
+        assert!(error.contains("16249"), "{error}");
+        assert!(error.contains("139"), "{error}");
+        assert!(error.contains("100"), "{error}");
+    }
+
+    #[test]
+    #[should_panic(expected = "PMU RCB overshoot")]
+    fn opt_in_overshoot_policy_panics() {
+        report_rcb_overshoot(true, 16_249, 139, 100);
     }
 }

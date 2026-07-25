@@ -13,7 +13,6 @@ pub mod runqueue;
 pub mod timed_waiters;
 
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -22,14 +21,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
-use std::u64;
 use std::vec::IntoIter;
 
 use detcore_model::summary::RunSummary;
+use detcore_model::summary::TimesliceStats;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
+use rand::RngExt as _;
 use rand::SeedableRng;
+use rand::seq::IndexedRandom;
 use rand::seq::SliceRandom;
 use rand_pcg::Pcg64Mcg;
 use reverie::syscalls::Syscall;
@@ -53,10 +54,12 @@ use tracing::info;
 use tracing::trace;
 
 use crate::config::Config;
+use crate::config::RunsPostFork;
 use crate::detlog_debug;
 use crate::ivar::Ivar;
 use crate::preemptions::PreemptionWriter;
 use crate::preemptions::read_trace;
+use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
@@ -68,6 +71,7 @@ use crate::types::DetTid;
 use crate::types::FutexID;
 use crate::types::GlobalTime;
 use crate::types::LogicalTime;
+use crate::types::MmId;
 use crate::types::SchedEvent;
 use crate::types::SigWrapper;
 use crate::types::SyscallPhase;
@@ -146,8 +150,29 @@ pub type SchedRequest = Result<Resources, ThreadExited>;
 #[derive(Debug, Clone)]
 pub struct ThreadExited;
 
-/// This thread ID is waiting on a futex.
-pub type FutexWaiter = (DetTid, Ivar<SchedResponse>);
+/// A thread waiting on a futex, including the bitset accepted by wake operations.
+#[derive(Debug, Clone)]
+pub struct FutexWaiter {
+    dettid: DetTid,
+    response: Ivar<SchedResponse>,
+    bitset: u32,
+}
+
+/// Deterministically pick one element from `choices` using the supplied PRNG,
+/// returning `None` for an empty slice. This is the single random-selection
+/// primitive used by the targeted-chaos scheduling points, so their choices stay
+/// reproducible under a fixed `--fuzz-seed`.
+fn chaos_pick<T: Copy>(prng: &mut Pcg64Mcg, choices: &[T]) -> Option<T> {
+    choices.choose(prng).copied()
+}
+
+fn take_matching_futex_waiters(waiters: &mut Vec<FutexWaiter>, wake_mask: u32) -> Vec<FutexWaiter> {
+    let (matching, remaining) = std::mem::take(waiters)
+        .into_iter()
+        .partition(|waiter| waiter.bitset & wake_mask != 0);
+    *waiters = remaining;
+    matching
+}
 
 /// Actions that are blocked on another internal action of the guest, such as a pipe communication,
 /// or are blocked on external conditions such as a network request.  These cannot consume a logical
@@ -157,14 +182,16 @@ pub type FutexWaiter = (DetTid, Ivar<SchedResponse>);
 /// See NOTE [Blocking Syscalls via Internal Polling] in this folder.
 #[derive(Debug, Clone, Default)]
 pub struct BlockedPool {
-    /// BLOCKED futex transactions, waiting for wakers.  Multiple threads may be blocked n
+    /// BLOCKED futex transactions, waiting for wakers. Multiple threads may be blocked on
     /// the same futex.
     ///
     /// INVARIANT: because Futexes aren't currently modeled with `ResourceID`, a thread
     /// waiting on a futex will have a request filled in `next_turns` but for zero resources.
-    ///
-    /// TODO: the entries of this hashmap are never reclaimed (but they could be).
     pub futex_waiters: HashMap<FutexID, Vec<FutexWaiter>>,
+
+    /// Futex waiters whose deadlines expired and must receive `ETIMEDOUT` when scheduled.
+    /// Timed-out waiters are removed from `futex_waiters` before entering the run queue.
+    pub timed_out_futex_waiters: HashSet<DetTid>,
 
     /// Threads whose next event is waiting on a point in time to proceed.
     ///
@@ -180,7 +207,7 @@ pub struct BlockedPool {
     /// `BlockedExternalContinue` request when the thread is past its blocking action and
     /// waiting for permission to resume.  The request will stay empty while the thread is
     /// doing the blocking action.  This is different than the normal relationship
-    pub external_io_blockers: BTreeSet<DetTid>,
+    pub external_io_blockers: BTreeMap<DetTid, ExternalOpId>,
 }
 
 impl BlockedPool {
@@ -205,10 +232,13 @@ impl BlockedPool {
 }
 
 /// Record the expectations about requests to continue after blocking IO.
-fn assert_continue_request(req: &Resources) {
+fn external_continue_id(req: &Resources) -> ExternalOpId {
     assert_eq!(req.resources.len(), 1);
     let rsrc = req.resources.iter().next().unwrap().0;
-    assert_eq!(rsrc, &ResourceID::BlockedExternalContinue);
+    match rsrc {
+        ResourceID::BlockedExternalContinue(op_id) => *op_id,
+        other => panic!("expected external continue request, got {other:?}"),
+    }
 }
 
 /// The state for the deterministic scheduler.
@@ -278,6 +308,11 @@ pub struct Scheduler {
     /// information and needs to "cooperate" and setup it's preemption for the amount
     pub timeslices: BTreeMap<DetTid, Option<LogicalTime>>,
 
+    /// Per-thread distribution of completed timeslice durations (virtual ns),
+    /// collected from each thread as it deregisters at exit. Aggregated into the
+    /// final run report. BTreeMap for deterministic iteration order.
+    pub per_thread_timeslice: BTreeMap<DetTid, TimesliceStats>,
+
     /// A record of which preemptions occured on each thread.  Only used IF `--record-preemptions`
     /// was specified in the Config, otherwise this remains empty.
     pub preemption_writer: Option<PreemptionWriter>,
@@ -297,6 +332,9 @@ pub struct Scheduler {
     /// PRNG to drive any fuzzing of OS semantics (other than scheduling).
     fuzz_prng: Pcg64Mcg,
 
+    /// Independent scheduler-seeded stream for post-fork ordering choices.
+    post_fork_prng: Pcg64Mcg,
+
     /// A cached copy of the same (immutable) field in Config.
     stop_after_turn: Option<u64>,
     /// A cached copy of the same (immutable) field in Config.
@@ -305,6 +343,10 @@ pub struct Scheduler {
     recordreplay_modes: bool,
     /// A cached copy of the same (immutable) field in Config.
     fuzz_futexes: bool,
+    /// A cached copy of the same (immutable) field in Config. When set (and only
+    /// meaningful in chaos mode) the scheduler biases its nondeterminism points
+    /// toward known race patterns rather than exploring uniformly.
+    chaos_target_races: bool,
 }
 
 type StacktraceEventsIter = Peekable<IntoIter<(u64, Option<SchedEvent>, Option<PathBuf>)>>;
@@ -517,10 +559,18 @@ impl Backoff {
         Backoff { count: 0 }
     }
 
-    async fn further(&mut self) {
+    async fn further(&mut self, blocking: bool) {
         self.count += 1;
         const YIELDS_FIRST: u64 = 10;
-        if self.count <= YIELDS_FIRST {
+        if blocking {
+            if self.count <= YIELDS_FIRST {
+                std::thread::yield_now();
+            } else {
+                let round = self.count - YIELDS_FIRST;
+                let micros = if round > 13 { 10_000 } else { 2 ^ round };
+                std::thread::sleep(Duration::from_micros(micros));
+            }
+        } else if self.count <= YIELDS_FIRST {
             tokio::task::yield_now().await;
         } else {
             let round = self.count - YIELDS_FIRST;
@@ -540,8 +590,30 @@ impl Default for Backoff {
     }
 }
 
+pub(crate) type SchedulerObserver = Arc<dyn Fn(&'static str) + Send + Sync>;
+
 pub(crate) async fn sched_loop(sched: Arc<Mutex<Scheduler>>, timer: Arc<Mutex<GlobalTime>>) {
+    sched_loop_inner(sched, timer, false, None).await;
+}
+
+pub(crate) async fn sched_loop_external(
+    sched: Arc<Mutex<Scheduler>>,
+    timer: Arc<Mutex<GlobalTime>>,
+    observer: SchedulerObserver,
+) {
+    sched_loop_inner(sched, timer, true, Some(observer)).await;
+}
+
+async fn sched_loop_inner(
+    sched: Arc<Mutex<Scheduler>>,
+    timer: Arc<Mutex<GlobalTime>>,
+    blocking_backoff: bool,
+    observer: Option<SchedulerObserver>,
+) {
     info!("[scheduler] daemon task starting up, waiting for guest thread start..");
+    if let Some(observer) = &observer {
+        observer("daemon task starting; waiting for guest thread");
+    }
     let (iv, stop_after_iter) = {
         // Block until queue is populated.
         let sched = sched.lock().unwrap();
@@ -549,17 +621,21 @@ pub(crate) async fn sched_loop(sched: Arc<Mutex<Scheduler>>, timer: Arc<Mutex<Gl
     };
     iv.get().await;
     info!("[scheduler] guest in queue, scheduler proceeding..",);
+    if let Some(observer) = &observer {
+        observer("guest registered; deterministic scheduler proceeding");
+    }
     let mut iter: u64 = 0;
     // We keep track of whether the last turn was a SKIP:
     let mut last_res = Err(SkipTurn);
     let mut backoff = Backoff::new();
+    let mut observed_turn = false;
 
     loop {
         // TODO (T137183027, T137184765): as part of the current strategy for blocking IO ops (see
         // SPINNING below), we need to make sure that other threads can progress so we don't
         // busy-wait too tightly.
         if last_res.is_err() {
-            backoff.further().await;
+            backoff.further(blocking_backoff).await;
         } else {
             backoff.reset();
         }
@@ -581,22 +657,31 @@ pub(crate) async fn sched_loop(sched: Arc<Mutex<Scheduler>>, timer: Arc<Mutex<Gl
             let sched = sched.lock().unwrap();
             if sched.run_queue.is_empty() && sched.blocked.is_empty() {
                 info!("[scheduler] run queue empty, exiting sched_loop.");
-                return;
-            } else if let Some(stop) = sched.stop_after_turn {
-                if sched.turn > stop {
-                    tracing::warn!(
-                        "[scheduler] Early exit during turn {} due to --stop-after-turn.  Summary:\n\n{}",
-                        sched.turn,
-                        sched.full_summary()
-                    );
-                    immediate_fatal_exit(); // We don't want a backtrace of this thread.
+                if let Some(observer) = &observer {
+                    observer("run queue empty; scheduler completed");
                 }
+                return;
+            } else if let Some(stop) = sched.stop_after_turn
+                && sched.turn > stop
+            {
+                tracing::warn!(
+                    "[scheduler] Early exit during turn {} due to --stop-after-turn.  Summary:\n\n{}",
+                    sched.turn,
+                    sched.full_summary()
+                );
+                immediate_fatal_exit(); // We don't want a backtrace of this thread.
             }
         }
 
         // Otherwise we trust the turn function to either choose a runnable thread or wait
         // until something blocked is ready to run again.
         last_res = do_a_turn_blocking(sched.clone(), timer.clone(), &last_res).await;
+        if last_res.is_ok() && !observed_turn {
+            if let Some(observer) = &observer {
+                observer("completed a deterministic scheduling turn");
+            }
+            observed_turn = true;
+        }
     }
 }
 
@@ -680,7 +765,8 @@ pub async fn do_a_turn_blocking(
         // The logical COMMIT point for the turn is during step4:
         mg.step4_resource_block(next_dtid, &rsrcs, &resp)?;
         mg.step5_guest_unblock(next_dtid, &rsrcs, &resp)?;
-        mg.step6_reenquue(next_dtid);
+        let sched_yield = rsrcs.resources.contains_key(&ResourceID::SchedYield);
+        mg.step6_reenquue(next_dtid, sched_yield);
         if let Some(call) = rsrcs.as_exit_syscall() {
             mg.step7_simulate_exit_posthook(next_dtid, call, &global_time);
         }
@@ -692,7 +778,7 @@ pub async fn do_a_turn_blocking(
 fn assert_futex_request(nextturn: &ThreadNextTurn) {
     match nextturn.req.try_read() {
         Some(Ok(req)) => {
-            if !(req.resources.get(&ResourceID::FutexWait).is_some() && req.resources.len() == 1) {
+            if !(req.resources.contains_key(&ResourceID::FutexWait) && req.resources.len() == 1) {
                 panic!(
                     "assert_empty_request({}): internal invariant broken, expected empty resource request, found: {:?}",
                     nextturn.dettid, req
@@ -813,8 +899,11 @@ impl Scheduler {
             thread_tree: Default::default(),
             priorities: Default::default(),
             timeslices: Default::default(),
+            per_thread_timeslice: Default::default(),
             fuzz_futexes: cfg.fuzz_futexes,
+            chaos_target_races: cfg.chaos_target_races,
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
+            post_fork_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed() ^ 0x706f_7374_666f_726b),
         }
     }
 
@@ -835,7 +924,7 @@ impl Scheduler {
         let nextturn = self.next_turns.get(det_tid).unwrap_or_else(|| {
             panic!(
                 "[check_request] internal error: dettid {} queued but missing entry in next_turns",
-                &det_tid
+                det_tid
             )
         });
         if nextturn.req.try_read().is_none() {
@@ -858,28 +947,28 @@ impl Scheduler {
         observed: &SchedEvent,
     ) -> MaybePrintStack {
         let mut result = None;
-        if let Some(iter) = &mut self.stacktrace_events {
-            if let Some((next_ix, event, m_path)) = iter.peek() {
-                let go = if let Some(ev) = event {
-                    (*next_ix == current_ix && events_consistent(observed, ev))
-                        || events_match(observed, ev)
-                } else {
-                    *next_ix == current_ix
-                };
-                if go {
-                    info!(
-                        "Now output stack trace for scheduled event #{} = {}:",
+        if let Some(iter) = &mut self.stacktrace_events
+            && let Some((next_ix, event, m_path)) = iter.peek()
+        {
+            let go = if let Some(ev) = event {
+                (*next_ix == current_ix && events_consistent(observed, ev))
+                    || events_match(observed, ev)
+            } else {
+                *next_ix == current_ix
+            };
+            if go {
+                info!(
+                    "Now output stack trace for scheduled event #{} = {}:",
+                    current_ix, observed,
+                );
+                if m_path.is_none() {
+                    eprintln!(
+                        "\nPrinting stack trace for scheduled event #{} = {}:",
                         current_ix, observed,
                     );
-                    if m_path.is_none() {
-                        eprintln!(
-                            "\nPrinting stack trace for scheduled event #{} = {}:",
-                            current_ix, observed,
-                        );
-                    }
-                    result = Some(m_path.clone());
-                    let _ = iter.next();
                 }
+                result = Some(m_path.clone());
+                let _ = iter.next();
             }
         }
         result
@@ -953,7 +1042,7 @@ impl Scheduler {
     ///
     /// This is IDEMPOTENT, and it may indeed be called twice, both to proactively remove a thread,
     /// and then reactively in response to an exit hook.
-    pub fn logically_kill_thread(&mut self, dtid: &DetTid, detpid: &DetPid) {
+    pub fn logically_kill_thread(&mut self, dtid: &DetTid, detpid: &DetPid, mm: MmId) {
         info!(
             "logically_kill: Scheduler removing all knowledge of [det]tid {} in pid {}..",
             dtid, detpid
@@ -980,7 +1069,10 @@ impl Scheduler {
                 // down the exit scenarios and ensure that they happen when the guest is running and
                 // has NOT filled its request to the scheduler yet.
                 nextturn.req.try_put(Err(ThreadExited));
-                self.wake_futex_child_cleartid((*detpid, nextturn.child_tid_addr), *dtid);
+                self.wake_futex_child_cleartid(
+                    FutexID::private(mm, nextturn.child_tid_addr),
+                    *dtid,
+                );
             }
         }
     }
@@ -989,9 +1081,20 @@ impl Scheduler {
     fn remove_blocking_entries(&mut self, dtid: &DetTid) {
         self.blocked.timed_waiters.remove(*dtid);
         let _ = self.blocked.external_io_blockers.remove(dtid);
-        for vec in &mut self.blocked.futex_waiters.values_mut() {
-            vec.retain(|(dt2, _)| dt2 != dtid);
-        }
+        self.blocked.timed_out_futex_waiters.remove(dtid);
+        let _ = self.remove_futex_waiter(dtid);
+    }
+
+    fn remove_futex_waiter(&mut self, dettid: &DetTid) -> bool {
+        let mut removed = 0;
+        self.blocked.futex_waiters.retain(|_, waiters| {
+            let before = waiters.len();
+            waiters.retain(|waiter| &waiter.dettid != dettid);
+            removed += before - waiters.len();
+            !waiters.is_empty()
+        });
+        assert!(removed <= 1, "thread was registered on multiple futexes");
+        removed == 1
     }
 
     /// Put a Futex waiter to sleep, to be awoken by `wake_futex_waiter`.
@@ -1000,13 +1103,18 @@ impl Scheduler {
         dettid: &DetTid,
         futexid: FutexID,
         maybe_timeout: Option<LogicalTime>,
+        bitset: u32,
     ) {
         let nxt = self
             .next_turns
             .get(dettid)
             .expect("Missing next_turns entry");
         let entry: &mut Vec<_> = self.blocked.futex_waiters.entry(futexid).or_default();
-        entry.push((*dettid, nxt.resp.clone()));
+        entry.push(FutexWaiter {
+            dettid: *dettid,
+            response: nxt.resp.clone(),
+            bitset,
+        });
         // When we park, we use a resource request to signal WHAT we're blocking on.  But this is
         // not quite the same as when an active thread in the runqueue blocks on a resource, because
         // we're not actually waiting on the scheduler giving us the resource.  We're waiting in the
@@ -1028,7 +1136,9 @@ impl Scheduler {
     }
 
     /// Reschedule a single thread that has been blocked on futex.
-    pub fn wake_futex_waiter(&mut self, (waiterid, waiter_ivar): FutexWaiter) {
+    pub fn wake_futex_waiter(&mut self, waiter: FutexWaiter) {
+        let waiterid = waiter.dettid;
+        let waiter_ivar = waiter.response;
         debug_assert!(!self.run_queue.contains_tid(waiterid));
 
         // If it was registered as a waiter-with-timeout, remove it:
@@ -1052,15 +1162,15 @@ impl Scheduler {
 
     fn choose_futex_wakees(
         &mut self,
-        vec: &mut Vec<(DetPid, Ivar<SchedResponse>)>,
+        vec: &mut Vec<FutexWaiter>,
         num_woken: usize,
-    ) -> Vec<(DetPid, Ivar<SchedResponse>)> {
+    ) -> Vec<FutexWaiter> {
         if self.fuzz_futexes {
             let rng = &mut self.fuzz_prng;
             debug!(
                 "[fuzz-futexes] selecting {} tids, pre shuffle: {:?}",
                 num_woken,
-                vec.iter().map(|x| x.0).collect::<Vec<DetPid>>()
+                vec.iter().map(|x| x.dettid).collect::<Vec<DetTid>>()
             );
 
             // No need to actually use the results here since vec was mutated:
@@ -1069,7 +1179,7 @@ impl Scheduler {
             info!(
                 "[fuzz-futexes] selecting {} tids, post shuffle: {:?}",
                 num_woken,
-                vec.iter().map(|x| x.0).collect::<Vec<DetPid>>()
+                vec.iter().map(|x| x.dettid).collect::<Vec<DetTid>>()
             );
         }
         // just take the first N, in whatever deterministic order they are in:
@@ -1082,6 +1192,7 @@ impl Scheduler {
         _waker_dettid: DetTid,
         futexid: FutexID,
         max_to_wake: i32,
+        wake_mask: u32,
     ) -> u64 {
         if max_to_wake == 0 {
             trace!("[detcore] Futex wake of 0 waiters necessarily fizzles...");
@@ -1104,13 +1215,15 @@ impl Scheduler {
             max_to_wake,
             vec.len(),
         );
-        let num_woken: usize = std::cmp::min(vec.len(), max_to_wake.try_into().unwrap());
-        let to_wake = self.choose_futex_wakees(&mut vec, num_woken);
+        let mut matching = take_matching_futex_waiters(&mut vec, wake_mask);
+        let num_woken: usize = std::cmp::min(matching.len(), max_to_wake.try_into().unwrap());
+        let to_wake = self.choose_futex_wakees(&mut matching, num_woken);
 
         assert_eq!(to_wake.len(), num_woken);
         for waiter in to_wake {
             self.wake_futex_waiter(waiter);
         }
+        vec.extend(matching);
         // Put back what wasn't woken up:
         if !vec.is_empty() {
             let junk = self.blocked.futex_waiters.insert(futexid, vec);
@@ -1127,7 +1240,7 @@ impl Scheduler {
         );
         // Wakes only one thread, as per:
         // https://man7.org/linux/man-pages/man2/set_tid_address.2.html
-        self.wake_futex_waiters(dettid, futid, 1);
+        self.wake_futex_waiters(dettid, futid, 1, u32::MAX);
     }
 
     /// Step: Before we select which thread to run, first we check if some internal data
@@ -1170,8 +1283,26 @@ impl Scheduler {
 
     // Follow Linux semantics for delivering a signal to a thread within a process group.
     // Optionally take a hint on which tid detcore would *like* to deliver to, if it is available.
-    fn select_signal_target(&self, detpid: DetPid, m_dettid: Option<DetTid>) -> DetTid {
-        // TODO(T137242449): chaos selection point for fuzzing all nondeterministic semantics:
+    fn select_signal_target(&mut self, detpid: DetPid, m_dettid: Option<DetTid>) -> DetTid {
+        // Targeted chaos (T137242449): a process-directed signal may legally be
+        // handled by any thread in the group that does not block it. Instead of
+        // always steering it to the hinted/leader thread, pick a random eligible
+        // thread to surface signal-timing races. This stays reproducible under a
+        // fixed `--fuzz-seed`.
+        if self.chaos_target_races {
+            let group = self.thread_tree.my_thread_group(&detpid);
+            let eligible: Vec<DetTid> = group
+                .into_iter()
+                .filter(|t| !matches!(self.thread_status(*t), ThreadStatus::Gone))
+                .collect();
+            if let Some(chosen) = chaos_pick(&mut self.fuzz_prng, &eligible) {
+                info!(
+                    "[targeted-chaos] delivering process-directed signal to random group thread {} (of {:?})",
+                    chosen, eligible
+                );
+                return chosen;
+            }
+        }
 
         if let Some(dettid) = m_dettid {
             match self.thread_status(dettid) {
@@ -1193,13 +1324,20 @@ impl Scheduler {
     }
 
     fn wake_timed_event(&mut self, time_ns: LogicalTime, dettid: DetTid) {
-        if enabled!(Level::TRACE) {
-            let nxtturn = self
+        let futex_timed_out = {
+            let next_turn = self
                 .next_turns
-                .get_mut(&dettid)
+                .get(&dettid)
                 .expect("internal invariant broken");
+            is_futex_request(next_turn)
+        };
+        if futex_timed_out {
+            assert!(self.remove_futex_waiter(&dettid));
+            assert!(self.blocked.timed_out_futex_waiters.insert(dettid));
+        }
 
-            if is_futex_request(nxtturn) {
+        if enabled!(Level::TRACE) {
+            if futex_timed_out {
                 info!(
                     "[sched-step2] Time-based event on thread {} (time {}, committed time {}) - futex wait timed out!",
                     dettid, time_ns, self.committed_time
@@ -1242,7 +1380,26 @@ impl Scheduler {
                 );
             }
             ThreadStatus::Running => {
-                // TODO(T137242449): could reprioritize to run it sooner, but for now we leave the priorities alone.
+                let is_internal_io_polling = self
+                    .next_turns
+                    .get(&dettid)
+                    .and_then(|next_turn| next_turn.req.try_read())
+                    .is_some_and(|request| {
+                        request.is_ok_and(|resources| {
+                            resources
+                                .resources
+                                .contains_key(&ResourceID::InternalIOPolling)
+                        })
+                    });
+
+                if is_internal_io_polling {
+                    assert!(self.run_queue.remove_tid(dettid));
+                    let mut rsrcs = Resources::new(dettid);
+                    rsrcs.insert(ResourceID::InboundSignal(SigWrapper(signal)), Permission::W);
+                    self.force_unblock_thread(dettid, rsrcs);
+                }
+                // TODO(T137242449): other runnable requests could be reprioritized to run
+                // sooner, but for now we leave their priorities alone.
             }
             ThreadStatus::NotRunning => {
                 let mut rsrcs = Resources::new(dettid);
@@ -1265,8 +1422,19 @@ impl Scheduler {
             nxt.req = Ivar::full(Ok(rsrcs));
         }
 
-        // TODO(T137242449): randomize choice of front/back and priority under --chaos:
-        self.runqueue_push_back(dettid);
+        // Targeted chaos (T137242449): a force-unblocked thread (e.g. woken by a
+        // signal or ready I/O) is normally requeued at the back of its priority
+        // level, so it runs after everything already queued. Randomizing whether
+        // it jumps to the front instead varies the order in which a just-woken
+        // thread races the threads it was contending with -- surfacing
+        // lock-ordering / wakeup-ordering races. Reproducible under `--fuzz-seed`.
+        let to_front = self.chaos_target_races
+            && chaos_pick(&mut self.fuzz_prng, &[true, false]).unwrap_or(false);
+        if to_front {
+            self.runqueue_push_front(dettid);
+        } else {
+            self.runqueue_push_back(dettid);
+        }
     }
 
     /// Check on threads that were backgrounded performing external IO.
@@ -1277,19 +1445,19 @@ impl Scheduler {
                 .blocked
                 .external_io_blockers
                 .iter()
-                .filter(|dtid| {
+                .filter(|(dtid, op_id)| {
                     let nt = self
                         .next_turns
                         .get(dtid)
                         .expect("internal invariant broken");
                     if let Some(Ok(req)) = nt.req.try_read() {
-                        assert_continue_request(&req);
+                        assert_eq!(external_continue_id(&req), **op_id);
                         true
                     } else {
                         false
                     }
                 })
-                .cloned()
+                .map(|(dtid, _)| *dtid)
                 .collect();
             debug!(
                 "Nondeterministic status of blocking IO: out of {}, completed on {}, dtids: {:?}",
@@ -1299,33 +1467,58 @@ impl Scheduler {
             );
 
             // FIXME TODO (T137183027): for record/replay to work properly, we need to ALLOW the
-            // "Nondeterminstic algorithm" below, but record & replay those scheduler events.  In
-            // the meantime, to get recording partially working, we use the dumb/eager policy where
-            // we eagerly block on any ExternalBlocking actions, which essentially is the same as
-            // not background them at all.
+            // "Nondeterminstic algorithm" below, but record & replay those scheduler events. In
+            // the meantime, use a deterministic eager policy once there is no other runnable work.
             if self.recordreplay_modes {
-                let first_dtid: DetTid = *self
-                    .blocked
-                    .external_io_blockers
-                    .first()
-                    .expect("internal logic error"); // See above blockers_empty check.
-                if ready.contains(&first_dtid) {
-                    info!(
-                        "[step2] Reschedule formerly (external IO) blocked dtid {:?}",
-                        first_dtid
-                    );
-                    self.blocked.external_io_blockers.remove(&first_dtid);
-                    self.run_queue.push_eager_io_repoll(first_dtid);
-                    return Ok(());
+                // Only *real* deterministic work should defer external-IO harvesting.
+                // Internal pollers sit at LAST_PRIORITY and are frequently spinning on
+                // the very result an external-IO blocker will produce (e.g. the reader
+                // side of `echo hi | cat`, where one stage uses InternalIOPolling while
+                // its peer is backgrounded on BlockingExternalIO). Treat a run queue
+                // that holds only pollers as "no deterministic work" so we still harvest
+                // completed IO below; a queued poller must not starve a ready blocker.
+                let only_pollers = if let Some(fp) = self.run_queue.first_priority() {
+                    fp >= LAST_PRIORITY
                 } else {
-                    // FIXME TODO (T137183027): We implement a busy-wait by going around the scheduler loop again.
-                    trace!(
-                        "[step2] TEMPORARY1: eagerly blocking on external IO for dtid {:?}.  SPINNING!",
-                        first_dtid
-                    );
-                    std::thread::yield_now();
-                    return Err(SkipTurn);
+                    true
+                };
+
+                // Deterministic work is runnable: let it proceed. Waiting here while such
+                // work exists can deadlock thread creation -- the parent and new child
+                // cannot complete clone while an existing worker blocks indefinitely in
+                // epoll_wait.
+                if !self.run_queue.is_empty() && !only_pollers {
+                    return Ok(());
                 }
+
+                // Reschedule every blocker whose IO has completed so its continuation can
+                // consume the recorded result. Harvesting all ready blockers (not just the
+                // first) and doing so even when pollers are queued is what breaks the
+                // record-mode pipe livelock: previously a queued poller made this branch
+                // return early forever, so the completed read/write was never rescheduled
+                // and the poller spun on data that never arrived.
+                if !ready.is_empty() {
+                    for ready_dtid in &ready {
+                        info!(
+                            "[step2] Reschedule formerly (external IO) blocked dtid {:?}",
+                            ready_dtid
+                        );
+                        self.blocked.external_io_blockers.remove(ready_dtid);
+                        self.run_queue.push_eager_io_repoll(*ready_dtid);
+                    }
+                    return Ok(());
+                }
+
+                // No completed IO yet, and nothing but pollers (or nothing) to run. The
+                // blocking syscalls are executing in the host kernel; go around the loop
+                // and re-check readiness. (Still a busy-wait; see T137183027 for the
+                // record-the-nondeterministic-event fix.)
+                trace!(
+                    "[step2] eagerly waiting on external IO for dtids {:?}. spinning.",
+                    &self.blocked.external_io_blockers
+                );
+                std::thread::yield_now();
+                return Err(SkipTurn);
             } // End region which should be deleted.
 
             // Nondeterminsitic algorithm: the unblocked background action jumps back in randomly.
@@ -1591,7 +1784,7 @@ impl Scheduler {
             }
 
             // Thread BEGINS [potentially] blocking external IO
-            ResourceID::BlockingExternalIO => {
+            ResourceID::BlockingExternalIO(op_id) => {
                 info!(
                     "[scheduler] >>>>>>>\n\n COMMIT turn {}, BACKGROUND dettid {} (maybe-blocking)",
                     self.turn, dettid
@@ -1612,17 +1805,19 @@ impl Scheduler {
                 // scheduler commits, and thus it leans on an assumption of
                 // non-interference, or on interference *only* affecting the external
                 // actions that will be recorded anyway.
+                self.run_queue.consume_yield_exclusion();
                 self.unblock_guest(dettid, resp);
 
                 // Only once the ivars are cleared, and the guest is officially past the
                 // BlockingExternalIO phase ready to issue BlockedExternalContinue, do we
                 // then put it into the external_io_blockers struct.
-                self.blocked.external_io_blockers.insert(dettid);
+                let old = self.blocked.external_io_blockers.insert(dettid, *op_id);
+                assert!(old.is_none(), "thread started a second external operation");
                 Err(SkipTurn)
             }
 
             // Thread CONTINUES after completing [potentially] blocking IO.
-            ResourceID::BlockedExternalContinue => {
+            ResourceID::BlockedExternalContinue(_) => {
                 // We leave the thread out of the run-queue.  At the point we put it back
                 // in, this resource request is immediately granted.
                 Ok(())
@@ -1642,11 +1837,12 @@ impl Scheduler {
             ResourceID::Path(_) => Ok(()),
             ResourceID::PathsTransitive(_) => Ok(()),
             ResourceID::Device(_) => Ok(()),
-            ResourceID::Exit(_) => Ok(()),
-            ResourceID::ParentContinue() => Ok(()),
+            ResourceID::Exit { .. } => Ok(()),
+            ResourceID::ParentContinue { .. } => Ok(()),
             ResourceID::InternalIOPolling => Ok(()),
             ResourceID::FutexWait => Ok(()),
             ResourceID::TraceReplay => Ok(()),
+            ResourceID::SchedYield => Ok(()),
             ResourceID::InboundSignal(_) => Ok(()),
         }
     }
@@ -1687,16 +1883,16 @@ impl Scheduler {
         let old_priority = self.priorities.insert(dettid, new_priority);
 
         // Do not attempt to record preemptions/priorities when we're dictated by a raw schedule replay.
-        if self.replayer.is_none() {
-            if let Some(pw) = &mut self.preemption_writer {
-                let old_prio = old_priority.unwrap();
-                debug!(
-                    "[dtid {}] Recording preemption point, current time {} prior priority {} (next priority {})",
-                    dettid, guest_time, old_prio, new_priority
-                );
-                pw.insert_reprioritization(dettid, guest_time, old_prio, new_priority);
-                pw.set_current(dettid, new_priority);
-            }
+        if self.replayer.is_none()
+            && let Some(pw) = &mut self.preemption_writer
+        {
+            let old_prio = old_priority.unwrap();
+            debug!(
+                "[dtid {}] Recording preemption point, current time {} prior priority {} (next priority {})",
+                dettid, guest_time, old_prio, new_priority
+            );
+            pw.insert_reprioritization(dettid, guest_time, old_prio, new_priority);
+            pw.set_current(dettid, new_priority);
         }
 
         let popped = self.run_queue.commit_tentative_pop(); // Begun in step3.
@@ -1748,6 +1944,16 @@ impl Scheduler {
         Self::is_x_turn(rsrcs, &ResourceID::TraceReplay)
     }
 
+    /// A turn that only grants `InternalIOPolling`, i.e. a retry of a nonblocking
+    /// poll/epoll/select/futex/recv/... injected by the blocking-via-polling machinery
+    /// (see `retry_nonblocking_syscall_helper`). The *number* of such retries before a
+    /// file descriptor becomes ready is wall-clock dependent when the readiness is driven
+    /// by an external actor (e.g. a child linker process draining a pipe), so it varies
+    /// between otherwise-identical runs.
+    fn is_polling_turn(rsrcs: &Resources) -> bool {
+        Self::is_x_turn(rsrcs, &ResourceID::InternalIOPolling)
+    }
+
     fn is_x_turn(rsrcs: &Resources, x: &ResourceID) -> bool {
         if rsrcs.resources.contains_key(x) {
             if rsrcs.resources.len() > 1 {
@@ -1770,6 +1976,20 @@ impl Scheduler {
         global_time: &Mutex<GlobalTime>,
         last_turn: &Result<Resources, SkipTurn>,
     ) {
+        // An internal IO-polling retry (see `is_polling_turn`) must still advance logical
+        // time -- finite poll/epoll/select/futex timeouts are enforced by comparing observed
+        // logical time against the deadline in `retry_nonblocking_syscall_helper`, so freezing
+        // time here would turn a timed wait into an infinite spin. But because the *count* of
+        // these retries is host-timing nondeterministic, we keep their time-advance out of the
+        // determinism log (DETLOG). This makes the `--verify` deterministic comparison
+        // insensitive to retry count; the matching `{InternalIOPolling: ...}` COMMIT turn is
+        // likewise excluded in `logdiff::is_internal_io_poll_commit`. Time values still shift
+        // between runs, but those are numerically normalized before comparison.
+        let last_turn_was_polling = last_turn
+            .as_ref()
+            .map(Self::is_polling_turn)
+            .unwrap_or(false);
+
         // At this moment, when threads are parked, we know that the global_time is
         // frozen and we can read it without any race.
         let snapshot: LogicalTime = {
@@ -1799,10 +2019,18 @@ impl Scheduler {
                 );
             } else {
                 let newtime = gtime.add_scheduler_time();
-                detlog_debug!(
-                    "[sched] advance global time for scheduler turn, new time {:?}",
-                    newtime,
-                );
+                if last_turn_was_polling {
+                    // Advance time (needed for timeout enforcement) but keep it off the DETLOG.
+                    trace!(
+                        "[sched] advance global time for internal IO-polling retry (suppressed from detlog), new time {:?}",
+                        newtime,
+                    );
+                } else {
+                    detlog_debug!(
+                        "[sched] advance global time for scheduler turn, new time {:?}",
+                        newtime,
+                    );
+                }
             }
             gtime.as_nanos()
         };
@@ -1816,6 +2044,11 @@ impl Scheduler {
             }
             std::cmp::Ordering::Equal => {}
             std::cmp::Ordering::Greater => {
+                // NB: `committed_time` still tracks the (host-timing-perturbed) global clock,
+                // including the time advanced by suppressed IO-polling retries above, so this
+                // line's presence is retry-count sensitive. It is therefore excluded from the
+                // deterministic `--verify` comparison in `logdiff::is_scheduler_committed_time`
+                // (it is redundant with the per-turn "advance global time" DETLOG anyway).
                 detlog_debug!(
                     "[sched-step1] advancing committed_time from {} to {}",
                     self.committed_time,
@@ -1866,9 +2099,12 @@ impl Scheduler {
             &resp, &dtid
         );
         let sig = self.is_signal_inbound(dtid); // Peek before we clear the ivars.
+        let futex_timed_out = self.blocked.timed_out_futex_waiters.remove(&dtid);
         self.clear_nextturn(dtid);
         let answer = if sig {
             SchedResponse::Signaled()
+        } else if futex_timed_out {
+            SchedResponse::Go(Some(SchedValue::TimeOut))
         } else {
             let timeslice = self.timeslices.remove(&dtid).flatten();
             // TODO(T137799529): use a more strongly typed representation rather than reusing
@@ -1910,12 +2146,19 @@ impl Scheduler {
     }
 
     /// Step: reenqueue the thread that just had a turn.
-    fn step6_reenquue(&mut self, next_dtid: DetTid) {
+    fn step6_reenquue(&mut self, next_dtid: DetTid, sched_yield: bool) {
         // We delay popping till here, so while holding the lock we "atomically" move the
         // thread from the front to the back of the queue.
-        let dt2 = self.run_queue.commit_tentative_pop();
+        let dt2 = self.run_queue.commit_tentative_pop_completed_turn();
         assert_eq!(next_dtid, dt2);
-        let pos = self.runqueue_push_back(next_dtid);
+        // SchedYield is emitted in normal execution and non-chaos preemption replay. Its
+        // queue placement is transient, so persistent priorities remain unchanged.
+        let pos = if sched_yield {
+            let priority = self.get_priority(next_dtid);
+            self.run_queue.push_yielded(next_dtid, priority)
+        } else {
+            self.runqueue_push_back(next_dtid)
+        };
         debug!(
             "[sched-step6] dettid {} going back into queue at position {}.",
             next_dtid, pos
@@ -1985,11 +2228,22 @@ impl Scheduler {
         self.run_queue.push_back(dettid, priority)
     }
 
-    /// Push_front a thread onto the runqueue, respecting its persistent priority
-    /// value. This should be the ordinary way threads are pushed onto the queue.
-    fn runqueue_push_front(&mut self, dettid: DetTid) -> PrioritizedOrder {
+    /// Push a thread to the front of its persistent priority band.
+    ///
+    /// This is reserved for protocol handoffs where the queued thread must run
+    /// before an equal-priority peer, such as ordinary clone child startup.
+    pub(crate) fn runqueue_push_front(&mut self, dettid: DetTid) -> PrioritizedOrder {
         let priority = self.get_priority(dettid);
         self.run_queue.push_front(dettid, priority)
+    }
+
+    /// Decide which side gets the first post-fork turn for an ordinary clone.
+    pub(crate) fn child_runs_first_post_fork(&mut self, mode: RunsPostFork) -> bool {
+        match mode {
+            RunsPostFork::Child => true,
+            RunsPostFork::Parent => false,
+            RunsPostFork::Random => self.post_fork_prng.random(),
+        }
     }
 
     /// Check if a thread is alive, but removed from run queue.
@@ -2000,8 +2254,8 @@ impl Scheduler {
             // Check all the places a blocked thread could be hiding.
             // TODO: this O(N) search could be made more efficient with more indexing structures.
             for v in self.blocked.futex_waiters.values() {
-                for (dt, _) in v {
-                    if *dt == dtid {
+                for waiter in v {
+                    if waiter.dettid == dtid {
                         return ThreadStatus::NotRunning;
                     }
                 }
@@ -2016,15 +2270,29 @@ impl Scheduler {
                     TimedEvent::AlarmEvt(_, _, _) => {}
                 }
             }
-            if self.blocked.external_io_blockers.contains(&dtid) {
+            if self.blocked.external_io_blockers.contains_key(&dtid) {
                 return ThreadStatus::NotRunning;
             }
             ThreadStatus::Gone
         }
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#252): Confirm completed and final partial slices belong in one distribution.
+    /// Fold an exiting thread's completed-timeslice distribution into the
+    /// scheduler's per-thread record, to be reported in the final run summary.
+    pub fn record_timeslice_stats(&mut self, dettid: DetTid, stats: TimesliceStats) {
+        if stats.is_empty() {
+            return;
+        }
+        self.per_thread_timeslice
+            .entry(dettid)
+            .or_default()
+            .merge(&stats);
+    }
+
     /// Summarize the run after completion, as a RunSummary. This is partial because the Scheduler
-    /// doesn't have all the necessary information.
+    /// does not have all the necessary information.
     ///
     /// Side Effects: This also flushes the in-memory PreemptionWriter to disk.
     pub fn generate_partial_run_summary(
@@ -2103,6 +2371,18 @@ impl Scheduler {
         let num_threads = self.thread_tree.size() as u64;
         let threads_descrip = format!("{}", self.thread_tree);
 
+        // Aggregate the per-thread timeslice distributions collected at thread
+        // exit. BTreeMap gives a deterministic (dettid-sorted) ordering.
+        let per_thread_timeslice: Vec<(DetTid, TimesliceStats)> = self
+            .per_thread_timeslice
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        let mut timeslice_stats = TimesliceStats::default();
+        for (_, st) in &per_thread_timeslice {
+            timeslice_stats.merge(st);
+        }
+
         Ok(RunSummary {
             sched_turns: self.turn,
             schedevent_replayed,
@@ -2117,13 +2397,15 @@ impl Scheduler {
             virttime_elapsed: 0, // Cannot fill.
             virttime_final: 0,   // Cannot fill.
             realtime_elapsed: None,
+            timeslice_stats,
+            per_thread_timeslice,
         })
     }
 
     /// Summarize the state of the scheduler while executing (verbose).
     pub fn full_summary(&self) -> String {
         let mut buf = String::new();
-        write!(&mut buf, "  {}", &self.run_queue).unwrap();
+        write!(&mut buf, "  {}", self.run_queue).unwrap();
 
         let total_futex_blocked: usize = self.blocked.futex_waiters.iter().map(|v| v.1.len()).sum();
         writeln!(
@@ -2218,6 +2500,108 @@ impl Scheduler {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    fn futex_waiter(dettid: i32, bitset: u32) -> FutexWaiter {
+        FutexWaiter {
+            dettid: DetTid::from_raw(dettid),
+            response: Ivar::new(),
+            bitset,
+        }
+    }
+
+    #[test]
+    fn chaos_pick_is_seed_deterministic_and_covers_all_choices() {
+        let choices = [10, 20, 30, 40];
+
+        // Same seed => identical sequence of picks (the reproducibility that
+        // targeted chaos relies on).
+        let mut a = Pcg64Mcg::seed_from_u64(1234);
+        let mut b = Pcg64Mcg::seed_from_u64(1234);
+        for _ in 0..64 {
+            assert_eq!(chaos_pick(&mut a, &choices), chaos_pick(&mut b, &choices));
+        }
+
+        // Over enough draws every choice is reachable (the bias actually explores
+        // the space rather than pinning one option).
+        let mut prng = Pcg64Mcg::seed_from_u64(9);
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..256 {
+            seen.insert(chaos_pick(&mut prng, &choices).unwrap());
+        }
+        assert_eq!(
+            seen,
+            choices.iter().copied().collect(),
+            "chaos_pick should be able to return every choice"
+        );
+
+        // An empty slice yields None rather than panicking.
+        assert_eq!(chaos_pick(&mut prng, &[] as &[i32]), None);
+
+        // The front/back coin flip used by force_unblock_thread reaches both.
+        let mut prng = Pcg64Mcg::seed_from_u64(7);
+        let mut both = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            both.insert(chaos_pick(&mut prng, &[true, false]).unwrap());
+        }
+        assert_eq!(both, [false, true].into_iter().collect());
+    }
+
+    #[test]
+    fn post_fork_modes_are_selectable_and_random_is_seed_deterministic() {
+        let config = Config {
+            sched_seed: Some(1234),
+            ..Default::default()
+        };
+        let mut fixed = Scheduler::new(&config);
+        assert!(fixed.child_runs_first_post_fork(RunsPostFork::Child));
+        assert!(!fixed.child_runs_first_post_fork(RunsPostFork::Parent));
+
+        let mut first = Scheduler::new(&config);
+        let mut second = Scheduler::new(&config);
+        let first_sequence = (0..64)
+            .map(|_| first.child_runs_first_post_fork(RunsPostFork::Random))
+            .collect::<Vec<_>>();
+        let second_sequence = (0..64)
+            .map(|_| second.child_runs_first_post_fork(RunsPostFork::Random))
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_sequence, second_sequence);
+        assert!(first_sequence.contains(&true));
+        assert!(first_sequence.contains(&false));
+    }
+
+    #[test]
+    fn futex_wake_bitset_only_selects_intersecting_waiters() {
+        let mut waiters = vec![
+            futex_waiter(1, 0b0001),
+            futex_waiter(2, 0b0010),
+            futex_waiter(3, 0b0011),
+        ];
+
+        let matching = take_matching_futex_waiters(&mut waiters, 0b0010);
+        assert_eq!(
+            matching
+                .iter()
+                .map(|waiter| waiter.dettid)
+                .collect::<Vec<_>>(),
+            [DetTid::from_raw(2), DetTid::from_raw(3)]
+        );
+        assert_eq!(
+            waiters
+                .iter()
+                .map(|waiter| waiter.dettid)
+                .collect::<Vec<_>>(),
+            [DetTid::from_raw(1)]
+        );
+
+        let matching = take_matching_futex_waiters(&mut waiters, 0);
+        assert!(
+            matching.is_empty(),
+            "a zero wake bitset must match no waiter"
+        );
+        assert_eq!(waiters.len(), 1, "nonmatching waiters must remain queued");
+    }
+
     #[test]
     fn test_my_thread_group1() {
         let mut tree: ThreadTree = Default::default();

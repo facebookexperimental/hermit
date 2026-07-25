@@ -1,0 +1,13 @@
+schema_version=1
+started_at_utc=20260722T014512Z
+repository_commit=96261f618dda654fb87ffacd0e178c4bf743faaf
+repository_branch=impl-record-replay-matrix-slot03
+hermit=/home/newton/work/dev-hermit/worktrees/slot03/hermit/target/debug/hermit
+hermit_sha256=da786a0dc9e694bada1bf8489d91f824c27fddb340a6daf4afff2524ae9eb4ee
+artifact_root=/home/newton/work/dev-hermit/worktrees/slot03/hermit/experiments/record-replay-matrix_20260721/artifacts/20260722T014512Z
+case_timeout_seconds=60
+host_kernel=Linux 6.13.2-0_fbk13_hardened_0_g02230262e956 x86_64 GNU/Linux
+cpu_model=AMD EPYC 9D85 158-Core Processor
+total=11
+compatible=6
+incompatible=5

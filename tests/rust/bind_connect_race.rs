@@ -8,6 +8,7 @@
 
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
+use std::sync::mpsc;
 use std::thread;
 
 use tempfile::tempdir;
@@ -19,33 +20,36 @@ use tempfile::tempdir;
 fn run_test() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("sock");
-    let p2 = path.clone();
+    let server_path = path.clone();
+    let client_path = path.clone();
+    let (client_result_tx, client_result_rx) = mpsc::channel();
 
-    let _t1 = thread::spawn(move || {
-        let listener = UnixListener::bind(p2).expect("bind to succeed");
+    let server = thread::spawn(move || {
+        let _listener = UnixListener::bind(server_path).expect("bind to succeed");
 
-        if let Some(stream) = listener.incoming().next() {
-            match stream {
-                Ok(_stream) => {
-                    /* connection succeeded */
-                    println!("Server: got client");
-                }
-                Err(err) => {
-                    /* connection failed */
-                    eprintln!("Server: connection failed: {:?}", err);
-                }
-            }
+        if client_result_rx
+            .recv()
+            .expect("client result channel closed")
+        {
+            println!("Server: got client");
         }
     });
-    let t2 = thread::spawn(move || {
-        if let Ok(_stream) = UnixStream::connect(path) {
+    let client = thread::spawn(move || match UnixStream::connect(client_path) {
+        Ok(_stream) => {
             eprintln!("Client: connection succeeded..");
-        } else {
+            true
+        }
+        Err(_) => {
             eprintln!("Client: connection failed.");
+            false
         }
     });
 
-    t2.join().expect("client to be ok");
+    let connected = client.join().expect("client to be ok");
+    client_result_tx
+        .send(connected)
+        .expect("server result channel closed");
+    server.join().expect("server to be ok");
 }
 
 fn main() {

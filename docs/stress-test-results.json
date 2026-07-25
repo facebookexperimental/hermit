@@ -1,0 +1,125 @@
+{
+  "timestamp": "2026-07-22T17:44:23Z",
+  "runs_requested": 20,
+  "iterations_recorded": 20,
+  "threads": 316,
+  "filter": "package(detcore-model)",
+  "total_tests": 16,
+  "summary": {
+    "green": 16
+  },
+  "results": [
+    {
+      "test": "detcore-model::collections::replay_cursor::tests::test_next",
+      "category": "green",
+      "pass": 20,
+      "total": 20,
+      "failures": []
+    },
+    {
+      "test": "detcore-model::collections::replay_cursor::tests::test_peek",
+      "category": "green",
+      "pass": 20,
+      "total": 20,
+      "failures": []
+    },
+    {
+      "test": "detcore-model::collections::replay_cursor::tests::test_peek_empty",
+      "category": "green",
+      "pass": 20,
+      "total": 20,
+      "failures": []
+    },
+    {
+      "test": "detcore-model::collections::replay_cursor::tests::test_peek_nth",
+      "category": "green",
+      "pass": 20,
+      "total": 20,
+      "failures": []
+    },
+    {
+      "test": "detcore-model::collections::replay_cursor::tests::test_peek_pair",
+      "category": "green",
+      "pass": 20,
+      "total": 20,
+      "failures": []
+    },
+    {
+      "test": "detcore-model::collections::replay_cursor::tests::test_peek_pair_empty",
+      "category": "green",
+      "pass": 20,
+      "total": 20,
+      "failures": []
+    },
+    {
+      "test": "detcore-model::collections::replay_cursor::tests::test_peek_pair_one",
+      "category": "green",
+      "pass": 20,
+      "total": 20,
+      "failures": []
+    },
+    {
+      "test": "detcore-model::futex::tests::clone_vm_controls_private_futex_aliasing",
+      "category": "green",
+      "pass": 20,
+      "total": 20,
+      "failures": []
+    },
+    {
+      "test": "detcore-model::futex::tests::shared_futexes_alias_by_object_and_offset",
+      "category": "green",
+      "pass": 20,
+      "total": 20,
+      "failures": []
+    },
+    {
+      "test": "detcore-model::pedigree::test::display_pedigree",
+      "category": "green",
+      "pass": 20,
+      "total": 20,
+      "failures": []
+    },
+    {
+      "test": "detcore-model::pedigree::test::test_longest_run",
+      "category": "green",
+      "pass": 20,
+      "total": 20,
+      "failures": []
+    },
+    {
+      "test": "detcore-model::pedigree::test::test_pedigree_basic",
+      "category": "green",
+      "pass": 20,
+      "total": 20,
+      "failures": []
+    },
+    {
+      "test": "detcore-model::pedigree::test::test_pedigree_many_forks",
+      "category": "green",
+      "pass": 20,
+      "total": 20,
+      "failures": []
+    },
+    {
+      "test": "detcore-model::pedigree::test::test_pedigree_overflow",
+      "category": "green",
+      "pass": 20,
+      "total": 20,
+      "failures": []
+    },
+    {
+      "test": "detcore-model::time::print_nanoseconds",
+      "category": "green",
+      "pass": 20,
+      "total": 20,
+      "failures": []
+    },
+    {
+      "test": "detcore-model::time::subsecond_units_are_converted_from_nanoseconds",
+      "category": "green",
+      "pass": 20,
+      "total": 20,
+      "failures": []
+    }
+  ]
+}

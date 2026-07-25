@@ -129,14 +129,14 @@ impl LogicalTime {
     /// This method does not return the length of the duration when represented by microseconds. The returned number always represents
     /// a fractional portion of a second (i.e., it is less than one million).
     pub fn subsec_micros(&self) -> u32 {
-        (self.0 % MICROS_PER_SEC) as u32
+        ((self.0 / NANOS_PER_MICRO) % MICROS_PER_SEC) as u32
     }
 
     /// Returns the fractional part of this `LogicalTime`, in milliseconds.
     /// This method does not return the length of the duration when represented by milliseconds. The returned number always represents
     /// a fractional portion of a second (i.e., it is less than one thousand).
     pub fn subsec_millis(&self) -> u32 {
-        (self.0 % MILLIS_PER_SEC) as u32
+        ((self.0 / NANOS_PER_MILLI) % MILLIS_PER_SEC) as u32
     }
 
     /// Returns the fractional part of this `LogicalTime`, in nanoseconds.
@@ -205,23 +205,29 @@ impl std::fmt::Display for LogicalTime {
 impl Add for LogicalTime {
     type Output = Self;
     fn add(self, rhs: Self) -> Self {
-        LogicalTime(self.0 + rhs.0)
+        // Saturate at LogicalTime::MAX rather than panicking on overflow: a
+        // far-future logical time is clamped to "the end of time".
+        LogicalTime(self.0.saturating_add(rhs.0))
     }
 }
 
 impl Add<Duration> for LogicalTime {
     type Output = Self;
     fn add(self, rhs: Duration) -> Self {
-        // Cast will be unsafe if rhs ever exceeds u64::MAX nanosecs
-        LogicalTime(self.0 + rhs.as_nanos() as u64)
+        // A `Duration` can hold more nanoseconds than fit in u64, and the sum
+        // can exceed u64::MAX (e.g. Java arms a far-future timer, issue #219).
+        // Saturate the u128->u64 conversion and the addition instead of
+        // overflowing/truncating.
+        let nanos = u64::try_from(rhs.as_nanos()).unwrap_or(u64::MAX);
+        LogicalTime(self.0.saturating_add(nanos))
     }
 }
 
 impl Add<u128> for LogicalTime {
     type Output = Self;
     fn add(self, rhs: u128) -> Self {
-        // Maybe this will be total in the future, but for now it can fail:
-        LogicalTime(self.0 + rhs as u64)
+        // Saturate both the u128->u64 clamp and the addition.
+        LogicalTime(self.0.saturating_add(rhs.min(u64::MAX as u128) as u64))
     }
 }
 
@@ -257,6 +263,50 @@ fn print_nanoseconds() {
     assert_eq!(format!("{}", ns1), "946_684_799.000_000_000s");
     assert_eq!(format!("{}", ns1 + ns2), "946_684_799.729_860_000s");
     assert_eq!(format!("{}", ns2), "729_860_000ns");
+}
+
+#[test]
+fn subsecond_units_are_converted_from_nanoseconds() {
+    let time = LogicalTime::from_secs(2) + LogicalTime::from_nanos(345_678_901);
+
+    assert_eq!(time.subsec_millis(), 345);
+    assert_eq!(time.subsec_micros(), 345_678);
+    assert_eq!(time.subsec_nanos(), 345_678_901);
+
+    let timeval: Timeval = time.into();
+    assert_eq!(timeval.tv_sec, 2);
+    assert_eq!(timeval.tv_usec, 345_678);
+}
+
+#[test]
+fn add_saturates_instead_of_overflowing() {
+    // Regression for issue #219: Java arms a far-future timer whose deadline
+    // overflows u64. All three `Add` impls must saturate at LogicalTime::MAX
+    // rather than panic.
+    let near_max = LogicalTime(u64::MAX - 10);
+
+    // Add<LogicalTime>
+    assert_eq!(near_max + LogicalTime::from_secs(1), LogicalTime::MAX);
+
+    // Add<Duration>, including a Duration whose nanos exceed u64::MAX.
+    assert_eq!(near_max + Duration::from_secs(1), LogicalTime::MAX);
+    assert_eq!(
+        LogicalTime::ZERO + Duration::from_secs(u64::MAX / 1_000_000_000 + 1),
+        LogicalTime::MAX
+    );
+
+    // Add<u128>, including an rhs larger than u64::MAX.
+    assert_eq!(near_max + 100u128, LogicalTime::MAX);
+    assert_eq!(
+        LogicalTime::ZERO + (u128::from(u64::MAX) + 5),
+        LogicalTime::MAX
+    );
+
+    // A non-overflowing add still produces the exact sum.
+    assert_eq!(
+        LogicalTime::from_secs(2) + Duration::from_secs(3),
+        LogicalTime::from_secs(5)
+    );
 }
 
 /// The same basic type alias as nanoseconds. Just for clarity/readability.
@@ -541,7 +591,7 @@ impl GlobalTime {
     // The expensive way to get the total (internal)
     fn sum_up(&self) -> LogicalTime {
         let mut sum = self.starting_nanos;
-        for (_tid, tm) in self.time_vector.iter() {
+        for tm in self.time_vector.values() {
             sum = sum + *tm;
         }
         sum + self.extra_time

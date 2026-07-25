@@ -37,14 +37,14 @@ impl RecordVersion {
     /// Check if the recorder/replayer version is compatible with a given
     /// recording (trace).
     pub fn compatible_with(&self, other: &RecordVersion) -> bool {
-        self.0 >= other.0
+        self == other
     }
 }
 
 /// hermit record/replay version.
-// NB: Increase the version number when there's any breaking changes, i.e.:
-// when new syscalls are added.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x100);
+// NB: Increase the version number when there are breaking changes, i.e.:
+// when new syscalls or event schemas are added.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x103);
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -149,11 +149,18 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
     let default_config: detcore::Config = Default::default();
     let mut config = detcore::Config {
         panic_on_unsupported_syscalls: false,
+        panic_on_rcb_overshoot: false,
         sequentialize_threads: true,
+        runs_post_fork: default_config.runs_post_fork,
+        // Record/replay keeps partial Detcore subscription; madvise policy semantics
+        // begin in v0x102.
+        passthru_opt: true,
         deterministic_io: false,
         virtualize_time: false,
         virtualize_metadata: false,
         virtualize_cpuid: true,
+        cpuid_virtualized_by_backend: false,
+        backend_supports_madvise: true,
         has_uts_namespace: true,
         // The path to the directory where syscalls will be recorded.
         replay_data: Some(data.to_path_buf()),
@@ -194,6 +201,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         memory: 1024 * 1024 * 1024,
         interrupt_at: vec![],
         fuzz_futexes: false,
+        chaos_target_races: false,
         fuzz_seed: None,
     };
     if config.preemption_timeout.is_some() && !reverie_ptrace::is_perf_supported() {
@@ -203,4 +211,27 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         config.preemption_timeout = None;
     }
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_version_requires_an_exact_match() {
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x102)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x104)));
+    }
+
+    #[test]
+    fn record_and_replay_preserve_partial_subscriptions() {
+        assert!(record_or_replay_config(Path::new("replay-data")).passthru_opt);
+    }
+
+    #[test]
+    fn record_version_rejects_pre_madvise_policy_streams() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x102)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x101)));
+    }
 }

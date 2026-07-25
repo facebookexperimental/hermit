@@ -1,0 +1,110 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::process::Output;
+use std::sync::OnceLock;
+
+const PATTERNS: [&str; 6] = [
+    "barrier",
+    "condvar",
+    "rwlock",
+    "semaphore",
+    "cancellation",
+    "tls-fork",
+];
+const REPEAT_COUNT: usize = 5;
+const TIMEOUT_SECONDS: u64 = 15;
+
+static THREAD_SYNC_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+fn command_output(mut command: Command, label: &str) -> Output {
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    assert!(
+        output.status.success(),
+        "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    output
+}
+
+fn thread_sync_guest() -> &'static Path {
+    THREAD_SYNC_GUEST
+        .get_or_init(|| {
+            let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("hermit-cli should be inside the repository");
+            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("thread-sync-determinism");
+            fs::create_dir_all(&build_root)
+                .expect("failed to create thread synchronization build directory");
+            let output = build_root.join("thread-sync-determinism");
+            let mut command = Command::new("cc");
+            command
+                .args([
+                    "-std=c11",
+                    "-O0",
+                    "-g",
+                    "-pthread",
+                    "-D_GNU_SOURCE",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                ])
+                .arg(repository.join("tests/c/thread_sync_determinism.c"))
+                .arg("-o")
+                .arg(&output);
+            command_output(command, "thread synchronization guest compilation");
+            output
+        })
+        .as_path()
+}
+
+fn run_pattern(pattern: &str, iteration: usize) -> String {
+    let mut command = Command::new("timeout");
+    command
+        .arg("--kill-after=2s")
+        .arg(format!("{TIMEOUT_SECONDS}s"))
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "run",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--preemption-timeout=disabled",
+            "--",
+        ])
+        .arg(thread_sync_guest())
+        .arg(pattern);
+    let output = command_output(command, &format!("{pattern} iteration {iteration}"));
+    String::from_utf8(output.stdout).expect("thread synchronization guest stdout should be UTF-8")
+}
+
+#[test]
+fn thread_sync_patterns_are_deterministic_across_five_runs() {
+    for pattern in PATTERNS {
+        let expected = run_pattern(pattern, 1);
+        assert!(
+            expected.starts_with(&format!("{pattern}:")),
+            "unexpected {pattern} output: {expected:?}"
+        );
+        for iteration in 2..=REPEAT_COUNT {
+            assert_eq!(
+                run_pattern(pattern, iteration),
+                expected,
+                "{pattern} output changed on iteration {iteration}"
+            );
+        }
+    }
+}
