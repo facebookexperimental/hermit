@@ -28,6 +28,7 @@ env:
   NEXTEST_VERSION: "0.9.100"
   RUSTFLAGS: -D warnings -C link-arg=-llzma
   RUSTDOCFLAGS: -D warnings
+  DETCORE_TEST_RUST_LOG: "off"
 
 jobs:
   quick:
@@ -50,7 +51,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc bsdextrautils bzip2 cmake curl default-jdk-headless file g++ gcc gawk git gzip jq libunwind-dev liblzma-dev lua5.4 make nginx nodejs openssl perl python3-full redis-server redis-tools sqlite3 util-linux xz-utils zlib1g-dev zstd
+          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq less libunwind-dev liblzma-dev libxml2-utils lsof lua5.4 m4 make ncal netcat-openbsd nginx nodejs openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 tcl time unzip util-linux vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Enable namespaces
         run: |
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
@@ -82,7 +83,7 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.level == 'full')
         )
       }}
-    runs-on: [self-hosted, Linux, X64, hermit, pmu]
+    runs-on: [self-hosted, Linux, X64, hermit, pmu, pmu-serial]
     timeout-minutes: 360
     env:
       DETCORE_TEST_RUST_LOG: "off"
@@ -142,7 +143,7 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.level == 'super')
         )
       }}
-    runs-on: [self-hosted, Linux, X64, hermit, pmu]
+    runs-on: [self-hosted, Linux, X64, hermit, pmu, pmu-serial]
     timeout-minutes: 360
     env:
       DETCORE_TEST_RUST_LOG: "off"

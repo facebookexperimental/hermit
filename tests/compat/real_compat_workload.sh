@@ -293,7 +293,11 @@ EOF
             -cp "$WORK_DIR" Compat
         ;;
     git)
-        readonly GIT=/usr/local/bin/git.meta.real
+        if [[ -x /usr/local/bin/git.meta.real ]]; then
+            readonly GIT=/usr/local/bin/git.meta.real
+        else
+            readonly GIT=/usr/bin/git
+        fi
         mkdir -p "$WORK_DIR/home" "$WORK_DIR/repo"
         export HOME="$WORK_DIR/home"
         export GIT_CONFIG_NOSYSTEM=1
@@ -465,7 +469,12 @@ EOF
         printf 'ip:loopback-ipv4-ok\n'
         ;;
     ss)
-        output=$(/usr/sbin/ss -H -ltn 'sport = :0')
+        if [[ -x /usr/sbin/ss ]]; then
+            readonly SS=/usr/sbin/ss
+        else
+            readonly SS=/usr/bin/ss
+        fi
+        output=$("$SS" -H -ltn 'sport = :0')
         test -z "$output"
         printf 'ss:no-port-zero-listener\n'
         ;;
