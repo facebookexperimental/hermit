@@ -17,6 +17,14 @@ build. As of this writing the deps are:
 - `detcore-model/Cargo.toml` — `reverie-syscalls`
 - `detcore/tests/testutils/Cargo.toml` — `reverie`, `reverie-ptrace`
 
+The optional `detcore-liteinst` cdylib is a deliberate leaf exception. Its
+`reverie-liteinst` dependency links only that standalone crate and `libc`; it
+does not link `reverie`, `reverie-ptrace`, or another shared Reverie core into
+the same artifact. It may therefore pin the reviewed LiteInst implementation
+independently while the shared dependency graph remains on one identical
+revision. Confirm this boundary with `cargo tree -p detcore-liteinst` whenever
+the LiteInst crate's dependencies change.
+
 ## How to bump
 
 1. Pick the target commit and confirm it exists upstream:

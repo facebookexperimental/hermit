@@ -80,25 +80,42 @@ hermit run --strict -- /bin/echo hello
 
 ### Execution Backends
 
-Hermit accepts `--backend=ptrace|dbi|kvm|e9patch` as a global option, before the
-subcommand. Omitting the option selects `ptrace`, preserving the existing behavior:
+Hermit accepts `--backend=ptrace|dbi|liteinst|sabre|kvm|e9patch` as a global
+option before the subcommand. Backend scope is command-specific: LiteInst and
+e9patch support only `run`, while SaBRe supports `run` and `strace`; unsupported
+combinations fail closed. Omitting the option selects `ptrace`, preserving the
+existing behavior:
 
 ```bash
 hermit --backend=ptrace run -- /bin/echo hello
 ```
 
-The e9patch preprocessor is currently supported only by `run`; other explicit
-e9patch subcommand combinations fail closed.
-
 For backwards compatibility, `run` still accepts `--backend` after the
 subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
 
 Backend selection fails closed. Hermit never substitutes ptrace after an
-explicit `dbi` or `kvm` request. The DynamoRIO prototype requires a discoverable
-SDK and does not yet expose a Detcore process launcher. The bare KVM prototype
-requires read-write `/dev/kvm` access (commonly through the `kvm` group or root)
-and a guest-kernel Linux ABI. Until those adapters are integrated, either returns
-an availability error rather than running the command without determinization.
+explicit backend request. LiteInst is an experimental in-process compatibility
+path for dynamically linked Linux x86-64 guests:
+
+```bash
+cargo build -p hermit -p detcore-liteinst
+hermit run --backend=liteinst --no-namespace --strict --verify -- /bin/echo hello
+```
+
+LiteInst compares exit status, stdout, stderr, and the run-length-normalized
+shape of intercepted syscall numbers across two runs. Normalization tolerates
+adjacent repeated reads caused by host I/O chunking without hiding reordered
+syscall kinds. It does not activate Detcore and therefore does not establish
+Hermit's L2 guarantee. Verification requires seekable stdin; exec and
+thread-creating clone operations remain unsupported by the preload prototype.
+LiteInst requires explicit `--no-namespace`: it honors the selected working
+directory and environment but does not implement Hermit's namespace, mount, or
+network isolation. Its per-run event cookie detects accidental control-record
+confusion, and direct operations on the controller-owned pipe are protected.
+This in-process path is not a security sandbox for intentionally hostile code.
+The DynamoRIO path requires a discoverable SDK, SaBRe requires its runner,
+rewriter, and plugin artifacts, and KVM requires read-write `/dev/kvm` access
+plus its guest-kernel Linux ABI.
 
 The experimental `e9patch` selection is intentionally a hybrid backend. At
 startup it loads or generates the main ELF's cached instruction map, then runs

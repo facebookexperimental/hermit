@@ -127,27 +127,36 @@ hermit run --base-env=minimal -e LANG=C --workdir=/tmp -- /bin/pwd
 
 #### Backend Selection
 
-Use `--backend=ptrace|dbi|kvm|e9patch` to select the process instrumentation
-backend. It is a global option and belongs before the subcommand. The default is
+Use `--backend=ptrace|dbi|liteinst|sabre|kvm|e9patch` to select the process
+instrumentation backend.
+It is a global option and belongs before the subcommand, but backend scope is
+command-specific. LiteInst and e9patch support only `run`, while SaBRe supports
+`run` and `strace`; unsupported combinations fail closed. The default is
 `ptrace`, so existing commands are unchanged:
 
 ```bash
 hermit --backend=ptrace run -- /bin/echo hello
 ```
 
-The e9patch preprocessor is currently supported only by `run`; other explicit
-e9patch subcommand combinations fail closed.
-
 For backwards compatibility, `run` also accepts `--backend` after the
 subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
 
 Hermit detects whether the requested backend is integrated and available on
-the current host. It does not silently fall back to a different backend. The
-current DynamoRIO prototype requires a discoverable SDK and has no Detcore
-process launcher. The bare KVM prototype requires read-write `/dev/kvm` access,
-commonly through the `kvm` group or root, plus a guest-kernel ABI. Requests for
-those prototypes therefore fail before the guest starts and explain the missing
-capability.
+the current host. It does not silently fall back to a different backend.
+LiteInst requires `libdetcore_liteinst.so` beside the Hermit executable. Its
+`--verify` mode compares two compatibility runs, including the run-length-
+normalized shape of their syscall-number streams, but does not activate Detcore
+or claim L2 determinism. LiteInst
+verification accepts seekable stdin such as a regular file or `/dev/null` and
+rejects pipes and terminals immediately because they cannot be replayed.
+LiteInst requires explicit `--no-namespace`: it honors `--workdir`,
+`--base-env`, and `--env`, but does not implement namespace, mount, or network
+isolation. Its event cookie prevents accidental control-record confusion and
+direct operations on the controller-owned pipe are protected; the in-process
+preload is not a security boundary for intentionally hostile code.
+The DynamoRIO path requires a discoverable SDK, SaBRe requires configured
+runner/rewriter/plugin artifacts, and KVM requires read-write `/dev/kvm` access
+plus a guest-kernel ABI.
 
 `e9patch` is an experimental hybrid rather than a standalone Detcore runtime.
 It uses the cached offline instruction map and conservative `e9tool -O0` mode

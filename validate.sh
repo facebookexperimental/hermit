@@ -36,6 +36,7 @@ cd "$ROOT_DIR" || exit 1
 #                                            # regressed below FILE's baseline
 #   ./validate.sh --strict-compat-only        # run the blocking L2 app matrix
 #   ./validate.sh --rr-compat-only            # gate the known-passing R/R matrix
+#   ./validate.sh --liteinst-compat-only      # gate the LiteInst preload matrix
 #   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix
 #   ./validate.sh --e9patch-compat-only       # gate core + installed e9patch L2 apps
 #   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
@@ -69,6 +70,7 @@ function select_validation_level {
 }
 STRICT_COMPAT_ONLY=0
 RR_COMPAT_ONLY=0
+LITEINST_COMPAT_ONLY=0
 SABRE_COMPAT_ONLY=0
 E9PATCH_COMPAT_ONLY=0
 QEMU_L2_ONLY=0
@@ -96,6 +98,9 @@ while [[ $# -gt 0 ]]; do
         --strict-compat-only) STRICT_COMPAT_ONLY=1; shift ;;
         --rr-compat-only) RR_COMPAT_ONLY=1; shift ;;
         # AUTONOMOUS-BOT-IMPLEMENTED
+        # TODO-HUMAN-REVIEW(#688): Review the focused LiteInst compatibility CLI.
+        --liteinst-compat-only) LITEINST_COMPAT_ONLY=1; shift ;;
+        # AUTONOMOUS-BOT-IMPLEMENTED
         # TODO-HUMAN-REVIEW(#589): Review the focused SaBRe compatibility CLI.
         --sabre-compat-only) SABRE_COMPAT_ONLY=1; shift ;;
         # TODO-HUMAN-REVIEW(PR-664): Review the focused e9patch compatibility CLI.
@@ -116,6 +121,7 @@ only_modes=0
 [[ $ENVELOPE_MODE == only ]] && ((only_modes += 1))
 ((STRICT_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((RR_COMPAT_ONLY == 1)) && ((only_modes += 1))
+((LITEINST_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((SABRE_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((E9PATCH_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((QEMU_L2_ONLY == 1)) && ((only_modes += 1))
@@ -131,6 +137,7 @@ VALIDATION_PROFILE=$VALIDATION_LEVEL
 [[ $ENVELOPE_MODE == only ]] && VALIDATION_PROFILE="envelope-only"
 ((STRICT_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="strict-compat-only"
 ((RR_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="rr-compat-only"
+((LITEINST_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="liteinst-compat-only"
 ((SABRE_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="sabre-compat-only"
 ((E9PATCH_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="e9patch-compat-only"
 ((QEMU_L2_ONLY == 1)) && VALIDATION_PROFILE="qemu-l2-only"
@@ -142,6 +149,7 @@ case "$VALIDATION_PROFILE" in
     super) VALIDATION_ESTIMATE="about 30-90 minutes, depending on repetitions and backends" ;;
     strict-compat-only) VALIDATION_ESTIMATE="about 5-15 minutes" ;;
     rr-compat-only) VALIDATION_ESTIMATE="about 5-65 minutes when healthy; fails fast on canary failure" ;;
+    liteinst-compat-only) VALIDATION_ESTIMATE="about 2-5 minutes" ;;
     sabre-compat-only) VALIDATION_ESTIMATE="about 10-20 minutes" ;;
     e9patch-compat-only) VALIDATION_ESTIMATE="about 5-20 minutes" ;;
     qemu-l2-only) VALIDATION_ESTIMATE="about 30-60 minutes" ;;
@@ -176,7 +184,8 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
-readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY SABRE_COMPAT_ONLY E9PATCH_COMPAT_ONLY
+readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY LITEINST_COMPAT_ONLY SABRE_COMPAT_ONLY
+readonly E9PATCH_COMPAT_ONLY
 readonly QEMU_L2_ONLY
 readonly VALIDATION_LEVEL VALIDATION_PROFILE
 
@@ -269,6 +278,7 @@ fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
 readonly STRICT_COMPAT_TOTAL=180
 readonly RR_COMPAT_EXPECTED=128
+readonly LITEINST_COMPAT_EXPECTED=29
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
@@ -724,6 +734,10 @@ function dbi_backend_available {
         </dev/null >/dev/null 2>&1
 }
 
+function liteinst_backend_available {
+    timeout "$HERMIT_SMOKE_TIMEOUT" "$HERMIT_BIN" run --backend liteinst --no-namespace -- /bin/true </dev/null >/dev/null 2>&1
+}
+
 function note_backend_skip {
     local backend=$1
     local reason=$2
@@ -758,6 +772,8 @@ function run_full_backend_gates {
         python3 experiments/backend-parity_20260722/run_matrix.py \
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
+    run_check "LiteInst backend smoke" liteinst_backend_available
+    run_check "LiteInst compatibility baseline (29 programs)" run_liteinst_compatibility_envelope
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -1194,6 +1210,95 @@ function rr_compatibility_probe {
     printf "  ❌ %-12s FAIL R/R (record %s, replay %s, stdout %s: %s)\n" \
         "$label" "$record_status" "$replay_status" "$stdout_equal" "$summary"
     return 0
+}
+
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#688): Review the blocking LiteInst compatibility floor.
+function liteinst_compatibility_probe {
+    local label=$1
+    shift
+
+    local started_at=$SECONDS
+    local output_start
+    local status
+    local summary
+
+    {
+        printf "=== LiteInst compatibility: %s ===\n" "$label"
+        printf "Command: timeout %s %q run --backend liteinst --no-namespace --strict --verify --" "$STRICT_COMPAT_TIMEOUT" "$STRICT_COMPAT_HERMIT_BIN"
+        printf " %q" "$@"
+        printf "\n"
+    } >>"$LOG_FILE"
+    output_start=$(($(wc -l <"$LOG_FILE") + 1))
+
+    if ((VERBOSE == 1)); then
+        printf "  LiteInst compatibility probe: %s\n" "$label"
+    fi
+    if timeout "$STRICT_COMPAT_TIMEOUT" "$STRICT_COMPAT_HERMIT_BIN" run --backend liteinst --no-namespace --strict --verify -- "$@" </dev/null >>"$LOG_FILE" 2>&1; then
+        status=0
+        printf "  ✅ %-12s PASS LiteInst compatibility (%ss)\n" "$label" "$((SECONDS - started_at))"
+    else
+        status=$?
+        summary=$(failure_summary "$output_start")
+        printf "  ❌ %-12s FAIL LiteInst (exit %s: %s)\n" "$label" "$status" "$summary"
+    fi
+
+    {
+        printf "Exit: %s\n" "$status"
+        printf "Duration: %ss\n\n" "$((SECONDS - started_at))"
+    } >>"$LOG_FILE"
+    return "$status"
+}
+
+function run_liteinst_compatibility_envelope {
+    local passed=0
+    local failed=0
+    local total
+
+    printf "\n== LiteInst compatibility baseline (blocking gate) ==\n"
+    printf "=== LiteInst compatibility baseline (blocking gate) ===\n" >>"$LOG_FILE"
+
+    liteinst_compatibility_probe true /bin/true && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe echo /bin/echo hermit-compat && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe seq /usr/bin/seq 10 && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe cat /bin/cat README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe wc /usr/bin/wc -c README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe head /usr/bin/head -n 3 README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe base64 /usr/bin/base64 README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe id /usr/bin/id -u && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe uname /usr/bin/uname -sr && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe printf /usr/bin/printf '%s=%d\n' hermit 42 && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe stat /usr/bin/stat -c '%n %s %f' README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sha256sum /usr/bin/sha256sum README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe arch /usr/bin/arch && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe factor /usr/bin/factor 42 && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe expr /usr/bin/expr 2 + 2 && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe hostname /usr/bin/hostname && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe python3 /usr/bin/python3 -c 'print(42)' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe perl /usr/bin/perl -e 'print 42, chr(10)' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe awk /usr/bin/awk 'BEGIN { print 42 }' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sqlite3 /usr/bin/sqlite3 :memory: 'SELECT 1+1;' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sort /usr/bin/sort README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe file /usr/bin/file /bin/sh && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe readlink /usr/bin/readlink -f README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe du /usr/bin/du -sk README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe nproc /usr/bin/nproc && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gcc /usr/bin/gcc --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe g++ /usr/bin/g++ --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe make /usr/bin/make --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe openssl /usr/bin/openssl dgst -sha256 /etc/hostname && passed=$((passed + 1)) || failed=$((failed + 1))
+
+    total=$((passed + failed))
+    if ((total != LITEINST_COMPAT_EXPECTED)); then
+        printf "❌ LiteInst compatibility baseline selected %s rows; expected %s\n" "$total" "$LITEINST_COMPAT_EXPECTED"
+        return 1
+    fi
+    if ((failed == 0)); then
+        printf "✅ LiteInst compatibility baseline (%s/%s passed)\n" "$passed" "$total"
+        return 0
+    fi
+    printf "❌ LiteInst compatibility baseline (%s/%s passed, %s regressed)\n" "$passed" "$total" "$failed"
+    return 1
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -2477,7 +2582,7 @@ function run_quick_suite {
 function run_full_suite {
     run_check "cargo-nextest available" ensure_cargo_nextest
     run_quick_suite
-    run_check "Build release Hermit" cargo build --release -p hermit
+    run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
 
     # Cargo supports concurrent commands in one target directory. Run checks that
     # do not execute Hermit guests alongside the ordered runtime and PMU gates.
@@ -2554,6 +2659,16 @@ if ((SABRE_COMPAT_ONLY == 1)); then
     if ((failures == 0)); then
         run_check "SaBRe compatibility ratchet (151 programs)" \
             run_sabre_compatibility_envelope
+    fi
+    print_summary
+    ((failures == 0))
+    exit $?
+fi
+
+if ((LITEINST_COMPAT_ONLY == 1)); then
+    run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
+    if ((failures == 0)); then
+        run_check "LiteInst compatibility baseline (29 programs)" run_liteinst_compatibility_envelope
     fi
     print_summary
     ((failures == 0))

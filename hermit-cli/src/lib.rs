@@ -283,6 +283,53 @@ fn dbi_runtime_unavailable_reason() -> Option<String> {
     })
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#688): Review LiteInst runtime discovery.
+/// Returns the LiteInst preload cdylib produced beside the Hermit binary.
+#[doc(hidden)]
+pub fn liteinst_runtime_library_path() -> io::Result<PathBuf> {
+    if let Some(path) = std::env::var_os("HERMIT_LITEINST_RUNTIME") {
+        let path = PathBuf::from(path);
+        return path.is_file().then_some(path).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "HERMIT_LITEINST_RUNTIME does not name a regular file",
+            )
+        });
+    }
+
+    let executable = std::env::current_exe()?;
+    let directory = executable.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Hermit executable has no parent directory",
+        )
+    })?;
+    [
+        directory.join("libdetcore_liteinst.so"),
+        directory.join("deps/libdetcore_liteinst.so"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "libdetcore_liteinst.so was not built beside {}",
+                executable.display()
+            ),
+        )
+    })
+}
+
+fn liteinst_runtime_unavailable_reason() -> Option<String> {
+    liteinst_runtime_library_path().err().map(|error| {
+        format!(
+            "the LiteInst preload runtime is unavailable: {error}; build detcore-liteinst and hermit in the same target directory"
+        )
+    })
+}
+
 fn kvm_device_unavailable_reason(path: &Path) -> Option<String> {
     fs::OpenOptions::new()
         .read(true)
@@ -306,6 +353,8 @@ pub enum Backend {
     Ptrace,
     /// Use the DynamoRIO backend.
     Dbi,
+    /// Use the experimental LiteInst preload compatibility backend.
+    Liteinst,
     /// Use the SaBRe static binary rewriting backend.
     Sabre,
     /// Use the KVM backend.
@@ -316,9 +365,10 @@ pub enum Backend {
 }
 
 impl Backend {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Ptrace,
         Self::Dbi,
+        Self::Liteinst,
         Self::Sabre,
         Self::Kvm,
         Self::E9patch,
@@ -329,6 +379,7 @@ impl Backend {
         match self {
             Self::Ptrace => "ptrace",
             Self::Dbi => "dbi",
+            Self::Liteinst => "liteinst",
             Self::Sabre => "sabre",
             Self::Kvm => "kvm",
             Self::E9patch => "e9patch",
@@ -372,6 +423,7 @@ impl Backend {
                     .to_owned(),
             ),
             Self::Dbi => dbi_runtime_unavailable_reason(),
+            Self::Liteinst => liteinst_runtime_unavailable_reason(),
             // TODO-HUMAN-REVIEW(#589): Review SaBRe backend availability reporting.
             Self::Sabre => sabre_runtime_unavailable_reason(),
             Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")),
@@ -901,6 +953,7 @@ mod tests {
     use super::ensure_backend_dispatch;
     use super::is_dynamorio_sdk;
     use super::kvm_device_unavailable_reason;
+    use super::liteinst_runtime_unavailable_reason;
     use super::sabre_runtime_unavailable_reason;
 
     #[test]
@@ -914,6 +967,10 @@ mod tests {
         assert_eq!(
             available.contains(&Backend::Dbi),
             dynamorio_sdk_available() && dbi_runtime_unavailable_reason().is_none()
+        );
+        assert_eq!(
+            available.contains(&Backend::Liteinst),
+            liteinst_runtime_unavailable_reason().is_none()
         );
         assert_eq!(
             available.contains(&Backend::Sabre),
@@ -957,6 +1014,10 @@ mod tests {
                 );
             }
         }
+        assert_eq!(
+            Backend::Liteinst.ensure_available().is_ok(),
+            liteinst_runtime_unavailable_reason().is_none()
+        );
 
         match Backend::Kvm.ensure_available() {
             Ok(()) => assert!(

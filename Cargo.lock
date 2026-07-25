@@ -493,6 +493,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "detcore-liteinst"
+version = "0.0.0"
+dependencies = [
+ "reverie-liteinst",
+]
+
+[[package]]
 name = "detcore-model"
 version = "0.0.0"
 dependencies = [
@@ -1562,6 +1569,14 @@ dependencies = [
  "libc",
  "reverie",
  "thiserror",
+]
+
+[[package]]
+name = "reverie-liteinst"
+version = "0.1.0"
+source = "git+https://github.com/rrnewton/reverie.git?rev=c28f9c61dce51a77e1ae7466a22c1edaacefa716#c28f9c61dce51a77e1ae7466a22c1edaacefa716"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

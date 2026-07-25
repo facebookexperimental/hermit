@@ -1,0 +1,12 @@
+[package]
+name = "detcore-liteinst"
+version = "0.0.0"
+edition = "2024"
+license = "BSD-3-Clause"
+repository = "https://github.com/facebookexperimental/hermit"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+reverie-liteinst = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "c28f9c61dce51a77e1ae7466a22c1edaacefa716", default-features = false }

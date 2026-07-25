@@ -157,6 +157,12 @@ impl Subcommand {
                  run`; other subcommands do not preprocess their guest"
             );
         }
+        if backend == Some(hermit::Backend::Liteinst) && !matches!(self, Subcommand::Run(_)) {
+            anyhow::bail!(
+                "the LiteInst preload backend is available only through `hermit --backend \
+                 liteinst run`; other subcommands do not use the preload runtime"
+            );
+        }
         Ok(())
     }
 
@@ -276,6 +282,26 @@ mod tests {
         let error = args
             .command
             .validate_backend_scope(Some(Backend::E9patch))
+            .unwrap_err();
+        assert!(error.to_string().contains("only through"));
+    }
+
+    #[test]
+    fn liteinst_is_rejected_outside_run() {
+        use hermit::Backend;
+
+        let args = Args::try_parse_from([
+            "hermit",
+            "--backend",
+            "liteinst",
+            "record",
+            "list",
+            "--json",
+        ])
+        .unwrap();
+        let error = args
+            .command
+            .validate_backend_scope(Some(Backend::Liteinst))
             .unwrap_err();
         assert!(error.to_string().contains("only through"));
     }
