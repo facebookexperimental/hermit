@@ -391,6 +391,33 @@ fn run_dbi_executes_integrated_backend() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#679): validate the dedicated DBI diagnostic channel.
+#[test]
+fn run_dbi_keeps_diagnostics_out_of_guest_stderr() {
+    let script = r#"set -euo pipefail; output=$(/bin/sh -c 'printf guest-stderr >&2' 2>&1); test "$output" = guest-stderr; printf 'isolated=%s\n' "$output""#;
+    let args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--strict",
+        "--verify",
+        "--",
+        "/bin/bash",
+        "-c",
+        script,
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "isolated=guest-stderr\n");
+    assert!(
+        stderr(&output).contains(":: DBI path confirmed: DynamoRIO client reported tool=Detcore"),
+        "DBI confirmation missing:\n{}",
+        stderr(&output),
+    );
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#543): validate the explicit application-mmap DBI regression.
 #[test]
 fn run_dbi_verifies_application_mmap() {
