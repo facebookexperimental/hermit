@@ -1496,6 +1496,19 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::Munlock(_)
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 | Syscall::Munlockall(_)
+                // Stable guest files make these synchronous extent and pathname operations
+                // repeatable when the namespace is not externally mutated.
+                // TODO-HUMAN-REVIEW(PR-675): Verify stable-filesystem passthrough assumptions.
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                | Syscall::Fallocate(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                | Syscall::Readlinkat(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                | Syscall::Rename(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                | Syscall::Renameat(_)
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                | Syscall::Truncate(_)
                 | Syscall::Getcwd(_)
                 | Syscall::Getegid(_)
                 | Syscall::Geteuid(_)

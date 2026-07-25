@@ -215,6 +215,19 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::munlock
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::munlockall
+        // These synchronous extent and pathname operations are repeatable for guest-owned
+        // files in a fixed namespace with adequate space and no external mutation.
+        // TODO-HUMAN-REVIEW(PR-675): Verify stable-filesystem passthrough assumptions.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::fallocate
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::readlinkat
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::rename
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::renameat
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::truncate
         // Ptrace executes rt_sigreturn directly; DBI has dedicated injected-sigreturn
         // handling, while KVM deterministically reports its current lack of signal support.
         | Sysno::rt_sigreturn => SyscallClassification::PassThrough,
@@ -241,7 +254,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::delete_module
         | Sysno::epoll_pwait2
         | Sysno::faccessat
-        | Sysno::fallocate
         | Sysno::fanotify_init
         | Sysno::fanotify_mark
         | Sysno::fchmod
@@ -365,13 +377,10 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::quotactl
         | Sysno::quotactl_fd
         | Sysno::readahead
-        | Sysno::readlinkat
         | Sysno::readv
         | Sysno::reboot
         | Sysno::recvmmsg
         | Sysno::remap_file_pages
-        | Sysno::rename
-        | Sysno::renameat
         | Sysno::request_key
         | Sysno::restart_syscall
         | Sysno::rt_sigpending
@@ -434,7 +443,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::tgkill
         | Sysno::times
         | Sysno::tkill
-        | Sysno::truncate
         | Sysno::tuxcall
         | Sysno::umount2
         | Sysno::unshare
@@ -468,7 +476,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [110, 44, 219]);
+        assert_eq!(counts, [110, 49, 214]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -515,12 +523,16 @@ mod tests {
             Sysno::fchdir,
             Sysno::fchmodat,
             Sysno::fdatasync,
+            Sysno::fallocate,
             Sysno::ftruncate,
             Sysno::fsync,
             Sysno::getresgid,
             Sysno::getresuid,
             Sysno::munlock,
             Sysno::munlockall,
+            Sysno::readlinkat,
+            Sysno::rename,
+            Sysno::renameat,
             Sysno::getgroups,
             Sysno::getxattr,
             Sysno::lgetxattr,
@@ -533,6 +545,7 @@ mod tests {
             Sysno::rt_sigreturn,
             Sysno::setxattr,
             Sysno::symlinkat,
+            Sysno::truncate,
             Sysno::umask,
             Sysno::unlink,
             Sysno::unlinkat,
@@ -542,9 +555,11 @@ mod tests {
         for sysno in [
             Sysno::add_key,
             Sysno::keyctl,
+            Sysno::msync,
             Sysno::prctl,
-            Sysno::readlinkat,
+            Sysno::readahead,
             Sysno::request_key,
+            Sysno::sync_file_range,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Unclassified);
         }
