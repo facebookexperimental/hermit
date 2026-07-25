@@ -1197,6 +1197,12 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     functional_compatibility_probe rustc rustc --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    if [[ $COMPATIBILITY_MODE == strict ]]; then
+        functional_compatibility_probe clang clang --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        functional_compatibility_probe javac javac -version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+    fi
     functional_compatibility_probe java java \
         -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -version \
         && passed=$((passed + 1)) || failed=$((failed + 1))

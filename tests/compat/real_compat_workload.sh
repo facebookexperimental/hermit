@@ -74,22 +74,69 @@ EOF
         printf 'cargo:metadata-and-package-list\n'
         ;;
     rustc)
-        cat >"$WORK_DIR/lib.rs" <<'EOF'
-#[no_mangle]
-pub extern "C" fn hermit_weighted(values: *const u64, len: usize) -> u64 {
-    let values = unsafe { std::slice::from_raw_parts(values, len) };
-    values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| (index as u64 + 1) * value)
-        .sum()
+        cat >"$WORK_DIR/main.rs" <<'EOF'
+fn main() {
+    let sum: u64 = (1..=100).map(|value| value * value).sum();
+    assert_eq!(sum, 338350);
+    println!("rustc:{sum}");
 }
 EOF
-        rustc --crate-name hermit_real_compat --crate-type lib --emit=obj \
-            -C opt-level=1 -C metadata=hermit-real-compat \
-            "$WORK_DIR/lib.rs" -o "$WORK_DIR/lib.o"
-        nm -g --defined-only "$WORK_DIR/lib.o" | grep -q ' T hermit_weighted$'
-        printf 'rustc:object-with-hermit_weighted\n'
+        # GCC's linker driver races vfork/pipe completion under L2.
+        # Clang keeps the ordering stable; suppress its build ID as well.
+        rustc --crate-name hermit_real_compat -C opt-level=1 -C debuginfo=0 \
+            -C metadata=hermit-real-compat -C linker=/usr/bin/clang \
+            -C link-arg=-Wl,--build-id=none \
+            "$WORK_DIR/main.rs" -o "$WORK_DIR/program"
+        "$WORK_DIR/program"
+        ;;
+    clang)
+        cat >"$WORK_DIR/main.c" <<'EOF'
+#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+
+int main(void) {
+    uint64_t factorial = 1;
+    for (uint64_t value = 2; value <= 20; ++value) {
+        factorial *= value;
+    }
+    if (factorial != UINT64_C(2432902008176640000)) {
+        return 1;
+    }
+    printf("clang:%" PRIu64 "\n", factorial);
+    return 0;
+}
+EOF
+        /usr/bin/clang -O2 -Wl,--build-id=none \
+            "$WORK_DIR/main.c" -o "$WORK_DIR/program"
+        "$WORK_DIR/program"
+        ;;
+    javac)
+        cat >"$WORK_DIR/CompilerCompat.java" <<'EOF'
+public final class CompilerCompat {
+    public static void main(String[] args) {
+        long previous = 0;
+        long current = 1;
+        for (int index = 0; index < 30; ++index) {
+            long next = previous + current;
+            previous = current;
+            current = next;
+        }
+        if (previous != 832040) {
+            throw new AssertionError(previous);
+        }
+        System.out.println("javac:" + previous);
+    }
+}
+EOF
+        # Avoid live NSS queries while the JVM initializes user properties.
+        javac -J-Duser.name=hermit -J-Duser.home="$WORK_DIR" \
+            -J-Xint -J-XX:+UseSerialGC -J-XX:ActiveProcessorCount=1 \
+            -g:none -d "$WORK_DIR" "$WORK_DIR/CompilerCompat.java"
+        # Direct execution avoids a parent/child command-substitution pipe.
+        java -Duser.name=hermit -Duser.home="$WORK_DIR" \
+            -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 \
+            -cp "$WORK_DIR" CompilerCompat
         ;;
     java)
         cat >"$WORK_DIR/Compat.java" <<'EOF'
