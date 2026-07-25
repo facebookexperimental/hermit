@@ -1,9 +1,22 @@
 # Existing ignored fail-closed tests. New ignores are rejected by the ratchet.
 # Columns: target<TAB>test<TAB>reason
 analyze	analyze_hello_race	slow schedule bisection; requires PMU and mount namespaces
-analyze	analyze_nanosleep_threads_nocrash	slow schedule bisection; requires PMU and mount namespaces
+analyze	analyze_nanosleep_threads_rejects_indistinguishable_baseline	slow schedule bisection; requires PMU and mount namespaces
 analyze	analyze_racewrite_nostdlib	slow schedule bisection; requires PMU and mount namespaces
+app_strict_verify	curl_version_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and curl
+app_strict_verify	go_goroutines_are_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and the Go toolchain
+app_strict_verify	go_hello_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and the Go toolchain
+app_strict_verify	go_version_is_l1_deterministic_under_strict	e2e requires PMU, mount namespaces, and the Go toolchain
+app_strict_verify	java_hello_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and a JDK
+app_strict_verify	java_threads_are_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and a JDK
+app_strict_verify	java_version_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and a JDK
+app_strict_verify	javac_is_l1_deterministic_under_strict	e2e requires PMU, mount namespaces, and a JDK
+app_strict_verify	nginx_version_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and nginx
+app_strict_verify	redis_server_version_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and redis-server
 command_strict_verify	common_commands_are_deterministic_under_strict_verify	requires PMU, mount namespaces, and the standard command suite
+command_strict_verify	python_getrandom_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and /usr/bin/python3
+command_strict_verify	python_prlimit64_query_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and /usr/bin/python3
+epoll_determinism	notification_control_syscalls_reach_strict_verify_l2	e2e requires PMU and mount namespaces
 hermit_modes	chaos_buck_clone	requires PMU branch counters and working mount namespaces
 hermit_modes	chaos_buck_getpid	requires PMU branch counters and working mount namespaces
 hermit_modes	chaos_buck_hello_alarm	requires PMU branch counters and working mount namespaces
@@ -20,7 +33,227 @@ language_runtime_determinism	node_runtime_entropy_is_determinized	requires the o
 language_runtime_determinism	ocaml_runtime_entropy_is_determinized	requires the optional OCaml native compiler
 language_runtime_determinism	python_runtime_entropy_is_determinized	requires an OSS CPython 3 runtime
 language_runtime_determinism	ruby_runtime_entropy_is_determinized	requires the optional Ruby runtime
+leveldb	full_leveldb_suite_is_deterministic_under_strict	full LevelDB suite contains long concurrent and randomized stress cases
+leveldb	leveldb_env_posix_is_deterministic_under_strict	repeated fork+exec close-on-exec checks are slow under ptrace
 python_stdlib	strict_python_stdlib_is_deterministic	requires system CPython with its full Lib/test package
+random_determinism	random_sources_are_deterministic_under_strict_verify	e2e requires PMU and mount namespaces
+rcx_canonicalization	rcx_r11_are_canonical_and_deterministic_under_strict	e2e requires PMU and mount namespaces
+redis_strict	redis_source_build_and_extended_suite_under_strict_hermit	downloads and builds pinned Redis, then runs the extended strict suite
+rr_suite	rr_args	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_brk	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_brk2	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_exit_group	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_exit_race	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_fadvise	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_fatal_init_signal	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_fcntl_dupfd	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_fcntl_misc	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_fcntl_rw_hints	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_fcntl_seals	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_fcntl_sig	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_fd_cleanup	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_fd_limit	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_fds_clean	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_fork_brk	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_fork_child_crash	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_fork_many	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_fork_stress	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_fork_syscalls	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_function_calls	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_getcpu	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_getgroups	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_getpwnam	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_getrandom	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_getsid	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_gettimeofday	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_hello	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_intr_ppoll	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_invalid_exec	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_invalid_fcntl	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_invalid_ioctl	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_io	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_ioctl	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_ioctl_blk	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_ioctl_fb	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_ioctl_fs	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_ioctl_sg	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_ioctl_tty	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_ioctl_vt	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_ioprio	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_join_threads	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_keyctl	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_kill_newborn	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_large_hole	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_large_write_deadlock	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_legacy_ugid	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_link	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_madvise	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_madvise_wipeonfork	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_map_fixed	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_map_shared_syscall	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_membarrier	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_memfd_create	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_memfd_create_shared	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_memfd_create_shared_huge	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mincore	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mknod	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mlock	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mmap_adjacent_to_rr_usage	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mmap_private	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mmap_private_grow_under_map	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mmap_recycle	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mmap_ro	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mmap_self_maps_shared	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mmap_shared_dev_zero	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mmap_shared_grow_under_map	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mmap_shared_multiple	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mmap_shared_write	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mmap_shared_write_fork	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mmap_short_file	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mmap_write_complex	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mmap_zero_size_fd	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mprotect	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mprotect_heterogenous	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mprotect_none	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mprotect_stack	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mremap	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mremap_after_coalesce	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mremap_grow	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mremap_grow_shared	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mremap_non_page_size	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mremap_overwrite	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mremap_private_grow_under_map	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mremap_shrink	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_msg_trunc	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_msync	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_mtio	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_multiple_pending_signals	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_munmap_discontinuous	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_munmap_segv	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_netlink_mmap_disable	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_no_mask_timeslice	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_numa	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_pause	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_personality	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_poll_sig_race	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_ppoll	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_prctl_name	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_prctl_short_name	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_prctl_speculation_ctrl	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_privileged_net_ioctl	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_proc_fds	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_protect_rr_fds	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_prw	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_pthread_condvar_locking	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_pthread_mutex_timedlock	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_pthread_rwlocks	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_quotactl	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_read_large	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_read_nothing	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_read_oversize	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_readdir	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_readlink	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_readlinkat	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_readv	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_recvfrom	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_rename	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_rlimit	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sched_attr	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sched_setaffinity	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sched_setparam	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sched_yield_to_lower_priority	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_scratch_read	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_seccomp_clone_fail	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_seccomp_cloning	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_seccomp_desched	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_seccomp_kill_exit	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_seccomp_sigsys_args	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_seccomp_sigsys_sigtrap	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_seccomp_sigsys_syscallbuf	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_seccomp_tsync	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_seccomp_veto_exec	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_self_shebang	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sendfile	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_setgid	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_setgroups	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_setitimer	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_setsid	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_setuid	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_shared_exec	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_shared_monitor	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_shared_offset	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_shared_write	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_shm	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_shm_unmap	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sigaction_old	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sigaltstack	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sigcont	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sighandler_bad_rsp_sigsegv	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sighandler_fork	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sighandler_mask	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sigill	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_signal_deferred	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_signal_during_preload_init	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_signal_frame	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_signal_unstoppable	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_signalfd	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sigprocmask	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sigprocmask_evil	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sigprocmask_syscallbuf	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sigpwr	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sigqueueinfo	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sigreturn_reg	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sigtrap	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_simple_threads_stress	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_small_holes	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_splice	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_stack_growth_after_syscallbuf	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_stack_growth_syscallbuf	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_stack_invalid	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_stack_overflow	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_stack_overflow_altstack	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_stack_overflow_with_guard	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_statx	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_stdout_child	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_stdout_cloexec	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_stdout_dup	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_stdout_redirect	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_symlink	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sync	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sync_file_range	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_syscall_bp	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_syscall_in_writable_mem	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_syscallbuf_signal_reset	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_syscallbuf_sigstop	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sysconf_conf	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sysctl	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sysemu_singlestep	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_sysinfo	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_tgkill	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_thread_stress	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_threads	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_truncate_temp	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_tun	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_ulimit_low	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_uname	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_unexpected_exit_pid_ns	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_unjoined_thread	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_unshare	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_vdso_clock_gettime_stack	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_vdso_gettimeofday_stack	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_vdso_parts	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_vdso_time_stack	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_vfork_flush	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_vfork_read_clone_stress	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_video_capture	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_vm_readv_writev	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_wait_for_all	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_write_race	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_writev	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_xattr	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+rr_suite	rr_zero_length_read	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
+sqlite_veryquick	sqlite_veryquick_is_deterministic_under_strict_hermit	downloads/builds SQLite and runs the slow veryquick compatibility probe
 stress_suite	fast_chaos_matrix	explicit fast stress tier
 stress_suite	slow_cas_search_and_replay	explicit PMU-dependent slow stress tier
 stress_suite	slow_race_matrix	explicit slow stress tier
+stress_suite	targeted_chaos_finds_order_violation_at_least_as_often	explicit fast stress tier

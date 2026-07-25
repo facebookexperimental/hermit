@@ -74,6 +74,12 @@ const HERMIT_VERIFY_TIMEOUT: &str = "120s";
 /// Grace period before `timeout(1)` escalates from SIGTERM to SIGKILL.
 const HERMIT_VERIFY_KILL_AFTER: &str = "10s";
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#657)
+fn hermit_verify_timeout() -> String {
+    std::env::var("HERMIT_APP_VERIFY_TIMEOUT").unwrap_or_else(|_| HERMIT_VERIFY_TIMEOUT.to_owned())
+}
+
 fn hermit_run_lock() -> MutexGuard<'static, ()> {
     HERMIT_RUN_LOCK
         .lock()
@@ -193,11 +199,8 @@ fn assert_l2_under_strict_verify(program: &Path, args: &[&str]) {
 
     let mut command = Command::new("timeout");
     command
-        .args([
-            "--kill-after",
-            HERMIT_VERIFY_KILL_AFTER,
-            HERMIT_VERIFY_TIMEOUT,
-        ])
+        .args(["--kill-after", HERMIT_VERIFY_KILL_AFTER])
+        .arg(hermit_verify_timeout())
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
             "--log=off",
@@ -412,11 +415,8 @@ fn compile_java(source: &str, class_name: &str) -> PathBuf {
 fn run_once_under_strict(program: &Path, args: &[&str]) -> Output {
     let mut command = Command::new("timeout");
     command
-        .args([
-            "--kill-after",
-            HERMIT_VERIFY_KILL_AFTER,
-            HERMIT_VERIFY_TIMEOUT,
-        ])
+        .args(["--kill-after", HERMIT_VERIFY_KILL_AFTER])
+        .arg(hermit_verify_timeout())
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
             "--log=off",

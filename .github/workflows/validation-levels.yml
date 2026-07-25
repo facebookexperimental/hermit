@@ -65,7 +65,8 @@ jobs:
         if: steps.namespaces.outputs.available != 'true'
         run: |
           cargo build --workspace
-          cargo test -p detcore
+          # AUTONOMOUS-BOT-IMPLEMENTED(#657): PMU integration tests run in the hardware lane.
+          cargo test -p detcore --lib --bins
           cargo test -p hermit --lib --bins
 
   full:
@@ -78,12 +79,9 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.level == 'full')
         )
       }}
-    runs-on: [self-hosted, Linux, X64, hermit, pmu]
     # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#646)
-    concurrency:
-      group: hermit-self-hosted-pmu
-      cancel-in-progress: false
+    # TODO-HUMAN-REVIEW(#657)
+    runs-on: [self-hosted, Linux, X64, hermit, pmu, pmu-serial]
     timeout-minutes: 180
     env:
       DETCORE_TEST_RUST_LOG: "off"
@@ -148,12 +146,9 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.level == 'super')
         )
       }}
-    runs-on: [self-hosted, Linux, X64, hermit, pmu]
     # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#646)
-    concurrency:
-      group: hermit-self-hosted-pmu
-      cancel-in-progress: false
+    # TODO-HUMAN-REVIEW(#657)
+    runs-on: [self-hosted, Linux, X64, hermit, pmu, pmu-serial]
     timeout-minutes: 180
     env:
       DETCORE_TEST_RUST_LOG: "off"
