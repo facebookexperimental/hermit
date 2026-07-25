@@ -8,6 +8,15 @@ description: Audit Hermit backend completion claims against real CLI execution, 
 ## Purpose
 This skill is used by hermit-coord to audit backend claims. Every time a backend agent reports completion, run this checklist to determine how "real" the backend is.
 
+## Milestone Completion Gate
+
+**A milestone is NOT DONE until the code is on main.**
+
+- Building on a feature branch = in progress.
+- PR opened = in review.
+- Merged to main + `hermit run --backend X` works = DONE.
+- Never close a backend milestone task for work on an unlanded branch.
+
 ## The Test
 
 A backend is REAL if and only if:
