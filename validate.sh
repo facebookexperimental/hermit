@@ -1420,6 +1420,27 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe uptime /usr/bin/uptime -p \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    # Restrict process tools to stable identity/existence observations. Host
+    # CPU, memory, and RSS counters intentionally remain outside the L2 claim.
+    # shellcheck disable=SC2016
+    strict_compatibility_probe ps bash -c \
+        'set -euo pipefail; pid=$(ps -o pid= -p $$); pid=${pid//[[:space:]]/}; test "$pid" = "$$"; printf "ps-ok\n"' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    # shellcheck disable=SC2016
+    strict_compatibility_probe top bash -c \
+        'set -euo pipefail; LC_ALL=C /usr/bin/top -b -n 1 -p $$ -w 80 | /usr/bin/awk -v pid="$$" "\$1 == pid && \$NF == \"bash\" { found=1 } END { exit !found }"; printf "top-ok\n"' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    # Signal zero checks deterministic guest-process existence without
+    # perturbing signal delivery or depending on host process IDs.
+    strict_compatibility_probe kill /usr/bin/kill -0 1 \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    # shellcheck disable=SC2016
+    strict_compatibility_probe pgrep bash -c \
+        'set -euo pipefail; /usr/bin/pgrep -x bash | /usr/bin/grep -qx "$$"; printf "pgrep-ok\n"' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe pkill bash -c \
+        'set -euo pipefail; /usr/bin/pkill -0 -x bash; printf "pkill-ok\n"' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
     # timeout is intentionally absent: "timeout 1 true" hangs in Run1 while
     # the parent waits in rt_sigsuspend for its delayed child.
     # Filesystem fixtures use distinct fixed paths and clean them before and
