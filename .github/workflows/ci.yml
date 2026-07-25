@@ -282,9 +282,10 @@ jobs:
     - name: Standard command strict-verify compatibility tests
       if: steps.namespaces.outputs.available == 'true'
       run: cargo test -p hermit --test command_strict_verify -- --ignored --test-threads=1
-    - name: Functional strict compatibility workloads (nonblocking)
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#575)
+    - name: Functional strict compatibility workloads (blocking)
       if: steps.namespaces.outputs.available == 'true'
-      continue-on-error: true
       run: ./validate.sh --strict-compat-only
     - name: Build pinned LevelDB integration fixture
       if: steps.namespaces.outputs.available == 'true'
