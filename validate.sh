@@ -2618,7 +2618,12 @@ function run_hosted_only_suite {
     start_check "Documentation" cargo doc --workspace --no-deps
 
     run_check "Test regular workspace crates" "${NEXTEST_RUN[@]}" --workspace --exclude detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests
-    run_check "Test flaky guest crate" cargo test -p hermetic_infra_hermit_flaky-tests
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#707): The guest harnesses deliberately exit nonzero
+    # for some native schedules. Compile them here; Hermit's deterministic and
+    # chaos-mode integration targets below exercise their runtime behavior.
+    run_check "Compile flaky guest test harnesses" \
+        cargo test -p hermetic_infra_hermit_flaky-tests --no-run
     run_check "Test Hermit unit and binary targets" cargo test -p hermit --lib --bins
     run_check "Test Detcore unit and binary targets" cargo test -p detcore --lib --bins
     run_check "Test Detcore non-CPUID miscellaneous cases" cargo test -p detcore --test tests_misc -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --test-threads=1
