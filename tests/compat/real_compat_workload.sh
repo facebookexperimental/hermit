@@ -198,6 +198,57 @@ EOF
         blob=$("$GIT" -C "$WORK_DIR/repo" rev-parse HEAD:data.txt)
         printf 'git:%s:%s\n' "$subject" "$blob"
         ;;
+    sqlite3)
+        output=$(
+            /usr/bin/sqlite3 -batch -noheader -separator : :memory: <<'EOF'
+CREATE TABLE measurements(category TEXT NOT NULL, value INTEGER NOT NULL);
+INSERT INTO measurements VALUES
+    ('alpha', 6), ('beta', 7), ('alpha', 15), ('beta', 14);
+SELECT category, count(*), sum(value)
+FROM measurements
+GROUP BY category
+ORDER BY category;
+EOF
+        )
+        test "$output" = $'alpha:2:21\nbeta:2:21'
+        printf 'sqlite3:groups-ok\n'
+        ;;
+    jq)
+        cat >"$WORK_DIR/input.json" <<'EOF'
+[
+  {"name": "gamma", "value": 21},
+  {"name": "beta", "value": 6},
+  {"name": "alpha", "value": 15}
+]
+EOF
+        output=$(/usr/bin/jq -c \
+            '{total: (map(.value) | add), selected: ([.[] | select(.value >= 10) | .name] | sort)}' \
+            "$WORK_DIR/input.json")
+        test "$output" = '{"total":42,"selected":["alpha","gamma"]}'
+        printf 'jq:aggregate-ok\n'
+        ;;
+    xmllint)
+        cat >"$WORK_DIR/inventory.xml" <<'EOF'
+<?xml version="1.0"?>
+<!DOCTYPE inventory [
+<!ELEMENT inventory (item+)>
+<!ELEMENT item EMPTY>
+<!ATTLIST item name CDATA #REQUIRED value CDATA #REQUIRED>
+]>
+<inventory>
+  <item name="alpha" value="6"/>
+  <item name="beta" value="15"/>
+  <item name="gamma" value="21"/>
+</inventory>
+EOF
+        /usr/bin/xmllint --nonet --valid --noout "$WORK_DIR/inventory.xml"
+        count=$(/usr/bin/xmllint --xpath 'count(/inventory/item)' \
+            "$WORK_DIR/inventory.xml")
+        sum=$(/usr/bin/xmllint --xpath 'sum(/inventory/item/@value)' \
+            "$WORK_DIR/inventory.xml")
+        test "$count:$sum" = '3:42'
+        printf 'xmllint:valid:count=%s:sum=%s\n' "$count" "$sum"
+        ;;
     gcc)
         cat >"$WORK_DIR/fixture.c" <<'EOF'
 #include <stddef.h>

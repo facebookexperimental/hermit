@@ -1182,12 +1182,16 @@ function run_compatibility_corpus {
     fi
     strict_compatibility_probe awk awk 'BEGIN { print 42 }' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe sqlite3 sqlite3 :memory: \
+    functional_compatibility_probe sqlite3 sqlite3 :memory: \
         'CREATE TABLE values_under_test(value INTEGER NOT NULL); WITH RECURSIVE sequence(value) AS (VALUES(1) UNION ALL SELECT value + 1 FROM sequence WHERE value < 100) INSERT INTO values_under_test SELECT value FROM sequence; SELECT count(*), sum(value) FROM values_under_test;' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe jq /usr/bin/jq -c -n \
+    functional_compatibility_probe jq /usr/bin/jq -c -n \
         '{sum: ([range(1;6)] | add), evens: [range(1;6) | select(. % 2 == 0)]}' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    if [[ $COMPATIBILITY_MODE == strict ]]; then
+        functional_compatibility_probe xmllint /usr/bin/xmllint --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+    fi
     # Expand $i inside the guest shell, not here.
     # shellcheck disable=SC2016
     strict_compatibility_probe bash bash -c \
