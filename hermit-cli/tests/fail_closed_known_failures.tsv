@@ -8,6 +8,7 @@ hashseed_determinism	python_set_order_nondeterministic_natively_deterministic_un
 hermit_modes	default_bind_mounts	unsupported-syscall	Ioctl
 hermit_modes	default_cargo_bind_connect_race	unsupported-syscall	Mkdir
 hermit_modes	default_cargo_clock_gettime	unsupported-syscall	ClockSettime
+hermit_modes	default_cargo_futex_and_print	runner-scheduler-hang	self-hosted runner blocked in futex guest for over 18 minutes; exact local fail-closed test passes in 5.74s
 hermit_modes	default_cargo_interrogate_tty	unsupported-syscall	Ioctl
 hermit_modes	default_cargo_network_hello_world	unsupported-syscall	Mkdir
 hermit_modes	default_cargo_poll	unsupported-syscall	Mkdir

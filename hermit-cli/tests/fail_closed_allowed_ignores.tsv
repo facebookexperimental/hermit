@@ -33,6 +33,7 @@ language_runtime_determinism	node_runtime_entropy_is_determinized	requires the o
 language_runtime_determinism	ocaml_runtime_entropy_is_determinized	requires the optional OCaml native compiler
 language_runtime_determinism	python_runtime_entropy_is_determinized	requires an OSS CPython 3 runtime
 language_runtime_determinism	ruby_runtime_entropy_is_determinized	requires the optional Ruby runtime
+language_runtime_determinism	ruby_thread_prctls_are_supported_in_fail_closed_mode	requires the optional Ruby runtime plus PMU/mount namespaces
 leveldb	full_leveldb_suite_is_deterministic_under_strict	full LevelDB suite contains long concurrent and randomized stress cases
 leveldb	leveldb_env_posix_is_deterministic_under_strict	repeated fork+exec close-on-exec checks are slow under ptrace
 python_stdlib	strict_python_stdlib_is_deterministic	requires system CPython with its full Lib/test package
