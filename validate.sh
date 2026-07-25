@@ -258,13 +258,14 @@ readonly STRICT_COMPAT_TIMEOUT=60
 readonly REAL_COMPAT_FIXTURES="$ROOT_DIR/target/real-compat-fixtures-$$"
 readonly E9PATCH_NSSWITCH_FILE="$VALIDATION_TMP_DIR/e9patch-nsswitch.conf"
 readonly REAL_COMPAT_WORKLOAD="$ROOT_DIR/tests/compat/real_compat_workload.sh"
+readonly COMPLEX_SHELL_WORKLOAD="$ROOT_DIR/tests/compat/complex_shell_workload.sh"
 RR_COMPAT_PHASE_TIMEOUT_SECONDS=${RR_COMPAT_PHASE_TIMEOUT_SECONDS:-60}
 if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     echo "validate.sh: RR_COMPAT_PHASE_TIMEOUT_SECONDS must be a positive integer" >&2
     exit 2
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
-readonly STRICT_COMPAT_TOTAL=164
+readonly STRICT_COMPAT_TOTAL=180
 readonly RR_COMPAT_EXPECTED=128
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
@@ -1208,6 +1209,12 @@ function run_compatibility_corpus {
     strict_compatibility_probe bash bash -c \
         'for i in 1 2 3; do echo "$i"; done' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#701): Review the complex shell-build L2 workload.
+    if [[ $COMPATIBILITY_MODE == strict ]]; then
+        strict_compatibility_probe shell-build bash "$COMPLEX_SHELL_WORKLOAD" \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+    fi
     functional_compatibility_probe cargo cargo --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     functional_compatibility_probe rustc rustc --version \
