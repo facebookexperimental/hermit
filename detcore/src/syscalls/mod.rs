@@ -13,6 +13,7 @@ pub mod helpers;
 mod io;
 mod memory;
 mod misc;
+pub(crate) use misc::is_supported_prctl_option;
 mod signal;
 mod sysinfo;
 mod threads;

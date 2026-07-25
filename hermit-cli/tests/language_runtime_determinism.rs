@@ -178,6 +178,29 @@ fn ruby_runtime_entropy_is_determinized() {
 }
 
 #[test]
+#[ignore = "requires the optional Ruby runtime plus PMU/mount namespaces"]
+fn ruby_thread_prctls_are_supported_in_fail_closed_mode() {
+    let _guard = runtime_lock();
+    let ruby = executable(&["/usr/bin/ruby"]);
+    let mut command = bounded_command(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args([
+            "run",
+            "--strict",
+            "--verify",
+            "--panic-on-unsupported-syscalls",
+            "--",
+        ])
+        .arg(ruby)
+        .args([
+            "--disable-gems",
+            "-e",
+            r#"thread = Thread.new { Thread.current.name = "hermit-ruby"; 42 }; raise "bad" unless thread.value == 42"#,
+        ]);
+    command_output(command, "Ruby fail-closed prctl verification");
+}
+
+#[test]
 #[ignore = "requires the optional Node.js runtime"]
 fn node_runtime_entropy_is_determinized() {
     let node = executable(&["/usr/bin/node"]);

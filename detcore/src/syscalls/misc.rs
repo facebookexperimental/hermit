@@ -39,6 +39,13 @@ const ARCH_SHSTK_UNLOCK: libc::c_int = 0x5004;
 const ARCH_SHSTK_STATUS: libc::c_int = 0x5005;
 const ARCH_SHSTK_VALID_MASK: usize = 0b11;
 
+pub(crate) fn is_supported_prctl_option(option: libc::c_int) -> bool {
+    matches!(
+        option,
+        libc::PR_SET_NAME | libc::PR_GET_NAME | libc::PR_SET_THP_DISABLE | libc::PR_GET_THP_DISABLE
+    )
+}
+
 fn from_str(s: &str) -> [i8; 65] {
     let mut ret: [i8; 65] = [0; 65];
     for (i, ch) in s.bytes().take(64).enumerate() {
@@ -102,6 +109,23 @@ fn write_random_chunk(
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// Preserve deterministic thread-name and transparent-huge-page controls.
+    ///
+    /// Ruby uses both controls while starting worker threads. Their results depend
+    /// only on the calling task and supplied arguments, and the shared passthrough
+    /// path records them when record/replay is active. Other prctl options retain
+    /// the existing unclassified policy at dispatch.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#655): Confirm the narrow prctl passthrough policy.
+    pub async fn handle_prctl<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Prctl,
+    ) -> Result<i64, Error> {
+        debug_assert!(is_supported_prctl_option(call.option()));
+        self.passthrough(guest, call.into()).await
+    }
+
     fn write_arch_prctl_u64<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -387,6 +411,20 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prctl_support_is_limited_to_ruby_thread_controls() {
+        for option in [
+            libc::PR_SET_NAME,
+            libc::PR_GET_NAME,
+            libc::PR_SET_THP_DISABLE,
+            libc::PR_GET_THP_DISABLE,
+        ] {
+            assert!(is_supported_prctl_option(option));
+        }
+
+        assert!(!is_supported_prctl_option(libc::PR_SET_NO_NEW_PRIVS));
+    }
 
     #[test]
     fn getrandom_accepts_linux_flags() {

@@ -1534,15 +1534,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .await
                 }
             },
-            SyscallClassification::Unclassified => {
-                self.handle_unclassified_syscall(
-                    guest,
-                    call,
-                    dettid,
-                    config.panic_on_unsupported_syscalls,
-                )
-                .await
-            }
+            SyscallClassification::Unclassified => match call {
+                Syscall::Prctl(s) if syscalls::is_supported_prctl_option(s.option()) => {
+                    self.handle_prctl(guest, s).await
+                }
+                unexpected => {
+                    self.handle_unclassified_syscall(
+                        guest,
+                        unexpected,
+                        dettid,
+                        config.panic_on_unsupported_syscalls,
+                    )
+                    .await
+                }
+            },
         };
 
         detlog!(
