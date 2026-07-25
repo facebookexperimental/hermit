@@ -151,10 +151,12 @@ capability.
 
 `e9patch` is an experimental hybrid rather than a standalone Detcore runtime.
 It uses the cached offline instruction map to apply `before empty` trampolines
-to every mapped site in the main ELF and rejects partial coverage. Hermit does
-not enable e9patch's B0 fallback because reserving SIGILL would change guest
-signal semantics. The rewritten program is bind-mounted read-only at the
-original executable path, then runs under the ptrace Detcore backend, which
+at exact candidate offsets in the main ELF. Because the linear candidate scan
+can include embedded data, e9tool decides which candidates are instructions;
+Hermit reports both counts and rejects partial coverage of the recovered set.
+Hermit does not enable e9patch's B0 fallback because reserving SIGILL would
+change guest signal semantics. The rewritten program is bind-mounted read-only
+at the original executable path, then runs under the ptrace Detcore backend, which
 preserves strict-mode semantics for trapped events in shared libraries, the
 vDSO, and dynamic code. Empty trampolines do not make raw `RDRAND`, `RDSEED`,
 or TSX deterministic even when those sites are mapped, so those instructions

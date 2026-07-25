@@ -103,10 +103,12 @@ an availability error rather than running the command without determinization.
 The experimental `e9patch` selection is intentionally a hybrid backend. At
 startup it loads or generates the main ELF's cached instruction map, then runs
 `e9tool` with exact file-offset matches to install semantics-preserving
-trampolines at every mapped site. Partial coverage fails closed. Hermit does not
-enable e9patch's B0 fallback because it reserves SIGILL and changes guest signal
-semantics. The rewritten ELF still runs through Detcore's ptrace backend, which
-executes the original instructions and covers trapped events in shared
+trampolines at every candidate offset that e9tool recovers as an instruction.
+The linear scan can include embedded data, so Hermit reports candidate and
+recovered counts separately. Partial e9tool coverage fails closed. Hermit does
+not enable e9patch's B0 fallback because it reserves SIGILL and changes guest
+signal semantics. The rewritten ELF still runs through Detcore's ptrace backend,
+which executes the original instructions and covers trapped events in shared
 libraries, the vDSO, and dynamic code. Raw `RDRAND`, `RDSEED`, and TSX in code
 remain unsupported even when present in the offline map because this initial
 integration installs empty trampolines. Privilege-bearing executables fail
@@ -309,6 +311,8 @@ and licensing guidelines.
 - [User Guide](docs/USER_GUIDE.md): modes, flags, examples, and troubleshooting.
 - [Architecture](docs/ARCHITECTURE.md): Reverie, Detcore, scheduling, time, and
   record/replay internals.
+- [e9patch Compatibility](docs/E9PATCH_COMPATIBILITY.md): measured application
+  envelope, preprocessing classifications, and known limits.
 - [Error Catalog](docs/ERROR_CATALOG.md): errors, triggers, and remediations.
 - [Examples](examples/README.md): small programs demonstrating controlled
   nondeterminism.

@@ -71,7 +71,7 @@ determinism curve:
 | **ptrace** | seccomp-BPF `SECCOMP_RET_TRACE` + `PTRACE`, out-of-process tracer | Production; the only in-tree backend (`reverie-ptrace`) | Complete and strongly deterministic; per-event context-switch cost |
 | **DBI** (SaBRe / DynamoRIO style) | In-process binary rewriting / function hooking of syscall sites | Experimental / research | Low overhead; today it is a syscall-boundary interceptor, **not** a deterministic backend |
 | **KVM / SVM** | Run the guest inside a hardware VM and trap via VM-exits | Exploratory | Can trap instructions ptrace cannot (see CPUID below); heaviest isolation and integration cost |
-| **e9patch + ptrace** | Cached offline main-ELF rewriting followed by the ptrace Detcore runtime | Experimental hybrid | Exact mapped-site coverage; raw random/TSX instructions remain unsupported even when mapped |
+| **e9patch + ptrace** | Cached offline main-ELF rewriting followed by the ptrace Detcore runtime | Experimental hybrid | Exact coverage of e9tool-recovered candidate sites; raw random/TSX instructions remain unsupported even when mapped |
 
 **ptrace (current).** seccomp selects which syscalls trap; ptrace delivers the
 stops to an out-of-process tracer that holds all Detcore state. This is the
@@ -81,10 +81,12 @@ preemption, at the cost of a context switch per intercepted event.
 
 **e9patch hybrid.** The `e9patch` backend loads the cached instruction map for
 the main executable and invokes `e9tool` with an exact file-offset matcher.
-Each mapped site receives an empty before-trampoline, preserving the original
-instruction; partial coverage fails closed, and B0 is disabled because it would
-reserve SIGILL. The result is bind-mounted read-only at the original executable
-path and runs through the existing ptrace Detcore runtime. Ptrace remains the
+The instruction map is a linear candidate scan and can include embedded data.
+Each candidate that e9tool recovers as an instruction receives an empty
+before-trampoline, preserving the original instruction; partial recovered-site
+coverage fails closed, and B0 is disabled because it would reserve SIGILL. The
+result is bind-mounted read-only at the original executable path and runs
+through the existing ptrace Detcore runtime. Ptrace remains the
 correctness path for trapped syscalls, CPUID, RDTSC, and RDTSCP in the main ELF,
 DSOs, vDSO, and dynamic code. Empty trampolines do not make raw `RDRAND`,
 `RDSEED`, or TSX deterministic even when those sites are mapped, so those

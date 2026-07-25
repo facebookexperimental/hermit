@@ -1869,8 +1869,10 @@ impl RunOpts {
             "miss"
         };
         eprintln!(
-            ":: Backend: e9patch preprocessing + ptrace runtime; mapped_sites={}; b0_sites={}; \
+            ":: Backend: e9patch preprocessing + ptrace runtime; candidate_sites={}; \
+             mapped_sites={}; b0_sites={}; \
              instruction_map_cache={:?}; rewrite_cache={}; artifact_sha256={}",
+            prepared.candidate_sites,
             prepared.patched_sites,
             prepared.b0_sites,
             prepared.instruction_map_cache_status,

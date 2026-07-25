@@ -38,15 +38,18 @@ pub const E9TOOL_ENV: &str = "HERMIT_E9TOOL";
 // TODO-HUMAN-REVIEW(PR-594): Review the public e9patch backend override.
 pub const E9PATCH_BACKEND_ENV: &str = "HERMIT_E9PATCH_BACKEND";
 
-const REWRITE_SCHEMA_VERSION: u32 = 4;
+const REWRITE_SCHEMA_VERSION: u32 = 5;
 
 /// Result of preparing the main guest ELF for the e9patch backend.
 // TODO-HUMAN-REVIEW(PR-594): Review cached rewrite result semantics.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PreparedBinary {
-    /// Original canonical executable when there are no sites, or cached rewritten ELF otherwise.
+    /// Original executable when no sites are patched, or the cached rewritten ELF otherwise.
     pub binary: PathBuf,
-    /// Number of mapped sites rewritten by e9tool.
+    /// Number of candidate sites found by the linear instruction-map scan.
+    // TODO-HUMAN-REVIEW(PR-664): Review e9patch candidate-site reporting.
+    pub candidate_sites: usize,
+    /// Number of candidate sites recovered and rewritten by e9tool.
     pub patched_sites: usize,
     /// Whether the instruction map was already cached.
     pub instruction_map_cache_status: CacheStatus,
@@ -54,7 +57,7 @@ pub struct PreparedBinary {
     pub rewrite_cache_hit: bool,
     /// Number of B0 signal-fallback sites. This backend rejects nonzero values.
     pub b0_sites: usize,
-    /// SHA-256 of the rewritten ELF, absent when the map contains no sites.
+    /// SHA-256 of the rewritten ELF, absent when no rewrite artifact is retained.
     pub artifact_sha256: Option<String>,
 }
 
@@ -73,7 +76,7 @@ struct RewriteIdentity {
     input_digest: Digest,
     e9tool_digest: Digest,
     instruction_map_digest: Digest,
-    patched_sites: usize,
+    candidate_sites: usize,
     e9patch_backend_digest: Digest,
 }
 
@@ -82,6 +85,8 @@ struct RewriteMetadata {
     #[serde(flatten)]
     identity: RewriteIdentity,
     output_digest: Digest,
+    patched_sites: usize,
+    recovered_sites: usize,
     b0_sites: usize,
 }
 
@@ -135,6 +140,7 @@ fn prepare_in(
     if result.map.sites.is_empty() {
         return Ok(PreparedBinary {
             binary: snapshot.original,
+            candidate_sites: 0,
             patched_sites: 0,
             instruction_map_cache_status: result.cache_status,
             rewrite_cache_hit: false,
@@ -154,7 +160,7 @@ fn prepare_in(
         e9tool_digest: e9tool.digest,
         e9patch_backend_digest: e9patch_backend.digest,
         input_mode: snapshot.mode,
-        patched_sites: result.map.sites.len(),
+        candidate_sites: result.map.sites.len(),
     };
     let rewrite_key = Digest::new(&serde_json::to_vec(&rewrite_identity)?).to_string();
     let metadata_path = cache_dir.join(format!("{rewrite_key}.json"));
@@ -163,7 +169,8 @@ fn prepare_in(
     {
         return Ok(PreparedBinary {
             binary,
-            patched_sites: result.map.sites.len(),
+            candidate_sites: result.map.sites.len(),
+            patched_sites: metadata.patched_sites,
             instruction_map_cache_status: result.cache_status,
             rewrite_cache_hit: true,
             b0_sites: metadata.b0_sites,
@@ -211,10 +218,16 @@ fn prepare_in(
             snapshot.original.display()
         ))
     })?;
+    validate_patch_coverage(patched, total, result.map.sites.len()).map_err(|reason| {
+        Error::msg(format!(
+            "e9tool coverage check failed for {}: {reason}:\n{diagnostic}",
+            snapshot.original.display()
+        ))
+    })?;
     let b0_sites = if let Some((b0_sites, b0_total)) = parse_metric(&diagnostic, "num_patched_B0") {
-        if b0_total != result.map.sites.len() {
+        if b0_total != total {
             return Err(Error::msg(
-                "e9tool B0 coverage total did not match the instruction map",
+                "e9tool B0 coverage total did not match its recovered-site total",
             ));
         }
         b0_sites
@@ -228,12 +241,16 @@ fn prepare_in(
             snapshot.original.display()
         )));
     }
-    if patched != result.map.sites.len() || total != result.map.sites.len() {
-        return Err(Error::msg(format!(
-            "e9tool patched {patched}/{total} sites in {}, but the instruction map contains {}:\n{diagnostic}",
-            snapshot.original.display(),
-            result.map.sites.len()
-        )));
+    if patched == 0 {
+        return Ok(PreparedBinary {
+            binary: snapshot.original,
+            candidate_sites: result.map.sites.len(),
+            patched_sites: 0,
+            instruction_map_cache_status: result.cache_status,
+            rewrite_cache_hit: false,
+            b0_sites: 0,
+            artifact_sha256: None,
+        });
     }
     if !is_executable_file(&temporary_binary) {
         return Err(Error::msg(format!(
@@ -271,12 +288,15 @@ fn prepare_in(
         &RewriteMetadata {
             identity: rewrite_identity,
             output_digest,
+            patched_sites: patched,
+            recovered_sites: total,
             b0_sites,
         },
     )?;
 
     Ok(PreparedBinary {
         binary: rewritten,
+        candidate_sites: result.map.sites.len(),
         patched_sites: patched,
         instruction_map_cache_status: result.cache_status,
         rewrite_cache_hit: false,
@@ -403,10 +423,22 @@ fn read_valid_rewrite(
     if metadata.identity != *expected {
         return None;
     }
+    valid_cached_coverage(&metadata, expected).then_some(())?;
     let binary = rewrite_artifact_path(cache_dir, rewrite_key, metadata.output_digest);
     let mode = fs::metadata(&binary).ok()?.permissions().mode() & 0o777;
     (mode == expected.input_mode && trusted_file_with_digest(&binary, metadata.output_digest, true))
         .then_some((binary, metadata))
+}
+
+fn valid_cached_coverage(metadata: &RewriteMetadata, expected: &RewriteIdentity) -> bool {
+    metadata.b0_sites == 0
+        && metadata.recovered_sites != 0
+        && validate_patch_coverage(
+            metadata.patched_sites,
+            metadata.recovered_sites,
+            expected.candidate_sites,
+        )
+        .is_ok()
 }
 
 fn rewrite_artifact_path(cache_dir: &Path, rewrite_key: &str, digest: Digest) -> PathBuf {
@@ -598,6 +630,24 @@ fn parse_metric(diagnostic: &str, name: &str) -> Option<(usize, usize)> {
     })
 }
 
+fn validate_patch_coverage(
+    patched: usize,
+    recovered: usize,
+    candidate_sites: usize,
+) -> Result<(), String> {
+    if recovered > candidate_sites {
+        return Err(format!(
+            "e9tool recovered {recovered} matches from only {candidate_sites} candidate offsets"
+        ));
+    }
+    if patched != recovered {
+        return Err(format!(
+            "e9tool patched only {patched}/{recovered} recovered matches"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,6 +674,93 @@ mod tests {
         assert_eq!(parse_metric(summary, "num_patched"), Some((2, 2)));
         assert_eq!(parse_metric(summary, "num_patched_B0"), Some((1, 2)));
         assert_eq!(parse_metric(summary, "num_patched_B1"), None);
+    }
+
+    #[test]
+    fn accepts_full_coverage_of_recovered_candidate_subset() {
+        assert_eq!(validate_patch_coverage(24, 24, 49), Ok(()));
+    }
+
+    #[test]
+    fn rejects_partial_e9tool_coverage() {
+        assert_eq!(
+            validate_patch_coverage(23, 24, 49),
+            Err("e9tool patched only 23/24 recovered matches".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_more_recovered_sites_than_candidates() {
+        assert_eq!(
+            validate_patch_coverage(50, 50, 49),
+            Err("e9tool recovered 50 matches from only 49 candidate offsets".to_owned())
+        );
+    }
+
+    #[test]
+    fn cached_rewrite_rejects_corrupted_coverage_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let rewrite_key = "rewrite";
+        let expected = RewriteIdentity {
+            schema_version: REWRITE_SCHEMA_VERSION,
+            input_mode: 0o755,
+            input_digest: Digest::new(b"input"),
+            e9tool_digest: Digest::new(b"e9tool"),
+            instruction_map_digest: Digest::new(b"map"),
+            candidate_sites: 49,
+            e9patch_backend_digest: Digest::new(b"backend"),
+        };
+        let artifact_contents = b"rewritten";
+        let output_digest = Digest::new(artifact_contents);
+        let artifact = rewrite_artifact_path(directory.path(), rewrite_key, output_digest);
+        fs::write(&artifact, artifact_contents).unwrap();
+        let mut permissions = fs::metadata(&artifact).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&artifact, permissions).unwrap();
+        let metadata_path = directory.path().join("rewrite.json");
+        let mut metadata = RewriteMetadata {
+            identity: expected,
+            output_digest,
+            patched_sites: 24,
+            recovered_sites: 24,
+            b0_sites: 0,
+        };
+        let write = |metadata: &RewriteMetadata| {
+            fs::write(&metadata_path, serde_json::to_vec(metadata).unwrap()).unwrap();
+        };
+
+        write(&metadata);
+        assert!(
+            read_valid_rewrite(directory.path(), rewrite_key, &metadata_path, &expected).is_some()
+        );
+
+        metadata.b0_sites = 1;
+        write(&metadata);
+        assert!(
+            read_valid_rewrite(directory.path(), rewrite_key, &metadata_path, &expected).is_none()
+        );
+
+        metadata.b0_sites = 0;
+        metadata.patched_sites = 0;
+        metadata.recovered_sites = 0;
+        write(&metadata);
+        assert!(
+            read_valid_rewrite(directory.path(), rewrite_key, &metadata_path, &expected).is_none()
+        );
+
+        metadata.patched_sites = 23;
+        metadata.recovered_sites = 24;
+        write(&metadata);
+        assert!(
+            read_valid_rewrite(directory.path(), rewrite_key, &metadata_path, &expected).is_none()
+        );
+
+        metadata.patched_sites = 50;
+        metadata.recovered_sites = 50;
+        write(&metadata);
+        assert!(
+            read_valid_rewrite(directory.path(), rewrite_key, &metadata_path, &expected).is_none()
+        );
     }
 
     #[test]
