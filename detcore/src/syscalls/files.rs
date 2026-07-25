@@ -342,6 +342,8 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Helper for performing a deterministic read that retries until it gets all its
     /// bytes.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#689): Confirm partial reads take precedence over later errors.
     async fn deterministic_read<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -376,9 +378,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .with_len(remaining_buf)
                         .with_buf(AddrMut::<u8>::from_raw(old_ptr + res as usize));
                 }
-                Err(e) => {
-                    break Err(e.into());
+                Err(error) if total_read_bytes > 0 => {
+                    trace!("[detcore/det_io]: returning {total_read_bytes} bytes before {error}");
+                    break Ok(total_read_bytes);
                 }
+                Err(error) => break Err(error.into()),
             }
         }
     }
