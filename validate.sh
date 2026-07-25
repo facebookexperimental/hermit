@@ -1146,13 +1146,41 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe id /usr/bin/id -u \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe lua lua -e 'print(42)' \
-        && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe perl perl -e 'print 42, chr(10)' \
-        && passed=$((passed + 1)) || failed=$((failed + 1))
+    if [[ $COMPATIBILITY_MODE == strict ]]; then
+        strict_compatibility_probe lua bash -c \
+            'set -euo pipefail; out=$("$1" -e "$2"); test "$out" = "$3"; printf "lua-fib=%s\n" "$out"' \
+            bash /usr/bin/lua \
+            'local a,b=0,1; for i=1,30 do a,b=b,a+b end; print(a)' 832040 \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe perl bash -c \
+            'set -euo pipefail; out=$("$1" -e "$2"); test "$out" = "$3"; printf "perl-prime-sum=%s\n" "$out"' \
+            bash /usr/bin/perl \
+            'my $sum=0; OUTER: for my $n (2..100) { for my $d (2..int(sqrt($n))) { next OUTER if $n % $d == 0 } $sum += $n } print "$sum\n"' 1060 \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe tcl bash -c \
+            'set -euo pipefail; out=$(printf "%s\n" "$2" | "$1"); test "$out" = "$3"; printf "tcl-squares=%s\n" "$out"' \
+            bash /usr/bin/tclsh \
+            'set sum 0; for {set i 1} {$i <= 100} {incr i} {set sum [expr {$sum + $i*$i}]}; puts $sum' 338350 \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe bc bash -c \
+            'set -euo pipefail; out=$(printf "%s\n" "$2" | "$1" -q); test "$out" = "$3"; printf "bc-factorial=%s\n" "$out"' \
+            bash /usr/bin/bc \
+            'define f(n) { auto r,i; r=1; for(i=2;i<=n;i++) r*=i; return(r) }; f(20)' \
+            2432902008176640000 \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe dc bash -c \
+            'set -euo pipefail; out=$(printf "%s\n" "$2" | "$1"); test "$out" = "$3"; printf "dc-power=%s\n" "$out"' \
+            bash /usr/bin/dc '2 100 ^ 1 - p' 1267650600228229401496703205375 \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+    else
+        strict_compatibility_probe lua lua -e 'print(42)' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe perl perl -e 'print 42, chr(10)' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe bc bash -c 'printf "6*7\n" | bc' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+    fi
     strict_compatibility_probe awk awk 'BEGIN { print 42 }' \
-        && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe bc bash -c 'printf "6*7\n" | bc' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe sqlite3 sqlite3 :memory: \
         'CREATE TABLE values_under_test(value INTEGER NOT NULL); WITH RECURSIVE sequence(value) AS (VALUES(1) UNION ALL SELECT value + 1 FROM sequence WHERE value < 100) INSERT INTO values_under_test SELECT value FROM sequence; SELECT count(*), sum(value) FROM values_under_test;' \
