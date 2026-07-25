@@ -1183,7 +1183,9 @@ fn shebang_interpreter(path: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(OsStr::from_bytes(&bytes[start..end])))
 }
 
-fn is_elf_file(path: &Path) -> Result<bool, Error> {
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-696): Review sharing ELF entrypoint detection with record.
+pub(super) fn is_elf_file(path: &Path) -> Result<bool, Error> {
     let mut file = File::open(path)
         .with_context(|| format!("failed to open executable {}", path.display()))?;
     let mut magic = [0_u8; 4];
@@ -1279,7 +1281,9 @@ fn normalize_guest_path(path: &Path) -> Result<PathBuf, Error> {
     Ok(normalized)
 }
 
-fn path_resolution_visits_prefix(path: &Path, prefix: &Path) -> Result<bool, Error> {
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-696): Review sharing mount-boundary resolution with record.
+pub(super) fn path_resolution_visits_prefix(path: &Path, prefix: &Path) -> Result<bool, Error> {
     let mut candidate = std::path::absolute(path)?;
     for _ in 0..40 {
         let components = candidate

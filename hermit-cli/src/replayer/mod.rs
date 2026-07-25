@@ -61,6 +61,11 @@ pub struct Replayer {
     stdout: Option<std::os::fd::OwnedFd>,
     #[serde(skip)]
     stderr: Option<std::os::fd::OwnedFd>,
+    /// Preserve replayed write ordering independently for each captured stream.
+    #[serde(skip)]
+    stdout_output_lock: tokio::sync::Mutex<()>,
+    #[serde(skip)]
+    stderr_output_lock: tokio::sync::Mutex<()>,
     #[serde(skip)]
     stdout_error: Option<String>,
     #[serde(skip)]
@@ -79,6 +84,8 @@ impl Tool for Replayer {
             data: cfg.replay_data.as_ref().unwrap().clone(),
             stdout,
             stderr,
+            stdout_output_lock: tokio::sync::Mutex::new(()),
+            stderr_output_lock: tokio::sync::Mutex::new(()),
             stdout_error,
             stderr_error,
         }

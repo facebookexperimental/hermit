@@ -423,6 +423,38 @@ fn record_shell_pipeline_stdout_matches() {
     );
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-696): Review same-executor replay output backpressure coverage.
+#[test]
+fn record_large_captured_output_does_not_deadlock() {
+    let _guard = hermit_record_lock();
+
+    let head = [Path::new("/usr/bin/head"), Path::new("/bin/head")]
+        .into_iter()
+        .find(|path| path.is_file())
+        .expect("coreutils head is missing");
+    record_replay_command(
+        "large-captured-stdout",
+        head,
+        &[
+            OsStr::new("-c"),
+            OsStr::new("262144"),
+            OsStr::new("/dev/zero"),
+        ],
+    );
+
+    let shell = [Path::new("/bin/sh"), Path::new("/usr/bin/sh")]
+        .into_iter()
+        .find(|path| path.is_file())
+        .expect("POSIX shell is missing");
+    let script = format!("{} -c 262144 /dev/zero >&2", head.display());
+    record_replay_command(
+        "large-captured-stderr",
+        shell,
+        &[OsStr::new("-c"), OsStr::new(&script)],
+    );
+}
+
 #[test]
 fn record_shell_command_substitution_stdout_matches() {
     let _guard = hermit_record_lock();

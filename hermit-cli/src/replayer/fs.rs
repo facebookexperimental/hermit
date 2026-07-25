@@ -7,7 +7,9 @@
  */
 
 use std::os::fd::AsRawFd;
-use std::sync::Mutex;
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
+use std::os::fd::RawFd;
 
 use reverie::Errno;
 use reverie::Guest;
@@ -45,47 +47,122 @@ struct UserSignalInfoHead {
     uid: libc::uid_t,
 }
 
-static REPLAY_OUTPUT_LOCK: Mutex<()> = Mutex::new(());
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-696): Review lossless replay-output backpressure handling.
+async fn wait_for_replay_output(output_fd: RawFd) -> bool {
+    // F_DUPFD_CLOEXEC keeps the endpoint alive while the bounded blocking task
+    // polls it, without changing the shared open-file-description flags.
+    let duplicate = unsafe { libc::fcntl(output_fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate == -1 {
+        tracing::debug!(
+            error = %std::io::Error::last_os_error(),
+            output_fd,
+            "could not duplicate replay output for readiness polling"
+        );
+        return false;
+    }
+    // SAFETY: F_DUPFD_CLOEXEC returned a new descriptor owned by this task.
+    let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate) };
+    let readiness = tokio::task::spawn_blocking(move || {
+        let mut pollfd = libc::pollfd {
+            fd: duplicate.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // A finite timeout keeps a cancelled replay from leaving an unbounded
+        // blocking-pool task behind. Timeout or EINTR asks the caller to retry
+        // its nonblocking write in a new bounded task.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 100) };
+        if ready > 0 {
+            return Ok(pollfd.revents & libc::POLLOUT != 0);
+        }
+        if ready == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            Ok(true)
+        } else {
+            Err(error)
+        }
+    })
+    .await;
+    match readiness {
+        Ok(Ok(ready)) => ready,
+        Ok(Err(error)) => {
+            tracing::debug!(%error, output_fd, "could not wait for replay output capacity");
+            false
+        }
+        Err(error) => {
+            tracing::debug!(%error, output_fd, "could not monitor replay output capacity");
+            false
+        }
+    }
+}
 
-fn emit_replay_output(
-    output_fd: libc::c_int,
+fn write_replay_output_once(
+    output_fd: RawFd,
+    bytes: &[u8],
+    file_offset: Option<i64>,
+) -> std::io::Result<usize> {
+    // Nonblocking mode is temporary and is restored before this function
+    // returns. In particular, no async suspension may expose it through the
+    // shared open-file description.
+    // SAFETY: fcntl only inspects this valid, Replayer-owned duplicate.
+    let flags = unsafe { libc::fcntl(output_fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let temporary_flags = match file_offset {
+        Some(_) => flags & !libc::O_APPEND,
+        None => flags | libc::O_NONBLOCK,
+    };
+    let changed_flags = temporary_flags != flags;
+    if changed_flags {
+        // SAFETY: the descriptor remains open and this function does not
+        // suspend before restoring its flags.
+        if unsafe { libc::fcntl(output_fd, libc::F_SETFL, temporary_flags) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    let written = match file_offset {
+        Some(position) => {
+            // SAFETY: bytes points to readable memory and output_fd is open.
+            unsafe { libc::pwrite(output_fd, bytes.as_ptr().cast(), bytes.len(), position) }
+        }
+        None => {
+            // SAFETY: bytes points to readable memory and output_fd is open.
+            unsafe { libc::write(output_fd, bytes.as_ptr().cast(), bytes.len()) }
+        }
+    };
+    let result = if written == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(written as usize)
+    };
+
+    if changed_flags {
+        // SAFETY: restore the shared description before any async wait.
+        if unsafe { libc::fcntl(output_fd, libc::F_SETFL, flags) } == -1 {
+            tracing::debug!(
+                error = %std::io::Error::last_os_error(),
+                output_fd,
+                "could not restore replay output flags"
+            );
+        }
+    }
+    result
+}
+
+async fn emit_replay_output(
+    output_fd: RawFd,
     bytes: &[u8],
     file_offset: Option<i64>,
     advances_output_offset: bool,
 ) {
     if bytes.is_empty() {
         return;
-    }
-
-    let _guard = REPLAY_OUTPUT_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // SAFETY: fcntl only inspects or changes the status flags of this valid,
-    // inherited output descriptor.
-    let flags = unsafe { libc::fcntl(output_fd, libc::F_GETFL) };
-    if flags == -1 {
-        tracing::debug!(
-            error = %std::io::Error::last_os_error(),
-            output_fd,
-            "could not inspect replay output"
-        );
-        return;
-    }
-    let mut temporary_flags = flags | libc::O_NONBLOCK;
-    if file_offset.is_some() {
-        temporary_flags &= !libc::O_APPEND;
-    }
-    let changed_flags = temporary_flags != flags;
-    if changed_flags {
-        // SAFETY: the descriptor remains open for the duration of this call.
-        if unsafe { libc::fcntl(output_fd, libc::F_SETFL, temporary_flags) } == -1 {
-            tracing::debug!(
-                error = %std::io::Error::last_os_error(),
-                output_fd,
-                "could not make replay output nonblocking"
-            );
-            return;
-        }
     }
 
     let mut offset = 0;
@@ -95,19 +172,12 @@ fn emit_replay_output(
             let position = file_offset
                 .checked_add(offset as i64)
                 .expect("recorded output offset overflow");
-            // SAFETY: remaining points to readable memory and output_fd is open.
-            unsafe {
-                libc::pwrite(
-                    output_fd,
-                    remaining.as_ptr().cast(),
-                    remaining.len(),
-                    position,
-                )
-            }
+            write_replay_output_once(output_fd, remaining, Some(position))
         } else {
             // send with MSG_NOSIGNAL handles sockets without risking a tracer
-            // SIGPIPE. Pipes reject send with ENOTSOCK, so use their
-            // now-nonblocking write path instead.
+            // SIGPIPE. MSG_DONTWAIT is per-call and does not modify the shared
+            // open-file description. Pipes reject send with ENOTSOCK, so use
+            // a write whose O_NONBLOCK window ends before any async wait.
             let sent = unsafe {
                 libc::send(
                     output_fd,
@@ -116,24 +186,34 @@ fn emit_replay_output(
                     libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
                 )
             };
-            if sent == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOTSOCK)
-            {
-                // SAFETY: remaining points to readable memory and output_fd is open.
-                unsafe { libc::write(output_fd, remaining.as_ptr().cast(), remaining.len()) }
+            if sent == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ENOTSOCK) {
+                    write_replay_output_once(output_fd, remaining, None)
+                } else {
+                    Err(error)
+                }
             } else {
-                sent
+                Ok(sent as usize)
             }
         };
-        if written > 0 {
-            offset += written as usize;
-            continue;
-        }
-        if written == -1 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
+        match written {
+            Ok(written) if written > 0 => {
+                offset += written;
                 continue;
             }
-            tracing::debug!(%error, output_fd, "could not emit all replay output");
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    && wait_for_replay_output(output_fd).await
+                {
+                    continue;
+                }
+                tracing::debug!(%error, output_fd, "could not emit all replay output");
+            }
+            Ok(_) => {}
         }
         break;
     }
@@ -151,16 +231,6 @@ fn emit_replay_output(
             "failed to advance captured output fd position: {}",
             std::io::Error::last_os_error()
         );
-    }
-    if changed_flags {
-        // SAFETY: restore the descriptor status flags before releasing the lock.
-        if unsafe { libc::fcntl(output_fd, libc::F_SETFL, flags) } == -1 {
-            tracing::debug!(
-                error = %std::io::Error::last_os_error(),
-                output_fd,
-                "could not restore replay output flags"
-            );
-        }
     }
 }
 
@@ -419,7 +489,7 @@ impl Replayer {
         })
     }
 
-    fn replay_output<G: Guest<Self>>(
+    async fn replay_output<G: Guest<Self>>(
         &self,
         guest: &mut G,
         advances_output_offset: bool,
@@ -429,8 +499,14 @@ impl Replayer {
         output_offset: Option<i64>,
     ) -> Result<(), Errno> {
         let bytes = read_write_bytes(&guest.memory(), syscall, count)?;
+        let output_lock = match output_fd {
+            libc::STDOUT_FILENO => &self.stdout_output_lock,
+            libc::STDERR_FILENO => &self.stderr_output_lock,
+            _ => panic!("invalid recorded output descriptor {output_fd}"),
+        };
+        let _guard = output_lock.lock().await;
         let output = self.output_endpoint(output_fd);
-        emit_replay_output(output, &bytes, output_offset, advances_output_offset);
+        emit_replay_output(output, &bytes, output_offset, advances_output_offset).await;
         Ok(())
     }
 
@@ -453,7 +529,8 @@ impl Replayer {
                 output_fd,
                 count as usize,
                 event.output_offset,
-            )?;
+            )
+            .await?;
         }
         event.result
     }
@@ -605,17 +682,19 @@ mod tests {
     use std::io::Read as _;
     use std::io::Seek as _;
     use std::io::Write as _;
+    use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
-    use std::sync::mpsc;
     use std::time::Duration;
+
+    use tokio::io::unix::AsyncFd;
 
     use super::*;
 
-    #[test]
-    fn replay_output_preserves_regular_file_offset() {
+    #[tokio::test]
+    async fn replay_output_preserves_regular_file_offset() {
         let mut file = tempfile::tempfile().unwrap();
-        emit_replay_output(file.as_raw_fd(), b"ONE", None, false);
-        emit_replay_output(file.as_raw_fd(), b"TWO", None, false);
+        emit_replay_output(file.as_raw_fd(), b"ONE", None, false).await;
+        emit_replay_output(file.as_raw_fd(), b"TWO", None, false).await;
         file.rewind().unwrap();
 
         let mut output = String::new();
@@ -623,10 +702,10 @@ mod tests {
         assert_eq!(output, "ONETWO");
     }
 
-    #[test]
-    fn replay_output_preserves_positioned_file_writes() {
+    #[tokio::test]
+    async fn replay_output_preserves_positioned_file_writes() {
         let mut file = tempfile::tempfile().unwrap();
-        emit_replay_output(file.as_raw_fd(), b"X", Some(5), false);
+        emit_replay_output(file.as_raw_fd(), b"X", Some(5), false).await;
         file.rewind().unwrap();
 
         let mut output = Vec::new();
@@ -634,10 +713,10 @@ mod tests {
         assert_eq!(output, b"\0\0\0\0\0X");
     }
 
-    #[test]
-    fn positioned_replay_advances_shared_offset_for_write() {
+    #[tokio::test]
+    async fn positioned_replay_advances_shared_offset_for_write() {
         let mut file = tempfile::tempfile().unwrap();
-        emit_replay_output(file.as_raw_fd(), b"X", Some(5), true);
+        emit_replay_output(file.as_raw_fd(), b"X", Some(5), true).await;
         assert_eq!(file.stream_position().unwrap(), 6);
         file.rewind().unwrap();
 
@@ -645,8 +724,9 @@ mod tests {
         file.read_to_end(&mut output).unwrap();
         assert_eq!(output, b"\0\0\0\0\0X");
     }
-    #[test]
-    fn positioned_replay_temporarily_clears_append() {
+
+    #[tokio::test]
+    async fn positioned_replay_temporarily_clears_append() {
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"ABC").unwrap();
         let fd = file.as_raw_fd();
@@ -659,7 +739,7 @@ mod tests {
             -1
         );
 
-        emit_replay_output(fd, b"X", Some(1), false);
+        emit_replay_output(fd, b"X", Some(1), false).await;
         file.rewind().unwrap();
         let mut output = String::new();
         file.read_to_string(&mut output).unwrap();
@@ -670,67 +750,143 @@ mod tests {
             0
         );
     }
-    #[test]
-    fn replay_output_supports_sockets() {
+
+    #[tokio::test]
+    async fn replay_output_supports_sockets() {
         let (output, mut peer) = UnixStream::pair().unwrap();
-        emit_replay_output(output.as_raw_fd(), b"SOCKET_OUT", None, false);
+        emit_replay_output(output.as_raw_fd(), b"SOCKET_OUT", None, false).await;
 
         let mut received = [0; 10];
         peer.read_exact(&mut received).unwrap();
         assert_eq!(&received, b"SOCKET_OUT");
     }
 
-    #[test]
-    fn replay_output_does_not_block_on_full_pipe() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_output_retries_after_blocking_pipe_backpressure_on_same_executor() {
         let mut pipe = [0; 2];
         // SAFETY: pipe points to two writable integers.
         assert_eq!(
-            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
             0
         );
+        // SAFETY: ownership of each open pipe descriptor transfers exactly once.
+        let input = AsyncFd::new(unsafe { OwnedFd::from_raw_fd(pipe[0]) }).unwrap();
+        let output = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+        // AsyncFd readers must use a nonblocking descriptor. The write end
+        // deliberately remains blocking to exercise temporary flag handling.
+        let input_flags = unsafe { libc::fcntl(input.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(input_flags, -1);
+        assert_ne!(
+            unsafe {
+                libc::fcntl(
+                    input.as_raw_fd(),
+                    libc::F_SETFL,
+                    input_flags | libc::O_NONBLOCK,
+                )
+            },
+            -1
+        );
+        let output_flags = unsafe { libc::fcntl(output.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(output_flags & libc::O_NONBLOCK, 0);
 
-        let fill = [0u8; 4096];
+        let expected = vec![b'x'; 256 * 1024];
+        let expected_for_reader = expected.clone();
+        let reader = tokio::spawn(async move {
+            let mut actual = vec![0; expected_for_reader.len()];
+            let mut offset = 0;
+            while offset < actual.len() {
+                let mut readiness = input.readable().await.unwrap();
+                match readiness.try_io(|input| {
+                    // SAFETY: actual's unwritten suffix is valid and the descriptor is open.
+                    let read = unsafe {
+                        libc::read(
+                            input.get_ref().as_raw_fd(),
+                            actual[offset..].as_mut_ptr().cast(),
+                            actual.len() - offset,
+                        )
+                    };
+                    if read == -1 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(read as usize)
+                    }
+                }) {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(read)) => offset += read,
+                    Ok(Err(error)) => panic!("pipe read failed: {error}"),
+                    Err(_) => continue,
+                }
+            }
+            actual.truncate(offset);
+            actual
+        });
+
+        let actual = tokio::time::timeout(Duration::from_secs(2), async {
+            emit_replay_output(output.as_raw_fd(), &expected, None, false).await;
+            assert_eq!(
+                unsafe { libc::fcntl(output.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+                0,
+                "replay output left the caller's pipe nonblocking"
+            );
+            drop(output);
+            reader.await.unwrap()
+        })
+        .await
+        .expect("replay output deadlocked its pipe reader");
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_output_cancellation_restores_blocking_pipe_flags() {
+        let mut pipe = [0; 2];
+        // SAFETY: pipe points to two writable integers.
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // SAFETY: ownership of each open pipe descriptor transfers exactly once.
+        let _input = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+        let output = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+
+        // Fill the pipe without blocking, then restore its blocking mode before
+        // calling the async replay path.
+        let flags = unsafe { libc::fcntl(output.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        assert_ne!(
+            unsafe { libc::fcntl(output.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            -1
+        );
+        let fill = [0_u8; 4096];
         loop {
-            // SAFETY: pipe[1] is open and fill is readable.
-            let written = unsafe { libc::write(pipe[1], fill.as_ptr().cast(), fill.len()) };
+            let written =
+                unsafe { libc::write(output.as_raw_fd(), fill.as_ptr().cast(), fill.len()) };
             if written >= 0 {
                 continue;
             }
             assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::EAGAIN)
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::WouldBlock
             );
             break;
         }
-
-        // SAFETY: pipe[1] is open and F_GETFL does not mutate memory.
-        let flags = unsafe { libc::fcntl(pipe[1], libc::F_GETFL) };
-        assert_ne!(flags, -1);
-        // SAFETY: pipe[1] is open; clearing O_NONBLOCK models a blocking sink.
         assert_ne!(
-            unsafe { libc::fcntl(pipe[1], libc::F_SETFL, flags & !libc::O_NONBLOCK) },
+            unsafe { libc::fcntl(output.as_raw_fd(), libc::F_SETFL, flags) },
             -1
         );
 
-        let (finished_tx, finished_rx) = mpsc::channel();
-        let write_fd = pipe[1];
-        let writer = std::thread::spawn(move || {
-            emit_replay_output(write_fd, b"x", None, false);
-            finished_tx.send(()).unwrap();
-        });
-        let result = finished_rx.recv_timeout(Duration::from_secs(1));
-        if result.is_err() {
-            // SAFETY: closing the read end releases a mistakenly blocked writer.
-            unsafe { libc::close(pipe[0]) };
-        }
-        writer.join().unwrap();
-        assert!(result.is_ok(), "replay output blocked on a full pipe");
-
-        if result.is_ok() {
-            // SAFETY: the read end is still open on the successful path.
-            unsafe { libc::close(pipe[0]) };
-        }
-        // SAFETY: the write end remains open until after the worker exits.
-        unsafe { libc::close(pipe[1]) };
+        let result = tokio::time::timeout(
+            Duration::from_millis(25),
+            emit_replay_output(output.as_raw_fd(), b"x", None, false),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "full pipe unexpectedly accepted replay output"
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(output.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+            0,
+            "cancelled replay output left the caller's pipe nonblocking"
+        );
     }
 }

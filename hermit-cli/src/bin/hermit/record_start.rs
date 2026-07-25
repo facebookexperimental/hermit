@@ -6,7 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::fs;
 use std::num::NonZeroU64;
+use std::path::Path;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::AtomicPtr;
@@ -16,6 +18,7 @@ use std::time::Duration;
 
 use clap::Args;
 use colored::Colorize;
+use hermit::Backend;
 use hermit::Context;
 use hermit::Error;
 use hermit::HermitData;
@@ -28,14 +31,25 @@ use nix::sys::signal::SigSet;
 use nix::sys::signal::Signal;
 use nix::sys::signal::sigaction;
 use reverie::process::Command;
+use reverie::process::Container;
 use reverie::process::ExitStatus;
+use reverie::process::Mount;
+use reverie::process::MountFlags;
 
 use super::container::default_container;
 use super::global_opts::GlobalOpts;
+use super::run::is_elf_file;
+use super::run::path_resolution_visits_prefix;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
 use super::verify::compare_two_runs;
 use super::verify::setup_double_run;
+
+#[derive(Debug)]
+struct E9patchRecordOverlay {
+    source: PathBuf,
+    target: PathBuf,
+}
 
 static TIMEOUT_MESSAGE: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
 static TIMEOUT_MESSAGE_LEN: AtomicUsize = AtomicUsize::new(0);
@@ -200,6 +214,96 @@ impl StartOpts {
         self.record_timeout
             .map(|seconds| Duration::from_secs(seconds.get()))
     }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-696): Review /proc magic-link rejection for record overlays.
+    fn resolve_e9patch_record_target(&self) -> Result<PathBuf, Error> {
+        let command = Command::new(self.program());
+        let resolved = command.find_program().with_context(|| {
+            format!(
+                "Could not resolve program {:?} in PATH for e9patch preprocessing",
+                self.program()
+            )
+        })?;
+        if path_resolution_visits_prefix(&resolved, Path::new("/proc"))? {
+            anyhow::bail!(
+                "e9patch cannot safely overlay executable {} because its path resolves through \
+                 /proc; use the executable's stable filesystem path",
+                self.program().display()
+            );
+        }
+        fs::canonicalize(&resolved).with_context(|| {
+            format!(
+                "failed to resolve e9patch executable {}",
+                resolved.display()
+            )
+        })
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-696): Review e9patch record preparation and executable overlaying.
+    fn prepare_e9patch_overlay(
+        &self,
+        global: &GlobalOpts,
+    ) -> Result<Option<E9patchRecordOverlay>, Error> {
+        if global.backend != Some(Backend::E9patch) {
+            return Ok(None);
+        }
+
+        Backend::Ptrace.ensure_available()?;
+        let target = self.resolve_e9patch_record_target()?;
+        if !is_elf_file(&target)? {
+            eprintln!(
+                ":: Backend: e9patch preprocessing + ptrace record runtime; mapped_sites=0; \
+                 main_executable=non-ELF; preprocessing=not-applicable"
+            );
+            return Ok(None);
+        }
+        if let Some(reason) = hermit::e9patch::unavailable_reason() {
+            anyhow::bail!("backend `e9patch` is unavailable: {reason}");
+        }
+
+        let prepared = hermit::e9patch::prepare(&target)?;
+        let rewrite_cache = if prepared.patched_sites == 0 {
+            "not-applicable"
+        } else if prepared.rewrite_cache_hit {
+            "hit"
+        } else {
+            "miss"
+        };
+        eprintln!(
+            ":: Backend: e9patch preprocessing + ptrace record runtime; candidate_sites={}; \
+             mapped_sites={}; b0_sites={}; instruction_map_cache={:?}; rewrite_cache={}; \
+             artifact_sha256={}",
+            prepared.candidate_sites,
+            prepared.patched_sites,
+            prepared.b0_sites,
+            prepared.instruction_map_cache_status,
+            rewrite_cache,
+            prepared.artifact_sha256.as_deref().unwrap_or("none"),
+        );
+
+        Ok(
+            (prepared.patched_sites != 0).then_some(E9patchRecordOverlay {
+                source: prepared.binary,
+                target,
+            }),
+        )
+    }
+
+    fn recording_container(&self, global: &GlobalOpts) -> Result<Container, Error> {
+        let overlay = self.prepare_e9patch_overlay(global)?;
+        let mut container = default_container(true);
+        if let Some(overlay) = overlay {
+            container.mount(Mount::bind(&overlay.source, &overlay.target).readonly());
+            container.mount(
+                Mount::new(overlay.target)
+                    .flags(MountFlags::MS_BIND | MountFlags::MS_REMOUNT | MountFlags::MS_RDONLY),
+            );
+        }
+        Ok(container)
+    }
+
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         if self.verify {
             self.record_verify(global)
@@ -209,7 +313,7 @@ impl StartOpts {
             let hermit = HermitData::from(self.data_dir.as_ref());
             let record_timeout = self.record_timeout();
 
-            let mut container = default_container(true);
+            let mut container = self.recording_container(global)?;
 
             let recording = match record_timeout {
                 Some(timeout) => {
@@ -253,7 +357,7 @@ impl StartOpts {
     fn record_verify(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         let ((global1, log1), (global2, log2)) = setup_double_run(global, "record", "replay");
 
-        let mut container = default_container(true);
+        let mut recording_container = self.recording_container(global)?;
 
         eprintln!(":: {}", "Recording...".yellow().bold());
 
@@ -261,7 +365,7 @@ impl StartOpts {
         let data_dir = temp_data_dir.path();
         let record_timeout = self.record_timeout();
 
-        let recording = container
+        let recording = recording_container
             .run(|| {
                 let _guard = global1.init_tracing();
 
@@ -281,7 +385,8 @@ impl StartOpts {
         eprintln!(":: {}", "Replaying...".yellow().bold());
 
         // Replay the recording.
-        let replay = container
+        let mut replay_container = default_container(true);
+        let replay = replay_container
             .run(|| {
                 let _guard = global2.init_tracing();
                 hermit::replay_with_output(data_dir).map_err(SerializableError::from)
@@ -306,7 +411,7 @@ impl StartOpts {
     }
     /// This is called when `--verify-with-gdbex` is passed to the command line.
     fn record_verify_debug(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
-        let mut container = default_container(true);
+        let mut container = self.recording_container(global)?;
 
         eprintln!(":: {}", "Recording...".yellow().bold());
 
@@ -423,6 +528,24 @@ mod tests {
         assert!(
             !SigSet::thread_get_mask().unwrap().contains(Signal::SIGALRM),
             "dropping must not block SIGALRM when it started unblocked"
+        );
+    }
+
+    #[test]
+    fn e9patch_record_target_rejects_proc_magic_links() {
+        let options = StartOpts {
+            program: Some(PathBuf::from("/proc/self/exe")),
+            _strict: false,
+            args: Vec::new(),
+            data_dir: None,
+            record_timeout: None,
+            verify: false,
+            gdbex: Vec::new(),
+        };
+        let error = options.resolve_e9patch_record_target().unwrap_err();
+        assert!(
+            error.to_string().contains("resolves through /proc"),
+            "unexpected error: {error}"
         );
     }
 }

@@ -151,10 +151,15 @@ impl Subcommand {
                 "the SaBRe backend is available only through `hermit --backend sabre strace`"
             );
         }
-        if backend == Some(hermit::Backend::E9patch) && !matches!(self, Subcommand::Run(_)) {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-696): Review the expanded e9patch CLI scope.
+        let starts_e9patch_guest = matches!(self, Subcommand::Run(_))
+            || matches!(self, Subcommand::Record(record) if record.starts_recording());
+        if backend == Some(hermit::Backend::E9patch) && !starts_e9patch_guest {
             anyhow::bail!(
                 "the e9patch preprocessor is available only through `hermit --backend e9patch \
-                 run`; other subcommands do not preprocess their guest"
+                 run` and `hermit --backend e9patch record`; other subcommands do not \
+                 preprocess their guest"
             );
         }
         if backend == Some(hermit::Backend::Liteinst) && !matches!(self, Subcommand::Run(_)) {
@@ -266,24 +271,51 @@ mod tests {
     }
 
     #[test]
-    fn e9patch_is_rejected_outside_run() {
+    fn e9patch_is_allowed_for_recording_but_rejected_for_management_and_replay() {
         use hermit::Backend;
 
-        let args = Args::try_parse_from([
-            "hermit",
-            "--backend",
-            "e9patch",
-            "record",
-            "start",
-            "--",
-            "/bin/true",
-        ])
-        .unwrap();
-        let error = args
-            .command
-            .validate_backend_scope(Some(Backend::E9patch))
-            .unwrap_err();
-        assert!(error.to_string().contains("only through"));
+        for command in [
+            vec![
+                "hermit",
+                "--backend",
+                "e9patch",
+                "record",
+                "start",
+                "--",
+                "/bin/true",
+            ],
+            vec![
+                "hermit",
+                "--backend",
+                "e9patch",
+                "record",
+                "--",
+                "/bin/true",
+            ],
+        ] {
+            let args = Args::try_parse_from(command).unwrap();
+            args.command
+                .validate_backend_scope(Some(Backend::E9patch))
+                .unwrap();
+        }
+
+        for command in [
+            vec!["hermit", "--backend", "e9patch", "record", "list"],
+            vec![
+                "hermit",
+                "--backend",
+                "e9patch",
+                "replay",
+                "0123456789abcdef0123456789abcdef",
+            ],
+        ] {
+            let args = Args::try_parse_from(command).unwrap();
+            let error = args
+                .command
+                .validate_backend_scope(Some(Backend::E9patch))
+                .unwrap_err();
+            assert!(error.to_string().contains("only through"));
+        }
     }
 
     #[test]

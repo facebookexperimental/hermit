@@ -49,6 +49,12 @@ enum RecordCommand {
 }
 
 impl RecordOpts {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-696): Review e9patch scope for record start forms.
+    pub fn starts_recording(&self) -> bool {
+        matches!(self.record_command, None | Some(RecordCommand::Start(_)))
+    }
+
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         match &self.record_command {
             Some(RecordCommand::List(x)) => x.main(global),
