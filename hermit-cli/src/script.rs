@@ -26,7 +26,7 @@ pub struct Shebang {
 
 impl Shebang {
     // Source of truth: fs/binfmt_script.c, function load_script().
-    fn from_buf(buf: &[u8]) -> Option<Self> {
+    pub(crate) fn from_buf(buf: &[u8]) -> Option<Self> {
         if !buf.starts_with(b"#!") {
             return None;
         }

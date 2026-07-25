@@ -487,6 +487,74 @@ fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
 /// Guest-physical memory available to the single-process KVM personality.
 const KVM_GUEST_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 
+/// Maximum `#!` interpreter indirection levels, matching the Linux kernel's
+/// `BINPRM_MAX_RECURSION` limit for chained script interpreters.
+const MAX_SHEBANG_DEPTH: usize = 4;
+
+/// Resolve `#!` interpreter scripts before the reverie-kvm ELF loader runs.
+///
+/// The KVM ELF loader can only map ELF images, so a guest program that is
+/// actually a `#!`-script (for example `/usr/local/bin/file` -> `#!/bin/bash`,
+/// or `/usr/bin/pkg-config` -> `#!/usr/bin/sh`) must be rewritten to launch its
+/// interpreter, exactly as the kernel's `execve(2)` `binfmt_script` handler
+/// does. On success the returned image is an ELF and `argv` has the interpreter,
+/// its shebang arguments, and the script path prepended in kernel order:
+/// `[interp, shebang_args.., script_path, <original argv[1..]>]`.
+///
+/// The interpreter line is parsed with hermit's shared [`Shebang`] so the KVM
+/// backend matches how the ptrace backend and recorder treat `#!`-scripts.
+fn resolve_kvm_shebang(
+    resolved_program: &Path,
+    mut argv: Vec<String>,
+) -> Result<(PathBuf, Vec<String>, Vec<u8>), Error> {
+    let mut load_path = resolved_program.to_path_buf();
+    let mut image = fs::read(&load_path)
+        .map_err(|error| anyhow!("failed to read KVM guest executable {load_path:?}: {error}"))?;
+
+    let mut depth = 0;
+    while image.starts_with(b"#!") {
+        depth += 1;
+        if depth > MAX_SHEBANG_DEPTH {
+            return Err(anyhow!(
+                "too many levels of `#!` interpreter indirection loading {resolved_program:?}"
+            ));
+        }
+        let (interpreter, shebang_args) = Shebang::from_buf(&image)
+            .ok_or_else(|| anyhow!("malformed `#!` interpreter line in {load_path:?}"))?
+            .into_parts();
+        let interpreter_str = interpreter
+            .to_str()
+            .ok_or_else(|| anyhow!("non-UTF-8 `#!` interpreter path in {load_path:?}"))?
+            .to_owned();
+
+        // Rewrite argv in kernel order. The prior argv[0] (the script's own
+        // name) is dropped on the first level; on deeper levels the previous
+        // interpreter path is preserved as a positional argument, matching
+        // `binfmt_script`.
+        let mut rewritten = Vec::with_capacity(argv.len() + shebang_args.len() + 2);
+        rewritten.push(interpreter_str);
+        for arg in &shebang_args {
+            rewritten.push(
+                arg.to_str()
+                    .ok_or_else(|| anyhow!("non-UTF-8 `#!` interpreter argument in {load_path:?}"))?
+                    .to_owned(),
+            );
+        }
+        rewritten.push(load_path.to_string_lossy().into_owned());
+        rewritten.extend_from_slice(&argv[1..]);
+        argv = rewritten;
+
+        load_path = interpreter;
+        image = fs::read(&load_path).map_err(|error| {
+            anyhow!(
+                "failed to read `#!` interpreter {load_path:?} for {resolved_program:?}: {error}"
+            )
+        })?;
+    }
+
+    Ok((load_path, argv, image))
+}
+
 /// Dispatch a command onto the real reverie-kvm Tool runtime.
 async fn run_kvm(
     command: &Command,
@@ -520,13 +588,6 @@ async fn run_kvm(
     let resolved_program = command.find_program().map_err(|error| {
         anyhow!("failed to resolve KVM guest executable {program:?} in the guest PATH: {error}")
     })?;
-    let image = fs::read(&resolved_program).map_err(|error| {
-        anyhow!(
-            "failed to read KVM guest executable {:?}: {error}",
-            resolved_program
-        )
-    })?;
-
     let mut argv = Vec::with_capacity(1 + command.get_args().count());
     argv.push(program.clone());
     for argument in command.get_args() {
@@ -537,6 +598,11 @@ async fn run_kvm(
                 .to_owned(),
         );
     }
+
+    // Rewrite `#!`-scripts to their interpreter before the ELF loader sees them.
+    let (_interpreter_path, argv, image) = resolve_kvm_shebang(&resolved_program, argv)?;
+    // After shebang resolution the executable is the interpreter (argv[0]).
+    let program = argv.first().cloned().unwrap_or(program);
     let envp = command
         .get_captured_envs()
         .into_iter()
@@ -946,6 +1012,7 @@ pub async fn replay_with_output(dir: &Path) -> Result<Output, Error> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
 
     use super::Backend;
     use super::dbi_runtime_unavailable_reason;
@@ -954,6 +1021,7 @@ mod tests {
     use super::is_dynamorio_sdk;
     use super::kvm_device_unavailable_reason;
     use super::liteinst_runtime_unavailable_reason;
+    use super::resolve_kvm_shebang;
     use super::sabre_runtime_unavailable_reason;
 
     #[test]
@@ -1128,5 +1196,101 @@ mod tests {
         // The point of the experiment is to observe whether Detcore can be driven
         // to completion over KvmGuest at all; assert it did not error.
         outcome.expect("Detcore drove the synthetic KVM guest to completion");
+    }
+
+    // Minimal fake ELF payload: the loader only needs the image to NOT start
+    // with `#!`, and a real ELF magic makes the intent obvious.
+    const FAKE_ELF: &[u8] = b"\x7fELF\x02\x01\x01\x00 fake elf body";
+
+    fn shebang_tmpdir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hermit-shebang-test-{}-{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn resolve_shebang_plain_elf_is_unchanged() {
+        let dir = shebang_tmpdir("plain");
+        let prog = dir.join("prog");
+        fs::write(&prog, FAKE_ELF).unwrap();
+
+        let argv = vec!["prog".to_owned(), "-a".to_owned()];
+        let (path, out_argv, image) = resolve_kvm_shebang(&prog, argv).unwrap();
+        assert_eq!(path, prog);
+        assert_eq!(out_argv, vec!["prog".to_owned(), "-a".to_owned()]);
+        assert_eq!(image, FAKE_ELF);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_shebang_single_level_kernel_order() {
+        let dir = shebang_tmpdir("single");
+        let interp = dir.join("fakebash");
+        fs::write(&interp, FAKE_ELF).unwrap();
+        let script = dir.join("script");
+        // Interpreter with a single optional argument.
+        fs::write(&script, format!("#!{} -x\necho hi\n", interp.display())).unwrap();
+
+        let argv = vec!["script".to_owned(), "arg1".to_owned()];
+        let (path, out_argv, image) = resolve_kvm_shebang(&script, argv).unwrap();
+        assert_eq!(path, interp);
+        // Kernel order: [interp, optarg, script_path, original args after argv[0]].
+        assert_eq!(
+            out_argv,
+            vec![
+                interp.to_string_lossy().into_owned(),
+                "-x".to_owned(),
+                script.to_string_lossy().into_owned(),
+                "arg1".to_owned(),
+            ]
+        );
+        assert_eq!(image, FAKE_ELF);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_shebang_nested_accumulates_like_binfmt_script() {
+        let dir = shebang_tmpdir("nested");
+        let interp = dir.join("fakebash");
+        fs::write(&interp, FAKE_ELF).unwrap();
+        let mid = dir.join("mid"); // a #!-interpreter that is itself a script
+        fs::write(&mid, format!("#!{}\n", interp.display())).unwrap();
+        let script = dir.join("script");
+        fs::write(&script, format!("#!{} -e\n", mid.display())).unwrap();
+
+        let argv = vec!["script".to_owned(), "arg1".to_owned()];
+        let (path, out_argv, image) = resolve_kvm_shebang(&script, argv).unwrap();
+        assert_eq!(path, interp);
+        // Level 1: [mid, -e, script, arg1]; level 2 prepends [interp, mid].
+        assert_eq!(
+            out_argv,
+            vec![
+                interp.to_string_lossy().into_owned(),
+                mid.to_string_lossy().into_owned(),
+                "-e".to_owned(),
+                script.to_string_lossy().into_owned(),
+                "arg1".to_owned(),
+            ]
+        );
+        assert_eq!(image, FAKE_ELF);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_shebang_rejects_infinite_recursion() {
+        let dir = shebang_tmpdir("loop");
+        let a = dir.join("a");
+        let b = dir.join("b");
+        fs::write(&a, format!("#!{}\n", b.display())).unwrap();
+        fs::write(&b, format!("#!{}\n", a.display())).unwrap();
+
+        let argv = vec!["a".to_owned()];
+        assert!(resolve_kvm_shebang(&a, argv).is_err());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
