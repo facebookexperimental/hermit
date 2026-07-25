@@ -269,8 +269,8 @@ readonly RR_COMPAT_EXPECTED=128
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
 readonly SABRE_COMPAT_TOTAL=151
-readonly E9PATCH_COMPAT_TOTAL=151
-readonly E9PATCH_EXTENDED_PROGRAMS=55
+readonly E9PATCH_COMPAT_TOTAL=156
+readonly E9PATCH_EXTENDED_PROGRAMS=56
 COMPATIBILITY_MODE=strict
 E9PATCH_COMPAT_REWRITTEN=0
 E9PATCH_COMPAT_ZERO_SITE=0
@@ -1031,7 +1031,9 @@ function strict_compatibility_probe {
         run_args+=(--strict --verify --)
         # TODO-HUMAN-REVIEW(PR-681): Review the cache-miss whole-row
         # budget for the large internal mysql executable.
-        if [[ $label == mysql ]]; then
+        # TODO-HUMAN-REVIEW(PR-687): Review extending the same cache-miss
+        # budget to the large internal PHP/HHVM executable.
+        if [[ $label == mysql || $label == php ]]; then
             probe_timeout=180
         fi
     fi
@@ -1764,6 +1766,8 @@ function run_e9patch_extended_compatibility_envelope {
     optional_e9patch_compatibility_probe perf perf --version
     optional_e9patch_compatibility_probe rustup rustup --version
     optional_e9patch_compatibility_probe mysql mysql --version
+    # TODO-HUMAN-REVIEW(PR-687): Review PHP/HHVM cache-miss rewrite coverage.
+    optional_e9patch_compatibility_probe php php --version
     optional_e9patch_compatibility_probe nginx nginx -v
     optional_e9patch_compatibility_probe ldconfig ldconfig --version
 
@@ -2193,11 +2197,11 @@ if ((E9PATCH_COMPAT_ONLY == 1)); then
             cargo build --release -p hermit
     fi
     if ((failures == 0)); then
-        run_check "e9patch compatibility matrix (151 programs)" \
+        run_check "e9patch compatibility matrix ($E9PATCH_COMPAT_TOTAL programs)" \
             run_e9patch_compatibility_envelope
     fi
     if ((failures == 0)); then
-        run_check "e9patch extended installed-program matrix (55 optional programs)" \
+        run_check "e9patch extended installed-program matrix ($E9PATCH_EXTENDED_PROGRAMS optional programs)" \
             run_e9patch_extended_compatibility_envelope
     fi
     print_summary
