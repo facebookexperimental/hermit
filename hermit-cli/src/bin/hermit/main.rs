@@ -143,14 +143,25 @@ enum Subcommand {
 }
 
 impl Subcommand {
-    fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
-        if global.backend == Some(hermit::Backend::Sabre)
+    fn validate_backend_scope(&self, backend: Option<hermit::Backend>) -> Result<(), Error> {
+        if backend == Some(hermit::Backend::Sabre)
             && !matches!(self, Subcommand::Strace(_) | Subcommand::Run(_))
         {
             anyhow::bail!(
                 "the SaBRe backend is available only through `hermit --backend sabre strace`"
             );
         }
+        if backend == Some(hermit::Backend::E9patch) && !matches!(self, Subcommand::Run(_)) {
+            anyhow::bail!(
+                "the e9patch preprocessor is available only through `hermit --backend e9patch \
+                 run`; other subcommands do not preprocess their guest"
+            );
+        }
+        Ok(())
+    }
+
+    fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        self.validate_backend_scope(global.backend)?;
         match self {
             Subcommand::Run(x) => x.main(global),
             Subcommand::Strace(x) => x.main(global),
@@ -246,6 +257,27 @@ mod tests {
             .expect("global-position --backend should parse");
         assert_eq!(args.global.backend, Some(Backend::Kvm));
         assert!(matches!(args.command, Subcommand::Run(_)));
+    }
+
+    #[test]
+    fn e9patch_is_rejected_outside_run() {
+        use hermit::Backend;
+
+        let args = Args::try_parse_from([
+            "hermit",
+            "--backend",
+            "e9patch",
+            "record",
+            "start",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        let error = args
+            .command
+            .validate_backend_scope(Some(Backend::E9patch))
+            .unwrap_err();
+        assert!(error.to_string().contains("only through"));
     }
 
     #[test]

@@ -898,6 +898,7 @@ dependencies = [
  "detcore",
  "detcore-dbi",
  "diff",
+ "digest 0.0.0",
  "dirs",
  "edit-distance",
  "fbinit",

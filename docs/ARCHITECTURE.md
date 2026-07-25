@@ -63,7 +63,7 @@ operations. Detcore supplies the policy — what is emulated, transformed,
 ordered, recorded, or replayed. Keeping that seam clean is what makes more than
 one backend conceivable without rewriting the deterministic core.
 
-Three backend mechanisms sit at different points on the speed/completeness/
+Four backend mechanisms sit at different points on the speed/completeness/
 determinism curve:
 
 | Backend | Mechanism | Status | Trade-off |
@@ -71,12 +71,27 @@ determinism curve:
 | **ptrace** | seccomp-BPF `SECCOMP_RET_TRACE` + `PTRACE`, out-of-process tracer | Production; the only in-tree backend (`reverie-ptrace`) | Complete and strongly deterministic; per-event context-switch cost |
 | **DBI** (SaBRe / DynamoRIO style) | In-process binary rewriting / function hooking of syscall sites | Experimental / research | Low overhead; today it is a syscall-boundary interceptor, **not** a deterministic backend |
 | **KVM / SVM** | Run the guest inside a hardware VM and trap via VM-exits | Exploratory | Can trap instructions ptrace cannot (see CPUID below); heaviest isolation and integration cost |
+| **e9patch + ptrace** | Cached offline main-ELF rewriting followed by the ptrace Detcore runtime | Experimental hybrid | Exact mapped-site coverage; raw random/TSX instructions remain unsupported even when mapped |
 
 **ptrace (current).** seccomp selects which syscalls trap; ptrace delivers the
 stops to an out-of-process tracer that holds all Detcore state. This is the
 backend the rest of this document describes. It is complete (it sees every
 subscribed event from every thread) and integrates with the PMU for RCB-based
 preemption, at the cost of a context switch per intercepted event.
+
+**e9patch hybrid.** The `e9patch` backend loads the cached instruction map for
+the main executable and invokes `e9tool` with an exact file-offset matcher.
+Each mapped site receives an empty before-trampoline, preserving the original
+instruction; partial coverage fails closed, and B0 is disabled because it would
+reserve SIGILL. The result is bind-mounted read-only at the original executable
+path and runs through the existing ptrace Detcore runtime. Ptrace remains the
+correctness path for trapped syscalls, CPUID, RDTSC, and RDTSCP in the main ELF,
+DSOs, vDSO, and dynamic code. Empty trampolines do not make raw `RDRAND`,
+`RDSEED`, or TSX deterministic even when those sites are mapped, so those
+instructions remain unsupported. Privilege-bearing executables fail closed
+rather than losing set-ID or file-capability semantics. A future standalone
+backend requires an in-process Detcore
+callback seam; this implementation does not claim that performance property.
 
 **DBI (in-process).** A dynamic binary instrumentation backend such as the
 restored SaBRe loader rewrites syscall sites in-process and calls into a tool
@@ -96,7 +111,7 @@ the current DBI prototype does not provide that coverage. Hardware
 virtualization has a much larger integration surface and loses the simple
 "host process under ptrace" model.
 
-The important invariant across all three: interception alone does not create
+The important invariant across all backends: interception alone does not create
 determinism. Whichever backend catches an event, a Detcore handler must still
 define the event's observable result and its place in the schedule.
 

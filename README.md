@@ -80,13 +80,15 @@ hermit run --strict -- /bin/echo hello
 
 ### Execution Backends
 
-Hermit accepts `--backend=ptrace|dbi|kvm` as a global option, before the
-subcommand, since the backend applies to how any subcommand instruments the
-guest. Omitting the option selects `ptrace`, preserving the existing behavior:
+Hermit accepts `--backend=ptrace|dbi|kvm|e9patch` as a global option, before the
+subcommand. Omitting the option selects `ptrace`, preserving the existing behavior:
 
 ```bash
 hermit --backend=ptrace run -- /bin/echo hello
 ```
+
+The e9patch preprocessor is currently supported only by `run`; other explicit
+e9patch subcommand combinations fail closed.
 
 For backwards compatibility, `run` still accepts `--backend` after the
 subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
@@ -97,6 +99,22 @@ SDK and does not yet expose a Detcore process launcher. The bare KVM prototype
 requires read-write `/dev/kvm` access (commonly through the `kvm` group or root)
 and a guest-kernel Linux ABI. Until those adapters are integrated, either returns
 an availability error rather than running the command without determinization.
+
+The experimental `e9patch` selection is intentionally a hybrid backend. At
+startup it loads or generates the main ELF's cached instruction map, then runs
+`e9tool` with exact file-offset matches to install semantics-preserving
+trampolines at every mapped site. Partial coverage fails closed. Hermit does not
+enable e9patch's B0 fallback because it reserves SIGILL and changes guest signal
+semantics. The rewritten ELF still runs through Detcore's ptrace backend, which
+executes the original instructions and covers trapped events in shared
+libraries, the vDSO, and dynamic code. Raw `RDRAND`, `RDSEED`, and TSX in code
+remain unsupported even when present in the offline map because this initial
+integration installs empty trampolines. Privilege-bearing executables fail
+closed rather than losing set-ID or file-capability semantics. This
+establishes the cached-rewrite pipeline but does not yet reduce ptrace events.
+Install `e9tool` in `PATH` or set `HERMIT_E9TOOL` to its executable.
+Non-ELF entrypoints, including shebang scripts, skip preprocessing and run
+through the ptrace correctness path.
 
 A quick determinism check is to run the same virtual random-data read twice:
 

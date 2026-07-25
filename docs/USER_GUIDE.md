@@ -127,14 +127,16 @@ hermit run --base-env=minimal -e LANG=C --workdir=/tmp -- /bin/pwd
 
 #### Backend Selection
 
-Use `--backend=ptrace|dbi|kvm` to select the process instrumentation backend.
-It is a global option and belongs before the subcommand, because the backend
-governs how any subcommand instruments the guest. The default is `ptrace`, so
-existing commands are unchanged:
+Use `--backend=ptrace|dbi|kvm|e9patch` to select the process instrumentation
+backend. It is a global option and belongs before the subcommand. The default is
+`ptrace`, so existing commands are unchanged:
 
 ```bash
 hermit --backend=ptrace run -- /bin/echo hello
 ```
+
+The e9patch preprocessor is currently supported only by `run`; other explicit
+e9patch subcommand combinations fail closed.
 
 For backwards compatibility, `run` also accepts `--backend` after the
 subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
@@ -146,6 +148,22 @@ process launcher. The bare KVM prototype requires read-write `/dev/kvm` access,
 commonly through the `kvm` group or root, plus a guest-kernel ABI. Requests for
 those prototypes therefore fail before the guest starts and explain the missing
 capability.
+
+`e9patch` is an experimental hybrid rather than a standalone Detcore runtime.
+It uses the cached offline instruction map to apply `before empty` trampolines
+to every mapped site in the main ELF and rejects partial coverage. Hermit does
+not enable e9patch's B0 fallback because reserving SIGILL would change guest
+signal semantics. The rewritten program is bind-mounted read-only at the
+original executable path, then runs under the ptrace Detcore backend, which
+preserves strict-mode semantics for trapped events in shared libraries, the
+vDSO, and dynamic code. Empty trampolines do not make raw `RDRAND`, `RDSEED`,
+or TSX deterministic even when those sites are mapped, so those instructions
+remain unsupported. Privilege-bearing executables fail closed rather than
+losing set-ID or file-capability semantics. This first integration validates
+rewrite coverage; it does not yet remove ptrace overhead. Put
+`e9tool` in `PATH` or set `HERMIT_E9TOOL=/path/to/e9tool`.
+Non-ELF entrypoints, including shebang scripts, skip preprocessing and run
+through the ptrace correctness path.
 
 `--namespace-only` bypasses instrumentation entirely. Combining it with any
 explicit `--backend` selection is rejected because the backend would be ignored.
