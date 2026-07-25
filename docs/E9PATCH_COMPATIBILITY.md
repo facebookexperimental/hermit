@@ -52,18 +52,26 @@ both passed at L2.
 
 ## 2026-07-24 extended result
 
-All 38 extended programs were installed on the measurement host.
+All 43 extended programs were installed on the measurement host.
 
 | Result | Programs | Meaning |
 | --- | ---: | --- |
-| L2 pass | 38 | Every installed extended probe produced equivalent logs. |
-| Rewritten ELF | 5 | `go`, `gdb`, `rsync`, `lscpu`, and `podman`. |
+| L2 pass | 43 | Every installed extended probe produced equivalent logs. |
+| Rewritten ELF | 10 | `go`, `gdb`, `rsync`, `lscpu`, `podman`, `perf`, `rustup`, `mysql`, `nginx`, and `ldconfig`. |
 | Zero-site ELF | 32 | No candidate instruction sites in the main executable. |
 | Non-ELF fallback | 1 | `ldd` ran through the explicit ptrace fallback. |
 | Failure | 0 | No failure remained in the blocking extended set. |
 
-Together, the core and extended matrices cover 189 entrypoints at L2 on this
-host, including 11 rewritten rows.
+Together, the core and extended matrices cover 194 entrypoints at L2 on this
+host, including 16 rewritten rows.
+
+The five added cache-miss rewrites recovered and patched `perf` 9/9 sites,
+`rustup` 24/49 candidates, `mysql` 125/125 sites, `nginx` 2/2 sites, and
+`ldconfig` 183/183 sites. Rustup's unrecovered offsets are data according to
+e9tool, so its 24/24 recovered instructions are complete coverage. The large
+internal mysql executable took about 95 seconds to preprocess on this host and
+then passed at L2 from cache; its complete row has a 180-second bound. The
+other rows retain the default 60-second bound.
 
 The initial full Go rewrite exposed an e9tool optimizer interaction. The
 default O2 artifact patched all 49 candidates and ran directly on the host, but

@@ -270,7 +270,7 @@ readonly RR_COMPAT_EXPECTED=128
 readonly SABRE_COMPAT_EXPECTED=151
 readonly SABRE_COMPAT_TOTAL=151
 readonly E9PATCH_COMPAT_TOTAL=151
-readonly E9PATCH_EXTENDED_PROGRAMS=38
+readonly E9PATCH_EXTENDED_PROGRAMS=43
 COMPATIBILITY_MODE=strict
 E9PATCH_COMPAT_REWRITTEN=0
 E9PATCH_COMPAT_ZERO_SITE=0
@@ -1012,6 +1012,7 @@ function strict_compatibility_probe {
     local summary
     local assurance=L2
     local backend_diagnostic=""
+    local probe_timeout=$STRICT_COMPAT_TIMEOUT
     local -a run_args=(run --strict --verify --)
     if [[ $COMPATIBILITY_MODE == sabre ]]; then
         assurance=SaBRe
@@ -1028,12 +1029,17 @@ function strict_compatibility_probe {
                 ;;
         esac
         run_args+=(--strict --verify --)
+        # TODO-HUMAN-REVIEW(PR-681): Review the cache-miss whole-row
+        # budget for the large internal mysql executable.
+        if [[ $label == mysql ]]; then
+            probe_timeout=180
+        fi
     fi
 
     {
         printf "=== %s compatibility: %s ===\n" "$assurance" "$label"
         printf "Command: timeout %s %q" \
-            "$STRICT_COMPAT_TIMEOUT" "$STRICT_COMPAT_HERMIT_BIN"
+            "$probe_timeout" "$STRICT_COMPAT_HERMIT_BIN"
         printf " %q" "${run_args[@]}"
         printf " %q" "$@"
         printf "\n"
@@ -1044,7 +1050,7 @@ function strict_compatibility_probe {
         printf "  %s compatibility probe: %s\n" "$assurance" "$label"
     fi
 
-    if timeout "$STRICT_COMPAT_TIMEOUT" \
+    if timeout "$probe_timeout" \
         "$STRICT_COMPAT_HERMIT_BIN" "${run_args[@]}" "$@" \
         </dev/null >>"$LOG_FILE" 2>&1; then
         status=0
@@ -1734,6 +1740,11 @@ function run_e9patch_extended_compatibility_envelope {
     optional_e9patch_compatibility_probe ip ip -Version
     optional_e9patch_compatibility_probe ss ss -V
     optional_e9patch_compatibility_probe podman podman --version
+    optional_e9patch_compatibility_probe perf perf --version
+    optional_e9patch_compatibility_probe rustup rustup --version
+    optional_e9patch_compatibility_probe mysql mysql --version
+    optional_e9patch_compatibility_probe nginx nginx -v
+    optional_e9patch_compatibility_probe ldconfig ldconfig --version
 
     classified=$((E9PATCH_COMPAT_REWRITTEN + E9PATCH_COMPAT_ZERO_SITE + \
         E9PATCH_COMPAT_CANDIDATE_ONLY + E9PATCH_COMPAT_NON_ELF + \
@@ -2151,7 +2162,7 @@ if ((E9PATCH_COMPAT_ONLY == 1)); then
             run_e9patch_compatibility_envelope
     fi
     if ((failures == 0)); then
-        run_check "e9patch extended installed-program matrix (38 optional programs)" \
+        run_check "e9patch extended installed-program matrix (43 optional programs)" \
             run_e9patch_extended_compatibility_envelope
     fi
     print_summary
