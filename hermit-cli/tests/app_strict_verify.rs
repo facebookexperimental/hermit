@@ -53,10 +53,14 @@
 //! isolates managed-runtime determinism from compiler determinism.
 
 use std::fs;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
@@ -76,6 +80,53 @@ fn hermit_run_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#651)
+/// Run a bounded Hermit command without waiting for orphaned guest pipe FDs.
+///
+/// If `timeout(1)` kills Hermit while a guest descendant is still alive, that
+/// descendant can retain inherited stdout/stderr pipes. `Command::output`
+/// would then wait forever for EOF even though `timeout` has already exited.
+/// Regular files let the harness observe the timeout status immediately.
+fn run_hermit_command(mut command: Command) -> Output {
+    let rendered = format!("{command:?}");
+    let mut stdout = tempfile::tempfile().expect("failed to create Hermit stdout capture");
+    let mut stderr = tempfile::tempfile().expect("failed to create Hermit stderr capture");
+
+    command
+        .stdout(Stdio::from(
+            stdout
+                .try_clone()
+                .expect("failed to clone Hermit stdout capture"),
+        ))
+        .stderr(Stdio::from(
+            stderr
+                .try_clone()
+                .expect("failed to clone Hermit stderr capture"),
+        ));
+
+    let status = command
+        .status()
+        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+
+    let mut stdout_bytes = Vec::new();
+    stdout
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| stdout.read_to_end(&mut stdout_bytes))
+        .expect("failed to read Hermit stdout capture");
+    let mut stderr_bytes = Vec::new();
+    stderr
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| stderr.read_to_end(&mut stderr_bytes))
+        .expect("failed to read Hermit stderr capture");
+
+    Output {
+        status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    }
+}
+
 /// Resolve the first candidate path that names an existing regular file.
 ///
 /// These applications are installed by the self-hosted CI job, so a missing
@@ -91,6 +142,44 @@ fn required_app(name: &str, candidates: &[&str]) -> PathBuf {
                  {candidates:?} (the self-hosted CI job installs it)"
             )
         })
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#651)
+/// Resolve a JDK tool from the setup-java toolchain before host fallbacks.
+fn required_jdk_app(name: &str, fallbacks: &[&str]) -> PathBuf {
+    if let Some(java_home) = std::env::var_os("JAVA_HOME") {
+        let path = PathBuf::from(java_home).join("bin").join(name);
+        assert!(
+            path.is_file(),
+            "ERROR: JAVA_HOME is set but required JDK tool {} is missing",
+            path.display(),
+        );
+        return path;
+    }
+
+    required_app(name, fallbacks)
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#651)
+/// Bound JVM-internal concurrency while retaining application thread coverage.
+fn java_vm_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut bounded: Vec<&'a str> = vec!["-Xint", "-XX:+UseSerialGC", "-XX:ActiveProcessorCount=1"];
+    bounded.extend_from_slice(args);
+    bounded
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#651)
+fn javac_vm_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut bounded: Vec<&'a str> = vec![
+        "-J-Xint",
+        "-J-XX:+UseSerialGC",
+        "-J-XX:ActiveProcessorCount=1",
+    ];
+    bounded.extend_from_slice(args);
+    bounded
 }
 
 /// Run `hermit run --strict --verify -- <program> <args>` and assert that
@@ -126,9 +215,7 @@ fn assert_l2_under_strict_verify(program: &Path, args: &[&str]) {
         .args(args);
 
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    let output = run_hermit_command(command);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -173,8 +260,9 @@ fn redis_server_version_is_deterministic_under_strict_verify() {
 #[test]
 #[ignore = "e2e: requires hermit + PMU/mount namespaces + a JVM"]
 fn java_version_is_deterministic_under_strict_verify() {
-    let java = required_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
-    assert_l2_under_strict_verify(&java, &["-version"]);
+    let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
+    let args = java_vm_args(&["-version"]);
+    assert_l2_under_strict_verify(&java, &args);
 }
 
 // ---------------------------------------------------------------------------
@@ -307,7 +395,7 @@ fn compile_go(source: &str, bin_name: &str) -> PathBuf {
 /// Compile a single Java class with the host `javac`, returning the classpath
 /// directory that holds the resulting `.class`.
 fn compile_java(source: &str, class_name: &str) -> PathBuf {
-    let javac = required_app("javac", &["/usr/local/bin/javac", "/usr/bin/javac"]);
+    let javac = required_jdk_app("javac", &["/usr/local/bin/javac", "/usr/bin/javac"]);
     let dir = build_dir(class_name);
     let src = dir.join(format!("{class_name}.java"));
     fs::write(&src, source).expect("failed to write Java source");
@@ -341,10 +429,7 @@ fn run_once_under_strict(program: &Path, args: &[&str]) -> Output {
         .arg(program)
         .args(args);
 
-    let rendered = format!("{command:?}");
-    command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"))
+    run_hermit_command(command)
 }
 
 /// Assert assurance level L1 for a driver that does not reach L2: two separate
@@ -397,19 +482,21 @@ fn go_goroutines_are_deterministic_under_strict_verify() {
 #[test]
 #[ignore = "e2e: requires hermit + PMU/mount namespaces + a JDK"]
 fn java_hello_is_deterministic_under_strict_verify() {
-    let java = required_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
+    let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
     let classpath = compile_java(JAVA_HELLO_SRC, "Hello");
     let classpath = classpath.to_str().expect("classpath is valid UTF-8");
-    assert_l2_under_strict_verify(&java, &["-cp", classpath, "Hello"]);
+    let args = java_vm_args(&["-cp", classpath, "Hello"]);
+    assert_l2_under_strict_verify(&java, &args);
 }
 
 #[test]
 #[ignore = "e2e: requires hermit + PMU/mount namespaces + a JDK"]
 fn java_threads_are_deterministic_under_strict_verify() {
-    let java = required_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
+    let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
     let classpath = compile_java(JAVA_THREADS_SRC, "Threads");
     let classpath = classpath.to_str().expect("classpath is valid UTF-8");
-    assert_l2_under_strict_verify(&java, &["-cp", classpath, "Threads"]);
+    let args = java_vm_args(&["-cp", classpath, "Threads"]);
+    assert_l2_under_strict_verify(&java, &args);
 }
 
 // --- L1: toolchain drivers are output-deterministic but not bitwise (no L2) ---
@@ -430,7 +517,7 @@ fn javac_is_l1_deterministic_under_strict() {
     // Hermit's --verify reports it nondeterministic, so it is asserted at L1.
     // Compile into two separate output directories under --strict and compare
     // both the exit status (via `run_once_under_strict`) and the emitted class.
-    let javac = required_app("javac", &["/usr/local/bin/javac", "/usr/bin/javac"]);
+    let javac = required_jdk_app("javac", &["/usr/local/bin/javac", "/usr/bin/javac"]);
 
     let src_dir = build_dir("javac_l1_src");
     let src = src_dir.join("Hello.java");
@@ -443,7 +530,8 @@ fn javac_is_l1_deterministic_under_strict() {
         let out_dir = build_dir(&format!("javac_l1_out{run}"));
         let out_dir_str = out_dir.to_str().expect("out dir is valid UTF-8");
         let src_str = src.to_str().expect("src path is valid UTF-8");
-        let output = run_once_under_strict(&javac, &["-d", out_dir_str, src_str]);
+        let args = javac_vm_args(&["-d", out_dir_str, src_str]);
+        let output = run_once_under_strict(&javac, &args);
         assert!(
             output.status.success(),
             "hermit run --strict javac (run {run}) failed\nstatus: {}\nstderr:\n{}",
