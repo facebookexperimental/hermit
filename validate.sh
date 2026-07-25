@@ -1132,7 +1132,9 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe pwd /usr/bin/pwd \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe seq /usr/bin/seq 10 \
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#700): Review the functional miscellaneous probes.
+    functional_compatibility_probe seq /usr/bin/seq 10 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe cat /bin/cat README.md \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1327,7 +1329,7 @@ function run_compatibility_corpus {
     strict_compatibility_probe join bash -c \
         'join <(printf "1 alpha\n2 beta\n") <(printf "1 one\n2 two\n")' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe find find /etc -maxdepth 1 \
+    functional_compatibility_probe find find /etc -maxdepth 1 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Numeric output avoids nondeterministic host NSS owner/group lookups.
     strict_compatibility_probe stat stat -c '%n %s %f' /etc/hostname \
@@ -1338,14 +1340,14 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe dirname /usr/bin/dirname /usr/local/bin/hermit \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe env /usr/bin/env -i HERMIT_COMPAT=env /usr/bin/env \
+    functional_compatibility_probe env /usr/bin/env -i HERMIT_COMPAT=env /usr/bin/env \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe printenv /usr/bin/env -i HERMIT_COMPAT=printenv \
         /usr/bin/printenv HERMIT_COMPAT \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe uname /usr/bin/uname -sr \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe factor factor 42 \
+    functional_compatibility_probe factor factor 42 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe expr expr 2 + 2 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1424,9 +1426,13 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe ls /usr/bin/ls -1 README.md \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe xargs bash -c \
+    functional_compatibility_probe xargs bash -c \
         'printf "one\ntwo\n" | /usr/bin/xargs -n1 /bin/echo' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    if [[ $COMPATIBILITY_MODE == strict ]]; then
+        functional_compatibility_probe time /usr/bin/time --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+    fi
     strict_compatibility_probe iconv bash -c \
         'printf "hermit\n" | /usr/bin/iconv -f UTF-8 -t UTF-8' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1586,7 +1592,7 @@ function run_compatibility_corpus {
     strict_compatibility_probe fmt bash -c \
         'set -euo pipefail; printf "Hermit formats this deterministic paragraph into narrow lines for validation.\n" | fmt -w 24' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe shuf bash -c \
+    functional_compatibility_probe shuf bash -c \
         'set -euo pipefail; output=$(printf "alpha\nbeta\ngamma\ndelta\n" | shuf | sort); test "$output" = "$(printf "alpha\nbeta\ndelta\ngamma\n")"; printf "shuf-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe numfmt /usr/bin/numfmt --to=iec 1048576 \

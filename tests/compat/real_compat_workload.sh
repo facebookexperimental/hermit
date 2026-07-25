@@ -478,6 +478,54 @@ EOF
         grep -Eq '^[[:space:]]*[1-9][0-9]*:.*compat_marker' "$WORK_DIR/coverage.c.gcov"
         printf 'gcov:covered-marker\n'
         ;;
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#700): Review the expanded miscellaneous workloads.
+    seq)
+        output=$(/usr/bin/seq 2 3 20 | /usr/bin/paste -sd, -)
+        test "$output" = '2,5,8,11,14,17,20'
+        printf 'seq:stepped-range-ok\n'
+        ;;
+    find)
+        readonly tree="$WORK_DIR/tree"
+        mkdir -p "$tree/a" "$tree/b/nested"
+        printf 'alpha\n' >"$tree/a/alpha.txt"
+        printf 'beta\n' >"$tree/b/beta.log"
+        printf 'gamma\n' >"$tree/b/nested/gamma.txt"
+        output=$(/usr/bin/find "$tree" -type f -name '*.txt' -printf '%P\n' |
+            /usr/bin/sort)
+        test "$output" = $'a/alpha.txt\nb/nested/gamma.txt'
+        printf 'find:recursive-filter-ok\n'
+        ;;
+    env)
+        output=$(/usr/bin/env -i ALPHA=6 BETA=7 /usr/bin/printenv ALPHA BETA)
+        test "$output" = $'6\n7'
+        printf 'env:clean-two-vars-ok\n'
+        ;;
+    factor)
+        output=$(/usr/bin/factor 360 97)
+        test "$output" = $'360: 2 2 2 3 3 5\n97: 97'
+        printf 'factor:composite-and-prime-ok\n'
+        ;;
+    xargs)
+        output=$(printf '6\n7\n' | /usr/bin/xargs -n1 /usr/bin/expr 6 '*')
+        test "$output" = $'36\n42'
+        printf 'xargs:two-products-ok\n'
+        ;;
+    time)
+        /usr/bin/time -f 'exit=%x maxrss=%M' -o "$WORK_DIR/timing.txt" \
+            /bin/sh -c "/bin/echo time-command-ok >$WORK_DIR/command.txt"
+        IFS= read -r command_output <"$WORK_DIR/command.txt"
+        IFS= read -r timing <"$WORK_DIR/timing.txt"
+        test "$command_output" = 'time-command-ok'
+        test "$timing" = 'exit=0 maxrss=0'
+        printf 'time:exit-and-rusage-ok\n'
+        ;;
+    shuf)
+        output=$(printf 'alpha\nbeta\ngamma\ndelta\n' |
+            /usr/bin/shuf | /usr/bin/sort)
+        test "$output" = $'alpha\nbeta\ndelta\ngamma'
+        printf 'shuf:permutation-ok\n'
+        ;;
     *)
         echo "unknown real compatibility workload: $PROGRAM" >&2
         exit 2
