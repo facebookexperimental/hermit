@@ -102,6 +102,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::pipe2
         | Sysno::poll
         | Sysno::ppoll
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
+        | Sysno::pselect6
         | Sysno::prlimit64
         | Sysno::pread64
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -395,7 +398,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::process_mrelease
         | Sysno::process_vm_readv
         | Sysno::process_vm_writev
-        | Sysno::pselect6
         | Sysno::ptrace
         | Sysno::putpmsg
         | Sysno::pwritev
@@ -500,7 +502,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [111, 68, 194]);
+        assert_eq!(counts, [112, 68, 193]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 

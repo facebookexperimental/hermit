@@ -43,7 +43,122 @@ function build_assembly_object {
     /usr/bin/as --64 "$WORK_DIR/add.s" -o "$WORK_DIR/add.o"
 }
 
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(#686): Review archive reproducibility and localhost fixture cleanup.
+function prepare_archive_fixture {
+    mkdir -p "$WORK_DIR/source" "$WORK_DIR/output"
+    printf 'Hermit archive payload\nline two\n' >"$WORK_DIR/source/payload.txt"
+    touch -t 200001010000 "$WORK_DIR/source/payload.txt"
+}
+
+function verify_archive_roundtrip {
+    local archive=$1
+    local archive_digest
+    local payload_digest
+
+    cmp "$WORK_DIR/source/payload.txt" "$WORK_DIR/output/payload.txt"
+    archive_digest=$(sha256sum "$archive" | cut -d' ' -f1)
+    payload_digest=$(sha256sum "$WORK_DIR/output/payload.txt" | cut -d' ' -f1)
+    printf '%s:%s:%s\n' "$PROGRAM" "$archive_digest" "$payload_digest"
+}
+
+function fetch_localhost_payload {
+    (
+        local client=$1
+        local server_pid=
+        local status=0
+        local ready=0
+        local attempt
+
+        trap 'if [[ -n $server_pid ]]; then kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; fi' EXIT
+        prepare_archive_fixture
+        /usr/bin/python3 -B -c \
+            'import functools, http.server, pathlib, sys; handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=sys.argv[1]); server = http.server.HTTPServer(("127.0.0.1", 18765), handler); pathlib.Path(sys.argv[2]).touch(); server.handle_request()' \
+            "$WORK_DIR/source" "$WORK_DIR/ready" >"$WORK_DIR/server.log" 2>&1 &
+        server_pid=$!
+
+        for ((attempt = 0; attempt < 500; attempt += 1)); do
+            if [[ -e $WORK_DIR/ready ]]; then
+                ready=1
+                break
+            fi
+            sleep 0.01
+        done
+        if ((ready == 0)); then
+            printf 'localhost fixture did not become ready\n' >&2
+            status=1
+        elif [[ $client == wget ]]; then
+            /usr/bin/wget --quiet \
+                --output-document="$WORK_DIR/output/payload.txt" \
+                http://127.0.0.1:18765/payload.txt || status=$?
+        else
+            /usr/bin/curl --fail --silent --show-error \
+                --output "$WORK_DIR/output/payload.txt" \
+                http://127.0.0.1:18765/payload.txt || status=$?
+        fi
+
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+        server_pid=
+        if ((status != 0)); then
+            return "$status"
+        fi
+
+        cmp "$WORK_DIR/source/payload.txt" "$WORK_DIR/output/payload.txt"
+        printf '%s:' "$PROGRAM"
+        sha256sum "$WORK_DIR/output/payload.txt" | cut -d' ' -f1
+    )
+}
+
 case "$PROGRAM" in
+    gzip-roundtrip)
+        prepare_archive_fixture
+        gzip -n -c "$WORK_DIR/source/payload.txt" >"$WORK_DIR/archive.gz"
+        gzip -dc "$WORK_DIR/archive.gz" >"$WORK_DIR/output/payload.txt"
+        verify_archive_roundtrip "$WORK_DIR/archive.gz"
+        ;;
+    bzip2-roundtrip)
+        prepare_archive_fixture
+        bzip2 -c "$WORK_DIR/source/payload.txt" >"$WORK_DIR/archive.bz2"
+        bzip2 -dc "$WORK_DIR/archive.bz2" >"$WORK_DIR/output/payload.txt"
+        verify_archive_roundtrip "$WORK_DIR/archive.bz2"
+        ;;
+    xz-roundtrip)
+        prepare_archive_fixture
+        xz -c "$WORK_DIR/source/payload.txt" >"$WORK_DIR/archive.xz"
+        xz -dc "$WORK_DIR/archive.xz" >"$WORK_DIR/output/payload.txt"
+        verify_archive_roundtrip "$WORK_DIR/archive.xz"
+        ;;
+    zstd-roundtrip)
+        prepare_archive_fixture
+        zstd -q -c "$WORK_DIR/source/payload.txt" >"$WORK_DIR/archive.zst"
+        zstd -q -d -c "$WORK_DIR/archive.zst" >"$WORK_DIR/output/payload.txt"
+        verify_archive_roundtrip "$WORK_DIR/archive.zst"
+        ;;
+    tar-roundtrip)
+        prepare_archive_fixture
+        tar --format=ustar --sort=name --mtime=@946684800 \
+            --owner=0 --group=0 --numeric-owner \
+            -cf "$WORK_DIR/archive.tar" -C "$WORK_DIR/source" payload.txt
+        tar -xf "$WORK_DIR/archive.tar" -C "$WORK_DIR/output"
+        verify_archive_roundtrip "$WORK_DIR/archive.tar"
+        ;;
+    cpio-roundtrip)
+        prepare_archive_fixture
+        (
+            cd "$WORK_DIR/source"
+            printf 'payload.txt\n' | cpio --quiet --reproducible \
+                --renumber-inodes -o -H newc
+        ) >"$WORK_DIR/archive.cpio"
+        (cd "$WORK_DIR/output" && cpio --quiet -id <"$WORK_DIR/archive.cpio")
+        verify_archive_roundtrip "$WORK_DIR/archive.cpio"
+        ;;
+    wget-localhost)
+        fetch_localhost_payload wget
+        ;;
+    curl-localhost)
+        fetch_localhost_payload curl
+        ;;
     cargo)
         mkdir -p "$WORK_DIR/src"
         cat >"$WORK_DIR/Cargo.toml" <<'EOF'

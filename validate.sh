@@ -264,6 +264,7 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
+readonly STRICT_COMPAT_TOTAL=164
 readonly RR_COMPAT_EXPECTED=128
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
@@ -1308,6 +1309,28 @@ function run_compatibility_corpus {
     strict_compatibility_probe zstd bash -c \
         'zstd -q -c README.md | sha256sum' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#686): Review strict-only archive/network envelope growth.
+    # These functional rows are measured only for ptrace strict L2. The alternate-backend
+    # and record/replay ratchets retain their independently measured 151/151 and 128 rows.
+    if [[ $COMPATIBILITY_MODE == strict ]]; then
+        functional_compatibility_probe gzip-roundtrip /usr/bin/gzip --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        functional_compatibility_probe bzip2-roundtrip /usr/bin/bzip2 --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        functional_compatibility_probe xz-roundtrip /usr/bin/xz --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        functional_compatibility_probe zstd-roundtrip /usr/bin/zstd --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        functional_compatibility_probe tar-roundtrip /usr/bin/tar --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        functional_compatibility_probe cpio-roundtrip /usr/bin/cpio --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        functional_compatibility_probe wget-localhost /usr/bin/wget --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        functional_compatibility_probe curl-localhost /usr/bin/curl --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+    fi
     strict_compatibility_probe zip-unzip bash -c \
         'set -euo pipefail; rm -rf /tmp/hermit-compat-zip; mkdir /tmp/hermit-compat-zip; printf "archive-data\n" >/tmp/hermit-compat-zip/input; touch -t 200001010000 /tmp/hermit-compat-zip/input; (cd /tmp/hermit-compat-zip && zip -q archive.zip input); unzip -Z1 /tmp/hermit-compat-zip/archive.zip; unzip -p /tmp/hermit-compat-zip/archive.zip input; rm -rf /tmp/hermit-compat-zip' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1692,6 +1715,12 @@ function run_compatibility_corpus {
         fi
         printf "❌ e9patch compatibility matrix (%s/%s passed L2, %s gaps)\n" \
             "$passed" "$total" "$failed"
+        return 1
+    fi
+
+    if ((total != STRICT_COMPAT_TOTAL)); then
+        printf "❌ Strict compatibility corpus selected %s rows; expected %s\n" \
+            "$total" "$STRICT_COMPAT_TOTAL"
         return 1
     fi
 

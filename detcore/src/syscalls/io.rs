@@ -20,6 +20,7 @@ use reverie::Guest;
 use reverie::Stack;
 use reverie::syscalls;
 use reverie::syscalls::AddrMut;
+use reverie::syscalls::Displayable;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
@@ -36,6 +37,7 @@ use crate::resources::Resources;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
+use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::tool_global::*;
 use crate::tool_local::Detcore;
@@ -59,6 +61,88 @@ fn print_poll(call: &syscalls::Poll) {
 }
 
 const KERNEL_SIGSET_SIZE: usize = std::mem::size_of::<u64>();
+const PSELECT6_INTERNAL_MAX_NFDS: i32 = (std::mem::size_of::<libc::c_ulong>() * 8) as i32;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Pselect6SigmaskArg {
+    sigmask: usize,
+    sigsetsize: usize,
+}
+
+fn pselect6_fd_set_len(nfds: i32) -> Result<usize, Errno> {
+    let nfds = usize::try_from(nfds).map_err(|_| Errno::EINVAL)?;
+    let bits_per_word = std::mem::size_of::<libc::c_ulong>() * 8;
+    Ok(nfds.div_ceil(bits_per_word) * std::mem::size_of::<libc::c_ulong>())
+}
+
+fn read_pselect6_fd_set<T, G>(
+    guest: &mut G,
+    address: Option<AddrMut<'_, libc::fd_set>>,
+    len: usize,
+) -> Result<Option<Vec<u8>>, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let Some(address) = address else {
+        return Ok(None);
+    };
+    let mut bytes = vec![0; len];
+    if len != 0 {
+        guest
+            .memory()
+            .read_exact(address.cast(), &mut bytes)
+            .map_err(|_| Errno::EFAULT)?;
+    }
+    Ok(Some(bytes))
+}
+
+fn write_pselect6_fd_set<T, G>(
+    guest: &mut G,
+    address: Option<AddrMut<'_, libc::fd_set>>,
+    bytes: &Option<Vec<u8>>,
+) -> Result<(), Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    if let (Some(address), Some(bytes)) = (address, bytes)
+        && !bytes.is_empty()
+    {
+        guest
+            .memory()
+            .write_exact(address.cast(), bytes)
+            .map_err(|_| Errno::EFAULT)?;
+    }
+    Ok(())
+}
+
+fn copy_pselect6_fd_set<T, G>(
+    guest: &mut G,
+    source: Option<AddrMut<'_, libc::fd_set>>,
+    destination: Option<AddrMut<'_, libc::fd_set>>,
+    len: usize,
+) -> Result<(), Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    if let (Some(source), Some(destination)) = (source, destination)
+        && len != 0
+    {
+        let mut bytes = vec![0; len];
+        guest
+            .memory()
+            .read_exact(source.cast(), &mut bytes)
+            .map_err(|_| Errno::EFAULT)?;
+        guest
+            .memory()
+            .write_exact(destination.cast(), &bytes)
+            .map_err(|_| Errno::EFAULT)?;
+    }
+    Ok(())
+}
 
 fn ppoll_timeout_duration(timeout: Timespec) -> Result<Duration, Errno> {
     let seconds = u64::try_from(timeout.tv_sec).map_err(|_| Errno::EINVAL)?;
@@ -103,6 +187,194 @@ impl<T: RecordOrReplay> Detcore<T> {
             // if is-external-poll { self.handle_external_poll(guest, call) }
             self.handle_internal_poll(guest, call).await
         }
+    }
+
+    /// pselect6 syscall (MAYHANG).
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
+    pub async fn handle_pselect6<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Pselect6,
+    ) -> Result<i64, Error> {
+        if self.cfg.recordreplay_modes || !self.cfg.sequentialize_threads {
+            // Recorder/Replayer do not model pselect6 events. Preserve their existing
+            // live-kernel behavior without adding BlockingExternalIO scheduler events.
+            return Ok(guest.inject(call).await?);
+        }
+
+        if call.nfds() < 0 {
+            return Ok(guest.inject(call).await?);
+        }
+
+        let raw_timeout = match call.timeout() {
+            Some(timeout) => {
+                let timeout: Timespec = guest.memory().read_value(timeout.cast())?;
+                Some(timeout)
+            }
+            None => None,
+        };
+        if matches!(raw_timeout, Some(timeout) if timeout.tv_sec == 0 && timeout.tv_nsec == 0) {
+            return Ok(guest.inject(call).await?);
+        }
+
+        // Linux clamps raw fd-set copies to the process fd table's current max_fds.
+        // Its initial table holds one machine word; larger nfds values can therefore
+        // require fewer bytes than a userspace calculation predicts. Keep those calls
+        // under kernel ownership rather than over-reading the guest bitmap.
+        if call.nfds() > PSELECT6_INTERNAL_MAX_NFDS {
+            return self
+                .record_or_replay_blocking(guest, Syscall::Pselect6(call))
+                .await;
+        }
+
+        // Linux wraps pselect6's temporary mask in { pointer, size }. Glibc supplies
+        // the wrapper even when the inner pointer is null. A real mask needs atomic
+        // kernel ownership across the wait, so keep it on the external-blocking path.
+        if let Some(argument) = call.sigmask() {
+            let argument: Pselect6SigmaskArg = guest.memory().read_value(argument.cast())?;
+            if argument.sigmask != 0 {
+                return self
+                    .record_or_replay_blocking(guest, Syscall::Pselect6(call))
+                    .await;
+            }
+        }
+        // The null inner mask was snapshotted above. Do not let later guest mutations of
+        // the outer wrapper change the meaning of a retry probe.
+        let call = call.with_sigmask(None);
+        let timeout = raw_timeout.map(ppoll_timeout_duration).transpose()?;
+
+        self.handle_internal_pselect6(guest, call, timeout).await
+    }
+
+    async fn handle_internal_pselect6<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Pselect6,
+        timeout: Option<Duration>,
+    ) -> Result<i64, Error> {
+        let len = pselect6_fd_set_len(call.nfds())?;
+        let deadline = match timeout {
+            Some(timeout) => Some(thread_observe_time(guest).await + timeout),
+            None => None,
+        };
+        let original_readfds = match read_pselect6_fd_set(guest, call.readfds(), len) {
+            Ok(value) => value,
+            Err(error) => {
+                self.write_pselect6_remaining(guest, call, deadline).await?;
+                return Err(error);
+            }
+        };
+        let original_writefds = match read_pselect6_fd_set(guest, call.writefds(), len) {
+            Ok(value) => value,
+            Err(error) => {
+                self.write_pselect6_remaining(guest, call, deadline).await?;
+                return Err(error);
+            }
+        };
+        let original_exceptfds = match read_pselect6_fd_set(guest, call.exceptfds(), len) {
+            Ok(value) => value,
+            Err(error) => {
+                self.write_pselect6_remaining(guest, call, deadline).await?;
+                return Err(error);
+            }
+        };
+
+        let mut stack = guest.stack().await;
+        let readfds = call.readfds().map(|_| stack.reserve::<libc::fd_set>());
+        let writefds = call.writefds().map(|_| stack.reserve::<libc::fd_set>());
+        let exceptfds = call.exceptfds().map(|_| stack.reserve::<libc::fd_set>());
+        let probe_timeout = stack
+            .push(Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            })
+            .cast::<libc::timeval>();
+        let _guard = stack.commit()?;
+        let probe = call
+            .with_readfds(readfds)
+            .with_writefds(writefds)
+            .with_exceptfds(exceptfds)
+            .with_timeout(Some(probe_timeout));
+
+        let mut resources = Resources::new(guest.thread_state().dettid);
+        resources.insert(ResourceID::InternalIOPolling, Permission::W);
+        resources.fyi("pselect6");
+
+        loop {
+            if resource_request(guest, resources.clone()).await == ResumeStatus::Signaled {
+                self.write_pselect6_remaining(guest, call, deadline).await?;
+                return Err(Errno::EINTR.into());
+            }
+            write_pselect6_fd_set(guest, probe.readfds(), &original_readfds)?;
+            write_pselect6_fd_set(guest, probe.writefds(), &original_writefds)?;
+            write_pselect6_fd_set(guest, probe.exceptfds(), &original_exceptfds)?;
+
+            let result = guest.inject(probe).await;
+            if result != Ok(0) {
+                let copy_result = if result.is_ok() {
+                    self.copy_pselect6_results(guest, probe, call, len)
+                } else {
+                    Ok(())
+                };
+                self.write_pselect6_remaining(guest, call, deadline).await?;
+                copy_result?;
+                return result.map_err(Into::into);
+            }
+
+            resources.poll_attempt += 1;
+            if let Some(deadline) = deadline
+                && thread_observe_time(guest).await >= deadline
+            {
+                let copy_result = self.copy_pselect6_results(guest, probe, call, len);
+                self.write_pselect6_remaining(guest, call, Some(deadline))
+                    .await?;
+                copy_result?;
+                return Ok(0);
+            }
+            trace!(
+                "Retry #{} for syscall due to result Ok(0): {}",
+                resources.poll_attempt,
+                probe.display(&guest.memory())
+            );
+            record_retry_event(guest, probe).await;
+        }
+    }
+
+    fn copy_pselect6_results<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        probe: syscalls::Pselect6,
+        call: syscalls::Pselect6,
+        len: usize,
+    ) -> Result<(), Error> {
+        copy_pselect6_fd_set(guest, probe.readfds(), call.readfds(), len)?;
+        copy_pselect6_fd_set(guest, probe.writefds(), call.writefds(), len)?;
+        copy_pselect6_fd_set(guest, probe.exceptfds(), call.exceptfds(), len)
+    }
+
+    async fn write_pselect6_remaining<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Pselect6,
+        deadline: Option<LogicalTime>,
+    ) -> Result<(), Error> {
+        if let (Some(timeout), Some(deadline)) = (call.timeout(), deadline) {
+            let now = thread_observe_time(guest).await;
+            let remaining = deadline.as_nanos().saturating_sub(now.as_nanos());
+            let remaining = Timespec {
+                tv_sec: (remaining / 1_000_000_000) as libc::time_t,
+                tv_nsec: (remaining % 1_000_000_000) as libc::c_long,
+            };
+            // SAFETY: pselect6's timeout is a writable in-out kernel timespec even though
+            // reverie-syscalls exposes the ABI-compatible pointer as shared.
+            let timeout = unsafe { timeout.cast::<Timespec>().into_mut() };
+            if let Err(error) = guest.memory().write_value(timeout, &remaining) {
+                // Linux preserves the pselect6 result when remaining-time copyout faults.
+                trace!(?error, "ignoring pselect6 timeout writeback failure");
+            }
+        }
+        Ok(())
     }
 
     /// ppoll syscall (MAYHANG)
@@ -445,6 +717,16 @@ mod tests {
                 tv_nsec: 345_678_901,
             }
         );
+    }
+
+    #[test]
+    fn pselect6_fd_set_lengths_follow_the_raw_linux_abi() {
+        assert_eq!(PSELECT6_INTERNAL_MAX_NFDS, 64);
+        assert_eq!(pselect6_fd_set_len(-1), Err(Errno::EINVAL));
+        assert_eq!(pselect6_fd_set_len(0), Ok(0));
+        assert_eq!(pselect6_fd_set_len(1), Ok(8));
+        assert_eq!(pselect6_fd_set_len(65), Ok(16));
+        assert_eq!(pselect6_fd_set_len(libc::FD_SETSIZE as i32), Ok(128));
     }
 
     #[test]

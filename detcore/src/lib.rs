@@ -706,8 +706,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::rt_sigaction,
                 Sysno::getrusage,
                 Sysno::sysinfo,
-                // TODO(T137258824): add proper Select / PSelect6
-                // Sysno::pselect6,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
+                Sysno::pselect6,
+                // TODO(T137258824): add proper Select
                 // Sysno::select,
             ]);
 
@@ -1393,6 +1395,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Getdents64(s) => self.handle_getdents64(guest, s).await,
 
                 Syscall::Poll(s) => self.handle_poll(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
+                Syscall::Pselect6(s) => self.handle_pselect6(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 Syscall::Ppoll(s) => self.handle_ppoll(guest, s).await,
                 Syscall::EpollCreate(s) => {
