@@ -1211,6 +1211,24 @@ function run_compatibility_corpus {
     strict_compatibility_probe curl /usr/bin/curl --fail --silent --show-error \
         file:///etc/hostname \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#699)
+    if [[ $COMPATIBILITY_MODE == strict ]]; then
+        strict_compatibility_probe wget /usr/bin/wget --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        strict_compatibility_probe netcat /usr/bin/nc -h \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        if [[ -x /usr/bin/socat ]]; then
+            strict_compatibility_probe socat /usr/bin/socat -h \
+                && passed=$((passed + 1)) || failed=$((failed + 1))
+        else
+            printf "  SKIP socat (not installed)\n"
+            {
+                printf "=== L2 compatibility: socat ===\n"
+                printf "Skipped: /usr/bin/socat is not installed\n\n"
+            } >>"$LOG_FILE"
+        fi
+    fi
     # Avoid the PATH Git wrapper: its telemetry sidecar pipes are nondeterministic.
     functional_compatibility_probe git /usr/local/bin/git.meta.real --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
