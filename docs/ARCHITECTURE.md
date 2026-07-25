@@ -80,7 +80,8 @@ subscribed event from every thread) and integrates with the PMU for RCB-based
 preemption, at the cost of a context switch per intercepted event.
 
 **e9patch hybrid.** The `e9patch` backend loads the cached instruction map for
-the main executable and invokes `e9tool` with an exact file-offset matcher.
+the main executable and invokes `e9tool -O0` with an exact file-offset matcher.
+Optimization is disabled because correctness takes priority for this hybrid.
 The instruction map is a linear candidate scan and can include embedded data.
 Each candidate that e9tool recovers as an instruction receives an empty
 before-trampoline, preserving the original instruction; partial recovered-site

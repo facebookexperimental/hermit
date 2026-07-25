@@ -37,7 +37,7 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --strict-compat-only        # run the nonblocking L2 app matrix
 #   ./validate.sh --rr-compat-only            # gate the known-passing R/R matrix
 #   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix
-#   ./validate.sh --e9patch-compat-only       # measure the e9patch L2 app matrix
+#   ./validate.sh --e9patch-compat-only       # gate core + installed e9patch L2 apps
 #   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
 #   ./validate.sh --verbose                  # stream each gate's command, PID,
 #                                            # elapsed time, and subprocess output
@@ -143,7 +143,7 @@ case "$VALIDATION_PROFILE" in
     strict-compat-only) VALIDATION_ESTIMATE="about 5-15 minutes" ;;
     rr-compat-only) VALIDATION_ESTIMATE="about 5-65 minutes when healthy; fails fast on canary failure" ;;
     sabre-compat-only) VALIDATION_ESTIMATE="about 10-20 minutes" ;;
-    e9patch-compat-only) VALIDATION_ESTIMATE="about 5-15 minutes" ;;
+    e9patch-compat-only) VALIDATION_ESTIMATE="about 5-20 minutes" ;;
     qemu-l2-only) VALIDATION_ESTIMATE="about 30-60 minutes" ;;
     envelope-only) VALIDATION_ESTIMATE="about 5 minutes" ;;
 esac
@@ -256,6 +256,7 @@ readonly SMOKE_MARKER="hermit-validation-smoke"
 readonly STRICT_COMPAT_HERMIT_BIN="$ROOT_DIR/target/release/hermit"
 readonly STRICT_COMPAT_TIMEOUT=60
 readonly REAL_COMPAT_FIXTURES="$ROOT_DIR/target/real-compat-fixtures-$$"
+readonly E9PATCH_NSSWITCH_FILE="$VALIDATION_TMP_DIR/e9patch-nsswitch.conf"
 readonly REAL_COMPAT_WORKLOAD="$ROOT_DIR/tests/compat/real_compat_workload.sh"
 RR_COMPAT_PHASE_TIMEOUT_SECONDS=${RR_COMPAT_PHASE_TIMEOUT_SECONDS:-60}
 if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
@@ -269,6 +270,7 @@ readonly RR_COMPAT_EXPECTED=128
 readonly SABRE_COMPAT_EXPECTED=151
 readonly SABRE_COMPAT_TOTAL=151
 readonly E9PATCH_COMPAT_TOTAL=151
+readonly E9PATCH_EXTENDED_PROGRAMS=38
 COMPATIBILITY_MODE=strict
 E9PATCH_COMPAT_REWRITTEN=0
 E9PATCH_COMPAT_ZERO_SITE=0
@@ -1016,7 +1018,16 @@ function strict_compatibility_probe {
         run_args=(run --backend sabre --strict --verify --)
     elif [[ $COMPATIBILITY_MODE == e9patch ]]; then
         assurance="e9patch L2"
-        run_args=(run --backend e9patch --strict --verify --)
+        run_args=(run --backend e9patch)
+        # These workloads query owner names that the host may delegate to an
+        # asynchronous identity daemon. Pin just those rows to the fixture;
+        # custom mounts intentionally reject unrelated symlinked executables.
+        case "$label" in
+            whoami | groups | pinky | logname | tar | chown)
+                run_args+=("--mount=type=bind,source=$E9PATCH_NSSWITCH_FILE,target=/etc/nsswitch.conf,readonly")
+                ;;
+        esac
+        run_args+=(--strict --verify --)
     fi
 
     {
@@ -1619,6 +1630,15 @@ function require_e9patch_artifacts {
         printf "validate.sh: HERMIT_E9PATCH_BACKEND must name an executable e9patch backend\n" >&2
         return 1
     fi
+
+    # TODO-HUMAN-REVIEW(PR-676): Review the files-only NSS fixture used to
+    # exclude host identity-daemon races from e9patch L2 measurements.
+    printf '%s\n' \
+        'aliases: files' 'automount: files' 'ethers: files' 'group: files' \
+        'gshadow: files' 'hosts: files' 'initgroups: files' 'netgroup: files' \
+        'netmasks: files' 'networks: files' 'passwd: files' 'protocols: files' \
+        'publickey: files' 'rpc: files' 'services: files' 'shadow: files' \
+        >"$E9PATCH_NSSWITCH_FILE"
 }
 
 function run_e9patch_compatibility_envelope {
@@ -1630,6 +1650,125 @@ function run_e9patch_compatibility_envelope {
     E9PATCH_COMPAT_NO_DIAGNOSTIC=0
     COMPATIBILITY_MODE=e9patch
     run_compatibility_corpus || status=$?
+    COMPATIBILITY_MODE=strict
+    return "$status"
+}
+
+# TODO-HUMAN-REVIEW(PR-676): Review optional program discovery and the extended
+# e9patch compatibility gate. Missing programs skip; every installed row gates.
+function optional_e9patch_compatibility_probe {
+    local label=$1
+    local command=$2
+    local program
+    shift 2
+
+    ((E9PATCH_EXTENDED_LISTED += 1))
+    program=$(command -v -- "$command" || true)
+    if [[ -z $program || ! -x $program ]]; then
+        printf "  SKIP %-12s not installed\n" "$label"
+        ((E9PATCH_EXTENDED_SKIPPED += 1))
+        return 0
+    fi
+
+    ((E9PATCH_EXTENDED_AVAILABLE += 1))
+    if strict_compatibility_probe "$label" "$program" "$@"; then
+        ((E9PATCH_EXTENDED_PASSED += 1))
+    else
+        ((E9PATCH_EXTENDED_FAILED += 1))
+    fi
+}
+
+function run_e9patch_extended_compatibility_envelope {
+    local classified
+    local status=0
+    E9PATCH_COMPAT_REWRITTEN=0
+    E9PATCH_COMPAT_ZERO_SITE=0
+    E9PATCH_COMPAT_CANDIDATE_ONLY=0
+    E9PATCH_COMPAT_NON_ELF=0
+    E9PATCH_COMPAT_NO_DIAGNOSTIC=0
+    E9PATCH_EXTENDED_LISTED=0
+    E9PATCH_EXTENDED_AVAILABLE=0
+    E9PATCH_EXTENDED_SKIPPED=0
+    E9PATCH_EXTENDED_PASSED=0
+    E9PATCH_EXTENDED_FAILED=0
+    COMPATIBILITY_MODE=e9patch
+
+    printf "\n== e9patch extended installed-program matrix (L2) ==\n"
+    printf "=== e9patch extended installed-program matrix (L2) ===\n" >>"$LOG_FILE"
+
+    optional_e9patch_compatibility_probe go go version
+    optional_e9patch_compatibility_probe clang clang --version
+    optional_e9patch_compatibility_probe clang++ clang++ --version
+    optional_e9patch_compatibility_probe cmake cmake --version
+    optional_e9patch_compatibility_probe javac javac -version
+    optional_e9patch_compatibility_probe chcon chcon --version
+    optional_e9patch_compatibility_probe gdb gdb --version
+    optional_e9patch_compatibility_probe strace strace -V
+    optional_e9patch_compatibility_probe ldd ldd --version
+    optional_e9patch_compatibility_probe locale locale --version
+    optional_e9patch_compatibility_probe localedef localedef --version
+    optional_e9patch_compatibility_probe timeout timeout --version
+    optional_e9patch_compatibility_probe link link --version
+    optional_e9patch_compatibility_probe unlink unlink --version
+    optional_e9patch_compatibility_probe sync sync --version
+    optional_e9patch_compatibility_probe truncate truncate --version
+    optional_e9patch_compatibility_probe wget wget --version
+    optional_e9patch_compatibility_probe pathchk pathchk --version
+    optional_e9patch_compatibility_probe rsync rsync --version
+    optional_e9patch_compatibility_probe ps ps --version
+    optional_e9patch_compatibility_probe free free --version
+    optional_e9patch_compatibility_probe vmstat vmstat --version
+    optional_e9patch_compatibility_probe pgrep pgrep --version
+    optional_e9patch_compatibility_probe pkill pkill --version
+    optional_e9patch_compatibility_probe killall killall --version
+    optional_e9patch_compatibility_probe top top -v
+    optional_e9patch_compatibility_probe watch watch --version
+    optional_e9patch_compatibility_probe lscpu lscpu --version
+    optional_e9patch_compatibility_probe lsblk lsblk --version
+    optional_e9patch_compatibility_probe lslocks lslocks --version
+    optional_e9patch_compatibility_probe lsns lsns --version
+    optional_e9patch_compatibility_probe findmnt findmnt --version
+    optional_e9patch_compatibility_probe blkid blkid --version
+    optional_e9patch_compatibility_probe uuidgen uuidgen --version
+    optional_e9patch_compatibility_probe dmesg dmesg --version
+    optional_e9patch_compatibility_probe ip ip -Version
+    optional_e9patch_compatibility_probe ss ss -V
+    optional_e9patch_compatibility_probe podman podman --version
+
+    classified=$((E9PATCH_COMPAT_REWRITTEN + E9PATCH_COMPAT_ZERO_SITE + \
+        E9PATCH_COMPAT_CANDIDATE_ONLY + E9PATCH_COMPAT_NON_ELF + \
+        E9PATCH_COMPAT_NO_DIAGNOSTIC))
+    printf "e9patch extended preprocessing: %s rewritten, %s zero-site, %s candidate-only, %s non-ELF fallback, %s without diagnostic\n" \
+        "$E9PATCH_COMPAT_REWRITTEN" "$E9PATCH_COMPAT_ZERO_SITE" \
+        "$E9PATCH_COMPAT_CANDIDATE_ONLY" "$E9PATCH_COMPAT_NON_ELF" \
+        "$E9PATCH_COMPAT_NO_DIAGNOSTIC"
+    printf "e9patch extended availability: %s available, %s skipped, %s listed\n" \
+        "$E9PATCH_EXTENDED_AVAILABLE" "$E9PATCH_EXTENDED_SKIPPED" \
+        "$E9PATCH_EXTENDED_LISTED"
+
+    if ((E9PATCH_EXTENDED_LISTED != E9PATCH_EXTENDED_PROGRAMS)); then
+        printf "❌ e9patch extended corpus listed %s rows; expected %s\n" \
+            "$E9PATCH_EXTENDED_LISTED" "$E9PATCH_EXTENDED_PROGRAMS"
+        status=1
+    elif ((classified != E9PATCH_EXTENDED_AVAILABLE)); then
+        printf "❌ e9patch extended corpus classified %s rows; expected %s\n" \
+            "$classified" "$E9PATCH_EXTENDED_AVAILABLE"
+        status=1
+    elif ((E9PATCH_COMPAT_NO_DIAGNOSTIC != 0)); then
+        printf "❌ e9patch extended corpus had %s rows without a backend diagnostic\n" \
+            "$E9PATCH_COMPAT_NO_DIAGNOSTIC"
+        status=1
+    elif ((E9PATCH_EXTENDED_FAILED != 0)); then
+        printf "❌ e9patch extended matrix (%s/%s available programs passed L2, %s gaps)\n" \
+            "$E9PATCH_EXTENDED_PASSED" "$E9PATCH_EXTENDED_AVAILABLE" \
+            "$E9PATCH_EXTENDED_FAILED"
+        status=1
+    else
+        printf "✅ e9patch extended matrix (%s/%s available programs passed L2; %s skipped)\n" \
+            "$E9PATCH_EXTENDED_PASSED" "$E9PATCH_EXTENDED_AVAILABLE" \
+            "$E9PATCH_EXTENDED_SKIPPED"
+    fi
+
     COMPATIBILITY_MODE=strict
     return "$status"
 }
@@ -2010,6 +2149,10 @@ if ((E9PATCH_COMPAT_ONLY == 1)); then
     if ((failures == 0)); then
         run_check "e9patch compatibility matrix (151 programs)" \
             run_e9patch_compatibility_envelope
+    fi
+    if ((failures == 0)); then
+        run_check "e9patch extended installed-program matrix (38 optional programs)" \
+            run_e9patch_extended_compatibility_envelope
     fi
     print_summary
     ((failures == 0))

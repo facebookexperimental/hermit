@@ -15,10 +15,19 @@ HERMIT_E9PATCH_BACKEND=/path/to/e9patch \
 ```
 
 The mode runs the same 151 installed-program probes used by the existing
-compatibility matrix. Every probe uses `hermit run --backend e9patch --strict
---verify`, so a pass is L2. Missing e9patch artifacts fail before the matrix.
+compatibility matrix, followed by 38 additional probes when their programs are
+installed. Every available probe uses `hermit run --backend e9patch --strict
+--verify`, so a pass is L2. Missing extended programs skip; an installed program
+that fails or lacks a backend diagnostic fails the gate. Missing e9patch
+artifacts fail before either matrix.
 
-## 2026-07-24 result
+For identity-dependent core rows (`whoami`, `groups`, `pinky`, `logname`,
+`tar`, and `chown`), the harness bind-mounts a files-only `nsswitch.conf`.
+This keeps asynchronous host identity daemons out of the two-run comparison
+without changing the commands under test. The fixture is a stable filesystem
+input, not a determinism relaxation.
+
+## 2026-07-24 core result
 
 Environment: x86_64 CentOS Stream 9; e9patch backend; default log level;
 relaxations: none.
@@ -40,6 +49,39 @@ compared the e9tool count to all 49 linear-scan candidates. Coverage accounting
 now keeps the two counts separate and still rejects any partial recovered-site
 rewrite. A cache-miss `cargo --version` run and cache-hit `rustc --version` run
 both passed at L2.
+
+## 2026-07-24 extended result
+
+All 38 extended programs were installed on the measurement host.
+
+| Result | Programs | Meaning |
+| --- | ---: | --- |
+| L2 pass | 38 | Every installed extended probe produced equivalent logs. |
+| Rewritten ELF | 5 | `go`, `gdb`, `rsync`, `lscpu`, and `podman`. |
+| Zero-site ELF | 32 | No candidate instruction sites in the main executable. |
+| Non-ELF fallback | 1 | `ldd` ran through the explicit ptrace fallback. |
+| Failure | 0 | No failure remained in the blocking extended set. |
+
+Together, the core and extended matrices cover 189 entrypoints at L2 on this
+host, including 11 rewritten rows.
+
+The initial full Go rewrite exposed an e9tool optimizer interaction. The
+default O2 artifact patched all 49 candidates and ran directly on the host, but
+terminated with SIGSEGV under Hermit. Instruction-class isolation showed that
+syscall-only, CPUID-only, RDTSC/RDTSCP-only, syscall-plus-CPUID, and
+CPUID-plus-RDTSC/RDTSCP artifacts ran; the combined syscall-plus-RDTSC/RDTSCP
+artifact failed. Rewriting the same complete 49-site set with `e9tool -O0`
+passed at L2. Hermit now uses the conservative setting and the rewrite schema
+invalidates artifacts made with the old optimizer default.
+
+Across the initial 45-program survey and two replacement probes, nine
+exclusions were identified that are not presented as
+e9patch rewrite coverage. `mount` and `umount` are intentionally rejected
+because they are privilege-bearing. `javap` and `ssh` had zero candidate sites
+but diverged on an external identity-service Unix-socket poll, so they are
+ptrace/environment gaps. The tested `jar` invocation was unsupported by the
+installed Java 8 CLI; npm/pip wrappers failed before useful backend coverage,
+npx produced differing output, and PHP timed out.
 
 ## Current limits and intentional failures
 

@@ -102,8 +102,9 @@ an availability error rather than running the command without determinization.
 
 The experimental `e9patch` selection is intentionally a hybrid backend. At
 startup it loads or generates the main ELF's cached instruction map, then runs
-`e9tool` with exact file-offset matches to install semantics-preserving
+`e9tool -O0` with exact file-offset matches to install semantics-preserving
 trampolines at every candidate offset that e9tool recovers as an instruction.
+The conservative optimizer setting avoids known multi-class rewrite failures.
 The linear scan can include embedded data, so Hermit reports candidate and
 recovered counts separately. Partial e9tool coverage fails closed. Hermit does
 not enable e9patch's B0 fallback because it reserves SIGILL and changes guest

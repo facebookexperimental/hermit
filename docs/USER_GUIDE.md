@@ -150,8 +150,9 @@ those prototypes therefore fail before the guest starts and explain the missing
 capability.
 
 `e9patch` is an experimental hybrid rather than a standalone Detcore runtime.
-It uses the cached offline instruction map to apply `before empty` trampolines
-at exact candidate offsets in the main ELF. Because the linear candidate scan
+It uses the cached offline instruction map and conservative `e9tool -O0` mode
+to apply `before empty` trampolines at exact candidate offsets in the main ELF.
+Because the linear candidate scan
 can include embedded data, e9tool decides which candidates are instructions;
 Hermit reports both counts and rejects partial coverage of the recovered set.
 Hermit does not enable e9patch's B0 fallback because reserving SIGILL would

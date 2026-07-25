@@ -38,7 +38,7 @@ pub const E9TOOL_ENV: &str = "HERMIT_E9TOOL";
 // TODO-HUMAN-REVIEW(PR-594): Review the public e9patch backend override.
 pub const E9PATCH_BACKEND_ENV: &str = "HERMIT_E9PATCH_BACKEND";
 
-const REWRITE_SCHEMA_VERSION: u32 = 5;
+const REWRITE_SCHEMA_VERSION: u32 = 6;
 
 /// Result of preparing the main guest ELF for the e9patch backend.
 // TODO-HUMAN-REVIEW(PR-594): Review cached rewrite result semantics.
@@ -194,6 +194,9 @@ fn prepare_in(
         .arg(&e9patch_backend.binary)
         .arg("--seed=1")
         .arg("--option=--tactic-B0=false")
+        // TODO-HUMAN-REVIEW(PR-676): Review the correctness-first e9tool
+        // optimizer selection required by combined syscall/RDTSC Go rewrites.
+        .arg("-O0")
         .arg("-M")
         .arg(&matcher)
         .arg("-P")
