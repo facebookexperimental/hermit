@@ -295,6 +295,57 @@ EOF
         test "$result" = 'make:42'
         printf '%s\n' "$result"
         ;;
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#697): Review the fixture-backed system utility workloads.
+    ip)
+        output=$(/usr/sbin/ip -o -4 addr show dev lo)
+        [[ $output == *" inet 127.0.0.1/8 "* ]]
+        [[ $output == *" scope host lo"* ]]
+        printf 'ip:loopback-ipv4-ok\n'
+        ;;
+    ss)
+        output=$(/usr/sbin/ss -H -ltn 'sport = :0')
+        test -z "$output"
+        printf 'ss:no-port-zero-listener\n'
+        ;;
+    lscpu)
+        readonly root="$WORK_DIR/sysroot"
+        mkdir -p "$root/proc" \
+            "$root/sys/devices/system/cpu/cpu0/topology"
+        cat >"$root/proc/cpuinfo" <<'EOF'
+processor : 0
+vendor_id : GenuineIntel
+cpu family : 6
+model : 85
+model name : Hermit Virtual CPU
+stepping : 7
+cpu MHz : 1000.000
+cache size : 1024 KB
+physical id : 0
+siblings : 1
+core id : 0
+cpu cores : 1
+flags : fpu
+EOF
+        for file in online possible present; do
+            printf '0\n' >"$root/sys/devices/system/cpu/$file"
+        done
+        printf '0\n' >"$root/sys/devices/system/cpu/cpu0/topology/core_id"
+        printf '0\n' \
+            >"$root/sys/devices/system/cpu/cpu0/topology/physical_package_id"
+        output=$(/usr/bin/lscpu --sysroot "$root" -p=CPU,ONLINE)
+        [[ $output == *"# CPU,Online"* ]]
+        [[ $output == *"0,Y"* ]]
+        printf 'lscpu:cpu0-online\n'
+        ;;
+    lsof)
+        printf 'lsof-fixture\n' >"$WORK_DIR/input.txt"
+        exec 9<"$WORK_DIR/input.txt"
+        output=$(/usr/bin/lsof -O -w -p $$ -a -d 9 -Ffn)
+        [[ $output == *f9* ]]
+        [[ $output == *"$WORK_DIR/input.txt"* ]]
+        printf 'lsof:fd9-ok\n'
+        ;;
     ar)
         archive=$(gcc -print-file-name=libgcc.a)
         test -r "$archive"

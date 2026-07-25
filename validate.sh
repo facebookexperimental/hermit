@@ -1146,6 +1146,8 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe id /usr/bin/id -u \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#697): Review the strict-only system utility probes.
     if [[ $COMPATIBILITY_MODE == strict ]]; then
         strict_compatibility_probe lua bash -c \
             'set -euo pipefail; out=$("$1" -e "$2"); test "$out" = "$3"; printf "lua-fib=%s\n" "$out"' \
@@ -1356,6 +1358,16 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe hostname /usr/bin/hostname \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    if [[ $COMPATIBILITY_MODE == strict ]]; then
+        functional_compatibility_probe ip /usr/sbin/ip -V \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        functional_compatibility_probe ss /usr/sbin/ss -V \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        functional_compatibility_probe lsof /usr/bin/lsof -v \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+        functional_compatibility_probe lscpu /usr/bin/lscpu --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+    fi
     strict_compatibility_probe whoami /usr/bin/whoami \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # An explicit user avoids host-specific supplementary GIDs without names.
