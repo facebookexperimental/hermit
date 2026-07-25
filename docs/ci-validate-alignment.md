@@ -6,171 +6,113 @@ This source code is licensed under the BSD-style license found in the
 LICENSE file in the root directory of this source tree.
 -->
 
-# CI ⇄ `validate.sh` Alignment
+# CI and validate.sh alignment
 
-This document is the authoritative mapping between the fork's GitHub Actions
-workflow (`.github/workflows/ci.yml`) and the local validation script
-(`validate.sh`). It exists so that **every test runs in both places, in the
-same mode**, and so that a reviewer can confirm at a glance that a
-test-adding PR did not update only one of the two.
+The Rust workflow and local validation use the same capability selectors:
 
-The invariant we maintain:
-
-> Every check that gates a merge in CI must be reproducible locally with
-> `./validate.sh`, and every check `validate.sh` runs must also gate CI.
-> When the two legitimately differ (host capability), the difference is
-> listed explicitly below and nowhere else.
-
-`validate.sh` is the local equivalent of the **entire** CI matrix, i.e. the
-`regular` job **plus** the `hardware` job. CI splits the matrix into two jobs
-only because GitHub-hosted runners lack a Performance Monitoring Unit (PMU)
-and mount-namespace privileges; a developer machine that has both runs the
-whole thing in one `./validate.sh` invocation.
-
-## Why there are two CI jobs
-
-| CI job | Runner | Has PMU / namespaces? | Purpose |
+| Lane | Runner | Command | Capability contract |
 | --- | --- | --- | --- |
-| `regular` | `ubuntu-latest` (GitHub-hosted) | No | Build, lint, format, docs, and all host-independent unit/integration tests. |
-| `hardware` | self-hosted `[Linux, X64, hermit, pmu]` | Yes | PMU-backed determinism, record/replay, mount-namespace integration tests, and the working-envelope gate. |
+| Portable | GitHub-hosted Ubuntu | `./validate.sh --hosted-only --no-label-pr` | No PMU counters, ptrace CPUID faulting, or KVM required |
+| Hardware | self-hosted `[Linux, X64, hermit, pmu]` | `./validate.sh --hardware-only --no-label-pr` | PMU, CPUID, KVM, or another host capability is part of the test |
 
-The default `full` profile combines both tiers and assumes the developer host
-has PMU and namespace support. `VALIDATE_LEVEL=hosted-only ./validate.sh` (or
-`./validate.sh --hosted`) runs only the portable `regular` tier. Checks that
-need hardware still fail loudly in `full` rather than silently skipping (see
-"Host-capability differences").
+The default `./validate.sh` remains the developer superset. The focused modes
+exist so either CI subset can be reproduced independently. The tiered workflow
+maps `quick` to portable, `full` to per-PR hardware, and long database and
+PMU chaos stress to the weekly self-hosted `super` profile.
 
-## Mapping table
+## Portable lane
 
-Status legend: ✅ identical / superset · ⚠️ same test, different mode ·
-❌ present in one side only (gap).
+The hosted job enables user and mount namespaces before starting Hermit. This
+is a privilege prerequisite, not a PMU or CPUID dependency. Guest tests in this
+lane either need no hardware event handling or explicitly pass:
 
-### Host-independent checks (CI `regular` job)
+```text
+--max-timeslice=disabled --no-virtualize-cpuid
+```
 
-| CI `regular` step | Command | `hosted-only` counterpart | Status |
-| --- | --- | --- | --- |
-| Backend abstraction | `./scripts/check-detcore-backend-abstraction.sh` | "Detcore backend-abstraction check" | ✅ |
-| Build | `cargo build --workspace` | "Build workspace" — `cargo build --workspace` | ✅ |
-| Test regular workspace crates | `cargo nextest run --profile ci --workspace --exclude detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests` | "Test portable workspace crates" with the same exclusions; add `NEXTEST_PROFILE=ci` locally for CI reporting/retries | ✅ |
-| Test Hermit (no namespace tests) | `cargo test -p hermit --lib --bins` | "Test Hermit libraries and binaries" | ✅ |
-| Test Detcore (no hardware tests) | `cargo test -p detcore --lib --bins` | "Test Detcore libraries and binaries" | ✅ |
-| Documentation | `cargo test --workspace --doc` + `cargo doc --workspace --no-deps` | "Test workspace documentation" + "Documentation" | ✅ |
-| Clippy | `cargo clippy --workspace --all-targets -- -D warnings` | "Clippy" | ✅ |
-| Format | `cargo fmt --all -- --check` | "Rustfmt" | ✅ |
+The selector covers exactly 469 of the 868 Cargo-discovered cases:
 
-`validate.sh` selects the `ci` nextest profile only when `CI` is set in the
-environment; locally it uses the default profile. The set of tests selected is
-identical; only reporting (JUnit output, retries) differs.
+| Group | Cases | Selector |
+| --- | ---: | --- |
+| Workspace unit, bin, and doc baseline | 319 | Existing regular-job selection |
+| Detcore misc without CPUID probes | 21 | `tests_misc`, excluding two RDRAND/CPUID cases |
+| Detcore parallel without RCB scheduling | 5 | Raw/noop cases, excluding generated `detcore` variants |
+| Flaky guest crate contract | 1 | The crate's standalone Cargo test |
+| Portable Hermit integration cases | 123 | Non-KVM CLI, LiteInst, strict/verify modes, non-JVM apps, commands, IPC, time, memory, procfs, signals, Python, and rr source contract |
 
-### Host-dependent checks (CI `hardware` job)
+The same lane enforces the 12 portable L1-L4 working-envelope cells and runs
+the 180-row strict compatibility corpus with the debug Hermit binary and PMU/CPUID disabled.
+The compatibility corpus retains its existing informational policy.
 
-| CI `hardware` step | Command | `validate.sh` counterpart | Status |
-| --- | --- | --- | --- |
-| CPUID and RDRAND/RDSEED | `cargo test -p detcore --test tests_misc has_rdrand_without_detcore \| rdrand_rdseed_is_masked -- --exact` | "Test detcore package" runs these (non-ignored) | ✅ |
-| PMU timing and misc | `tests_misc getrandom_intercepted --exact`; `cargo test -p detcore --test tests_time -- --ignored --test-threads=4` | "Test detcore package" runs `tests_time` non-ignored | ⚠️ **and CI bug** — see note (1) |
-| PMU parallel futex | `cargo test -p detcore --test tests_parallelism futex_wait_parent -- --ignored --test-threads=3` | "Test detcore package" runs it non-ignored | ⚠️ note (1) |
-| PMU parallel memory | `cargo test -p detcore --test tests_parallelism 'mem_race::' \| 'mem_print_race::' -- --ignored --test-threads=4` | "Test detcore package" | ⚠️ note (1) |
-| Stable Hermit tests incl. record/replay matrix | serial loop over `arbitrary_binaries, cli, clock_determinism, epoll_determinism, mmap_determinism, procfs_determinism, signal_determinism` (`--test-threads=1`) + `record_replay_matrix` + `strict_mode_matrix` | validate runs the same tests via workspace nextest (parallel processes) | ⚠️ note (2) |
-| Fail-closed ratchet | `./scripts/test-fail-closed.sh` | — | ❌ gap A |
-| Working-envelope gate | `./validate.sh --envelope-compare envelope-baseline.json` | validate's `run_envelope` (measure, no compare) | ✅ shared code path by construction |
-| Debugger integration | `./tests/debugger/run_debugger_tests.sh` | — | ❌ gap B |
-| Backend parity ratchet | `python3 experiments/backend-parity_20260722/run_matrix.py …` | — | ❌ gap C |
+The lane also requires all six DynamoRIO DBI parity scenarios currently
+marked `pass`. Cargo builds the pinned DynamoRIO runtime and native client;
+external `DYNAMORIO_HOME`, `HERMIT_DRRUN`, and `HERMIT_DBI_CLIENT` variables are
+not part of the CI contract.
 
-### Checks only in `validate.sh`
+## Hardware lane
 
-| `validate.sh` step | Command | CI counterpart | Status |
-| --- | --- | --- | --- |
-| Hermit run smoke test | `hermit run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled -- /bin/echo …` | envelope L1 (`--strict`) approximates it | ⚠️ partial |
-| Hermit output determinism | run twice, diff stdout | — | ❌ gap D |
-| Hermit verify-mode smoke test | `hermit run … --verify -- /bin/echo …` | envelope L2 (`--strict --verify`) approximates it | ⚠️ partial |
-| Fast concurrency stress suite | `cargo nextest run -p hermit --test stress_suite --run-ignored only -E 'test(=fast_chaos_matrix)'` | — | ❌ gap E |
-| Hermit analyze scenarios | `cargo test -p hermit --test analyze -- --ignored` | — | ❌ gap F |
-| Schedule search E2E | `./tests/util/hermit_analyze_e2e.sh` | — | ❌ gap G |
+The remaining 399 Cargo cases are outside the blocking hosted subset. The
+per-PR hardware lane executes 318 blocking cases, seven cases run as bounded
+nonblocking diagnostics, the weekly `super` tier executes 69 long or relaxed
+cases, and five existing gaps remain explicit:
 
-## Notes
+| Group | Cases | Routing | Hardware reason |
+| --- | ---: | --- | --- |
+| Detcore CPUID/RDRAND probes | 2 | Per-PR | Host feature probe and deterministic masking |
+| Detcore time tests | 14 | Per-PR | Nonzero RCB preemption configuration |
+| Detcore parallel variants | 11 | Per-PR | Deterministic RCB preemption assertions |
+| KVM CLI cases | 17 | Per-PR | Read/write `/dev/kvm` is required |
+| DBI pipe backpressure | 1 | Per-PR diagnostic | Bounded known DBI hang from PR #598 |
+| Pselect signal interruption | 1 | Per-PR diagnostic | Virtual timeout currently wins the delayed-signal race |
+| Buck chaos variants | 8 | Weekly | Explicit one-million-RCB time slice |
+| Relaxed default-mode cases | 55 | 53 weekly, 2 known ignored gaps | Non-sequentialized relaxed execution can block without hardware scheduling |
+| Portable chaos/stress cases | 5 | Weekly | Seed searches exceed hosted per-gate budgets |
+| Runtime, database, scheduling, and syscall targets | 52 | 51 per-PR blocking, 1 per-PR diagnostic | Default PMU/CPUID or record/replay configuration |
+| Ignored runtime/database/analyze tiers | 19 | 12 per-PR, 3 weekly, 4 JVM diagnostics | Default PMU/CPUID configuration |
+| Slow CAS stress | 1 | Per-PR | PMU preemption search and replay |
+| rr syscall corpus | 213 | 210 per-PR, 3 known gaps | Explicit 80-million-RCB time slice |
 
-**(1) CI `--ignored` on detcore PMU tests is a silent no-op on `main`.**
-`detcore/tests/time/mod.rs` and `detcore/tests/parallelism/mod.rs` contain
-**no** `#[ignore]` attributes, so `cargo test … -- --ignored` (which selects
-*only* ignored tests) currently runs **zero** tests in the "PMU timing",
-"PMU parallel futex", and "PMU parallel memory" steps. `validate.sh` runs the
-same test binaries *without* `--ignored` and therefore actually exercises them.
-The fix is to drop `--ignored` from those CI steps (the `frontier` branch and
-PRs #152–#154 already do this). Until then, `validate.sh` has strictly more
-detcore coverage than CI here.
+The Detcore time and parallel commands intentionally do not pass `--ignored`.
+Those targets contain no ignored tests; the former workflow selected zero
+cases. Each of the 25 PMU cases runs as an exact, single-threaded Cargo test so
+a leaked tracee cannot hold a whole family harness open. Timing cases have a
+two-minute limit, futex cases five minutes, and the CPU-heavy memory cases 15
+minutes each. A family stops after its first failure, while a green run still
+executes every enumerated case.
 
-**(2) Serial vs. parallel execution of PMU-sensitive Hermit tests.**
-The `hardware` job runs the determinism integration tests with
-`--test-threads=1` because they contend for the PMU. `validate.sh` runs them
-through `cargo nextest`, which launches each test in its own process (still
-one guest at a time per process, but multiple processes concurrently). The
-*set* of tests is the same; a flake that only appears under one scheduling
-should be reproduced with the matching invocation before diagnosing.
+The per-PR hardware lane runs LevelDB's bounded `env_posix_test`. The eight
+Buck chaos cases, PMU-skid-sensitive `analyze_hello_race`, full randomized
+LevelDB suite, SQLite veryquick suite, 53 relaxed default-mode cases, and five
+portable chaos/stress cases remain in the weekly `super` profile because they
+cannot fit the per-PR hosted budget. The two intentionally ignored default-mode
+known hangs remain explicit gaps.
 
-## Gap ledger (must be driven to empty)
+The rr gate excludes `rr_ppoll` (unsupported `ppoll` operation), `rr_rlimit`
+(host policy rejects `setrlimit`), and `rr_sched_yield_to_lower_priority` (priority scheduling gap).
 
-| ID | Check | Lives in | Action to align |
-| --- | --- | --- | --- |
-| A | `scripts/test-fail-closed.sh` | CI only | Add a `run_check "Fail-closed ratchet" ./scripts/test-fail-closed.sh` step to `validate.sh`. |
-| B | `tests/debugger/run_debugger_tests.sh` | CI only | Add a `run_check` step to `validate.sh`. |
-| C | Backend parity ratchet | CI only | Add a `run_check` invoking `run_matrix.py --backend ptrace` to `validate.sh`. |
-| D | Hermit output determinism | validate only | Add an equivalent probe/step to the CI `hardware` job (or fold into the envelope gate). |
-| E | `fast_chaos_matrix` | validate only | Add a CI `hardware` step: `cargo nextest run -p hermit --test stress_suite --run-ignored only -E 'test(=fast_chaos_matrix)'`. |
-| F | `analyze` scenarios | validate only | Add a CI `hardware` step: `cargo test -p hermit --test analyze -- --ignored`. |
-| G | Schedule search E2E | validate only | Add a CI `hardware` step running `./tests/util/hermit_analyze_e2e.sh`. |
+The stable record/replay integration cases remain blocking. The intermittently
+flaky `record_replay_matrix`, four JVM cases, the DBI pipe-backpressure case,
+and the pselect signal-interruption case
+still execute on every pull request as bounded nonblocking diagnostics tracked
+by PRs #678, #657, #598, and #673.
 
-The `main` ↔ `frontier` divergence is itself the largest single source of
-skew: `frontier` has already removed the envelope/debugger/backend-parity
-steps and added `rr_suite` + LevelDB steps. Whichever shape `main` converges
-to, this table must be updated in the same PR so it never lies.
+The hardware lane also gates the three record/replay working-envelope cells,
+the 128-row R/R compatibility corpus, debugger
+integration, and ptrace backend parity. Missing rr sources, namespaces, PMU,
+CPUID, KVM, or runtime prerequisites fail the lane instead of silently reducing
+coverage.
 
-## Reconciliation checklist for test-adding PRs
+## Workflow prerequisites
 
-Any PR that adds, removes, or renames a test **must** keep the two sides in
-sync. Before requesting review, confirm:
+The hosted job installs the Unix commands, language tools, app binaries,
+cargo-nextest, rustfmt, and Clippy used by its selected tests. The self-hosted
+job initializes the rr submodule and preflights PMU, KVM, namespaces, runtime
+tools, databases, and debuggers before starting the hardware selector.
 
-1. The new test is invoked in **both** `.github/workflows/ci.yml` **and**
-   `validate.sh` (unless it is genuinely host-only — then it goes only in the
-   CI `hardware` job *and* is listed in the "Host-capability differences"
-   section below, never silently).
-2. The invocation **mode matches**: same package, same `--test`/`-E` filter,
-   same `--ignored` / `--run-ignored` selection, same `--test-threads`.
-3. This document's mapping table is updated in the same PR.
-4. If the test contributes to the working envelope, `envelope-baseline.json`
-   is raised (never lowered) and `./validate.sh --envelope-compare
-   envelope-baseline.json` still passes.
+When adding a test:
 
-### Known in-flight PRs (as of 2026-07-22)
-
-These open PRs all move the test matrix and must be reconciled against this
-table when they land (all target `main` except #155):
-
-- **#152** `impl-validate-strict-mode` — runs all `validate.sh` **and** CI
-  hermit invocations under `--strict`. Touches both files; keeps them in sync.
-- **#153** `strict-workload-matrix` — adds a real strict-determinism workload
-  matrix. Touches both files.
-- **#154** `impl-fbsource-replay-matrix` — adds
-  `hermit-cli/tests/replay_matrix.rs` (`trace_replay_matrix`,
-  `chaos_replay_matrix`) and wires it into CI **but does not modify
-  `validate.sh`**. This introduces gap-shaped skew (a CI-only test); align by
-  adding the same invocation to `validate.sh` before or when it lands.
-- **#155** `fix-fbsource-chaos-matrix` — expands the verified chaos matrix in
-  `hermit_modes.rs`. Targets `frontier`, not `main`.
-
-## Host-capability differences (the *only* sanctioned skew)
-
-A check may run in CI's `hardware` job but not on a given developer host, or
-vice versa, **only** for a hardware/privilege reason, and it must be named
-here:
-
-- PMU (retired-conditional-branch counters) — required by determinism and
-  record/replay tests. Absent in most VMs and GitHub-hosted runners, present
-  on the self-hosted `pmu` runner.
-- Mount namespaces (`unshare --user --map-root-user --mount …`) — required by
-  the Hermit integration tests. The CI `hardware` job requires them; a host
-  without them cannot run those tests under `validate.sh` either.
-- CPUID interception — the `tests_misc` RDRAND/RDSEED tests depend on it and
-  can fail on VMs that expose unusual CPU features.
-
-No skew other than the above is acceptable; anything else is a gap in the
-ledger and must be closed, not documented away.
+1. Identify whether it asserts PMU/RCB, CPUID, KVM, or another host capability.
+2. Put it in exactly one validation tier.
+3. If it is portable, make the disabling flags explicit in its command helper.
+4. Run both focused modes on a capable host and the default full validation.
+5. Update the case totals in this document.

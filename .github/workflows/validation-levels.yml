@@ -6,7 +6,6 @@ on:
   merge_group:
     types: [checks_requested]
   schedule:
-    # Weekly stress run on Sunday. Scheduled workflows run from the default branch.
     - cron: "23 05 * * 0"
   workflow_dispatch:
     inputs:
@@ -15,10 +14,7 @@ on:
         required: true
         type: choice
         default: quick
-        options:
-          - quick
-          - full
-          - super
+        options: [quick, full, super]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
@@ -35,42 +31,49 @@ env:
 
 jobs:
   quick:
-    name: Quick validation (PR)
+    name: Portable validation (PR)
     if: >-
       ${{
         github.event_name == 'pull_request' ||
         (github.event_name == 'workflow_dispatch' && inputs.level == 'quick')
       }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 180
+    env:
+      STRICT_COMPAT_HERMIT_BIN: ${{ github.workspace }}/target/debug/hermit
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libunwind-dev liblzma-dev
-      - name: Check namespace support
-        id: namespaces
+          sudo apt-get install -y bc bsdextrautils bzip2 cmake curl default-jdk-headless file g++ gcc gawk git gzip jq libunwind-dev liblzma-dev lua5.4 make nginx nodejs openssl perl python3-full redis-server redis-tools sqlite3 util-linux xz-utils zlib1g-dev zstd
+      - name: Enable namespaces
         run: |
-          if unshare --user --map-root-user --pid --fork --uts --net --mount true 2>/dev/null; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::User/PID/mount namespaces unavailable; running portable validation"
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
-      - name: Core ptrace validation
-        if: steps.namespaces.outputs.available == 'true'
-        run: ./validate.sh quick --no-label-pr
-      - name: Portable validation
-        if: steps.namespaces.outputs.available != 'true'
+          unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
+      - name: Install validation tools
         run: |
-          cargo build --workspace
-          # AUTONOMOUS-BOT-IMPLEMENTED(#657): PMU integration tests run in the hardware lane.
-          cargo test -p detcore --lib --bins
-          cargo test -p hermit --lib --bins
+          cargo install cargo-nextest --locked --version "$NEXTEST_VERSION"
+          rustup component add clippy rustfmt
+      - name: GitHub-hosted test lane
+        run: ./validate.sh --hosted-only --no-label-pr
+      - name: Upload nextest JUnit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-levels-nextest-${{ github.job }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 14
 
   full:
-    name: Full validation (merge gate)
+    name: Hardware validation (merge gate)
     if: >-
       ${{
         github.repository == 'rrnewton/hermit' &&
@@ -79,22 +82,12 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.level == 'full')
         )
       }}
-    # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#657)
-    runs-on: [self-hosted, Linux, X64, hermit, pmu, pmu-serial]
-    timeout-minutes: 180
+    runs-on: [self-hosted, Linux, X64, hermit, pmu]
+    timeout-minutes: 360
     env:
       DETCORE_TEST_RUST_LOG: "off"
-      VALIDATE_GATE_TIMEOUT_SECONDS: "1200"
+      VALIDATE_GATE_TIMEOUT_SECONDS: "3600"
     steps:
-      # AUTONOMOUS-BOT-IMPLEMENTED
-      # TODO-HUMAN-REVIEW(#647)
-      - name: Remove stale checkout locks
-        run: |
-          if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
-            find "$GITHUB_WORKSPACE/.git" -type f -name "*.lock" -print -delete
-          fi
-
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -107,26 +100,29 @@ jobs:
           if command -v dnf >/dev/null; then
             sudo dnf makecache || echo "::notice::dnf makecache failed; using existing metadata"
             sudo dnf install -y gcc-c++ libunwind-devel xz-devel
-            for pkg in cmake zlib-devel redis sqlite golang; do
-              sudo dnf install -y "$pkg" || echo "::notice::$pkg unavailable; skipping"
+            for pkg in cmake zlib-devel redis sqlite ruby nodejs java-latest-openjdk-devel ocaml python3-test gdb lldb; do
+              sudo dnf install -y "$pkg" || echo "::notice::$pkg unavailable; checking existing tools"
             done
           elif command -v apt-get >/dev/null; then
             sudo apt-get update || echo "::notice::apt-get update failed; using existing package index"
             sudo apt-get install -y g++ libunwind-dev liblzma-dev
-            for pkg in cmake zlib1g-dev redis-server redis-tools sqlite3 golang-go; do
-              sudo apt-get install -y "$pkg" || echo "::notice::$pkg unavailable; skipping"
+            for pkg in cmake zlib1g-dev redis-server redis-tools sqlite3 ruby nodejs default-jdk-headless ocaml-nox libpython3.12-testsuite gdb lldb; do
+              sudo apt-get install -y "$pkg" || echo "::notice::$pkg unavailable; checking existing tools"
             done
           else
             echo "::error::Unsupported package manager"
             exit 1
           fi
-      - name: Namespace preflight
-        run: >-
-          unshare --user --map-root-user --pid --fork --uts --net --mount
-          sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys &&
-          mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp'
-      - name: Complete validation suite
-        run: ./validate.sh full --no-label-pr
+      - name: Hardware and runtime preflight
+        run: |
+          test -r /proc/sys/kernel/perf_event_paranoid
+          test -r /dev/kvm -a -w /dev/kvm
+          command -v flock
+          command -v go ruby node javac java ocamlopt python3 redis-server redis-cli sqlite3 gdb lldb
+          python3 -c 'import test.support'
+          unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
+      - name: Self-hosted PMU and CPUID test lane
+        run: flock /tmp/hermit-self-hosted-pmu.lock ./validate.sh --hardware-only --no-label-pr
       - name: Upload working-envelope JSON
         if: always()
         uses: actions/upload-artifact@v4
@@ -146,23 +142,13 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.level == 'super')
         )
       }}
-    # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#657)
-    runs-on: [self-hosted, Linux, X64, hermit, pmu, pmu-serial]
-    timeout-minutes: 180
+    runs-on: [self-hosted, Linux, X64, hermit, pmu]
+    timeout-minutes: 360
     env:
       DETCORE_TEST_RUST_LOG: "off"
       SUPER_REPETITIONS: "20"
-      VALIDATE_GATE_TIMEOUT_SECONDS: "1200"
+      VALIDATE_GATE_TIMEOUT_SECONDS: "7200"
     steps:
-      # AUTONOMOUS-BOT-IMPLEMENTED
-      # TODO-HUMAN-REVIEW(#647)
-      - name: Remove stale checkout locks
-        run: |
-          if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
-            find "$GITHUB_WORKSPACE/.git" -type f -name "*.lock" -print -delete
-          fi
-
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -171,23 +157,23 @@ jobs:
           if command -v dnf >/dev/null; then
             sudo dnf makecache || echo "::notice::dnf makecache failed; using existing metadata"
             sudo dnf install -y gcc-c++ libunwind-devel xz-devel
-            for pkg in cmake zlib-devel; do
-              sudo dnf install -y "$pkg" || echo "::notice::$pkg unavailable; skipping"
+            for pkg in cmake zlib-devel curl unzip patch tcl-devel; do
+              sudo dnf install -y "$pkg" || echo "::notice::$pkg unavailable; checking existing tools"
             done
           elif command -v apt-get >/dev/null; then
             sudo apt-get update || echo "::notice::apt-get update failed; using existing package index"
             sudo apt-get install -y g++ libunwind-dev liblzma-dev
-            for pkg in cmake zlib1g-dev; do
-              sudo apt-get install -y "$pkg" || echo "::notice::$pkg unavailable; skipping"
+            for pkg in cmake zlib1g-dev curl unzip patch tcl-dev; do
+              sudo apt-get install -y "$pkg" || echo "::notice::$pkg unavailable; checking existing tools"
             done
           else
             echo "::error::Unsupported package manager"
             exit 1
           fi
-      - name: Namespace preflight
-        run: >-
-          unshare --user --map-root-user --pid --fork --uts --net --mount
-          sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys &&
-          mount --bind /tmp /tmp && mount --make-rshared /tmp && umount /tmp'
-      - name: Repeated determinism stress
-        run: ./validate.sh super --no-label-pr
+      - name: PMU and namespace preflight
+        run: |
+          test -r /proc/sys/kernel/perf_event_paranoid
+          command -v flock
+          unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
+      - name: Repeated and long-form hardware validation
+        run: flock /tmp/hermit-self-hosted-pmu.lock ./validate.sh super --no-label-pr

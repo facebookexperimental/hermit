@@ -1,0 +1,62 @@
+name: CI (GitHub-hosted)
+
+on:
+  push:
+  # Keep stacked pull requests covered before they are retargeted to main.
+  pull_request:
+  workflow_dispatch:
+
+# Hosted capacity is elastic. Do not add a concurrency group here: every push
+# and pull-request run should finish even while the self-hosted queue backs up.
+env:
+  CARGO_TERM_COLOR: always
+  NEXTEST_VERSION: "0.9.100"
+  RUSTFLAGS: -D warnings -C link-arg=-llzma
+  RUSTDOCFLAGS: -D warnings
+  DETCORE_TEST_RUST_LOG: "off"
+  STRICT_COMPAT_HERMIT_BIN: ${{ github.workspace }}/target/debug/hermit
+
+jobs:
+  regular:
+    name: Regular tests (GitHub-hosted)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-go@v5
+      with:
+        go-version: stable
+        cache: false
+    - name: Enforce detcore backend-abstraction commandment
+      run: ./scripts/check-detcore-backend-abstraction.sh
+    - name: Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq less libunwind-dev liblzma-dev libxml2-utils lsof lua5.4 m4 make netcat-openbsd nginx nodejs openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 tcl time unzip util-linux vim-common wget xz-utils zip zlib1g-dev zstd
+    - name: Enable unprivileged user and mount namespaces
+      run: |
+        if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        fi
+        unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
+    - name: Install cargo-nextest
+      run: cargo install cargo-nextest --locked --version "$NEXTEST_VERSION"
+    - name: Rust components
+      run: rustup component add clippy rustfmt
+    - name: Portable test lane (no PMU or CPUID interception)
+      run: ./validate.sh --hosted-only --no-label-pr --verbose
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#598)
+    - name: DBI pipe backpressure diagnostics (nonblocking)
+      continue-on-error: true
+      timeout-minutes: 5
+      run: cargo test -p hermit --test cli run_dbi_verifies_pipe_backpressure -- --exact --test-threads=1
+    - name: Upload nextest JUnit report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: nextest-junit-${{ github.job }}
+        path: target/nextest/ci/junit.xml
+        if-no-files-found: warn
+        retention-days: 14

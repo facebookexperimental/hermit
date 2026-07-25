@@ -917,21 +917,27 @@ fn verify_verbose_compares_the_full_trace() {
 fn verify_honors_tmp_and_environment() {
     let _guard = hermit_run_lock();
     let tmp = tempfile::tempdir().expect("failed to create verify tmp directory");
+    let source = tmp.path().join("guest.c");
     let guest = tmp.path().join("guest");
     fs::write(
-        &guest,
-        r#"#!/bin/sh
-[ "${VERIFY_CONFIGURED-}" = expected ] || exit 11
-[ "${VERIFY_HOST_ONLY+set}" != set ] || exit 12
-printf 'configured\n'
+        &source,
+        r#"#include <stdlib.h>
+#include <string.h>
+
+int main(void) {
+    const char *configured = getenv("VERIFY_CONFIGURED");
+    if (configured == NULL || strcmp(configured, "expected") != 0) {
+        return 11;
+    }
+    if (getenv("VERIFY_HOST_ONLY") != NULL) {
+        return 12;
+    }
+    return 0;
+}
 "#,
     )
-    .expect("failed to write verify guest");
-    let mut permissions = fs::metadata(&guest)
-        .expect("failed to stat verify guest")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&guest, permissions).expect("failed to make verify guest executable");
+    .expect("failed to write verify guest source");
+    compile_c(&source, &guest);
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command

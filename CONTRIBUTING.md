@@ -29,8 +29,10 @@ entry point is:
 ./validate.sh
 ```
 
-`validate.sh` is the local mirror of the GitHub Actions workflow
-(`.github/workflows/ci.yml`): it runs the same build, lint, format, doc, and
+`validate.sh` is the local mirror of the GitHub Actions workflows
+(`.github/workflows/ci-hosted.yml` and
+`.github/workflows/ci-selfhosted.yml`): it runs the same build, lint,
+format, doc, and
 test matrix, in the same modes, so a green local run predicts a green CI run.
 The exact step-by-step mapping between the two — and any sanctioned
 host-capability differences — is documented in
@@ -56,8 +58,8 @@ Protocol for every PR:
    say so explicitly in the PR description — state the command, the host
    limitation, and what you observed. Never silently skip a check or weaken a
    hardware-sensitive assertion to make a local VM green.
-2. When you add, remove, or rename a test, update **both** `ci.yml` and
-   `validate.sh` in the same PR so they stay in lockstep, and update the
+2. When you add, remove, or rename a test, update `validate.sh` and the
+   owning CI workflow in the same PR so they stay in lockstep, and update the
    mapping table in `docs/ci-validate-alignment.md`. See the "Reconciliation
    checklist for test-adding PRs" in that document.
 3. Once `validate.sh` passes, add the **`locally-validated`** label to the PR.

@@ -59,12 +59,10 @@ cargo build -p hermit
 python3 experiments/backend-parity_20260722/run_matrix.py --backend ptrace
 ```
 
-Run DBI with a source-built DynamoRIO and the Reverie client:
+Run DBI with the pinned DynamoRIO runtime and client built by Cargo:
 
 ```bash
-export DYNAMORIO_HOME=$HOME/dynamorio/install
-export HERMIT_DRRUN=$DYNAMORIO_HOME/bin64/drrun
-export HERMIT_DBI_CLIENT=$HOME/work/dev-reverie/reverie/target/reverie-dbi-native/libreverie_dbi_client.so
+cargo build -p hermit
 python3 experiments/backend-parity_20260722/run_matrix.py --backend dbi --require-backend
 ```
 

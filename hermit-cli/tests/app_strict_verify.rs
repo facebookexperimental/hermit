@@ -207,8 +207,8 @@ fn assert_l2_under_strict_verify(program: &Path, args: &[&str]) {
             "run",
             "--strict",
             "--verify",
-            // The self-hosted runner exposes real CPUID/PMU; these relaxations
-            // keep the test usable on VMs without CPUID interception without
+            // The test does not assert CPUID or PMU behavior; these flags
+            // keep the test portable to runners without those capabilities. They do not
             // weakening determinism (they do not disable strict mode).
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",
@@ -237,21 +237,21 @@ fn assert_l2_under_strict_verify(program: &Path, args: &[&str]) {
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + the curl binary"]
+#[ignore = "e2e: requires hermit + mount namespaces + the curl binary"]
 fn curl_version_is_deterministic_under_strict_verify() {
     let curl = required_app("curl", &["/usr/bin/curl", "/usr/local/bin/curl"]);
     assert_l2_under_strict_verify(&curl, &["--version"]);
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + the nginx binary"]
+#[ignore = "e2e: requires hermit + mount namespaces + the nginx binary"]
 fn nginx_version_is_deterministic_under_strict_verify() {
     let nginx = required_app("nginx", &["/usr/sbin/nginx", "/usr/bin/nginx"]);
     assert_l2_under_strict_verify(&nginx, &["-v"]);
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + the redis-server binary"]
+#[ignore = "e2e: requires hermit + mount namespaces + the redis-server binary"]
 fn redis_server_version_is_deterministic_under_strict_verify() {
     let redis_server = required_app(
         "redis-server",
@@ -261,7 +261,7 @@ fn redis_server_version_is_deterministic_under_strict_verify() {
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + a JVM"]
+#[ignore = "e2e: requires hermit + mount namespaces + a JVM"]
 fn java_version_is_deterministic_under_strict_verify() {
     let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
     let args = java_vm_args(&["-version"]);
@@ -466,21 +466,21 @@ fn assert_l1_stdout_deterministic(program: &Path, args: &[&str]) {
 // --- L2: compiled managed-runtime programs are bitwise deterministic ---
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + the Go toolchain"]
+#[ignore = "e2e: requires hermit + mount namespaces + the Go toolchain"]
 fn go_hello_is_deterministic_under_strict_verify() {
     let bin = compile_go(GO_HELLO_SRC, "hermit_go_hello");
     assert_l2_under_strict_verify(&bin, &[]);
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + the Go toolchain"]
+#[ignore = "e2e: requires hermit + mount namespaces + the Go toolchain"]
 fn go_goroutines_are_deterministic_under_strict_verify() {
     let bin = compile_go(GO_GOROUTINES_SRC, "hermit_go_goroutines");
     assert_l2_under_strict_verify(&bin, &[]);
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + a JDK"]
+#[ignore = "e2e: requires hermit + mount namespaces + a JDK"]
 fn java_hello_is_deterministic_under_strict_verify() {
     let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
     let classpath = compile_java(JAVA_HELLO_SRC, "Hello");
@@ -490,7 +490,7 @@ fn java_hello_is_deterministic_under_strict_verify() {
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + a JDK"]
+#[ignore = "e2e: requires hermit + mount namespaces + a JDK"]
 fn java_threads_are_deterministic_under_strict_verify() {
     let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
     let classpath = compile_java(JAVA_THREADS_SRC, "Threads");
@@ -502,7 +502,7 @@ fn java_threads_are_deterministic_under_strict_verify() {
 // --- L1: toolchain drivers are output-deterministic but not bitwise (no L2) ---
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + the Go toolchain"]
+#[ignore = "e2e: requires hermit + mount namespaces + the Go toolchain"]
 fn go_version_is_l1_deterministic_under_strict() {
     // `go version` is output-deterministic under --strict but Hermit's --verify
     // reports it nondeterministic, so it is asserted at L1 only.
@@ -511,7 +511,7 @@ fn go_version_is_l1_deterministic_under_strict() {
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + a JDK"]
+#[ignore = "e2e: requires hermit + mount namespaces + a JDK"]
 fn javac_is_l1_deterministic_under_strict() {
     // `javac` produces a bytewise-identical class file across --strict runs, but
     // Hermit's --verify reports it nondeterministic, so it is asserted at L1.

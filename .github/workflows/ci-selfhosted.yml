@@ -1,0 +1,173 @@
+name: CI (self-hosted)
+
+on:
+  push:
+    branches: [ "main" ]
+  # Keep stacked pull requests covered before they are retargeted to main.
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      qemu_l2:
+        description: Run the optional heavyweight QEMU strict-L2 boot gate
+        required: false
+        type: boolean
+        default: false
+
+# Self-hosted capacity is scarce, so a newer commit replaces an older run for
+# the same pull request or branch.
+concurrency:
+  group: selfhosted-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  NEXTEST_VERSION: "0.9.100"
+  RUSTFLAGS: -D warnings -C link-arg=-llzma
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  # AUTONOMOUS-BOT-IMPLEMENTED
+  # TODO-HUMAN-REVIEW(#553)
+  qemu-l2:
+    name: QEMU strict L2 boot (optional heavyweight)
+    if: >-
+      ${{
+        github.repository == 'rrnewton/hermit' &&
+        github.event_name == 'workflow_dispatch' &&
+        inputs.qemu_l2
+      }}
+    runs-on: [self-hosted, Linux, X64, hermit, pmu]
+    timeout-minutes: 60
+
+    steps:
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#647)
+    - name: Remove stale checkout locks
+      run: |
+        if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+          find "$GITHUB_WORKSPACE/.git" -type f -name "*.lock" -print -delete
+        fi
+
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - name: Dependencies
+      run: |
+        # Refresh the (partial) self-hosted package index first, install the hard
+        # link deps strictly, then the rest best-effort so a missing package does
+        # not fail the step before the preflight can report a clear diagnosis.
+        if command -v dnf >/dev/null; then
+          sudo dnf makecache || echo "::notice::dnf makecache failed; using existing metadata"
+          sudo dnf install -y gcc-c++ libunwind-devel xz-devel
+          for pkg in cmake zlib-devel cpio gzip qemu-system-x86-core; do
+            sudo dnf install -y "$pkg" || echo "::notice::$pkg unavailable; skipping"
+          done
+        elif command -v apt-get >/dev/null; then
+          sudo apt-get update || echo "::notice::apt-get update failed; using existing package index"
+          sudo apt-get install -y g++ libunwind-dev liblzma-dev
+          for pkg in cmake zlib1g-dev cpio gzip qemu-system-x86; do
+            sudo apt-get install -y "$pkg" || echo "::notice::$pkg unavailable; skipping"
+          done
+        else
+          echo "::error::Unsupported package manager; QEMU L2 dependencies are unavailable"
+          exit 1
+        fi
+    - name: QEMU and namespace preflight
+      run: |
+        command -v flock
+        command -v qemu-system-x86_64
+        test -r /boot/vmlinuz
+        unshare --user --map-root-user --pid --fork --uts --net --mount \
+          sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
+    - name: Validate QEMU strict L2 boot
+      env:
+        KERNEL_IMAGE: /boot/vmlinuz
+      run: flock /tmp/hermit-self-hosted-pmu.lock ./validate.sh --qemu-l2-only --no-label-pr
+
+  hardware:
+    name: PMU and CPUID tests (self-hosted)
+    if: >-
+      ${{
+        github.repository == 'rrnewton/hermit' &&
+        (
+          github.event_name == 'push' ||
+          github.event_name == 'workflow_dispatch' ||
+          (
+            github.event_name == 'pull_request' &&
+            github.event.pull_request.user.login == 'rrnewton'
+          )
+        )
+      }}
+    runs-on: [self-hosted, Linux, X64, hermit, pmu]
+    timeout-minutes: 240
+    env:
+      DETCORE_TEST_RUST_LOG: "off"
+
+    steps:
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#647)
+    - name: Remove stale checkout locks
+      run: |
+        if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+          find "$GITHUB_WORKSPACE/.git" -type f -name "*.lock" -print -delete
+        fi
+
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - uses: actions/setup-go@v5
+      with:
+        go-version: stable
+        cache: false
+    - name: Dependencies
+      run: |
+        # Install compiler/linker dependencies strictly. Runtime and debugger
+        # packages are best-effort here because this runner has a partial package
+        # mirror; the following preflight reports any missing capability clearly.
+        if command -v dnf >/dev/null; then
+          sudo dnf makecache || echo "::notice::dnf makecache failed; using existing metadata"
+          sudo dnf install -y gcc-c++ libunwind-devel xz-devel
+          for pkg in cmake zlib-devel redis sqlite ruby nodejs java-latest-openjdk-devel ocaml python3-test gdb lldb; do
+            sudo dnf install -y "$pkg" || echo "::notice::$pkg unavailable; checking existing tools"
+          done
+        elif command -v apt-get >/dev/null; then
+          sudo apt-get update || echo "::notice::apt-get update failed; using existing package index"
+          sudo apt-get install -y g++ libunwind-dev liblzma-dev
+          for pkg in cmake zlib1g-dev redis-server redis-tools sqlite3 ruby nodejs default-jdk-headless ocaml-nox libpython3.12-testsuite gdb lldb; do
+            sudo apt-get install -y "$pkg" || echo "::notice::$pkg unavailable; checking existing tools"
+          done
+        else
+          echo "::error::Unsupported package manager"
+          exit 1
+        fi
+    - name: Require hardware and runtime capabilities
+      run: |
+        test -r /proc/sys/kernel/perf_event_paranoid
+        test -r /dev/kvm -a -w /dev/kvm
+        command -v flock
+        command -v go ruby node javac java ocamlopt python3 redis-server redis-cli sqlite3 gdb lldb
+        python3 -c 'import test.support'
+        unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
+    - name: PMU and CPUID test lane
+      run: flock /tmp/hermit-self-hosted-pmu.lock ./validate.sh --hardware-only --no-label-pr
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#673)
+    - name: Pselect signal-interruption diagnostic (nonblocking)
+      continue-on-error: true
+      timeout-minutes: 5
+      run: flock /tmp/hermit-self-hosted-pmu.lock cargo test -p hermit --test pselect6_simulation -- --test-threads=1
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#678)
+    - name: Record/replay matrix diagnostics (nonblocking)
+      continue-on-error: true
+      timeout-minutes: 5
+      run: flock /tmp/hermit-self-hosted-pmu.lock cargo test -p hermit --test record_replay record_replay_matrix -- --exact --test-threads=1
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#657)
+    - name: Managed JVM strict-verify diagnostics (nonblocking)
+      continue-on-error: true
+      timeout-minutes: 5
+      env:
+        HERMIT_APP_VERIFY_TIMEOUT: "20s"
+        RUST_BACKTRACE: "1"
+      run: flock /tmp/hermit-self-hosted-pmu.lock cargo test -p hermit --test app_strict_verify java -- --ignored --test-threads=1 --nocapture

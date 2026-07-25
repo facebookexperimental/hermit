@@ -114,7 +114,15 @@ fn assert_scenario_reaches_l2(scenario: &str) {
     command
         .args(["--kill-after", "10s", "60s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=off", "run", "--strict", "--verify", "--"])
+        .args([
+            "--log=off",
+            "run",
+            "--strict",
+            "--verify",
+            "--no-virtualize-cpuid",
+            "--preemption-timeout=disabled",
+            "--",
+        ])
         .arg(epoll_guest())
         .arg(scenario);
 
@@ -160,7 +168,7 @@ fn notification_control_syscalls_are_deterministic() {
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces"]
+#[ignore = "e2e: requires hermit + mount namespaces"]
 fn notification_control_syscalls_reach_strict_verify_l2() {
     assert_scenario_reaches_l2("control-fds");
 }

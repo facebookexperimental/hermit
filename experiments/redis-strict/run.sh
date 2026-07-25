@@ -75,7 +75,8 @@ cmp "$artifact_root/strict-extended-1.stderr" \
   fail "strict Redis diagnostics changed between runs"
 
 memory_log=$artifact_root/strict-memory-test.log
-if ! timeout 120 "$hermit_bin" --log off run --strict -- \
+# This guest is single-process; PMU preemption adds no coverage and can fail on AMD skid.
+if ! timeout 120 "$hermit_bin" --log off run --strict --max-timeslice=disabled -- \
   "$redis_server" --test-memory 2 >"$memory_log" 2>&1; then
   tail -n 40 "$memory_log" >&2
   fail "Redis built-in memory test failed under strict Hermit"

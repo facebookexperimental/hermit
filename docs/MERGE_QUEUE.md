@@ -6,8 +6,8 @@ request head from bypassing changes that landed ahead of it.
 
 The required check is `merge-gate`. It passes when either:
 
-- the latest `.github/workflows/ci.yml` run for the exact pull request head
-  completed successfully; or
+- the latest `.github/workflows/ci-hosted.yml` run for the exact pull request
+  head completed successfully; or
 - the pull request has the `locally-validated` label from a fully green
   `./validate.sh` run.
 
@@ -37,6 +37,8 @@ when a green run must not update GitHub.
 
 The label is an alternate merge admission signal, not a partial-test waiver.
 Apply it only through a full green validator run on the exact pull request head.
+The self-hosted workflow remains an independent bonus signal and is not a merge
+admission requirement.
 
 ## Repository settings
 

@@ -40,6 +40,8 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix
 #   ./validate.sh --e9patch-compat-only       # gate core + installed e9patch L2 apps
 #   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
+#   ./validate.sh --hosted-only               # no PMU/CPUID hardware required
+#   ./validate.sh --hardware-only             # PMU/CPUID-dependent tests only
 #   ./validate.sh --verbose                  # stream each gate's command, PID,
 #                                            # elapsed time, and subprocess output
 # A fully-green full run labels the current PR `locally-validated` by default.
@@ -74,6 +76,7 @@ LITEINST_COMPAT_ONLY=0
 SABRE_COMPAT_ONLY=0
 E9PATCH_COMPAT_ONLY=0
 QEMU_L2_ONLY=0
+HARDWARE_ONLY=0
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
 VERBOSE=0
@@ -106,6 +109,7 @@ while [[ $# -gt 0 ]]; do
         # TODO-HUMAN-REVIEW(PR-664): Review the focused e9patch compatibility CLI.
         --e9patch-compat-only) E9PATCH_COMPAT_ONLY=1; shift ;;
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
+        --hardware-only) HARDWARE_ONLY=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
         --no-label-pr) LABEL_PR=0; shift ;;
@@ -125,6 +129,7 @@ only_modes=0
 ((SABRE_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((E9PATCH_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((QEMU_L2_ONLY == 1)) && ((only_modes += 1))
+((HARDWARE_ONLY == 1)) && ((only_modes += 1))
 if ((only_modes > 1)); then
     echo "validate.sh: choose only one focused validation mode" >&2
     exit 2
@@ -141,6 +146,7 @@ VALIDATION_PROFILE=$VALIDATION_LEVEL
 ((SABRE_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="sabre-compat-only"
 ((E9PATCH_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="e9patch-compat-only"
 ((QEMU_L2_ONLY == 1)) && VALIDATION_PROFILE="qemu-l2-only"
+((HARDWARE_ONLY == 1)) && VALIDATION_PROFILE="hardware-only"
 
 case "$VALIDATION_PROFILE" in
     quick) VALIDATION_ESTIMATE="about 3 minutes" ;;
@@ -153,6 +159,7 @@ case "$VALIDATION_PROFILE" in
     sabre-compat-only) VALIDATION_ESTIMATE="about 10-20 minutes" ;;
     e9patch-compat-only) VALIDATION_ESTIMATE="about 5-20 minutes" ;;
     qemu-l2-only) VALIDATION_ESTIMATE="about 30-60 minutes" ;;
+    hardware-only) VALIDATION_ESTIMATE="about 60-180 minutes" ;;
     envelope-only) VALIDATION_ESTIMATE="about 5 minutes" ;;
 esac
 readonly VALIDATION_ESTIMATE
@@ -167,6 +174,10 @@ if ((QEMU_L2_ONLY == 1)); then
     # One boot-oracle phase plus run1/run2/compare, with five minutes for
     # process startup, teardown, and reporting outside those phase budgets.
     default_gate_timeout_seconds=$((4 * qemu_phase_timeout_seconds + 300))
+elif ((HARDWARE_ONLY == 1)); then
+    # The PMU memory-race fixtures perform tens of millions of instrumented
+    # atomic operations. They need a longer per-family budget than portable CI.
+    default_gate_timeout_seconds=3600
 fi
 GATE_TIMEOUT_SECONDS=${VALIDATE_GATE_TIMEOUT_SECONDS:-$default_gate_timeout_seconds}
 TIMEOUT_KILL_GRACE_SECONDS=${VALIDATE_TIMEOUT_KILL_GRACE_SECONDS:-5}
@@ -185,8 +196,7 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
 readonly STRICT_COMPAT_ONLY RR_COMPAT_ONLY LITEINST_COMPAT_ONLY SABRE_COMPAT_ONLY
-readonly E9PATCH_COMPAT_ONLY
-readonly QEMU_L2_ONLY
+readonly E9PATCH_COMPAT_ONLY QEMU_L2_ONLY HARDWARE_ONLY
 readonly VALIDATION_LEVEL VALIDATION_PROFILE
 
 SUPER_REPETITIONS=${SUPER_REPETITIONS:-20}
@@ -262,7 +272,8 @@ readonly NEXTEST_PROFILE_NAME NEXTEST_RUN
 readonly HERMIT_BIN="$ROOT_DIR/target/debug/hermit"
 readonly HERMIT_SMOKE_TIMEOUT="30s"
 readonly SMOKE_MARKER="hermit-validation-smoke"
-readonly STRICT_COMPAT_HERMIT_BIN="$ROOT_DIR/target/release/hermit"
+STRICT_COMPAT_HERMIT_BIN=${STRICT_COMPAT_HERMIT_BIN:-"$ROOT_DIR/target/release/hermit"}
+readonly STRICT_COMPAT_HERMIT_BIN
 readonly STRICT_COMPAT_TIMEOUT=60
 readonly BACKEND_COMPAT_RESULTS="$VALIDATION_TMP_DIR/backend-compat-results.tsv"
 readonly COMPAT_SUMMARY_RESULTS="$VALIDATION_TMP_DIR/compat-summary-results.tsv"
@@ -433,7 +444,8 @@ function failure_summary {
 function run_timed_command {
     local name=$1
     local log_file=$2
-    shift 2
+    local timeout_seconds=$3
+    shift 3
 
     local started_at=$SECONDS
     local next_report=$VERBOSE_INTERVAL_SECONDS
@@ -460,7 +472,7 @@ function run_timed_command {
 
     while kill -0 "$pid" 2>/dev/null; do
         elapsed=$((SECONDS - started_at))
-        if ((elapsed >= GATE_TIMEOUT_SECONDS)); then
+        if ((elapsed >= timeout_seconds)); then
             kill_process_tree "$pid" TERM
             grace_deadline=$((SECONDS + TIMEOUT_KILL_GRACE_SECONDS))
             while kill -0 "$pid" 2>/dev/null && ((SECONDS < grace_deadline)); do
@@ -472,15 +484,15 @@ function run_timed_command {
             wait "$pid" 2>/dev/null || true
             active_check_pid=""
             printf "Gate timed out after %ss (subprocess PID %s)\n" \
-                "$GATE_TIMEOUT_SECONDS" "$pid" >>"$log_file"
+                "$timeout_seconds" "$pid" >>"$log_file"
             printf "⏱️  %s timed out after %ss (subprocess PID %s)\n" \
-                "$name" "$GATE_TIMEOUT_SECONDS" "$pid"
+                "$name" "$timeout_seconds" "$pid"
             return 124
         fi
 
         if ((VERBOSE == 1 && elapsed >= next_report)); then
             printf "  still running: %s (PID %s, elapsed %ss/%ss)\n" \
-                "$name" "$pid" "$elapsed" "$GATE_TIMEOUT_SECONDS"
+                "$name" "$pid" "$elapsed" "$timeout_seconds"
             next_report=$((next_report + VERBOSE_INTERVAL_SECONDS))
         fi
         sleep 0.2
@@ -498,9 +510,10 @@ function run_timed_command {
     return "$status"
 }
 
-function run_check {
-    local name=$1
-    shift
+function run_check_with_timeout {
+    local timeout_seconds=$1
+    local name=$2
+    shift 2
 
     local started_at=$SECONDS
     local output_start
@@ -519,10 +532,10 @@ function run_check {
         printf "\n▶ %s\n" "$name"
         printf "  command:"
         printf " %q" "$@"
-        printf "\n  timeout: %ss\n" "$GATE_TIMEOUT_SECONDS"
+        printf "\n  timeout: %ss\n" "$timeout_seconds"
     fi
 
-    if run_timed_command "$name" "$LOG_FILE" "$@"; then
+    if run_timed_command "$name" "$LOG_FILE" "$timeout_seconds" "$@"; then
         status=0
         printf "✅ %s (1 passed, 0 failed, %ss)\n" \
             "$name" "$((SECONDS - started_at))"
@@ -539,6 +552,10 @@ function run_check {
         printf "Duration: %ss\n\n" "$((SECONDS - started_at))"
     } >>"$LOG_FILE"
     checks=$((checks + 1))
+}
+
+function run_check {
+    run_check_with_timeout "$GATE_TIMEOUT_SECONDS" "$@"
 }
 
 function start_check {
@@ -565,7 +582,7 @@ function start_check {
         local started_at=$SECONDS
         local status
 
-        if run_timed_command "$name" "$log_file" "$@"; then
+        if run_timed_command "$name" "$log_file" "$GATE_TIMEOUT_SECONDS" "$@"; then
             status=0
         else
             status=$?
@@ -1322,6 +1339,9 @@ function strict_compatibility_probe {
     local backend_diagnostic=""
     local probe_timeout=$STRICT_COMPAT_TIMEOUT
     local -a run_args=(run --strict --verify --)
+    if [[ $VALIDATION_PROFILE == hosted-only ]]; then
+        run_args=(run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --)
+    fi
     if [[ $COMPATIBILITY_MODE == sabre ]]; then
         assurance=SaBRe
         run_args=(run --backend sabre --strict --verify --)
@@ -2550,6 +2570,42 @@ function print_summary {
     fi
 }
 
+function run_hosted_envelope_levels {
+    local probe cmd iteration
+    local -a command
+
+    for probe in "${ENVELOPE_PROBES[@]}"; do
+        cmd=${probe#*|}
+        read -r -a command <<<"$cmd"
+        _envelope_level "--strict" "${command[@]}" || return $?
+        _envelope_level "--strict --verify" "${command[@]}" || return $?
+        _envelope_level "--strict --verify --detlog-heap --detlog-stack" "${command[@]}" || return $?
+        for ((iteration = 0; iteration < L4_REPS; iteration++)); do
+            _envelope_level "--strict --verify" "${command[@]}" || return $?
+        done
+    done
+}
+
+function run_hardware_envelope_record_replay {
+    local probe cmd
+    local -a command
+
+    for probe in "${ENVELOPE_PROBES[@]}"; do
+        cmd=${probe#*|}
+        read -r -a command <<<"$cmd"
+        timeout "${HERMIT_RR_TIMEOUT:-$HERMIT_SMOKE_TIMEOUT}" \
+            "$HERMIT_BIN" record start --verify -- "${command[@]}" \
+            </dev/null >>"$LOG_FILE" 2>&1 || return $?
+    done
+}
+
+function run_hermit_targets_serial {
+    local target
+    for target in "$@"; do
+        cargo test -p hermit --test "$target" -- --test-threads=1 || return $?
+    done
+}
+
 function run_hosted_only_suite {
     run_check "Detcore backend-abstraction check" \
         ./scripts/check-detcore-backend-abstraction.sh
@@ -2561,13 +2617,122 @@ function run_hosted_only_suite {
     start_check "Rustfmt" cargo fmt --all -- --check
     start_check "Documentation" cargo doc --workspace --no-deps
 
-    run_check "Test portable workspace crates" \
-        "${NEXTEST_RUN[@]}" --workspace --exclude detcore --exclude hermit \
-        --exclude hermetic_infra_hermit_flaky-tests
-    run_check "Test Hermit libraries and binaries" cargo test -p hermit --lib --bins
-    run_check "Test Detcore libraries and binaries" cargo test -p detcore --lib --bins
+    run_check "Test regular workspace crates" "${NEXTEST_RUN[@]}" --workspace --exclude detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests
+    run_check "Test flaky guest crate" cargo test -p hermetic_infra_hermit_flaky-tests
+    run_check "Test Hermit unit and binary targets" cargo test -p hermit --lib --bins
+    run_check "Test Detcore unit and binary targets" cargo test -p detcore --lib --bins
+    run_check "Test Detcore non-CPUID miscellaneous cases" cargo test -p detcore --test tests_misc -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --test-threads=1
+    run_check "Test Detcore non-PMU parallel cases" cargo test -p detcore --test tests_parallelism -- --skip detcore --test-threads=4
+
+    run_check "Portable Hermit integration targets" run_hermit_targets_serial chaos_sched_yield_progress chaos_stress_pmu_detection clock_determinism epoll_determinism fp_reduction_determinism hashseed_determinism integration_matrix ipc_determinism mmap_determinism procfs_determinism python_stdlib random_determinism signal_determinism thread_sync_determinism
+    run_check "Portable arbitrary-binary cases" cargo test -p hermit --test arbitrary_binaries -- --skip record_replay_stable_arbitrary_binaries --test-threads=1
+    run_check "Portable CLI cases" cargo test -p hermit --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbi_verifies_pipe_backpressure --test-threads=1
+    run_check "Portable Hermit mode cases" cargo test -p hermit --test hermit_modes -- --skip default_ --skip chaos_buck_ --test-threads=1
+    run_check "Portable application strict verification" cargo test -p hermit --test app_strict_verify -- --ignored --skip java_ --skip javac_ --test-threads=1
+    run_check "Portable command strict verification" cargo test -p hermit --test command_strict_verify -- --ignored --test-threads=1
+    run_check "Portable ignored syscall regressions" cargo test -p hermit --test epoll_determinism --test rcx_canonicalization -- --ignored --test-threads=1
+    run_check "rr suite source contract" cargo test -p hermit --test rr_suite rr_scratch_directories_are_fresh_and_cleaned -- --exact
+    run_check "DynamoRIO DBI backend parity" python3 experiments/backend-parity_20260722/run_matrix.py --backend dbi --require-backend
+    run_check "Portable working-envelope levels" run_hosted_envelope_levels
+
+    run_check "Strict compatibility envelope" run_strict_compatibility_envelope
 
     wait_for_background_checks
+    print_summary
+    ((failures == 0))
+}
+
+function run_exact_detcore_cases {
+    local label=$1
+    local target=$2
+    local timeout_seconds=$3
+    shift 3
+
+    local failures_before=$failures
+    local test_name
+
+    for test_name in "$@"; do
+        printf "Running %s: %s\n" "$label" "$test_name"
+        run_check_with_timeout "$timeout_seconds" "$label: $test_name" \
+            cargo test -p detcore --test "$target" "$test_name" -- --exact --test-threads=1
+        if ((failures > failures_before)); then
+            printf "Skipping remaining %s cases after the first failure.\n" "$label"
+            return
+        fi
+    done
+}
+
+function run_hardware_validation {
+    local leveldb_install="$ROOT_DIR/target/hermit-leveldb-ci"
+    local leveldb_build="$ROOT_DIR/target/hermit-leveldb-build-ci"
+
+    run_check "Build workspace" cargo build --workspace
+    run_check "Build release Hermit for record/replay compatibility" cargo build --release -p hermit
+    run_check "CPUID host feature probe" cargo test -p detcore --test tests_misc has_rdrand_without_detcore -- --exact
+    run_check "CPUID RDRAND/RDSEED masking" cargo test -p detcore --test tests_misc rdrand_rdseed_is_masked -- --exact
+    # Keep PMU tracees in separate harness processes. On the persistent runner,
+    # a leaked tracee can otherwise hold an entire family gate open for an hour.
+    run_exact_detcore_cases "PMU timing" tests_time 120 \
+        max_timeslice_preempts_cpu_bound_code_without_rcb_logical_time \
+        rdtsc_deltas \
+        target_timeslice_yields_at_syscall_boundaries_without_pmu \
+        tod_clock_getres \
+        tod_clock_getres_2 \
+        tod_clock_gettime \
+        tod_from_epoch \
+        tod_gettimeofday \
+        tod_gettimeofday_delta::bottom_detcore \
+        tod_gettimeofday_delta::default_detcore \
+        tod_gettimeofday_delta::middle_detcore \
+        tod_gettimeofday_delta::top_detcore \
+        tod_is_stable \
+        tod_time
+    run_exact_detcore_cases "PMU parallel futex" tests_parallelism 300 \
+        futex_wait_parent::bottom_detcore \
+        futex_wait_parent::default_detcore \
+        futex_wait_parent::middle_detcore
+    run_exact_detcore_cases "PMU parallel memory" tests_parallelism 900 \
+        mem_race::bottom_detcore \
+        mem_race::default_detcore \
+        mem_race::middle_detcore \
+        mem_race::top_detcore
+    run_exact_detcore_cases "PMU parallel memory-and-print" tests_parallelism 900 \
+        mem_print_race::bottom_detcore \
+        mem_print_race::default_detcore \
+        mem_print_race::middle_detcore \
+        mem_print_race::top_detcore
+
+    run_check "KVM CLI cases" cargo test -p hermit --test cli run_kvm_ -- --test-threads=1
+    run_check "KVM global-position CLI case" cargo test -p hermit --test cli backend_accepted_in_global_position -- --exact --test-threads=1
+    run_check "Hardware Hermit integration targets" run_hermit_targets_serial arch_prctl compression madvise ppoll_simulation redis_strict sqlite_veryquick syscall_file_io syscall_file_metadata syscall_quick_wins thread_scheduling_fairness writev_determinism
+    run_check "Stable record/replay integration tests" cargo test -p hermit --test record_replay -- --skip record_replay_matrix --test-threads=1
+    run_check "Arbitrary-binary record/replay case" cargo test -p hermit --test arbitrary_binaries record_replay_stable_arbitrary_binaries -- --exact --test-threads=1
+    run_check "Random-source strict verification" cargo test -p hermit --test random_determinism random_sources_are_deterministic_under_strict_verify -- --exact --ignored --test-threads=1
+    run_check "PMU analyze scenarios" cargo test -p hermit --test analyze -- --ignored --skip analyze_hello_race --test-threads=1
+    run_check "Runtime entropy scenarios" cargo test -p hermit --test language_runtime_determinism -- --ignored --test-threads=1
+    run_check "PMU Python stdlib scenarios" cargo test -p hermit --test python_stdlib -- --ignored --test-threads=1
+    run_check "PMU stress search and replay" cargo test -p hermit --test stress_suite slow_cas_search_and_replay -- --exact --ignored --test-threads=1
+
+    run_check "Build pinned LevelDB integration fixture" ./hermit-cli/tests/prepare_leveldb.sh "$leveldb_install" "$leveldb_build"
+    run_check "Focused LevelDB strict determinism" env HERMIT_LEVELDB_BUILD_DIR="$leveldb_build" cargo test -p hermit --test leveldb focused_leveldb_tests_are_deterministic_under_strict -- --exact --test-threads=1
+    run_check "LevelDB env_posix strict determinism" env HERMIT_LEVELDB_BUILD_DIR="$leveldb_build" cargo test -p hermit --test leveldb leveldb_env_posix_is_deterministic_under_strict -- --exact --ignored --test-threads=1
+    run_check "Extended Redis strict determinism" cargo test -p hermit --test redis_strict -- --ignored --test-threads=1
+
+    if [[ -f "$ROOT_DIR/third-party/rr/src/test/util.h" ]]; then
+        run_check "PMU rr syscall suite" cargo test -p hermit --test rr_suite -- --ignored --skip rr_ppoll --skip rr_rlimit --skip rr_sched_yield_to_lower_priority --test-threads=1
+    else
+        failures=$((failures + 1))
+        checks=$((checks + 1))
+        echo "FAIL: PMU rr syscall suite requires initialized third-party/rr"
+    fi
+
+    run_check "Record/replay working-envelope level" run_hardware_envelope_record_replay
+    run_check "Record/replay compatibility baseline" run_rr_compatibility_envelope
+    run_check "Debugger integration tests" ./tests/debugger/run_debugger_tests.sh
+    run_check "Ptrace backend parity" python3 experiments/backend-parity_20260722/run_matrix.py --backend ptrace
+
+    print_summary
+    ((failures == 0))
 }
 
 function run_quick_suite {
@@ -2629,6 +2794,9 @@ function run_full_suite {
 }
 
 function run_super_suite {
+    local leveldb_install="$ROOT_DIR/target/hermit-leveldb-super"
+    local leveldb_build="$ROOT_DIR/target/hermit-leveldb-build-super"
+
     run_check "Build workspace" cargo build --workspace
     run_check "Build release Hermit" cargo build --release -p hermit
     run_check "Super repeated determinism probes" run_super_stress_suite
@@ -2636,10 +2804,28 @@ function run_super_suite {
         printf "\n== Super stress pass rates ==\n"
         cat "$VALIDATION_TMP_DIR/super-report"
     fi
+    run_check "Weekly relaxed default-mode cases" cargo test -p hermit --test hermit_modes default_ -- --test-threads=1
+    run_check "Weekly portable chaos cases" cargo test -p hermit --test stress_suite -- --skip slow_cas_search_and_replay --test-threads=1
+    run_check "Weekly ignored portable chaos cases" cargo test -p hermit --test stress_suite -- --ignored --skip slow_cas_search_and_replay --test-threads=1
+    run_check "PMU Buck chaos cases" cargo test -p hermit --test hermit_modes chaos_buck_ -- --ignored --test-threads=1
+    run_check "PMU analyze hello-race stress" cargo test -p hermit --test analyze analyze_hello_race -- --exact --ignored --test-threads=1
+    run_check "Build pinned LevelDB super fixture" ./hermit-cli/tests/prepare_leveldb.sh "$leveldb_install" "$leveldb_build"
+    run_check "Full LevelDB strict determinism" env HERMIT_LEVELDB_BUILD_DIR="$leveldb_build" cargo test -p hermit --test leveldb full_leveldb_suite_is_deterministic_under_strict -- --exact --ignored --test-threads=1
+    run_check "SQLite veryquick strict determinism" cargo test -p hermit --test sqlite_veryquick sqlite_veryquick_is_deterministic_under_strict_hermit -- --exact --ignored --test-threads=1
 }
 
 # Envelope-only fast path: build the binary, measure the envelope, optionally
 # enforce monotonicity, and exit. CI uses this so its numbers match validate.sh.
+if [[ $VALIDATION_LEVEL == hosted-only ]]; then
+    run_hosted_only_suite
+    exit $?
+fi
+
+if ((HARDWARE_ONLY == 1)); then
+    run_hardware_validation
+    exit $?
+fi
+
 if ((STRICT_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit for strict compatibility" \
         cargo build --release -p hermit

@@ -57,7 +57,15 @@ fn assert_guest_l2(guest: &Path) {
     let output = Command::new("timeout")
         .args(["--kill-after", "10s", "60s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=off", "run", "--strict", "--verify", "--"])
+        .args([
+            "--log=off",
+            "run",
+            "--strict",
+            "--verify",
+            "--no-virtualize-cpuid",
+            "--preemption-timeout=disabled",
+            "--",
+        ])
         .arg(guest)
         .output()
         .expect("failed to run random guest under strict verification");
@@ -89,7 +97,7 @@ fn random_sources_repeat_across_runs_and_change_with_seed() {
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces"]
+#[ignore = "e2e: requires hermit + mount namespaces"]
 fn random_sources_are_deterministic_under_strict_verify() {
     let guest =
         Path::new(env!("CARGO_TARGET_TMPDIR")).join("random-determinism/random-sources-strict");

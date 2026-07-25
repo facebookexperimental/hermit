@@ -18,7 +18,7 @@
 #      X's base branch is Y's head branch.
 #   3. Checks per-PR health: can it merge onto its base (no conflicts), and is
 #      the meaningful CI job ("Regular tests (GitHub-hosted)") green. The
-#      hardware-gated "Host-dependent tests (self-hosted)" job is reported
+#      hardware-gated "PMU and CPUID tests (self-hosted)" job is reported
 #      separately because it is not a landing gate.
 #   4. Ranks review priority: "Review PR #X -> releases N PRs from floating to
 #      landed", where N is the size of X's dependent subtree.
@@ -91,7 +91,7 @@ def ci_of($rollup):
   | { checks: ($r|length),
       regular: (($r | map(select((.name // .context)=="Regular tests (GitHub-hosted)")) | .[0]) as $x
                 | if $x==null then "NONE" else ($x|result) end),
-      hostdep: (($r | map(select((.name // .context)=="Host-dependent tests (self-hosted)")) | .[0]) as $x
+      hostdep: (($r | map(select((.name // .context)=="PMU and CPUID tests (self-hosted)")) | .[0]) as $x
                 | if $x==null then "NONE" else ($x|result) end) }
   | . as $o
   | $o + { overall:

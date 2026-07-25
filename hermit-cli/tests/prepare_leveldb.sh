@@ -13,6 +13,19 @@ fi
 readonly source_dir=$1
 readonly build_dir=$2
 
+# Repeated validation may reuse only a complete fixture at the pinned revision.
+if [[ -d "$source_dir/.git" &&
+      -x "$build_dir/c_test" &&
+      -x "$build_dir/env_posix_test" &&
+      -x "$build_dir/leveldb_tests" ]] &&
+   actual_revision=$(git -C "$source_dir" rev-parse HEAD 2>/dev/null) &&
+   [[ "$actual_revision" == "$LEVELDB_REVISION" ]] &&
+   git -C "$source_dir" diff --quiet &&
+   git -C "$source_dir" diff --cached --quiet; then
+  echo "$build_dir"
+  exit 0
+fi
+
 if [[ -e "$source_dir" || -e "$build_dir" ]]; then
   echo "source and build destinations must not already exist" >&2
   exit 2

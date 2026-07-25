@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import signal
 from pathlib import Path
 import shutil
 import subprocess
@@ -189,6 +190,26 @@ def hermit_command(
     return command
 
 
+def run_with_timeout(command: list[str]) -> subprocess.CompletedProcess[bytes] | None:
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+        return None
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
 def run_case(
     hermit: Path, backend: str, name: str, fixtures: Fixtures
 ) -> tuple[str, str, float]:
@@ -197,11 +218,8 @@ def run_case(
     started = time.monotonic()
     for iteration in range(RUNS):
         command = hermit_command(hermit, backend, guest, name)
-        try:
-            result = subprocess.run(
-                command, capture_output=True, timeout=30, check=False
-            )
-        except subprocess.TimeoutExpired:
+        result = run_with_timeout(command)
+        if result is None:
             return "FAIL", f"run {iteration + 1} timed out", time.monotonic() - started
 
         if result.returncode != expected_status:

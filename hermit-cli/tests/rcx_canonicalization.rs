@@ -101,7 +101,7 @@ fn run_under_hermit_strict() -> Output {
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces"]
+#[ignore = "e2e: requires hermit + mount namespaces"]
 fn rcx_r11_are_canonical_and_deterministic_under_strict() {
     let _guard = hermit_rcx_lock();
 
