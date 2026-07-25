@@ -154,11 +154,37 @@ preemption. Its implementation is split between `tool_local`, which handles
 events near each guest task, and `tool_global`, which owns shared deterministic
 state; the two communicate through RPC.
 
-Hermit can drive the guest through more than one instrumentation backend. The
-`ptrace` backend is the default and best-tested path. Alternative backends
-(dynamic binary instrumentation and KVM) exist at varying maturity; always state
-which backend a result came from, because behavior and coverage differ between
-them.
+## Backend Definition
+
+In this repository, a **backend** is a complete execution path that loads the
+shared Detcore tool through Reverie as `Detcore<XxxGuest>`, where `XxxGuest` is
+the backend-specific guest implementation. Every real backend runs the same
+copy of the Detcore determinism code; a separate reimplementation or a command
+that merely launches a program is not a backend.
+
+The `ptrace` backend is the default and best-tested path. DBI and KVM are real
+backends only where they execute this full Detcore tool path. Use these terms
+precisely:
+
+- e9patch is **not** a backend. It is binary-rewriting preprocessing used with
+  the ptrace backend. A CLI spelling such as `--backend=e9patch` does not change
+  this architectural classification.
+- A prototype, stub, launch adapter, preprocessing tool, or compatibility shim
+  is **not** a backend. Report it by its actual category and state explicitly
+  whether it ever loads Detcore as a Reverie tool.
+- There is one shared copy of Detcore behavior. Do not describe backend-local
+  syscall emulation or a second determinism engine as Detcore parity.
+
+Never make an unqualified "pass", "deterministic", or "L2" claim. Every result
+must name the exact backend and exact test or guest command, including relevant
+flags. For preprocessing and prototype results, say what executed underneath;
+for example, "e9patch preprocessing with the ptrace backend" rather than
+"e9patch backend".
+
+A feature is **done** only when the exact test produces bitwise-identical output
+across **all backends**. A pass on one backend is evidence for that backend
+only, not a project-wide completion claim. If a backend cannot run the test,
+report that gap explicitly instead of weakening the definition of done.
 
 Start investigations in these locations:
 
