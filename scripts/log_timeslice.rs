@@ -1,4 +1,11 @@
 #!/usr/bin/env rust-script
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
 //! Analyze Hermit/Detcore scheduler *timeslice* structure from a hermit log.
 //!
 //! Feed it the stderr/log of a `hermit run --log info` (or debug/trace) run:

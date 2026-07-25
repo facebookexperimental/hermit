@@ -32,6 +32,19 @@ jobs:
     - uses: actions/checkout@v3
     - name: Enforce detcore backend-abstraction commandment
       run: ./scripts/check-detcore-backend-abstraction.sh
+    - name: Copyright headers (fbsource lint)
+      # Enforce the Meta copyright header on the GitHub-hosted lane so the gate
+      # actually runs in CI (validate.sh only runs on the self-hosted job).
+      # experiments/ is durable local research, not imported to fbsource, so it
+      # is exempt; head -n 8 allows a shebang before the /* */ block.
+      run: |
+        missing=0
+        while IFS= read -r f; do
+          case "$f" in experiments/*) continue ;; esac
+          head -n 8 "$f" | grep -q 'Copyright (c) Meta Platforms' \
+            || { echo "missing Meta copyright header: $f"; missing=1; }
+        done < <(git ls-files '*.rs')
+        [ "$missing" -eq 0 ]
     - name: Dependencies
       run: sudo apt-get install -y libunwind-dev liblzma-dev
     - name: Install cargo-nextest

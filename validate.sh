@@ -2144,6 +2144,28 @@ function apply_locally_validated_label {
     fi
 }
 
+# fbsource import lints require the Meta copyright header on every imported Rust
+# source file. experiments/ is durable local research and is not imported to
+# fbsource, so it is exempt. `head -n 8` permits a rust-script shebang first.
+function check_copyright_headers {
+    local missing=0 f
+    while IFS= read -r f; do
+        case "$f" in
+            experiments/*) continue ;;
+        esac
+        if ! head -n 8 "$f" | grep -q 'Copyright (c) Meta Platforms'; then
+            printf '  missing Meta copyright header: %s\n' "$f"
+            missing=$((missing + 1))
+        fi
+    done < <(git ls-files '*.rs')
+    if ((missing > 0)); then
+        printf 'validate.sh: %d Rust file(s) missing the Meta copyright header required for fbsource import.\n' \
+            "$missing" >&2
+        return 1
+    fi
+    return 0
+}
+
 function print_summary {
     local passed=$((checks - failures))
     if ((failures == 0)); then
@@ -2194,6 +2216,7 @@ function run_full_suite {
     start_check "Test workspace documentation" cargo test --workspace --doc
     start_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
     start_check "Rustfmt" cargo fmt --all -- --check
+    start_check "Copyright headers (fbsource lint)" check_copyright_headers
     start_check "Documentation" cargo doc --workspace --no-deps
 
     if ! run_strict_compatibility_envelope; then
