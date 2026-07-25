@@ -1,35 +1,8 @@
 # Known fail-closed debt. Keep rows sorted by integration target and test name.
 # Columns: target<TAB>test<TAB>class<TAB>first observed blocker
 # Removing a row enables that test in the ratchet; adding a row requires debt review.
-arbitrary_binaries	run_arbitrary_binary_matrix	unsupported-syscall	Ioctl
-epoll_determinism	mixed_fd_readiness_is_deterministic	unsupported-syscall	Kill
 fp_reduction_determinism	strict_parallel_fp_reduction_is_bit_identical	host-pmu-bug	CI runner AMD errata AmdSpecLockMapShouldBeDisabled causes strict-mode SIGSEGV
 hashseed_determinism	python_set_order_nondeterministic_natively_deterministic_under_hermit	host-pmu-bug	CI-runner SIGSEGV in reverie clone_with_stack::callback under --strict; not reproducible locally (passes on devserver kernel 6.17, standalone x15, and under CI-like unshare namespaces); same self-hosted-runner class as AmdSpecLockMapShouldBeDisabled above
-hermit_modes	default_bind_mounts	unsupported-syscall	Ioctl
-hermit_modes	default_cargo_bind_connect_race	unsupported-syscall	Mkdir
-hermit_modes	default_cargo_clock_gettime	unsupported-syscall	ClockSettime
 hermit_modes	default_cargo_futex_and_print	runner-scheduler-hang	self-hosted runner blocked in futex guest for over 18 minutes; exact local fail-closed test passes in 5.74s
-hermit_modes	default_cargo_interrogate_tty	unsupported-syscall	Ioctl
-hermit_modes	default_cargo_network_hello_world	unsupported-syscall	Mkdir
-hermit_modes	default_cargo_poll	unsupported-syscall	Mkdir
-hermit_modes	default_exit_codes	unsupported-syscall	Ioctl
-hermit_modes	default_hello_signals	unsupported-syscall	Tgkill
-hermit_modes	default_lit_rt_sigaction	unsupported-syscall	Setitimer
-hermit_modes	default_network_bind	unsupported-syscall	Setsockopt
-hermit_modes	default_shell_parallel_work	unsupported-syscall	Ioctl
-hermit_modes	default_shell_taskset	unsupported-syscall	Ioctl
-hermit_modes	default_sigtimedwait_no_timeout	unsupported-syscall	Tgkill
-hermit_modes	default_sigtimedwait_timeout_1s	unsupported-syscall	Tgkill
-hermit_modes	resource_syscalls_are_deterministic_across_five_runs	unsupported-syscall	Getrlimit
-hermit_modes	verify_honors_tmp_and_environment	unsupported-syscall	Ioctl
-hermit_modes	verify_reports_exit_status_divergence	unsupported-syscall	Getuid
-hermit_modes	verify_reports_stdout_divergence	unsupported-syscall	Getuid
-integration_matrix	integration_matrix	unsupported-syscall	Statfs
-redis_strict	redis_persistence_restart_is_deterministic_under_strict_hermit	unsupported-syscall	Getppid
-redis_strict	redis_small_subset_is_deterministic_under_strict_hermit	unsupported-syscall	Getppid
-signal_determinism	alternate_signal_stack_is_preserved	unsupported-syscall	Tgkill
 signal_determinism	blocking_sigsuspend_releases_the_scheduler	scheduler-hang	rt_sigsuspend does not wake under fail-closed mode
-signal_determinism	pending_signal_and_mask_survive_exec	unsupported-syscall	Tgkill
-signal_determinism	sigalrm_itimer_delivery_is_deterministic	unsupported-syscall	Setitimer
-signal_determinism	signal_handler_reentrance_is_deterministic	unsupported-syscall	Tgkill
-signal_determinism	signal_interrupts_rt_sigtimedwait_despite_sa_restart	unsupported-syscall	Kill
+sqlite_veryquick	sqlite_fast_subset_is_deterministic_under_strict_hermit	unsupported-syscall	Fchown

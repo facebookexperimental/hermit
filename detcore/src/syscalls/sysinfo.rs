@@ -21,6 +21,64 @@ use crate::tool_local::ResourceLimit;
 const MB: u64 = 1024 * 1024;
 
 impl<T: RecordOrReplay> Detcore<T> {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
+    /// Return one deterministic process resource limit through the legacy ABI.
+    pub async fn handle_getrlimit<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Getrlimit,
+    ) -> Result<i64, Error> {
+        let resource = u32::try_from(call.resource()).map_err(|_| Errno::EINVAL)?;
+        let address = call.rlim().ok_or(Errno::EFAULT)?;
+        let limit = guest
+            .thread_state()
+            .resource_limits
+            .lock()
+            .expect("resource limits mutex poisoned")
+            .get(resource)
+            .ok_or(Errno::EINVAL)?;
+        let result = libc::rlimit {
+            rlim_cur: limit.current,
+            rlim_max: limit.maximum,
+        };
+        guest.memory().write_value(address, &result)?;
+        Ok(0)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
+    /// Update one virtual process resource limit through the legacy ABI.
+    pub async fn handle_setrlimit<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Setrlimit,
+    ) -> Result<i64, Error> {
+        let resource = u32::try_from(call.resource()).map_err(|_| Errno::EINVAL)?;
+        let address = call.rlim().ok_or(Errno::EFAULT)?;
+        let requested: libc::rlimit = guest.memory().read_value(address)?;
+        let requested = ResourceLimit {
+            current: requested.rlim_cur,
+            maximum: requested.rlim_max,
+        };
+        let resource_limits = guest.thread_state().resource_limits.clone();
+        let mut limits = resource_limits
+            .lock()
+            .expect("resource limits mutex poisoned");
+        let previous = limits.get(resource).ok_or(Errno::EINVAL)?;
+        if requested.current > requested.maximum {
+            return Err(Errno::EINVAL.into());
+        }
+        if resource != libc::RLIMIT_STACK && resource != libc::RLIMIT_NOFILE {
+            return Err(Errno::EPERM.into());
+        }
+        if requested.maximum > previous.maximum {
+            return Err(Errno::EPERM.into());
+        }
+        limits.set(resource, requested);
+        Ok(0)
+    }
+
     /// Virtualize `prlimit64(2)` for the current guest process.
     ///
     /// Queries return process-local deterministic values. Mutations are kept

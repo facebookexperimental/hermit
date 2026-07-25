@@ -121,6 +121,11 @@ fn sigalrm_itimer_delivery_is_deterministic() {
 }
 
 #[test]
+fn armed_itimer_is_discarded_on_process_exit() {
+    run_signal_scenario("itimer-exit", "timer discarded after process exit\n");
+}
+
+#[test]
 fn signal_interrupts_emulated_blocking_read() {
     run_signal_scenario(
         "blocking-read-interrupted",

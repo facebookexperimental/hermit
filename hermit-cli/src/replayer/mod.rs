@@ -203,7 +203,10 @@ impl Tool for Replayer {
             Syscall::Gettimeofday(syscall) => self.handle_gettimeofday(guest, syscall).await,
             Syscall::Settimeofday(_) => self.handle_simple(guest, syscall).await,
             Syscall::Time(syscall) => self.handle_time(guest, syscall).await,
-            Syscall::Setsockopt(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Setsockopt(_) => {
+                self.handle_replayed_side_effect(guest, syscall, "setsockopt")
+                    .await
+            }
             Syscall::Fcntl(call)
                 if matches!(
                     call.cmd(),
@@ -462,6 +465,22 @@ impl Replayer {
             if actual != Err(Errno::EBADF) {
                 assert_eq!(actual, recorded, "dup2 fd-table mutation diverged");
             }
+        }
+        recorded
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
+    async fn handle_replayed_side_effect<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+        operation: &str,
+    ) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Return);
+        if recorded.is_ok() {
+            let actual = guest.inject_with_retry(syscall).await;
+            assert_eq!(actual, recorded, "{operation} side effects diverged");
         }
         recorded
     }

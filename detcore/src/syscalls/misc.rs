@@ -39,7 +39,7 @@ const ARCH_SHSTK_UNLOCK: libc::c_int = 0x5004;
 const ARCH_SHSTK_STATUS: libc::c_int = 0x5005;
 const ARCH_SHSTK_VALID_MASK: usize = 0b11;
 
-pub(crate) fn is_supported_prctl_option(option: libc::c_int) -> bool {
+fn is_supported_prctl_option(option: libc::c_int) -> bool {
     matches!(
         option,
         libc::PR_SET_NAME | libc::PR_GET_NAME | libc::PR_SET_THP_DISABLE | libc::PR_GET_THP_DISABLE
@@ -109,23 +109,6 @@ fn write_random_chunk(
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
-    /// Preserve deterministic thread-name and transparent-huge-page controls.
-    ///
-    /// Ruby uses both controls while starting worker threads. Their results depend
-    /// only on the calling task and supplied arguments, and the shared passthrough
-    /// path records them when record/replay is active. Other prctl options retain
-    /// the existing unclassified policy at dispatch.
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#655): Confirm the narrow prctl passthrough policy.
-    pub async fn handle_prctl<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        call: syscalls::Prctl,
-    ) -> Result<i64, Error> {
-        debug_assert!(is_supported_prctl_option(call.option()));
-        self.passthrough(guest, call.into()).await
-    }
-
     fn write_arch_prctl_u64<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -215,6 +198,74 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
 
             ArchPrctlCmd::Other(_, _) => Err(Errno::EINVAL.into()),
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
+    /// Preserve deterministic Ruby thread controls, report the container's fixed
+    /// capability bounding set, and reject options that expose unmodeled process
+    /// or host state.
+    pub async fn handle_prctl<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Prctl,
+    ) -> Result<i64, Error> {
+        match call.option() {
+            // The capability bounding set is fixed by the container launch policy.
+            libc::PR_CAPBSET_READ => Ok(self.record_or_replay(guest, call).await?),
+            option if is_supported_prctl_option(option) => {
+                self.passthrough(guest, call.into()).await
+            }
+            _ => Err(Errno::ENOSYS.into()),
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
+    /// Report the deterministic default nice value for the current process.
+    pub async fn handle_getpriority<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        call: syscalls::Getpriority,
+    ) -> Result<i64, Error> {
+        if call.which() == libc::PRIO_PROCESS as i32 && call.who() == 0 {
+            // The raw Linux syscall returns 20 - nice, so nice 0 is reported as 20.
+            Ok(20)
+        } else {
+            Err(Errno::EPERM.into())
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
+    /// Accept the common reset-to-default request without changing host scheduling.
+    pub async fn handle_setpriority<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        call: syscalls::Setpriority,
+    ) -> Result<i64, Error> {
+        if call.which() == libc::PRIO_PROCESS as i32 && call.who() == 0 && call.prio() == 0 {
+            Ok(0)
+        } else {
+            Err(Errno::EPERM.into())
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
+    /// Reject cross-process memory advice without consulting host process state.
+    pub fn handle_process_madvise(pidfd: usize, flags: usize) -> Result<i64, Error> {
+        if flags != 0 {
+            return Err(Errno::EINVAL.into());
+        }
+
+        // Linux interprets pidfd as an int. Preserve its deterministic invalid-fd
+        // rejection, but never let a valid host pidfd alter another process's memory.
+        if (pidfd as libc::c_int) < 0 {
+            Err(Errno::EBADF.into())
+        } else {
+            Err(Errno::EPERM.into())
         }
     }
 
@@ -459,5 +510,24 @@ mod tests {
     fn getrandom_caps_requests_at_linux_max_rw_count() {
         assert_eq!(getrandom_request_len(16), 16);
         assert_eq!(getrandom_request_len(usize::MAX), GETRANDOM_MAX_BYTES);
+    }
+
+    #[test]
+    fn process_madvise_is_rejected_deterministically() {
+        assert!(matches!(
+            Detcore::<crate::record_or_replay::NoopTool>::handle_process_madvise(
+                (-10_000_i32) as usize,
+                0
+            ),
+            Err(Error::Errno(Errno::EBADF))
+        ));
+        assert!(matches!(
+            Detcore::<crate::record_or_replay::NoopTool>::handle_process_madvise(3, 1),
+            Err(Error::Errno(Errno::EINVAL))
+        ));
+        assert!(matches!(
+            Detcore::<crate::record_or_replay::NoopTool>::handle_process_madvise(3, 0),
+            Err(Error::Errno(Errno::EPERM))
+        ));
     }
 }

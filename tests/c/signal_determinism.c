@@ -744,6 +744,38 @@ static int test_pending_across_exec(const char* executable) {
   return 1;
 }
 
+static int test_itimer_is_discarded_on_process_exit(void) {
+  const pid_t child = fork();
+  if (child < 0) {
+    perror("fork");
+    return 1;
+  }
+  if (child == 0) {
+    const struct itimerval timer = {
+        .it_value = {.tv_sec = 1, .tv_usec = 0},
+    };
+    if (setitimer(ITIMER_REAL, &timer, NULL) != 0) {
+      _exit(2);
+    }
+    _exit(0);
+  }
+
+  int status;
+  if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+      WEXITSTATUS(status) != 0) {
+    fputs("child failed to arm timer before exit\n", stderr);
+    return 1;
+  }
+
+  const struct timespec delay = {.tv_sec = 2, .tv_nsec = 0};
+  if (nanosleep(&delay, NULL) != 0) {
+    perror("nanosleep");
+    return 1;
+  }
+  puts("timer discarded after process exit");
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(stderr, "usage: %s SCENARIO\n", argv[0]);
@@ -751,6 +783,9 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "itimer-delivery") == 0) {
     return test_itimer_delivery();
+  }
+  if (strcmp(argv[1], "itimer-exit") == 0) {
+    return test_itimer_is_discarded_on_process_exit();
   }
   if (strcmp(argv[1], "blocking-sigsuspend") == 0) {
     return test_blocking_sigsuspend();

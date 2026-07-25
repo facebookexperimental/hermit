@@ -199,6 +199,7 @@ fn workloads() -> &'static [Workload] {
         let c_sources = [
             ("c_getpid", "getpid.c"),
             ("c_getsockopt_null", "getsockopt_null.c"),
+            ("c_setsockopt_replay", "record_replay_setsockopt.c"),
             ("c_ioctl_fioclex", "ioctl_fioclex.c"),
             ("c_ioctl_siocethtool", "ioctl_siocethtool.c"),
             ("c_record_replay_fd_close", "record_replay_fd_close.c"),
@@ -783,6 +784,7 @@ macro_rules! record_replay_tests {
 
 record_replay_tests! {
     record_c_getsockopt_null => "c_getsockopt_null",
+    record_c_setsockopt_replay => "c_setsockopt_replay",
     record_c_fd_reuse_after_close => "c_record_replay_fd_close",
     record_c_sigpipe_siginfo => "c_sigpipe_siginfo",
     record_rs_clock_total_order => "rustbin_clock_total_order",

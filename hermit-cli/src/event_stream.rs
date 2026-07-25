@@ -80,12 +80,12 @@ fn kernel_arg_count(sysno: Sysno) -> Option<u8> {
     Some(match sysno {
         close | fchdir | dup | time | unlink => 1,
         access | stat | fstat | lstat | dup2 | clock_gettime | gettimeofday | settimeofday
-        | mkdir | statfs | fstatfs => 2,
+        | mkdir | statfs | fstatfs | kill | listen | rt_sigpending => 2,
         mprotect | read | readv | write | writev | lseek | getdents | getdents64 | dup3 | ioctl
         | socket | fcntl | connect | sendmsg | poll | getpeername | getsockname | getrandom
-        | readlink | unlinkat | open | execve | close_range => 3,
+        | readlink | unlinkat | open | execve | close_range | tgkill => 3,
         pread64 | pwrite64 | newfstatat | fadvise64 | openat => 4,
-        statx | pwritev | preadv | ppoll | setsockopt | getsockopt | execveat => 5,
+        statx | pwritev | preadv | ppoll | setsockopt | getsockopt | execveat | prctl => 5,
         recvfrom | sendto | pwritev2 | preadv2 | mmap => 6,
         _ => return None,
     })
@@ -243,6 +243,7 @@ mod tests {
     use reverie::syscalls::SyscallArgs;
     use reverie::syscalls::Sysno;
 
+    use super::kernel_arg_count;
     use super::normalize_unused_args;
 
     fn raw(sysno: Sysno, args: SyscallArgs) -> Syscall {
@@ -299,6 +300,15 @@ mod tests {
             normalize_unused_args(b),
             "fcntl's third argument is meaningful and must not be zeroed"
         );
+    }
+
+    #[test]
+    fn delegated_syscalls_have_kernel_arities() {
+        assert_eq!(kernel_arg_count(Sysno::kill), Some(2));
+        assert_eq!(kernel_arg_count(Sysno::listen), Some(2));
+        assert_eq!(kernel_arg_count(Sysno::rt_sigpending), Some(2));
+        assert_eq!(kernel_arg_count(Sysno::tgkill), Some(3));
+        assert_eq!(kernel_arg_count(Sysno::prctl), Some(5));
     }
 
     #[test]

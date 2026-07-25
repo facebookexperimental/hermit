@@ -70,7 +70,7 @@ impl TimedEvents {
         sig: Signal,
     ) -> Option<LogicalTime> {
         let old = self.alarm_times.insert(dp, ns);
-        self.clear_old_alarm(old);
+        self.clear_old_alarm(dp, old);
 
         let set = self.map.entry(ns).or_default();
         let evt = TimedEvent::AlarmEvt(dp, dt, sig);
@@ -83,7 +83,9 @@ impl TimedEvents {
         old
     }
 
-    fn clear_old_alarm(&mut self, old: Option<LogicalTime>) {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#663)
+    fn clear_old_alarm(&mut self, dp: DetPid, old: Option<LogicalTime>) {
         if let Some(time) = old {
             // The `map` entry may already be gone if the alarm fired (was
             // popped by `pop_if_before`) before being cleared. Clearing an
@@ -95,7 +97,7 @@ impl TimedEvents {
             // Could use a drain_filter here, but it is nightly only:
             let mut to_remove = None;
             for evt in set.iter() {
-                if matches!(evt, TimedEvent::AlarmEvt(_, _, _)) {
+                if matches!(evt, TimedEvent::AlarmEvt(evt_dp, _, _) if *evt_dp == dp) {
                     assert!(to_remove.is_none());
                     to_remove = Some(*evt);
                 }
@@ -115,7 +117,7 @@ impl TimedEvents {
     // Return the time of any previous alarm on this process.
     pub fn remove_alarm(&mut self, dp: DetPid) -> Option<LogicalTime> {
         let old = self.alarm_times.remove(&dp);
-        self.clear_old_alarm(old);
+        self.clear_old_alarm(dp, old);
         old
     }
 
@@ -244,6 +246,34 @@ mod test {
             None
         );
         assert_eq!(ev.len(), 1);
+    }
+
+    #[test]
+    fn removing_alarm_preserves_other_process_at_same_deadline() {
+        let mut ev = TimedEvents::default();
+        let first_pid = pid(100);
+        let second_pid = pid(200);
+        let deadline = at(1_000);
+
+        assert_eq!(
+            ev.insert_alarm(deadline, first_pid, tid(101), Signal::SIGALRM),
+            None
+        );
+        assert_eq!(
+            ev.insert_alarm(deadline, second_pid, tid(201), Signal::SIGALRM),
+            None
+        );
+
+        assert_eq!(ev.remove_alarm(first_pid), Some(deadline));
+        assert_eq!(
+            ev.iter().collect::<Vec<_>>(),
+            vec![(
+                deadline,
+                TimedEvent::AlarmEvt(second_pid, tid(201), Signal::SIGALRM)
+            )]
+        );
+        assert_eq!(ev.remove_alarm(second_pid), Some(deadline));
+        assert!(ev.is_empty());
     }
 
     /// Cancelling (`alarm(0)`) after a fire must be a no-op, not a panic.
