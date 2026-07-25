@@ -127,6 +127,7 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
+use crate::syscall_classification::is_privileged_admin_refused_syscall;
 use crate::syscall_classification::is_unimplemented_enosys_syscall;
 use crate::syscalls::helpers::with_guest_rip;
 use crate::syscalls::helpers::with_guest_time;
@@ -1268,6 +1269,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 if is_unimplemented_enosys_syscall(call.number()) =>
             {
                 Err(Error::Errno(Errno::ENOSYS))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#722): Deterministic EPERM for privileged
+            // system-administration syscalls (module load/unload, kexec, reboot,
+            // swap, raw I/O ports, root-mount pivot, host/domain name, tty
+            // hangup, disk quotas). The deterministic guest does not hold the
+            // capabilities these require against the host kernel, so a fixed
+            // -EPERM matches the unprivileged errno, never perturbs global host
+            // state, and is identical across --verify and record/replay. These
+            // are untyped (Syscall::Other) in the pinned Reverie, so dispatch on
+            // the Sysno before the typed match below.
+            SyscallClassification::Determinized
+                if is_privileged_admin_refused_syscall(call.number()) =>
+            {
+                Err(Error::Errno(Errno::EPERM))
             }
             SyscallClassification::Determinized => match call {
                 Syscall::Write(w) => self.handle_write(guest, w).await,
