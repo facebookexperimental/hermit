@@ -256,9 +256,9 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
 readonly RR_COMPAT_EXPECTED=128
-# The prior 115/121 floor plus 25 passing additions in the current corpus.
+# Require the repaired variable-output probes while retaining one row of headroom.
 # This is a compatibility floor, not a Detcore determinism claim.
-readonly SABRE_COMPAT_EXPECTED=140
+readonly SABRE_COMPAT_EXPECTED=145
 readonly SABRE_COMPAT_TOTAL=147
 COMPATIBILITY_MODE=strict
 
@@ -1246,7 +1246,7 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # shellcheck disable=SC2016
     strict_compatibility_probe mktemp bash -c \
-        'd=$(mktemp -d /tmp/hermit-compat.XXXXXX) && basename "$d" && rmdir "$d"' \
+        'set -euo pipefail; d=$(mktemp -d /tmp/hermit-compat.XXXXXX); test -d "$d"; rmdir "$d"; printf "mktemp-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe sha256sum /usr/bin/sha256sum README.md \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1300,17 +1300,19 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Query the virtualized guest PID rather than setting a host CPU/policy.
     # shellcheck disable=SC2016
-    strict_compatibility_probe taskset bash -c 'taskset -p $$' \
+    strict_compatibility_probe taskset bash -c \
+        'set -euo pipefail; taskset -p $$ >/dev/null; printf "taskset-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # shellcheck disable=SC2016
-    strict_compatibility_probe chrt bash -c 'chrt -p $$' \
+    strict_compatibility_probe chrt bash -c \
+        'set -euo pipefail; chrt -p $$ >/dev/null; printf "chrt-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe flock bash -c \
         'set -euo pipefail; rm -f /tmp/hermit-compat-flock; flock -x /tmp/hermit-compat-flock -c "printf \"flock-ok\\n\""; rm -f /tmp/hermit-compat-flock' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    # Exercise logger formatting without writing to a host logging service.
-    strict_compatibility_probe logger /usr/bin/logger --stderr --no-act \
-        -t hermit-compat logger-ok \
+    # Capture logger's wall-clock prefix and assert only its semantic payload.
+    strict_compatibility_probe logger bash -c \
+        'set -euo pipefail; output=$(/usr/bin/logger --stderr --no-act -t hermit-compat logger-ok 2>&1); [[ $output == *"hermit-compat: logger-ok" ]]; printf "logger-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe getopt /usr/bin/getopt -o ab: -- -a -b value \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1421,7 +1423,7 @@ function run_compatibility_corpus {
         'set -euo pipefail; printf "Hermit formats this deterministic paragraph into narrow lines for validation.\n" | fmt -w 24' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe shuf bash -c \
-        'set -euo pipefail; printf "alpha\nbeta\ngamma\ndelta\n" | shuf' \
+        'set -euo pipefail; output=$(printf "alpha\nbeta\ngamma\ndelta\n" | shuf | sort); test "$output" = "$(printf "alpha\nbeta\ndelta\ngamma\n")"; printf "shuf-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe numfmt /usr/bin/numfmt --to=iec 1048576 \
         && passed=$((passed + 1)) || failed=$((failed + 1))
