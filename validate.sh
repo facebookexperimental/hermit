@@ -1162,15 +1162,19 @@ function run_compatibility_corpus {
             bash /usr/bin/tclsh \
             'set sum 0; for {set i 1} {$i <= 100} {incr i} {set sum [expr {$sum + $i*$i}]}; puts $sum' 338350 \
             && passed=$((passed + 1)) || failed=$((failed + 1))
+        # AUTONOMOUS-BOT-IMPLEMENTED
+        # TODO-HUMAN-REVIEW(#698): Review the expanded bc and dc exact-output probes.
+        # Keep the combined exact result below GNU bc output wrap width.
         strict_compatibility_probe bc bash -c \
-            'set -euo pipefail; out=$(printf "%s\n" "$2" | "$1" -q); test "$out" = "$3"; printf "bc-factorial=%s\n" "$out"' \
+            'set -euo pipefail; out=$(printf "%s\n" "$2" | BC_LINE_LENGTH=200 "$1" -q); test "$out" = "$3"; printf "bc-math=%s\n" "$out"' \
             bash /usr/bin/bc \
-            'define f(n) { auto r,i; r=1; for(i=2;i<=n;i++) r*=i; return(r) }; f(20)' \
-            2432902008176640000 \
+            'define f(n) { auto r,i; r=1; for(i=2;i<=n;i++) r*=i; return(r) }; scale=50; print f(20), " ", sqrt(2), "\n"' \
+            '2432902008176640000 1.41421356237309504880168872420969807856967187537694' \
             && passed=$((passed + 1)) || failed=$((failed + 1))
         strict_compatibility_probe dc bash -c \
-            'set -euo pipefail; out=$(printf "%s\n" "$2" | "$1"); test "$out" = "$3"; printf "dc-power=%s\n" "$out"' \
-            bash /usr/bin/dc '2 100 ^ 1 - p' 1267650600228229401496703205375 \
+            'set -euo pipefail; out=$(printf "%s\n" "$2" | "$1"); test "$out" = "$3"; printf "dc-math=%s\n" "$out"' \
+            bash /usr/bin/dc '2 100 ^ 1 - n [ ]P 4 13 497 | p' \
+            '1267650600228229401496703205375 445' \
             && passed=$((passed + 1)) || failed=$((failed + 1))
     else
         strict_compatibility_probe lua lua -e 'print(42)' \
