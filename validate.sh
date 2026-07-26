@@ -1425,6 +1425,56 @@ function run_liteinst_compatibility_envelope {
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(PR-808): Review SaBRe compatibility process-group teardown.
+function terminate_sabre_compatibility_group {
+    local pid=$1
+    local grace_deadline
+
+    kill -TERM -- "-$pid" 2>/dev/null || true
+    grace_deadline=$((SECONDS + TIMEOUT_KILL_GRACE_SECONDS))
+    while kill -0 -- "-$pid" 2>/dev/null && ((SECONDS < grace_deadline)); do
+        sleep 0.2
+    done
+    if kill -0 -- "-$pid" 2>/dev/null; then
+        kill -KILL -- "-$pid" 2>/dev/null || true
+    fi
+}
+
+function run_sabre_compatibility_command {
+    (
+        local timeout_seconds=$1
+        shift
+
+        local started_at=$SECONDS
+        local pid=""
+        local status
+
+        trap 'if [[ -n $pid ]]; then terminate_sabre_compatibility_group "$pid"; wait "$pid" 2>/dev/null || true; fi; exit 143' INT TERM HUP
+        setsid "$@" </dev/null >>"$LOG_FILE" 2>&1 &
+        pid=$!
+        while kill -0 "$pid" 2>/dev/null; do
+            if ((SECONDS - started_at >= timeout_seconds)); then
+                terminate_sabre_compatibility_group "$pid"
+                wait "$pid" 2>/dev/null || true
+                exit 124
+            fi
+            sleep 0.2
+        done
+
+        if wait "$pid"; then
+            status=0
+        else
+            status=$?
+        fi
+        if kill -0 -- "-$pid" 2>/dev/null; then
+            terminate_sabre_compatibility_group "$pid"
+        fi
+        trap - INT TERM HUP
+        exit "$status"
+    )
+}
+
+# AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(#521): Review the strict compatibility policy.
 # Run one application through strict L2 or the SaBRe compatibility path. Each
 # row has its own hard timeout so a regression cannot stall the rest of the matrix.
@@ -1490,15 +1540,22 @@ function strict_compatibility_probe {
         printf "  %s compatibility probe: %s\n" "$assurance" "$label"
     fi
 
-    if timeout "$probe_timeout" \
-        "$STRICT_COMPAT_HERMIT_BIN" "${run_args[@]}" "$@" \
-        </dev/null >>"$LOG_FILE" 2>&1; then
-        status=0
+    if [[ $COMPATIBILITY_MODE == sabre ]]; then
+        run_sabre_compatibility_command "$probe_timeout" \
+            "$STRICT_COMPAT_HERMIT_BIN" "${run_args[@]}" "$@"
+        status=$?
+    else
+        timeout "$probe_timeout" \
+            "$STRICT_COMPAT_HERMIT_BIN" "${run_args[@]}" "$@" \
+            </dev/null >>"$LOG_FILE" 2>&1
+        status=$?
+    fi
+
+    if ((status == 0)); then
         printf "  ✅ %-12s PASS %s (%ss)\n" \
             "$label" "$assurance" "$((SECONDS - started_at))"
         record_compatibility_result "$label" PASS "$assurance"
     else
-        status=$?
         summary=$(failure_summary "$output_start")
         printf "  ❌ %-12s FAIL %s (exit %s: %s)\n" \
             "$label" "$assurance" "$status" "$summary"
