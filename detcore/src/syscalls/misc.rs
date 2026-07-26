@@ -61,6 +61,40 @@ fn is_supported_prctl_option(option: libc::c_int) -> bool {
     )
 }
 
+/// Is `which` one of the Linux `PRIO_*` target selectors for get/setpriority?
+fn is_valid_prio_which(which: i32) -> bool {
+    which == libc::PRIO_PROCESS as i32
+        || which == libc::PRIO_PGRP as i32
+        || which == libc::PRIO_USER as i32
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#806)
+/// Deterministic raw `getpriority(2)` result under Hermit's inert-nice model.
+///
+/// Returns `20 - nice` (nice 0 -> 20) for any valid target regardless of `who`,
+/// because nice is inert under the virtualized scheduler and `getpriority` never
+/// checks permissions; an unknown `which` faults with `EINVAL`, matching Linux.
+fn getpriority_result(which: i32) -> Result<i64, Errno> {
+    if is_valid_prio_which(which) {
+        Ok(20)
+    } else {
+        Err(Errno::EINVAL)
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#806)
+/// Deterministic raw `setpriority(2)` result: accept any priority change for a
+/// valid target as an inert no-op (returns 0), `EINVAL` for an unknown `which`.
+fn setpriority_result(which: i32) -> Result<i64, Errno> {
+    if is_valid_prio_which(which) {
+        Ok(0)
+    } else {
+        Err(Errno::EINVAL)
+    }
+}
+
 fn from_str(s: &str) -> [i8; 65] {
     let mut ret: [i8; 65] = [0; 65];
     for (i, ch) in s.bytes().take(64).enumerate() {
@@ -237,34 +271,41 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#663)
-    /// Report the deterministic default nice value for the current process.
+    // TODO-HUMAN-REVIEW(#806)
+    /// Report the deterministic default nice value for any scheduling target.
+    ///
+    /// Under Hermit the Linux nice value is inert: the scheduler is virtualized
+    /// and guest threads are serialized onto one virtual CPU, so a process's,
+    /// group's, or user's scheduling priority never affects guest-visible
+    /// computation. Report the deterministic default nice (0) for every valid
+    /// target regardless of `who` — real tools such as `renice -p <pid>` always
+    /// pass an explicit pid, and the raw `getpriority(2)` never checks
+    /// permissions on a read, so it must never return `EPERM`. An unknown
+    /// `which` still faults with `EINVAL`, matching Linux.
     pub async fn handle_getpriority<G: Guest<Self>>(
         &self,
         _guest: &mut G,
         call: syscalls::Getpriority,
     ) -> Result<i64, Error> {
-        if call.which() == libc::PRIO_PROCESS as i32 && call.who() == 0 {
-            // The raw Linux syscall returns 20 - nice, so nice 0 is reported as 20.
-            Ok(20)
-        } else {
-            Err(Errno::EPERM.into())
-        }
+        Ok(getpriority_result(call.which())?)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#663)
-    /// Accept the common reset-to-default request without changing host scheduling.
+    // TODO-HUMAN-REVIEW(#806)
+    /// Accept any priority change as a deterministic no-op.
+    ///
+    /// Nice values are inert under Hermit's virtualized, serialized scheduler,
+    /// so accept the request without touching host scheduling. The guest runs as
+    /// a single uid-0 container principal, so a real `setpriority(2)` from the
+    /// caller would succeed anyway; never fabricate `EPERM` for tools such as
+    /// `nice -n 5 <cmd>`, `renice -p <pid>`, or Python's `os.nice`. An unknown
+    /// `which` still faults with `EINVAL`, matching Linux.
     pub async fn handle_setpriority<G: Guest<Self>>(
         &self,
         _guest: &mut G,
         call: syscalls::Setpriority,
     ) -> Result<i64, Error> {
-        if call.which() == libc::PRIO_PROCESS as i32 && call.who() == 0 && call.prio() == 0 {
-            Ok(0)
-        } else {
-            Err(Errno::EPERM.into())
-        }
+        Ok(setpriority_result(call.which())?)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -570,6 +611,35 @@ mod tests {
     fn getrandom_caps_requests_at_linux_max_rw_count() {
         assert_eq!(getrandom_request_len(16), 16);
         assert_eq!(getrandom_request_len(usize::MAX), GETRANDOM_MAX_BYTES);
+    }
+
+    #[test]
+    fn getpriority_reports_default_nice_for_every_target() {
+        // Every valid PRIO_* selector reports the default nice (raw 20 = nice 0),
+        // regardless of `who`. Real tools such as `renice -p <pid>` pass an
+        // explicit pid, and getpriority never checks permissions, so this must
+        // never be EPERM (the pre-fix stub only accepted PRIO_PROCESS/who==0).
+        for which in [libc::PRIO_PROCESS, libc::PRIO_PGRP, libc::PRIO_USER] {
+            assert_eq!(getpriority_result(which as i32), Ok(20));
+        }
+    }
+
+    #[test]
+    fn setpriority_accepts_any_change_for_valid_target() {
+        // Nice is inert under Hermit, so any priority change for a valid target
+        // succeeds as a no-op — including nonzero nice (`nice -n 5`, os.nice).
+        for which in [libc::PRIO_PROCESS, libc::PRIO_PGRP, libc::PRIO_USER] {
+            assert_eq!(setpriority_result(which as i32), Ok(0));
+        }
+    }
+
+    #[test]
+    fn get_and_set_priority_reject_unknown_which_with_einval() {
+        // Match Linux: an unknown target selector faults with EINVAL, not EPERM.
+        for which in [-1, 3, 42] {
+            assert_eq!(getpriority_result(which), Err(Errno::EINVAL));
+            assert_eq!(setpriority_result(which), Err(Errno::EINVAL));
+        }
     }
 
     #[test]
