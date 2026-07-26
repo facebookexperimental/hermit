@@ -19,7 +19,8 @@ use reverie_syscalls::Errno;
 use reverie_syscalls::Syscall;
 
 /// Environment variable containing the coordinator's Unix-domain socket path.
-pub const RPC_SOCKET_ENV: &str = "HERMIT_SABRE_RPC_SOCKET";
+// TODO-HUMAN-REVIEW(PR-745): Review the private SaBRe exec environment contract.
+pub const RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
 
 /// Returns the Detcore SaBRe plugin built beside the running Hermit binary.
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -55,8 +56,10 @@ struct Plugin {
 
 impl Plugin {
     fn connect() -> Self {
-        let socket = std::env::var_os(RPC_SOCKET_ENV)
+        // SAFETY: Plugin construction runs before SaBRe starts guest callbacks.
+        let socket = unsafe { sabre::take_private_env(RPC_SOCKET_ENV) }
             .unwrap_or_else(|| panic!("{RPC_SOCKET_ENV} is not set"));
+
         let adapter = RemoteReverieAdapter::connect(socket)
             .expect("failed to connect Detcore SaBRe plugin to coordinator");
 
@@ -98,5 +101,15 @@ impl reverie_sabre::Tool for Plugin {
 
     fn on_thread_exit(&self, thread_id: u32) {
         self.adapter.handle_thread_exit(thread_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rpc_socket_uses_sabre_private_environment_namespace() {
+        assert!(RPC_SOCKET_ENV.starts_with("REVERIE_SABRE_"));
     }
 }

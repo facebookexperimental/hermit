@@ -505,7 +505,7 @@ fn resolve_sabre_binary() -> Result<PathBuf, Error> {
     resolve_sabre_binary_from(override_path.as_deref(), &executable, &path_env)
 }
 
-const SABRE_RPC_SOCKET_ENV: &str = "HERMIT_SABRE_RPC_SOCKET";
+const SABRE_RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
 
 // TODO-HUMAN-REVIEW(PR-738): Review controller/plugin artifact separation.
 fn sabre_runtime_library_path() -> io::Result<PathBuf> {
@@ -1343,6 +1343,7 @@ mod tests {
 
     use super::Backend;
     use super::ExitStatus;
+    use super::SABRE_RPC_SOCKET_ENV;
     use super::dbi_runtime_unavailable_reason;
     use super::dynamorio_sdk_available;
     use super::ensure_backend_dispatch;
@@ -1414,6 +1415,11 @@ mod tests {
         let mut permissions = fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[test]
+    fn sabre_rpc_socket_uses_private_exec_environment() {
+        assert!(SABRE_RPC_SOCKET_ENV.starts_with("REVERIE_SABRE_"));
     }
 
     #[test]

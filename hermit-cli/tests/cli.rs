@@ -1355,6 +1355,45 @@ fn sabre_backend_validation_honors_command_scope() {
     ]);
     assert_failure_contains(&log, &["does not support --log or --log-file"]);
 }
+
+#[test]
+fn sabre_rpc_socket_is_hidden_from_proc_environ() {
+    let hermit_binary = Path::new(env!("CARGO_BIN_EXE_hermit"));
+    let executable_dir = hermit_binary.parent().unwrap();
+    let target_dir = executable_dir.parent().unwrap();
+    let loader = target_dir.join("sabre/sabre");
+    let plugin = executable_dir.join("libdetcore_sabre.so");
+    if !loader.is_file() || !plugin.is_file() {
+        return;
+    }
+
+    let _guard = HERMIT_RUN_LOCK.lock().unwrap();
+    let args = [
+        "run",
+        "--backend",
+        "sabre",
+        "--strict",
+        "--verify",
+        "--base-env=minimal",
+        "--",
+        "/usr/bin/cat",
+        "/proc/self/environ",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+
+    let guest_environment = stdout(&output);
+    assert!(
+        !guest_environment.contains("REVERIE_SABRE_HERMIT_RPC_SOCKET"),
+        "private coordinator setting leaked through procfs: {guest_environment:?}"
+    );
+    assert!(
+        stderr(&output).contains("Determinism verified"),
+        "strict repeat verification did not complete:\n{}",
+        stderr(&output)
+    );
+}
+
 #[test]
 fn global_position_rejects_unknown_backends() {
     let args = ["--backend", "unknown", "run", "--", "/bin/true"];
