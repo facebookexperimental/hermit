@@ -41,6 +41,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use anyhow::anyhow;
 use clap::ValueEnum;
@@ -544,6 +545,33 @@ fn sabre_runtime_unavailable_reason() -> Option<String> {
     })
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-774): Review the bounded SaBRe RPC disconnect drain.
+const SABRE_RPC_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+async fn wait_for_sabre_rpc_disconnects<T>(
+    global: &Arc<T>,
+    timeout: Duration,
+) -> Result<(), usize> {
+    let disconnected = tokio::time::timeout(timeout, async {
+        while Arc::strong_count(global) > 1 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+
+    if disconnected.is_ok() {
+        return Ok(());
+    }
+
+    let live_references = Arc::strong_count(global).saturating_sub(1);
+    if live_references == 0 {
+        Ok(())
+    } else {
+        Err(live_references)
+    }
+}
+
 fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
     // The CLI probes ptrace readiness before entering its container; repeating
     // the namespace probe here would test nested namespaces instead of the host.
@@ -648,12 +676,11 @@ async fn run_sabre(
 
     server_task.abort();
     let _ = server_task.await;
-    for _ in 0..100 {
-        if Arc::strong_count(&global) == 1 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    wait_for_sabre_rpc_disconnects(&global, SABRE_RPC_DISCONNECT_TIMEOUT)
+        .await
+        .map_err(|live_references| {
+            anyhow!("SaBRe coordinator stopped with {live_references} live RPC reference(s)")
+        })?;
     let global = Arc::try_unwrap(global).map_err(|global| {
         anyhow!(
             "SaBRe coordinator stopped with {} live RPC reference(s)",
@@ -1378,6 +1405,8 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     use super::Backend;
     use super::ExitStatus;
@@ -1393,6 +1422,7 @@ mod tests {
     use super::resolve_kvm_shebang;
     use super::resolve_sabre_binary_from;
     use super::sabre_runtime_unavailable_reason;
+    use super::wait_for_sabre_rpc_disconnects;
 
     #[test]
     fn liteinst_reserved_failures_require_scheduler_cancellation() {
@@ -1505,6 +1535,32 @@ mod tests {
     #[test]
     fn sabre_rpc_socket_uses_private_exec_environment() {
         assert!(SABRE_RPC_SOCKET_ENV.starts_with("REVERIE_SABRE_"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sabre_rpc_disconnect_wait_observes_delayed_release() {
+        let global = Arc::new(());
+        let connection = global.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            drop(connection);
+        });
+
+        assert_eq!(
+            wait_for_sabre_rpc_disconnects(&global, Duration::from_millis(50)).await,
+            Ok(())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sabre_rpc_disconnect_wait_reports_stuck_connection() {
+        let global = Arc::new(());
+        let _connection = global.clone();
+
+        assert_eq!(
+            wait_for_sabre_rpc_disconnects(&global, Duration::from_millis(10)).await,
+            Err(1)
+        );
     }
 
     #[test]
