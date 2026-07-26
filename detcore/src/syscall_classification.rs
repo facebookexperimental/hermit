@@ -362,7 +362,34 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(#791)
         | Sysno::flock
         | Sysno::ioprio_set
-        | Sysno::sched_getattr => SyscallClassification::Determinized,
+        | Sysno::sched_getattr
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#787): BATCH 38. openat2(2) is a modern superset of
+        // openat(2); callers are required to fall back to openat on ENOSYS
+        // (kernels before 5.6 lack it). Detcore already determinizes openat, so a
+        // fixed -ENOSYS for openat2 routes those programs (for example GNU tar's
+        // safe directory traversal) onto the determinized openat path with no
+        // host dependency and identical behavior across --verify and
+        // record/replay. The credential-setting family (setuid/setgid and their
+        // re-/res-/fs- variants, and setgroups) is inoperative under Detcore's
+        // fixed virtual-root identity: getuid/geteuid/getgid/getegid are
+        // virtualized to 0 and Detcore never tracks a credential change, so these
+        // succeed as deterministic no-ops (return 0) instead of fail-closing.
+        // Success is the errno a real root process sees for these calls, it lets
+        // privilege-dropping programs (newgrp/sg/su and daemons) proceed, and it
+        // is bitwise-identical across runs. All are untyped (Syscall::Other) in
+        // the pinned Reverie, so the dispatcher matches on the Sysno before the
+        // typed match below.
+        | Sysno::openat2
+        | Sysno::setuid
+        | Sysno::setgid
+        | Sysno::setresuid
+        | Sysno::setresgid
+        | Sysno::setreuid
+        | Sysno::setregid
+        | Sysno::setgroups
+        | Sysno::setfsuid
+        | Sysno::setfsgid => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
         // These existing and triaged passthroughs are conditionally repeatable under
@@ -560,7 +587,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::memfd_secret
         | Sysno::mincore
         | Sysno::name_to_handle_at
-        | Sysno::openat2
         | Sysno::perf_event_open
         | Sysno::pidfd_getfd
         | Sysno::pidfd_open
@@ -584,15 +610,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::semop
         | Sysno::semtimedop
         | Sysno::sendfile
-        | Sysno::setfsgid
-        | Sysno::setfsuid
-        | Sysno::setgid
-        | Sysno::setgroups
-        | Sysno::setregid
-        | Sysno::setresgid
-        | Sysno::setresuid
-        | Sysno::setreuid
-        | Sysno::setuid
         | Sysno::shmat
         | Sysno::shmctl
         | Sysno::shmdt
@@ -711,6 +728,35 @@ pub(crate) const fn is_mount_ns_admin_refused_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#787): Deterministic no-op success set.
+/// Credential-setting syscalls (`setuid`/`setgid` and their `re-`, `res-`, and
+/// `fs-` variants, and `setgroups`). Detcore presents a fixed virtual-root
+/// identity: `getuid`/`geteuid`/`getgid`/`getegid` are virtualized to `0` and
+/// Detcore never tracks a credential change for the guest. These calls are
+/// therefore inoperative under that model, so Detcore accepts them as
+/// deterministic no-ops returning `0` (for `setfsuid`/`setfsgid`, the previous
+/// fs-id, which is the virtual `0`). Success is the errno a real root process
+/// receives for these calls, it lets privilege-dropping programs
+/// (`newgrp`/`sg`/`su` and daemons) continue instead of fail-closing, and it is
+/// never forwarded to the host and bitwise-identical across `--verify` and
+/// record/replay. These are untyped (`Syscall::Other`) in the pinned Reverie, so
+/// the dispatcher matches on the `Sysno` before the typed match.
+pub(crate) const fn is_credential_identity_noop_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::setuid
+            | Sysno::setgid
+            | Sysno::setresuid
+            | Sysno::setresgid
+            | Sysno::setreuid
+            | Sysno::setregid
+            | Sysno::setgroups
+            | Sysno::setfsuid
+            | Sysno::setfsgid
+    )
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#731): Deterministic ENOSYS refusal set.
 /// Asynchronous and message-passing I/O and IPC interfaces Detcore does not
 /// model: Linux native AIO (`io_setup`/`io_destroy`/`io_submit`/`io_cancel`/
@@ -766,7 +812,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [210, 91, 72]);
+        assert_eq!(counts, [220, 91, 62]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1055,6 +1101,56 @@ mod tests {
                     refused.contains(&sysno),
                     "{sysno:?} is flagged by the helper but not in the reviewed refusal set"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn batch38_openat2_and_credential_syscalls_are_determinized() {
+        // BATCH 38: openat2 is determinized (dispatcher returns a fixed ENOSYS so
+        // callers fall back to the already-determinized openat), and the
+        // credential-setting family is determinized to a no-op success under the
+        // fixed virtual-root identity. All must classify as Determinized so they
+        // no longer fail-close under --strict.
+        assert_eq!(
+            classify_syscall(Sysno::openat2),
+            SyscallClassification::Determinized,
+            "openat2 should be Determinized (deterministic ENOSYS fallback)"
+        );
+        let credentials = [
+            Sysno::setuid,
+            Sysno::setgid,
+            Sysno::setresuid,
+            Sysno::setresgid,
+            Sysno::setreuid,
+            Sysno::setregid,
+            Sysno::setgroups,
+            Sysno::setfsuid,
+            Sysno::setfsgid,
+        ];
+        for sysno in credentials {
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Determinized,
+                "{sysno:?} should be Determinized (deterministic no-op success)"
+            );
+            assert!(
+                is_credential_identity_noop_syscall(sysno),
+                "{sysno:?} should be in the credential no-op helper set"
+            );
+        }
+        // The credential helper must not claim any syscall outside the set, and
+        // must never overlap the ENOSYS or EPERM refusal helpers.
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            if is_credential_identity_noop_syscall(sysno) {
+                assert!(
+                    credentials.contains(&sysno),
+                    "{sysno:?} is flagged by the credential helper but not in the reviewed set"
+                );
+                assert!(!is_unimplemented_enosys_syscall(sysno));
+                assert!(!is_privileged_admin_refused_syscall(sysno));
+                assert!(!is_mount_ns_admin_refused_syscall(sysno));
+                assert!(!is_unsupported_async_ipc_syscall(sysno));
             }
         }
     }

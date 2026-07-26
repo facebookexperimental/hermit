@@ -154,6 +154,7 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
+use crate::syscall_classification::is_credential_identity_noop_syscall;
 use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
 use crate::syscall_classification::is_privileged_admin_refused_syscall;
 use crate::syscall_classification::is_unimplemented_enosys_syscall;
@@ -1409,6 +1410,32 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 if is_unsupported_async_ipc_syscall(call.number()) =>
             {
                 Err(Error::Errno(Errno::ENOSYS))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#787): BATCH 38. openat2 is untyped (Syscall::Other)
+            // in the pinned Reverie revision. It is a superset of openat whose
+            // callers must fall back to openat when it returns ENOSYS (kernels
+            // before 5.6 lack openat2), so a fixed -ENOSYS routes them onto the
+            // already-determinized openat path with no host dependency and behavior
+            // identical across --verify and record/replay.
+            SyscallClassification::Determinized if call.number() == Sysno::openat2 => {
+                Err(Error::Errno(Errno::ENOSYS))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#787): BATCH 38. The credential-setting family
+            // (setuid/setgid and their re-/res-/fs- variants, and setgroups) is
+            // untyped (Syscall::Other) in the pinned Reverie. Detcore presents a
+            // fixed virtual-root identity (getuid/geteuid/getgid/getegid are
+            // virtualized to 0) and never tracks a credential change, so these
+            // succeed as deterministic no-ops returning 0 -- the value a real root
+            // process gets for a permitted credential change (and the previous
+            // fs-id, virtual 0, for setfsuid/setfsgid). That lets privilege-
+            // dropping programs proceed instead of fail-closing and is identical
+            // across --verify and record/replay.
+            SyscallClassification::Determinized
+                if is_credential_identity_noop_syscall(call.number()) =>
+            {
+                Ok(0)
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#773): epoll_pwait2 is untyped (Syscall::Other)
