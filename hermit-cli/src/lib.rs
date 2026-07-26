@@ -35,6 +35,7 @@ use std::fs;
 use std::io;
 use std::io::Write;
 use std::os::fd::FromRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -440,6 +441,70 @@ impl Backend {
     }
 }
 
+const SABRE_BINARY_ENV: &str = "HERMIT_SABRE_BINARY";
+
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+// TODO-HUMAN-REVIEW(PR-739): Review SaBRe loader discovery and executable validation.
+fn resolve_sabre_binary_from(
+    override_path: Option<&OsStr>,
+    executable: &Path,
+    path_env: &OsStr,
+) -> Result<PathBuf, Error> {
+    if let Some(requested) = override_path {
+        if requested.is_empty() {
+            return Err(anyhow!("{SABRE_BINARY_ENV} is empty"));
+        }
+        let path = PathBuf::from(requested);
+        return is_executable_file(&path)
+            .then_some(path.clone())
+            .ok_or_else(|| {
+                anyhow!(
+                    "{SABRE_BINARY_ENV}={} is not an executable file",
+                    path.display()
+                )
+            });
+    }
+
+    let directory = executable
+        .parent()
+        .ok_or_else(|| anyhow!("Hermit executable has no parent directory"))?;
+    let sibling = directory.join("sabre");
+    let target_build = directory.parent().map(|target| target.join("sabre/sabre"));
+
+    if is_executable_file(&sibling) {
+        return Ok(sibling);
+    }
+    if let Some(candidate) = &target_build
+        && is_executable_file(candidate)
+    {
+        return Ok(candidate.clone());
+    }
+    if !path_env.is_empty()
+        && let Some(candidate) = std::env::split_paths(path_env)
+            .map(|directory| directory.join("sabre"))
+            .find(|candidate| is_executable_file(candidate))
+    {
+        return Ok(candidate);
+    }
+
+    Err(anyhow!(
+        "SaBRe executable was not found beside {} or in PATH; set {SABRE_BINARY_ENV} or build the pinned loader as target/sabre/sabre",
+        executable.display()
+    ))
+}
+
+fn resolve_sabre_binary() -> Result<PathBuf, Error> {
+    let executable =
+        std::env::current_exe().context("failed to locate running Hermit executable")?;
+    let override_path = std::env::var_os(SABRE_BINARY_ENV);
+    let path_env = std::env::var_os("PATH").unwrap_or_default();
+    resolve_sabre_binary_from(override_path.as_deref(), &executable, &path_env)
+}
+
 const SABRE_RPC_SOCKET_ENV: &str = "HERMIT_SABRE_RPC_SOCKET";
 
 // TODO-HUMAN-REVIEW(PR-738): Review controller/plugin artifact separation.
@@ -469,25 +534,8 @@ fn sabre_runtime_library_path() -> io::Result<PathBuf> {
 }
 
 fn sabre_runtime_unavailable_reason() -> Option<String> {
-    let variable = "HERMIT_SABRE_BINARY";
-    let Some(value) = std::env::var_os(variable) else {
-        return Some("set HERMIT_SABRE_BINARY to the SaBRe executable path".to_owned());
-    };
-    let path = Path::new(&value);
-    match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => {
-            return Some(format!(
-                "{variable}={} is not a regular file",
-                path.display()
-            ));
-        }
-        Err(error) => {
-            return Some(format!(
-                "cannot access {variable}={}: {error}",
-                path.display()
-            ));
-        }
+    if let Err(error) = resolve_sabre_binary() {
+        return Some(error.to_string());
     }
     sabre_runtime_library_path().err().map(|error| {
         format!(
@@ -528,8 +576,7 @@ async fn run_sabre(
     print_summary_to_json_file: &Option<PathBuf>,
     capture_output: bool,
 ) -> Result<Output, Error> {
-    let sabre = std::env::var_os("HERMIT_SABRE_BINARY")
-        .ok_or_else(|| anyhow!("HERMIT_SABRE_BINARY is not set"))?;
+    let sabre = resolve_sabre_binary()?;
     let plugin = sabre_runtime_library_path()
         .map_err(|error| anyhow!("failed to locate the Detcore SaBRe plugin: {error}"))?;
     let program = command.find_program().map_err(|error| {
@@ -1286,7 +1333,9 @@ pub async fn replay_with_output(dir: &Path) -> Result<Output, Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     use super::Backend;
@@ -1297,6 +1346,7 @@ mod tests {
     use super::kvm_device_unavailable_reason;
     use super::liteinst_runtime_unavailable_reason;
     use super::resolve_kvm_shebang;
+    use super::resolve_sabre_binary_from;
     use super::sabre_runtime_unavailable_reason;
 
     #[test]
@@ -1340,6 +1390,51 @@ mod tests {
         let reason = kvm_device_unavailable_reason(temp.path())
             .expect("a directory must not pass the read-write KVM device probe");
         assert!(reason.contains("read-write"));
+    }
+
+    fn write_test_executable(path: &std::path::Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"test loader").unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[test]
+    fn sabre_binary_resolver_finds_cargo_target_build() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("target/release/hermit");
+        let loader = temp.path().join("target/sabre/sabre");
+        write_test_executable(&loader);
+
+        assert_eq!(
+            resolve_sabre_binary_from(None, &executable, OsStr::new("")).unwrap(),
+            loader
+        );
+    }
+
+    #[test]
+    fn sabre_binary_resolver_prefers_and_validates_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("target/release/hermit");
+        let discovered = temp.path().join("target/sabre/sabre");
+        let requested = temp.path().join("requested-sabre");
+        write_test_executable(&discovered);
+        write_test_executable(&requested);
+
+        assert_eq!(
+            resolve_sabre_binary_from(Some(requested.as_os_str()), &executable, OsStr::new(""))
+                .unwrap(),
+            requested
+        );
+
+        let mut permissions = fs::metadata(&requested).unwrap().permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&requested, permissions).unwrap();
+        let error =
+            resolve_sabre_binary_from(Some(requested.as_os_str()), &executable, OsStr::new(""))
+                .unwrap_err();
+        assert!(error.to_string().contains("is not an executable file"));
     }
 
     #[test]
