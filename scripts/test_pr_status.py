@@ -13,23 +13,147 @@ import pr_status
 
 class ClassifyCiRollupTest(unittest.TestCase):
     def test_empty_or_missing_is_none(self) -> None:
-        self.assertEqual(pr_status.classify_ci_rollup([]), "none")
-        self.assertEqual(pr_status.classify_ci_rollup(None), "none")
+        self.assertEqual(pr_status.classify_ci_rollup("rrnewton/hermit", []), "none")
+        self.assertEqual(pr_status.classify_ci_rollup("rrnewton/hermit", None), "none")
 
     def test_failure_conclusion_is_red(self) -> None:
         checks = [
-            {"conclusion": "SUCCESS", "status": "COMPLETED"},
-            {"conclusion": "FAILURE", "status": "COMPLETED"},
+            {
+                "name": pr_status.REGULAR_HOSTED_CHECK,
+                "conclusion": "FAILURE",
+                "status": "COMPLETED",
+            },
         ]
-        self.assertEqual(pr_status.classify_ci_rollup(checks), "red")
+        self.assertEqual(
+            pr_status.classify_ci_rollup("rrnewton/hermit", checks), "red"
+        )
 
     def test_incomplete_status_is_pending(self) -> None:
-        checks = [{"conclusion": "", "status": "IN_PROGRESS"}]
-        self.assertEqual(pr_status.classify_ci_rollup(checks), "pending")
+        checks = [
+            {
+                "name": pr_status.REGULAR_HOSTED_CHECK,
+                "conclusion": "",
+                "status": "IN_PROGRESS",
+            }
+        ]
+        self.assertEqual(
+            pr_status.classify_ci_rollup("rrnewton/hermit", checks), "pending"
+        )
 
     def test_all_success_is_green(self) -> None:
-        checks = [{"conclusion": "SUCCESS", "status": "COMPLETED"}]
-        self.assertEqual(pr_status.classify_ci_rollup(checks), "green")
+        checks = [
+            {
+                "name": pr_status.REGULAR_HOSTED_CHECK,
+                "conclusion": "SUCCESS",
+                "status": "COMPLETED",
+            }
+        ]
+        self.assertEqual(
+            pr_status.classify_ci_rollup("rrnewton/hermit", checks), "green"
+        )
+
+    def test_merge_gate_failure_is_ignored(self) -> None:
+        checks = [
+            {
+                "name": "merge-gate",
+                "conclusion": "FAILURE",
+                "status": "COMPLETED",
+                "startedAt": "2026-07-26T12:00:00Z",
+            },
+            {
+                "name": pr_status.REGULAR_HOSTED_CHECK,
+                "conclusion": "SUCCESS",
+                "status": "COMPLETED",
+                "startedAt": "2026-07-26T12:01:00Z",
+            },
+        ]
+        self.assertEqual(
+            pr_status.classify_ci_rollup("rrnewton/hermit", checks), "green"
+        )
+
+    def test_latest_authoritative_rerun_wins(self) -> None:
+        checks = [
+            {
+                "name": pr_status.REGULAR_HOSTED_CHECK,
+                "conclusion": "FAILURE",
+                "status": "COMPLETED",
+                "startedAt": "2026-07-26T12:00:00Z",
+            },
+            {
+                "name": pr_status.REGULAR_HOSTED_CHECK,
+                "conclusion": "SUCCESS",
+                "status": "COMPLETED",
+                "startedAt": "2026-07-26T12:05:00Z",
+            },
+        ]
+        self.assertEqual(
+            pr_status.classify_ci_rollup("rrnewton/hermit", checks), "green"
+        )
+
+    def test_newer_queued_run_wins_over_older_success(self) -> None:
+        checks = [
+            {
+                "name": pr_status.REGULAR_HOSTED_CHECK,
+                "conclusion": "SUCCESS",
+                "status": "COMPLETED",
+                "startedAt": "2026-07-26T12:00:00Z",
+                "detailsUrl": "https://github.com/o/r/actions/runs/10/job/1",
+            },
+            {
+                "name": pr_status.REGULAR_HOSTED_CHECK,
+                "conclusion": "",
+                "status": "QUEUED",
+                "startedAt": "0001-01-01T00:00:00Z",
+                "detailsUrl": "https://github.com/o/r/actions/runs/11/job/2",
+            },
+        ]
+        self.assertEqual(
+            pr_status.classify_ci_rollup("rrnewton/hermit", checks), "pending"
+        )
+
+    def test_hermit_self_hosted_failure_is_nonblocking(self) -> None:
+        checks = [
+            {
+                "name": pr_status.REGULAR_HOSTED_CHECK,
+                "conclusion": "SUCCESS",
+                "status": "COMPLETED",
+            },
+            {
+                "name": "PMU and CPUID tests (self-hosted)",
+                "conclusion": "FAILURE",
+                "status": "COMPLETED",
+            },
+        ]
+        self.assertEqual(
+            pr_status.classify_ci_rollup("rrnewton/hermit", checks), "green"
+        )
+
+    def test_reverie_requires_hosted_and_host_dependent_checks(self) -> None:
+        hosted = {
+            "name": pr_status.REGULAR_HOSTED_CHECK,
+            "conclusion": "SUCCESS",
+            "status": "COMPLETED",
+        }
+        host_dependent = {
+            "name": "Host-dependent tests (self-hosted)",
+            "conclusion": "SUCCESS",
+            "status": "COMPLETED",
+        }
+        self.assertEqual(
+            pr_status.classify_ci_rollup("rrnewton/reverie", [hosted]), "pending"
+        )
+        self.assertEqual(
+            pr_status.classify_ci_rollup(
+                "rrnewton/reverie", [hosted, host_dependent]
+            ),
+            "green",
+        )
+
+        failed = {**host_dependent, "conclusion": "FAILURE"}
+        self.assertEqual(
+            pr_status.classify_ci_rollup("rrnewton/reverie", [hosted, failed]),
+            "red",
+        )
 
 
 class ParsePullRequestTest(unittest.TestCase):

@@ -23,10 +23,19 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Sequence
+from urllib.parse import urlparse
 
 DEFAULT_REPOS = ("rrnewton/hermit", "rrnewton/reverie")
 DEFAULT_WARN_THRESHOLD = 10
 HUMAN_REVIEW_LABEL = "human-review"
+REGULAR_HOSTED_CHECK = "Regular tests (GitHub-hosted)"
+REQUIRED_CHECKS = {
+    "rrnewton/hermit": (REGULAR_HOSTED_CHECK,),
+    "rrnewton/reverie": (
+        REGULAR_HOSTED_CHECK,
+        "Host-dependent tests (self-hosted)",
+    ),
+}
 
 RED_CONCLUSIONS = frozenset(
     (
@@ -59,17 +68,52 @@ class PullRequest:
         return HUMAN_REVIEW_LABEL in self.labels
 
 
-def classify_ci_rollup(checks: object) -> str:
-    """Classify a GitHub statusCheckRollup as green, red, pending, or none."""
+def _check_sort_key(check: dict[object, object], index: int) -> tuple[int, str, int]:
+    details_url = str(check.get("detailsUrl") or "")
+    path_parts = [part for part in urlparse(details_url).path.split("/") if part]
+    try:
+        runs_index = path_parts.index("runs")
+        run_id = int(path_parts[runs_index + 1])
+    except (ValueError, IndexError):
+        run_id = -1
+    timestamp = str(
+        check.get("startedAt")
+        or check.get("createdAt")
+        or check.get("completedAt")
+        or ""
+    )
+    return run_id, timestamp, index
+
+
+def classify_ci_rollup(repo: str, checks: object) -> str:
+    """Classify the latest authoritative checks as green, red, pending, or none.
+
+    GitHub retains older reruns and auxiliary checks in ``statusCheckRollup``.
+    In particular, Hermit's merge gate intentionally starts red and refires
+    after hosted CI completes. Those historical placeholders must not turn a
+    hosted-green pull request red in this operational report.
+    """
     if not isinstance(checks, list) or not checks:
         return "none"
 
-    saw_check = False
-    saw_pending = False
-    for check in checks:
+    required = REQUIRED_CHECKS.get(repo, (REGULAR_HOSTED_CHECK,))
+    latest: dict[str, tuple[tuple[int, str, int], dict[object, object]]] = {}
+    for index, check in enumerate(checks):
         if not isinstance(check, dict):
             continue
-        saw_check = True
+        name = str(check.get("name") or check.get("context") or "")
+        if name not in required:
+            continue
+        sort_key = _check_sort_key(check, index)
+        previous = latest.get(name)
+        if previous is None or sort_key > previous[0]:
+            latest[name] = (sort_key, check)
+
+    if not latest:
+        return "none"
+
+    saw_pending = len(latest) != len(required)
+    for _, check in latest.values():
         conclusion = str(check.get("conclusion") or check.get("state") or "").upper()
         status = str(check.get("status") or "").upper()
 
@@ -82,8 +126,6 @@ def classify_ci_rollup(checks: object) -> str:
         ):
             saw_pending = True
 
-    if not saw_check:
-        return "none"
     return "pending" if saw_pending else "green"
 
 
@@ -112,7 +154,7 @@ def parse_pull_request(repo: str, raw: object) -> PullRequest:
         url=url,
         is_draft=raw.get("isDraft") is True,
         labels=labels,
-        ci_status=classify_ci_rollup(raw.get("statusCheckRollup")),
+        ci_status=classify_ci_rollup(repo, raw.get("statusCheckRollup")),
     )
 
 
