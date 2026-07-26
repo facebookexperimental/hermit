@@ -303,7 +303,7 @@ readonly STRICT_COMPAT_TOTAL=181
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
 readonly RR_COMPAT_EXPECTED=143
-readonly LITEINST_COMPAT_EXPECTED=76
+readonly LITEINST_COMPAT_EXPECTED=97
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
@@ -828,7 +828,7 @@ function run_full_backend_gates {
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
     run_check "LiteInst backend smoke" liteinst_backend_available
-    run_check "LiteInst compatibility baseline (76 programs)" run_liteinst_compatibility_envelope
+    run_check "LiteInst compatibility baseline (97 programs)" run_liteinst_compatibility_envelope
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -1389,6 +1389,27 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe printenv /usr/bin/printenv PATH && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe whoami /usr/bin/whoami && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe groups /usr/bin/groups && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe bash /bin/bash -c 'printf "bash-ok\n"' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sh /bin/sh -c 'printf "sh-ok\n"' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe cmp /usr/bin/cmp README.md README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe diff /usr/bin/diff README.md README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe pr /usr/bin/pr -t README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe numfmt /usr/bin/numfmt --to=iec 1048576 && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe test /usr/bin/test -f README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe bracket '/usr/bin/[' -f README.md ']' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe users /usr/bin/users && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe pinky /usr/bin/pinky -l root && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ptx /usr/bin/ptx README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe tsort /usr/bin/tsort /dev/null && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe column /usr/bin/column README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe hexdump /usr/bin/hexdump -C -n 32 README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe iconv /usr/bin/iconv -f UTF-8 -t UTF-8 README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe jq /usr/bin/jq -n '{answer: 42}' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe lua /usr/bin/lua -e 'print(42)' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe dc /usr/bin/dc -e '2 2 + p' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe cal /usr/bin/cal 1 2000 && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sleep /usr/bin/sleep 0 && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe logger /usr/bin/logger --stderr --no-act -t hermit-compat logger-ok && passed=$((passed + 1)) || failed=$((failed + 1))
 
     total=$((passed + failed))
     if ((total != LITEINST_COMPAT_EXPECTED)); then
@@ -3088,7 +3109,7 @@ fi
 if ((LITEINST_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
     if ((failures == 0)); then
-        run_check "LiteInst compatibility baseline (76 programs)" run_liteinst_compatibility_envelope
+        run_check "LiteInst compatibility baseline (97 programs)" run_liteinst_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
