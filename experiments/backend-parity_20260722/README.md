@@ -10,39 +10,48 @@ A `gap` must have a concrete implementation reason.
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
 | ptrace | 10/10 | 100% |
-| DBI | 7/10 | 70% |
-| KVM | 1/10 | 10% |
+| DBI | 6/10 | 60% |
+| KVM | 8/10 | 80% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 7/10 number above is deliberately
+measures the backend's own Reverie suite. The 6/10 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 Conflating the two would overstate Detcore parity because the current DBI client
 observes most syscalls but only rewrites `write` and CPUID; it does not yet use
 Detcore's scheduler, virtual clock, PID model, or random model.
 
-KVM's single passing pair is the built-in hello/write VM-exit path. The current
-KVM prototype does not load the requested Linux ELF, so treating `/bin/true`
-returning zero as a pass would be a false positive. Its CPUID policy is covered
-inside `reverie-kvm`, but it cannot yet execute this suite's CPUID probe ELF.
+KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
+eight pairs, including deterministic clock, PID, and synthetic CPUID probes.
+The remaining gaps are the pthread lifecycle and the threaded random-source
+fixture; both require guest thread lifecycle support, and the latter also needs
+page-permission fault enforcement.
 
 ## Matrix
 
 | Test | ptrace | DBI | KVM |
 | --- | --- | --- | --- |
 | `hello_stdout` | pass | pass | pass |
-| `argument_forwarding` | pass | pass | gap |
-| `exit_zero` | pass | pass | gap |
-| `exit_status` | pass | pass | gap |
-| `file_read` | pass | pass | gap |
-| `pthread_lifecycle` | pass | pass | gap |
-| `cpuid_policy` | pass | pass | gap |
-| `virtual_clock` | pass | gap | gap |
+| `argument_forwarding` | pass | pass | pass |
+| `exit_zero` | pass | pass | pass |
+| `exit_status` | pass | pass | pass |
+| `file_read` | pass | pass | pass |
+| `pthread_lifecycle` | pass | gap | gap |
+| `cpuid_policy` | pass | pass | pass |
+| `virtual_clock` | pass | gap | pass |
 | `random_sources` | pass | gap | gap |
-| `virtual_pid` | pass | gap | gap |
+| `virtual_pid` | pass | gap | pass |
 
 The authoritative reasons live in `matrix.tsv`, next to the status they
 justify. The runner executes each passing pair three times and checks exit
 status, stdout, and (for determinism cases) byte-identical repeated output.
+These repeat-run results are compatibility evidence, not an L1/L2 assurance
+level: the runner disables timeslicing and does not pass `--strict --verify`.
+
+Hermit's KVM root process enters the shared tool through
+`run_static_elf_with_tool::<Detcore>`, but forked children currently execute in
+the backend's deterministic `ElfExecutor` personality without per-child
+Detcore tool callbacks. The CPUID row similarly validates reverie-kvm's
+backend-local `KVM_SET_CPUID2` policy, not Detcore CPUID-event parity.
 
 ## Running
 

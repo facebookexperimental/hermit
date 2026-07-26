@@ -930,6 +930,90 @@ fn run_kvm_propagates_explicit_environment() {
 }
 
 #[test]
+fn run_kvm_bash_process_substitution_is_deterministic() {
+    if !Path::new("/dev/kvm").exists()
+        || !Path::new("/bin/bash").exists()
+        || !Path::new("/usr/bin/paste").exists()
+        || !Path::new("/usr/bin/diff").exists()
+    {
+        return;
+    }
+
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--base-env=minimal",
+        "--",
+        "/bin/bash",
+        "-c",
+        r#"set -euo pipefail; /usr/bin/paste -d: <(printf "alpha\nbeta\n") <(printf "1\n2\n") | /usr/bin/diff -u <(printf "alpha:1\nbeta:2\n") -; printf "paste-ok\n""#,
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "paste-ok\n");
+    assert!(stderr(&output).contains("Determinism verified"));
+}
+
+#[test]
+fn run_kvm_cpuid_policy_is_deterministic() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let compiler = ["cc", "gcc", "clang"]
+        .into_iter()
+        .find(|program| {
+            Command::new(program)
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })
+        .expect("KVM CPUID regression requires cc, gcc, or clang on PATH");
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kvm-cpuid");
+    fs::create_dir_all(&build_root).expect("failed to create KVM CPUID guest directory");
+    let binary = build_root.join("cpuid_probe");
+    let compile = Command::new(compiler)
+        .args(["-O2", "-g", "-std=c11", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("experiments/backend-parity_20260722/fixtures/cpuid_probe.c"))
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("failed to compile KVM CPUID guest");
+    assert!(
+        compile.status.success(),
+        "KVM CPUID guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr),
+    );
+
+    let program = binary.to_str().expect("CPUID guest path should be UTF-8");
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--base-env=minimal",
+        "--",
+        program,
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "CPUID-SUCCESS vendor=GenuineIntel signature=00000663\n"
+    );
+    assert!(stderr(&output).contains("Determinism verified"));
+}
+
+#[test]
 fn run_kvm_respects_workdir_for_relative_paths() {
     if !Path::new("/dev/kvm").exists() {
         return;
