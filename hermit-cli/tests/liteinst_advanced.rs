@@ -7,11 +7,16 @@
  */
 
 use std::fs;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
+use std::process::Stdio;
 use std::sync::OnceLock;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 
 static LITEINST_ADVANCED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
@@ -115,4 +120,51 @@ fn liteinst_thread_clone_fails_closed_without_sigsys() {
 #[test]
 fn liteinst_fork_fails_closed_without_hanging() {
     assert_clone_boundary("fork", "fork: Operation not supported");
+}
+
+#[test]
+fn liteinst_abnormal_exit_after_registration_does_not_hang() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log",
+            "info",
+            "run",
+            "--backend",
+            "liteinst",
+            "--strict",
+            "--base-env=minimal",
+            "--no-namespace",
+            "--",
+            "/bin/sh",
+            "-c",
+            "kill -9 $$",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start Hermit LiteInst fatal-exit guest");
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll Hermit LiteInst") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("Hermit LiteInst hung after a registered guest exited by signal");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    let output = child
+        .wait_with_output()
+        .expect("failed to collect Hermit LiteInst output");
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "{output:?}");
+    assert_eq!(output.status, status);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("[scheduler] guest in queue"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
 }

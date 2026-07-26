@@ -344,6 +344,22 @@ impl GlobalState {
         info!("Scheduler state at exit:\n{}", sched.full_summary());
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-744): Review explicit abnormal-backend scheduler cancellation.
+    /// Cancels the internally spawned scheduler task after a backend guest exits abnormally.
+    ///
+    /// External-scheduler states do not own a task and are left unchanged.
+    pub async fn cancel_internal_scheduler(&mut self) {
+        if let Some(handle) = self.sched_handle.take() {
+            handle.abort();
+            match handle.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => panic!("cancelled scheduler task panicked: {error}"),
+            }
+        }
+    }
+
     /// Shut down anything running, in particular wait on the scheduler.
     ///
     /// This is basically the destructor for the global state, but is here rather than in the
@@ -1893,8 +1909,15 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::time::Duration;
 
+    use super::GlobalState;
     use super::format_unsupported_syscall_warning;
+    use crate::config::Config;
+    use crate::ivar::Ivar;
+    use crate::scheduler::DEFAULT_PRIORITY;
+    use crate::scheduler::ThreadNextTurn;
+    use crate::types::DetTid;
 
     #[test]
     fn unsupported_syscall_warning_is_sorted_and_aggregated() {
@@ -1909,5 +1932,62 @@ mod tests {
             Some("syscalls getppid,vmsplice used but not yet supported")
         );
         assert_eq!(format_unsupported_syscall_warning(&BTreeSet::new()), None);
+    }
+
+    #[tokio::test]
+    async fn abnormal_cleanup_cancels_an_unstarted_scheduler() {
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let mut state = GlobalState::initialize(&config, true);
+        state.cancel_internal_scheduler().await;
+        let summary_path = None;
+        let cleanup = state.clean_up(false, &summary_path);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), cleanup)
+                .await
+                .is_ok(),
+            "cleanup waited for a scheduler whose guest never registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn abnormal_cleanup_cancels_a_registered_scheduler() {
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let mut state = GlobalState::initialize(&config, true);
+        let dettid = DetTid::from_raw(1);
+        {
+            let mut scheduler = state.sched.lock().unwrap();
+            scheduler.priorities.insert(dettid, DEFAULT_PRIORITY);
+            scheduler.next_turns.insert(
+                dettid,
+                ThreadNextTurn {
+                    dettid,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                },
+            );
+            scheduler.runqueue_push_back(dettid);
+            scheduler.started_up.put(());
+        }
+        tokio::task::yield_now().await;
+
+        state.cancel_internal_scheduler().await;
+        let summary_path = None;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                state.clean_up(false, &summary_path),
+            )
+            .await
+            .is_ok(),
+            "cleanup waited after cancelling a registered scheduler"
+        );
     }
 }

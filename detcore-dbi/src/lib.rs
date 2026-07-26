@@ -514,13 +514,25 @@ pub extern "C" fn reverie_dbi_runtime_ready(image_generation: u64) -> i32 {
 }
 
 /// Initializes native per-thread scratch state. Detcore state is initialized
-/// lazily when the callback provides the actual guest tid and pid.
+/// lazily when the syscall callback provides the actual guest tid and pid.
 ///
 /// # Safety
 ///
-/// The native client must pass a valid writable scratch pointer or null.
+/// The native client must pass a valid writable scratch pointer and callback
+/// pointers that remain valid for the application lifetime.
+// TODO-HUMAN-REVIEW(PR-744): Review compatibility with the expanded native thread-init ABI.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(scratch: *mut c_void) {
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
+    scratch: *mut c_void,
+    _context: *mut c_void,
+    _tid: i32,
+    _pid: i32,
+    _branches: u64,
+    _defer_runtime: i32,
+    _invoke_syscall: SyscallInvoker,
+    _read_registers: RegisterReader,
+) -> i32 {
     unsafe {
         scratch
             .cast::<NativeThreadScratch>()
@@ -531,6 +543,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(scratch: *mut c_void) {
                 runtime_state: std::ptr::null_mut(),
             });
     }
+    0
 }
 
 /// Releases Detcore state owned by a DynamoRIO application thread.
@@ -911,5 +924,43 @@ mod tests {
             &args,
             None
         ));
+    }
+
+    #[test]
+    fn native_thread_init_uses_the_expanded_success_returning_abi() {
+        unsafe extern "C" fn invoke_syscall(
+            _context: usize,
+            _sysnum: i64,
+            _args: *const u64,
+        ) -> i64 {
+            0
+        }
+        unsafe extern "C" fn read_registers(
+            _context: usize,
+            _registers: *mut libc::user_regs_struct,
+        ) -> i32 {
+            0
+        }
+
+        let mut scratch = std::mem::MaybeUninit::<NativeThreadScratch>::uninit();
+        let status = unsafe {
+            reverie_dbi_runtime_thread_init(
+                scratch.as_mut_ptr().cast(),
+                std::ptr::null_mut(),
+                7,
+                7,
+                99,
+                1,
+                invoke_syscall,
+                read_registers,
+            )
+        };
+
+        assert_eq!(status, 0);
+        let scratch = unsafe { scratch.assume_init() };
+        assert_eq!(scratch.branches, 0);
+        assert_eq!(scratch.observed_syscalls, 0);
+        assert_eq!(scratch.rewritten_syscalls, 0);
+        assert!(scratch.runtime_state.is_null());
     }
 }
