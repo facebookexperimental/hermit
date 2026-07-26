@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/liteinst.rs"]
+mod liteinst_runtime;
+
 use std::fs;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -19,7 +22,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 static LITEINST_ADVANCED_GUEST: OnceLock<PathBuf> = OnceLock::new();
-static LITEINST_RUNTIME: OnceLock<()> = OnceLock::new();
 
 fn advanced_guest() -> &'static Path {
     LITEINST_ADVANCED_GUEST.get_or_init(|| {
@@ -46,48 +48,8 @@ fn advanced_guest() -> &'static Path {
     })
 }
 
-fn ensure_liteinst_runtime() {
-    LITEINST_RUNTIME.get_or_init(|| {
-        let hermit = Path::new(env!("CARGO_BIN_EXE_hermit"));
-        let profile_dir = hermit
-            .parent()
-            .expect("Hermit test binary should have a profile directory");
-        let target_dir = profile_dir
-            .parent()
-            .expect("Hermit profile should be inside a target directory");
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("hermit-cli should be inside the repository");
-        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        let output = Command::new(cargo)
-            .current_dir(repository)
-            .args([
-                "build",
-                "--locked",
-                "-p",
-                "detcore-liteinst",
-                "--target-dir",
-            ])
-            .arg(target_dir)
-            .output()
-            .expect("failed to build the LiteInst runtime");
-        assert!(
-            output.status.success(),
-            "LiteInst runtime build failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        let runtime = profile_dir.join("libdetcore_liteinst.so");
-        assert!(
-            runtime.is_file(),
-            "detcore-liteinst build did not create {}",
-            runtime.display(),
-        );
-    });
-}
-
 fn run_liteinst(program: &Path, args: &[&str], verify: bool) -> Output {
-    ensure_liteinst_runtime();
+    liteinst_runtime::ensure_liteinst_runtime();
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command.args(["run", "--backend", "liteinst", "--strict"]);
     if verify {
@@ -174,7 +136,7 @@ fn liteinst_fork_fails_closed_without_hanging() {
 
 #[test]
 fn liteinst_abnormal_exit_after_registration_does_not_hang() {
-    ensure_liteinst_runtime();
+    liteinst_runtime::ensure_liteinst_runtime();
     let mut child = Command::new(env!("CARGO_BIN_EXE_hermit"))
         .args([
             "--log",

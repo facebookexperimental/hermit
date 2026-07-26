@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/liteinst.rs"]
+mod liteinst_runtime;
+
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -611,6 +614,7 @@ fn run_dbi_strict_returns_with_blocked_stdin_source() {
 // TODO-HUMAN-REVIEW(PR-736): Review the real LiteInst Detcore CLI assertion.
 #[test]
 fn run_liteinst_verifies_detcore_backend() {
+    liteinst_runtime::ensure_liteinst_runtime();
     let args = [
         "run",
         "--backend",
