@@ -8,8 +8,10 @@
 
 //! SaBRe plugin that executes Hermit's Detcore tool inside each guest process.
 
+use std::ffi::OsStr;
 use std::io;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use detcore::Detcore;
 use reverie_memory::LocalMemory;
@@ -23,6 +25,30 @@ use reverie_syscalls::Sysno;
 /// Environment variable containing the coordinator's Unix-domain socket path.
 // TODO-HUMAN-REVIEW(PR-745): Review the private SaBRe exec environment contract.
 pub const RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-771): Review fork-inherited SaBRe coordinator discovery.
+static RPC_SOCKET: OnceLock<PathBuf> = OnceLock::new();
+
+fn coordinator_socket() -> Option<PathBuf> {
+    if let Some(socket) = RPC_SOCKET.get() {
+        return Some(socket.clone());
+    }
+
+    // SAFETY: Plugin construction runs before SaBRe starts guest callbacks.
+    let requested = unsafe { sabre::take_private_env(RPC_SOCKET_ENV) };
+    remember_coordinator_socket(&RPC_SOCKET, requested.as_deref())
+}
+
+fn remember_coordinator_socket(
+    slot: &OnceLock<PathBuf>,
+    requested: Option<&OsStr>,
+) -> Option<PathBuf> {
+    slot.get().cloned().or_else(|| {
+        let requested = requested.map(PathBuf::from)?;
+        Some(slot.get_or_init(|| requested).clone())
+    })
+}
 
 /// Returns the Detcore SaBRe plugin built beside the running Hermit binary.
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -58,9 +84,7 @@ struct Plugin {
 
 impl Plugin {
     fn connect() -> Self {
-        // SAFETY: Plugin construction runs before SaBRe starts guest callbacks.
-        let socket = unsafe { sabre::take_private_env(RPC_SOCKET_ENV) }
-            .unwrap_or_else(|| panic!("{RPC_SOCKET_ENV} is not set"));
+        let socket = coordinator_socket().unwrap_or_else(|| panic!("{RPC_SOCKET_ENV} is not set"));
 
         let adapter = RemoteReverieAdapter::connect(socket)
             .expect("failed to connect Detcore SaBRe plugin to coordinator");
@@ -158,5 +182,19 @@ mod tests {
     #[test]
     fn rpc_socket_uses_sabre_private_environment_namespace() {
         assert!(RPC_SOCKET_ENV.starts_with("REVERIE_SABRE_"));
+    }
+
+    #[test]
+    fn rpc_socket_survives_plugin_reinitialization() {
+        let socket = OnceLock::new();
+
+        assert_eq!(
+            remember_coordinator_socket(&socket, Some(OsStr::new("/tmp/coordinator.sock"))),
+            Some(PathBuf::from("/tmp/coordinator.sock"))
+        );
+        assert_eq!(
+            remember_coordinator_socket(&socket, None),
+            Some(PathBuf::from("/tmp/coordinator.sock"))
+        );
     }
 }
