@@ -938,6 +938,7 @@ pub fn run_with_backend(
     if backend == Backend::Kvm {
         ensure_kvm_stdin_reserved()?;
     }
+    let config = prepare_backend_config(config, backend);
     run_with_backend_inner(
         command,
         config,
@@ -945,6 +946,17 @@ pub fn run_with_backend(
         print_summary_to_json_file,
         backend,
     )
+}
+
+// TODO-HUMAN-REVIEW(PR-749): Review LiteInst backend configuration normalization.
+fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig {
+    if backend == Backend::Liteinst && config.max_timeslice.is_some() {
+        eprintln!(
+            "WARNING: --backend=liteinst does not implement PMU/RCB timer delivery; continuing with --max-timeslice=disabled."
+        );
+        config.max_timeslice = None;
+    }
+    config
 }
 
 // TODO-HUMAN-REVIEW(PR-736): Review reserved LiteInst runtime failure statuses.
@@ -1044,6 +1056,7 @@ pub fn run_with_output_backend(
     if backend == Backend::Kvm {
         ensure_kvm_stdin_reserved()?;
     }
+    let config = prepare_backend_config(config, backend);
     run_with_output_backend_inner(
         command,
         config,
@@ -1351,6 +1364,7 @@ mod tests {
     use super::kvm_device_unavailable_reason;
     use super::liteinst_requires_forced_shutdown;
     use super::liteinst_runtime_unavailable_reason;
+    use super::prepare_backend_config;
     use super::resolve_kvm_shebang;
     use super::resolve_sabre_binary_from;
     use super::sabre_runtime_unavailable_reason;
@@ -1364,6 +1378,52 @@ mod tests {
         }
         assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(121)));
         assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(128)));
+    }
+
+    #[test]
+    fn liteinst_backend_config_disables_unsupported_rcb_timeslices() {
+        let config = super::DetConfig::default();
+        assert!(config.max_timeslice.is_some());
+        assert!(
+            prepare_backend_config(config.clone(), Backend::Liteinst)
+                .max_timeslice
+                .is_none()
+        );
+        assert!(
+            prepare_backend_config(config, Backend::Ptrace)
+                .max_timeslice
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn liteinst_public_dispatch_runs_default_config_without_rcb_timers() {
+        if Backend::Liteinst.ensure_available().is_err() {
+            return;
+        }
+
+        let mut command = super::Command::new("/bin/echo");
+        command.arg("hello");
+        let output = super::run_with_output_backend(
+            command,
+            super::DetConfig::default(),
+            false,
+            &None,
+            Backend::Liteinst,
+        )
+        .expect("run /bin/echo through LiteinstGuest<Detcore>");
+        assert_eq!(output.status, super::ExitStatus::Exited(0));
+        assert_eq!(output.stdout, b"hello\n");
+
+        let status = super::run_with_backend(
+            super::Command::new("/bin/true"),
+            super::DetConfig::default(),
+            false,
+            &None,
+            Backend::Liteinst,
+        )
+        .expect("run /bin/true through LiteinstGuest<Detcore>");
+        assert_eq!(status, super::ExitStatus::Exited(0));
     }
 
     #[test]

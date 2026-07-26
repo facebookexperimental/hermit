@@ -55,7 +55,11 @@ fn run_liteinst(program: &Path, args: &[&str], verify: bool) -> Output {
     command.output().expect("failed to run Hermit LiteInst")
 }
 
-fn assert_l2(program: &Path, args: &[&str], expected_stdout: &[u8]) {
+fn assert_strict_verify_without_rcb_preemption(
+    program: &Path,
+    args: &[&str],
+    expected_stdout: &[u8],
+) {
     let output = run_liteinst(program, args, true);
     assert!(
         output.status.success(),
@@ -71,6 +75,10 @@ fn assert_l2(program: &Path, args: &[&str], expected_stdout: &[u8]) {
         "{stderr}"
     );
     assert!(
+        stderr.contains("continuing with --max-timeslice=disabled"),
+        "{stderr}"
+    );
+    assert!(
         stderr.contains("Success: deterministic. Determinism verified."),
         "{stderr}"
     );
@@ -82,15 +90,15 @@ fn assert_l2(program: &Path, args: &[&str], expected_stdout: &[u8]) {
 
 #[test]
 fn liteinst_detcore_strict_verify_micro_suite() {
-    assert_l2(Path::new("/bin/true"), &[], b"");
-    assert_l2(Path::new("/bin/echo"), &["hello"], b"hello\n");
+    assert_strict_verify_without_rcb_preemption(Path::new("/bin/true"), &[], b"");
+    assert_strict_verify_without_rcb_preemption(Path::new("/bin/echo"), &["hello"], b"hello\n");
 
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
     let readme = repository.join("README.md");
     let expected = fs::read(&readme).expect("read README fixture");
-    assert_l2(
+    assert_strict_verify_without_rcb_preemption(
         Path::new("/bin/cat"),
         &[readme.to_str().unwrap()],
         &expected,

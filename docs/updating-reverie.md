@@ -9,21 +9,16 @@ silently changed by an upstream push).
 ## Where the pin lives
 
 The same `rev` appears in every crate that depends on a Reverie crate. Keep them
-identical — mixing revisions pulls two incompatible `reverie` cores into one
+identical — mixing revisions can pull two incompatible `reverie` cores into one
 build. As of this writing the deps are:
 
-- `hermit-cli/Cargo.toml` — `reverie`, `reverie-ptrace`
-- `detcore/Cargo.toml` — `reverie`, `reverie-ptrace`
+- `hermit-cli/Cargo.toml`
+- `detcore/Cargo.toml`
+- `detcore-dbi/Cargo.toml`
+- `detcore-liteinst/Cargo.toml`
 - `detcore-model/Cargo.toml` — `reverie-syscalls`
-- `detcore/tests/testutils/Cargo.toml` — `reverie`, `reverie-ptrace`
-
-The optional `detcore-liteinst` cdylib is a deliberate leaf exception. Its
-`reverie-liteinst` dependency links only that standalone crate and `libc`; it
-does not link `reverie`, `reverie-ptrace`, or another shared Reverie core into
-the same artifact. It may therefore pin the reviewed LiteInst implementation
-independently while the shared dependency graph remains on one identical
-revision. Confirm this boundary with `cargo tree -p detcore-liteinst` whenever
-the LiteInst crate's dependencies change.
+- `detcore-sabre/Cargo.toml`
+- `detcore/tests/testutils/Cargo.toml`
 
 ## How to bump
 
@@ -54,8 +49,8 @@ the LiteInst crate's dependencies change.
 
 ## Notes
 
-- `Cargo.lock` is not tracked in this repo, so the `rev` in the manifests is the
-  authoritative pin.
+- `Cargo.lock` is tracked. Commit its updated Reverie source entries with every
+  pin change.
 - To point at a fork instead of upstream (e.g. for the experimental
   `reverie-dbi` / `reverie-kvm` backends), change the `git =` URL as well as the
   `rev`, and keep all Reverie crates on the same source.
