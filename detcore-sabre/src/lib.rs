@@ -50,6 +50,12 @@ fn remember_coordinator_socket(
     })
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-779): Review fail-closed SaBRe RDTSC errors.
+fn require_virtual_rdtsc(result: Result<u64, Errno>) -> u64 {
+    result.expect("SaBRe RDTSC virtualization failed")
+}
+
 /// Returns the Detcore SaBRe plugin built beside the running Hermit binary.
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-738): Review the Hermit-to-SaBRe plugin artifact boundary.
@@ -130,7 +136,7 @@ impl reverie_sabre::Tool for Plugin {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-755): Review SaBRe RDTSC virtualization.
     fn rdtsc(&self) -> u64 {
-        self.adapter.handle_rdtsc().unwrap_or(0)
+        require_virtual_rdtsc(self.adapter.handle_rdtsc())
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -196,5 +202,16 @@ mod tests {
             remember_coordinator_socket(&socket, None),
             Some(PathBuf::from("/tmp/coordinator.sock"))
         );
+    }
+
+    #[test]
+    fn virtual_rdtsc_returns_coordinator_value() {
+        assert_eq!(require_virtual_rdtsc(Ok(42)), 42);
+    }
+
+    #[test]
+    #[should_panic(expected = "SaBRe RDTSC virtualization failed")]
+    fn virtual_rdtsc_error_fails_closed() {
+        require_virtual_rdtsc(Err(Errno::EIO));
     }
 }
