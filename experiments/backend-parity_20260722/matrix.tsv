@@ -4,7 +4,7 @@ argument_forwarding	pass	pass	pass	-	-
 exit_zero	pass	pass	pass	-	-
 exit_status	pass	pass	pass	-	-
 file_read	pass	pass	pass	-	-
-pthread_lifecycle	pass	gap	gap	DBI thread-exit scheduling deadlocks before join completes	KVM single-vCPU personality does not implement clone and futex thread lifecycle
+pthread_lifecycle	pass	gap	gap	Hosted DynamoRIO sideline runtime exits before Detcore readiness for linked pthread guests	KVM single-vCPU personality does not implement clone and futex thread lifecycle
 cpuid_policy	pass	pass	gap	-	KVM exposes the host vendor and maximum leaves instead of Detcore's ptrace CPUID identity
 virtual_clock	pass	gap	pass	DBI observes syscalls but does not route clock calls through Detcore virtual time	-
 random_sources	pass	gap	gap	DBI observes syscalls but does not route random sources through Detcore	KVM random fixture still requires thread lifecycle and page-permission fault enforcement

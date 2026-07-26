@@ -13,6 +13,7 @@
 
 #![deny(missing_docs)]
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs;
 use std::future::Future;
@@ -23,6 +24,7 @@ use std::pin::pin;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
@@ -42,10 +44,12 @@ use reverie::ExitStatus;
 use reverie::Pid;
 use reverie::Tid;
 use reverie::Tool;
+use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Errno;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::Sysno;
+use reverie_dbi::DbiGuest;
 use reverie_dbi::DbiSyscallOutcome;
 use reverie_dbi::MemoryReader;
 use reverie_dbi::RegisterReader;
@@ -130,16 +134,16 @@ fn load_dbi_config() -> (Config, ConfigSource) {
 }
 
 // TODO-HUMAN-REVIEW(PR-587): Confirm DynamoRIO-native process lifecycle boundaries.
-fn requires_native_process_lifecycle(sysnum: i64, args: &[u64], clone3_flags: Option<u64>) -> bool {
+// TODO-HUMAN-REVIEW(PR-743): Review native clone scheduling and registration ordering.
+fn requires_native_lifecycle(sysnum: i64) -> bool {
     match sysnum {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        libc::SYS_fork | libc::SYS_vfork | libc::SYS_rt_sigreturn | libc::SYS_execve => true,
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        libc::SYS_clone => args[0] & libc::CLONE_THREAD as u64 == 0,
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        libc::SYS_clone3 => {
-            clone3_flags.is_some_and(|flags| flags & libc::CLONE_THREAD as u64 == 0)
-        }
+        libc::SYS_fork
+        | libc::SYS_vfork
+        | libc::SYS_clone
+        | libc::SYS_clone3
+        | libc::SYS_rt_sigreturn
+        | libc::SYS_execve => true,
         _ => false,
     }
 }
@@ -170,6 +174,18 @@ fn run_cooperative<F: Future<Output = ()>>(future: F, idle: Idler) {
     }
 }
 
+fn run_ready<F: Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
 struct Runtime {
     config: Config,
     global: GlobalState,
@@ -183,15 +199,27 @@ struct ThreadRuntime {
     post_exec_pending: bool,
 }
 
+// TODO-HUMAN-REVIEW(PR-743): Review the scratch ABI shared with DynamoRIO.
 #[repr(C)]
 struct NativeThreadScratch {
     branches: u64,
     observed_syscalls: u64,
     rewritten_syscalls: u64,
     runtime_state: *mut ThreadRuntime,
+    pending_thread_clone: u64,
+    thread_clone_flags: u64,
+    thread_clone_ctid: u64,
+    pending_thread_start: u64,
+    virtual_pid: i32,
+    virtual_ppid: i32,
+    virtual_tid: i32,
+    pending_virtual_child: i32,
+    pending_clone_flags: u64,
 }
 
 static RUNTIME: LazyLock<RwLock<Option<Arc<Runtime>>>> = LazyLock::new(|| RwLock::new(None));
+static PENDING_THREAD_PARENTS: LazyLock<Mutex<HashMap<i32, (Tid, DetcoreThreadState)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 static IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static READY_IMAGE: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -513,36 +541,171 @@ pub extern "C" fn reverie_dbi_runtime_ready(image_generation: u64) -> i32 {
     )
 }
 
-/// Initializes native per-thread scratch state. Detcore state is initialized
-/// lazily when the syscall callback provides the actual guest tid and pid.
+/// Initializes native per-thread scratch state and registers the application
+/// thread with Detcore before it begins executing guest code.
+///
+/// Copied process runtimes retain scratch-only state until exec installs a new
+/// scheduler owned by that process.
+///
+/// Returns a positive retry status when a native child's parent snapshot is not
+/// published yet, so the client can retry outside DynamoRIO's thread-init path.
 ///
 /// # Safety
 ///
-/// The native client must pass a valid writable scratch pointer and callback
-/// pointers that remain valid for the application lifetime.
-// TODO-HUMAN-REVIEW(PR-744): Review compatibility with the expanded native thread-init ABI.
+/// The native client must pass a valid writable `scratch` pointer, a live
+/// DynamoRIO `context`, and callback pointers valid for this application.
+// TODO-HUMAN-REVIEW(PR-743): Review the native thread initialization ABI and state handoff.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
     scratch: *mut c_void,
-    _context: *mut c_void,
-    _tid: i32,
-    _pid: i32,
-    _branches: u64,
-    _defer_runtime: i32,
-    _invoke_syscall: SyscallInvoker,
-    _read_registers: RegisterReader,
+    context: *mut c_void,
+    tid: i32,
+    pid: i32,
+    branch_count: u64,
+    defer_runtime: i32,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
 ) -> i32 {
     unsafe {
         scratch
             .cast::<NativeThreadScratch>()
             .write(NativeThreadScratch {
-                branches: 0,
+                branches: branch_count,
                 observed_syscalls: 0,
                 rewritten_syscalls: 0,
                 runtime_state: std::ptr::null_mut(),
+                pending_thread_clone: 0,
+                thread_clone_flags: 0,
+                thread_clone_ctid: 0,
+                pending_thread_start: 0,
+                virtual_pid: 0,
+                virtual_ppid: 0,
+                virtual_tid: 0,
+                pending_virtual_child: 0,
+                pending_clone_flags: 0,
             });
     }
+    if defer_runtime != 0 {
+        return 0;
+    }
+
+    let runtime = current_runtime();
+    let tool = runtime
+        .tool
+        .get_or_init(|| Detcore::new(Pid::from_raw(pid), &runtime.config));
+    let parent = if tid == pid {
+        None
+    } else {
+        let parent = PENDING_THREAD_PARENTS
+            .lock()
+            .expect("pending DBI thread parent lock poisoned")
+            .remove(&tid);
+        let Some(parent) = parent else {
+            return 1;
+        };
+        Some(parent)
+    };
+    let parent_ref = parent
+        .as_ref()
+        .map(|(parent_tid, state)| (*parent_tid, state));
+    let tid = Pid::from_raw(tid);
+    let pid = Pid::from_raw(pid);
+    let mut thread = Box::new(ThreadRuntime {
+        tid,
+        state: tool.init_thread_state(Tid::from_raw(tid.into()), parent_ref),
+        initialized: false,
+        post_exec_pending: tid == pid,
+    });
+    if reverie_dbi::run_tool_thread_start(
+        tool,
+        context as usize,
+        tid,
+        pid,
+        branch_count,
+        &mut thread.state,
+        &runtime.global,
+        &runtime.config,
+        invoke_syscall,
+        read_registers,
+    )
+    .is_err()
+    {
+        return -1;
+    }
+    thread.initialized = true;
+    unsafe {
+        (*scratch.cast::<NativeThreadScratch>()).runtime_state = Box::into_raw(thread);
+    }
+    0
+}
+
+/// Registers a child thread created by a native clone syscall.
+///
+/// # Safety
+///
+/// `scratch` must name the initialized parent state, `context` must be its
+/// live DynamoRIO context, and callback pointers must remain valid.
+// TODO-HUMAN-REVIEW(PR-743): Review parent-side native child registration.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
+    scratch: *mut c_void,
+    context: *mut c_void,
+    parent_tid: i32,
+    pid: i32,
+    branch_count: u64,
+    child_tid: i32,
+    child_tid_addr: u64,
+    flags: u64,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+) -> i32 {
+    let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
+    if scratch.runtime_state.is_null() {
+        return -1;
+    }
+
+    let runtime = current_runtime();
+    let tool = runtime
+        .tool
+        .get()
+        .expect("Detcore DBI tool was initialized");
+    let parent = unsafe { &mut *scratch.runtime_state };
+    let flags = CloneFlags::from_bits_truncate(flags);
+    parent.state.clone_flags = Some(flags);
+    let parent_snapshot = parent.state.clone();
+    if PENDING_THREAD_PARENTS
+        .lock()
+        .expect("pending DBI thread parent lock poisoned")
+        .insert(child_tid, (Tid::from_raw(parent_tid), parent_snapshot))
+        .is_some()
+    {
+        parent.state.clone_flags = None;
+        return -1;
+    }
+
+    {
+        let mut guest = DbiGuest::new(
+            context as usize,
+            parent.tid,
+            Pid::from_raw(pid),
+            None,
+            branch_count,
+            &mut parent.state,
+            &runtime.global,
+            &runtime.config,
+            invoke_syscall,
+            read_registers,
+        );
+        run_ready(tool.register_external_child(
+            &mut guest,
+            Tid::from_raw(child_tid),
+            child_tid_addr as usize,
+            flags,
+        ));
+    }
+    parent.state.clone_flags = None;
     0
 }
 
@@ -655,28 +818,14 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         unsafe { emit(message.as_ptr(), message.len()) };
     }
     let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
-    let clone3_flags = if sysnum == libc::SYS_clone3
-        && raw_args[0] != 0
-        && raw_args[1] >= std::mem::size_of::<u64>() as u64
-    {
-        let mut flags = 0_u64;
-        let read = unsafe {
-            read_memory(
-                raw_args[0] as usize,
-                (&mut flags as *mut u64).cast(),
-                std::mem::size_of_val(&flags),
-            )
-        };
-        (read != 0).then_some(flags)
-    } else {
-        None
-    };
     if sysnum == libc::SYS_execveat {
         unsafe { result.write(-(Errno::ENOSYS.into_raw() as i64)) };
         TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
         return 1;
     }
-    if requires_native_process_lifecycle(sysnum, raw_args, clone3_flags) {
+    // clone(2) and clone3(2) return in both the parent and child. Injecting
+    // either from this callback makes the child return on the client stack.
+    if requires_native_lifecycle(sysnum) {
         if sysnum == libc::SYS_execve {
             READY_IMAGE.store(0, Ordering::Release);
             RUNTIME_PAUSE_REQUESTED.store(true, Ordering::Release);
@@ -872,15 +1021,16 @@ mod tests {
     }
 
     #[test]
-    fn only_dynamorio_managed_process_lifecycle_stays_native() {
-        let args = [0_u64; 6];
+    fn only_dynamorio_managed_lifecycle_stays_native() {
         for sysnum in [
             libc::SYS_fork,
             libc::SYS_vfork,
+            libc::SYS_clone,
+            libc::SYS_clone3,
             libc::SYS_rt_sigreturn,
             libc::SYS_execve,
         ] {
-            assert!(requires_native_process_lifecycle(sysnum, &args, None));
+            assert!(requires_native_lifecycle(sysnum));
         }
         for sysnum in [
             libc::SYS_execveat,
@@ -888,42 +1038,8 @@ mod tests {
             libc::SYS_waitid,
             libc::SYS_read,
         ] {
-            assert!(!requires_native_process_lifecycle(sysnum, &args, None));
+            assert!(!requires_native_lifecycle(sysnum));
         }
-    }
-
-    #[test]
-    fn clone_classification_separates_processes_from_threads() {
-        let mut args = [0_u64; 6];
-        args[0] = libc::SIGCHLD as u64;
-        assert!(requires_native_process_lifecycle(
-            libc::SYS_clone,
-            &args,
-            None
-        ));
-
-        args[0] = libc::CLONE_THREAD as u64;
-        assert!(!requires_native_process_lifecycle(
-            libc::SYS_clone,
-            &args,
-            None
-        ));
-
-        assert!(requires_native_process_lifecycle(
-            libc::SYS_clone3,
-            &args,
-            Some(libc::SIGCHLD as u64)
-        ));
-        assert!(!requires_native_process_lifecycle(
-            libc::SYS_clone3,
-            &args,
-            Some(libc::CLONE_THREAD as u64)
-        ));
-        assert!(!requires_native_process_lifecycle(
-            libc::SYS_clone3,
-            &args,
-            None
-        ));
     }
 
     #[test]
@@ -958,9 +1074,18 @@ mod tests {
 
         assert_eq!(status, 0);
         let scratch = unsafe { scratch.assume_init() };
-        assert_eq!(scratch.branches, 0);
+        assert_eq!(scratch.branches, 99);
         assert_eq!(scratch.observed_syscalls, 0);
         assert_eq!(scratch.rewritten_syscalls, 0);
         assert!(scratch.runtime_state.is_null());
+        assert_eq!(scratch.pending_thread_clone, 0);
+        assert_eq!(scratch.thread_clone_flags, 0);
+        assert_eq!(scratch.thread_clone_ctid, 0);
+        assert_eq!(scratch.pending_thread_start, 0);
+        assert_eq!(scratch.virtual_pid, 0);
+        assert_eq!(scratch.virtual_ppid, 0);
+        assert_eq!(scratch.virtual_tid, 0);
+        assert_eq!(scratch.pending_virtual_child, 0);
+        assert_eq!(scratch.pending_clone_flags, 0);
     }
 }

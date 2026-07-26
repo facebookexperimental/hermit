@@ -836,6 +836,11 @@ async fn run_kvm(
     })
 }
 
+// TODO-HUMAN-REVIEW(PR-743): Review bounded relaunch before DBI guest execution.
+fn dbi_client_thread_start_failed(status: &std::process::ExitStatus) -> bool {
+    status.code() == Some(reverie_dbi::CLIENT_THREAD_START_FAILURE_EXIT_CODE)
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-737): Review public DBI dispatch and child environment ownership.
 /// Dispatch a command onto the Detcore-linked reverie-dbi runtime.
@@ -884,9 +889,19 @@ async fn run_dbi(
     );
 
     if capture_output {
-        let output = runner
-            .output_with_environment(&guest, &environment)
-            .map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))?;
+        let launch = || {
+            runner
+                .output_with_environment(&guest, &environment)
+                .map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))
+        };
+        let mut output = launch()?;
+        if dbi_client_thread_start_failed(&output.status) {
+            tracing::warn!(
+                target: "hermit::dbi",
+                "DynamoRIO client thread failed before guest start; retrying once",
+            );
+            output = launch()?;
+        }
         return Ok(Output {
             status: output.status.into(),
             stdout: output.stdout,
@@ -894,9 +909,19 @@ async fn run_dbi(
         });
     }
 
-    let status = runner
-        .status_with_environment(&guest, &environment)
-        .map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))?;
+    let launch = || {
+        runner
+            .status_with_environment(&guest, &environment)
+            .map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))
+    };
+    let mut status = launch()?;
+    if dbi_client_thread_start_failed(&status) {
+        tracing::warn!(
+            target: "hermit::dbi",
+            "DynamoRIO client thread failed before guest start; retrying once",
+        );
+        status = launch()?;
+    }
     Ok(Output {
         status: status.into(),
         stdout: Vec::new(),
@@ -1562,6 +1587,19 @@ mod tests {
             error.to_string().contains("requires CLI preprocessing"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn dbi_retries_only_the_pre_guest_bootstrap_failure() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let failure = std::process::ExitStatus::from_raw(
+            reverie_dbi::CLIENT_THREAD_START_FAILURE_EXIT_CODE << 8,
+        );
+        assert!(super::dbi_client_thread_start_failed(&failure));
+        assert!(!super::dbi_client_thread_start_failed(
+            &std::process::ExitStatus::from_raw(1 << 8)
+        ));
     }
 
     #[test]

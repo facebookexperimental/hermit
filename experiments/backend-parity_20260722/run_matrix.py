@@ -200,12 +200,67 @@ def run_with_timeout(command: list[str]) -> subprocess.CompletedProcess[bytes] |
     try:
         stdout, stderr = process.communicate(timeout=30)
     except subprocess.TimeoutExpired:
+        print(f"timed-out command: {command!r}", file=sys.stderr)
+        for proc in sorted(
+            Path("/proc").glob("[0-9]*"), key=lambda path: int(path.name)
+        ):
+            try:
+                stat = (proc / "stat").read_text(encoding="utf-8").split()
+                if int(stat[4]) != process.pid:
+                    continue
+                command_line = (
+                    (proc / "cmdline")
+                    .read_bytes()
+                    .replace(b"\0", b" ")
+                    .decode(errors="replace")
+                )
+                wait_channel = (proc / "wchan").read_text(encoding="utf-8").strip()
+                print(
+                    f"timed-out process: pid={proc.name} state={stat[2]} "
+                    f"wchan={wait_channel} command={command_line}",
+                    file=sys.stderr,
+                )
+                for task in sorted((proc / "task").glob("[0-9]*")):
+                    try:
+                        task_stat = (task / "stat").read_text(encoding="utf-8").split()
+                        task_wait = (task / "wchan").read_text(encoding="utf-8").strip()
+                        task_syscall = (
+                            (task / "syscall").read_text(encoding="utf-8").strip()
+                        )
+                        print(
+                            f"timed-out thread: tid={task.name} state={task_stat[2]} "
+                            f"wchan={task_wait} syscall={task_syscall}",
+                            file=sys.stderr,
+                        )
+                    except (FileNotFoundError, PermissionError, ProcessLookupError):
+                        continue
+            except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
+                continue
+        try:
+            cgroup_path = next(
+                line.partition("::")[2]
+                for line in Path("/proc/self/cgroup").read_text().splitlines()
+                if line.startswith("0::")
+            )
+            cgroup_dir = Path("/sys/fs/cgroup") / cgroup_path.lstrip("/")
+            for name in ("pids.current", "pids.max", "pids.events"):
+                value = (cgroup_dir / name).read_text(encoding="utf-8").strip()
+                print(f"timed-out cgroup: {name}={value}", file=sys.stderr)
+        except (FileNotFoundError, PermissionError, StopIteration):
+            pass
         os.killpg(process.pid, signal.SIGTERM)
         try:
-            process.communicate(timeout=2)
+            stdout, stderr = process.communicate(timeout=2)
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
-            process.communicate()
+            stdout, stderr = process.communicate()
+        if stdout:
+            print("timed-out guest stdout:", file=sys.stderr)
+            sys.stderr.buffer.write(stdout[-8192:])
+        if stderr:
+            print("timed-out hermit stderr:", file=sys.stderr)
+            sys.stderr.buffer.write(stderr[-8192:])
+        sys.stderr.flush()
         return None
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
