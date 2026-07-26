@@ -19,19 +19,27 @@ use crate::tool_global::thread_observe_time;
 use crate::tool_local::ResourceLimit;
 
 const MB: u64 = 1024 * 1024;
+// Linux exposes USER_HZ, not the kernel's configurable scheduler HZ, through times(2).
 const CLOCK_TICKS_PER_SECOND: u64 = 100;
 const NANOS_PER_CLOCK_TICK: u64 = 1_000_000_000 / CLOCK_TICKS_PER_SECOND;
+
+fn clock_ticks(duration: crate::types::LogicalTime) -> u64 {
+    duration.as_nanos() / NANOS_PER_CLOCK_TICK
+}
+
+fn clock_t_from_ticks(ticks: u64) -> libc::clock_t {
+    ticks as libc::clock_t
+}
 
 fn logical_clock_ticks(
     now: crate::types::LogicalTime,
     boot: crate::types::LogicalTime,
     uptime_offset_seconds: u64,
 ) -> libc::clock_t {
-    let elapsed_ticks = (now - boot).as_nanos() / NANOS_PER_CLOCK_TICK;
     let ticks = uptime_offset_seconds
-        .saturating_mul(CLOCK_TICKS_PER_SECOND)
-        .saturating_add(elapsed_ticks);
-    libc::clock_t::try_from(ticks).unwrap_or(libc::clock_t::MAX)
+        .wrapping_mul(CLOCK_TICKS_PER_SECOND)
+        .wrapping_add(clock_ticks(now - boot));
+    clock_t_from_ticks(ticks)
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -210,12 +218,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#783): Review logical tick and zero-CPU accounting semantics.
+    // TODO-HUMAN-REVIEW(#797): Review logical elapsed and process CPU accounting semantics.
     /// Return deterministic elapsed ticks and process CPU accounting for `times(2)`.
     ///
     /// Linux's host boot epoch and scheduler CPU counters are nondeterministic. Detcore instead
-    /// derives the return value from its logical clock and reports zero CPU ticks, matching the
-    /// policy used by `getrusage` until logical per-process CPU accounting is modeled.
+    /// derives the return value from its global logical clock. Per-process logical CPU accounting
+    /// aggregates user instruction and syscall-system time across threads; forked processes start
+    /// fresh counters and contribute their totals to the parent's child counters when reaped.
     pub async fn handle_times<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -224,13 +233,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         let now = thread_observe_time(guest).await;
         let boot = crate::types::DetTime::new(&self.cfg).as_nanos();
         let ticks = logical_clock_ticks(now, boot, self.cfg.sysinfo_uptime_offset);
+        let cpu = guest.thread_state_mut().process_cpu_time();
 
         if let Some(address) = call.buf() {
             let usage = libc::tms {
-                tms_utime: 0,
-                tms_stime: 0,
-                tms_cutime: 0,
-                tms_cstime: 0,
+                tms_utime: clock_t_from_ticks(clock_ticks(cpu.user)),
+                tms_stime: clock_t_from_ticks(clock_ticks(cpu.system)),
+                tms_cutime: clock_t_from_ticks(clock_ticks(cpu.children_user)),
+                tms_cstime: clock_t_from_ticks(clock_ticks(cpu.children_system)),
             };
             guest.memory().write_value(address, &usage)?;
         }
@@ -322,9 +332,17 @@ mod tests {
     }
 
     #[test]
-    fn logical_clock_ticks_saturate_at_clock_t_max() {
-        let ticks = logical_clock_ticks(LogicalTime::MAX, LogicalTime::ZERO, u64::MAX);
+    fn logical_cpu_ticks_exclude_boot_epoch() {
+        assert_eq!(clock_ticks(LogicalTime::from_millis(25)), 2);
+    }
 
-        assert_eq!(ticks, libc::clock_t::MAX);
+    #[test]
+    fn logical_clock_ticks_wrap_configured_offset_like_linux_clock_t() {
+        let boot = LogicalTime::from_secs(1_000);
+        let before = logical_clock_ticks(boot, boot, u64::MAX);
+        let after = logical_clock_ticks(boot + LogicalTime::from_millis(10), boot, u64::MAX);
+
+        assert_eq!(before, -100);
+        assert_eq!(after, -99);
     }
 }

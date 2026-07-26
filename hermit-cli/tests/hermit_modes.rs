@@ -477,7 +477,7 @@ fn resource_syscalls_are_deterministic_across_five_runs() {
             "rusage thread maxrss",
             "rusage children zero",
             "sysinfo",
-            "times logical ticks and zero CPU accounting",
+            "times logical process and child CPU ticks",
         ] {
             assert!(
                 stdout.contains(expected),

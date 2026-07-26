@@ -50,6 +50,7 @@ use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
 use crate::tool_local::PendingVfork;
+use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 
@@ -77,6 +78,14 @@ union WaitidSiginfoFields {
 struct WaitidSiginfoHead {
     _base: [libc::c_int; 3],
     fields: WaitidSiginfoFields,
+}
+
+fn wait_status_is_termination(status: libc::c_int) -> bool {
+    libc::WIFEXITED(status) || libc::WIFSIGNALED(status)
+}
+
+fn waitid_code_is_termination(code: libc::c_int) -> bool {
+    matches!(code, libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED)
 }
 
 fn canonicalize_waitid_siginfo(info: &mut libc::siginfo_t) {
@@ -683,6 +692,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             // so it is not routed through the record/replay subtool.
             retry_nonblocking_syscall(guest, call, rsrc, None).await?
         };
+        let consumed_termination = if value <= 0 {
+            false
+        } else if let Some(status) = call.wstatus() {
+            wait_status_is_termination(guest.memory().read_value(status)?)
+        } else {
+            guest
+                .thread_state()
+                .has_exited_child_process_cpu_time(DetPid::from_raw(value as i32))
+        };
+        if consumed_termination {
+            guest
+                .thread_state_mut()
+                .reap_child_process_cpu_time(DetPid::from_raw(value as i32));
+        }
         if value > 0
             && let Some(rusage) = call.rusage()
         {
@@ -776,9 +799,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut info_value: libc::siginfo_t = guest.memory().read_value(info)?;
             // SAFETY: waitid writes either zeroed output or the SIGCHLD
             // siginfo_t variant, for which libc exposes si_pid.
-            if unsafe { info_value.si_pid() } != 0 {
+            let child_pid = unsafe { info_value.si_pid() };
+            if child_pid != 0 {
                 canonicalize_waitid_siginfo(&mut info_value);
                 guest.memory().write_value(info, &info_value)?;
+                if call.options() & libc::WNOWAIT == 0
+                    && waitid_code_is_termination(info_value.si_code)
+                {
+                    guest
+                        .thread_state_mut()
+                        .reap_child_process_cpu_time(DetPid::from_raw(child_pid));
+                }
                 if let Some(rusage) = call.rusage() {
                     // Host CPU and scheduling counters are not deterministic.
                     let usage: libc::rusage = unsafe { std::mem::zeroed() };
@@ -806,6 +837,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     if child_pid != 0 {
                         canonicalize_waitid_siginfo(&mut info_value);
                         guest.memory().write_value(info, &info_value)?;
+                        if call.options() & libc::WNOWAIT == 0
+                            && waitid_code_is_termination(info_value.si_code)
+                        {
+                            guest
+                                .thread_state_mut()
+                                .reap_child_process_cpu_time(DetPid::from_raw(child_pid));
+                        }
                         if let Some(rusage) = call.rusage() {
                             // Host CPU and scheduling counters are not deterministic.
                             let usage: libc::rusage = unsafe { std::mem::zeroed() };
@@ -1028,6 +1066,21 @@ mod tests {
         assert_eq!(unsafe { info.si_status() }, 7);
         assert_eq!(unsafe { info.si_utime() }, 0);
         assert_eq!(unsafe { info.si_stime() }, 0);
+    }
+
+    #[test]
+    fn wait_status_rollup_only_accepts_process_termination() {
+        assert!(wait_status_is_termination(0));
+        assert!(wait_status_is_termination(libc::SIGTERM));
+        assert!(!wait_status_is_termination((libc::SIGSTOP << 8) | 0x7f));
+        assert!(!wait_status_is_termination(0xffff));
+
+        assert!(waitid_code_is_termination(libc::CLD_EXITED));
+        assert!(waitid_code_is_termination(libc::CLD_KILLED));
+        assert!(waitid_code_is_termination(libc::CLD_DUMPED));
+        assert!(!waitid_code_is_termination(libc::CLD_STOPPED));
+        assert!(!waitid_code_is_termination(libc::CLD_CONTINUED));
+        assert!(!waitid_code_is_termination(libc::CLD_TRAPPED));
     }
 
     #[test]

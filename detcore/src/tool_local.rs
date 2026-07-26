@@ -8,6 +8,7 @@
 
 //! The process-local portion of the Detcore Reverie-tool.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::os::fd::BorrowedFd;
@@ -806,6 +807,54 @@ pub struct PendingVfork {
     pub child_priority_entropy: Option<u64>,
 }
 
+// TODO-HUMAN-REVIEW(#797): Review process-wide logical CPU aggregation.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+pub(crate) struct ProcessCpuSnapshot {
+    pub user: LogicalTime,
+    pub system: LogicalTime,
+    pub children_user: LogicalTime,
+    pub children_system: LogicalTime,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub(crate) struct ProcessCpuTime {
+    snapshot: ProcessCpuSnapshot,
+    exited_children: BTreeMap<DetPid, ProcessCpuSnapshot>,
+}
+
+impl ProcessCpuTime {
+    fn add_thread_delta(&mut self, user: LogicalTime, system: LogicalTime) {
+        self.snapshot.user = self.snapshot.user + user;
+        self.snapshot.system = self.snapshot.system + system;
+    }
+
+    fn record_exited_child(&mut self, pid: DetPid, child: ProcessCpuSnapshot) {
+        self.exited_children
+            .entry(pid)
+            .and_modify(|previous| {
+                previous.user = previous.user.max(child.user);
+                previous.system = previous.system.max(child.system);
+                previous.children_user = previous.children_user.max(child.children_user);
+                previous.children_system = previous.children_system.max(child.children_system);
+            })
+            .or_insert(child);
+    }
+
+    fn reap_child(&mut self, pid: DetPid) {
+        let Some(child) = self.exited_children.remove(&pid) else {
+            return;
+        };
+        self.snapshot.children_user =
+            self.snapshot.children_user + child.user + child.children_user;
+        self.snapshot.children_system =
+            self.snapshot.children_system + child.system + child.children_system;
+    }
+
+    fn prepare_child(&mut self, pid: DetPid) {
+        self.exited_children.remove(&pid);
+    }
+}
+
 /// The Detcore per-thread state.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ThreadState<T> {
@@ -856,6 +905,16 @@ pub struct ThreadState<T> {
 
     /// Resource limits shared by threads and copied when a new process forks.
     pub(crate) resource_limits: Arc<Mutex<ResourceLimits>>,
+
+    /// Logical CPU accounting shared by all threads in this process.
+    pub(crate) process_cpu_time: Arc<Mutex<ProcessCpuTime>>,
+
+    /// Parent process accounting notified when this process leader exits.
+    pub(crate) parent_process_cpu_time: Option<Arc<Mutex<ProcessCpuTime>>>,
+
+    /// Per-thread checkpoints used to add only new work to the process totals.
+    pub(crate) last_accounted_user_time: LogicalTime,
+    pub(crate) last_accounted_system_time: LogicalTime,
 
     /// pseudo random number state
     pub prng: Pcg64Mcg,
@@ -914,6 +973,7 @@ impl<T> std::fmt::Debug for ThreadState<T> {
             .field("file_metadata", &self.file_metadata)
             .field("posix_timers", &self.posix_timers)
             .field("resource_limits", &self.resource_limits)
+            .field("process_cpu_time", &self.process_cpu_time)
             .field("prng", &self.prng)
             .field("chaos_prng", &self.chaos_prng)
             .field("thread_logical_time", &self.thread_logical_time)
@@ -965,6 +1025,66 @@ fn from_atflags(flags: AtFlags) -> OFlag {
 }
 
 impl<T> ThreadState<T> {
+    pub(crate) fn account_process_cpu_time(&mut self) {
+        let user = self.thread_logical_time.user_cpu_time();
+        let system = self.thread_logical_time.system_cpu_time();
+        let user_delta = user - self.last_accounted_user_time;
+        let system_delta = system - self.last_accounted_system_time;
+        self.process_cpu_time
+            .lock()
+            .expect("process CPU time mutex poisoned")
+            .add_thread_delta(user_delta, system_delta);
+        self.last_accounted_user_time = user;
+        self.last_accounted_system_time = system;
+    }
+
+    pub(crate) fn process_cpu_time(&mut self) -> ProcessCpuSnapshot {
+        self.account_process_cpu_time();
+        self.process_cpu_time
+            .lock()
+            .expect("process CPU time mutex poisoned")
+            .snapshot
+    }
+
+    pub(crate) fn record_exited_child_process_cpu_time(&mut self, pid: DetPid) {
+        self.account_process_cpu_time();
+        let Some(parent) = &self.parent_process_cpu_time else {
+            return;
+        };
+        let child = self
+            .process_cpu_time
+            .lock()
+            .expect("process CPU time mutex poisoned")
+            .snapshot;
+        parent
+            .lock()
+            .expect("parent process CPU time mutex poisoned")
+            .record_exited_child(pid, child);
+    }
+
+    pub(crate) fn has_exited_child_process_cpu_time(&self, pid: DetPid) -> bool {
+        self.process_cpu_time
+            .lock()
+            .expect("process CPU time mutex poisoned")
+            .exited_children
+            .contains_key(&pid)
+    }
+
+    pub(crate) fn reap_child_process_cpu_time(&mut self, pid: DetPid) {
+        self.account_process_cpu_time();
+        self.process_cpu_time
+            .lock()
+            .expect("process CPU time mutex poisoned")
+            .reap_child(pid);
+    }
+
+    pub(crate) fn prepare_child_process_cpu_time(&self, pid: DetPid) {
+        self.process_cpu_time
+            .lock()
+            .expect("process CPU time mutex poisoned")
+            .prepare_child(pid);
+    }
+
     /// Create a fresh new thread state from nothing.  In practice this is only used for the thread
     /// state of the root thread of the container.
     pub fn new(pid: DetPid, cfg: &Config, record_or_replay: T) -> Self {
@@ -976,6 +1096,9 @@ impl<T> ThreadState<T> {
             "CHAOSRAND: seeding chaos scheduler with seed {}",
             cfg.sched_seed()
         );
+        let thread_logical_time = DetTime::new(cfg);
+        let last_accounted_user_time = thread_logical_time.user_cpu_time();
+        let last_accounted_system_time = thread_logical_time.system_cpu_time();
         ThreadState {
             dettid: pid,
             detpid: None, // Initialized later.
@@ -988,12 +1111,16 @@ impl<T> ThreadState<T> {
             )),
             posix_timers: Arc::new(Mutex::new(PosixTimers::default())),
             resource_limits: Arc::new(Mutex::new(ResourceLimits::default())),
+            process_cpu_time: Arc::new(Mutex::new(ProcessCpuTime::default())),
+            parent_process_cpu_time: None,
+            last_accounted_user_time,
+            last_accounted_system_time,
             clone_flags: None,
             pending_vfork: None,
             // For the root thread, we initialize from the seed in the config:
             prng: Pcg64Mcg::seed_from_u64(cfg.rng_seed()),
             chaos_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed()),
-            thread_logical_time: DetTime::new(cfg),
+            thread_logical_time,
             committed_clock_value: 0,
             end_of_timeslice: None, // Temporary/bogus.
             max_timeslice_end: None,
@@ -1345,6 +1472,62 @@ mod timeslice_tests {
     use std::num::NonZeroU64;
 
     use super::*;
+
+    fn cpu_snapshot(
+        user: u64,
+        system: u64,
+        children_user: u64,
+        children_system: u64,
+    ) -> ProcessCpuSnapshot {
+        ProcessCpuSnapshot {
+            user: LogicalTime::from_nanos(user),
+            system: LogicalTime::from_nanos(system),
+            children_user: LogicalTime::from_nanos(children_user),
+            children_system: LogicalTime::from_nanos(children_system),
+        }
+    }
+
+    #[test]
+    fn child_cpu_time_is_hidden_until_reap() {
+        let pid = DetPid::from_raw(2);
+        let mut parent = ProcessCpuTime::default();
+        parent.record_exited_child(pid, cpu_snapshot(10, 20, 3, 4));
+
+        assert_eq!(parent.snapshot.children_user, LogicalTime::ZERO);
+        assert_eq!(parent.snapshot.children_system, LogicalTime::ZERO);
+
+        parent.reap_child(pid);
+        assert_eq!(parent.snapshot.children_user, LogicalTime::from_nanos(13));
+        assert_eq!(parent.snapshot.children_system, LogicalTime::from_nanos(24));
+    }
+
+    #[test]
+    fn reaping_nonexited_child_does_not_change_accounting() {
+        let pid = DetPid::from_raw(2);
+        let mut parent = ProcessCpuTime::default();
+
+        parent.reap_child(pid);
+        assert_eq!(parent.snapshot.children_user, LogicalTime::ZERO);
+        assert_eq!(parent.snapshot.children_system, LogicalTime::ZERO);
+    }
+
+    #[test]
+    fn child_cpu_time_uses_final_thread_snapshot_and_drops_reaped_state() {
+        let pid = DetPid::from_raw(2);
+        let mut parent = ProcessCpuTime::default();
+
+        parent.record_exited_child(pid, cpu_snapshot(10, 20, 3, 4));
+        parent.record_exited_child(pid, cpu_snapshot(12, 25, 4, 5));
+
+        parent.reap_child(pid);
+        assert_eq!(parent.snapshot.children_user, LogicalTime::from_nanos(16));
+        assert_eq!(parent.snapshot.children_system, LogicalTime::from_nanos(30));
+        assert!(parent.exited_children.is_empty());
+
+        parent.reap_child(pid);
+        assert_eq!(parent.snapshot.children_user, LogicalTime::from_nanos(16));
+        assert_eq!(parent.snapshot.children_system, LogicalTime::from_nanos(30));
+    }
 
     fn nz(value: u64) -> Option<NonZeroU64> {
         NonZeroU64::new(value)

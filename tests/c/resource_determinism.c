@@ -359,14 +359,6 @@ static void check_sysinfo(void) {
       info.mem_unit);
 }
 
-static void require_zero_tms(const struct tms* usage, const char* operation) {
-  if (usage->tms_utime != 0 || usage->tms_stime != 0 ||
-      usage->tms_cutime != 0 || usage->tms_cstime != 0) {
-    fprintf(stderr, "%s returned nonzero CPU accounting\n", operation);
-    exit(1);
-  }
-}
-
 static void check_times(void) {
   struct tms first_usage;
   struct tms second_usage;
@@ -377,16 +369,62 @@ static void check_times(void) {
   if (first == (clock_t)-1) {
     fail("times first");
   }
-  require_zero_tms(&first_usage, "times first");
 
-  usleep(25000);
+  // Syscall-heavy work advances logical execution time even on no-PMU hosts.
+  for (int i = 0; i < 2048; ++i) {
+    (void)syscall(SYS_getpid);
+  }
   clock_t second = times(&second_usage);
   if (second == (clock_t)-1) {
     fail("times second");
   }
-  require_zero_tms(&second_usage, "times second");
   if (second <= first) {
-    fprintf(stderr, "times did not advance across logical sleep\n");
+    fprintf(stderr, "times elapsed clock did not advance across logical work\n");
+    exit(1);
+  }
+  if (second_usage.tms_stime <= first_usage.tms_stime) {
+    fprintf(stderr, "times system CPU clock did not advance across syscall work\n");
+    exit(1);
+  }
+
+  clock_t child_system_before = second_usage.tms_cstime;
+  pid_t child = fork();
+  if (child < 0) {
+    fail("times fork");
+  }
+  if (child == 0) {
+    for (int i = 0; i < 2048; ++i) {
+      (void)syscall(SYS_getpid);
+    }
+    _exit(0);
+  }
+
+  siginfo_t child_info;
+  memset(&child_info, 0, sizeof(child_info));
+  if (waitid(P_PID, child, &child_info, WEXITED | WNOWAIT) != 0) {
+    fail("times waitid WNOWAIT");
+  }
+  if (child_info.si_pid != child) {
+    fprintf(stderr, "times waitid WNOWAIT returned the wrong child\n");
+    exit(1);
+  }
+  struct tms before_reap;
+  if (times(&before_reap) == (clock_t)-1) {
+    fail("times before child reap");
+  }
+  if (before_reap.tms_cstime != child_system_before) {
+    fprintf(stderr, "times child CPU clock advanced before reap\n");
+    exit(1);
+  }
+  if (waitpid(child, NULL, WUNTRACED) != child) {
+    fail("times waitpid");
+  }
+  struct tms after_child;
+  if (times(&after_child) == (clock_t)-1) {
+    fail("times after child");
+  }
+  if (after_child.tms_cstime <= child_system_before) {
+    fprintf(stderr, "times child system CPU clock did not include reaped child\n");
     exit(1);
   }
 
@@ -395,7 +433,13 @@ static void check_times(void) {
     fprintf(stderr, "times(NULL) did not preserve elapsed ticks\n");
     exit(1);
   }
-  puts("times logical ticks and zero CPU accounting");
+
+  errno = 0;
+  if (syscall(SYS_times, (void*)1) != -1 || errno != EFAULT) {
+    fprintf(stderr, "invalid times destination did not return EFAULT\n");
+    exit(1);
+  }
+  puts("times logical process and child CPU ticks");
 }
 
 int main(void) {

@@ -137,6 +137,7 @@ pub fn is_unsupported_syscall(sysno: Sysno) -> bool {
 }
 
 use tool_local::PosixTimers;
+use tool_local::ProcessCpuTime;
 pub use tool_local::ThreadState;
 pub use tool_local::ThreadStats;
 pub use tool_local::thread_rng_from_parent;
@@ -324,6 +325,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             if self.cfg.use_rcb_time() {
                 thread_state.thread_logical_time.add_rcbs(delta_rcbs);
             }
+            thread_state.account_process_cpu_time();
             thread_state.committed_clock_value = clock_value;
 
             if thread_state.end_of_timeslice.is_some() {
@@ -1007,6 +1009,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // If we had mutable access to the parent state, we could update it here, but
                 // instead we leave that to the clone/fork handling.
                 let (child_pedigree, _parent) = pts.1.pedigree.fork();
+                let child_logical_time = pts.1.thread_logical_time.clone();
+                let last_accounted_user_time = child_logical_time.user_cpu_time();
+                let last_accounted_system_time = child_logical_time.system_cpu_time();
+                if !clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                    pts.1.prepare_child_process_cpu_time(dettid);
+                }
 
                 ThreadState {
                     dettid,
@@ -1064,6 +1072,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                                 .clone(),
                         ))
                     },
+                    process_cpu_time: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                        Arc::clone(&pts.1.process_cpu_time)
+                    } else {
+                        Arc::new(Mutex::new(ProcessCpuTime::default()))
+                    },
+                    parent_process_cpu_time: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                        pts.1.parent_process_cpu_time.clone()
+                    } else {
+                        Some(Arc::clone(&pts.1.process_cpu_time))
+                    },
+                    last_accounted_user_time,
+                    last_accounted_system_time,
                     clone_flags: None,
                     pending_vfork: pts.1.pending_vfork.clone(),
 
@@ -1074,7 +1094,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // For comparing progress to other threads, it is important that our
                     // child thread start at a sensible place, rather than starting back
                     // at zero:
-                    thread_logical_time: pts.1.thread_logical_time.clone(),
+                    thread_logical_time: child_logical_time,
                     // A new thread gets a new clock, so we've committed 0 ticks
                     committed_clock_value: 0,
 
@@ -1294,6 +1314,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             thread_state
                 .thread_logical_time
                 .add_syscall_with_cost(syscall_cost_ns);
+            thread_state.account_process_cpu_time();
             thread_state.stats.syscall_count
         };
 
@@ -1787,7 +1808,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // full slice.
         let now = thread_state.thread_logical_time.as_nanos();
         thread_state.stats.close_final_timeslice(now);
+        // Reverie invokes this callback while the backend still owns the exit
+        // event, before the guest parent can consume it with wait. Ptrace also
+        // guarantees that the process leader exits after the other threads, so
+        // the final published aggregate is complete when wait returns.
         let detpid = thread_state.detpid.expect("Missing DetPid");
+        if dettid == detpid {
+            thread_state.record_exited_child_process_cpu_time(detpid);
+        } else {
+            thread_state.account_process_cpu_time();
+        }
         let mm_id = thread_state.mm_id;
         deregister_thread(
             dettid,
