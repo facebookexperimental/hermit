@@ -1,3 +1,6 @@
 [submodule "third-party/rr"]
 	path = third-party/rr
 	url = https://github.com/rr-debugger/rr
+[submodule "agent-utils"]
+	path = agent-utils
+	url = https://github.com/rrnewton/agent-utils.git

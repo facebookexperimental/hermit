@@ -1,0 +1,84 @@
+name: CI (DAG runner, manual)
+
+# Manual entrypoint for comparing or debugging the hosted and hardware DAGs.
+# The required GitHub-hosted lane uses the same hosted DAG directly from
+# ci-hosted.yml; this workflow adds no per-PR load.
+on:
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: Which validation lane to run as a DAG
+        required: true
+        type: choice
+        default: hosted
+        options: [hosted, hardware]
+      max_mem:
+        description: RAM budget for memory-aware -j (e.g. 32G); blank = one CPU per job
+        required: false
+        type: string
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+  NEXTEST_VERSION: "0.9.100"
+  RUSTFLAGS: -D warnings -C link-arg=-llzma
+  RUSTDOCFLAGS: -D warnings
+  DETCORE_TEST_RUST_LOG: "off"
+  STRICT_COMPAT_HERMIT_BIN: ${{ github.workspace }}/target/debug/hermit
+
+jobs:
+  dag-hosted:
+    name: DAG lane (GitHub-hosted)
+    if: ${{ inputs.lane == 'hosted' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize safe-ci-dag-runner
+        run: git submodule update --init agent-utils
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq less libunwind-dev liblzma-dev libxml2-utils lsof lua5.4 m4 make ncal netcat-openbsd nginx nodejs openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 tcl time unzip util-linux vim-common wget xz-utils zip zlib1g-dev zstd
+      - name: Enable unprivileged user and mount namespaces
+        run: |
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked --version "$NEXTEST_VERSION"
+      - name: Rust components
+        run: rustup component add clippy rustfmt
+      - name: Run hosted lane as a DAG
+        run: ci/run-dag.sh hosted ${{ inputs.max_mem != '' && format('--max-mem {0}', inputs.max_mem) || '' }} -v
+
+  dag-hardware:
+    name: DAG lane (self-hosted)
+    if: ${{ inputs.lane == 'hardware' && github.repository == 'rrnewton/hermit' }}
+    runs-on: [self-hosted, Linux, X64, hermit, pmu, pmu-serial]
+    timeout-minutes: 240
+    env:
+      DETCORE_TEST_RUST_LOG: "off"
+    steps:
+      - name: Remove stale checkout locks
+        run: |
+          if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+            find "$GITHUB_WORKSPACE/.git" -type f -name "*.lock" -print -delete
+          fi
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      # PMU access is a single serialized host resource; hold the same lock the
+      # validate.sh self-hosted lane uses. The DAG's own {"pmu": 1} cap keeps
+      # gates one-at-a-time within this run.
+      - name: Run hardware lane as a DAG
+        run: flock /tmp/hermit-self-hosted-pmu.lock ci/run-dag.sh hardware -j 2 -v

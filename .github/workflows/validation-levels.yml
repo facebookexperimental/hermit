@@ -1,8 +1,6 @@
 name: Validation Levels
 
 on:
-  pull_request:
-    branches: [main]
   merge_group:
     types: [checks_requested]
   schedule:
@@ -32,11 +30,10 @@ env:
 
 jobs:
   quick:
-    name: Portable validation (PR)
+    name: Portable validation (manual)
     if: >-
       ${{
-        github.event_name == 'pull_request' ||
-        (github.event_name == 'workflow_dispatch' && inputs.level == 'quick')
+        github.event_name == 'workflow_dispatch' && inputs.level == 'quick'
       }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
@@ -122,8 +119,16 @@ jobs:
           command -v go ruby node javac java ocamlopt python3 redis-server redis-cli sqlite3 gdb lldb
           python3 -c 'import test.support'
           unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
-      - name: Self-hosted PMU and CPUID test lane
-        run: flock /tmp/hermit-self-hosted-pmu.lock ./validate.sh --hardware-only --no-label-pr
+      - name: Self-hosted PMU and CPUID test DAG
+        run: env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner flock /tmp/hermit-self-hosted-pmu.lock ci/run-dag.sh hardware -j 2 --perf-dir "$RUNNER_TEMP/hermit-hardware-dag-perf" -v
+      - name: Upload hardware DAG performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-levels-hardware-dag-perf
+          path: ${{ runner.temp }}/hermit-hardware-dag-perf
+          if-no-files-found: warn
+          retention-days: 14
       - name: Upload working-envelope JSON
         if: always()
         uses: actions/upload-artifact@v4

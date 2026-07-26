@@ -1,0 +1,247 @@
+{
+  "resource_caps": {"hermit_guest": 1},
+  "mem_cap_factor": 1.25,
+  "mem_cap_floor_bytes": 8589934592,
+  "outer_mem_safety_factor": 1.0,
+  "default_step_timeout": 600,
+  "steps": [
+    {
+      "group": "check", "job": "backend_abstraction",
+      "desc": "Detcore backend-abstraction check",
+      "cmd": "./scripts/check-detcore-backend-abstraction.sh",
+      "timeout": 120,
+      "hint": {"est_duration_s": 20, "rss_baseline_bytes": 268435456,
+               "hard_mem_max_bytes": 1073741824, "classification": "light"}
+    },
+    {
+      "group": "setup", "job": "nextest",
+      "desc": "cargo-nextest available",
+      "cmd": "cargo nextest show-config version >/dev/null 2>&1 || if command -v with-proxy >/dev/null 2>&1; then with-proxy cargo install cargo-nextest --locked --version 0.9.100; else cargo install cargo-nextest --locked --version 0.9.100; fi",
+      "timeout": 600,
+      "hint": {"est_duration_s": 30, "rss_baseline_bytes": 536870912,
+               "hard_mem_max_bytes": 2147483648, "classification": "light"}
+    },
+    {
+      "group": "build", "job": "workspace",
+      "desc": "Build workspace (cargo build --workspace)",
+      "cmd": "cargo build --workspace",
+      "timeout": 1200,
+      "hint": {"est_duration_s": 360, "rss_baseline_bytes": 5368709120,
+               "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
+    },
+    {
+      "group": "lint", "job": "rustfmt",
+      "desc": "Rustfmt (cargo fmt --all -- --check)",
+      "cmd": "cargo fmt --all -- --check",
+      "timeout": 120,
+      "hint": {"est_duration_s": 20, "rss_baseline_bytes": 268435456,
+               "hard_mem_max_bytes": 1073741824, "classification": "light"}
+    },
+    {
+      "group": "lint", "job": "clippy",
+      "desc": "Clippy (cargo clippy --workspace --all-targets -D warnings)",
+      "cmd": "cargo clippy --workspace --all-targets -- -D warnings",
+      "deps": ["build.workspace"],
+      "timeout": 1200,
+      "hint": {"est_duration_s": 300, "rss_baseline_bytes": 6442450944,
+               "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
+    },
+    {
+      "group": "doc", "job": "doctests",
+      "desc": "Test workspace documentation (cargo test --workspace --doc)",
+      "cmd": "cargo test --workspace --doc",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"est_duration_s": 180, "rss_baseline_bytes": 3221225472,
+               "hard_mem_max_bytes": 5368709120, "classification": "cpu-bound"}
+    },
+    {
+      "group": "doc", "job": "rustdoc",
+      "desc": "Documentation (cargo doc --workspace --no-deps)",
+      "cmd": "cargo doc --workspace --no-deps",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"est_duration_s": 150, "rss_baseline_bytes": 3221225472,
+               "hard_mem_max_bytes": 5368709120, "classification": "cpu-bound"}
+    },
+    {
+      "group": "test", "job": "regular_crates",
+      "desc": "Test regular workspace crates (nextest, excludes detcore/hermit/flaky)",
+      "cmd": "cargo nextest run ${CI:+--profile ci} --workspace --exclude detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests",
+      "deps": ["build.workspace", "setup.nextest"],
+      "timeout": 900,
+      "hint": {"est_duration_s": 200, "rss_baseline_bytes": 4294967296,
+               "hard_mem_max_bytes": 6442450944, "classification": "cpu-bound"}
+    },
+    {
+      "group": "build", "job": "flaky_harnesses",
+      "desc": "Compile flaky guest test harnesses (--no-run)",
+      "cmd": "cargo test -p hermetic_infra_hermit_flaky-tests --no-run",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"est_duration_s": 120, "rss_baseline_bytes": 3221225472,
+               "hard_mem_max_bytes": 5368709120, "classification": "cpu-bound"}
+    },
+    {
+      "group": "test", "job": "hermit_unit",
+      "desc": "Test Hermit unit and binary targets (-p hermit --lib --bins)",
+      "cmd": "cargo test -p hermit --lib --bins",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"est_duration_s": 120,
+               "rss_baseline_bytes": 3221225472, "hard_mem_max_bytes": 5368709120,
+               "classification": "cpu-bound"}
+    },
+    {
+      "group": "test", "job": "detcore_unit",
+      "desc": "Test Detcore unit and binary targets (-p detcore --lib --bins)",
+      "cmd": "cargo test -p detcore --lib --bins",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"est_duration_s": 120,
+               "rss_baseline_bytes": 3221225472, "hard_mem_max_bytes": 5368709120,
+               "classification": "cpu-bound"}
+    },
+    {
+      "group": "test", "job": "detcore_misc",
+      "desc": "Detcore non-CPUID miscellaneous cases (tests_misc, skips RDRAND host probes)",
+      "cmd": "cargo test -p detcore --test tests_misc -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --skip ordinary_clone_child_starts_before_parent_resumes --skip ordinary_clone_parent_mode_can_resume_before_child --skip network_syscalls_are_deterministic_across_five_runs --test-threads=1",
+      "deps": ["build.workspace"],
+      "timeout": 600,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
+               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "classification": "cpu-bound"}
+    },
+    {
+      "group": "test", "job": "detcore_parallel",
+      "desc": "Detcore non-PMU parallel cases (tests_parallelism, --skip detcore, -j4)",
+      "cmd": "cargo test -p detcore --test tests_parallelism -- --skip detcore --test-threads=4",
+      "deps": ["build.workspace"],
+      "timeout": 600,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "classification": "cpu-bound"}
+    },
+    {
+      "group": "test", "job": "hermit_integration",
+      "desc": "Portable Hermit integration targets (serial, isolated per target)",
+      "cmd": "set -e; for t in chaos_sched_yield_progress chaos_stress_pmu_detection clock_determinism epoll_determinism fp_reduction_determinism hashseed_determinism mmap_determinism procfs_determinism python_stdlib signal_determinism; do cargo test -p hermit --test \"$t\" -- --test-threads=1; done",
+      "deps": ["build.workspace"],
+      "timeout": 1200,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 300,
+               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "arbitrary_binaries",
+      "desc": "Portable arbitrary-binary cases",
+      "cmd": "cargo test -p hermit --test arbitrary_binaries -- --skip record_replay_stable_arbitrary_binaries --test-threads=1",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "cli",
+      "desc": "Portable CLI cases (skips KVM/DBI-backend-only cases)",
+      "cmd": "cargo test -p hermit --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbi_strict_returns_with_blocked_stdin_source --skip run_dbi_verifies_pipe_backpressure --skip run_dbi_keeps_diagnostics_out_of_guest_stderr --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --test-threads=1",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
+               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "cli_dbi_diagnostics",
+      "desc": "DBI diagnostics stay out of guest stderr (isolated bounded gate)",
+      "cmd": "cargo test -p hermit --test cli run_dbi_keeps_diagnostics_out_of_guest_stderr -- --exact --test-threads=1",
+      "deps": ["build.workspace"],
+      "timeout": 120,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 10,
+               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "hermit_modes",
+      "desc": "Portable Hermit mode cases (skips default_ and chaos_buck_)",
+      "cmd": "cargo test -p hermit --test hermit_modes -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify --test-threads=1",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
+               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "app_strict_verify",
+      "desc": "Portable application strict verification (skips java/javac)",
+      "cmd": "cargo test -p hermit --test app_strict_verify -- --ignored --skip java_ --skip javac_ --test-threads=1",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
+               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "command_strict_verify",
+      "desc": "Portable command strict verification",
+      "cmd": "cargo test -p hermit --test command_strict_verify -- --ignored --test-threads=1",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
+               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "ignored_syscall_regressions",
+      "desc": "Portable ignored syscall regressions (epoll_determinism, rcx_canonicalization)",
+      "cmd": "cargo test -p hermit --test epoll_determinism --test rcx_canonicalization -- --ignored --test-threads=1",
+      "deps": ["build.workspace"],
+      "timeout": 600,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
+               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "rr_suite_contract",
+      "desc": "rr suite source contract (scratch dirs fresh and cleaned)",
+      "cmd": "cargo test -p hermit --test rr_suite rr_scratch_directories_are_fresh_and_cleaned -- --exact",
+      "deps": ["build.workspace"],
+      "timeout": 300,
+      "hint": {"est_duration_s": 30, "rss_baseline_bytes": 1073741824,
+               "hard_mem_max_bytes": 2147483648, "classification": "light"}
+    },
+    {
+      "group": "test", "job": "dbi_parity",
+      "desc": "DynamoRIO DBI backend parity matrix",
+      "cmd": "python3 experiments/backend-parity_20260722/run_matrix.py --backend dbi --require-backend",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
+               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "envelope_levels",
+      "desc": "Portable working-envelope levels (L1-L4 over true/echo/date; mirrors run_hosted_envelope_levels, validate.sh:2573)",
+      "cmd": "set -e; HERMIT=target/debug/hermit; ARGS='run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled'; REPS=${L4_REPS:-20}; run_probe() { local c=\"$1\"; timeout 30s $HERMIT $ARGS --strict -- $c </dev/null; timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null; timeout 30s $HERMIT $ARGS --strict --verify --detlog-heap --detlog-stack -- $c </dev/null; local i; for ((i=0;i<REPS;i++)); do timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null; done; }; run_probe '/bin/true'; run_probe '/bin/echo hermit-envelope'; run_probe '/bin/date -u +%Y'",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "strict_compat",
+      "desc": "Hosted strict compatibility envelope (blocking L2 matrix with bounded diagnostics)",
+      "cmd": "./validate.sh --hosted-strict-compat-only --no-label-pr --verbose",
+      "deps": ["lint.clippy", "doc.doctests", "doc.rustdoc",
+               "test.regular_crates", "build.flaky_harnesses",
+               "test.hermit_unit", "test.detcore_unit", "test.rr_suite_contract"],
+      "timeout": 1800,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 600,
+               "rss_baseline_bytes": 3221225472, "hard_mem_max_bytes": 6442450944,
+               "classification": "latency-bound"}
+    }
+  ]
+}

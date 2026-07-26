@@ -2,6 +2,7 @@ name: CI (GitHub-hosted)
 
 on:
   push:
+    branches: ["main"]
   # Keep stacked pull requests covered before they are retargeted to main.
   pull_request:
   workflow_dispatch:
@@ -24,12 +25,12 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Initialize safe-ci-dag-runner
+      run: git submodule update --init agent-utils
     - uses: actions/setup-go@v5
       with:
         go-version: stable
         cache: false
-    - name: Enforce detcore backend-abstraction commandment
-      run: ./scripts/check-detcore-backend-abstraction.sh
     - name: Dependencies
       run: |
         sudo apt-get update
@@ -44,55 +45,16 @@ jobs:
       run: cargo install cargo-nextest --locked --version "$NEXTEST_VERSION"
     - name: Rust components
       run: rustup component add clippy rustfmt
-    - name: Portable test lane (no PMU or CPUID interception)
-      run: ./validate.sh --hosted-only --no-label-pr --verbose
-    # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#712): Review bounded CI-only routing for no-PMU hangs.
-    - name: Post-fork scheduling diagnostics (nonblocking)
-      if: ${{ !cancelled() }}
-      continue-on-error: true
-      timeout-minutes: 3
-      run: cargo test -p detcore --test tests_misc ordinary_clone_ -- --test-threads=1
-    - name: Network syscall determinism diagnostic (nonblocking)
-      if: ${{ !cancelled() }}
-      continue-on-error: true
-      timeout-minutes: 3
-      run: cargo test -p detcore --test tests_misc network_syscalls_are_deterministic_across_five_runs -- --exact --test-threads=1
-    - name: IPC determinism diagnostic (nonblocking)
-      if: ${{ !cancelled() }}
-      continue-on-error: true
-      timeout-minutes: 3
-      run: cargo test -p hermit --test ipc_determinism ipc_patterns_are_deterministic_across_five_runs -- --exact --test-threads=1
-    - name: Random-source determinism diagnostic (nonblocking)
-      if: ${{ !cancelled() }}
-      continue-on-error: true
-      timeout-minutes: 3
-      run: cargo test -p hermit --test random_determinism random_sources_repeat_across_runs_and_change_with_seed -- --exact --test-threads=1
-    - name: Threaded integration matrix diagnostic (nonblocking)
-      if: ${{ !cancelled() }}
-      continue-on-error: true
-      timeout-minutes: 5
-      run: cargo test -p hermit --test integration_matrix -- --test-threads=1
-    # The python3 --verify LiteInst cases observe interpreter-startup syscall
-    # reordering under the non-determinizing preload backend, so they run as
-    # bounded, observable diagnostics rather than blocking the no-PMU gate.
-    - name: LiteInst python3 --verify diagnostics (nonblocking)
-      if: ${{ !cancelled() }}
-      continue-on-error: true
-      timeout-minutes: 5
-      run: cargo test -p hermit --test cli -- run_liteinst_rejects_non_fork_clone run_liteinst_handles_inherited_ignored_sigchld run_liteinst_verifies_forked_guest run_liteinst_verifies_raw_fork_guest --test-threads=1
-    - name: Chaos hello-race verification diagnostic (nonblocking)
-      if: ${{ !cancelled() }}
-      continue-on-error: true
-      timeout-minutes: 5
-      run: cargo test -p hermit --test hermit_modes hello_race_chaos_verify -- --exact --test-threads=1
-    # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#598)
-    - name: DBI pipe backpressure diagnostics (nonblocking)
-      if: ${{ !cancelled() }}
-      continue-on-error: true
-      timeout-minutes: 5
-      run: cargo test -p hermit --test cli run_dbi_verifies_pipe_backpressure -- --exact --test-threads=1
+    - name: Portable test DAG (no PMU or CPUID interception)
+      run: env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh hosted --max-mem 14G --perf-dir "$RUNNER_TEMP/hermit-dag-perf" -v
+    - name: Upload DAG performance report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: dag-perf-${{ github.job }}
+        path: ${{ runner.temp }}/hermit-dag-perf
+        if-no-files-found: warn
+        retention-days: 14
     - name: Upload nextest JUnit report
       if: always()
       uses: actions/upload-artifact@v4

@@ -5,6 +5,7 @@ on:
     branches: [ "main" ]
   # Keep stacked pull requests covered before they are retargeted to main.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       qemu_l2:
@@ -94,7 +95,8 @@ jobs:
           github.event_name == 'workflow_dispatch' ||
           (
             github.event_name == 'pull_request' &&
-            github.event.pull_request.user.login == 'rrnewton'
+            github.event.pull_request.user.login == 'rrnewton' &&
+            github.event.pull_request.draft == false
           )
         )
       }}
@@ -148,8 +150,16 @@ jobs:
         command -v go ruby node javac java ocamlopt python3 redis-server redis-cli sqlite3 gdb lldb
         python3 -c 'import test.support'
         unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
-    - name: PMU and CPUID test lane
-      run: flock /tmp/hermit-self-hosted-pmu.lock ./validate.sh --hardware-only --no-label-pr
+    - name: PMU and CPUID test DAG
+      run: env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner flock /tmp/hermit-self-hosted-pmu.lock ci/run-dag.sh hardware -j 2 --perf-dir "$RUNNER_TEMP/hermit-hardware-dag-perf" -v
+    - name: Upload hardware DAG performance report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: hardware-dag-perf-${{ github.job }}
+        path: ${{ runner.temp }}/hermit-hardware-dag-perf
+        if-no-files-found: warn
+        retention-days: 14
     # AUTONOMOUS-BOT-IMPLEMENTED
     # TODO-HUMAN-REVIEW(#673)
     - name: Pselect signal-interruption diagnostic (nonblocking)
