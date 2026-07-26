@@ -303,7 +303,7 @@ readonly STRICT_COMPAT_TOTAL=181
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
 readonly RR_COMPAT_EXPECTED=143
-readonly LITEINST_COMPAT_EXPECTED=185
+readonly LITEINST_COMPAT_EXPECTED=203
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
@@ -828,7 +828,7 @@ function run_full_backend_gates {
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
     run_check "LiteInst backend smoke" liteinst_backend_available
-    run_check "LiteInst compatibility baseline (185 programs)" run_liteinst_compatibility_envelope
+    run_check "LiteInst compatibility baseline (203 programs)" run_liteinst_compatibility_envelope
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -1388,7 +1388,7 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe unexpand /usr/bin/unexpand -a README.md && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe printenv /usr/bin/printenv PATH && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe whoami /usr/bin/whoami && passed=$((passed + 1)) || failed=$((failed + 1))
-    liteinst_compatibility_probe groups /usr/bin/groups && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe groups /usr/bin/groups --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe bash /bin/bash -c 'printf "bash-ok\n"' && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe sh /bin/sh -c 'printf "sh-ok\n"' && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe cmp /usr/bin/cmp README.md README.md && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1498,6 +1498,24 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe last-live /usr/bin/last -n 1 && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe taskset-pid1 /usr/bin/taskset -pc 1 && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe pkgconf /usr/bin/pkgconf --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe tail /usr/bin/tail -n 3 README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe hostid /usr/bin/hostid && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe stty /usr/bin/stty --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe dircolors /usr/bin/dircolors --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe env-version /usr/bin/env --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe nice-version /usr/bin/nice --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe nohup-version /usr/bin/nohup --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe stdbuf-version /usr/bin/stdbuf --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe free-version /usr/bin/free --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gzip-stream /usr/bin/gzip -cn README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe tar-stream /usr/bin/tar -cf - README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe zip-stream /usr/bin/zip -q - README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe git-hash /usr/bin/git hash-object README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe cmake-sha /usr/bin/cmake -E sha256sum README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe findmnt-root /usr/bin/findmnt -n -o TARGET / && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-escape /usr/bin/systemd-escape --path /tmp/hermit-compat && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sysctl-ostype /usr/sbin/sysctl -n kernel.ostype && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe php-version /usr/bin/php -v && passed=$((passed + 1)) || failed=$((failed + 1))
 
     total=$((passed + failed))
     if ((total != LITEINST_COMPAT_EXPECTED)); then
@@ -3255,7 +3273,7 @@ fi
 if ((LITEINST_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
     if ((failures == 0)); then
-        run_check "LiteInst compatibility baseline (185 programs)" run_liteinst_compatibility_envelope
+        run_check "LiteInst compatibility baseline (203 programs)" run_liteinst_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
