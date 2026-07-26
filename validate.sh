@@ -2736,8 +2736,6 @@ function run_hosted_only_suite {
     # non-python3 LiteInst cases (/bin/echo, /bin/sh, /bin/cat, workdir, stdin,
     # exit/signal, orphan reaping) stay blocking here.
     run_check "Portable CLI cases" cargo test -p hermit --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbi_strict_returns_with_blocked_stdin_source --skip run_dbi_verifies_pipe_backpressure --skip run_dbi_keeps_diagnostics_out_of_guest_stderr --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --test-threads=1
-    run_check_with_timeout 120 "DBI diagnostics stay out of guest stderr" \
-        cargo test -p hermit --test cli run_dbi_keeps_diagnostics_out_of_guest_stderr -- --exact --test-threads=1
     run_check "Portable Hermit mode cases" cargo test -p hermit --test hermit_modes -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify --test-threads=1
     run_check "Portable application strict verification" cargo test -p hermit --test app_strict_verify -- --ignored --skip java_ --skip javac_ --test-threads=1
     run_check "Portable command strict verification" cargo test -p hermit --test command_strict_verify -- --ignored --test-threads=1
@@ -2941,6 +2939,8 @@ function run_super_diagnostic_suite {
         cargo test -p hermit --test cli run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them -- --exact --test-threads=1
     run_check_with_timeout 30 "DBI strict blocked-stdin teardown diagnostic" \
         cargo test -p hermit --test cli run_dbi_strict_returns_with_blocked_stdin_source -- --exact --test-threads=1
+    run_check_with_timeout 120 "DBI guest-stderr isolation diagnostic" \
+        cargo test -p hermit --test cli run_dbi_keeps_diagnostics_out_of_guest_stderr -- --exact --test-threads=1
 }
 
 function run_super_suite {

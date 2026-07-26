@@ -153,16 +153,6 @@
                "classification": "latency-bound"}
     },
     {
-      "group": "test", "job": "cli_dbi_diagnostics",
-      "desc": "DBI diagnostics stay out of guest stderr (isolated bounded gate)",
-      "cmd": "cargo test -p hermit --test cli run_dbi_keeps_diagnostics_out_of_guest_stderr -- --exact --test-threads=1",
-      "deps": ["build.workspace"],
-      "timeout": 120,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 10,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
-               "classification": "latency-bound"}
-    },
-    {
       "group": "test", "job": "hermit_modes",
       "desc": "Portable Hermit mode cases (skips default_ and chaos_buck_)",
       "cmd": "cargo test -p hermit --test hermit_modes -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify --test-threads=1",
