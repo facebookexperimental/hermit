@@ -1653,6 +1653,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                 Syscall::Getrusage(s) => self.handle_getrusage(guest, s).await,
                 Syscall::Sysinfo(s) => self.handle_sysinfo(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                Syscall::Times(s) => self.handle_times(guest, s).await,
                 Syscall::Prlimit64(s) => self.handle_prlimit64(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)

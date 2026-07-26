@@ -142,6 +142,8 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::statfs
         | Sysno::statx
         | Sysno::sysinfo
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::times
         | Sysno::time
         | Sysno::timer_create
         | Sysno::timer_delete
@@ -561,7 +563,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sysfs
         | Sysno::syslog
         | Sysno::tee
-        | Sysno::times
         | Sysno::tkill
         | Sysno::ustat
         | Sysno::vmsplice => SyscallClassification::Unsupported,
@@ -727,7 +728,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [200, 91, 82]);
+        assert_eq!(counts, [201, 91, 81]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -767,6 +768,10 @@ mod tests {
         );
         assert_eq!(
             classify_syscall(Sysno::writev),
+            SyscallClassification::Determinized
+        );
+        assert_eq!(
+            classify_syscall(Sysno::times),
             SyscallClassification::Determinized
         );
         for sysno in [

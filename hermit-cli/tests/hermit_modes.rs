@@ -461,7 +461,7 @@ fn resource_syscalls_are_deterministic_across_five_runs() {
 
     for run in 1..=5 {
         let mut command = hermit_command("minimal");
-        command.arg("--").arg(&workload.path);
+        command.args(["--strict", "--"]).arg(&workload.path);
         let output = command_output(command, &format!("resource determinism run {run}"));
         let stdout = String::from_utf8(output.stdout).expect("resource output should be UTF-8");
 
@@ -477,6 +477,7 @@ fn resource_syscalls_are_deterministic_across_five_runs() {
             "rusage thread maxrss",
             "rusage children zero",
             "sysinfo",
+            "times logical ticks and zero CPU accounting",
         ] {
             assert!(
                 stdout.contains(expected),

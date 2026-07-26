@@ -19,6 +19,20 @@ use crate::tool_global::thread_observe_time;
 use crate::tool_local::ResourceLimit;
 
 const MB: u64 = 1024 * 1024;
+const CLOCK_TICKS_PER_SECOND: u64 = 100;
+const NANOS_PER_CLOCK_TICK: u64 = 1_000_000_000 / CLOCK_TICKS_PER_SECOND;
+
+fn logical_clock_ticks(
+    now: crate::types::LogicalTime,
+    boot: crate::types::LogicalTime,
+    uptime_offset_seconds: u64,
+) -> libc::clock_t {
+    let elapsed_ticks = (now - boot).as_nanos() / NANOS_PER_CLOCK_TICK;
+    let ticks = uptime_offset_seconds
+        .saturating_mul(CLOCK_TICKS_PER_SECOND)
+        .saturating_add(elapsed_ticks);
+    libc::clock_t::try_from(ticks).unwrap_or(libc::clock_t::MAX)
+}
 
 impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -195,6 +209,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#783): Review logical tick and zero-CPU accounting semantics.
+    /// Return deterministic elapsed ticks and process CPU accounting for `times(2)`.
+    ///
+    /// Linux's host boot epoch and scheduler CPU counters are nondeterministic. Detcore instead
+    /// derives the return value from its logical clock and reports zero CPU ticks, matching the
+    /// policy used by `getrusage` until logical per-process CPU accounting is modeled.
+    pub async fn handle_times<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Times,
+    ) -> Result<i64, Error> {
+        let now = thread_observe_time(guest).await;
+        let boot = crate::types::DetTime::new(&self.cfg).as_nanos();
+        let ticks = logical_clock_ticks(now, boot, self.cfg.sysinfo_uptime_offset);
+
+        if let Some(address) = call.buf() {
+            let usage = libc::tms {
+                tms_utime: 0,
+                tms_stime: 0,
+                tms_cutime: 0,
+                tms_cstime: 0,
+            };
+            guest.memory().write_value(address, &usage)?;
+        }
+
+        Ok(ticks as i64)
+    }
+
     /// The guest's peak resident set size ("high water mark") in kibibytes, matching the units of
     /// Linux `getrusage`'s `ru_maxrss`. Reads procfs like [`Self::free_ram`]; always returns a
     /// positive value so guests can rely on a nonzero maximum RSS even if the read fails.
@@ -262,5 +305,26 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(0);
         }
         Ok(total_ram - used_memory)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::LogicalTime;
+
+    #[test]
+    fn logical_clock_ticks_include_boot_offset_and_fractional_seconds() {
+        let boot = LogicalTime::from_secs(1_000);
+        let now = boot + LogicalTime::from_millis(25);
+
+        assert_eq!(logical_clock_ticks(now, boot, 120), 12_002);
+    }
+
+    #[test]
+    fn logical_clock_ticks_saturate_at_clock_t_max() {
+        let ticks = logical_clock_ticks(LogicalTime::MAX, LogicalTime::ZERO, u64::MAX);
+
+        assert_eq!(ticks, libc::clock_t::MAX);
     }
 }

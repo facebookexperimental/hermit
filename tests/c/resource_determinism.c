@@ -15,6 +15,7 @@
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
+#include <sys/times.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -358,6 +359,45 @@ static void check_sysinfo(void) {
       info.mem_unit);
 }
 
+static void require_zero_tms(const struct tms* usage, const char* operation) {
+  if (usage->tms_utime != 0 || usage->tms_stime != 0 ||
+      usage->tms_cutime != 0 || usage->tms_cstime != 0) {
+    fprintf(stderr, "%s returned nonzero CPU accounting\n", operation);
+    exit(1);
+  }
+}
+
+static void check_times(void) {
+  struct tms first_usage;
+  struct tms second_usage;
+  memset(&first_usage, 0xa5, sizeof(first_usage));
+  memset(&second_usage, 0xa5, sizeof(second_usage));
+
+  clock_t first = times(&first_usage);
+  if (first == (clock_t)-1) {
+    fail("times first");
+  }
+  require_zero_tms(&first_usage, "times first");
+
+  usleep(25000);
+  clock_t second = times(&second_usage);
+  if (second == (clock_t)-1) {
+    fail("times second");
+  }
+  require_zero_tms(&second_usage, "times second");
+  if (second <= first) {
+    fprintf(stderr, "times did not advance across logical sleep\n");
+    exit(1);
+  }
+
+  clock_t without_usage = times(NULL);
+  if (without_usage == (clock_t)-1 || without_usage < second) {
+    fprintf(stderr, "times(NULL) did not preserve elapsed ticks\n");
+    exit(1);
+  }
+  puts("times logical ticks and zero CPU accounting");
+}
+
 int main(void) {
   check_limit_queries();
   check_limit_mutations();
@@ -367,5 +407,6 @@ int main(void) {
   check_rusage(RUSAGE_CHILDREN, "children", 0);
   check_rusage_errors();
   check_sysinfo();
+  check_times();
   return 0;
 }
