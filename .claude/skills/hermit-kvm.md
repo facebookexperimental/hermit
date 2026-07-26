@@ -41,10 +41,13 @@ per-syscall cost/behavior comparison current.
 
 ## Worktree assignment
 
-Work in a standard `worktrees/slotNN` pool slot (coordinator-assigned or
-provisioned), one active slot per task, with coordinated Hermit/Reverie feature
-branches in the same slot when a change spans both repos. Never do feature work
-in a primary checkout. Leave the unused child detached at its pinned gitlink.
+Own the named slot **`worktrees/kvm/`** (nested layout v2:
+`worktrees/kvm/hermit` and `worktrees/kvm/reverie`), one slot per agent.
+Provision it with `scripts/allocate-worktree.rs --agent hermit-kvm --product
+both`; coordinated Hermit/Reverie feature branches live in the same slot when a
+change spans both repos. Never do feature work in a primary checkout. Leave an
+unused child detached at its pinned gitlink. See
+`ai_docs/transient/worktree-management-map.md` for the full protocol.
 
 ## Related
 

@@ -48,9 +48,14 @@ is the operational summary of the coordinator role.
 ## Worktree assignment
 
 Operates on the **parent** and the **primary checkouts** (coordinator-owned
-integration surfaces) and dispatches feature work into `worktrees/slotNN` slots.
+integration surfaces) and dispatches feature work into nested named-agent or
+`slotNN` slots via `scripts/allocate-worktree.rs` (one slot per agent).
 Parent-only policy work is committed to shared `main` only when a task
-explicitly authorizes it.
+explicitly authorizes it. Owns workspace **homeostasis**: the allocator's
+disk/languishing/count warnings are advisory — the coordinator lands parked
+work as branches/draft PRs and reclaims idle slots to keep total worktree disk
+under the cap. Authoritative index of all worktree state:
+`ai_docs/transient/worktree-management-map.md`.
 
 ## Related
 

@@ -36,9 +36,12 @@ runtime footprint, RPATH) working.
 
 ## Worktree assignment
 
-Work in a coordinator-assigned `worktrees/slotNN` slot, one active slot per
-task, coordinated Hermit/Reverie branches in the same slot when the change spans
-both. Never feature-build in a primary checkout.
+Own the named slot **`worktrees/dbi/`** (nested layout v2:
+`worktrees/dbi/{hermit,reverie}`), one slot per agent. Provision it with
+`scripts/allocate-worktree.rs --agent hermit-dbi --product both`; coordinated
+Hermit/Reverie branches live in the same slot when the change spans both. Never
+feature-build in a primary checkout. See
+`ai_docs/transient/worktree-management-map.md` for the full protocol.
 
 ## Related
 

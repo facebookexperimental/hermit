@@ -39,8 +39,10 @@ infrastructure flakes, and improve the CI configuration and validation harness.
 ## Worktree assignment
 
 Read CI state from anywhere (read-only inspection is always fine). For CI-config
-changes, use a coordinator-assigned `worktrees/slotNN` slot and open a PR — never
-edit a primary checkout.
+changes, own the named slot **`worktrees/ci/`** (nested layout v2), provisioned
+with `scripts/allocate-worktree.rs --agent hermit-ci --product hermit`, and open
+a PR — never edit a primary checkout. See
+`ai_docs/transient/worktree-management-map.md` for the full protocol.
 
 ## Related
 

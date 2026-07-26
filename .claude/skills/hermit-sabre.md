@@ -32,9 +32,12 @@ selection/fork behavior of example tools correct.
 
 ## Worktree assignment
 
-Work in a coordinator-assigned `worktrees/slotNN` slot, one active slot per
-task; Reverie-only unless a coordinated Hermit change is explicitly assigned.
-Never feature-build in a primary checkout.
+Own the named slot **`worktrees/sabre/`** (nested layout v2:
+`worktrees/sabre/{hermit,reverie}`), one slot per agent. Provision it with
+`scripts/allocate-worktree.rs --agent hermit-sabre`; Reverie-only unless a
+coordinated Hermit change is explicitly assigned. Never feature-build in a
+primary checkout. See `ai_docs/transient/worktree-management-map.md` for the
+full protocol.
 
 ## Related
 
