@@ -303,7 +303,7 @@ readonly STRICT_COMPAT_TOTAL=181
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
 readonly RR_COMPAT_EXPECTED=143
-readonly LITEINST_COMPAT_EXPECTED=172
+readonly LITEINST_COMPAT_EXPECTED=185
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
@@ -828,7 +828,7 @@ function run_full_backend_gates {
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
     run_check "LiteInst backend smoke" liteinst_backend_available
-    run_check "LiteInst compatibility baseline (172 programs)" run_liteinst_compatibility_envelope
+    run_check "LiteInst compatibility baseline (185 programs)" run_liteinst_compatibility_envelope
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -1485,6 +1485,19 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe last /usr/bin/last --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe lastlog /usr/bin/lastlog --help && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe wall /usr/bin/wall --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe curl-file /usr/bin/curl --fail --silent --show-error file:///etc/hostname && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe clang-preprocess /usr/bin/clang -E -x c /dev/null && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe shuf-singleton /usr/bin/shuf -i 1-1 -n 1 && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sync-file /usr/bin/sync -f README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe mountpoint /usr/bin/mountpoint -q / && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe getent-root /usr/bin/getent passwd root && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ip-loopback /usr/sbin/ip -o link show lo && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe lastlog-root /usr/bin/lastlog -u root && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe bzip2-stream /usr/bin/bzip2 -c README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe who-live /usr/bin/who && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe last-live /usr/bin/last -n 1 && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe taskset-pid1 /usr/bin/taskset -pc 1 && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe pkgconf /usr/bin/pkgconf --version && passed=$((passed + 1)) || failed=$((failed + 1))
 
     total=$((passed + failed))
     if ((total != LITEINST_COMPAT_EXPECTED)); then
@@ -3242,7 +3255,7 @@ fi
 if ((LITEINST_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
     if ((failures == 0)); then
-        run_check "LiteInst compatibility baseline (172 programs)" run_liteinst_compatibility_envelope
+        run_check "LiteInst compatibility baseline (185 programs)" run_liteinst_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
