@@ -210,6 +210,7 @@ struct NativeThreadScratch {
     thread_clone_flags: u64,
     thread_clone_ctid: u64,
     pending_thread_start: u64,
+    // TODO-HUMAN-REVIEW(PR-723): Review virtual-identity scratch ABI alignment.
     virtual_pid: i32,
     virtual_ppid: i32,
     virtual_tid: i32,

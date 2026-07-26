@@ -21,6 +21,7 @@ use std::sync::OnceLock;
 static DBI_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBI_EXEC_FAILURE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBI_EXECVEAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DBI_PID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBI_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBI_UNSUPPORTED_SYSCALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
@@ -144,6 +145,32 @@ fn dbi_wait_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "DBI wait guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+// TODO-HUMAN-REVIEW(PR-723): Review the DBI PID fixture build.
+fn dbi_pid_guest() -> &'static Path {
+    DBI_PID_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbi-pid");
+        fs::create_dir_all(&build_root).expect("failed to create DBI PID guest directory");
+        let guest = build_root.join("dbi_pid_virtualization");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/dbi_pid_virtualization.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile DBI PID guest");
+        assert!(
+            output.status.success(),
+            "DBI PID guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -677,6 +704,50 @@ fn run_dbi_verifies_process_wait_lifecycle() {
     assert_eq!(
         stdout(&output),
         "wait4=7 waitid=9 sigchld=2 reaped=2 cpu=zero\n"
+    );
+    assert!(
+        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
+        "DBI determinism confirmation missing:\n{}",
+        stderr(&output),
+    );
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-723): Review DBI PID virtualization L2 coverage.
+#[test]
+fn run_dbi_virtualizes_process_identities() {
+    let program = dbi_pid_guest()
+        .to_str()
+        .expect("DBI PID guest path should be UTF-8");
+    let args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--strict",
+        "--verify",
+        "--",
+        program,
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        concat!(
+            "root pid=3 ppid=1 tid=3\n",
+            "grandchild pid=5 ppid=4 tid=5\n",
+            "child pid=4 ppid=3 tid=4\n",
+            "child grandchild=5 waited=5 exit=5\n",
+            "root child=4 waited=4 exit=6\n",
+            "exec-child pid=6 ppid=3 tid=6\n",
+            "exec-proc stat=6/3 status=6/3 tracer=1\n",
+            "root exec=6 waited=6 exit=8\n",
+            "waitid-child pid=7 ppid=3 tid=7\n",
+            "root waitid=7 reported=7 exit=9\n",
+            "root vfork=8 waited=8 exit=0 pid=3 tid=3\n",
+            "vfork-exec-child pid=9 ppid=3 tid=9\n",
+            "root vfork-exec=9 waited=9 exit=10 pid=3 tid=3\n",
+        )
     );
     assert!(
         stderr(&output).contains(":: Success: deterministic. Determinism verified."),

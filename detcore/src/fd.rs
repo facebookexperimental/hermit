@@ -285,12 +285,19 @@ impl DetFd {
     }
 
     /// Initialize the deterministic snapshot shared by all aliases.
-    pub(crate) fn initialize_procfs(&self, contents: Vec<u8>, virtual_uptime_seconds: u64) {
+    // TODO-HUMAN-REVIEW(PR-723): Review procfs snapshot identity parameters.
+    pub(crate) fn initialize_procfs(
+        &self,
+        contents: Vec<u8>,
+        virtual_uptime_seconds: u64,
+        virtual_pid: i32,
+        virtual_ppid: i32,
+    ) {
         self.description()
             .procfs
             .as_mut()
             .expect("procfs fd disappeared while taking its snapshot")
-            .initialize(contents, virtual_uptime_seconds);
+            .initialize(contents, virtual_uptime_seconds, virtual_pid, virtual_ppid);
     }
 
     /// Read from the deterministic procfs snapshot at its shared offset.
