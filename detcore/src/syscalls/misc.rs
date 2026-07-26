@@ -42,7 +42,22 @@ const ARCH_SHSTK_VALID_MASK: usize = 0b11;
 fn is_supported_prctl_option(option: libc::c_int) -> bool {
     matches!(
         option,
-        libc::PR_SET_NAME | libc::PR_GET_NAME | libc::PR_SET_THP_DISABLE | libc::PR_GET_THP_DISABLE
+        libc::PR_SET_NAME
+            | libc::PR_GET_NAME
+            | libc::PR_SET_THP_DISABLE
+            | libc::PR_GET_THP_DISABLE
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#802)
+            //
+            // PR_{SET,GET}_KEEPCAPS only read/toggle the calling thread's
+            // "keep capabilities across a UID change" flag. The result is a pure
+            // function of the guest's own prior prctl calls (0/1), never host
+            // state, so passthrough is deterministic and bitwise-identical across
+            // runs. Supporting it lets `setpriv` (and the `date`/privilege-drop
+            // wrappers that call it) run under --strict instead of aborting with
+            // "keep process capabilities failed: Function not implemented".
+            | libc::PR_SET_KEEPCAPS
+            | libc::PR_GET_KEEPCAPS
     )
 }
 
@@ -506,12 +521,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prctl_support_is_limited_to_ruby_thread_controls() {
+    fn prctl_support_covers_deterministic_thread_controls() {
         for option in [
             libc::PR_SET_NAME,
             libc::PR_GET_NAME,
             libc::PR_SET_THP_DISABLE,
             libc::PR_GET_THP_DISABLE,
+            // Deterministic per-thread capability-retention flag used by setpriv.
+            libc::PR_SET_KEEPCAPS,
+            libc::PR_GET_KEEPCAPS,
         ] {
             assert!(is_supported_prctl_option(option));
         }

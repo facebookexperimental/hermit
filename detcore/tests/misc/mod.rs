@@ -232,6 +232,22 @@ fn passthru_opt_still_intercepts_madvise() {
 }
 
 #[test]
+fn prctl_keepcaps_round_trips_deterministically() {
+    // `setpriv` (used by the `date` privilege-drop wrapper) sets and reads the
+    // per-thread PR_SET_KEEPCAPS flag during startup. Detcore must support it
+    // instead of returning ENOSYS, which made setpriv abort with
+    // "keep process capabilities failed: Function not implemented". The flag is
+    // process-local, so the set/get round trip is deterministic regardless of
+    // the initial state.
+    det_test_fn_sequential_without_pmu(|| unsafe {
+        assert_eq!(libc::prctl(libc::PR_SET_KEEPCAPS, 1), 0);
+        assert_eq!(libc::prctl(libc::PR_GET_KEEPCAPS), 1);
+        assert_eq!(libc::prctl(libc::PR_SET_KEEPCAPS, 0), 0);
+        assert_eq!(libc::prctl(libc::PR_GET_KEEPCAPS), 0);
+    });
+}
+
+#[test]
 fn sched_affinity_is_normalized_to_virtual_cpu_zero() {
     det_test_fn_sequential_without_pmu(|| {
         const VIRTUAL_CPUSET_BYTES: usize = 16;
