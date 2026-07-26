@@ -40,7 +40,8 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --hosted-strict-compat-only # hosted L2 matrix with bounded diagnostics
 #   ./validate.sh --rr-compat-only            # gate the known-passing R/R matrix
 #   ./validate.sh --liteinst-compat-only      # gate the LiteInst preload matrix
-#   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix
+#   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix;
+#                                            # needs executable HERMIT_SABRE_BINARY
 #   ./validate.sh --e9patch-compat-only       # gate core + installed e9patch L2 apps
 #   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
 #   ./validate.sh --hosted-only               # no PMU/CPUID hardware required
@@ -2412,15 +2413,14 @@ function run_e9patch_extended_compatibility_envelope {
     return "$status"
 }
 
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(PR-799): Review the focused SaBRe artifact contract.
 function require_sabre_artifacts {
-    local variable
-    for variable in HERMIT_SABRE_RUNNER HERMIT_SABRE_BINARY HERMIT_SABRE_PLUGIN; do
-        if [[ -z ${!variable:-} || ! -f ${!variable} ]]; then
-            printf "validate.sh: %s must name a regular file for SaBRe compatibility\n" \
-                "$variable" >&2
-            return 1
-        fi
-    done
+    local binary=${HERMIT_SABRE_BINARY:-}
+    if [[ -z $binary || ! -f $binary || ! -x $binary ]]; then
+        printf "validate.sh: HERMIT_SABRE_BINARY must name an executable SaBRe loader\n" >&2
+        return 1
+    fi
 }
 
 function run_rr_compatibility_envelope {
@@ -3048,8 +3048,8 @@ fi
 if ((SABRE_COMPAT_ONLY == 1)); then
     run_check "SaBRe artifacts configured" require_sabre_artifacts
     if ((failures == 0)); then
-        run_check "Build release Hermit for SaBRe compatibility" \
-            cargo build --release -p hermit
+        run_check "Build release Hermit and Detcore plugin for SaBRe compatibility" \
+            cargo build --release -p hermit -p detcore-sabre
     fi
     if ((failures == 0)); then
         run_check "SaBRe compatibility ratchet (151 programs)" \
