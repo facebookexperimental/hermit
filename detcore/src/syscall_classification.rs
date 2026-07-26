@@ -348,6 +348,26 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msgsnd
         | Sysno::msgrcv
         | Sysno::msgctl
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#827): Deterministic ENOSYS for the Landlock
+        // unprivileged-sandbox syscalls (landlock_create_ruleset,
+        // landlock_add_rule, landlock_restrict_self). Landlock is an LSM whose
+        // presence and ABI version depend on the host kernel build
+        // (CONFIG_SECURITY_LANDLOCK) and its runtime LSM stacking, so forwarding
+        // these (the legacy pass-through) makes a guest that probes or installs
+        // a sandbox behave differently across hosts -- a host dependency and,
+        // because a ruleset restricts the whole thread tree, a global-state
+        // isolation hole. A fixed -ENOSYS is exactly the errno a kernel built
+        // without Landlock returns, so a guest sees a consistent "sandbox
+        // unavailable" answer (the common best-effort path) regardless of host;
+        // it is never forwarded to the host and is bitwise-identical across
+        // --verify and record/replay, mirroring the io_uring / async-IPC ENOSYS
+        // refusals above. These are untyped (Syscall::Other) in the pinned
+        // Reverie, so the dispatcher matches on the Sysno before the typed match
+        // below.
+        | Sysno::landlock_create_ruleset
+        | Sysno::landlock_add_rule
+        | Sysno::landlock_restrict_self
         // ===== BATCH 51: fail-closed utility syscalls with no deterministic effect =====
         // These three previously fail-closed --strict (aborting real programs such
         // as chrt, ionice, and flock) even though none can change guest-visible
@@ -576,9 +596,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::ioprio_get
         | Sysno::kcmp
         | Sysno::keyctl
-        | Sysno::landlock_add_rule
-        | Sysno::landlock_create_ruleset
-        | Sysno::landlock_restrict_self
         | Sysno::listmount
         | Sysno::lsm_get_self_attr
         | Sysno::lsm_list_modules
@@ -796,6 +813,29 @@ pub(crate) const fn is_unsupported_async_ipc_syscall(sysno: Sysno) -> bool {
     )
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#827): Deterministic ENOSYS refusal set.
+/// The Landlock unprivileged-sandbox syscalls (`landlock_create_ruleset`,
+/// `landlock_add_rule`, `landlock_restrict_self`). Landlock is an LSM whose
+/// availability and ABI version depend on the host kernel build
+/// (`CONFIG_SECURITY_LANDLOCK`) and its runtime LSM stacking, so forwarding
+/// these to the host (the legacy pass-through) makes a guest that probes or
+/// installs a sandbox behave differently across hosts, and -- because a
+/// ruleset restricts the whole thread tree -- opens a global-state isolation
+/// hole. Detcore refuses them with a fixed `ENOSYS`: exactly the errno a kernel
+/// built without Landlock returns, so the guest sees a consistent "sandbox
+/// unavailable" answer (the common best-effort path) independent of the host.
+/// The result is never forwarded to the host and is bitwise-identical across
+/// `--verify` and record/replay, mirroring the io_uring and async-IPC ENOSYS
+/// refusals. These are untyped (`Syscall::Other`) in the pinned Reverie, so the
+/// dispatcher matches on the `Sysno` before the typed match.
+pub(crate) const fn is_landlock_sandbox_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::landlock_create_ruleset | Sysno::landlock_add_rule | Sysno::landlock_restrict_self
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,7 +852,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [220, 91, 62]);
+        assert_eq!(counts, [223, 91, 59]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1151,6 +1191,39 @@ mod tests {
                 assert!(!is_privileged_admin_refused_syscall(sysno));
                 assert!(!is_mount_ns_admin_refused_syscall(sysno));
                 assert!(!is_unsupported_async_ipc_syscall(sysno));
+            }
+        }
+    }
+
+    #[test]
+    fn landlock_sandbox_syscalls_are_determinized_and_consistent() {
+        // Every Landlock sandbox syscall must classify as Determinized (routed
+        // to the deterministic ENOSYS refusal), and the helper used by the
+        // dispatcher must agree exactly with that classification across the
+        // whole pinned table. Regression for #827.
+        let refused = [
+            Sysno::landlock_create_ruleset,
+            Sysno::landlock_add_rule,
+            Sysno::landlock_restrict_self,
+        ];
+        for sysno in refused {
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Determinized,
+                "{sysno:?} should be Determinized (deterministic ENOSYS refusal)"
+            );
+            assert!(
+                is_landlock_sandbox_syscall(sysno),
+                "{sysno:?} should be in the Landlock ENOSYS-refusal helper set"
+            );
+        }
+        // The helper must not claim any syscall outside the reviewed set.
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            if is_landlock_sandbox_syscall(sysno) {
+                assert!(
+                    refused.contains(&sysno),
+                    "{sysno:?} is flagged by the helper but not in the reviewed refusal set"
+                );
             }
         }
     }

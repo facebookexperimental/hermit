@@ -155,6 +155,7 @@ use crate::resources::ResourceID;
 use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
 use crate::syscall_classification::is_credential_identity_noop_syscall;
+use crate::syscall_classification::is_landlock_sandbox_syscall;
 use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
 use crate::syscall_classification::is_privileged_admin_refused_syscall;
 use crate::syscall_classification::is_unimplemented_enosys_syscall;
@@ -1436,6 +1437,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 if is_credential_identity_noop_syscall(call.number()) =>
             {
                 Ok(0)
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#827): Deterministic ENOSYS for the Landlock
+            // unprivileged-sandbox syscalls (landlock_create_ruleset,
+            // landlock_add_rule, landlock_restrict_self). Landlock availability
+            // and ABI version depend on the host kernel build
+            // (CONFIG_SECURITY_LANDLOCK) and runtime LSM stacking, so forwarding
+            // them (the legacy pass-through) is host-dependent and, because a
+            // ruleset restricts the whole thread tree, a global-state isolation
+            // hole. A fixed -ENOSYS is the errno a kernel built without Landlock
+            // returns, so the guest sees a consistent "sandbox unavailable"
+            // answer regardless of host; never forwarded to the host and
+            // bitwise-identical across --verify and record/replay. Untyped
+            // (Syscall::Other) in the pinned Reverie, so dispatch on the Sysno
+            // before the typed match below.
+            SyscallClassification::Determinized if is_landlock_sandbox_syscall(call.number()) => {
+                Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#773): epoll_pwait2 is untyped (Syscall::Other)
