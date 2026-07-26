@@ -228,6 +228,14 @@ pub struct RunOpts {
     #[clap(long, value_name = "success|failure|both", default_value = "success")]
     verify_allow: VerifyAllow,
 
+    /// If --verify is specified, echo the FIRST run's `--log` output to stderr,
+    /// the same way a normal (non-verify) run does. During --verify the log is
+    /// otherwise diverted to a temporary file for comparison, so the user never
+    /// sees it. This restores observability of `--log` output while still
+    /// performing the two-run determinism check.
+    #[clap(long, requires = "verify")]
+    verify_logs: bool,
+
     /// Print a summary of the process tree's execution to stderr before exiting.
     #[clap(long, short = 'u')]
     pub(crate) summary: bool,
@@ -2021,6 +2029,24 @@ impl RunOpts {
         eprintln!(":: {}", "Run1...".yellow().bold());
 
         let out1: Output = self.run_verify(log1_file, global)?;
+
+        // With --verify the first run's `--log` output was diverted to a
+        // temporary file for later comparison rather than shown to the user.
+        // When --verify-logs is set, echo that first run's log to stderr so the
+        // user still sees `--log` output, matching a normal (non-verify) run.
+        // The log file is fully flushed here because run_verify runs each
+        // execution in a child process that has already exited.
+        if self.verify_logs {
+            match fs::read(&log1_path) {
+                Ok(bytes) => std::io::stderr().write_all(&bytes)?,
+                Err(err) => eprintln!(
+                    "WARNING: --verify-logs could not read first-run log {}: {}",
+                    log1_path.display(),
+                    err
+                ),
+            }
+        }
+
         if !self.verify_allow.satisfies(out1.status) {
             eprintln!(
                 "First run errored during --verify, not continuing to a second. Stdout:\n{}\nStderr:\n{}",
