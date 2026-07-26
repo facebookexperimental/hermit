@@ -303,7 +303,7 @@ readonly STRICT_COMPAT_TOTAL=181
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
 readonly RR_COMPAT_EXPECTED=143
-readonly LITEINST_COMPAT_EXPECTED=130
+readonly LITEINST_COMPAT_EXPECTED=172
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
@@ -828,7 +828,7 @@ function run_full_backend_gates {
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
     run_check "LiteInst backend smoke" liteinst_backend_available
-    run_check "LiteInst compatibility baseline (130 programs)" run_liteinst_compatibility_envelope
+    run_check "LiteInst compatibility baseline (172 programs)" run_liteinst_compatibility_envelope
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -1443,6 +1443,48 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe ionice /usr/bin/ionice --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe pgrep /usr/bin/pgrep --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe pkill /usr/bin/pkill --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe bzip2 /usr/bin/bzip2 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe zstd /usr/bin/zstd --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe cpio /usr/bin/cpio --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe zip /usr/bin/zip -v && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe unzip /usr/bin/unzip -v && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe patch /usr/bin/patch --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe xmllint /usr/bin/xmllint --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe curl /usr/bin/curl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe wget /usr/bin/wget --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe clang /usr/bin/clang --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe bc /usr/bin/bc --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe tcl /usr/bin/tclsh /dev/null && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe kill /usr/bin/kill --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ps /usr/bin/ps --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe top /usr/bin/top -v && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ip /usr/sbin/ip -Version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ss /usr/sbin/ss --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe taskset /usr/bin/taskset --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe time /usr/bin/time --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe yes /usr/bin/yes --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe shuf /usr/bin/shuf --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe cp /usr/bin/cp --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe mv /usr/bin/mv --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe rm /usr/bin/rm --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe mkdir /usr/bin/mkdir --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe rmdir /usr/bin/rmdir --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe touch /usr/bin/touch --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe chmod /usr/bin/chmod --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe chown /usr/bin/chown --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ln /usr/bin/ln --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe install /usr/bin/install --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe mkfifo /usr/bin/mkfifo --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe mktemp /usr/bin/mktemp --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe link /usr/bin/link --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe unlink /usr/bin/unlink --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sync /usr/bin/sync --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe truncate /usr/bin/truncate --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe who /usr/bin/who --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe w /usr/bin/w --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe last /usr/bin/last --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe lastlog /usr/bin/lastlog --help && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe wall /usr/bin/wall --version && passed=$((passed + 1)) || failed=$((failed + 1))
 
     total=$((passed + failed))
     if ((total != LITEINST_COMPAT_EXPECTED)); then
@@ -3199,7 +3241,7 @@ fi
 if ((LITEINST_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
     if ((failures == 0)); then
-        run_check "LiteInst compatibility baseline (130 programs)" run_liteinst_compatibility_envelope
+        run_check "LiteInst compatibility baseline (172 programs)" run_liteinst_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
