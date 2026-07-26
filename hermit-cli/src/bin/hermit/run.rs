@@ -98,8 +98,8 @@ pub struct RunOpts {
     #[clap(flatten)]
     pub(crate) det_opts: DetOptions,
 
-    /// Enable strict deterministic mode. This is currently the default; the flag is retained for
-    /// command-line compatibility.
+    /// Enable fail-closed strict deterministic mode. Deterministic scheduling and I/O are the
+    /// default; this explicit flag additionally rejects unsupported syscalls immediately.
     #[clap(
         long,
         conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io"]
@@ -889,14 +889,22 @@ fn display_runopts4() {
 }
 
 #[test]
-fn strict_flag_preserves_deterministic_defaults() {
-    let mut ro = RunOpts::parse_from(["fakehermit", "--strict", "fakeprog"]);
-    ro.validate_args_with_perf_support(true).unwrap();
+fn strict_flag_preserves_deterministic_defaults_and_rejects_unsupported_syscalls() {
+    let mut normal = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    normal.validate_args_with_perf_support(true).unwrap();
+    assert!(!normal.det_opts.det_config.panic_on_unsupported_syscalls);
 
-    assert!(ro.det_opts.det_config.sequentialize_threads);
-    assert!(ro.det_opts.det_config.deterministic_io);
-    assert!(!ro.det_opts.det_config.passthru_opt);
-    assert_eq!(format!("{}", ro), " -- fakeprog");
+    let mut strict = RunOpts::parse_from(["fakehermit", "--strict", "fakeprog"]);
+    strict.validate_args_with_perf_support(true).unwrap();
+
+    assert!(strict.det_opts.det_config.sequentialize_threads);
+    assert!(strict.det_opts.det_config.deterministic_io);
+    assert!(!strict.det_opts.det_config.passthru_opt);
+    assert!(strict.det_opts.det_config.panic_on_unsupported_syscalls);
+    assert_eq!(
+        format!("{}", strict),
+        " --panic-on-unsupported-syscalls -- fakeprog"
+    );
 }
 
 #[test]
@@ -917,6 +925,26 @@ fn passthru_optimization_requires_explicit_opt_in() {
 
     assert!(ro.det_opts.det_config.passthru_opt);
     assert_eq!(format!("{}", ro), " --passthru-opt -- fakeprog");
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review rejecting optimization that bypasses fail-closed policy.
+#[test]
+fn passthru_optimization_rejects_fail_closed_modes() {
+    for fail_closed in ["--strict", "--panic-on-unsupported-syscalls"] {
+        let mut opts =
+            RunOpts::parse_from(["fakehermit", "--passthru-opt", fail_closed, "fakeprog"]);
+        let error = opts.validate_args_with_perf_support(true).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("--passthru-opt"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("fail-closed"),
+            "unexpected error: {message}"
+        );
+    }
 }
 
 #[test]
@@ -1090,8 +1118,8 @@ fn strict_help_describes_compatibility_and_opt_outs() {
     let help = RunOpts::command().render_long_help().to_string();
     for expected in [
         "--strict",
-        "This is currently the default",
-        "command-line compatibility",
+        "fail-closed strict deterministic mode",
+        "rejects unsupported syscalls immediately",
         "--no-sequentialize-threads",
         "Disable deterministic sequential thread execution",
         "--no-deterministic-io",
@@ -1482,6 +1510,18 @@ impl RunOpts {
 
         config.sequentialize_threads = self.strict || !self.no_sequentialize_threads;
         config.deterministic_io = self.strict || !self.no_deterministic_io;
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-644): Review explicit strict mode failing on unsupported syscalls.
+        if self.strict {
+            config.panic_on_unsupported_syscalls = true;
+        }
+        if config.passthru_opt && config.panic_on_unsupported_syscalls {
+            anyhow::bail!(
+                "--passthru-opt cannot be combined with fail-closed unsupported-syscall handling \
+                 (--strict or --panic-on-unsupported-syscalls)"
+            );
+        }
+        config.shutdown_on_unsupported_syscall = config.panic_on_unsupported_syscalls;
 
         // virtualize_metadata implies virtualize_time
         if config.virtualize_metadata && !config.virtualize_time {
@@ -2195,6 +2235,7 @@ impl RunOpts {
         if std::env::var(FAIL_CLOSED_ENV).is_ok_and(|value| value == "1") {
             config.panic_on_unsupported_syscalls = true;
         }
+        config.shutdown_on_unsupported_syscall = config.panic_on_unsupported_syscalls;
         config
     }
 

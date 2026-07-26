@@ -178,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn unclassified_syscalls_still_advance_time() {
+    fn unsupported_syscalls_still_advance_time() {
         assert_eq!(cost_ns(Sysno::restart_syscall), FAST_NS);
         assert!(cost_ns(Sysno::restart_syscall) > 0);
     }

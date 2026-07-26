@@ -52,9 +52,13 @@ fn madvise_policy_verifies_in_run_record_and_kvm_modes() {
         .arg(&guest);
     command_output(compile, "madvise guest compilation");
 
-    for (label, extra_arg) in [
-        ("strict madvise verification", None),
-        ("passthru-opt madvise verification", Some("--passthru-opt")),
+    for (label, strict, extra_arg) in [
+        ("strict madvise verification", true, None),
+        (
+            "passthru-opt madvise verification",
+            false,
+            Some("--passthru-opt"),
+        ),
     ] {
         let mut verify = Command::new("timeout");
         verify
@@ -63,11 +67,13 @@ fn madvise_policy_verifies_in_run_record_and_kvm_modes() {
             .args([
                 "--log=off",
                 "run",
-                "--strict",
                 "--verify",
                 "--preemption-timeout=disabled",
                 "--base-env=minimal",
             ]);
+        if strict {
+            verify.arg("--strict");
+        }
         if let Some(arg) = extra_arg {
             verify.arg(arg);
         }

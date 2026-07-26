@@ -28,6 +28,7 @@ static DBI_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBI_EXEC_FAILURE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBI_EXECVEAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBI_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DBI_UNSUPPORTED_SYSCALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 fn hermit(args: &[&str]) -> Output {
@@ -149,6 +150,34 @@ fn dbi_wait_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "DBI wait guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review the DBI unsupported-syscall fixture build.
+fn dbi_unsupported_syscall_guest() -> &'static Path {
+    DBI_UNSUPPORTED_SYSCALL_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbi-unsupported-syscall");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create DBI unsupported-syscall guest directory");
+        let guest = build_root.join("dbi_unsupported_syscall");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/dbi_unsupported_syscall.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile DBI unsupported-syscall guest");
+        assert!(
+            output.status.success(),
+            "DBI unsupported-syscall guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -394,6 +423,167 @@ fn run_dbi_executes_integrated_backend() {
     let args = ["run", "--backend", "dbi", "--", "/bin/true"];
     let output = hermit(&args);
     assert_success(&output, &args);
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review ptrace verification warning delivery.
+#[test]
+fn run_ptrace_verify_reemits_unsupported_syscall_warning() {
+    let program = dbi_unsupported_syscall_guest()
+        .to_str()
+        .expect("unsupported-syscall guest path should be UTF-8");
+    let args = ["--log", "warn", "run", "--verify", "--", program];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let warning = "syscalls get_robust_list,getitimer used but not yet supported";
+    assert_eq!(
+        stderr(&output).matches(warning).count(),
+        1,
+        "verify did not re-emit exactly one aggregate warning:\n{}",
+        stderr(&output)
+    );
+}
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review DBI normal aggregation and strict failure coverage.
+#[test]
+fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
+    let program = dbi_unsupported_syscall_guest()
+        .to_str()
+        .expect("DBI unsupported-syscall guest path should be UTF-8");
+
+    let normal_args = ["run", "--backend", "dbi", "--verify", "--", program];
+    let normal = hermit(&normal_args);
+    assert_success(&normal, &normal_args);
+    assert_eq!(stdout(&normal), "dbi-unsupported-ok\n");
+    let normal_stderr = stderr(&normal);
+    let warning = "syscalls get_robust_list,getitimer used but not yet supported";
+    assert_eq!(
+        normal_stderr.matches(warning).count(),
+        1,
+        "expected one aggregate warning:\n{normal_stderr}"
+    );
+
+    let tamper_args = ["run", "--backend", "dbi", "--", program, "report-tamper"];
+    let tamper = hermit(&tamper_args);
+    assert_success(&tamper, &tamper_args);
+    assert_eq!(stdout(&tamper), "dbi-unsupported-report-tamper-ok\n");
+    assert_eq!(
+        stderr(&tamper).matches(warning).count(),
+        1,
+        "report tampering suppressed the aggregate warning:\n{}",
+        stderr(&tamper)
+    );
+
+    let fork_tamper_args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--",
+        program,
+        "fork-report-tamper",
+    ];
+    let fork_tamper = hermit(&fork_tamper_args);
+    assert_success(&fork_tamper, &fork_tamper_args);
+    assert_eq!(
+        stdout(&fork_tamper),
+        "dbi-unsupported-fork-report-tamper-ok\n"
+    );
+    assert_eq!(
+        stderr(&fork_tamper).matches(warning).count(),
+        1,
+        "fork-child report tampering suppressed the aggregate warning:\n{}",
+        stderr(&fork_tamper)
+    );
+
+    let strict_args = ["run", "--backend", "dbi", "--strict", "--", program];
+    let strict = hermit(&strict_args);
+    assert!(
+        !strict.status.success(),
+        "strict DBI unexpectedly succeeded:\n{}",
+        stderr(&strict)
+    );
+    assert!(
+        stderr(&strict).contains("unsupported syscall: getitimer"),
+        "strict DBI failure omitted unsupported syscall:\n{}",
+        stderr(&strict)
+    );
+    let normal_fork_args = ["run", "--backend", "dbi", "--verify", "--", program, "fork"];
+    let normal_fork = hermit(&normal_fork_args);
+    assert_success(&normal_fork, &normal_fork_args);
+    assert_eq!(stdout(&normal_fork), "dbi-unsupported-fork-ok\n");
+    assert_eq!(
+        stderr(&normal_fork).matches(warning).count(),
+        1,
+        "fork-child warning was not aggregated exactly once:\n{}",
+        stderr(&normal_fork)
+    );
+
+    let normal_fork_exec_args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--verify",
+        "--",
+        program,
+        "fork-exec",
+    ];
+    let normal_fork_exec = hermit(&normal_fork_exec_args);
+    assert_success(&normal_fork_exec, &normal_fork_exec_args);
+    assert_eq!(
+        stdout(&normal_fork_exec),
+        "dbi-unsupported-exec-ok\ndbi-unsupported-fork-exec-parent-ok\n"
+    );
+    assert_eq!(
+        stderr(&normal_fork_exec).matches(warning).count(),
+        1,
+        "fork-exec warning was not aggregated exactly once:\n{}",
+        stderr(&normal_fork_exec)
+    );
+
+    for mode in ["fork", "fork-exec", "fork-setsid-exec", "exec-empty"] {
+        let args = ["run", "--backend", "dbi", "--strict", "--", program, mode];
+        let output = hermit(&args);
+        assert!(
+            !output.status.success(),
+            "strict DBI {mode} unexpectedly succeeded:\n{}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("unsupported syscall"),
+            "strict DBI {mode} omitted unsupported-syscall diagnostic:\n{}",
+            stderr(&output)
+        );
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review strict DBI teardown with a blocked stdin source.
+#[test]
+fn run_dbi_strict_returns_with_blocked_stdin_source() {
+    let program = dbi_unsupported_syscall_guest()
+        .to_str()
+        .expect("DBI unsupported-syscall guest path should be UTF-8");
+    let mut source = Command::new("sleep")
+        .arg("30")
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to start blocked DBI stdin source");
+    let args = ["run", "--backend", "dbi", "--strict", "--", program];
+    let output = Command::new("timeout")
+        .args(["--kill-after", "2s", "10s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(args)
+        .stdin(source.stdout.take().expect("sleep stdout was not piped"))
+        .output()
+        .expect("failed to run strict DBI blocked-input regression");
+    let _ = source.kill();
+    let _ = source.wait();
+    assert_ne!(output.status.code(), Some(124), "strict DBI hung on stdin");
+    assert!(
+        !output.status.success(),
+        "strict DBI unexpectedly succeeded"
+    );
+    assert!(stderr(&output).contains("unsupported syscall"));
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -906,7 +1096,6 @@ fn run_dbi_verifies_shell_process_lifecycle() {
         "run",
         "--backend",
         "dbi",
-        "--strict",
         "--verify",
         "--",
         "/bin/sh",
@@ -933,7 +1122,6 @@ fn run_dbi_verifies_pipe_backpressure() {
         "run",
         "--backend",
         "dbi",
-        "--strict",
         "--verify",
         "--",
         "/bin/bash",
@@ -1127,7 +1315,6 @@ fn run_kvm_lists_host_directory_metadata() {
         "run",
         "--backend",
         "kvm",
-        "--strict",
         "--verify",
         "--base-env=minimal",
         "--tmp=/tmp",

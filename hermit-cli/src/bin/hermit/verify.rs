@@ -6,7 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::collections::BTreeSet;
 use std::io;
+use std::path::Path;
 use std::path::PathBuf;
 
 use colored::Colorize;
@@ -64,6 +66,30 @@ pub fn setup_double_run(
     let mut global2 = global.clone();
     global2.log_file = Some(path2);
     ((global, file1), (global2, file2))
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review re-emitting aggregate warnings captured by verification.
+fn unsupported_syscalls_from_log(path: &Path) -> io::Result<BTreeSet<String>> {
+    let mut syscalls = BTreeSet::new();
+    for line in std::fs::read_to_string(path)?.lines() {
+        let Some((_, remainder)) = line.split_once("syscalls ") else {
+            continue;
+        };
+        let Some((names, _)) = remainder.split_once(" used but not yet supported") else {
+            continue;
+        };
+        for name in names.split(',') {
+            if !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                syscalls.insert(name.to_owned());
+            }
+        }
+    }
+    Ok(syscalls)
 }
 
 pub fn compare_two_runs(
@@ -151,6 +177,11 @@ pub fn compare_two_runs(
         ))
     } else {
         // Allow the NamedTempFiles to be deleted in this case:
+        let mut unsupported = unsupported_syscalls_from_log(log1.as_ref())?;
+        unsupported.extend(unsupported_syscalls_from_log(log2.as_ref())?);
+        if let Some(message) = detcore::format_unsupported_syscall_warning(&unsupported) {
+            eprintln!("WARNING: {message}");
+        }
         eprintln!(":: {}", options.success_message.green().bold());
         Ok(out2.status)
     }
@@ -212,6 +243,21 @@ mod tests {
                 verbose: false,
             },
         )
+    }
+
+    #[test]
+    fn extracts_unsupported_syscall_warning_union_from_logs() {
+        let file = NamedTempFile::new().unwrap();
+        fs::write(
+            file.path(),
+            b"2026 WARN syscalls vmsplice,getppid used but not yet supported\ninvalid\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            unsupported_syscalls_from_log(file.path()).unwrap(),
+            BTreeSet::from(["getppid".to_owned(), "vmsplice".to_owned()])
+        );
     }
 
     #[test]

@@ -52,10 +52,11 @@ fn arch_prctl_controls_verify_in_run_and_record_modes() {
         .arg(&guest);
     command_output(compile, "arch_prctl guest compilation");
 
-    for (label, extra_args) in [
-        ("strict arch_prctl verification", None),
+    for (label, strict, extra_args) in [
+        ("strict arch_prctl verification", true, None),
         (
             "passthru-opt arch_prctl verification",
+            false,
             Some("--passthru-opt"),
         ),
     ] {
@@ -66,11 +67,13 @@ fn arch_prctl_controls_verify_in_run_and_record_modes() {
             .args([
                 "--log=off",
                 "run",
-                "--strict",
                 "--verify",
                 "--preemption-timeout=disabled",
                 "--base-env=minimal",
             ]);
+        if strict {
+            verify.arg("--strict");
+        }
         if let Some(arg) = extra_args {
             verify.arg(arg);
         }

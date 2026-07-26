@@ -18,6 +18,7 @@
 //! Reverie plugin. Generic runs use quiet compatibility checking, while
 //! `hermit --backend sabre strace` retains verbose syscall diagnostics.
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
@@ -65,6 +66,162 @@ impl DbiSummary {
             && self.memory_hash == other.memory_hash
     }
 }
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review inherited DBI policy descriptors and bounded reports.
+struct InstalledFd {
+    target: i32,
+    backup: Option<i32>,
+    original_flags: Option<i32>,
+}
+
+impl InstalledFd {
+    fn install(source: i32, target: i32) -> std::io::Result<Self> {
+        // Keep the backup above the reserved transport descriptor so installing the target
+        // cannot overwrite its backup.
+        let backup = unsafe {
+            libc::fcntl(
+                target,
+                libc::F_DUPFD_CLOEXEC,
+                detcore_dbi::UNSUPPORTED_SYSCALL_REPORT_FD + 1,
+            )
+        };
+        let backup = if backup == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EBADF) {
+                None
+            } else {
+                return Err(error);
+            }
+        } else {
+            Some(backup)
+        };
+        let original_flags = if let Some(backup_fd) = backup {
+            let flags = unsafe { libc::fcntl(target, libc::F_GETFD) };
+            if flags == -1 {
+                let error = std::io::Error::last_os_error();
+                let _ = unsafe { libc::close(backup_fd) };
+                return Err(error);
+            }
+            Some(flags)
+        } else {
+            None
+        };
+        let installed = Self {
+            target,
+            backup,
+            original_flags,
+        };
+        if unsafe { libc::dup2(source, target) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(target, libc::F_SETFD, 0) } == -1 {
+            let error = std::io::Error::last_os_error();
+            drop(installed);
+            return Err(error);
+        }
+        Ok(installed)
+    }
+}
+
+impl Drop for InstalledFd {
+    fn drop(&mut self) {
+        if let Some(backup) = self.backup {
+            let _ = unsafe { libc::dup2(backup, self.target) };
+            if let Some(flags) = self.original_flags {
+                let _ = unsafe { libc::fcntl(self.target, libc::F_SETFD, flags) };
+            }
+            let _ = unsafe { libc::close(backup) };
+        } else {
+            let _ = unsafe { libc::close(self.target) };
+        }
+    }
+}
+
+struct DbiUnsupportedSyscallReport {
+    reader: std::fs::File,
+    _writer: std::fs::File,
+    _report_fd: InstalledFd,
+}
+
+impl DbiUnsupportedSyscallReport {
+    fn new() -> std::io::Result<Self> {
+        let mut descriptors = [-1; 2];
+        let result =
+            unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        if result == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: pipe2 initialized both descriptors, transferring their ownership here.
+        let reader = unsafe { std::fs::File::from_raw_fd(descriptors[0]) };
+        let writer = unsafe { std::fs::File::from_raw_fd(descriptors[1]) };
+        let report_fd = InstalledFd::install(
+            writer.as_raw_fd(),
+            detcore_dbi::UNSUPPORTED_SYSCALL_REPORT_FD,
+        )?;
+        Ok(Self {
+            reader,
+            _writer: writer,
+            _report_fd: report_fd,
+        })
+    }
+
+    fn emit(&mut self) -> std::io::Result<()> {
+        const MAX_REPORT_BYTES: usize = 1024 * 1024;
+        let mut contents = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match self.reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    if contents.len() + read > MAX_REPORT_BYTES {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "DBI unsupported-syscall report exceeded 1 MiB",
+                        ));
+                    }
+                    contents.extend_from_slice(&buffer[..read]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        let contents = String::from_utf8_lossy(&contents);
+        let syscalls = contents
+            .lines()
+            .filter_map(|line| {
+                if let Some(raw) = line.strip_prefix("@") {
+                    let sysno = raw
+                        .parse::<i32>()
+                        .ok()
+                        .map(reverie::syscalls::Sysno::from)?;
+                    detcore::is_unsupported_syscall(sysno).then(|| sysno.to_string())
+                } else if !line.is_empty()
+                    && line.len() <= 64
+                    && line
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                {
+                    Some(line.to_owned())
+                } else {
+                    None
+                }
+            })
+            .take(512)
+            .collect::<BTreeSet<_>>();
+        if let Some(message) = detcore::format_unsupported_syscall_warning(&syscalls) {
+            eprintln!("WARNING: {message}");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DbiUnsupportedSyscallReport {
+    fn drop(&mut self) {
+        if let Err(error) = self.emit() {
+            eprintln!("WARNING: failed to read DBI unsupported-syscall report: {error}");
+        }
+    }
+}
 
 struct TeeReader<R, W> {
     input: R,
@@ -110,6 +267,10 @@ pub fn run_dbi(
             "failed to serialize the Detcore config for the DBI backend: {error}"
         ))
     })?;
+    // The full DetConfig now reaches the DBI runtime via the serialized env
+    // above; the fail-closed policy (PR #644) still drives process-group
+    // isolation and the client flag here.
+    let panic_on_unsupported_syscalls = config.panic_on_unsupported_syscalls;
 
     let stdin_is_terminal = std::io::stdin().is_terminal();
 
@@ -118,7 +279,7 @@ pub fn run_dbi(
             "failed to prepare the Detcore DynamoRIO client: {error}"
         ))
     })?;
-    let runner = DbiRunner::new(&drrun, &client)
+    let mut runner = DbiRunner::new(&drrun, &client)
         .map_err(|error| {
             Error::msg(format!(
                 "failed to configure the DynamoRIO DBI runner (drrun={}, client={}): {error}",
@@ -126,13 +287,18 @@ pub fn run_dbi(
                 client.display()
             ))
         })?
-        .summary(true);
+        .summary(true)
+        .isolated_process_group(panic_on_unsupported_syscalls);
+    if panic_on_unsupported_syscalls {
+        runner = runner.client_argument("-panic-on-unsupported-syscalls");
+    }
 
     eprintln!(
         "hermit: [dbi backend] Detcore Tool active; running {program:?} under DynamoRIO ({})",
         drrun.display()
     );
 
+    let _unsupported_report = DbiUnsupportedSyscallReport::new()?;
     let mut guest = StdCommand::new(program);
     if let Some(level) = log {
         guest.env("HERMIT_LOG", level.to_string());
@@ -223,14 +389,14 @@ pub fn run_dbi(
     Ok(ExitStatus::Exited(0))
 }
 
-fn run_once<R: Read + Send>(
+fn run_once<R: Read + Send + 'static>(
     runner: &DbiRunner,
     guest: &StdCommand,
     drrun: &Path,
     input: R,
 ) -> Result<Output, Error> {
     runner
-        .output_with_reader(guest, input)
+        .output_with_detached_reader(guest, input)
         .map_err(|error| launch_error(drrun, error))
 }
 

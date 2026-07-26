@@ -149,6 +149,9 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
     let default_config: detcore::Config = Default::default();
     let mut config = detcore::Config {
         panic_on_unsupported_syscalls: false,
+        exit_on_unsupported_syscall: false,
+        shutdown_on_unsupported_syscall: false,
+        unsupported_syscall_report_fd: None,
         panic_on_rcb_overshoot: false,
         sequentialize_threads: true,
         runs_post_fork: default_config.runs_post_fork,

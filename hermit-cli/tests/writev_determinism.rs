@@ -73,22 +73,22 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
          stdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
     );
 
-    for (label, extra_arg) in [
-        ("strict writev verification", None),
-        ("passthru-opt writev verification", Some("--passthru-opt")),
+    for (label, strict, extra_arg) in [
+        ("strict writev verification", true, None),
+        (
+            "passthru-opt writev verification",
+            false,
+            Some("--passthru-opt"),
+        ),
     ] {
         let mut verify = Command::new("timeout");
         verify
             .args(["--kill-after", "5s", "30s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
-            .args([
-                "--log=off",
-                "run",
-                "--strict",
-                "--verify",
-                "--panic-on-unsupported-syscalls",
-                "--base-env=minimal",
-            ]);
+            .args(["--log=off", "run", "--verify", "--base-env=minimal"]);
+        if strict {
+            verify.args(["--strict", "--panic-on-unsupported-syscalls"]);
+        }
         if let Some(arg) = extra_arg {
             verify.arg(arg);
         }

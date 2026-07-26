@@ -25,8 +25,9 @@ pub(crate) enum SyscallClassification {
     Determinized,
     /// The syscall is intentionally forwarded under documented container assumptions.
     PassThrough,
-    /// The syscall retains the legacy fail-closed-or-forward policy pending investigation.
-    Unclassified,
+    /// The syscall lacks a deterministic implementation and uses the configured fallback policy.
+    // TODO-HUMAN-REVIEW(PR-643): Review the issue-backed unsupported classification policy.
+    Unsupported,
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -443,16 +444,42 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::rt_sigreturn => SyscallClassification::PassThrough,
         // ===== END PASS-THRU SYSCALLS =====
 
-        // ===== UNCLASSIFIED (TEMPORARY PASS-THRU) =====
-        // TODO/FIXME: These syscalls have not been classified. They temporarily use
-        // the legacy passthrough policy and may need deterministic handling. Each must
-        // be investigated and moved to DETERMINIZED or PASS-THRU.
+        // ===== ISSUE-REVIEWED PASS-THROUGH SYSCALLS =====
+        // Every matching classification issue recommends PASS-THRU. These remain
+        // conditional on Hermit's fixed-container and stable-state assumptions.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-643): Review issue-backed pass-through promotions.
+        Sysno::chroot
+        | Sysno::get_thread_area
+        | Sysno::mknod
+        | Sysno::mknodat
+        | Sysno::mlock
+        | Sysno::mlock2
+        | Sysno::mlockall
+        | Sysno::modify_ldt
+        | Sysno::personality
+        | Sysno::pkey_alloc
+        | Sysno::pkey_free
+        | Sysno::pkey_mprotect
+        | Sysno::sched_get_priority_max
+        | Sysno::sched_get_priority_min
+        | Sysno::set_thread_area
+        | Sysno::sync
+        | Sysno::syncfs
+        => SyscallClassification::PassThrough,
+        // ===== END ISSUE-REVIEWED PASS-THROUGH SYSCALLS =====
+
+        // ===== UNSUPPORTED SYSCALLS =====
+        // These require a deterministic handler or further investigation. Normal mode
+        // records their use for an aggregate warning and preserves legacy forwarding;
+        // --panic-on-unsupported-syscalls stops at the first use.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-643): Review issue-backed unsupported classifications.
         Sysno::acct
         | Sysno::add_key
         | Sysno::adjtimex
         | Sysno::bpf
         | Sysno::cachestat
-        | Sysno::chroot
         | Sysno::clock_adjtime
         | Sysno::close_range
         | Sysno::copy_file_range
@@ -463,7 +490,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::futex_waitv
         | Sysno::futex_wake
         | Sysno::get_robust_list
-        | Sysno::get_thread_area
         | Sysno::getitimer
         | Sysno::ioprio_get
         | Sysno::ioprio_set
@@ -479,22 +505,12 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::map_shadow_stack
         | Sysno::memfd_secret
         | Sysno::mincore
-        | Sysno::mknod
-        | Sysno::mknodat
-        | Sysno::mlock
-        | Sysno::mlock2
-        | Sysno::mlockall
-        | Sysno::modify_ldt
         | Sysno::name_to_handle_at
         | Sysno::openat2
         | Sysno::perf_event_open
-        | Sysno::personality
         | Sysno::pidfd_getfd
         | Sysno::pidfd_open
         | Sysno::pidfd_send_signal
-        | Sysno::pkey_alloc
-        | Sysno::pkey_free
-        | Sysno::pkey_mprotect
         | Sysno::preadv
         | Sysno::preadv2
         | Sysno::process_mrelease
@@ -510,8 +526,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::restart_syscall
         | Sysno::rt_sigqueueinfo
         | Sysno::rt_tgsigqueueinfo
-        | Sysno::sched_get_priority_max
-        | Sysno::sched_get_priority_min
         | Sysno::sched_getattr
         | Sysno::sched_setattr
         | Sysno::seccomp
@@ -521,7 +535,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::semop
         | Sysno::semtimedop
         | Sysno::sendfile
-        | Sysno::set_thread_area
         | Sysno::setfsgid
         | Sysno::setfsuid
         | Sysno::setgid
@@ -538,16 +551,14 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::shutdown
         | Sysno::splice
         | Sysno::statmount
-        | Sysno::sync
-        | Sysno::syncfs
         | Sysno::sysfs
         | Sysno::syslog
         | Sysno::tee
         | Sysno::times
         | Sysno::tkill
         | Sysno::ustat
-        | Sysno::vmsplice => SyscallClassification::Unclassified,
-        // ===== END UNCLASSIFIED =====
+        | Sysno::vmsplice => SyscallClassification::Unsupported,
+        // ===== END UNSUPPORTED SYSCALLS =====
 
         // `Sysno` is `#[non_exhaustive]` outside its crate. The const ABI guards above
         // make changes to the pinned table a compile error; this arm only satisfies the
@@ -705,11 +716,11 @@ mod tests {
             match classify_syscall(sysno) {
                 SyscallClassification::Determinized => counts[0] += 1,
                 SyscallClassification::PassThrough => counts[1] += 1,
-                SyscallClassification::Unclassified => counts[2] += 1,
+                SyscallClassification::Unsupported => counts[2] += 1,
             }
         }
 
-        assert_eq!(counts, [199, 74, 100]);
+        assert_eq!(counts, [199, 91, 83]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -836,7 +847,28 @@ mod tests {
             assert_eq!(classify_syscall(sysno), SyscallClassification::PassThrough);
         }
         for sysno in [Sysno::add_key, Sysno::keyctl, Sysno::request_key] {
-            assert_eq!(classify_syscall(sysno), SyscallClassification::Unclassified);
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
+        }
+        for sysno in [
+            Sysno::chroot,
+            Sysno::get_thread_area,
+            Sysno::mknod,
+            Sysno::mknodat,
+            Sysno::mlock,
+            Sysno::mlock2,
+            Sysno::mlockall,
+            Sysno::modify_ldt,
+            Sysno::personality,
+            Sysno::pkey_alloc,
+            Sysno::pkey_free,
+            Sysno::pkey_mprotect,
+            Sysno::sched_get_priority_max,
+            Sysno::sched_get_priority_min,
+            Sysno::set_thread_area,
+            Sysno::sync,
+            Sysno::syncfs,
+        ] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::PassThrough);
         }
         // Batch 3: NUMA memory-placement and Linux CPU-scheduling policy are
         // determinized to fixed, host-independent results (single virtual NUMA
@@ -882,9 +914,9 @@ mod tests {
             assert!(is_unsupported_async_ipc_syscall(sysno));
         }
         // System V semaphores and shared memory are deliberately still
-        // unclassified (intra-container primitives pending a dedicated decision).
+        // unsupported (intra-container primitives pending a dedicated decision).
         for sysno in [Sysno::semget, Sysno::semop, Sysno::shmget, Sysno::shmat] {
-            assert_eq!(classify_syscall(sysno), SyscallClassification::Unclassified);
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
             assert!(!is_unsupported_async_ipc_syscall(sysno));
         }
     }

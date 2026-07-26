@@ -10,13 +10,16 @@
 //! the Detcore tool.
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::btree_map::Entry;
 use std::fmt::Debug;
 use std::fs;
 use std::fs::File;
+use std::io::Write;
 use std::num::NonZeroUsize;
+use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -189,6 +192,12 @@ pub struct GlobalState {
     // used ports
     used_ports: Mutex<HashSet<u16>>,
 
+    // Unsupported syscall names observed across every process in this run.
+    unsupported_syscalls: Mutex<BTreeSet<String>>,
+
+    // Optional append-only sink shared by DBI fork descendants.
+    unsupported_syscall_report_fd: Option<Mutex<File>>,
+
     // Open file description to bound port.
     open_file_to_port: Mutex<HashMap<OpenFileId, u16>>,
 
@@ -230,6 +239,12 @@ impl Default for GlobalState {
 
 impl Drop for GlobalState {
     fn drop(&mut self) {
+        // TODO-HUMAN-REVIEW(PR-643): Review shutdown-time aggregate warning delivery.
+        if let Some(message) =
+            format_unsupported_syscall_warning(&self.unsupported_syscalls.lock().unwrap())
+        {
+            warn!("{}", message);
+        }
         info!("detcore shut down, destroying global state");
     }
 }
@@ -250,10 +265,26 @@ impl GlobalState {
             .map(|path| PreemptionReader::new(path));
         let range = Self::read_port_range();
 
+        let unsupported_syscall_report_fd = cfg.unsupported_syscall_report_fd.and_then(|fd| {
+            let duplicate = unsafe { libc::dup(fd) };
+            if duplicate == -1 {
+                warn!(
+                    "failed to duplicate unsupported-syscall report fd {fd}: {}",
+                    std::io::Error::last_os_error()
+                );
+                None
+            } else {
+                // SAFETY: dup returned a new owned descriptor.
+                Some(Mutex::new(unsafe { File::from_raw_fd(duplicate) }))
+            }
+        });
+
         Self {
             sched,
             next_port: AtomicU16::new(range[0]),
             used_ports: Mutex::new(HashSet::new()),
+            unsupported_syscalls: Mutex::new(BTreeSet::new()),
+            unsupported_syscall_report_fd,
             port_start_range: AtomicU16::new(range[0]),
             port_end_range: AtomicU16::new(range[1]),
             open_file_to_port: Mutex::new(HashMap::new()),
@@ -445,6 +476,21 @@ impl GlobalTool for GlobalState {
             }
             GlobalRequest::ReleaseAllResources => {
                 R::ReleaseAllResources(self.recv_release_all_resources(from).await)
+            }
+            // TODO-HUMAN-REVIEW(PR-643): Review run-wide unsupported-syscall aggregation.
+            GlobalRequest::ReportUnsupportedSyscall(name) => {
+                let inserted = self
+                    .unsupported_syscalls
+                    .lock()
+                    .unwrap()
+                    .insert(name.clone());
+                if inserted
+                    && let Some(report) = &self.unsupported_syscall_report_fd
+                    && let Err(error) = writeln!(report.lock().unwrap(), "{name}")
+                {
+                    warn!("failed to append unsupported-syscall report: {error}");
+                }
+                R::ReportUnsupportedSyscall(())
             }
             GlobalRequest::MarkPastFirstExecve => {
                 self.past_first_execve.store(true, SeqCst);
@@ -1175,6 +1221,10 @@ pub enum GlobalRequest {
     /// For convenience, release all the resources held by the current TID.
     ReleaseAllResources,
 
+    // TODO-HUMAN-REVIEW(PR-643): Review this new Detcore global RPC request.
+    /// Add a syscall to the run-wide unsupported-use summary.
+    ReportUnsupportedSyscall(String),
+
     /// Mark the initial image transition complete for backends that begin post-exec.
     MarkPastFirstExecve,
 
@@ -1249,6 +1299,8 @@ pub enum GlobalResponse {
     RequestResources(ResumeStatus),
     ReleaseResources(()),
     ReleaseAllResources(()),
+    // TODO-HUMAN-REVIEW(PR-643): Review this new Detcore global RPC response.
+    ReportUnsupportedSyscall(()),
     MarkPastFirstExecve(()),
     CreateChildThread(()),
     /// Includes optional preemption points for the new thread.
@@ -1276,6 +1328,20 @@ pub enum GlobalResponse {
     PortFull,
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review the shared warning formatter API.
+/// Formats one deterministic warning for a set of unsupported syscall names.
+pub fn format_unsupported_syscall_warning(syscalls: &BTreeSet<String>) -> Option<String> {
+    if syscalls.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "syscalls {} used but not yet supported",
+            syscalls.iter().cloned().collect::<Vec<_>>().join(",")
+        ))
+    }
+}
+
 pub async fn mark_past_first_execve<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
@@ -1283,6 +1349,20 @@ where
 {
     let (_, response) = send_and_update_time(guest, GlobalRequest::MarkPastFirstExecve).await;
     assert_eq!(response, GlobalResponse::MarkPastFirstExecve(()));
+}
+
+// TODO-HUMAN-REVIEW(PR-643): Review the guest-to-global unsupported-syscall report path.
+pub async fn report_unsupported_syscall<G, T>(guest: &mut G, sysno: Sysno)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) = send_and_update_time(
+        guest,
+        GlobalRequest::ReportUnsupportedSyscall(sysno.to_string()),
+    )
+    .await;
+    assert_eq!(response, GlobalResponse::ReportUnsupportedSyscall(()));
 }
 
 pub async fn send_and_update_time<G, T>(
@@ -1808,4 +1888,26 @@ where
 
     // In this scenario a backtrace doesn't really help us.
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::format_unsupported_syscall_warning;
+
+    #[test]
+    fn unsupported_syscall_warning_is_sorted_and_aggregated() {
+        let syscalls = BTreeSet::from([
+            "vmsplice".to_owned(),
+            "getppid".to_owned(),
+            "getppid".to_owned(),
+        ]);
+
+        assert_eq!(
+            format_unsupported_syscall_warning(&syscalls).as_deref(),
+            Some("syscalls getppid,vmsplice used but not yet supported")
+        );
+        assert_eq!(format_unsupported_syscall_warning(&BTreeSet::new()), None);
+    }
 }
