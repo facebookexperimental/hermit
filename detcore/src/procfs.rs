@@ -6,7 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Deterministic snapshots for volatile procfs files.
+//! Deterministic snapshots for volatile procfs and sysfs files.
 
 use std::path::Path;
 
@@ -20,6 +20,7 @@ enum ProcfsKind {
     Cpuinfo,
     Loadavg,
     Uptime,
+    ScalingCurFreq,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -39,6 +40,18 @@ impl ProcfsFile {
             "/proc/cpuinfo" => ProcfsKind::Cpuinfo,
             "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
+            // a live hardware reading that differs run-to-run and breaks tools
+            // like `lscpu` under `--verify`. These are opened relative to a
+            // `/sys/devices/system/cpu` directory fd, so match on the suffix
+            // rather than an absolute path.
+            other
+                if other.ends_with("cpufreq/scaling_cur_freq")
+                    || other.ends_with("cpufreq/cpuinfo_cur_freq") =>
+            {
+                ProcfsKind::ScalingCurFreq
+            }
             _ => return None,
         };
         Some(Self {
@@ -68,6 +81,7 @@ impl ProcfsFile {
             ProcfsKind::Cpuinfo => sanitize_cpuinfo(&contents),
             ProcfsKind::Loadavg => sanitize_loadavg(&contents),
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
+            ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
         });
         self.offset = 0;
     }
@@ -198,6 +212,21 @@ fn sanitize_cpuinfo(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-764)
+/// Normalizes a cpufreq `scaling_cur_freq` / `cpuinfo_cur_freq` snapshot. The
+/// instantaneous core frequency is a live hardware reading that varies between
+/// otherwise identical runs, so replace it with a fixed value. This mirrors the
+/// `cpu MHz` zeroing already done for `/proc/cpuinfo` in [`sanitize_cpuinfo`],
+/// and keeps the static `cpuinfo_max_freq`/`scaling_max_freq` files untouched.
+fn sanitize_scaling_cur_freq(contents: &[u8]) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        b"0\n".to_vec()
+    }
+}
+
 fn sanitize_loadavg(contents: &[u8]) -> Vec<u8> {
     if contents.is_empty() {
         Vec::new()
@@ -251,6 +280,34 @@ mod tests {
             ProcfsKind::Uptime
         );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
+    }
+
+    #[test]
+    fn recognizes_cpufreq_current_frequency_by_suffix() {
+        // Opened relative to a `/sys/devices/system/cpu` directory fd.
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("cpu0/cpufreq/scaling_cur_freq"))
+                .unwrap()
+                .kind,
+            ProcfsKind::ScalingCurFreq
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new(
+                "/sys/devices/system/cpu/cpu3/cpufreq/cpuinfo_cur_freq"
+            ))
+            .unwrap()
+            .kind,
+            ProcfsKind::ScalingCurFreq
+        );
+        // The static min/max limits are deterministic and must not be rewritten.
+        assert!(ProcfsFile::from_path(Path::new("cpu0/cpufreq/cpuinfo_max_freq")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("cpu0/cpufreq/scaling_max_freq")).is_none());
+    }
+
+    #[test]
+    fn scaling_cur_freq_is_fixed() {
+        assert_eq!(sanitize_scaling_cur_freq(b"2483951\n"), b"0\n");
+        assert!(sanitize_scaling_cur_freq(b"").is_empty());
     }
 
     #[test]
