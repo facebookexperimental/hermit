@@ -1,0 +1,36 @@
+program,category,dbi_run_exit,dbi_eq_native,dbi_L2_verify,ptrace_parity,note
+echo,trivial,0,Y,PASS,SAME,
+true,trivial,0,Y,PASS,SAME,
+false,trivial,1,Y,not_in_L2_corpus,SAME,intended nonzero exit
+printf,trivial,0,Y,PASS,SAME,
+pwd,sysutil,0,Y,PASS,not_diffed,cwd
+whoami,sysutil,0,Y,not_in_L2_corpus,DIFFERS,dbi=newton vs ptrace=root (container uid map bypassed)
+id,sysutil,0,Y,PASS,DIFFERS,dbi uid=212630 vs ptrace=0 (container uid map bypassed)
+hostname,sysutil,0,Y,not_in_L2_corpus,DIFFERS,dbi=real host vs ptrace=hermetic-container.local (UTS ns bypassed)
+uname,sysutil,0,N,PASS,DIFFERS,"dbi_eq_native=N because Detcore virtualizes kernel version (5.2.0 vs native 6.17.13); ptrace parity DIFFERS on nodename (real vs hermetic-container.local)"
+arch,sysutil,0,Y,PASS,SAME,
+nproc,sysutil,0,N,PASS,SAME,dbi=ptrace=1 (CPU count virtualized); dbi_eq_native=N vs native 316 is intended
+seq,textutil,0,Y,PASS,SAME,
+cat,textutil,0,Y,PASS,SAME,
+head,textutil,0,Y,PASS,SAME,
+tail,textutil,0,Y,not_in_L2_corpus,SAME,
+wc,textutil,0,Y,PASS,SAME,
+sort,textutil,0,Y,PASS,SAME,
+uniq,textutil,0,Y,not_in_L2_corpus,SAME,
+cut,textutil,0,Y,not_in_L2_corpus,SAME,
+tr,textutil,1,Y,not_in_L2_corpus,SAME,intended nonzero exit
+rev,textutil,0,Y,not_in_L2_corpus,SAME,
+base64,textutil,0,Y,PASS,SAME,
+sha256sum,textutil,0,Y,PASS,SAME,
+cksum,textutil,0,Y,not_in_L2_corpus,SAME,
+od,textutil,0,Y,PASS,SAME,
+nl,textutil,0,Y,not_in_L2_corpus,SAME,
+tac,textutil,0,Y,not_in_L2_corpus,SAME,
+date,time,0,N,PASS,DIFFERS,"dbi=1970 vs ptrace=2021 (vDSO clock bypass, reverie-dbi #705); deterministic under dbi so still L2 PASS"
+sleep,time,0,Y,not_in_L2_corpus,SAME,sleep 0
+sh_exit,shell,23,Y,PASS,SAME,sh -c 'exit 23'
+bash_echo,shell,0,Y,PASS,SAME,
+bash_pipe,shell,0,Y,PASS,SAME,bash -c 'echo a b c | wc -w'
+bash_loop,shell,0,Y,not_in_L2_corpus,SAME,bash -c 'for i in 1 2 3; do echo $i; done'
+python3,interpreter,0,Y,PASS,SAME,python3 -c 'print(2+2)'
+perl,interpreter,0,Y,PASS,SAME,perl -e 'print "perlhi\n"'

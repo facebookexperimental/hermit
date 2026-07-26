@@ -1,0 +1,25 @@
+{
+  "question": "How large is the real program-compatibility envelope of the DBI backend (real Detcore<DbiGuest>) after PR #713 wired DetConfig, and where are the remaining backend-parity gaps versus ptrace?",
+  "date": "2026-07-25",
+  "hermit_sha": "86e14633e71319ffc9eed9180e39f1ed9b01cec5",
+  "hermit_branch": "dbi-sprint",
+  "reverie_dbi_pinned_rev": "0e77d260a84083f462ba10b986c8a72ab8f92758",
+  "backend": "dbi (Detcore<DbiGuest> over DynamoRIO)",
+  "dynamorio": "bundled via reverie-dbi build.rs (drrun at target/release/build/reverie-dbi-*/out/dynamorio-install/bin64/drrun)",
+  "dbi_native_client": "detcore-dbi cdylib built by detcore_dbi::prepare_native_client() via cmake from reverie_dbi::native_client_source_dir()",
+  "host": {
+    "kernel": "6.17.13-0_fbk0_crackerjackhost_0_g2b4321c50d79",
+    "cpu": "AMD EPYC 9D85 158-Core Processor",
+    "nproc": 316,
+    "perf_event_paranoid": 1,
+    "note": "shared devserver under heavy concurrent load (30+ other hermit processes during measurement); isolated timeouts required to avoid contention-induced false TIMEOUTs"
+  },
+  "toolchain": "rustc 1.99.0-nightly (be8e82435 2026-07-11)",
+  "commands": {
+    "functional_and_parity": "bash run_matrix.sh   (native vs ptrace vs dbi run: stdout+exit)",
+    "l2_determinism": "bash l2_sweep.sh   (hermit run --backend dbi --strict --verify: bitwise-identical repeat)",
+    "combined": "bash combined_matrix.sh   (produces results.csv: native/ptrace/dbi-run/dbi-L2 per program)",
+    "clock_probe": "hermit run --backend dbi -- ./clockprobe   (vDSO vs forced raw clock_gettime syscall)"
+  },
+  "env_setup": "source hermit/.env.dbi is NOT required (DynamoRIO + client are bundled/auto-built); a stale reflinked target/ CMakeCache must be cleared: rm -rf target/release/**/detcore-dbi-native-* before first DBI run in a fresh worktree"
+}
