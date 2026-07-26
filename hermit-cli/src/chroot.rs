@@ -22,7 +22,7 @@ pub struct TempChroot {
 
 impl TempChroot {
     /// Creates a temporary directory that the tracee will chroot to. It is here
-    /// where we can hard link files needed by the tracee.
+    /// where we can copy files needed by the tracee.
     pub fn new_in(data_dir: &Path) -> io::Result<Self> {
         let dir = TempDir::new_in(data_dir)?;
         Ok(Self { dir })
@@ -36,30 +36,6 @@ impl TempChroot {
     /// Returns a path relative to the chroot directory.
     pub fn relpath(&self, path: &Path) -> PathBuf {
         self.path().join(path.strip_prefix("/").unwrap_or(path))
-    }
-
-    /// Hard link a file path into the chroot directory. Any intermediate
-    /// directory that the path has will also be created. `link` must be an
-    /// absolute path.
-    ///
-    /// NOTE: The `path` should be a path on the same file system. Otherwise this
-    /// will fail. This should be the case if the path being hard linked has
-    /// already been copied to the recording directory.
-    ///
-    /// NOTE: This should only be used for paths we are certain will not be
-    /// modified by a replay. Otherwise, we could end up currupting a previously
-    /// recorded file.
-    ///
-    /// NOTE: This does not handle symlinks. If `path` is a symlink, the real
-    /// path is not hard linked, just the symlink itself.
-    pub fn hard_link(&self, original: &Path, link: &Path) -> io::Result<()> {
-        let link = self.relpath(link);
-
-        if let Some(dir) = link.parent() {
-            fs::create_dir_all(dir)?;
-        }
-
-        fs::hard_link(original, link)
     }
 
     /// Create symlink a file path into the chroot directory. Any intermediate

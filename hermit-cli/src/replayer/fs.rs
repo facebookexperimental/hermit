@@ -10,12 +10,15 @@ use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 use std::os::fd::RawFd;
+use std::os::unix::fs::FileExt;
 
 use reverie::Errno;
 use reverie::Guest;
 use reverie::Stack;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
+use reverie::syscalls::Fcntl;
+use reverie::syscalls::FcntlCmd;
 use reverie::syscalls::Ftruncate;
 use reverie::syscalls::Getdents;
 use reverie::syscalls::Getdents64;
@@ -35,6 +38,8 @@ use reverie::syscalls::family::WriteFamily;
 use reverie::syscalls::ioctl;
 
 use super::Replayer;
+use crate::event::FileCloneImage;
+use crate::event::ReplayFdKind;
 use crate::event::deterministic_ioctl_error;
 
 #[repr(C)]
@@ -98,6 +103,115 @@ async fn wait_for_replay_output(output_fd: RawFd) -> bool {
             false
         }
     }
+}
+
+const CLONE_COPY_CHUNK_BYTES: usize = 1024 * 1024;
+
+fn restore_sparse_clone_sidecar(
+    source: &std::fs::File,
+    destination: &std::fs::File,
+    length: u64,
+    destination_offset: u64,
+) -> std::io::Result<()> {
+    let mut cursor = 0u64;
+    let mut buffer = vec![0; CLONE_COPY_CHUNK_BYTES];
+    while cursor < length {
+        // SAFETY: source is owned and cursor fits off_t on x86_64.
+        let data_offset = unsafe {
+            libc::lseek(
+                source.as_raw_fd(),
+                cursor.try_into().unwrap(),
+                libc::SEEK_DATA,
+            )
+        };
+        let (data_offset, hole) = if data_offset == -1 {
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::ENXIO) => break,
+                Some(libc::EINVAL) => (0, length),
+                _ => return Err(error),
+            }
+        } else {
+            // SAFETY: source is owned and data_offset came from lseek.
+            let hole = unsafe { libc::lseek(source.as_raw_fd(), data_offset, libc::SEEK_HOLE) };
+            if hole == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ENXIO) {
+                    return Err(error);
+                }
+            }
+            (
+                data_offset as u64,
+                if hole == -1 {
+                    length
+                } else {
+                    (hole as u64).min(length)
+                },
+            )
+        };
+
+        let mut offset = data_offset;
+        while offset < hole {
+            let count = usize::try_from((hole - offset).min(buffer.len() as u64)).unwrap();
+            source.read_exact_at(&mut buffer[..count], offset)?;
+            destination.write_all_at(
+                &buffer[..count],
+                destination_offset.checked_add(offset).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "clone offset overflow")
+                })?,
+            )?;
+            offset += count as u64;
+        }
+        cursor = hole;
+    }
+    Ok(())
+}
+
+fn clear_clone_destination_range(
+    file: &std::fs::File,
+    offset: u64,
+    length: u64,
+) -> std::io::Result<()> {
+    if length == 0 {
+        return Ok(());
+    }
+    // SAFETY: file is an owned regular-file descriptor and the range was
+    // accepted by the recorded FICLONERANGE operation.
+    let result = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            offset.try_into().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "clone offset overflow")
+            })?,
+            length.try_into().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "clone length overflow")
+            })?,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if !matches!(
+        error.raw_os_error(),
+        Some(libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL)
+    ) {
+        return Err(error);
+    }
+
+    tracing::warn!(%error, "hole punching unavailable; zeroing cloned replay range");
+    let zeros = vec![0; CLONE_COPY_CHUNK_BYTES];
+    let mut written = 0u64;
+    while written < length {
+        let count = usize::try_from((length - written).min(zeros.len() as u64)).unwrap();
+        let write_offset = offset.checked_add(written).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "clone offset overflow")
+        })?;
+        file.write_all_at(&zeros[..count], write_offset)?;
+        written += count as u64;
+    }
+    Ok(())
 }
 
 fn write_replay_output_once(
@@ -352,17 +466,135 @@ fn read_write_bytes<M: MemoryAccess>(
     }
 }
 
+fn vectored_offset(low: u64, high: u64) -> i64 {
+    if std::mem::size_of::<usize>() == 8 {
+        low as i64
+    } else {
+        ((high << 32) | (low & u32::MAX as u64)) as i64
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#662): Audit temporary blocking and restoration for replay side effects.
+async fn inject_kernel_side_effect<G: Guest<Replayer>>(
+    guest: &mut G,
+    fd: libc::c_int,
+    syscall: Syscall,
+) -> Result<i64, Errno> {
+    let result = guest.inject(syscall).await;
+    if result != Err(Errno::EAGAIN) {
+        return result;
+    }
+
+    let flags = guest
+        .inject(Fcntl::new().with_fd(fd).with_cmd(FcntlCmd::F_GETFL))
+        .await? as libc::c_int;
+    if flags & libc::O_NONBLOCK == 0 {
+        return result;
+    }
+    guest
+        .inject(
+            Fcntl::new()
+                .with_fd(fd)
+                .with_cmd(FcntlCmd::F_SETFL(flags & !libc::O_NONBLOCK)),
+        )
+        .await?;
+    let result = guest.inject(syscall).await;
+    let restored = guest
+        .inject(Fcntl::new().with_fd(fd).with_cmd(FcntlCmd::F_SETFL(flags)))
+        .await;
+    assert_eq!(restored, Ok(0), "failed to restore replay fd flags");
+    result
+}
+
 impl Replayer {
+    fn advance_regular_file_position(&self, pid: reverie::Pid, fd: libc::c_int, length: usize) {
+        if !self.fd_is_in_replay_root(pid, fd) {
+            return;
+        }
+        let duplicate = crate::fd::duplicate_guest_fd(pid, fd)
+            .unwrap_or_else(|error| panic!("failed to duplicate replay file for read: {error}"));
+        let offset = libc::off_t::try_from(length).expect("recorded read length exceeds off_t");
+        // SAFETY: duplicate is an owned descriptor and the recorded read succeeded.
+        let result = unsafe { libc::lseek(duplicate.as_raw_fd(), offset, libc::SEEK_CUR) };
+        assert_ne!(
+            result,
+            -1,
+            "failed to advance replay file after read: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    fn replay_regular_file_write<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        syscall: WriteFamily,
+        count: usize,
+        offset: Option<i64>,
+        advances_offset: bool,
+    ) -> Result<(), Errno> {
+        if !self.fd_is_in_replay_root(guest.pid(), syscall.fd()) {
+            return Ok(());
+        }
+        let offset = offset.expect("recorded regular-file write is missing its offset");
+        let offset_u64 = u64::try_from(offset).expect("recorded write used a negative offset");
+        let bytes = read_write_bytes(&guest.memory(), syscall, count)?;
+        let duplicate = crate::fd::duplicate_guest_fd(guest.pid(), syscall.fd())
+            .unwrap_or_else(|error| panic!("failed to duplicate replay file for write: {error}"));
+        let file = std::fs::File::from(duplicate);
+        file.write_all_at(&bytes, offset_u64)
+            .unwrap_or_else(|error| panic!("failed to materialize replay write: {error}"));
+
+        if advances_offset {
+            let next = offset
+                .checked_add(i64::try_from(count).expect("recorded write length exceeds i64"))
+                .expect("recorded write offset overflow");
+            // SAFETY: file owns a duplicate of the guest open-file description.
+            let result = unsafe { libc::lseek(file.as_raw_fd(), next, libc::SEEK_SET) };
+            assert_eq!(
+                result,
+                next,
+                "failed to advance replay file after write: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(())
+    }
+
     /// Replays the vectored read family (`readv`/`preadv`/`preadv2`) by
     /// scattering the recorded flattened output bytes across the guest's current
-    /// `iovec` buffers, without touching any live descriptor.
+    /// `iovec` buffers. Guest-created regular files and eventfds are also read
+    /// live so their kernel state remains aligned with the recording.
     pub(super) async fn handle_readv_family<G: Guest<Self>>(
         &self,
         guest: &mut G,
         iov_addr: Option<usize>,
         iovcnt: usize,
+        syscall: Syscall,
     ) -> Result<i64, Errno> {
         let event = next_event!(guest, ReadvV2)?;
+        let (fd, advances_offset) = match syscall {
+            Syscall::Readv(call) => (call.fd(), true),
+            Syscall::Preadv(call) => (call.fd(), false),
+            Syscall::Preadv2(call) => {
+                (call.fd(), vectored_offset(call.pos_l(), call.pos_h()) == -1)
+            }
+            _ => unreachable!("readv-family handler received {syscall:?}"),
+        };
+        match event.replay_fd_kind {
+            ReplayFdKind::Eventfd => {
+                let actual = inject_kernel_side_effect(guest, fd, syscall).await;
+                assert_eq!(
+                    actual,
+                    Ok(event.bytes.len() as i64),
+                    "replayed readv eventfd side effect diverged"
+                );
+            }
+            ReplayFdKind::RegularFile if advances_offset => {
+                self.advance_regular_file_position(guest.pid(), fd, event.bytes.len());
+            }
+            ReplayFdKind::None | ReplayFdKind::RegularFile => {}
+        }
         for _ in 0..event.consumed_sigpipe_count {
             self.consume_pending_sigpipe(guest).await?;
         }
@@ -377,6 +609,20 @@ impl Replayer {
         syscall: Read,
     ) -> Result<i64, Errno> {
         let event = next_event!(guest, ReadV2)?;
+        match event.replay_fd_kind {
+            ReplayFdKind::Eventfd => {
+                let actual = inject_kernel_side_effect(guest, syscall.fd(), syscall.into()).await;
+                assert_eq!(
+                    actual,
+                    Ok(event.bytes.len() as i64),
+                    "replayed read eventfd side effect diverged"
+                );
+            }
+            ReplayFdKind::RegularFile => {
+                self.advance_regular_file_position(guest.pid(), syscall.fd(), event.bytes.len());
+            }
+            ReplayFdKind::None => {}
+        }
         for _ in 0..event.consumed_sigpipe_count {
             self.consume_pending_sigpipe(guest).await?;
         }
@@ -518,6 +764,28 @@ impl Replayer {
         syscall: WriteFamily,
     ) -> Result<i64, Errno> {
         let event = next_event!(guest, WriteV2)?;
+        match event.replay_fd_kind {
+            ReplayFdKind::Eventfd => {
+                let actual =
+                    inject_kernel_side_effect(guest, syscall.fd(), Syscall::from(syscall)).await;
+                assert_eq!(
+                    actual, event.result,
+                    "replayed eventfd write side effect diverged"
+                );
+            }
+            ReplayFdKind::RegularFile => {
+                if let Ok(count) = event.result {
+                    self.replay_regular_file_write(
+                        guest,
+                        syscall,
+                        usize::try_from(count).expect("negative successful write count"),
+                        event.replay_file_offset,
+                        event.replay_file_advances_offset,
+                    )?;
+                }
+            }
+            ReplayFdKind::None => {}
+        }
         if event.generated_sigpipe {
             self.replay_sigpipe(guest).await?;
         }
@@ -555,6 +823,20 @@ impl Replayer {
                     "failed to reproduce ftruncate on captured output fd {output_fd}: {}",
                     std::io::Error::last_os_error()
                 );
+            }
+            if event.replay_regular_file
+                && event.output_fd.is_none()
+                && self.fd_is_in_replay_root(guest.pid(), syscall.fd())
+            {
+                let duplicate = crate::fd::duplicate_guest_fd(guest.pid(), syscall.fd())
+                    .unwrap_or_else(|error| {
+                        panic!("failed to duplicate replay file for ftruncate: {error}")
+                    });
+                let file = std::fs::File::from(duplicate);
+                file.set_len(
+                    u64::try_from(event.length).expect("successful ftruncate used negative length"),
+                )
+                .unwrap_or_else(|error| panic!("failed to materialize replay ftruncate: {error}"));
             }
         }
         event.result
@@ -612,9 +894,93 @@ impl Replayer {
 
         if matches!(
             request,
+            ioctl::Request::FICLONE(_) | ioctl::Request::FICLONERANGE(_)
+        ) {
+            let snapshot = next_event!(guest, FileClone)?;
+            let destination_is_internal = self.fd_is_in_replay_root(guest.pid(), syscall.fd());
+            if destination_is_internal {
+                let path = format!("/proc/{}/fd/{}", guest.pid().as_raw(), syscall.fd());
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap_or_else(|error| {
+                        panic!("failed to open cloned replay destination {path}: {error}")
+                    });
+                let prior_length = file
+                    .metadata()
+                    .unwrap_or_else(|error| panic!("failed to stat clone destination: {error}"))
+                    .len();
+                if snapshot.truncate_destination {
+                    file.set_len(0).unwrap_or_else(|error| {
+                        panic!("failed to truncate cloned replay file: {error}")
+                    });
+                }
+                file.set_len(snapshot.length)
+                    .unwrap_or_else(|error| panic!("failed to size cloned replay file: {error}"));
+                if !snapshot.truncate_destination && snapshot.destination_offset < prior_length {
+                    let overlap = snapshot
+                        .replacement_length
+                        .min(prior_length - snapshot.destination_offset);
+                    clear_clone_destination_range(&file, snapshot.destination_offset, overlap)
+                        .unwrap_or_else(|error| {
+                            panic!("failed to clear cloned replay range: {error}")
+                        });
+                }
+                match snapshot.image {
+                    FileCloneImage::Extents(extents) => {
+                        for extent in extents {
+                            let offset = snapshot
+                                .destination_offset
+                                .checked_add(extent.offset)
+                                .expect("clone destination offset overflow");
+                            file.write_all_at(&extent.bytes, offset)
+                                .unwrap_or_else(|error| {
+                                    panic!("failed to materialize cloned replay extent: {error}")
+                                });
+                        }
+                    }
+                    FileCloneImage::Sidecar(relative) => {
+                        let relative = std::path::Path::new(&relative);
+                        assert!(
+                            !relative.is_absolute()
+                                && !relative.components().any(|component| matches!(
+                                    component,
+                                    std::path::Component::ParentDir | std::path::Component::RootDir
+                                )),
+                            "invalid clone sidecar path {relative:?}"
+                        );
+                        let sidecar = self.data.join(relative);
+                        let source = std::fs::File::open(&sidecar).unwrap_or_else(|error| {
+                            panic!("failed to open clone sidecar {sidecar:?}: {error}")
+                        });
+                        let sidecar_length = source
+                            .metadata()
+                            .unwrap_or_else(|error| {
+                                panic!("failed to stat clone sidecar {sidecar:?}: {error}")
+                            })
+                            .len();
+                        assert_eq!(
+                            sidecar_length, snapshot.replacement_length,
+                            "clone sidecar length changed"
+                        );
+                        restore_sparse_clone_sidecar(
+                            &source,
+                            &file,
+                            snapshot.replacement_length,
+                            snapshot.destination_offset,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("failed to restore clone sidecar {sidecar:?}: {error}")
+                        });
+                    }
+                }
+            }
+            Ok(0)
+        } else if matches!(
+            request,
             ioctl::Request::FIOCLEX | ioctl::Request::FIONCLEX | ioctl::Request::FIONBIO(_)
         ) {
-            self.handle_replayed_fd_operation(guest, Syscall::from(syscall))
+            self.handle_replayed_side_effect(guest, Syscall::from(syscall), "ioctl")
                 .await
         } else if request.direction() == ioctl::Direction::Read {
             let output = next_event!(guest, Ioctl)?;

@@ -204,6 +204,7 @@ fn workloads() -> &'static [Workload] {
             ("c_ioctl_siocethtool", "ioctl_siocethtool.c"),
             ("c_record_replay_fd_close", "record_replay_fd_close.c"),
             ("c_recvmsg_scm_rights_mmap", "recvmsg_scm_rights_mmap.c"),
+            ("c_record_replay_file_state", "record_replay_file_state.c"),
             ("c_sigpipe_siginfo", "sigpipe_siginfo.c"),
             ("c_ppoll_readv", "ppoll_readv.c"),
             ("c_uname", "uname.c"),
@@ -265,6 +266,32 @@ fn record_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
         "Hermit did not report deterministic replay for {name}:\n{combined_output}"
     );
 }
+fn record_then_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "record", "start", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg("--")
+        .arg(program)
+        .args(args);
+    let record_output = command_output(record, &format!("recording for {name}"));
+
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "replay", "--autopilot"])
+        .arg(format!("--data-dir={}", data_dir.path().display()));
+    let replay_output = command_output(replay, &format!("replay for {name}"));
+
+    assert_eq!(
+        record_output.stdout, replay_output.stdout,
+        "replayed guest stdout did not match the recording for {name}"
+    );
+}
 
 fn record_replay(workload: &Workload) {
     record_replay_command(workload.name, &workload.path, &[]);
@@ -313,6 +340,11 @@ fn record_replay_matrix() {
 }
 
 #[test]
+fn record_reopened_inherited_and_cloned_file_state() {
+    run_record_replay("c_record_replay_file_state");
+}
+
+#[test]
 fn record_find_directory_tree() {
     let _guard = hermit_record_lock();
     let tree = tempfile::tempdir().expect("failed to create find fixture directory");
@@ -331,6 +363,78 @@ fn record_find_directory_tree() {
             OsStr::new("-type"),
             OsStr::new("f"),
             OsStr::new("-print"),
+        ],
+    );
+}
+
+#[test]
+fn record_mkdir_and_rmdir_side_effects() {
+    let _guard = hermit_record_lock();
+    let shell = Path::new("/bin/bash");
+    assert!(shell.is_file(), "bash is missing at {}", shell.display());
+
+    record_replay_command(
+        "mkdir-rmdir-side-effects",
+        shell,
+        &[
+            OsStr::new("-c"),
+            OsStr::new(
+                "set -euo pipefail; root=/tmp/hermit-record-mkdir-side-effect; rm -rf \"$root\"; mkdir \"$root\"; rmdir \"$root\"; printf 'mkdir-rmdir-side-effect-ok\\n'",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn record_nested_mkdir_side_effects() {
+    let _guard = hermit_record_lock();
+    let shell = Path::new("/bin/bash");
+    assert!(shell.is_file(), "bash is missing at {}", shell.display());
+
+    record_replay_command(
+        "nested-mkdir-side-effects",
+        shell,
+        &[
+            OsStr::new("-c"),
+            OsStr::new(
+                "set -euo pipefail; root=/tmp/hermit-record-nested-mkdir; rm -rf \"$root\"; mkdir -p \"$root/a/b\"; test -d \"$root/a/b\"; printf 'nested-mkdir-ok\\n'; rm -rf \"$root\"",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn record_writable_filesystem_side_effects() {
+    let _guard = hermit_record_lock();
+    let shell = Path::new("/bin/bash");
+    assert!(shell.is_file(), "bash is missing at {}", shell.display());
+
+    record_replay_command(
+        "writable-filesystem-side-effects",
+        shell,
+        &[
+            OsStr::new("-c"),
+            OsStr::new(
+                "set -euo pipefail; root=/tmp/hermit-record-filesystem; rm -rf \"$root\"; mkdir \"$root\"; printf 'payload\\n' >\"$root/source\"; cp \"$root/source\" \"$root/copy\"; cmp \"$root/source\" \"$root/copy\"; mv \"$root/copy\" \"$root/moved\"; chmod 640 \"$root/moved\"; touch -t 200001010000 \"$root/moved\"; tar -cf \"$root/archive.tar\" -C \"$root\" moved; tar -tf \"$root/archive.tar\"; rm -rf \"$root\"; printf 'filesystem-side-effects-ok\\n'",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn record_mkfifo_in_replay_tmp() {
+    let _guard = hermit_record_lock();
+    let shell = Path::new("/bin/bash");
+    assert!(shell.is_file(), "bash is missing at {}", shell.display());
+
+    record_replay_command(
+        "mkfifo-in-replay-tmp",
+        shell,
+        &[
+            OsStr::new("-c"),
+            OsStr::new(
+                "set -euo pipefail; fifo=/tmp/hermit-record-mkfifo; rm -f \"$fifo\"; mkfifo \"$fifo\"; stat -c '%F' \"$fifo\"; rm -f \"$fifo\"",
+            ),
         ],
     );
 }
@@ -527,6 +631,26 @@ fn record_curl_version() {
     };
 
     record_replay_command("curl", curl, &[OsStr::new("--version")]);
+}
+
+#[test]
+fn record_node_eventfd_epoll_sequence() {
+    let _guard = hermit_record_lock();
+    let node = [Path::new("/usr/bin/node"), Path::new("/usr/local/bin/node")]
+        .into_iter()
+        .find(|path| path.is_file());
+    let Some(node) = node else {
+        eprintln!("node is not installed; skipping eventfd/epoll record coverage");
+        return;
+    };
+
+    // Node's worker wake order can change the DETLOG order while preserving the
+    // recorded event stream, descriptor state, exit status, and guest output.
+    record_then_replay_command(
+        "node-eventfd-epoll-sequence",
+        node,
+        &[OsStr::new("-e"), OsStr::new("console.log(42)")],
+    );
 }
 
 /// Regression test for the SQLite record/replay Mmap-event panic.

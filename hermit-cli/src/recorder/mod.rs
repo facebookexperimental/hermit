@@ -34,11 +34,23 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::event::Event;
+use crate::event::OpenEvent;
+use crate::event::ReplayFdKind;
 use crate::event::SyscallEvent;
 use crate::event_stream::DebugEvent;
 use crate::event_stream::EventWriter;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    Eq,
+    Ord,
+    PartialEq,
+    PartialOrd
+)]
 struct OutputIdentity {
     device: u64,
     inode: u64,
@@ -57,6 +69,7 @@ impl OutputIdentity {
         self.device == metadata.dev() && self.inode == metadata.ino()
     }
 }
+
 fn duplicate_regular_output(pid: Pid, fd: libc::c_int) -> Option<std::os::fd::OwnedFd> {
     let metadata = std::fs::metadata(format!("/proc/{}/fd/{fd}", pid.as_raw())).ok()?;
     metadata
@@ -185,6 +198,16 @@ impl Tool for Recorder {
             Sysno::open,
             Sysno::openat,
             Sysno::close,
+            Sysno::openat2,
+            Sysno::mkdirat,
+            Sysno::mknodat,
+            Sysno::fchownat,
+            Sysno::linkat,
+            Sysno::renameat,
+            Sysno::renameat2,
+            Sysno::symlinkat,
+            Sysno::fchmodat,
+            Sysno::utimensat,
             Sysno::fchdir,
             Sysno::close_range,
             Sysno::fadvise64,
@@ -302,9 +325,18 @@ impl Tool for Recorder {
             Syscall::Getdents64(syscall) => self.handle_getdents64(guest, syscall).await,
             Syscall::Mmap(syscall) => self.handle_mmap(guest, syscall).await,
             Syscall::Munmap(_) => self.let_through(guest, syscall).await,
-            Syscall::Open(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Openat(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Open(_) | Syscall::Openat(_) => self.handle_open(guest, syscall).await,
             Syscall::Close(_) => self.handle_fd_table_mutation(guest, syscall).await,
+            Syscall::Openat2(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Mkdirat(_)
+            | Syscall::Mknodat(_)
+            | Syscall::Fchownat(_)
+            | Syscall::Linkat(_)
+            | Syscall::Renameat(_)
+            | Syscall::Renameat2(_)
+            | Syscall::Symlinkat(_)
+            | Syscall::Fchmodat(_)
+            | Syscall::Utimensat(_) => self.handle_simple(guest, syscall).await,
             Syscall::Fchdir(_) => self.handle_simple(guest, syscall).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
             Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
@@ -363,6 +395,75 @@ impl Tool for Recorder {
 }
 
 impl Recorder {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#662): Audit recorded physical-open classification.
+    async fn handle_open<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+        let materialize = result
+            .ok()
+            .and_then(|fd| {
+                std::fs::metadata(format!("/proc/{}/fd/{fd}", guest.pid().as_raw())).ok()
+            })
+            .is_some_and(|metadata| {
+                metadata.file_type().is_file() || metadata.file_type().is_dir()
+            });
+        self.record_event(
+            guest,
+            Ok(SyscallEvent::Open(OpenEvent {
+                result,
+                materialize,
+            })),
+        );
+        result
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#662): Audit guest FD replay classification.
+    fn fd_replay_kind(&self, pid: Pid, fd: libc::c_int) -> ReplayFdKind {
+        let path = format!("/proc/{}/fd/{fd}", pid.as_raw());
+        if std::fs::read_link(&path)
+            .ok()
+            .is_some_and(|target| target == std::path::Path::new("anon_inode:[eventfd]"))
+        {
+            return ReplayFdKind::Eventfd;
+        }
+
+        if std::fs::metadata(path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            ReplayFdKind::RegularFile
+        } else {
+            ReplayFdKind::None
+        }
+    }
+
+    fn epoll_requires_replay_kernel_side_effect(&self, pid: Pid, fd: libc::c_int) -> bool {
+        let Ok(fdinfo) = std::fs::read_to_string(format!("/proc/{}/fdinfo/{fd}", pid.as_raw()))
+        else {
+            return false;
+        };
+        let targets = fdinfo.lines().filter_map(|line| {
+            line.strip_prefix("tfd:")?
+                .split_whitespace()
+                .next()?
+                .parse::<libc::c_int>()
+                .ok()
+        });
+        let mut saw_target = false;
+        for target in targets {
+            saw_target = true;
+            if self.fd_replay_kind(pid, target) == ReplayFdKind::None {
+                return false;
+            }
+        }
+        saw_target
+    }
+
     pub(super) fn output_ofd_matches(
         &self,
         output_fd: libc::c_int,

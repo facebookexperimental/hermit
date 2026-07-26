@@ -86,11 +86,16 @@ pub enum SyscallEvent {
     Poll(PollEvent),
     SockOpt(SockOptEvent),
     EpollWait(EpollWaitEvent),
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#662): Audit the replay filesystem event schema.
+    Open(OpenEvent),
     // TODO-HUMAN-REVIEW(#557): Audit the V2 record/replay event schema.
     WriteV2(WriteEvent),
     ReadV2(ReadEvent),
     ReadvV2(ReadEvent),
     FtruncateV2(FtruncateEvent),
+    /// Destination length after a successful clone ioctl.
+    FileClone(FileCloneEvent),
 }
 
 /// Recorded output and signal side effects of a read syscall.
@@ -101,6 +106,8 @@ pub struct ReadEvent {
     pub bytes: Vec<u8>,
     /// Number of pending SIGPIPE instances consumed by this signalfd read.
     pub consumed_sigpipe_count: u64,
+    /// Kernel object whose state must advance during replay.
+    pub replay_fd_kind: ReplayFdKind,
 }
 
 /// Recorded result and side effects of a write-family syscall.
@@ -116,6 +123,12 @@ pub struct WriteEvent {
     pub advances_output_offset: bool,
     /// Whether the kernel generated SIGPIPE together with EPIPE.
     pub generated_sigpipe: bool,
+    /// Kernel object whose state must advance during replay.
+    pub replay_fd_kind: ReplayFdKind,
+    /// Offset at which a regular-file write began.
+    pub replay_file_offset: Option<i64>,
+    /// Whether the regular-file write advanced its open-file description.
+    pub replay_file_advances_offset: bool,
 }
 
 /// Recorded result and captured-output side effect of ftruncate.
@@ -128,6 +141,57 @@ pub struct FtruncateEvent {
     pub output_fd: Option<i32>,
     /// Requested file length.
     pub length: libc::off_t,
+    /// Whether the target was a regular file during recording.
+    pub replay_regular_file: bool,
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#662): Audit descriptor-kind replay side effects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReplayFdKind {
+    None,
+    Eventfd,
+    RegularFile,
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#662): Audit physical-open replay policy.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OpenEvent {
+    /// Recorded syscall result.
+    pub result: Result<i64, Errno>,
+    /// Whether recording resolved the descriptor to a regular file or directory.
+    pub materialize: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FileCloneEvent {
+    /// Final logical destination length.
+    pub length: u64,
+    /// Destination offset where the recorded source image begins.
+    pub destination_offset: u64,
+    /// Logical length of the cloned source range.
+    pub replacement_length: u64,
+    /// Whether the clone replaces the complete destination image.
+    pub truncate_destination: bool,
+    /// Recorded representation of the final destination image.
+    pub image: FileCloneImage,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum FileCloneImage {
+    /// Allocated data extents stored directly in the event stream.
+    Extents(Vec<FileExtent>),
+    /// Path relative to the recording data directory for a streamed snapshot.
+    Sidecar(String),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FileExtent {
+    /// Byte offset of this extent.
+    pub offset: u64,
+    /// Extent contents.
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -192,6 +256,8 @@ pub struct EpollWaitEvent {
     pub events: Vec<u8>,
     /// The number of initialized events in the buffer.
     pub updated: usize,
+    /// Whether replay must wait on the guest-created kernel epoll set.
+    pub replay_kernel_side_effect: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

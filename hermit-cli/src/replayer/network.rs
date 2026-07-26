@@ -114,6 +114,14 @@ impl Replayer {
         syscall: EpollWait,
     ) -> Result<i64, Errno> {
         let event = next_event!(guest, EpollWait)?;
+        if event.replay_kernel_side_effect {
+            let actual = guest.inject(syscall).await;
+            assert_eq!(
+                actual,
+                Ok(event.updated as i64),
+                "replayed epoll_wait kernel side effect diverged"
+            );
+        }
         assert_eq!(
             event.events.len(),
             event.updated * std::mem::size_of::<libc::epoll_event>()

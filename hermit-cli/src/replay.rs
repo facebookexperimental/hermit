@@ -13,6 +13,7 @@ use std::path::Path;
 use reverie::ExitStatus;
 use reverie::process::Command;
 use reverie::process::Mount;
+use reverie::process::MountFlags;
 use reverie::process::Output;
 use reverie::process::Stdio;
 
@@ -102,7 +103,12 @@ impl Replay {
             chroot
                 .create_dir_all(fbcode)
                 .context("Failed to create fbcode bind-mount target in chroot")?;
-            command.mount(Mount::bind(fbcode, chroot.path().join("usr/local/fbcode")).recursive());
+            let target = chroot.path().join("usr/local/fbcode");
+            command.mount(Mount::bind(fbcode, &target).readonly());
+            command.mount(
+                Mount::new(target)
+                    .flags(MountFlags::MS_BIND | MountFlags::MS_REMOUNT | MountFlags::MS_RDONLY),
+            );
         }
 
         command.chroot(chroot.path());
@@ -147,7 +153,7 @@ fn prepare_chroot(dir: &Path, metadata: &Metadata) -> io::Result<TempChroot> {
     // Hard link the executable. Hard linking is okay here since the chroot
     // directory and the executable live on the same file system. The executable
     // is also unlikely to be modified during the program's lifetime.
-    chroot.hard_link(&exe, &metadata.exe)?;
+    chroot.copy(&exe, &metadata.exe)?;
     add_executable_deps(&chroot, &metadata.exe)?;
 
     // Make every binary the guest exec'd during recording available inside the
@@ -158,6 +164,12 @@ fn prepare_chroot(dir: &Path, metadata: &Metadata) -> io::Result<TempChroot> {
 
     // Create the working directory.
     chroot.create_dir_all(&metadata.current_dir)?;
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#653)
+    // Successful recorded mkdir calls must have their parent in the replay root.
+    chroot.create_dir_all(Path::new("/tmp"))?;
+    chroot.create_dir_all(Path::new("/var/tmp"))?;
 
     Ok(chroot)
 }

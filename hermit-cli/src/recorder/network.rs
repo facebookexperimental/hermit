@@ -77,7 +77,12 @@ impl Recorder {
                     .memory()
                     .read_exact(syscall.events().ok_or(Errno::EFAULT)?.cast(), &mut events)?;
             }
-            Ok(SyscallEvent::EpollWait(EpollWaitEvent { events, updated }))
+            Ok(SyscallEvent::EpollWait(EpollWaitEvent {
+                events,
+                updated,
+                replay_kernel_side_effect: self
+                    .epoll_requires_replay_kernel_side_effect(guest.pid(), syscall.epfd()),
+            }))
         });
 
         self.record_event(guest, event);

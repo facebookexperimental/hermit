@@ -15,7 +15,13 @@ mod network;
 mod random;
 mod time;
 
+use std::collections::BTreeSet;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use reverie::Errno;
 use reverie::Error;
@@ -30,10 +36,14 @@ use reverie::Tool;
 use reverie::syscalls::Close;
 use reverie::syscalls::EfdFlags;
 use reverie::syscalls::Eventfd2;
+use reverie::syscalls::Fchdir;
 use reverie::syscalls::FcntlCmd;
 use reverie::syscalls::OFlag;
+use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Sysno;
+use reverie::syscalls::Unlinkat;
+use reverie::syscalls::Whence;
 use serde::Deserialize;
 use serde::Serialize;
 fn capture_guest_fd(pid: Pid, fd: libc::c_int) -> (Option<std::os::fd::OwnedFd>, Option<String>) {
@@ -41,6 +51,42 @@ fn capture_guest_fd(pid: Pid, fd: libc::c_int) -> (Option<std::os::fd::OwnedFd>,
         Ok(duplicate) => (Some(duplicate), None),
         Err(error) if error.raw_os_error() == Some(libc::EBADF) => (None, None),
         Err(error) => (None, Some(error.to_string())),
+    }
+}
+
+fn replay_root(pid: Pid) -> Option<PathBuf> {
+    std::fs::canonicalize(format!("/proc/{}/root", pid.as_raw())).ok()
+}
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ReplayFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl ReplayFileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+static MATERIALIZED_FILES: OnceLock<Mutex<BTreeSet<ReplayFileIdentity>>> = OnceLock::new();
+
+fn materialized_files() -> &'static Mutex<BTreeSet<ReplayFileIdentity>> {
+    MATERIALIZED_FILES.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+fn remember_materialized_file(pid: Pid, fd: libc::c_int) {
+    let Ok(metadata) = std::fs::metadata(format!("/proc/{}/fd/{fd}", pid.as_raw())) else {
+        return;
+    };
+    if metadata.file_type().is_file() {
+        materialized_files()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(ReplayFileIdentity::from_metadata(&metadata));
     }
 }
 
@@ -142,14 +188,20 @@ impl Tool for Replayer {
             Syscall::Read(syscall) => self.handle_read(guest, syscall).await,
             Syscall::Pread64(syscall) => self.handle_pread64(guest, syscall).await,
             Syscall::Readv(syscall) => {
-                self.handle_readv_family(guest, syscall.iov().map(|a| a.as_raw()), syscall.len())
-                    .await
+                self.handle_readv_family(
+                    guest,
+                    syscall.iov().map(|a| a.as_raw()),
+                    syscall.len(),
+                    syscall.into(),
+                )
+                .await
             }
             Syscall::Preadv(syscall) => {
                 self.handle_readv_family(
                     guest,
                     syscall.iov().map(|a| a.as_raw()),
                     syscall.iov_len(),
+                    syscall.into(),
                 )
                 .await
             }
@@ -158,6 +210,7 @@ impl Tool for Replayer {
                     guest,
                     syscall.iov().map(|a| a.as_raw()),
                     syscall.iov_len() as usize,
+                    syscall.into(),
                 )
                 .await
             }
@@ -169,7 +222,7 @@ impl Tool for Replayer {
             Syscall::Pwritev(syscall) => self.handle_write_family(guest, syscall.into()).await,
             Syscall::Pwritev2(syscall) => self.handle_write_family(guest, syscall.into()).await,
             Syscall::Access(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Lseek(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Lseek(_) => self.handle_optional_fd_position(guest, syscall).await,
             Syscall::Stat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
             Syscall::Fstat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
             Syscall::Lstat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
@@ -182,23 +235,33 @@ impl Tool for Replayer {
             Syscall::Mmap(syscall) => self.handle_mmap(guest, syscall).await,
             Syscall::Munmap(_) => self.let_through(guest, syscall).await,
             Syscall::Open(call) => {
-                self.handle_virtual_fd_create(guest, call.flags().contains(OFlag::O_CLOEXEC))
+                self.handle_virtual_fd_create(guest, syscall, call.flags())
                     .await
             }
             Syscall::Openat(call) => {
-                self.handle_virtual_fd_create(guest, call.flags().contains(OFlag::O_CLOEXEC))
+                self.handle_virtual_fd_create(guest, syscall, call.flags())
                     .await
             }
+            Syscall::Openat2(call) => self.handle_openat2(guest, call).await,
             Syscall::Close(_) => self.handle_close(guest, syscall).await,
-            Syscall::Fchdir(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Fchdir(call) => self.handle_fchdir(guest, call).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
             Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
             Syscall::Ftruncate(syscall) => self.handle_ftruncate(guest, syscall),
-            Syscall::Dup(_) => self.handle_replayed_fd_operation(guest, syscall).await,
+            Syscall::Dup(_) => {
+                self.handle_replayed_side_effect(guest, syscall, "dup")
+                    .await
+            }
             Syscall::Dup2(_) => self.handle_dup2(guest, syscall).await,
-            Syscall::Dup3(_) => self.handle_replayed_fd_operation(guest, syscall).await,
+            Syscall::Dup3(_) => {
+                self.handle_replayed_side_effect(guest, syscall, "dup3")
+                    .await
+            }
             Syscall::Ioctl(syscall) => self.handle_ioctl(guest, syscall).await,
-            Syscall::Socket(_) => self.handle_replayed_fd_operation(guest, syscall).await,
+            Syscall::Socket(_) => {
+                self.handle_replayed_side_effect(guest, syscall, "socket")
+                    .await
+            }
             Syscall::ClockGettime(syscall) => self.handle_clock_gettime(guest, syscall).await,
             Syscall::Gettimeofday(syscall) => self.handle_gettimeofday(guest, syscall).await,
             Syscall::Settimeofday(_) => self.handle_simple(guest, syscall).await,
@@ -213,10 +276,12 @@ impl Tool for Replayer {
                     FcntlCmd::F_DUPFD(_) | FcntlCmd::F_DUPFD_CLOEXEC(_)
                 ) =>
             {
-                self.handle_replayed_fd_operation(guest, syscall).await
+                self.handle_replayed_side_effect(guest, syscall, "fcntl_dupfd")
+                    .await
             }
             Syscall::Fcntl(call) if matches!(call.cmd(), FcntlCmd::F_SETFD(_)) => {
-                self.handle_replayed_fd_operation(guest, syscall).await
+                self.handle_replayed_side_effect(guest, syscall, "fcntl_setfd")
+                    .await
             }
             Syscall::Fcntl(_) => self.handle_simple(guest, syscall).await,
             Syscall::Connect(_) => self.handle_simple(guest, syscall).await,
@@ -234,9 +299,23 @@ impl Tool for Replayer {
             }
             Syscall::Getrandom(syscall) => self.handle_getrandom(guest, syscall).await,
             Syscall::Readlink(syscall) => self.handle_readlink(guest, syscall).await,
-            Syscall::Mkdir(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Unlink(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Unlinkat(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#653)
+            Syscall::Mkdir(_) => {
+                self.handle_replayed_side_effect(guest, syscall, "mkdir")
+                    .await
+            }
+            Syscall::Unlink(_) => self.handle_optional_path_removal(guest, syscall).await,
+            Syscall::Unlinkat(call) => self.handle_unlinkat(guest, call).await,
+            Syscall::Mkdirat(_)
+            | Syscall::Mknodat(_)
+            | Syscall::Fchownat(_)
+            | Syscall::Linkat(_)
+            | Syscall::Renameat(_)
+            | Syscall::Renameat2(_)
+            | Syscall::Symlinkat(_)
+            | Syscall::Fchmodat(_)
+            | Syscall::Utimensat(_) => self.handle_confined_path_mutation(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Other(Sysno::close_range, _) => self.handle_close_range(guest, syscall).await,
             unsupported => return Ok(guest.inject_with_retry(unsupported).await?),
@@ -277,40 +356,325 @@ impl Replayer {
             );
         }
     }
+    pub(super) fn fd_is_in_replay_root(&self, pid: Pid, fd: libc::c_int) -> bool {
+        let path = format!("/proc/{}/fd/{fd}", pid.as_raw());
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            return false;
+        };
+        if metadata.file_type().is_file() {
+            return materialized_files()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&ReplayFileIdentity::from_metadata(&metadata));
+        }
+        if !metadata.file_type().is_dir() {
+            return false;
+        }
+        let Some(root) = replay_root(pid) else {
+            return false;
+        };
+        std::fs::canonicalize(path).is_ok_and(|path| path.starts_with(root))
+    }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#662): Audit replay path confinement.
+    fn open_path_in_replay_root<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        syscall: Syscall,
+    ) -> Option<PathBuf> {
+        let (dirfd, path) = match syscall {
+            Syscall::Open(call) => (
+                libc::AT_FDCWD,
+                call.path().and_then(|path| path.read(&guest.memory()).ok()),
+            ),
+            Syscall::Openat(call) => (
+                call.dirfd(),
+                call.path().and_then(|path| path.read(&guest.memory()).ok()),
+            ),
+            _ => return None,
+        };
+        let path = path?;
+        let root = replay_root(guest.pid())?;
+
+        let candidate = if let Ok(relative) = path.strip_prefix(Path::new("/")) {
+            root.join(relative)
+        } else {
+            let base = if dirfd == libc::AT_FDCWD {
+                format!("/proc/{}/cwd", guest.pid().as_raw())
+            } else {
+                format!("/proc/{}/fd/{dirfd}", guest.pid().as_raw())
+            };
+            let base = std::fs::canonicalize(base).ok()?;
+            if !base.starts_with(&root) {
+                return None;
+            }
+            base.join(path)
+        };
+
+        let resolved = match std::fs::canonicalize(&candidate) {
+            Ok(path) => path,
+            Err(_) => {
+                let parent = std::fs::canonicalize(candidate.parent()?).ok()?;
+                parent.join(candidate.file_name()?)
+            }
+        };
+        resolved.starts_with(&root).then_some(resolved)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#662): Audit replay-root file and directory materialization.
     async fn handle_virtual_fd_create<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        cloexec: bool,
+        syscall: Syscall,
+        flags: OFlag,
+    ) -> Result<i64, Errno> {
+        let event = next_event!(guest, Open)?;
+        let recorded = event.result;
+        if let Ok(fd) = recorded {
+            let candidate = event
+                .materialize
+                .then(|| self.open_path_in_replay_root(guest, syscall))
+                .flatten();
+            if let Some(candidate) = &candidate {
+                if flags.contains(OFlag::O_DIRECTORY) {
+                    let _ = std::fs::create_dir_all(candidate);
+                } else if flags.contains(OFlag::O_CREAT)
+                    && let Some(parent) = candidate.parent()
+                {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            }
+            let materialize = candidate.as_ref().is_some_and(|candidate| {
+                if flags.contains(OFlag::O_TMPFILE) {
+                    return candidate.is_dir();
+                }
+                match std::fs::metadata(candidate) {
+                    Ok(metadata) if metadata.file_type().is_dir() => true,
+                    Ok(metadata) if metadata.file_type().is_file() => materialized_files()
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .contains(&ReplayFileIdentity::from_metadata(&metadata)),
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound
+                            && flags.contains(OFlag::O_CREAT) =>
+                    {
+                        true
+                    }
+                    _ => false,
+                }
+            });
+            if materialize {
+                match guest.inject_with_retry(syscall).await {
+                    Ok(actual) => {
+                        assert_eq!(
+                            actual, fd,
+                            "replay materialized open returned a different descriptor"
+                        );
+                        remember_materialized_file(guest.pid(), actual as libc::c_int);
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            ?syscall,
+                            %error,
+                            "replay path unavailable; reserving a virtual descriptor"
+                        );
+                        self.reserve_replay_fd(guest, fd as i32, flags.contains(OFlag::O_CLOEXEC))
+                            .await;
+                    }
+                }
+            } else {
+                self.reserve_replay_fd(guest, fd as i32, flags.contains(OFlag::O_CLOEXEC))
+                    .await;
+            }
+        }
+        recorded
+    }
+    fn dirfd_is_confined(&self, pid: Pid, fd: libc::c_int) -> bool {
+        fd == libc::AT_FDCWD || self.fd_is_in_replay_root(pid, fd)
+    }
+
+    fn path_mutation_dirfds_are_confined(&self, pid: Pid, syscall: Syscall) -> bool {
+        match syscall {
+            Syscall::Mkdirat(call) => self.dirfd_is_confined(pid, call.dirfd()),
+            Syscall::Mknodat(call) => self.dirfd_is_confined(pid, call.dirfd()),
+            Syscall::Fchownat(call) => self.dirfd_is_confined(pid, call.dirfd()),
+            Syscall::Fchmodat(call) => self.dirfd_is_confined(pid, call.dirfd()),
+            Syscall::Utimensat(call) => self.dirfd_is_confined(pid, call.dirfd()),
+            Syscall::Symlinkat(call) => self.dirfd_is_confined(pid, call.newdirfd()),
+            Syscall::Linkat(call) => {
+                self.dirfd_is_confined(pid, call.olddirfd())
+                    && self.dirfd_is_confined(pid, call.newdirfd())
+            }
+            Syscall::Renameat(call) => {
+                self.dirfd_is_confined(pid, call.olddirfd())
+                    && self.dirfd_is_confined(pid, call.newdirfd())
+            }
+            Syscall::Renameat2(call) => {
+                self.dirfd_is_confined(pid, call.olddirfd())
+                    && self.dirfd_is_confined(pid, call.newdirfd())
+            }
+            _ => false,
+        }
+    }
+
+    async fn handle_openat2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: reverie::syscalls::Openat2,
     ) -> Result<i64, Errno> {
         let recorded = next_event!(guest, Return);
         if let Ok(fd) = recorded {
-            self.reserve_replay_fd(guest, fd as i32, cloexec).await;
+            if self.dirfd_is_confined(guest.pid(), syscall.dirfd()) {
+                match guest.inject_with_retry(syscall).await {
+                    Ok(actual) => {
+                        assert_eq!(actual, fd, "replayed openat2 returned a different fd")
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "replay openat2 path unavailable");
+                        self.reserve_replay_fd(guest, fd as i32, false).await;
+                    }
+                }
+            } else {
+                self.reserve_replay_fd(guest, fd as i32, false).await;
+            }
         }
         recorded
     }
 
-    async fn handle_replayed_fd_operation<G: Guest<Self>>(
+    async fn handle_confined_path_mutation<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Return);
+        if let Ok(expected) = recorded
+            && self.path_mutation_dirfds_are_confined(guest.pid(), syscall)
+        {
+            match guest.inject_with_retry(syscall).await {
+                Ok(actual) => assert_eq!(
+                    actual, expected,
+                    "replayed path mutation returned a different result"
+                ),
+                Err(error @ (Errno::ENOENT | Errno::ENOTDIR | Errno::EROFS)) => {
+                    tracing::debug!(?syscall, %error, "replay path mutation kept virtual");
+                }
+                Err(error) => {
+                    panic!(
+                        "replayed path mutation {syscall:?} failed after recording returned {expected}: {error}"
+                    );
+                }
+            }
+        }
+        recorded
+    }
+
+    async fn handle_fchdir<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Fchdir,
+    ) -> Result<i64, Errno> {
+        if self.fd_is_in_replay_root(guest.pid(), syscall.fd()) {
+            self.handle_replayed_side_effect(guest, syscall.into(), "fchdir")
+                .await
+        } else {
+            self.handle_simple(guest, syscall.into()).await
+        }
+    }
+
+    async fn handle_unlinkat<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Unlinkat,
+    ) -> Result<i64, Errno> {
+        if syscall.dirfd() == libc::AT_FDCWD
+            || self.fd_is_in_replay_root(guest.pid(), syscall.dirfd())
+        {
+            self.handle_optional_path_removal(guest, syscall.into())
+                .await
+        } else {
+            self.handle_simple(guest, syscall.into()).await
+        }
+    }
+
+    async fn handle_optional_path_removal<G: Guest<Self>>(
         &self,
         guest: &mut G,
         syscall: Syscall,
     ) -> Result<i64, Errno> {
         let recorded = next_event!(guest, Return);
         if let Ok(expected) = recorded {
-            let actual = guest
-                .inject_with_retry(syscall)
-                .await
-                .unwrap_or_else(|error| {
+            match guest.inject_with_retry(syscall).await {
+                Ok(actual) => assert_eq!(
+                    actual, expected,
+                    "replayed path removal returned a different result"
+                ),
+                Err(error @ (Errno::ENOENT | Errno::ENOTDIR)) => {
+                    tracing::debug!(
+                        ?syscall,
+                        %error,
+                        "replay path unavailable; keeping path removal virtual"
+                    );
+                }
+                Err(error) => {
                     panic!(
-                        "replayed FD operation {:?} failed after recording returned {expected}: {error}",
-                        syscall
-                    )
-                });
-            if actual != expected {
-                panic!(
-                    "replay FD namespace diverged for {:?}: recorded {expected}, replayed {actual}",
-                    syscall
+                        "replayed path removal {syscall:?} failed after recording returned {expected}: {error}"
+                    );
+                }
+            }
+        }
+        recorded
+    }
+
+    async fn handle_optional_fd_position<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let Syscall::Lseek(call) = syscall else {
+            unreachable!("descriptor-position handler received {syscall:?}");
+        };
+        if !self.fd_is_in_replay_root(guest.pid(), call.fd()) {
+            return self.handle_simple(guest, syscall).await;
+        }
+        if matches!(call.whence(), Whence::SEEK_DATA | Whence::SEEK_HOLE) {
+            let recorded = next_event!(guest, Return);
+            if let Ok(expected) = recorded {
+                let duplicate = crate::fd::duplicate_guest_fd(guest.pid(), call.fd())
+                    .unwrap_or_else(|error| {
+                        panic!("failed to duplicate replay file for extent seek: {error}")
+                    });
+                // SAFETY: duplicate owns the same open-file description and the
+                // recorded extent seek returned this nonnegative offset.
+                let actual =
+                    unsafe { libc::lseek(duplicate.as_raw_fd(), expected, libc::SEEK_SET) };
+                assert_eq!(
+                    actual, expected,
+                    "failed to restore replay position after extent seek"
                 );
+            }
+            return recorded;
+        }
+        let recorded = next_event!(guest, Return);
+        if let Ok(expected) = recorded {
+            match guest.inject_with_retry(syscall).await {
+                Ok(actual) => assert_eq!(
+                    actual, expected,
+                    "replayed descriptor position returned a different offset"
+                ),
+                Err(error @ (Errno::EBADF | Errno::ESPIPE)) => {
+                    tracing::debug!(
+                        ?syscall,
+                        %error,
+                        "replay descriptor is virtual; keeping position change virtual"
+                    );
+                }
+                Err(error) => {
+                    panic!(
+                        "replayed descriptor position {syscall:?} failed after recording returned {expected}: {error}"
+                    );
+                }
             }
         }
         recorded

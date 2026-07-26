@@ -288,7 +288,10 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
 readonly STRICT_COMPAT_TOTAL=181
-readonly RR_COMPAT_EXPECTED=131
+# Current main's 131-row ratchet (which already includes ruby/dc/tcl from
+# PR #729) plus four descriptor-state and eight writable-filesystem programs
+# adopted from PR #662.
+readonly RR_COMPAT_EXPECTED=143
 readonly LITEINST_COMPAT_EXPECTED=29
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
@@ -332,8 +335,8 @@ declare -Ar HOSTED_STRICT_DIAGNOSTIC_FAILURES=(
 HOSTED_STRICT_DIAGNOSTIC_FAILURE_COUNT=0
 declare -A COMPAT_SUMMARY_CELLS=()
 
-# Exact label ratchet measured at Hermit a919cce. Commands remain owned by the
-# strict corpus below; this set only selects the rows known to pass R/R.
+# Commands remain owned by the strict corpus below; this exact set only selects
+# rows measured to pass R/R.
 declare -Ar RR_COMPAT_PASSING_LABELS=(
     [echo]=1 [seq]=1 [cat]=1 [wc]=1 [head]=1 [base64]=1 [id]=1
     [lua]=1 [perl]=1 [awk]=1 [bc]=1 [sqlite3]=1 [bash]=1
@@ -351,7 +354,8 @@ declare -Ar RR_COMPAT_PASSING_LABELS=(
     [tsort]=1 [ptx]=1 [pinky]=1 [logname]=1 [users]=1 [uptime]=1
     [grep]=1 [egrep]=1 [fgrep]=1 [sed]=1 [date]=1 [cal]=1 [yes]=1
     [tac]=1 [rev]=1 [fold]=1 [fmt]=1 [shuf]=1 [numfmt]=1
-    [split]=1 [cmp]=1
+    [split]=1 [cmp]=1 [rmdir]=1 [mkfifo]=1 [mkdir]=1 [node]=1
+    [diff]=1 [cp]=1 [install]=1 [tar]=1 [mv]=1 [rm]=1 [touch]=1 [chmod]=1
     [java]=1 [python3]=1 [git]=1 [true]=1 [pwd]=1 [base32]=1
     [sha224sum]=1 [sha384sum]=1 [sha512sum]=1 [pr]=1 [ls]=1
     [xargs]=1 [iconv]=1 [ar]=1 [as]=1 [ld]=1 [nm]=1 [objcopy]=1
@@ -359,6 +363,8 @@ declare -Ar RR_COMPAT_PASSING_LABELS=(
     [c++filt]=1 [elfedit]=1 [gprof]=1 [cpp]=1 [gcov]=1
     [ruby]=1 [dc]=1 [tcl]=1
 )
+# mktemp remains excluded: SIGCHLD delivery can race the command-substitution pipe EOF
+# during replay, changing deterministic log order while preserving output and exit status.
 if ((${#RR_COMPAT_PASSING_LABELS[@]} != RR_COMPAT_EXPECTED)); then
     echo "validate.sh: R/R compatibility label set must contain exactly $RR_COMPAT_EXPECTED rows" >&2
     exit 2
@@ -2854,7 +2860,7 @@ function run_full_suite {
         printf "❌ Strict compatibility envelope regressed; failing validation (matches the now-blocking CI gate).\n"
         failures=$((failures + 1))
     fi
-    run_check "Record/replay compatibility baseline (128 programs)" \
+    run_check "Record/replay compatibility baseline ($RR_COMPAT_EXPECTED programs)" \
         run_rr_compatibility_envelope
     # Nextest runs most package unit and Cargo integration targets in parallel.
     # Detcore's PMU tests depend on same-binary coordination; nextest would launch
@@ -2977,7 +2983,7 @@ if ((RR_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit for record/replay compatibility" \
         cargo build --release -p hermit
     if ((failures == 0)); then
-        run_check "Record/replay compatibility baseline (128 programs)" \
+        run_check "Record/replay compatibility baseline ($RR_COMPAT_EXPECTED programs)" \
             run_rr_compatibility_envelope
     fi
     print_summary
