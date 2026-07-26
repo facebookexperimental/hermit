@@ -325,9 +325,8 @@ declare -Ar COMPAT_SUMMARY_KNOWN_FAILURES=(
     # programs each require a syscall Detcore does not yet determinize, so they
     # correctly abort under fail-closed --strict; they only passed the envelope
     # previously because --strict used to forward unsupported syscalls.
-    [chrt]="fail-closed --strict rejects the unsupported sched_getattr syscall"
-    [flock]="fail-closed --strict rejects the unsupported flock syscall"
-    [ionice]="fail-closed --strict rejects the unsupported ioprio_set syscall"
+    # (chrt/ioprio_set-based ionice/flock were determinized in PR-batch-51 and
+    # are now measured as ordinary passing rows below.)
     [lsof]="fail-closed --strict rejects the unsupported close_range syscall"
     [make]="fail-closed --strict rejects the unsupported setresuid syscall"
     [curl-localhost]="fail-closed --strict rejects the unsupported shutdown syscall in the localhost fetch"
@@ -1913,20 +1912,20 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe nice /usr/bin/nice -n 1 /bin/echo nice-ok \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    tally_known_failclosed_probe passed failed known_flaky ionice \
-        strict_compatibility_probe ionice /usr/bin/ionice -c 3 /bin/echo ionice-ok
+    strict_compatibility_probe ionice /usr/bin/ionice -c 3 /bin/echo ionice-ok \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
     # Query the virtualized guest PID rather than setting a host CPU/policy.
     # shellcheck disable=SC2016
     strict_compatibility_probe taskset bash -c \
         'set -euo pipefail; taskset -p $$ >/dev/null; printf "taskset-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # shellcheck disable=SC2016
-    tally_known_failclosed_probe passed failed known_flaky chrt \
-        strict_compatibility_probe chrt bash -c \
-        'set -euo pipefail; chrt -p $$ >/dev/null; printf "chrt-ok\n"'
-    tally_known_failclosed_probe passed failed known_flaky flock \
-        strict_compatibility_probe flock bash -c \
-        'set -euo pipefail; f=$(mktemp); flock -x "$f" -c "printf \"flock-ok\\n\""; rm -f "$f"'
+    strict_compatibility_probe chrt bash -c \
+        'set -euo pipefail; chrt -p $$ >/dev/null; printf "chrt-ok\n"' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe flock bash -c \
+        'set -euo pipefail; f=$(mktemp); flock -x "$f" -c "printf \"flock-ok\\n\""; rm -f "$f"' \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
     # Capture logger's wall-clock prefix and assert only its semantic payload.
     strict_compatibility_probe logger bash -c \
         'set -euo pipefail; output=$(/usr/bin/logger --stderr --no-act -t hermit-compat logger-ok 2>&1); [[ $output == *"hermit-compat: logger-ok" ]]; printf "logger-ok\n"' \

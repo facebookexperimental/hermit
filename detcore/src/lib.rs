@@ -1622,6 +1622,24 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::SchedGetparam(s) => self.handle_sched_getparam(guest, s).await,
                 Syscall::SchedRrGetInterval(s) => self.handle_sched_rr_get_interval(guest, s).await,
 
+                // ===== BATCH 51: fail-closed utility syscalls with no deterministic
+                // effect under Hermit. Detcore replaces the Linux scheduler, exposes a
+                // single virtual CPU, and serializes guest threads, so a thread's
+                // Linux scheduling attributes (sched_getattr) and I/O priority
+                // (ioprio_set) are inert, and an advisory whole-file lock (flock) is
+                // never contended inside the serialized container. Emulated to fixed,
+                // host-independent results (see syscall_classification.rs); re-enables
+                // chrt, ionice, and flock under --strict.
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#791)
+                Syscall::SchedGetattr(s) => self.handle_sched_getattr(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#791)
+                Syscall::IoprioSet(s) => self.handle_ioprio_set(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#791)
+                Syscall::Flock(s) => self.handle_flock(guest, s).await,
+
                 Syscall::Recvfrom(s) => self.handle_sendrecv(guest, s).await,
                 Syscall::Recvmsg(s) => self.handle_sendrecv(guest, s).await,
                 Syscall::Sendto(s) => self.handle_sendrecv(guest, s).await,

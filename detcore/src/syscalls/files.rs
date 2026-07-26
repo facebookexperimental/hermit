@@ -194,6 +194,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         res.map_err(Error::from)
     }
 
+    /// flock under Hermit. `flock(2)` places an advisory whole-file lock. Detcore
+    /// serializes guest threads onto a single virtual CPU, so a lock is never
+    /// truly contended within the run: a blocking `LOCK_EX`/`LOCK_SH` would
+    /// otherwise leave the deterministic scheduler waiting on an external event.
+    /// Treat every operation (lock/unlock, with or without `LOCK_NB`) as a
+    /// deterministic no-op success, mirroring how sched_setaffinity/ioprio_set are
+    /// suppressed. Re-enables `flock` under --strict.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#791)
+    pub async fn handle_flock<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        call: syscalls::Flock,
+    ) -> Result<i64, Error> {
+        info!(
+            "flock(fd={}, operation={:#x}) treated as a deterministic no-op success",
+            call.fd(),
+            call.operation()
+        );
+        Ok(0)
+    }
+
     async fn snapshot_procfs<G: Guest<Self>>(
         &self,
         guest: &mut G,

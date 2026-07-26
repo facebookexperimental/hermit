@@ -315,7 +315,22 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msgget
         | Sysno::msgsnd
         | Sysno::msgrcv
-        | Sysno::msgctl => SyscallClassification::Determinized,
+        | Sysno::msgctl
+        // ===== BATCH 51: fail-closed utility syscalls with no deterministic effect =====
+        // These three previously fail-closed --strict (aborting real programs such
+        // as chrt, ionice, and flock) even though none can change guest-visible
+        // computation under Hermit. Detcore replaces the Linux scheduler, presents a
+        // single virtual CPU, and serializes guest threads, so a thread's I/O
+        // priority (ioprio_set) and its Linux scheduling attributes (sched_getattr)
+        // are inert, and an advisory whole-file lock (flock) is never contended
+        // within the serialized container. They are determinized to fixed,
+        // host-independent results; see the handlers in lib.rs. sched_setattr and
+        // ioprio_get remain Unsupported until a task owns their write/read pair.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#791)
+        | Sysno::flock
+        | Sysno::ioprio_set
+        | Sysno::sched_getattr => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
         // These existing and triaged passthroughs are conditionally repeatable under
@@ -493,7 +508,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::clock_adjtime
         | Sysno::close_range
         | Sysno::copy_file_range
-        | Sysno::flock
         | Sysno::futex_requeue
         | Sysno::futex_wait
         | Sysno::futex_waitv
@@ -501,7 +515,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::get_robust_list
         | Sysno::getitimer
         | Sysno::ioprio_get
-        | Sysno::ioprio_set
         | Sysno::kcmp
         | Sysno::keyctl
         | Sysno::landlock_add_rule
@@ -535,7 +548,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::restart_syscall
         | Sysno::rt_sigqueueinfo
         | Sysno::rt_tgsigqueueinfo
-        | Sysno::sched_getattr
         | Sysno::sched_setattr
         | Sysno::seccomp
         | Sysno::select
@@ -728,7 +740,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [201, 91, 81]);
+        assert_eq!(counts, [204, 91, 78]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -774,6 +786,14 @@ mod tests {
             classify_syscall(Sysno::times),
             SyscallClassification::Determinized
         );
+        // BATCH 51: these previously fail-closed --strict; now determinized.
+        for sysno in [Sysno::flock, Sysno::ioprio_set, Sysno::sched_getattr] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+        }
+        // Their read/write siblings deliberately remain Unsupported for now.
+        for sysno in [Sysno::ioprio_get, Sysno::sched_setattr] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
+        }
         for sysno in [
             Sysno::epoll_pwait2,
             Sysno::clock_settime,

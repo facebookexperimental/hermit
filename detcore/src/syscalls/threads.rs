@@ -933,6 +933,68 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         Ok(0)
     }
+
+    /// sched_getattr under Hermit. Detcore replaces the Linux scheduler with its
+    /// own deterministic one, so a thread's Linux scheduling attributes are inert.
+    /// Report a fixed SCHED_OTHER policy with zeroed nice/priority/flags. The
+    /// value is emulated (never injected), so it is identical across --verify runs
+    /// and record/replay. Re-enables `chrt` under --strict.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#791)
+    pub async fn handle_sched_getattr<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::SchedGetattr,
+    ) -> Result<i64, Error> {
+        // `flags` is reserved and must be zero; the kernel rejects anything else.
+        if call.flags() != 0 {
+            return Err(Errno::EINVAL.into());
+        }
+        // The caller must provide room for at least the base sched_attr (VER0).
+        let attr_size = std::mem::size_of::<libc::sched_attr>();
+        if (call.size() as usize) < attr_size {
+            return Err(Errno::EINVAL.into());
+        }
+        let attr = call.attr().ok_or(Errno::EINVAL)?;
+        // SAFETY: sched_attr is a plain-old-data struct; an all-zero bit pattern is
+        // a valid SCHED_OTHER descriptor (nice/priority/flags/runtime/... all 0).
+        let mut sa: libc::sched_attr = unsafe { std::mem::zeroed() };
+        sa.size = attr_size as u32;
+        sa.sched_policy = libc::SCHED_OTHER as u32;
+        // SAFETY: reinterpret the POD struct as its raw bytes to copy it into the
+        // guest's buffer.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(&sa as *const libc::sched_attr as *const u8, attr_size)
+        };
+        let dst: AddrMut<u8> = attr.cast();
+        guest.memory().write_exact(dst, bytes)?;
+        info!(
+            "Emulating sched_getattr(pid={}): fixed SCHED_OTHER, nice 0, priority 0",
+            call.pid()
+        );
+        Ok(0)
+    }
+
+    /// ioprio_set under Hermit. Detcore serializes guest threads onto one virtual
+    /// CPU, so the block-layer I/O scheduling class and priority cannot change
+    /// guest-visible computation. Accept and suppress the request as a
+    /// deterministic no-op success, mirroring how sched_setaffinity is handled.
+    /// Re-enables `ionice` under --strict.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#791)
+    pub async fn handle_ioprio_set<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        call: syscalls::IoprioSet,
+    ) -> Result<i64, Error> {
+        info!(
+            "Suppressing ioprio_set(which={}, who={}, priority={}); I/O priority is virtual",
+            call.which(),
+            call.who(),
+            call.priority()
+        );
+        Ok(0)
+    }
 }
 
 #[cfg(test)]
