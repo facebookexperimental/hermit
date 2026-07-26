@@ -3,9 +3,11 @@ name: CI (self-hosted)
 on:
   push:
     branches: [ "main" ]
-  # Keep stacked pull requests covered before they are retargeted to main.
+  # Keep stacked pull requests covered before they are retargeted to main. A
+  # closed event enters the same concurrency group and cancels any stale run;
+  # the hardware job itself skips that event.
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, closed]
   workflow_dispatch:
     inputs:
       qemu_l2:
@@ -95,6 +97,7 @@ jobs:
           github.event_name == 'workflow_dispatch' ||
           (
             github.event_name == 'pull_request' &&
+            github.event.action != 'closed' &&
             github.event.pull_request.user.login == 'rrnewton' &&
             github.event.pull_request.draft == false
           )
@@ -160,24 +163,3 @@ jobs:
         path: ${{ runner.temp }}/hermit-hardware-dag-perf
         if-no-files-found: warn
         retention-days: 14
-    # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#673)
-    - name: Pselect signal-interruption diagnostic (nonblocking)
-      continue-on-error: true
-      timeout-minutes: 5
-      run: flock /tmp/hermit-self-hosted-pmu.lock cargo test -p hermit --test pselect6_simulation -- --test-threads=1
-    # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#678)
-    - name: Record/replay matrix diagnostics (nonblocking)
-      continue-on-error: true
-      timeout-minutes: 5
-      run: flock /tmp/hermit-self-hosted-pmu.lock cargo test -p hermit --test record_replay record_replay_matrix -- --exact --test-threads=1
-    # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#657)
-    - name: Managed JVM strict-verify diagnostics (nonblocking)
-      continue-on-error: true
-      timeout-minutes: 5
-      env:
-        HERMIT_APP_VERIFY_TIMEOUT: "20s"
-        RUST_BACKTRACE: "1"
-      run: flock /tmp/hermit-self-hosted-pmu.lock cargo test -p hermit --test app_strict_verify java -- --ignored --test-threads=1 --nocapture

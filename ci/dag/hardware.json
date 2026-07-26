@@ -62,16 +62,6 @@
                "classification": "cpu-bound"}
     },
     {
-      "group": "pmu", "job": "parallel_mem",
-      "desc": "PMU parallel memory-race exact cases (tests_parallelism, per-case timeout 900s)",
-      "cmd": "set -e; for n in mem_race::bottom_detcore mem_race::default_detcore mem_race::middle_detcore mem_race::top_detcore; do timeout 900 cargo test -p detcore --test tests_parallelism \"$n\" -- --exact --test-threads=1; done",
-      "deps": ["build.workspace"],
-      "timeout": 3600,
-      "hint": {"resources": {"pmu": 1}, "est_duration_s": 1200,
-               "rss_baseline_bytes": 3221225472, "hard_mem_max_bytes": 6442450944,
-               "classification": "cpu-bound"}
-    },
-    {
       "group": "pmu", "job": "parallel_mem_print",
       "desc": "PMU parallel memory-and-print exact cases (tests_parallelism, per-case timeout 900s)",
       "cmd": "set -e; for n in mem_print_race::bottom_detcore mem_print_race::default_detcore mem_print_race::middle_detcore mem_print_race::top_detcore; do timeout 900 cargo test -p detcore --test tests_parallelism \"$n\" -- --exact --test-threads=1; done",

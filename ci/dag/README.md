@@ -32,6 +32,11 @@ the merge-gate contract, and the outer PMU `flock` stay unchanged; only the
 internal scheduler changes. `validate.sh` remains the source of truth for
 individual gate commands.
 
+Closed pull requests trigger a skipped workflow in the same concurrency group,
+which cancels their queued or in-progress PMU run. The `mem_race` family and
+three nonblocking post-DAG diagnostics run in the scheduled `super` tier so a
+known host-sensitive hang cannot consume the required serialized lane.
+
 The `Validation Levels` workflow no longer launches a second copy of
 `--hosted-only` for every pull request. Its quick lane remains available by
 manual dispatch, while merge-group hardware and scheduled super validation are
