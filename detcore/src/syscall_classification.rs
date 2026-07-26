@@ -193,6 +193,16 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::setsockopt
         | Sysno::tgkill
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#812): signal-sending siblings of the already
+        // Determinized kill/tgkill. tkill is the two-argument thread-directed
+        // predecessor of tgkill; rt_sigqueueinfo/rt_tgsigqueueinfo are the
+        // data-carrying sigqueue forms. Signal generation/delivery is
+        // scheduler-serialized and TGID/TID are stable in the fresh PID
+        // namespace, so these are deterministic (KVM ratchet round 11).
+        | Sysno::tkill
+        | Sysno::rt_sigqueueinfo
+        | Sysno::rt_tgsigqueueinfo
+        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#715): Deterministic ENOSYS for syscalls the pinned
         // x86_64 kernel leaves unimplemented (sys_ni_syscall). A fixed -ENOSYS is
         // deterministic by construction and matches the modern kernel's own return,
@@ -557,8 +567,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::remap_file_pages
         | Sysno::request_key
         | Sysno::restart_syscall
-        | Sysno::rt_sigqueueinfo
-        | Sysno::rt_tgsigqueueinfo
         | Sysno::sched_setattr
         | Sysno::seccomp
         | Sysno::semctl
@@ -585,7 +593,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sysfs
         | Sysno::syslog
         | Sysno::tee
-        | Sysno::tkill
         | Sysno::ustat
         | Sysno::vmsplice => SyscallClassification::Unsupported,
         // ===== END UNSUPPORTED SYSCALLS =====
@@ -750,7 +757,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [206, 91, 76]);
+        assert_eq!(counts, [209, 91, 73]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -842,6 +849,17 @@ mod tests {
             Sysno::setrlimit,
             Sysno::setsockopt,
             Sysno::tgkill,
+        ] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+        }
+        // KVM ratchet round 11: signal-sending siblings of kill/tgkill. tkill
+        // (routed through handle_tkill) and rt_sigqueueinfo/rt_tgsigqueueinfo
+        // (routed through handle_rt_sigqueueinfo/handle_rt_tgsigqueueinfo) must
+        // stay Determinized rather than fail-closing under --strict.
+        for sysno in [
+            Sysno::tkill,
+            Sysno::rt_sigqueueinfo,
+            Sysno::rt_tgsigqueueinfo,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }

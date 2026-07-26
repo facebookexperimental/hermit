@@ -309,6 +309,69 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#812)
+    /// Send a thread-directed signal through the older two-argument `tkill`.
+    /// Like its `tgkill` sibling, the target thread is addressed by a guest TID
+    /// that is stable in the fresh PID namespace and delivery is
+    /// scheduler-serialized, so forwarding the kernel call is deterministic.
+    pub async fn handle_tkill<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Tkill,
+    ) -> Result<i64, Error> {
+        Ok(self.record_or_replay(guest, call).await?)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#812)
+    /// Queue a thread-directed signal with an accompanying `siginfo_t`. Like
+    /// `tgkill`, the target is a specific thread named by stable guest TGID/TID
+    /// and delivery is scheduler-serialized; the guest-supplied siginfo is
+    /// deterministic input, so forwarding the kernel call is deterministic.
+    pub async fn handle_rt_tgsigqueueinfo<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::RtTgsigqueueinfo,
+    ) -> Result<i64, Error> {
+        Ok(self.record_or_replay(guest, call).await?)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#812)
+    /// Queue a process-directed signal with an accompanying `siginfo_t`. Mirrors
+    /// `handle_kill`: a signal-zero existence check forwards unchanged, and an
+    /// unambiguous positive-PID target is routed to its sole live thread via
+    /// `rt_tgsigqueueinfo`, preserving the guest siginfo pointer. Ambiguous
+    /// multithreaded process-directed delivery is refused until Detcore models
+    /// eligible signal masks.
+    pub async fn handle_rt_sigqueueinfo<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::RtSigqueueinfo,
+    ) -> Result<i64, Error> {
+        if !guest.config().sequentialize_threads {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+
+        if call.sig() == 0 {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+
+        let tgid = call.tgid();
+        if tgid <= 0 {
+            return Err(Errno::ENOSYS.into());
+        }
+        let targets = resolve_kill_targets(guest, DetPid::from_raw(tgid)).await;
+        let tid = deterministic_kill_target(&targets, call.sig())?;
+        let targeted = syscalls::RtTgsigqueueinfo::new()
+            .with_tgid(tgid)
+            .with_tid(tid.as_raw())
+            .with_sig(call.sig())
+            .with_siginfo(call.siginfo());
+        Ok(self.record_or_replay(guest, targeted).await?)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     /// Read the kernel pending-signal mask after Detcore has serialized all signal
     /// generation and delivery events that can change it.
