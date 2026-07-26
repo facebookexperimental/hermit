@@ -127,6 +127,7 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
+use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
 use crate::syscall_classification::is_privileged_admin_refused_syscall;
 use crate::syscall_classification::is_unimplemented_enosys_syscall;
 use crate::syscalls::helpers::with_guest_rip;
@@ -1294,6 +1295,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 if call.number() == Sysno::set_mempolicy_home_node =>
             {
                 Ok(0)
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#724): Deterministic EPERM for privileged mount
+            // and namespace administration syscalls (mount/umount2/mount_setattr/
+            // move_mount/open_tree/fsopen/fsmount/fsconfig/fspick, unshare, setns,
+            // open_by_handle_at, fanotify_init/fanotify_mark, settimeofday). A
+            // deterministic container pins the guest's namespaces, mount
+            // hierarchy, and virtual clock for the whole run, so these are
+            // refused with a fixed -EPERM: the unprivileged errno for the
+            // capability-gated operations and a deliberate deterministic refusal
+            // otherwise. Never forwarded to the host; identical across --verify
+            // and record/replay. Untyped (Syscall::Other) in the pinned Reverie,
+            // so dispatch on the Sysno before the typed match below.
+            SyscallClassification::Determinized
+                if is_mount_ns_admin_refused_syscall(call.number()) =>
+            {
+                Err(Error::Errno(Errno::EPERM))
             }
             SyscallClassification::Determinized => match call {
                 Syscall::Write(w) => self.handle_write(guest, w).await,
