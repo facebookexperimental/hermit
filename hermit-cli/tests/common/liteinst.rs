@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -18,6 +19,14 @@ pub(super) fn ensure_liteinst_runtime() {
         let profile_dir = hermit
             .parent()
             .expect("Hermit test binary should have a profile directory");
+        let profile = profile_dir
+            .file_name()
+            .expect("Hermit profile directory should have a name");
+        let cargo_profile = if profile == OsStr::new("debug") {
+            OsStr::new("dev")
+        } else {
+            profile
+        };
         let target_dir = profile_dir
             .parent()
             .expect("Hermit profile should be inside a target directory");
@@ -27,13 +36,9 @@ pub(super) fn ensure_liteinst_runtime() {
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let output = Command::new(cargo)
             .current_dir(repository)
-            .args([
-                "build",
-                "--locked",
-                "-p",
-                "detcore-liteinst",
-                "--target-dir",
-            ])
+            .args(["build", "--locked", "-p", "detcore-liteinst", "--profile"])
+            .arg(cargo_profile)
+            .arg("--target-dir")
             .arg(target_dir)
             .output()
             .expect("failed to build the LiteInst runtime");
