@@ -288,7 +288,7 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
 readonly STRICT_COMPAT_TOTAL=181
-readonly RR_COMPAT_EXPECTED=128
+readonly RR_COMPAT_EXPECTED=131
 readonly LITEINST_COMPAT_EXPECTED=29
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
@@ -346,6 +346,7 @@ declare -Ar RR_COMPAT_PASSING_LABELS=(
     [xargs]=1 [iconv]=1 [ar]=1 [as]=1 [ld]=1 [nm]=1 [objcopy]=1
     [objdump]=1 [ranlib]=1 [readelf]=1 [size]=1 [strip]=1 [addr2line]=1
     [c++filt]=1 [elfedit]=1 [gprof]=1 [cpp]=1 [gcov]=1
+    [ruby]=1 [dc]=1 [tcl]=1
 )
 if ((${#RR_COMPAT_PASSING_LABELS[@]} != RR_COMPAT_EXPECTED)); then
     echo "validate.sh: R/R compatibility label set must contain exactly $RR_COMPAT_EXPECTED rows" >&2
