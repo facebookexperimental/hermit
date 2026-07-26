@@ -589,6 +589,25 @@ where
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-789): Review complete SaBRe RPC shutdown ordering.
+async fn shutdown_sabre_rpc<T, E>(
+    server_task: tokio::task::JoinHandle<Result<(), E>>,
+    global: &Arc<T>,
+    timeout: Duration,
+) -> Result<(), Error>
+where
+    E: std::fmt::Display,
+{
+    let server_result = stop_sabre_rpc_server(server_task).await;
+    let disconnect_result = wait_for_sabre_rpc_disconnects(global, timeout).await;
+
+    server_result?;
+    disconnect_result.map_err(|live_references| {
+        anyhow!("SaBRe coordinator stopped with {live_references} live RPC reference(s)")
+    })
+}
+
 fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
     // The CLI probes ptrace readiness before entering its container; repeating
     // the namespace probe here would test nested namespaces instead of the host.
@@ -672,7 +691,7 @@ async fn run_sabre(
         Ok(supervised) => supervised,
         Err(error) => {
             global.force_shutdown_with_error();
-            let _ = stop_sabre_rpc_server(server_task).await;
+            let _ = shutdown_sabre_rpc(server_task, &global, SABRE_RPC_DISCONNECT_TIMEOUT).await;
             return Err(error);
         }
     };
@@ -690,12 +709,7 @@ async fn run_sabre(
         stderr: supervised.stderr,
     };
 
-    stop_sabre_rpc_server(server_task).await?;
-    wait_for_sabre_rpc_disconnects(&global, SABRE_RPC_DISCONNECT_TIMEOUT)
-        .await
-        .map_err(|live_references| {
-            anyhow!("SaBRe coordinator stopped with {live_references} live RPC reference(s)")
-        })?;
+    shutdown_sabre_rpc(server_task, &global, SABRE_RPC_DISCONNECT_TIMEOUT).await?;
     let global = Arc::try_unwrap(global).map_err(|global| {
         anyhow!(
             "SaBRe coordinator stopped with {} live RPC reference(s)",
@@ -1437,6 +1451,7 @@ mod tests {
     use super::resolve_kvm_shebang;
     use super::resolve_sabre_binary_from;
     use super::sabre_runtime_unavailable_reason;
+    use super::shutdown_sabre_rpc;
     use super::stop_sabre_rpc_server;
     use super::wait_for_sabre_rpc_disconnects;
 
@@ -1595,6 +1610,26 @@ mod tests {
 
         let error = stop_sabre_rpc_server(server_task).await.unwrap_err();
         assert!(error.to_string().contains("accept failed"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sabre_rpc_shutdown_drains_connections_after_server_failure() {
+        let global = Arc::new(());
+        let connection = global.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            drop(connection);
+        });
+        let server_task = tokio::spawn(async { Err::<(), _>("accept failed") });
+        while !server_task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        let error = shutdown_sabre_rpc(server_task, &global, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("accept failed"));
+        assert_eq!(Arc::strong_count(&global), 1);
     }
 
     #[test]
