@@ -130,6 +130,7 @@ use crate::syscall_classification::classify_syscall;
 use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
 use crate::syscall_classification::is_privileged_admin_refused_syscall;
 use crate::syscall_classification::is_unimplemented_enosys_syscall;
+use crate::syscall_classification::is_unsupported_async_ipc_syscall;
 use crate::syscalls::helpers::with_guest_rip;
 use crate::syscalls::helpers::with_guest_time;
 use crate::tool_global::resource_request;
@@ -1312,6 +1313,25 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 if is_mount_ns_admin_refused_syscall(call.number()) =>
             {
                 Err(Error::Errno(Errno::EPERM))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#731): Deterministic ENOSYS for the
+            // asynchronous and message-passing I/O and IPC interfaces Detcore
+            // does not model: Linux native AIO (io_setup/io_destroy/io_submit/
+            // io_cancel/io_getevents/io_pgetevents), POSIX message queues
+            // (mq_*), and System V message queues (msg*). AIO completion is
+            // kernel-driven and lives outside logical time; the message-queue
+            // families operate on global, key/name-addressed kernel objects
+            // shared with the whole host. A fixed -ENOSYS is the errno a kernel
+            // built without AIO/CONFIG_POSIX_MQUEUE/CONFIG_SYSVIPC returns, is
+            // never forwarded to the host, and is identical across --verify and
+            // record/replay (mirrors the io_uring refusal). Untyped
+            // (Syscall::Other) in the pinned Reverie, so dispatch on the Sysno
+            // before the typed match below.
+            SyscallClassification::Determinized
+                if is_unsupported_async_ipc_syscall(call.number()) =>
+            {
+                Err(Error::Errno(Errno::ENOSYS))
             }
             SyscallClassification::Determinized => match call {
                 Syscall::Write(w) => self.handle_write(guest, w).await,
