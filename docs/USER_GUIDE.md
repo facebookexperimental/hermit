@@ -143,17 +143,25 @@ subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
 
 Hermit detects whether the requested backend is integrated and available on
 the current host. It does not silently fall back to a different backend.
-LiteInst requires `libdetcore_liteinst.so` beside the Hermit executable. Its
-`--verify` mode compares two compatibility runs, including the run-length-
-normalized shape of their syscall-number streams, but does not activate Detcore
-or claim L2 determinism. LiteInst
-verification accepts seekable stdin such as a regular file or `/dev/null` and
-rejects pipes and terminals immediately because they cannot be replayed.
-LiteInst requires explicit `--no-namespace`: it honors `--workdir`,
-`--base-env`, and `--env`, but does not implement namespace, mount, or network
-isolation. Its event cookie prevents accidental control-record confusion and
-direct operations on the controller-owned pipe are protected; the in-process
-preload is not a security boundary for intentionally hostile code.
+LiteInst requires `libdetcore_liteinst.so` beside the Hermit executable. That
+DSO installs `Detcore` over `LiteinstGuest`; a coordinator-side
+`LiteinstBackend` owns global state and transports tool RPC over a Unix socket.
+The first syscall at each site traps through seccomp `SIGSYS`; subsequent calls
+use the installed LiteInst trampoline.
+
+LiteInst uses the normal Hermit run and verification paths. A successful
+`--strict --verify` run compares captured status/output and Detcore scheduler
+logs and is therefore an L2 result. Verification currently supplies
+`/dev/null` as guest stdin. The supported execution scope is dynamically
+linked, single-threaded, single-process Linux x86-64 guests. Thread clone,
+`fork`, and `vfork` fail closed with `EOPNOTSUPP`, and `exec` remains
+unsupported. RCB timer delivery and CPUID/RDTSC interception are not yet
+implemented.
+
+The default namespace, mount, and network setup is shared with Hermit's other
+backends; `--no-namespace` remains available for trusted guests. The preload
+runtime reserves `SIGSYS` in kernel-visible signal masks. This experimental
+in-process path is not a security boundary for intentionally hostile code.
 The DynamoRIO path requires a discoverable SDK, SaBRe requires configured
 runner/rewriter/plugin artifacts, and KVM requires read-write `/dev/kvm` access
 plus a guest-kernel ABI.

@@ -9,4 +9,6 @@ repository = "https://github.com/facebookexperimental/hermit"
 crate-type = ["cdylib"]
 
 [dependencies]
-reverie-liteinst = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "c28f9c61dce51a77e1ae7466a22c1edaacefa716", default-features = false }
+detcore = { version = "0.0.0", path = "../detcore" }
+libc = "0.2.186"
+reverie-liteinst = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "51bf24c12501a76e0eaee173ce567f99f3fa9e85", default-features = false }

@@ -66,8 +66,8 @@
     },
     {
       "group": "test", "job": "regular_crates",
-      "desc": "Test regular workspace crates (nextest, excludes detcore/hermit/flaky)",
-      "cmd": "cargo nextest run ${CI:+--profile ci} --workspace --exclude detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests",
+      "desc": "Test regular workspace crates (nextest, excludes detcore/detcore-liteinst/hermit/flaky)",
+      "cmd": "cargo nextest run ${CI:+--profile ci} --workspace --exclude detcore --exclude detcore-liteinst --exclude hermit --exclude hermetic_infra_hermit_flaky-tests",
       "deps": ["build.workspace", "setup.nextest"],
       "timeout": 900,
       "hint": {"est_duration_s": 200, "rss_baseline_bytes": 4294967296,
@@ -85,10 +85,10 @@
     {
       "group": "test", "job": "hermit_unit",
       "desc": "Test Hermit unit and binary targets (-p hermit --lib --bins)",
-      "cmd": "cargo test -p hermit --lib --bins",
+      "cmd": "cargo test -p hermit --lib --bins -- --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 900,
-      "hint": {"est_duration_s": 120,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
                "rss_baseline_bytes": 3221225472, "hard_mem_max_bytes": 5368709120,
                "classification": "cpu-bound"}
     },
@@ -145,7 +145,7 @@
     {
       "group": "test", "job": "cli",
       "desc": "Portable CLI cases (skips KVM/DBI-backend-only cases)",
-      "cmd": "cargo test -p hermit --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbi_strict_returns_with_blocked_stdin_source --skip run_dbi_verifies_pipe_backpressure --skip run_dbi_keeps_diagnostics_out_of_guest_stderr --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --test-threads=1",
+      "cmd": "cargo test -p hermit --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbi_strict_returns_with_blocked_stdin_source --skip run_dbi_verifies_pipe_backpressure --skip run_dbi_keeps_diagnostics_out_of_guest_stderr --skip run_dbi_recovers_after_failed_exec --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,

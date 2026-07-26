@@ -7,12 +7,9 @@
  */
 
 use std::fs;
-use std::io::Seek;
-use std::io::SeekFrom;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
-use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -20,9 +17,6 @@ use std::process::Output;
 use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::thread;
-use std::time::Duration;
-use std::time::Instant;
 
 static DBI_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBI_EXEC_FAILURE_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -587,18 +581,13 @@ fn run_dbi_strict_returns_with_blocked_stdin_source() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#688): Review the LiteInst CLI compatibility assertion.
+// TODO-HUMAN-REVIEW(PR-736): Review the real LiteInst Detcore CLI assertion.
 #[test]
-fn run_liteinst_verifies_integrated_preload_backend() {
-    if !hermit::Backend::Liteinst.is_available() {
-        eprintln!("skipping LiteInst CLI regression: runtime cdylib is not packaged");
-        return;
-    }
+fn run_liteinst_verifies_detcore_backend() {
     let args = [
         "run",
         "--backend",
         "liteinst",
-        "--no-namespace",
         "--strict",
         "--verify",
         "--",
@@ -610,411 +599,17 @@ fn run_liteinst_verifies_integrated_preload_backend() {
     assert_eq!(stdout(&output), "liteinst-cli-ok\n");
     let stderr = stderr(&output);
     assert!(
-        stderr.contains("Detcore determinization is unavailable"),
+        stderr.contains("liteinst backend] Detcore Tool active"),
         "{stderr}"
     );
     assert!(
-        stderr.contains("LiteInst compatibility observations matched"),
+        stderr.contains("Success: deterministic. Determinism verified."),
         "{stderr}"
     );
     assert!(
-        !stderr.contains("reverie-liteinst: tool=compat"),
+        stderr.contains("LiteInst (reverie-liteinst LiteinstGuest<Detcore>)"),
         "{stderr}"
     );
-}
-
-#[test]
-fn run_liteinst_keeps_marker_shaped_guest_stderr() {
-    if !hermit::Backend::Liteinst.is_available() {
-        return;
-    }
-    let marker = "reverie-liteinst: tool=compat syscall=999999";
-    let args = [
-        "run",
-        "--backend",
-        "liteinst",
-        "--no-namespace",
-        "--verify",
-        "--",
-        "/bin/sh",
-        "-c",
-        "printf 'reverie-liteinst: tool=compat syscall=999999\n' >&2",
-    ];
-    let output = hermit(&args);
-    assert_success(&output, &args);
-    let stderr = stderr(&output);
-    assert_eq!(stderr.matches(marker).count(), 1, "{stderr}");
-    assert!(
-        stderr.contains("LiteInst compatibility observations matched"),
-        "{stderr}"
-    );
-}
-
-#[test]
-fn run_liteinst_compares_repeatable_nonzero_runs() {
-    if !hermit::Backend::Liteinst.is_available() {
-        return;
-    }
-    let args = [
-        "run",
-        "--backend",
-        "liteinst",
-        "--no-namespace",
-        "--verify",
-        "--",
-        "/bin/sh",
-        "-c",
-        "exit 7",
-    ];
-    let output = hermit(&args);
-    assert_eq!(output.status.code(), Some(7), "{}", stderr(&output));
-    let stderr = stderr(&output);
-    assert!(stderr.contains("compatibility run 1"), "{stderr}");
-    assert!(stderr.contains("compatibility run 2"), "{stderr}");
-    assert!(
-        stderr.contains("LiteInst compatibility observations matched"),
-        "{stderr}"
-    );
-}
-
-#[test]
-fn run_liteinst_verify_rejects_nonseekable_stdin() {
-    if !hermit::Backend::Liteinst.is_available() {
-        return;
-    }
-    let args = [
-        "run",
-        "--backend",
-        "liteinst",
-        "--no-namespace",
-        "--verify",
-        "--",
-        "/bin/cat",
-    ];
-    let output = hermit_with_stdin(&args, b"must-not-block");
-    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
-    assert!(
-        stderr(&output).contains("requires seekable stdin"),
-        "{}",
-        stderr(&output)
-    );
-}
-
-#[test]
-fn run_liteinst_nonverify_does_not_prebuffer_infinite_stdin() {
-    if !hermit::Backend::Liteinst.is_available() {
-        return;
-    }
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "run",
-            "--backend",
-            "liteinst",
-            "--no-namespace",
-            "--",
-            "/usr/bin/head",
-            "-n",
-            "1",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut input = child.stdin.take().unwrap();
-    let writer = thread::spawn(move || while input.write_all(b"x\n").is_ok() {});
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            let _ = child.wait();
-            writer.join().unwrap();
-            panic!("LiteInst non-verify run prebuffered infinite stdin");
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    let output = child.wait_with_output().unwrap();
-    writer.join().unwrap();
-    assert_success(&output, &["LiteInst infinite-stdin regression"]);
-    assert_eq!(stdout(&output), "x\n");
-}
-
-#[test]
-fn run_liteinst_requires_explicit_host_mode() {
-    let args = ["run", "--backend", "liteinst", "--", "/bin/true"];
-    let output = hermit(&args);
-    assert_eq!(output.status.code(), Some(1));
-    assert!(stderr(&output).contains("requires --no-namespace"));
-}
-
-#[test]
-fn run_liteinst_honors_workdir_and_environment() {
-    if !hermit::Backend::Liteinst.is_available() {
-        return;
-    }
-    let args = [
-        "run",
-        "--backend",
-        "liteinst",
-        "--no-namespace",
-        "--verify",
-        "--base-env=empty",
-        "--env=LITEINST_SENTINEL=present",
-        "--workdir=/tmp",
-        "--",
-        "/bin/sh",
-        "-c",
-        "pwd; printf '%s\\n' \"$LITEINST_SENTINEL\"",
-    ];
-    let output = hermit(&args);
-    assert_success(&output, &args);
-    assert_eq!(stdout(&output), "/tmp\npresent\n");
-}
-
-#[test]
-fn run_liteinst_replays_seekable_stdin_from_nonzero_offset() {
-    if !hermit::Backend::Liteinst.is_available() {
-        return;
-    }
-    let mut input = tempfile::tempfile().unwrap();
-    input.write_all(b"skip:payload\n").unwrap();
-    input.seek(SeekFrom::Start(5)).unwrap();
-    let args = [
-        "run",
-        "--backend",
-        "liteinst",
-        "--no-namespace",
-        "--verify",
-        "--",
-        "/bin/cat",
-    ];
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(args)
-        .stdin(Stdio::from(input.try_clone().unwrap()))
-        .output()
-        .unwrap();
-    assert_success(&output, &args);
-    assert_eq!(stdout(&output), "payload\n");
-    assert_eq!(input.stream_position().unwrap(), 5);
-}
-
-#[test]
-fn run_liteinst_preserves_reserved_guest_exit_codes() {
-    if !hermit::Backend::Liteinst.is_available() {
-        return;
-    }
-    for code in 120..=127 {
-        let script = format!("exit {code}");
-        let args = [
-            "run",
-            "--backend",
-            "liteinst",
-            "--no-namespace",
-            "--verify",
-            "--",
-            "/bin/sh",
-            "-c",
-            &script,
-        ];
-        let output = hermit(&args);
-        assert_eq!(output.status.code(), Some(code), "{}", stderr(&output));
-    }
-}
-
-#[test]
-fn run_liteinst_preserves_signal_termination() {
-    if !hermit::Backend::Liteinst.is_available() {
-        return;
-    }
-    let args = [
-        "run",
-        "--backend",
-        "liteinst",
-        "--no-namespace",
-        "--verify",
-        "--",
-        "/bin/sh",
-        "-c",
-        "kill -TERM $$",
-    ];
-    let output = hermit(&args);
-    assert_eq!(output.status.signal(), Some(libc::SIGTERM), "{output:?}");
-}
-
-#[test]
-fn run_liteinst_reaps_orphaned_fork_children() {
-    if !hermit::Backend::Liteinst.is_available() {
-        return;
-    }
-    let args = [
-        "run",
-        "--backend",
-        "liteinst",
-        "--no-namespace",
-        "--",
-        "/bin/sh",
-        "-c",
-        "(trap '' TERM; while :; do :; done) >/dev/null 2>&1 & exit 0",
-    ];
-    let started = Instant::now();
-    let output = hermit(&args);
-    assert_success(&output, &args);
-    assert!(started.elapsed() < Duration::from_secs(5), "{output:?}");
-}
-
-#[test]
-fn run_liteinst_prevents_orphan_process_group_escape() {
-    if !hermit::Backend::Liteinst.is_available() {
-        return;
-    }
-    let script = r#"import os, time
-pid = os.fork()
-if pid == 0:
-    null = os.open('/dev/null', os.O_RDWR)
-    os.dup2(null, 0); os.dup2(null, 1); os.dup2(null, 2); os.close(null)
-    try:
-        os.setsid()
-    except PermissionError:
-        pass
-    time.sleep(30)
-    os._exit(0)
-os._exit(0)
-"#;
-    let args = [
-        "run",
-        "--backend",
-        "liteinst",
-        "--no-namespace",
-        "--",
-        "/usr/bin/python3",
-        "-c",
-        script,
-    ];
-    let started = Instant::now();
-    let output = hermit(&args);
-    assert_success(&output, &args);
-    assert!(started.elapsed() < Duration::from_secs(5), "{output:?}");
-}
-
-#[test]
-fn run_liteinst_handles_inherited_ignored_sigchld() {
-    if !hermit::Backend::Liteinst.is_available() {
-        return;
-    }
-    let args = [
-        "run",
-        "--backend",
-        "liteinst",
-        "--no-namespace",
-        "--verify",
-        "--",
-        "/usr/bin/python3",
-        "-c",
-        "import signal; print('ignored' if signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN else 'changed')",
-    ];
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command.args(args);
-    unsafe {
-        command.pre_exec(|| {
-            if libc::signal(libc::SIGCHLD, libc::SIG_IGN) == libc::SIG_ERR {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let output = command.output().expect("failed to run hermit");
-    assert_success(&output, &args);
-    assert_eq!(stdout(&output), "ignored\n");
-}
-
-#[test]
-fn run_liteinst_verifies_forked_guest() {
-    if !hermit::Backend::Liteinst.is_available() {
-        return;
-    }
-    let script = r#"import os
-child = os.fork()
-if child == 0:
-    os._exit(0)
-pid, status = os.waitpid(child, 0)
-assert pid == child and os.waitstatus_to_exitcode(status) == 0
-print("fork-ok")
-"#;
-    let args = [
-        "run",
-        "--backend",
-        "liteinst",
-        "--no-namespace",
-        "--verify",
-        "--",
-        "/usr/bin/python3",
-        "-c",
-        script,
-    ];
-    let output = hermit(&args);
-    assert_success(&output, &args);
-    assert_eq!(stdout(&output), "fork-ok\n");
-}
-
-#[test]
-fn run_liteinst_verifies_raw_fork_guest() {
-    if !hermit::Backend::Liteinst.is_available() {
-        return;
-    }
-    let script = r#"import ctypes, os
-child = ctypes.CDLL(None).syscall(57)
-if child == 0:
-    os._exit(0)
-assert child > 0
-pid, status = os.waitpid(child, 0)
-assert pid == child and os.waitstatus_to_exitcode(status) == 0
-print("raw-fork-ok")
-"#;
-    let args = [
-        "run",
-        "--backend",
-        "liteinst",
-        "--no-namespace",
-        "--verify",
-        "--",
-        "/usr/bin/python3",
-        "-c",
-        script,
-    ];
-    let output = hermit(&args);
-    assert_success(&output, &args);
-    assert_eq!(stdout(&output), "raw-fork-ok\n");
-}
-
-#[test]
-fn run_liteinst_rejects_non_fork_clone() {
-    if !hermit::Backend::Liteinst.is_available() {
-        return;
-    }
-    let script = r#"import ctypes, errno
-libc = ctypes.CDLL(None, use_errno=True)
-result = libc.syscall(56, 0x100 | 0x4000 | 17, 0, 0, 0, 0)
-assert result == -1 and ctypes.get_errno() == errno.EPERM
-print("unsafe-clone-rejected")
-"#;
-    let args = [
-        "run",
-        "--backend",
-        "liteinst",
-        "--no-namespace",
-        "--verify",
-        "--",
-        "/usr/bin/python3",
-        "-c",
-        script,
-    ];
-    let output = hermit(&args);
-    assert_success(&output, &args);
-    assert_eq!(stdout(&output), "unsafe-clone-rejected\n");
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED

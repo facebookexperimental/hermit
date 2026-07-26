@@ -94,25 +94,30 @@ For backwards compatibility, `run` still accepts `--backend` after the
 subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
 
 Backend selection fails closed. Hermit never substitutes ptrace after an
-explicit backend request. LiteInst is an experimental in-process compatibility
-path for dynamically linked Linux x86-64 guests:
+explicit backend request. LiteInst is an experimental in-process Detcore
+backend for dynamically linked Linux x86-64 guests:
 
 ```bash
-cargo build -p hermit -p detcore-liteinst
-hermit run --backend=liteinst --no-namespace --strict --verify -- /bin/echo hello
+cargo build -p hermit --bin hermit
+cargo build -p detcore-liteinst --lib
+hermit run --backend=liteinst --strict --verify -- /bin/echo hello
 ```
 
-LiteInst compares exit status, stdout, stderr, and the run-length-normalized
-shape of intercepted syscall numbers across two runs. Normalization tolerates
-adjacent repeated reads caused by host I/O chunking without hiding reordered
-syscall kinds. It does not activate Detcore and therefore does not establish
-Hermit's L2 guarantee. Verification requires seekable stdin; exec and
-thread-creating clone operations remain unsupported by the preload prototype.
-LiteInst requires explicit `--no-namespace`: it honors the selected working
-directory and environment but does not implement Hermit's namespace, mount, or
-network isolation. Its per-run event cookie detects accidental control-record
-confusion, and direct operations on the controller-owned pipe are protected.
-This in-process path is not a security sandbox for intentionally hostile code.
+The Hermit-owned preload DSO installs `Detcore` as a generic Reverie `Tool`.
+The first invocation of a syscall site arrives through seccomp `SIGSYS`, where
+LiteInst installs an instruction-punning hook. Later invocations enter the
+LiteInst trampoline and `LiteinstGuest<Detcore>`; global Detcore state remains
+in the coordinator and is reached over the Reverie RPC transport.
+
+`--verify` runs the normal Detcore comparison over captured status, output,
+and deterministic scheduler logs, so a successful result is an L2 claim.
+Current support is limited to single-threaded, single-process guests. Thread
+clone, `fork`, and `vfork` fail closed with `EOPNOTSUPP`; `exec` is also
+unsupported because the inherited seccomp filter would outlive the preload
+runtime. RCB preemption and CPUID/RDTSC interception are not implemented.
+The default Hermit namespace path is supported; `--no-namespace` remains an
+explicit option for trusted guests. The in-process preload is experimental and
+must not be treated as a security boundary for hostile code.
 The DynamoRIO path requires a discoverable SDK, SaBRe requires its runner,
 rewriter, and plugin artifacts, and KVM requires read-write `/dev/kvm` access
 plus its guest-kernel Linux ABI.
