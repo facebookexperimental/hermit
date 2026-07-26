@@ -1567,8 +1567,16 @@ function run_compatibility_corpus {
     # AUTONOMOUS-BOT-IMPLEMENTED
     # TODO-HUMAN-REVIEW(#701): Review the complex shell-build L2 workload.
     if [[ $COMPATIBILITY_MODE == strict ]]; then
+        # Give the workload a per-run-unique work directory so concurrent
+        # validate.sh runs never collide on a shared path under --verify. The
+        # path is identical across this probe's two --verify runs (fixed argv),
+        # keeping it L2-stable, but unique across processes (host mktemp).
+        local shell_build_dir
+        shell_build_dir=$(mktemp -d "${TMPDIR:-/tmp}/hermit-shell-build.XXXXXX")
         strict_compatibility_probe shell-build bash "$COMPLEX_SHELL_WORKLOAD" \
+            "$shell_build_dir" \
             && passed=$((passed + 1)) || failed=$((failed + 1))
+        rm -rf "$shell_build_dir"
     fi
     functional_compatibility_probe cargo cargo --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
