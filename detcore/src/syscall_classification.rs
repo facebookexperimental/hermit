@@ -191,6 +191,16 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::process_madvise
         | Sysno::setrlimit
         | Sysno::setsockopt
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#818): shutdown is the lone remaining Unsupported
+        // member of the socket family (socket/bind/connect/listen/accept/
+        // getsockname/getpeername/getsockopt/setsockopt/sendto/recvfrom/sendmsg/
+        // recvmsg/sendmmsg/recvmmsg are all Determinized). It half-closes a
+        // tracked socket's read and/or write direction; it never blocks, returns
+        // no data, and its effect is deterministic given the container's socket
+        // state, so handle_shutdown forwards it via record_or_replay exactly like
+        // handle_listen/handle_setsockopt (KVM ratchet round 12).
+        | Sysno::shutdown
         | Sysno::tgkill
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#812): signal-sending siblings of the already
@@ -587,7 +597,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::shmctl
         | Sysno::shmdt
         | Sysno::shmget
-        | Sysno::shutdown
         | Sysno::splice
         | Sysno::statmount
         | Sysno::sysfs
@@ -757,7 +766,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [209, 91, 73]);
+        assert_eq!(counts, [210, 91, 72]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -829,6 +838,12 @@ mod tests {
         );
         assert_eq!(
             classify_syscall(Sysno::recvmsg),
+            SyscallClassification::Determinized
+        );
+        // shutdown is the lone remaining socket-family syscall; it must stay
+        // Determinized (routed through handle_shutdown); regression for #818.
+        assert_eq!(
+            classify_syscall(Sysno::shutdown),
             SyscallClassification::Determinized
         );
         for sysno in [

@@ -1355,6 +1355,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(self.record_or_replay(guest, call).await?)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#818)
+    /// Half-close the read and/or write direction of an already tracked socket.
+    /// shutdown never blocks and returns no data; its effect is deterministic
+    /// given the container's socket state, so it forwards via record_or_replay
+    /// exactly like the rest of the socket family (KVM ratchet round 12).
+    pub async fn handle_shutdown<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Shutdown,
+    ) -> Result<i64, Error> {
+        Ok(self.record_or_replay(guest, call).await?)
+    }
+
     /// bind system call.
     pub async fn handle_bind<G: Guest<Self>>(
         &self,

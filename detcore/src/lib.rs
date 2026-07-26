@@ -1568,6 +1568,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
                 Syscall::Getsockopt(s) => self.handle_getsockopt(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#818): shutdown is the lone remaining
+                // socket-family syscall; half-closes a tracked socket and
+                // forwards via record_or_replay (KVM ratchet round 12).
+                Syscall::Shutdown(s) => self.handle_shutdown(guest, s).await,
                 Syscall::Eventfd(s) => self.handle_eventfd2(guest, s.into()).await,
                 Syscall::Eventfd2(s) => self.handle_eventfd2(guest, s).await,
                 Syscall::Signalfd(s) => self.handle_signalfd4(guest, s.into()).await,
