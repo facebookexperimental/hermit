@@ -476,7 +476,8 @@ fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
              e9patch::prepare and then select `ptrace`"
         ));
     }
-    // The KVM backend has its own dispatch (`run_kvm`); it must not reach here.
+    // KVM and DBI have dedicated dispatches (`run_kvm` and `run_dbi`); neither
+    // must reach this generic rejection path.
     backend.ensure_available()?;
     Err(anyhow!(
         "backend `{}` has no Hermit dispatch implementation",
@@ -655,6 +656,74 @@ async fn run_kvm(
     })
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-737): Review public DBI dispatch and child environment ownership.
+/// Dispatch a command onto the Detcore-linked reverie-dbi runtime.
+async fn run_dbi(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    capture_output: bool,
+) -> Result<Output, Error> {
+    if !config.sequentialize_threads {
+        return Err(anyhow!(
+            "the dbi backend requires sequentialized threads; remove \
+             --no-sequentialize-threads (or --strace-only) to run under --backend dbi"
+        ));
+    }
+
+    let config_json = serde_json::to_string(&config)
+        .map_err(|error| anyhow!("failed to serialize the Detcore config for DBI: {error}"))?;
+    let panic_on_unsupported_syscalls = config.panic_on_unsupported_syscalls;
+    let (drrun, client) = detcore_dbi::prepare_native_client()
+        .map_err(|error| anyhow!("failed to prepare the Detcore DynamoRIO client: {error}"))?;
+    let mut runner = reverie_dbi::DbiRunner::new(&drrun, &client)
+        .map_err(|error| {
+            anyhow!(
+                "failed to configure the DynamoRIO DBI runner (drrun={}, client={}): {error}",
+                drrun.display(),
+                client.display()
+            )
+        })?
+        .summary(print_summary)
+        .isolated_process_group(panic_on_unsupported_syscalls);
+    if panic_on_unsupported_syscalls {
+        runner = runner.client_argument("-panic-on-unsupported-syscalls");
+    }
+
+    let program = command.get_program().to_owned();
+    let mut environment = command.get_captured_envs();
+    environment.insert(detcore_dbi::DETCONFIG_ENV.into(), config_json.into());
+    let guest = command.into_std_lossy();
+    tracing::info!(
+        target: "hermit::dbi",
+        program = ?program,
+        drrun = %drrun.display(),
+        client = %client.display(),
+        "launching guest through reverie-dbi with Detcore<DbiGuest>",
+    );
+
+    if capture_output {
+        let output = runner
+            .output_with_environment(&guest, &environment)
+            .map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))?;
+        return Ok(Output {
+            status: output.status.into(),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        });
+    }
+
+    let status = runner
+        .status_with_environment(&guest, &environment)
+        .map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))?;
+    Ok(Output {
+        status: status.into(),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    })
+}
+
 // NOTE: A single-threaded executor is used here so that the tokio threads
 // themselves wouldn't contribute non-determinism to the PID namespace. This
 // could also be changed to a specific number of threads and that would be
@@ -716,6 +785,9 @@ async fn run_with_backend_inner(
         )
         .await?
         .status);
+    }
+    if backend == Backend::Dbi {
+        return Ok(run_dbi(command, config, print_summary, false).await?.status);
     }
     ensure_backend_dispatch(backend)?;
 
@@ -783,6 +855,9 @@ async fn run_with_output_backend_inner(
             true,
         )
         .await;
+    }
+    if backend == Backend::Dbi {
+        return run_dbi(command, config, print_summary, true).await;
     }
     ensure_backend_dispatch(backend)?;
 
@@ -1110,6 +1185,69 @@ mod tests {
             error.to_string().contains("requires CLI preprocessing"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn dbi_public_dispatch_requires_sequentialized_threads() {
+        let command = super::Command::new("/bin/true");
+        let config = super::DetConfig {
+            sequentialize_threads: false,
+            ..Default::default()
+        };
+
+        let error = super::run_with_output_backend(command, config, false, &None, Backend::Dbi)
+            .expect_err("DBI must reject non-sequentialized execution");
+        assert!(
+            error
+                .to_string()
+                .contains("dbi backend requires sequentialized threads"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn dbi_public_dispatch_runs_echo_through_detcore() {
+        use clap::Parser;
+
+        if Backend::Dbi.ensure_available().is_err() {
+            return;
+        }
+
+        let mut command = super::Command::new("/bin/echo");
+        command.arg("hello");
+        let mut config = super::DetConfig::parse_from(["hermit-dbi-test"]);
+        config.sequentialize_threads = true;
+        config.validate();
+        let output = super::run_with_output_backend(command, config, true, &None, Backend::Dbi)
+            .expect("run /bin/echo through DbiGuest<Detcore>");
+
+        assert_eq!(output.status, super::ExitStatus::Exited(0));
+        assert_eq!(output.stdout, b"hello\n");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .any(|line| line.starts_with("reverie-dbi: tool=Detcore ")),
+            "DBI native summary did not prove Detcore dispatch: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn dbi_public_status_dispatch_runs_true_through_detcore() {
+        use clap::Parser;
+
+        if Backend::Dbi.ensure_available().is_err() {
+            return;
+        }
+
+        let command = super::Command::new("/bin/true");
+        let mut config = super::DetConfig::parse_from(["hermit-dbi-test"]);
+        config.sequentialize_threads = true;
+        config.validate();
+        let status = super::run_with_backend(command, config, true, &None, Backend::Dbi)
+            .expect("run /bin/true through DbiGuest<Detcore>");
+
+        assert_eq!(status, super::ExitStatus::Exited(0));
     }
 
     #[test]
