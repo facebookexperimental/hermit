@@ -103,8 +103,8 @@
     },
     {
       "group": "hw", "job": "integration",
-      "desc": "Hardware Hermit integration targets (serial, isolated per target)",
-      "cmd": "set -e; for t in arch_prctl compression madvise ppoll_simulation redis_strict sqlite_veryquick syscall_file_io syscall_file_metadata syscall_quick_wins thread_scheduling_fairness writev_determinism; do cargo test -p hermit --test \"$t\" -- --test-threads=1; done",
+      "desc": "Hardware Hermit integration targets (batched compile, serial test binaries)",
+      "cmd": "cargo test -p hermit --test arch_prctl --test compression --test madvise --test ppoll_simulation --test redis_strict --test sqlite_veryquick --test syscall_file_io --test syscall_file_metadata --test syscall_quick_wins --test thread_scheduling_fairness --test writev_determinism -- --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 3600,
       "hint": {"resources": {"pmu": 1}, "est_duration_s": 900,

@@ -564,13 +564,12 @@ EOF
         printf 'objdump:compat_add:ret\n'
         ;;
     ranlib)
-        archive=$(gcc -print-file-name=libgcc.a)
-        test -r "$archive"
-        cp "$archive" "$WORK_DIR/libcompat.a"
+        cp "$FIXTURE_ROOT/binutils/with-symbols.o" "$WORK_DIR/compat.o"
+        /usr/bin/ar crDS "$WORK_DIR/libcompat.a" "$WORK_DIR/compat.o"
         /usr/bin/ranlib -D "$WORK_DIR/libcompat.a"
         /usr/bin/nm -s "$WORK_DIR/libcompat.a" >"$WORK_DIR/archive-index.txt"
-        grep -q ' in _muldi3.o$' "$WORK_DIR/archive-index.txt"
-        printf 'ranlib:indexed-libgcc-copy\n'
+        grep -qx 'compat_line in compat.o' "$WORK_DIR/archive-index.txt"
+        printf 'ranlib:indexed-fixture-archive\n'
         ;;
     readelf)
         build_assembly_object

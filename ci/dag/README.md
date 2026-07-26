@@ -96,10 +96,11 @@ moving parts:
 - **Hosted strict compatibility starts after every non-guest Cargo node** so
   its `shell-build` run1/run2 comparison cannot observe concurrent target or
   cache mutation. Those short nodes still run in parallel before the barrier.
-- **Serial per-target loops are inlined** as a `for` loop with `set -e`
-  (`test.hermit_integration`, `hw.integration`, and the `pmu.*` exact-case
-  gates), matching `run_hermit_targets_serial` / `run_exact_detcore_cases`
-  including their per-case `timeout`s.
+- **Hermit integration targets use one Cargo invocation** with repeated
+  `--test` selectors (`test.hermit_integration` and `hw.integration`). Cargo
+  plans and links the selected targets together, then executes their separate
+  test binaries serially. The `pmu.*` exact-case gates retain their `for` loops
+  and per-case `timeout`s to preserve fail-fast hardware isolation.
 - **The hosted `envelope_levels` gate is inlined** (L1–L4 over the three
   `ENVELOPE_PROBES`: `true`, `echo`, `date`) because it has no standalone
   `validate.sh` flag. It mirrors `run_hosted_envelope_levels` in `validate.sh`.

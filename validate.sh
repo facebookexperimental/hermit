@@ -2698,9 +2698,16 @@ function run_hardware_envelope_record_replay {
 
 function run_hermit_targets_serial {
     local target
+    local -a cargo_args=(test -p hermit)
+
     for target in "$@"; do
-        cargo test -p hermit --test "$target" -- --test-threads=1 || return $?
+        cargo_args+=(--test "$target")
     done
+
+    # One Cargo invocation plans and links all selected test binaries together,
+    # avoiding repeated package-cache and target-directory lock acquisition.
+    # Cargo still executes the separate test binaries serially by default.
+    cargo "${cargo_args[@]}" -- --test-threads=1
 }
 
 function run_hosted_only_suite {

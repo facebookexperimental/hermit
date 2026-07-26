@@ -31,6 +31,10 @@ jobs:
       with:
         go-version: stable
         cache: false
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: hosted-validation
+        cache-on-failure: true
     - name: Dependencies
       run: |
         sudo apt-get update
@@ -41,8 +45,10 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
         fi
         unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
-    - name: Install cargo-nextest
-      run: cargo install cargo-nextest --locked --version "$NEXTEST_VERSION"
+    - name: Install cargo-nextest (prebuilt)
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
     - name: Rust components
       run: rustup component add clippy rustfmt
     - name: Portable test DAG (no PMU or CPUID interception)
