@@ -153,6 +153,16 @@ fn ppoll_timeout_duration(timeout: Timespec) -> Result<Duration, Errno> {
     Ok(Duration::new(seconds, nanoseconds))
 }
 
+fn select_timeout_duration(timeout: libc::timeval) -> Result<Duration, Errno> {
+    let seconds = u64::try_from(timeout.tv_sec).map_err(|_| Errno::EINVAL)?;
+    let microseconds = u64::try_from(timeout.tv_usec).map_err(|_| Errno::EINVAL)?;
+    // Linux rejects select timeouts whose microsecond field is out of range.
+    if microseconds >= 1_000_000 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(Duration::new(seconds, (microseconds * 1_000) as u32))
+}
+
 fn timespec_from_duration(duration: Duration) -> Timespec {
     Timespec {
         tv_sec: duration.as_secs() as libc::time_t,
@@ -372,6 +382,187 @@ impl<T: RecordOrReplay> Detcore<T> {
             if let Err(error) = guest.memory().write_value(timeout, &remaining) {
                 // Linux preserves the pselect6 result when remaining-time copyout faults.
                 trace!(?error, "ignoring pselect6 timeout writeback failure");
+            }
+        }
+        Ok(())
+    }
+
+    /// select syscall (MAYHANG).
+    ///
+    /// `select` is the classic `timeval` sibling of `pselect6` (which is already
+    /// Determinized). It reuses the pselect6 fd-set scratch machinery, but takes
+    /// a `struct timeval` timeout (which Linux updates in place with the time not
+    /// slept) and carries no signal mask.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#800): Review select determinization mirroring pselect6.
+    pub async fn handle_select<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Select,
+    ) -> Result<i64, Error> {
+        if self.cfg.recordreplay_modes || !self.cfg.sequentialize_threads {
+            // Recorder/Replayer do not model select events. Preserve their existing
+            // live-kernel behavior without adding BlockingExternalIO scheduler events.
+            return Ok(guest.inject(call).await?);
+        }
+
+        if call.nfds() < 0 {
+            return Ok(guest.inject(call).await?);
+        }
+
+        let raw_timeout = match call.timeout() {
+            Some(timeout) => {
+                let timeout: libc::timeval = guest.memory().read_value(timeout)?;
+                Some(timeout)
+            }
+            None => None,
+        };
+        if matches!(raw_timeout, Some(timeout) if timeout.tv_sec == 0 && timeout.tv_usec == 0) {
+            // A zero timeout is a pure non-blocking poll; the kernel can service it directly.
+            return Ok(guest.inject(call).await?);
+        }
+
+        // Mirror pselect6: keep large fd tables under kernel ownership rather than
+        // over-reading the guest bitmap (Linux clamps raw fd-set copies to max_fds).
+        if call.nfds() > PSELECT6_INTERNAL_MAX_NFDS {
+            return self
+                .record_or_replay_blocking(guest, Syscall::Select(call))
+                .await;
+        }
+
+        let timeout = raw_timeout.map(select_timeout_duration).transpose()?;
+        self.handle_internal_select(guest, call, timeout).await
+    }
+
+    async fn handle_internal_select<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Select,
+        timeout: Option<Duration>,
+    ) -> Result<i64, Error> {
+        let len = pselect6_fd_set_len(call.nfds())?;
+        let deadline = match timeout {
+            Some(timeout) => Some(thread_observe_time(guest).await + timeout),
+            None => None,
+        };
+        let original_readfds = match read_pselect6_fd_set(guest, call.readfds(), len) {
+            Ok(value) => value,
+            Err(error) => {
+                self.write_select_remaining(guest, call, deadline).await?;
+                return Err(error);
+            }
+        };
+        let original_writefds = match read_pselect6_fd_set(guest, call.writefds(), len) {
+            Ok(value) => value,
+            Err(error) => {
+                self.write_select_remaining(guest, call, deadline).await?;
+                return Err(error);
+            }
+        };
+        let original_exceptfds = match read_pselect6_fd_set(guest, call.exceptfds(), len) {
+            Ok(value) => value,
+            Err(error) => {
+                self.write_select_remaining(guest, call, deadline).await?;
+                return Err(error);
+            }
+        };
+
+        let mut stack = guest.stack().await;
+        let readfds = call.readfds().map(|_| stack.reserve::<libc::fd_set>());
+        let writefds = call.writefds().map(|_| stack.reserve::<libc::fd_set>());
+        let exceptfds = call.exceptfds().map(|_| stack.reserve::<libc::fd_set>());
+        // select modifies its timeout in place, so the probe timeout must be a
+        // writable scratch cell. It is re-zeroed each iteration to keep every
+        // probe a non-blocking poll (a NULL timeout would block indefinitely).
+        let probe_timeout = stack.reserve::<libc::timeval>();
+        let _guard = stack.commit()?;
+        let probe = call
+            .with_readfds(readfds)
+            .with_writefds(writefds)
+            .with_exceptfds(exceptfds)
+            .with_timeout(Some(probe_timeout));
+
+        let mut resources = Resources::new(guest.thread_state().dettid);
+        resources.insert(ResourceID::InternalIOPolling, Permission::W);
+        resources.fyi("select");
+
+        loop {
+            if resource_request(guest, resources.clone()).await == ResumeStatus::Signaled {
+                self.write_select_remaining(guest, call, deadline).await?;
+                return Err(Errno::EINTR.into());
+            }
+            guest.memory().write_value(
+                probe_timeout,
+                &libc::timeval {
+                    tv_sec: 0,
+                    tv_usec: 0,
+                },
+            )?;
+            write_pselect6_fd_set(guest, probe.readfds(), &original_readfds)?;
+            write_pselect6_fd_set(guest, probe.writefds(), &original_writefds)?;
+            write_pselect6_fd_set(guest, probe.exceptfds(), &original_exceptfds)?;
+
+            let result = guest.inject(probe).await;
+            if result != Ok(0) {
+                let copy_result = if result.is_ok() {
+                    self.copy_select_results(guest, probe, call, len)
+                } else {
+                    Ok(())
+                };
+                self.write_select_remaining(guest, call, deadline).await?;
+                copy_result?;
+                return result.map_err(Into::into);
+            }
+
+            resources.poll_attempt += 1;
+            if let Some(deadline) = deadline
+                && thread_observe_time(guest).await >= deadline
+            {
+                let copy_result = self.copy_select_results(guest, probe, call, len);
+                self.write_select_remaining(guest, call, Some(deadline))
+                    .await?;
+                copy_result?;
+                return Ok(0);
+            }
+            trace!(
+                "Retry #{} for syscall due to result Ok(0): {}",
+                resources.poll_attempt,
+                probe.display(&guest.memory())
+            );
+            record_retry_event(guest, probe).await;
+        }
+    }
+
+    fn copy_select_results<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        probe: syscalls::Select,
+        call: syscalls::Select,
+        len: usize,
+    ) -> Result<(), Error> {
+        copy_pselect6_fd_set(guest, probe.readfds(), call.readfds(), len)?;
+        copy_pselect6_fd_set(guest, probe.writefds(), call.writefds(), len)?;
+        copy_pselect6_fd_set(guest, probe.exceptfds(), call.exceptfds(), len)
+    }
+
+    async fn write_select_remaining<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Select,
+        deadline: Option<LogicalTime>,
+    ) -> Result<(), Error> {
+        if let (Some(timeout), Some(deadline)) = (call.timeout(), deadline) {
+            let now = thread_observe_time(guest).await;
+            let remaining = deadline.as_nanos().saturating_sub(now.as_nanos());
+            let remaining = libc::timeval {
+                tv_sec: (remaining / 1_000_000_000) as libc::time_t,
+                tv_usec: ((remaining % 1_000_000_000) / 1_000) as libc::suseconds_t,
+            };
+            // select's timeout is a writable in-out kernel timeval reporting the
+            // time not slept; derive it from deterministic virtual time.
+            if let Err(error) = guest.memory().write_value(timeout, &remaining) {
+                // Linux preserves the select result when remaining-time copyout faults.
+                trace!(?error, "ignoring select timeout writeback failure");
             }
         }
         Ok(())

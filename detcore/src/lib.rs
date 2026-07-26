@@ -1601,6 +1601,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
                 Syscall::Pselect6(s) => self.handle_pselect6(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#800): select is the timeval sibling of pselect6.
+                Syscall::Select(s) => self.handle_select(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 Syscall::Ppoll(s) => self.handle_ppoll(guest, s).await,
                 Syscall::EpollCreate(s) => {
                     self.handle_epoll_create1(guest, EpollCreate1::from(s))

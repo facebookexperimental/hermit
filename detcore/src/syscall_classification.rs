@@ -114,6 +114,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
         | Sysno::pselect6
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#800): select is the timeval sibling of pselect6.
+        | Sysno::select
         | Sysno::prlimit64
         | Sysno::pread64
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -558,7 +561,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::rt_tgsigqueueinfo
         | Sysno::sched_setattr
         | Sysno::seccomp
-        | Sysno::select
         | Sysno::semctl
         | Sysno::semget
         | Sysno::semop
@@ -748,7 +750,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [205, 91, 77]);
+        assert_eq!(counts, [206, 91, 76]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -768,6 +770,16 @@ mod tests {
         );
         assert_eq!(
             classify_syscall(Sysno::ppoll),
+            SyscallClassification::Determinized
+        );
+        // select is the timeval sibling of pselect6 and must stay Determinized
+        // (routed through handle_select); regression for #800.
+        assert_eq!(
+            classify_syscall(Sysno::select),
+            SyscallClassification::Determinized
+        );
+        assert_eq!(
+            classify_syscall(Sysno::pselect6),
             SyscallClassification::Determinized
         );
         assert_eq!(
