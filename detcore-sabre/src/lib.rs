@@ -17,6 +17,8 @@ use reverie_sabre as sabre;
 use reverie_sabre::RemoteReverieAdapter;
 use reverie_syscalls::Errno;
 use reverie_syscalls::Syscall;
+use reverie_syscalls::SyscallArgs;
+use reverie_syscalls::Sysno;
 
 /// Environment variable containing the coordinator's Unix-domain socket path.
 // TODO-HUMAN-REVIEW(PR-745): Review the private SaBRe exec environment contract.
@@ -65,6 +67,12 @@ impl Plugin {
 
         Self { adapter }
     }
+
+    fn handle_vdso(&self, sysno: Sysno, args: SyscallArgs) -> i32 {
+        self.adapter
+            .handle_syscall(Syscall::from_raw(sysno, args))
+            .map_or_else(|errno| -errno.into_raw(), |result| result as i32)
+    }
 }
 
 #[sabre::tool]
@@ -93,6 +101,45 @@ impl reverie_sabre::Tool for Plugin {
         F: FnMut() -> usize + Send + Sync,
     {
         self.adapter.handle_syscall_with_inject(syscall, inject)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-755): Review SaBRe RDTSC virtualization.
+    fn rdtsc(&self) -> u64 {
+        self.adapter.handle_rdtsc().unwrap_or(0)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-755): Review SaBRe clock_gettime VDSO virtualization.
+    fn vdso_clock_gettime(&self, clockid: libc::clockid_t, tp: *mut libc::timespec) -> i32 {
+        self.handle_vdso(
+            Sysno::clock_gettime,
+            SyscallArgs::new(clockid as usize, tp as usize, 0, 0, 0, 0),
+        )
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-755): Review SaBRe getcpu VDSO virtualization.
+    fn vdso_getcpu(&self, cpu: *mut u32, node: *mut u32, unused: usize) -> i32 {
+        self.handle_vdso(
+            Sysno::getcpu,
+            SyscallArgs::new(cpu as usize, node as usize, unused, 0, 0, 0),
+        )
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-755): Review SaBRe gettimeofday VDSO virtualization.
+    fn vdso_gettimeofday(&self, tv: *mut libc::timeval, tz: *mut libc::timezone) -> i32 {
+        self.handle_vdso(
+            Sysno::gettimeofday,
+            SyscallArgs::new(tv as usize, tz as usize, 0, 0, 0, 0),
+        )
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-755): Review SaBRe time VDSO virtualization.
+    fn vdso_time(&self, tloc: *mut libc::time_t) -> i32 {
+        self.handle_vdso(Sysno::time, SyscallArgs::new(tloc as usize, 0, 0, 0, 0, 0))
     }
 
     fn on_thread_start(&self, thread_id: u32) {
