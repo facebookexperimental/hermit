@@ -58,6 +58,14 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::epoll_ctl
         | Sysno::epoll_ctl_old
         | Sysno::epoll_pwait
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#773): epoll_pwait2 is epoll_pwait with a
+        // `struct timespec *` timeout instead of int-milliseconds. Recent glibc
+        // implements epoll_wait/epoll_pwait via epoll_pwait2 when the kernel
+        // supports it, so programs fail-close here without it. Untyped
+        // (Syscall::Other) in the pinned Reverie; dispatched by Sysno in lib.rs
+        // and handled identically to epoll_pwait.
+        | Sysno::epoll_pwait2
         | Sysno::epoll_wait
         | Sysno::epoll_wait_old
         | Sysno::eventfd
@@ -483,7 +491,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::clock_adjtime
         | Sysno::close_range
         | Sysno::copy_file_range
-        | Sysno::epoll_pwait2
         | Sysno::flock
         | Sysno::futex_requeue
         | Sysno::futex_wait
@@ -720,7 +727,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [199, 91, 83]);
+        assert_eq!(counts, [200, 91, 82]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -763,6 +770,7 @@ mod tests {
             SyscallClassification::Determinized
         );
         for sysno in [
+            Sysno::epoll_pwait2,
             Sysno::clock_settime,
             Sysno::getpeername,
             Sysno::getsockname,

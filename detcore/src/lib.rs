@@ -1389,6 +1389,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             {
                 Err(Error::Errno(Errno::ENOSYS))
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#773): epoll_pwait2 is untyped (Syscall::Other)
+            // in the pinned Reverie revision. It is epoll_pwait with a
+            // `struct timespec *` timeout; recent glibc routes epoll_wait/
+            // epoll_pwait through it. Handled identically to epoll_pwait
+            // (scheduler yield + record/replay forwarding).
+            SyscallClassification::Determinized if call.number() == Sysno::epoll_pwait2 => {
+                self.handle_epoll_pwait2(guest, call).await
+            }
             SyscallClassification::Determinized => match call {
                 Syscall::Write(w) => self.handle_write(guest, w).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
