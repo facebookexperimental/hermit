@@ -1426,10 +1426,14 @@ impl RunOpts {
         }
         // });
 
-        // DBI and SaBRe use dedicated launch adapters. LiteInst, KVM, e9patch,
-        // and ptrace use the common container plus run/verify machinery below.
+        // DBI uses its dedicated CLI launch adapter. SaBRe, LiteInst, KVM,
+        // e9patch, and ptrace use the common container and run/verify machinery.
         match backend {
-            Backend::Ptrace | Backend::Liteinst | Backend::Kvm | Backend::E9patch => {}
+            Backend::Ptrace
+            | Backend::Liteinst
+            | Backend::Sabre
+            | Backend::Kvm
+            | Backend::E9patch => {}
             Backend::Dbi => {
                 return super::backends::run_dbi(
                     &self.program,
@@ -1437,15 +1441,6 @@ impl RunOpts {
                     self.verify,
                     global.log,
                     &self.effective_det_config(),
-                );
-            }
-            // TODO-HUMAN-REVIEW(#589): Review generic SaBRe CLI execution.
-            Backend::Sabre => {
-                return super::backends::run_sabre(
-                    &self.program,
-                    &self.args,
-                    self.verify,
-                    global.log,
                 );
             }
         }

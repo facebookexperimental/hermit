@@ -14,9 +14,9 @@
 //! client against Hermit's `detcore-dbi` runtime. That runtime instantiates the
 //! production [`detcore::Detcore`] Tool over [`reverie_dbi::DbiGuest`].
 //!
-//! The SaBRe path ([`hermit::Backend::Sabre`]) performs static rewriting with a
-//! Reverie plugin. Generic runs use quiet compatibility checking, while
-//! `hermit --backend sabre strace` retains verbose syscall diagnostics.
+//! Generic SaBRe runs are coordinated by `libhermit` with the real Detcore
+//! plugin. This module retains the separate
+//! `hermit --backend sabre strace` diagnostic path.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -582,109 +582,6 @@ pub fn run_sabre_strace(program: &Path, args: &[String]) -> Result<ExitStatus, E
         })?;
 
     Ok(status.into())
-}
-
-fn sabre_output(mut command: StdCommand, input: &[u8], runner: &Path) -> Result<Output, Error> {
-    command
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = command.spawn().map_err(|error| {
-        Error::msg(format!(
-            "failed to launch the SaBRe runner {}: {error}",
-            runner.display()
-        ))
-    })?;
-    child
-        .stdin
-        .take()
-        .expect("piped SaBRe stdin")
-        .write_all(input)?;
-    child.wait_with_output().map_err(Error::from)
-}
-
-/// Runs a compatibility probe through the shared Reverie syscall tool.
-///
-/// SaBRe does not provide Detcore determinization. Verification executes the
-/// same guest twice and compares its exit status, stdout, and stderr. This is
-/// therefore a compatibility check, not Hermit's L2 determinism guarantee.
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#589): Review SaBRe CLI backend dispatch.
-pub fn run_sabre(
-    program: &Path,
-    args: &[String],
-    verify: bool,
-    log: Option<LevelFilter>,
-) -> Result<ExitStatus, Error> {
-    let (runner, sabre, plugin) = sabre_artifacts()?;
-    let runner_path = Path::new(&runner);
-
-    eprintln!(
-        "hermit: [sabre backend] shared Reverie StraceTool active for {program:?}; \
-         Detcore determinization is unavailable"
-    );
-
-    if !verify {
-        let status = sabre_command(&runner, &sabre, &plugin, program, args, true, log)
-            .status()
-            .map_err(|error| {
-                Error::msg(format!(
-                    "failed to launch the SaBRe runner {}: {error}",
-                    runner_path.display()
-                ))
-            })?;
-        return Ok(status.into());
-    }
-
-    let mut input = Vec::new();
-    if !std::io::stdin().is_terminal() {
-        std::io::stdin().read_to_end(&mut input)?;
-    }
-
-    eprintln!(":: SaBRe compatibility run 1...");
-    let first = sabre_output(
-        sabre_command(&runner, &sabre, &plugin, program, args, true, log),
-        &input,
-        runner_path,
-    )?;
-    if !first.status.success() {
-        write_output(&first)?;
-        return Ok(output_status(&first));
-    }
-
-    eprintln!(":: SaBRe compatibility run 2...");
-    let second = sabre_output(
-        sabre_command(&runner, &sabre, &plugin, program, args, true, log),
-        &input,
-        runner_path,
-    )?;
-    if !second.status.success() {
-        write_output(&second)?;
-        return Ok(output_status(&second));
-    }
-
-    if first.status != second.status {
-        return Err(Error::msg(format!(
-            "SaBRe compatibility verification failed: exit statuses differed ({} != {})",
-            first.status, second.status
-        )));
-    }
-    if first.stdout != second.stdout {
-        return Err(Error::msg(
-            "SaBRe compatibility verification failed: guest stdout differed between runs",
-        ));
-    }
-    if first.stderr != second.stderr {
-        return Err(Error::msg(
-            "SaBRe compatibility verification failed: guest stderr differed between runs",
-        ));
-    }
-
-    write_output(&first)?;
-    eprintln!(
-        ":: SaBRe compatibility verified (shared Reverie StraceTool; no Detcore determinization)."
-    );
-    Ok(ExitStatus::Exited(0))
 }
 
 #[cfg(test)]

@@ -282,17 +282,12 @@ fn error_result(error: Error) -> i64 {
     }
 }
 
-/// Returns the cdylib built beside the running Hermit binary or in Cargo's deps directory.
+/// Returns the Detcore DBI cdylib built beside the running Hermit binary or in Cargo's deps directory.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-738): Review native-client linkage to the minimal DBI runtime.
 pub fn runtime_library_path() -> io::Result<PathBuf> {
     let executable = std::env::current_exe()?;
-    let directory = executable.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "Hermit executable has no parent directory",
-        )
-    })?;
-    let direct = directory.join("libhermit.so");
-    let deps = directory.join("deps/libhermit.so");
+    let [deps, direct] = runtime_library_candidates(&executable)?;
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#598): Confirm deps-first lookup matches Cargo artifact placement.
     [deps, direct]
@@ -308,6 +303,19 @@ pub fn runtime_library_path() -> io::Result<PathBuf> {
             )
         })
 }
+fn runtime_library_candidates(executable: &std::path::Path) -> io::Result<[PathBuf; 2]> {
+    let directory = executable.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Hermit executable has no parent directory",
+        )
+    })?;
+    Ok([
+        directory.join("deps/libdetcore_dbi.so"),
+        directory.join("libdetcore_dbi.so"),
+    ])
+}
+
 fn lock_native_client_build(directory: &std::path::Path) -> io::Result<fs::File> {
     let lock = fs::OpenOptions::new()
         .create(true)
@@ -835,6 +843,20 @@ pub unsafe extern "C" fn reverie_dbi_runtime_totals(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_client_links_only_the_dedicated_dbi_runtime() {
+        let executable = std::path::Path::new("/workspace/target/debug/hermit");
+        let [deps, direct] = runtime_library_candidates(executable).unwrap();
+        assert_eq!(
+            deps,
+            std::path::Path::new("/workspace/target/debug/deps/libdetcore_dbi.so")
+        );
+        assert_eq!(
+            direct,
+            std::path::Path::new("/workspace/target/debug/libdetcore_dbi.so")
+        );
+    }
 
     #[test]
     fn only_dynamorio_managed_process_lifecycle_stays_native() {
