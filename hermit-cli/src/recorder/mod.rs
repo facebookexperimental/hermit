@@ -347,6 +347,13 @@ impl Tool for Recorder {
             }
             Syscall::Ioctl(syscall) => self.handle_ioctl(guest, syscall).await,
             Syscall::Socket(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-979): pidfd_open is an input-only,
+            // fd-returning syscall (like socket): record its return value so
+            // the pidfd allocation is captured and can be recreated/validated
+            // on replay. Without this arm it fell through to live injection and
+            // the fd side effect was neither recorded nor replayed.
+            Syscall::PidfdOpen(_) => self.handle_simple(guest, syscall).await,
             Syscall::ClockGettime(syscall) => self.handle_clock_gettime(guest, syscall).await,
             Syscall::Gettimeofday(syscall) => self.handle_gettimeofday(guest, syscall).await,
             Syscall::Settimeofday(_) => self.handle_simple(guest, syscall).await,

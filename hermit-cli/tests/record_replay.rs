@@ -203,6 +203,8 @@ fn workloads() -> &'static [Workload] {
             ("c_ioctl_fioclex", "ioctl_fioclex.c"),
             ("c_ioctl_siocethtool", "ioctl_siocethtool.c"),
             ("c_record_replay_fd_close", "record_replay_fd_close.c"),
+            ("c_pidfd_open_self", "pidfd_open_self.c"),
+            ("c_pidfd_poll_self", "pidfd_poll_self.c"),
             ("c_recvmsg_scm_rights_mmap", "recvmsg_scm_rights_mmap.c"),
             ("c_record_replay_file_state", "record_replay_file_state.c"),
             ("c_sigpipe_siginfo", "sigpipe_siginfo.c"),
@@ -893,6 +895,26 @@ fn record_timeout_terminates_descendant_processes() {
         0,
         "timed-out recording left partial data"
     );
+}
+
+/// Regression test for issue #862: `pidfd_open` was tracked in Detcore
+/// (`add_fd(.., FdType::Pidfd)`) but the record/replay tool layer had no
+/// `Syscall::PidfdOpen` arm, so under record/replay it fell through to live
+/// injection — the returned pidfd was neither recorded nor recreated/validated
+/// on replay. That left the deterministic replay unenforced and exposed the
+/// Detcore descriptor model to fd-allocation or target-lifetime drift.
+///
+/// These guests open a pidfd and then perform a *modeled* descriptor operation
+/// on it (`fcntl(F_GETFD)` and a zero-timeout `poll`), so a divergence between
+/// the recorded and replayed pidfd would surface as a record/replay mismatch.
+/// The `--verify` path records then replays and asserts the two agree, which is
+/// the record/replay witness the earlier `hermit run --verify`-only coverage
+/// lacked (that path never exercises the recorder/replayer at all).
+#[test]
+fn record_pidfd_open_modeled_descriptor_ops() {
+    let _guard = hermit_record_lock();
+    record_replay(workload("c_pidfd_open_self"));
+    record_replay(workload("c_pidfd_poll_self"));
 }
 
 macro_rules! record_replay_tests {

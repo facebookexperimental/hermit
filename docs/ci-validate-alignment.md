@@ -30,7 +30,7 @@ lane either need no hardware event handling or explicitly pass:
 --max-timeslice=disabled --no-virtualize-cpuid
 ```
 
-The selector covers exactly 476 of the 888 Cargo-discovered cases:
+The selector covers exactly 476 of the 889 Cargo-discovered cases:
 
 | Group | Cases | Selector |
 | --- | ---: | --- |
@@ -53,8 +53,8 @@ not part of the CI contract.
 
 ## Hardware lane
 
-The remaining 412 Cargo cases are outside the blocking hosted subset. The
-per-PR hardware lane executes 319 blocking cases, 18 cases run as bounded
+The remaining 413 Cargo cases are outside the blocking hosted subset. The
+per-PR hardware lane executes 320 blocking cases, 18 cases run as bounded
 nonblocking diagnostics (eleven hosted and seven hardware), the weekly `super`
 tier executes 69 long or relaxed cases, and five existing gaps remain explicit:
 
@@ -71,7 +71,7 @@ tier executes 69 long or relaxed cases, and five existing gaps remain explicit:
 | Buck chaos variants | 8 | Weekly | Explicit one-million-RCB time slice |
 | Relaxed default-mode cases | 55 | 53 weekly, 2 known ignored gaps | Non-sequentialized relaxed execution can block without hardware scheduling |
 | Portable chaos/stress cases | 5 | Weekly | Seed searches exceed hosted per-gate budgets |
-| Runtime, database, scheduling, and syscall targets | 53 | 52 per-PR blocking, 1 per-PR diagnostic | Default PMU/CPUID or record/replay configuration; includes the relocated five-run thread-sync determinism target |
+| Runtime, database, scheduling, and syscall targets | 54 | 53 per-PR blocking, 1 per-PR diagnostic | Default PMU/CPUID or record/replay configuration; includes the relocated five-run thread-sync determinism target and the pidfd_open record/replay witness |
 | Ignored runtime/database/analyze tiers | 19 | 12 per-PR, 3 weekly, 4 JVM diagnostics | Default PMU/CPUID configuration |
 | Slow CAS stress | 1 | Per-PR | PMU preemption search and replay |
 | rr syscall corpus | 213 | 210 per-PR, 3 known gaps | Explicit 80-million-RCB time slice |

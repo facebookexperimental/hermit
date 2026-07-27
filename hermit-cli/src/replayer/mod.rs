@@ -262,6 +262,17 @@ impl Tool for Replayer {
                 self.handle_replayed_side_effect(guest, syscall, "socket")
                     .await
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-979): recreate and validate the pidfd on
+            // replay. pidfd_open returns a real kernel fd that later modeled
+            // descriptor ops (fcntl/poll/waitid/close) act on, so we re-inject
+            // it and assert the fd matches the recorded value, catching
+            // fd-allocation or target-lifetime drift rather than blindly
+            // substituting the recorded number.
+            Syscall::PidfdOpen(_) => {
+                self.handle_replayed_side_effect(guest, syscall, "pidfd_open")
+                    .await
+            }
             Syscall::ClockGettime(syscall) => self.handle_clock_gettime(guest, syscall).await,
             Syscall::Gettimeofday(syscall) => self.handle_gettimeofday(guest, syscall).await,
             Syscall::Settimeofday(_) => self.handle_simple(guest, syscall).await,
