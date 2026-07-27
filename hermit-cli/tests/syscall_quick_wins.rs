@@ -64,7 +64,14 @@ fn deterministic_passthrough_syscalls_verify() {
         trace_stdout.contains("syscall-quick-wins-ok"),
         "guest omitted its success marker\nstdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
     );
-    for syscall in ["getresuid", "getresgid", "munlock", "munlockall", "fsync"] {
+    for syscall in [
+        "getresuid",
+        "getresgid",
+        "munlock",
+        "munlockall",
+        "fsync",
+        "shutdown",
+    ] {
         assert!(
             trace_stderr.contains(&format!("inbound syscall: {syscall}(")),
             "trace omitted {syscall}\nstdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
