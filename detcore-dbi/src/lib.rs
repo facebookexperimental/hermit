@@ -439,6 +439,12 @@ fn error_result(error: Error) -> i64 {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-738): Review native-client linkage to the minimal DBI runtime.
 pub fn runtime_library_path() -> io::Result<PathBuf> {
+    if let Some(runtime) = hermit_resources::resource("libdetcore_dbi.so")?
+        && runtime.is_file()
+    {
+        return Ok(runtime);
+    }
+
     let executable = std::env::current_exe()?;
     let [deps, direct] = runtime_library_candidates(&executable)?;
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -489,7 +495,24 @@ fn lock_native_client_build(directory: &std::path::Path) -> io::Result<fs::File>
 }
 
 /// Builds the DynamoRIO native client against the Detcore runtime if needed.
+// TODO-HUMAN-REVIEW(PR-1002): Review packaged DBI runtime and client discovery.
 pub fn prepare_native_client() -> io::Result<(PathBuf, PathBuf)> {
+    if let Some(install_dir) = hermit_resources::install_dir()? {
+        let resources = install_dir.join("rsrcs");
+        let drrun = resources.join("dynamorio/bin64/drrun");
+        let client = resources.join("libreverie_dbi_client.so");
+        if drrun.is_file() && client.is_file() {
+            return Ok((drrun, client));
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "Hermit installation {} is missing its packaged DynamoRIO launcher or DBI client",
+                install_dir.display()
+            ),
+        ));
+    }
+
     let runtime = runtime_library_path()?;
     let source = reverie_dbi::native_client_source_dir();
     let source_identity = source

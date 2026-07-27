@@ -537,6 +537,7 @@ name = "detcore-dbi"
 version = "0.0.0"
 dependencies = [
  "detcore",
+ "hermit-resources",
  "libc",
  "rand",
  "reverie",
@@ -1012,6 +1013,7 @@ dependencies = [
  "edit-distance",
  "fbinit",
  "goblin",
+ "hermit-resources",
  "iced-x86",
  "libc",
  "nix 0.30.1",
@@ -1042,6 +1044,17 @@ name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
+
+[[package]]
+name = "hermit-install"
+version = "0.0.0"
+dependencies = [
+ "reverie-dbi",
+]
+
+[[package]]
+name = "hermit-resources"
+version = "0.0.0"
 
 [[package]]
 name = "hermit-verify"

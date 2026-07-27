@@ -59,6 +59,22 @@ cargo build --workspace
 ./target/debug/hermit --version
 ```
 
+An optimized workspace build also assembles every backend runtime into one
+installation staging directory:
+
+```bash
+cargo build --release
+./target/install_pkg/hermit --version
+```
+
+`target/install_pkg/rsrcs/` contains the SaBRe and e9patch rewriters, Detcore
+backend shared libraries, the DynamoRIO launcher/runtime, and its relocatable
+client. Hermit finds that directory from its invocation path or executable
+path. Set `HERMIT_INSTALL_DIR` only when the resources live under a different
+prefix. The staging `hermit` entry is a symlink to `target/release/hermit`; use
+a dereferencing copy such as `cp -aL target/install_pkg/ DESTINATION` when
+making a standalone installation or archive.
+
 ## Quick Start
 
 Run a command deterministically by placing `hermit run --` before it:
@@ -118,9 +134,9 @@ runtime. RCB preemption and CPUID/RDTSC interception are not implemented.
 The default Hermit namespace path is supported; `--no-namespace` remains an
 explicit option for trusted guests. The in-process preload is experimental and
 must not be treated as a security boundary for hostile code.
-The DynamoRIO path requires a discoverable SDK, SaBRe requires its runner,
-rewriter, and plugin artifacts, and KVM requires read-write `/dev/kvm` access
-plus its guest-kernel Linux ABI.
+The release installation package supplies the DynamoRIO, SaBRe, LiteInst, and
+e9patch runtime artifacts. KVM requires read-write `/dev/kvm` access plus its
+guest-kernel Linux ABI.
 
 The experimental `e9patch` selection is intentionally a hybrid backend. At
 startup it loads or generates the main ELF's cached instruction map, then runs

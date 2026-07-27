@@ -542,7 +542,17 @@ fn trusted_file_with_digest(path: &Path, expected: Digest, executable: bool) -> 
 }
 
 fn resolve_e9tool() -> Result<PathBuf, Error> {
-    let requested = env::var_os(E9TOOL_ENV).unwrap_or_else(|| "e9tool".into());
+    let requested = match env::var_os(E9TOOL_ENV) {
+        Some(requested) => requested,
+        None => {
+            if let Some(packaged) = hermit_resources::resource("e9tool")?
+                && is_executable_file(&packaged)
+            {
+                return Ok(packaged);
+            }
+            "e9tool".into()
+        }
+    };
     if requested.is_empty() {
         return Err(Error::msg(format!("{E9TOOL_ENV} is empty")));
     }
@@ -570,9 +580,17 @@ fn resolve_e9tool() -> Result<PathBuf, Error> {
 }
 
 fn resolve_e9patch_backend(e9tool: &Path) -> Result<PathBuf, Error> {
-    let requested = env::var_os(E9PATCH_BACKEND_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| e9tool.with_file_name("e9patch"));
+    let requested = match env::var_os(E9PATCH_BACKEND_ENV) {
+        Some(requested) => PathBuf::from(requested),
+        None => {
+            if let Some(packaged) = hermit_resources::resource("e9patch")?
+                && is_executable_file(&packaged)
+            {
+                return Ok(packaged);
+            }
+            e9tool.with_file_name("e9patch")
+        }
+    };
     if requested.components().count() > 1 {
         return is_executable_file(&requested)
             .then_some(requested.clone())

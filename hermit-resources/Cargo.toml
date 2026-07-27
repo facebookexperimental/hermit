@@ -1,0 +1,9 @@
+[package]
+name = "hermit-resources"
+version = "0.0.0"
+edition = "2024"
+license = "BSD-3-Clause"
+repository = "https://github.com/facebookexperimental/hermit"
+
+[lib]
+path = "src/lib.rs"

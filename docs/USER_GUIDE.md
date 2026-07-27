@@ -56,8 +56,25 @@ cargo build --workspace
 The debug executable is `target/debug/hermit`. For an optimized build:
 
 ```bash
-cargo build --release -p hermit --bin hermit
-./target/release/hermit --version
+cargo build --release
+./target/install_pkg/hermit --version
+```
+
+The release build creates `target/install_pkg/hermit` and
+`target/install_pkg/rsrcs/`. The resource directory contains the SaBRe and
+e9patch rewriters, Detcore backend shared libraries, and the minimal DynamoRIO
+runtime. Hermit discovers it beside the invoked executable and, for an in-tree
+release binary, under `target/install_pkg`. Set
+`HERMIT_INSTALL_DIR=/path/to/install` to select another installation root.
+Backend-specific environment variables remain compatibility overrides, but a
+complete package needs none of them.
+
+`target/install_pkg/hermit` is a staging symlink to the release binary. Follow
+it when creating a standalone installation, for example:
+
+```bash
+cp -aL target/install_pkg/ /opt/hermit
+/opt/hermit/hermit --version
 ```
 
 To install the current checkout into Cargo's binary directory, normally
@@ -162,9 +179,9 @@ The default namespace, mount, and network setup is shared with Hermit's other
 backends; `--no-namespace` remains available for trusted guests. The preload
 runtime reserves `SIGSYS` in kernel-visible signal masks. This experimental
 in-process path is not a security boundary for intentionally hostile code.
-The DynamoRIO path requires a discoverable SDK, SaBRe requires configured
-runner/rewriter/plugin artifacts, and KVM requires read-write `/dev/kvm` access
-plus a guest-kernel ABI.
+The release installation package provides the DynamoRIO, SaBRe, LiteInst, and
+e9patch runtime artifacts. KVM requires read-write `/dev/kvm` access plus a
+guest-kernel ABI.
 
 `e9patch` is an experimental hybrid rather than a standalone Detcore runtime.
 It uses the cached offline instruction map and conservative `e9tool -O0` mode

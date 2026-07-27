@@ -11,6 +11,8 @@ members = [
   "detcore/tests/testutils",
   "flaky-tests",
   "hermit-cli",
+  "hermit-install",
+  "hermit-resources",
   "hermit-verify",
   "tests",
 ]

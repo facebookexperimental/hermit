@@ -266,6 +266,11 @@ fn is_dynamorio_sdk(path: &Path) -> bool {
 }
 
 fn dynamorio_sdk_available() -> bool {
+    if hermit_resources::resource("dynamorio/bin64/drrun")
+        .is_ok_and(|path| path.is_some_and(|path| path.is_file()))
+    {
+        return true;
+    }
     if reverie_dbi::bundled_drrun_path().is_file() {
         return true;
     }
@@ -305,6 +310,12 @@ pub fn liteinst_runtime_library_path() -> io::Result<PathBuf> {
                 "HERMIT_LITEINST_RUNTIME does not name a regular file",
             )
         });
+    }
+
+    if let Some(path) = hermit_resources::resource("libdetcore_liteinst.so")?
+        && path.is_file()
+    {
+        return Ok(path);
     }
 
     let executable = std::env::current_exe()?;
@@ -428,7 +439,7 @@ impl Backend {
                 .err()
                 .map(|error| error.to_string()),
             Self::Dbi if !dynamorio_sdk_available() => Some(
-                "the DynamoRIO SDK was not found; set DYNAMORIO_HOME or DynamoRIO_DIR to a valid SDK"
+                "the DynamoRIO runtime was not found; build target/install_pkg, set HERMIT_INSTALL_DIR, or set DYNAMORIO_HOME/DynamoRIO_DIR to a valid SDK"
                     .to_owned(),
             ),
             Self::Dbi => dbi_runtime_unavailable_reason(),
@@ -454,6 +465,7 @@ fn is_executable_file(path: &Path) -> bool {
 // TODO-HUMAN-REVIEW(PR-739): Review SaBRe loader discovery and executable validation.
 fn resolve_sabre_binary_from(
     override_path: Option<&OsStr>,
+    packaged_path: Option<&Path>,
     executable: &Path,
     path_env: &OsStr,
 ) -> Result<PathBuf, Error> {
@@ -470,6 +482,12 @@ fn resolve_sabre_binary_from(
                     path.display()
                 )
             });
+    }
+
+    if let Some(path) = packaged_path
+        && is_executable_file(path)
+    {
+        return Ok(path.to_path_buf());
     }
 
     let directory = executable
@@ -495,8 +513,9 @@ fn resolve_sabre_binary_from(
     }
 
     Err(anyhow!(
-        "SaBRe executable was not found beside {} or in PATH; set {SABRE_BINARY_ENV} or build the pinned loader as target/sabre/sabre",
-        executable.display()
+        "SaBRe executable was not found in the Hermit installation, beside {}, or in PATH; set {} or {SABRE_BINARY_ENV}",
+        executable.display(),
+        hermit_resources::INSTALL_DIR_ENV
     ))
 }
 
@@ -504,8 +523,14 @@ fn resolve_sabre_binary() -> Result<PathBuf, Error> {
     let executable =
         std::env::current_exe().context("failed to locate running Hermit executable")?;
     let override_path = std::env::var_os(SABRE_BINARY_ENV);
+    let packaged_path = hermit_resources::resource("sabre")?;
     let path_env = std::env::var_os("PATH").unwrap_or_default();
-    resolve_sabre_binary_from(override_path.as_deref(), &executable, &path_env)
+    resolve_sabre_binary_from(
+        override_path.as_deref(),
+        packaged_path.as_deref(),
+        &executable,
+        &path_env,
+    )
 }
 
 const SABRE_RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
@@ -571,6 +596,12 @@ fn stage_sabre_program_in(
 
 // TODO-HUMAN-REVIEW(PR-738): Review controller/plugin artifact separation.
 fn sabre_runtime_library_path() -> io::Result<PathBuf> {
+    if let Some(path) = hermit_resources::resource("libdetcore_sabre.so")?
+        && path.is_file()
+    {
+        return Ok(path);
+    }
+
     let executable = std::env::current_exe()?;
     let directory = executable.parent().ok_or_else(|| {
         io::Error::new(
@@ -1779,8 +1810,21 @@ mod tests {
         write_test_executable(&loader);
 
         assert_eq!(
-            resolve_sabre_binary_from(None, &executable, OsStr::new("")).unwrap(),
+            resolve_sabre_binary_from(None, None, &executable, OsStr::new("")).unwrap(),
             loader
+        );
+    }
+
+    #[test]
+    fn sabre_binary_resolver_uses_packaged_loader() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("target/release/hermit");
+        let packaged = temp.path().join("install_pkg/rsrcs/sabre");
+        write_test_executable(&packaged);
+
+        assert_eq!(
+            resolve_sabre_binary_from(None, Some(&packaged), &executable, OsStr::new("")).unwrap(),
+            packaged
         );
     }
 
@@ -1794,17 +1838,26 @@ mod tests {
         write_test_executable(&requested);
 
         assert_eq!(
-            resolve_sabre_binary_from(Some(requested.as_os_str()), &executable, OsStr::new(""))
-                .unwrap(),
+            resolve_sabre_binary_from(
+                Some(requested.as_os_str()),
+                Some(&discovered),
+                &executable,
+                OsStr::new(""),
+            )
+            .unwrap(),
             requested
         );
 
         let mut permissions = fs::metadata(&requested).unwrap().permissions();
         permissions.set_mode(0o600);
         fs::set_permissions(&requested, permissions).unwrap();
-        let error =
-            resolve_sabre_binary_from(Some(requested.as_os_str()), &executable, OsStr::new(""))
-                .unwrap_err();
+        let error = resolve_sabre_binary_from(
+            Some(requested.as_os_str()),
+            Some(&discovered),
+            &executable,
+            OsStr::new(""),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("is not an executable file"));
     }
 
@@ -1818,7 +1871,8 @@ mod tests {
             Err(dbi_error) => {
                 let message = dbi_error.to_string();
                 assert!(
-                    message.contains("DynamoRIO SDK") || message.contains("Detcore DBI runtime"),
+                    message.contains("DynamoRIO runtime")
+                        || message.contains("Detcore DBI runtime"),
                     "unexpected DBI availability error: {message}"
                 );
             }
