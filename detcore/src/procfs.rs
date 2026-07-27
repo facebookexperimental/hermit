@@ -89,6 +89,9 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-960): Review per-CPU host interrupt normalization.
     IrqPerCpuCount,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-958): Review host-global uevent sequence normalization.
+    UeventSeqnum,
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -277,6 +280,9 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-958): Review host-global uevent sequence normalization.
+            "/sys/kernel/uevent_seqnum" => ProcfsKind::UeventSeqnum,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-939): Review NUMA node VM accounting normalization.
             other if is_node_vmstat_path(other) => ProcfsKind::NodeVmstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -422,6 +428,7 @@ impl ProcfsFile {
             ProcfsKind::BlockStat => sanitize_block_stat(&contents),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::UeventSeqnum => sanitize_uevent_seqnum(&contents),
             ProcfsKind::IrqPerCpuCount => sanitize_irq_per_cpu_count(&contents),
             ProcfsKind::PtyNr => sanitize_pty_nr(&contents),
             ProcfsKind::SelfSched => sanitize_self_sched(&contents),
@@ -1129,6 +1136,19 @@ fn sanitize_node_vmstat(contents: &[u8]) -> Vec<u8> {
         }
     }
     normalized
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-958): Review the synthetic /sys/kernel/uevent_seqnum value.
+fn sanitize_uevent_seqnum(contents: &[u8]) -> Vec<u8> {
+    let Some(value) = contents.strip_suffix(b"\n") else {
+        return contents.to_vec();
+    };
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        contents.to_vec()
+    } else {
+        b"0\n".to_vec()
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2263,6 +2283,13 @@ mod tests {
             ProcfsKind::Sockstat
         );
         assert_eq!(
+            ProcfsFile::from_path(Path::new("/sys/kernel/uevent_seqnum"))
+                .unwrap()
+                .kind,
+            ProcfsKind::UeventSeqnum
+        );
+        assert!(ProcfsFile::from_path(Path::new("/sys/kernel/uevent_helper")).is_none());
+        assert_eq!(
             ProcfsFile::from_path(Path::new("/sys/kernel/irq/254/per_cpu_count"))
                 .unwrap()
                 .kind,
@@ -2847,6 +2874,14 @@ mod tests {
         ] {
             assert_eq!(sanitize_sysfs_rtc_attribute(malformed, kind), malformed);
         }
+    }
+
+    #[test]
+    fn uevent_seqnum_is_fixed_after_strict_validation() {
+        assert_eq!(sanitize_uevent_seqnum(b"1282733\n"), b"0\n");
+        assert_eq!(sanitize_uevent_seqnum(b"1282733"), b"1282733");
+        assert_eq!(sanitize_uevent_seqnum(b"unknown\n"), b"unknown\n");
+        assert_eq!(sanitize_uevent_seqnum(b"\n"), b"\n");
     }
 
     #[test]
