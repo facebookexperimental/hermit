@@ -12,6 +12,6 @@ crate-type = ["cdylib", "rlib"]
 detcore = { version = "0.0.0", path = "../detcore" }
 libc = "0.2.186"
 rand = "0.10.2"
-reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "4c6e9a0b73376ad18b7c5d4ad6e365ccd3d964ac" }
-reverie-dbi = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "4c6e9a0b73376ad18b7c5d4ad6e365ccd3d964ac", default-features = false }
+reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "f1ed0280e36c88a7ef5d11f2fad929b63176386e" }
+reverie-dbi = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "f1ed0280e36c88a7ef5d11f2fad929b63176386e", default-features = false }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
