@@ -59,6 +59,7 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-945): Review host swap-usage normalization.
     Swaps,
+    Locks,
 }
 
 fn is_btrfs_bytes_reserved_path(path: &Path) -> bool {
@@ -212,6 +213,9 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-916): Review live protocol allocation counter normalization.
             "/proc/net/protocols" => ProcfsKind::Protocols,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-926): Review kernel lock identity normalization.
+            "/proc/locks" => ProcfsKind::Locks,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-969): Review Btrfs reserved-byte normalization.
             other if is_btrfs_bytes_reserved_path(Path::new(other)) => {
                 ProcfsKind::BtrfsBytesReserved
@@ -300,6 +304,7 @@ impl ProcfsFile {
             ProcfsKind::BtrfsBytesPinned => sanitize_btrfs_bytes_pinned(&contents),
             ProcfsKind::Rtc => sanitize_rtc(&contents, virtual_realtime_seconds),
             ProcfsKind::DentryState => sanitize_dentry_state(&contents),
+            ProcfsKind::Locks => sanitize_locks(&contents),
         });
     }
 
@@ -1454,6 +1459,108 @@ fn sanitize_rtc(contents: &[u8], virtual_realtime_seconds: i64) -> Vec<u8> {
     normalized
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-926): Review the /proc/locks identity-virtualization policy.
+//
+// `/proc/locks` rows have the shape
+//     `SEQ: [->] CLASS MODE RW PID MAJOR:MINOR:INODE START END`
+// where the leading `SEQ:` is a kernel-global lock counter, `PID` is the owner
+// task, and `MAJOR:MINOR:INODE` identifies the backing object. All three are
+// host-specific and vary run-to-run, and the kernel emits rows in an internal
+// order. A granted lock and the blocked waiters queued behind it share one
+// `SEQ`, and a waiter row is marked with `->`.
+//
+// Rather than collapse every identity to a single constant (which would make
+// two distinct locked files indistinguishable and break holder/waiter
+// grouping), remap each *distinct* raw sequence, PID, and device:inode to a
+// dense synthetic value. Equal raw values map to equal synthetic values, so
+// same-object, same-owner, and holder/waiter equivalences survive while the
+// host-specific magnitudes do not. Rows are grouped by their (virtual)
+// sequence with the granted holder ahead of its waiters, giving a byte-stable
+// snapshot without scattering a group across a global sort. A row we cannot
+// classify is redacted to a sentinel rather than passed through, so an
+// unrecognized kernel extension fails safe instead of leaking raw identities.
+fn sanitize_locks(contents: &[u8]) -> Vec<u8> {
+    use std::collections::BTreeMap;
+
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    struct LockRow {
+        details: usize,
+        seq: String,
+        fields: Vec<String>,
+    }
+
+    let mut rows = Vec::new();
+    let mut redactions = 0usize;
+    // Distinct raw values, kept sorted so the dense assignment is reproducible.
+    let mut seqs = BTreeMap::new();
+    let mut pids = BTreeMap::new();
+    let mut objs = BTreeMap::new();
+    for line in text.lines() {
+        let fields = line
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let details = usize::from(fields.get(1).is_some_and(|field| field == "->")) + 1;
+        let well_formed = fields.len() >= details + 7
+            && fields.first().is_some_and(|field| field.ends_with(':'))
+            && fields[details + 4].split(':').count() == 3;
+        if !well_formed {
+            redactions += 1;
+            continue;
+        }
+
+        let seq = fields[0].trim_end_matches(':').to_owned();
+        seqs.insert(seq.clone(), 0usize);
+        pids.insert(fields[details + 3].clone(), 0usize);
+        objs.insert(fields[details + 4].clone(), 0usize);
+        rows.push(LockRow {
+            details,
+            seq,
+            fields,
+        });
+    }
+
+    // Assign dense identities in sorted order of the distinct raw values.
+    for (index, value) in seqs.values_mut().enumerate() {
+        *value = index;
+    }
+    for (index, value) in pids.values_mut().enumerate() {
+        *value = index + 1;
+    }
+    for (index, value) in objs.values_mut().enumerate() {
+        *value = index + 1;
+    }
+
+    for row in &mut rows {
+        let details = row.details;
+        row.fields[0] = format!("{}:", seqs[&row.seq]);
+        row.fields[details + 3] = pids[&row.fields[details + 3]].to_string();
+        row.fields[details + 4] = format!("00:00:{}", objs[&row.fields[details + 4]]);
+    }
+
+    // Group by virtual sequence, holder (details == 1) before its waiters, so a
+    // lock and the tasks blocked on it stay adjacent and in a stable order.
+    rows.sort_by(|a, b| {
+        (seqs[&a.seq], a.details, &a.fields).cmp(&(seqs[&b.seq], b.details, &b.fields))
+    });
+
+    let mut normalized: Vec<String> = rows.iter().map(|row| row.fields.join(" ")).collect();
+    normalized.extend(std::iter::repeat_n("REDACTED".to_owned(), redactions));
+
+    let mut normalized = normalized.join("\n").into_bytes();
+    if text.ends_with('\n') {
+        normalized.push(b'\n');
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1635,6 +1742,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Protocols
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/locks"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Locks
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/self/smaps"))
@@ -2281,6 +2394,68 @@ se.vruntime : 2.0\n\
 se.sum_exec_runtime : 3.0\n\
 nr_switches : -1\n";
         assert_eq!(sanitize_self_sched(negative_counter), negative_counter);
+    }
+
+    #[test]
+    fn locks_virtualize_identities_but_preserve_equivalences() {
+        // A holder (seq 74) with a waiter blocked behind it on the same object,
+        // a second lock by the same owner (PID 480) on a *different* object,
+        // and a third lock by a different owner on the *first* object.
+        let contents = b"74: POSIX  ADVISORY  WRITE 480 08:02:1111 0 EOF\n\
+74: -> POSIX  ADVISORY  WRITE 481 08:02:1111 0 EOF\n\
+9: OFDLCK ADVISORY  WRITE 480 08:02:2222 0 EOF\n\
+21: FLOCK ADVISORY  WRITE 999 08:02:1111 0 EOF\n";
+
+        let out = String::from_utf8(sanitize_locks(contents)).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+
+        // No host-specific sequence, PID, or device:inode magnitude survives.
+        assert!(!out.contains("74"), "raw sequence leaked: {out}");
+        assert!(!out.contains("480") && !out.contains("481") && !out.contains("999"));
+        assert!(!out.contains("1111") && !out.contains("2222"));
+
+        // The holder and its `->` waiter keep a shared virtual sequence and stay
+        // adjacent (grouping preserved rather than scattered by a global sort).
+        let holder = lines
+            .iter()
+            .position(|l| l.contains("POSIX") && !l.contains("->"));
+        let waiter = lines.iter().position(|l| l.contains("->"));
+        let (holder, waiter) = (holder.unwrap(), waiter.unwrap());
+        assert_eq!(waiter, holder + 1, "waiter must immediately follow holder");
+        let seq_of = |l: &str| l.split(':').next().unwrap().to_owned();
+        assert_eq!(seq_of(lines[holder]), seq_of(lines[waiter]));
+
+        // The two locks on object 08:02:1111 (holder + FLOCK) share one virtual
+        // object id; the lock on 08:02:2222 keeps a *distinct* one.
+        let obj_of = |l: &str| l.split_whitespace().nth_back(2).unwrap().to_owned();
+        let flock = lines.iter().find(|l| l.contains("FLOCK")).unwrap();
+        let ofd = lines.iter().find(|l| l.contains("OFDLCK")).unwrap();
+        assert_eq!(
+            obj_of(lines[holder]),
+            obj_of(flock),
+            "same object must match"
+        );
+        assert_ne!(
+            obj_of(lines[holder]),
+            obj_of(ofd),
+            "distinct objects must differ"
+        );
+
+        // Same raw owner (PID 480) on two different objects keeps one virtual
+        // owner; the other owners stay distinct.
+        let pid_of = |l: &str| l.split_whitespace().nth_back(3).unwrap().to_owned();
+        assert_eq!(pid_of(lines[holder]), pid_of(ofd), "same owner must match");
+        assert_ne!(pid_of(lines[holder]), pid_of(lines[waiter]));
+        assert_ne!(pid_of(lines[holder]), pid_of(flock));
+
+        // Fail safe, not open: an unclassifiable row is redacted rather than
+        // passed through with its raw kernel identities.
+        assert_eq!(sanitize_locks(b"malformed row\n"), b"REDACTED\n");
+        assert_eq!(
+            sanitize_locks(b"74: POSIX ADVISORY WRITE 480 08:02:1111 0 EOF\nmalformed\n"),
+            b"0: POSIX ADVISORY WRITE 1 00:00:1 0 EOF\nREDACTED\n"
+        );
+        assert!(sanitize_locks(b"").is_empty());
     }
 
     #[test]
