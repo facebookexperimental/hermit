@@ -715,6 +715,79 @@ fn bound_port_survives_closing_dup_alias() {
 }
 
 #[test]
+fn unix_autobind_names_are_deterministic() {
+    det_test_fn_sequential_without_pmu(|| {
+        let mut open_fds = Vec::new();
+        let mut names = Vec::new();
+        for (socket_type, label) in [
+            (libc::SOCK_DGRAM, "dgram"),
+            (libc::SOCK_STREAM, "stream"),
+            (libc::SOCK_SEQPACKET, "seqpacket"),
+        ] {
+            let fd = unsafe { libc::socket(libc::AF_UNIX, socket_type, 0) };
+            assert!(fd >= 0, "{label} socket creation failed");
+
+            let mut requested: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            requested.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            assert_eq!(
+                unsafe {
+                    libc::bind(
+                        fd,
+                        (&requested as *const libc::sockaddr_un).cast(),
+                        std::mem::offset_of!(libc::sockaddr_un, sun_path) as libc::socklen_t,
+                    )
+                },
+                0,
+                "{label} autobind failed"
+            );
+
+            let mut observed: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            let mut observed_len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+            assert_eq!(
+                unsafe {
+                    libc::getsockname(
+                        fd,
+                        (&mut observed as *mut libc::sockaddr_un).cast(),
+                        &mut observed_len,
+                    )
+                },
+                0,
+                "{label} getsockname failed"
+            );
+
+            assert_eq!(observed.sun_family, libc::AF_UNIX as libc::sa_family_t);
+            assert_eq!(
+                observed_len as usize,
+                std::mem::offset_of!(libc::sockaddr_un, sun_path) + 6
+            );
+            assert_eq!(observed.sun_path[0], 0);
+            let name = observed.sun_path[1..6]
+                .iter()
+                .map(|byte| *byte as u8)
+                .collect::<Vec<_>>();
+            assert!(
+                name.iter()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+            );
+            println!("{label}={}", String::from_utf8(name).unwrap());
+            open_fds.push(fd);
+            names.push(observed.sun_path[1..6].to_vec());
+        }
+
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            3,
+            "live autobind sockets must have unique names"
+        );
+        for fd in open_fds {
+            assert_eq!(unsafe { libc::close(fd) }, 0);
+        }
+    });
+}
+
+#[test]
 fn shared_futex_modes_are_supported_and_validate_bitsets() {
     det_test_fn_sequential_without_pmu(|| {
         let futex = 0_u32;
