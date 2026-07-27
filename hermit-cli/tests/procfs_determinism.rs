@@ -157,6 +157,81 @@ fn proc_self_cmdline_is_deterministic() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-843): Review process and system accounting coverage.
+#[test]
+fn proc_system_cpu_accounting_is_deterministic() {
+    assert_deterministic("/proc/stat", |contents| {
+        let text = std::str::from_utf8(contents).expect("stat should be UTF-8");
+        let cpu_lines = text
+            .lines()
+            .filter(|line| line.starts_with("cpu"))
+            .collect::<Vec<_>>();
+        let cpu_count = cpu_lines.len() - 1;
+        for line in &cpu_lines {
+            let mut fields = line.split_whitespace();
+            let name = fields.next().expect("CPU line has no name");
+            let counters = fields
+                .map(|field| field.parse::<u64>().expect("CPU counter should be numeric"))
+                .collect::<Vec<_>>();
+            assert!(
+                counters
+                    .iter()
+                    .enumerate()
+                    .all(|(index, value)| index == 0 || *value == 0)
+            );
+            assert_eq!(
+                counters[0],
+                if name == "cpu" {
+                    12_000 * cpu_count as u64
+                } else {
+                    12_000
+                }
+            );
+        }
+        assert!(text.contains("btime 1640995079\n"));
+    });
+}
+
+#[test]
+fn proc_vm_accounting_is_deterministic() {
+    assert_deterministic("/proc/vmstat", |contents| {
+        let text = std::str::from_utf8(contents).expect("vmstat should be UTF-8");
+        assert!(
+            text.lines()
+                .all(|line| line.split_whitespace().nth(1) == Some("0"))
+        );
+    });
+}
+
+#[test]
+fn proc_pid_stat_accounting_is_deterministic() {
+    assert_deterministic("/proc/1/stat", |contents| {
+        let text = std::str::from_utf8(contents).expect("process stat should be UTF-8");
+        let comm_end = text.rfind(") ").expect("stat has no comm terminator");
+        let fields = text[comm_end + 2..].split_whitespace().collect::<Vec<_>>();
+        assert_eq!(fields[0], "S");
+        assert_eq!(fields[23 - 3], "0");
+        assert_eq!(fields[24 - 3], "0");
+    });
+}
+
+#[test]
+fn proc_pid_statm_accounting_is_deterministic() {
+    assert_deterministic("/proc/1/statm", |contents| {
+        assert_eq!(contents, b"0 0 0 0 0 0 0\n");
+    });
+}
+
+#[test]
+fn proc_pid_status_accounting_is_deterministic() {
+    assert_deterministic("/proc/1/status", |contents| {
+        let text = std::str::from_utf8(contents).expect("process status should be UTF-8");
+        assert!(text.contains("VmSize:\t0 kB\n"));
+        assert!(text.contains("VmRSS:\t0 kB\n"));
+    });
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-861): Review deterministic kernel I/O accounting coverage.
 #[test]
 fn proc_diskstats_uses_synthetic_counters() {

@@ -26,6 +26,12 @@ enum ProcfsKind {
     // TODO-HUMAN-REVIEW(PR-964): Review thread-self procfs identity normalization.
     ThreadStat,
     ThreadStatus,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-843): Review process and system accounting snapshots.
+    ProcessStat,
+    Statm,
+    ProcessStatus,
+    SystemStat,
     Cpuinfo,
     Diskstats,
     Loadavg,
@@ -324,12 +330,17 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-964): Review the thread-self aliases.
             "/proc/thread-self/stat" => ProcfsKind::ThreadStat,
             "/proc/thread-self/status" => ProcfsKind::ThreadStatus,
+            "/proc/self/statm" | "/proc/thread-self/statm" => ProcfsKind::Statm,
+            other if is_process_file_path(other, "stat") => ProcfsKind::ProcessStat,
+            other if is_process_file_path(other, "statm") => ProcfsKind::Statm,
+            other if is_process_file_path(other, "status") => ProcfsKind::ProcessStatus,
             "/proc/cpuinfo" => ProcfsKind::Cpuinfo,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-861): Review deterministic kernel I/O accounting.
             "/proc/diskstats" => ProcfsKind::Diskstats,
             "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
+            "/proc/stat" => ProcfsKind::SystemStat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-863): Review canonical guest memory accounting.
             "/proc/meminfo" => ProcfsKind::Meminfo,
@@ -520,22 +531,31 @@ impl ProcfsFile {
             random_uuid,
         } = context;
         self.contents = Some(match self.kind {
-            ProcfsKind::Stat => sanitize_stat(&contents, virtual_pid, virtual_ppid),
+            ProcfsKind::Stat => sanitize_stat(&contents, Some((virtual_pid, virtual_ppid))),
             ProcfsKind::Status => {
-                sanitize_status(&contents, virtual_pid, virtual_pid, virtual_ppid)
+                sanitize_status(&contents, Some((virtual_pid, virtual_pid, virtual_ppid)))
             }
             ProcfsKind::ThreadStat => {
                 let (_, tid, ppid) = self
                     .bound_thread_identity
                     .expect("thread-self stat was not bound when opened");
-                sanitize_stat(&contents, tid, ppid)
+                sanitize_stat(&contents, Some((tid, ppid)))
             }
             ProcfsKind::ThreadStatus => {
                 let (tgid, tid, ppid) = self
                     .bound_thread_identity
                     .expect("thread-self status was not bound when opened");
-                sanitize_status(&contents, tgid, tid, ppid)
+                sanitize_status(&contents, Some((tgid, tid, ppid)))
             }
+            ProcfsKind::ProcessStat => sanitize_stat(&contents, None),
+            ProcfsKind::Statm => sanitize_statm(&contents),
+            ProcfsKind::ProcessStatus => sanitize_status(&contents, None),
+            ProcfsKind::SystemStat => sanitize_system_stat(
+                &contents,
+                virtual_uptime_seconds,
+                virtual_realtime_seconds
+                    .saturating_sub(i64::try_from(virtual_uptime_seconds).unwrap_or(i64::MAX)),
+            ),
             ProcfsKind::Cpuinfo => sanitize_cpuinfo(&contents),
             ProcfsKind::Diskstats => sanitize_diskstats(&contents),
             ProcfsKind::Loadavg => sanitize_loadavg(&contents),
@@ -776,8 +796,12 @@ fn is_hwmon_input_file(path: &str) -> bool {
 }
 
 // TODO-HUMAN-REVIEW(PR-723): Review /proc stat identity field normalization.
-fn sanitize_stat(contents: &[u8], virtual_pid: i32, virtual_ppid: i32) -> Vec<u8> {
-    const VOLATILE_FIELDS: &[usize] = &[10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 24, 39, 42, 43, 44];
+// TODO-HUMAN-REVIEW(PR-843): Review process memory and runtime normalization.
+fn sanitize_stat(contents: &[u8], virtual_identity: Option<(i32, i32)>) -> Vec<u8> {
+    const VOLATILE_FIELDS: &[usize] = &[
+        10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 23, 24, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36,
+        37, 39, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
+    ];
 
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
@@ -798,24 +822,41 @@ fn sanitize_stat(contents: &[u8], virtual_pid: i32, virtual_ppid: i32) -> Vec<u8
     }
 
     // `fields` starts with proc stat field 3 (state).
-    fields[4 - 3] = virtual_ppid.to_string();
-    fields[5 - 3] = "0".to_owned();
-    fields[6 - 3] = "0".to_owned();
+    let pid = if let Some((virtual_pid, virtual_ppid)) = virtual_identity {
+        fields[4 - 3] = virtual_ppid.to_string();
+        fields[5 - 3] = "0".to_owned();
+        fields[6 - 3] = "0".to_owned();
+        virtual_pid.to_string()
+    } else {
+        fields[0] = "S".to_owned();
+        text[..comm_start].to_owned()
+    };
     for field in VOLATILE_FIELDS {
         fields[*field - 3] = "0".to_owned();
     }
-    format!("{virtual_pid}{comm} {}\n", fields.join(" ")).into_bytes()
+    format!("{pid}{comm} {}\n", fields.join(" ")).into_bytes()
+}
+
+fn sanitize_statm(contents: &[u8]) -> Vec<u8> {
+    let fields = contents
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    if fields.len() != 7
+        || fields
+            .iter()
+            .any(|field| !field.iter().all(u8::is_ascii_digit))
+    {
+        return contents.to_vec();
+    }
+    b"0 0 0 0 0 0 0\n".to_vec()
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#553)
 // TODO-HUMAN-REVIEW(PR-723): Review /proc status identity field normalization.
-fn sanitize_status(
-    contents: &[u8],
-    virtual_tgid: i32,
-    virtual_pid: i32,
-    virtual_ppid: i32,
-) -> Vec<u8> {
+fn sanitize_status(contents: &[u8], virtual_identity: Option<(i32, i32, i32)>) -> Vec<u8> {
+    const STATE: &[u8] = b"State:";
     const TGID: &[u8] = b"Tgid:";
     const PID: &[u8] = b"Pid:";
     const PPID: &[u8] = b"PPid:";
@@ -829,12 +870,20 @@ fn sanitize_status(
     const CPUS_ALLOWED_LIST: &[u8] = b"Cpus_allowed_list:";
     const VOLUNTARY: &[u8] = b"voluntary_ctxt_switches:";
     const NONVOLUNTARY: &[u8] = b"nonvoluntary_ctxt_switches:";
-    const MEMORY_ACCOUNTING_FIELDS: &[&[u8]] = &[
+    const MEMORY_FIELDS: &[&[u8]] = &[
+        b"VmPeak",
+        b"VmSize",
+        b"VmLck",
+        b"VmPin",
         b"VmHWM",
         b"VmRSS",
         b"RssAnon",
         b"RssFile",
         b"RssShmem",
+        b"VmData",
+        b"VmStk",
+        b"VmExe",
+        b"VmLib",
         b"VmPTE",
         b"VmSwap",
         b"HugetlbPages",
@@ -844,20 +893,32 @@ fn sanitize_status(
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
         let has_newline = line.last() == Some(&b'\n');
         let body = line.strip_suffix(b"\n").unwrap_or(line);
-        if body.starts_with(TGID) || body.starts_with(NS_TGID) {
+        if body.starts_with(STATE) {
+            normalized.extend_from_slice(b"State:\tS (sleeping)");
+        } else if let Some((virtual_tgid, _, _)) = virtual_identity
+            && (body.starts_with(TGID) || body.starts_with(NS_TGID))
+        {
             let label = body.split(|byte| *byte == b':').next().unwrap_or_default();
             normalized.extend_from_slice(label);
             normalized.extend_from_slice(format!(":\t{virtual_tgid}").as_bytes());
-        } else if body.starts_with(PID) || body.starts_with(NS_PID) {
+        } else if let Some((_, virtual_pid, _)) = virtual_identity
+            && (body.starts_with(PID) || body.starts_with(NS_PID))
+        {
             let label = body.split(|byte| *byte == b':').next().unwrap_or_default();
             normalized.extend_from_slice(label);
             normalized.extend_from_slice(format!(":\t{virtual_pid}").as_bytes());
-        } else if body.starts_with(PPID) {
+        } else if let Some((_, _, virtual_ppid)) = virtual_identity
+            && body.starts_with(PPID)
+        {
             normalized.extend_from_slice(PPID);
             normalized.extend_from_slice(format!("\t{virtual_ppid}").as_bytes());
         } else if body.starts_with(TRACER_PID) {
             normalized.extend_from_slice(TRACER_PID);
-            normalized.extend_from_slice(b"\t1");
+            normalized.extend_from_slice(if virtual_identity.is_some() {
+                b"\t1"
+            } else {
+                b"\t0"
+            });
         } else if body.starts_with(NS_PGID) || body.starts_with(NS_SID) {
             let label = body.split(|byte| *byte == b':').next().unwrap_or_default();
             normalized.extend_from_slice(label);
@@ -877,13 +938,10 @@ fn sanitize_status(
         } else if body.starts_with(NONVOLUNTARY) {
             normalized.extend_from_slice(NONVOLUNTARY);
             normalized.extend_from_slice(b"\t0");
-        } else if body
-            .split(|byte| *byte == b':')
-            .next()
-            .is_some_and(|label| MEMORY_ACCOUNTING_FIELDS.contains(&label))
+        } else if let Some(name_end) = body.iter().position(|byte| *byte == b':')
+            && MEMORY_FIELDS.contains(&&body[..name_end])
         {
-            let label = body.split(|byte| *byte == b':').next().unwrap_or_default();
-            normalized.extend_from_slice(label);
+            normalized.extend_from_slice(&body[..name_end]);
             normalized.extend_from_slice(b":\t0 kB");
         } else {
             normalized.extend_from_slice(body);
@@ -1250,6 +1308,87 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
     } else {
         format!("{virtual_uptime_seconds}.00 0.00\n").into_bytes()
     }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-843): Review deterministic procfs system accounting.
+fn sanitize_system_stat(
+    contents: &[u8],
+    virtual_uptime_seconds: u64,
+    virtual_boot_time_seconds: i64,
+) -> Vec<u8> {
+    const VOLATILE_FIELDS: &[&[u8]] = &[
+        b"intr",
+        b"ctxt",
+        b"processes",
+        b"procs_running",
+        b"procs_blocked",
+        b"softirq",
+    ];
+
+    let cpu_count = contents
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| line.split(|byte| byte.is_ascii_whitespace()).next())
+        .filter(|name| name.starts_with(b"cpu") && *name != b"cpu")
+        .count() as u64;
+    let per_cpu_idle_ticks = virtual_uptime_seconds.saturating_mul(100);
+    let counters = sanitize_named_counters(
+        contents,
+        |name| name.starts_with(b"cpu") || VOLATILE_FIELDS.contains(&name),
+        |name, index| {
+            if index == 0 && name == b"cpu" {
+                per_cpu_idle_ticks.saturating_mul(cpu_count)
+            } else if index == 0 && name.starts_with(b"cpu") {
+                per_cpu_idle_ticks
+            } else {
+                0
+            }
+        },
+    );
+
+    let mut normalized = Vec::with_capacity(counters.len());
+    for line in counters.split_inclusive(|byte| *byte == b'\n') {
+        let has_newline = line.last() == Some(&b'\n');
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        if body.starts_with(b"btime ") {
+            normalized.extend_from_slice(format!("btime {virtual_boot_time_seconds}").as_bytes());
+        } else {
+            normalized.extend_from_slice(body);
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
+fn sanitize_named_counters(
+    contents: &[u8],
+    should_normalize: impl Fn(&[u8]) -> bool,
+    counter_value: impl Fn(&[u8], usize) -> u64,
+) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+        let has_newline = line.last() == Some(&b'\n');
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        let mut fields = body
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty());
+        let name = fields.next().unwrap_or_default();
+        if should_normalize(name) {
+            normalized.extend_from_slice(name);
+            for (index, _) in fields.enumerate() {
+                normalized.push(b' ');
+                normalized.extend_from_slice(counter_value(name, index).to_string().as_bytes());
+            }
+        } else {
+            normalized.extend_from_slice(body);
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3000,6 +3139,16 @@ mod tests {
                 .kind,
             ProcfsKind::ThreadStatus
         );
+        for (path, kind) in [
+            ("/proc/123/stat", ProcfsKind::ProcessStat),
+            ("/proc/self/statm", ProcfsKind::Statm),
+            ("/proc/123/statm", ProcfsKind::Statm),
+            ("/proc/123/status", ProcfsKind::ProcessStatus),
+            ("/proc/stat", ProcfsKind::SystemStat),
+        ] {
+            assert_eq!(ProcfsFile::from_path(Path::new(path)).unwrap().kind, kind);
+        }
+        assert!(ProcfsFile::from_path(Path::new("/proc/not-a-pid/stat")).is_none());
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/cpuinfo"))
                 .unwrap()
@@ -3781,12 +3930,15 @@ mod tests {
     #[test]
     fn stat_normalizes_runtime_counters() {
         let input = b"3 (name with spaces) R 1 0 0 0 -1 0 89 0 1 2 3 4 5 6 20 0 1 7 520343512 2879488 123 18446744073709551615 100 200 300 0 0 0 0 3145728 0 0 0 0 17 114 0 0 9 10 11 400 500 600 700 800 900 1000 0\n";
-        let output = String::from_utf8(sanitize_stat(input, 3, 1)).unwrap();
+        let output = String::from_utf8(sanitize_stat(input, Some((3, 1)))).unwrap();
         let comm_end = output.rfind(") ").unwrap();
         let fields = output[comm_end + 2..]
             .split_whitespace()
             .collect::<Vec<_>>();
-        for field in [10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 24, 39, 42, 43, 44] {
+        for field in [
+            10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 23, 24, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+            36, 37, 39, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
+        ] {
             assert_eq!(fields[field - 3], "0", "field {field} was not normalized");
         }
         assert!(output.starts_with("3 (name with spaces) R 1 0 0 "));
@@ -3798,7 +3950,7 @@ mod tests {
     fn status_normalizes_affinity_and_context_switches() {
         let input = b"Name:\tcat\nTgid:\t1234\nPid:\t1234\nPPid:\t1200\nTracerPid:\t0\nNStgid:\t1234\nNSpid:\t1234\nNSpgid:\t1200\nNSsid:\t1190\nSigQ:\t426/2042342\nVmHWM:\t1572 kB\nVmRSS:\t1568 kB\nRssFile:\t1452 kB\nCpus_allowed:\tffffffff,ffffffff\nCpus_allowed_list:\t0-63\nvoluntary_ctxt_switches:\t120\nnonvoluntary_ctxt_switches:\t3\n";
         assert_eq!(
-            sanitize_status(input, 3, 3, 1),
+            sanitize_status(input, Some((3, 3, 1))),
             b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t1\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/0\nVmHWM:\t0 kB\nVmRSS:\t0 kB\nRssFile:\t0 kB\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
         );
     }
@@ -3819,6 +3971,41 @@ mod tests {
         assert_eq!(
             file.take(usize::MAX).unwrap(),
             b"Tgid:\t3\nPid:\t4\nPPid:\t1\nNStgid:\t3\nNSpid:\t4\n"
+        );
+    }
+
+    #[test]
+    fn process_accounting_preserves_identity_and_hides_live_state() {
+        let stat = b"42 (worker) R 1 7 8 0 -1 0 89 0 1 2 3 4 5 6 20 0 1 7 520343512 2879488 123 18446744073709551615 100 200 300 0 0 0 0 3145728 0 0 0 0 17 114 0 0 9 10 11 400 500 600 700 800 900 1000 0\n";
+        let output = String::from_utf8(sanitize_stat(stat, None)).unwrap();
+        assert!(output.starts_with("42 (worker) S 1 7 8 "));
+        let comm_end = output.rfind(") ").unwrap();
+        let fields = output[comm_end + 2..]
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        assert_eq!(fields[23 - 3], "0");
+        assert_eq!(fields[24 - 3], "0");
+
+        assert_eq!(
+            sanitize_statm(b"62203 7952 5707 4033 0 3255 0\n"),
+            b"0 0 0 0 0 0 0\n"
+        );
+        let status = b"Name:\thermit\nState:\tR (running)\nPid:\t1\nPPid:\t0\nVmSize:\t249000 kB\nVmRSS:\t30000 kB\n";
+        assert_eq!(
+            sanitize_status(status, None),
+            b"Name:\thermit\nState:\tS (sleeping)\nPid:\t1\nPPid:\t0\nVmSize:\t0 kB\nVmRSS:\t0 kB\n"
+        );
+    }
+
+    #[test]
+    fn system_stat_uses_virtual_uptime_and_boot_time() {
+        assert_eq!(
+            sanitize_system_stat(
+                b"cpu  1 2 3 4 5 6 7 8 9 10\ncpu0 1 2 3 4 5 6 7 8 9 10\nintr 9 8 7\nbtime 1234\nprocesses 55\n",
+                120,
+                1_640_995_079,
+            ),
+            b"cpu 12000 0 0 0 0 0 0 0 0 0\ncpu0 12000 0 0 0 0 0 0 0 0 0\nintr 0 0 0\nbtime 1640995079\nprocesses 0\n"
         );
     }
 

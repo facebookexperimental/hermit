@@ -299,8 +299,9 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
-# Current main's 191-row strict corpus plus numastat, numactl, and sensors.
-readonly STRICT_COMPAT_TOTAL=194
+# Current main's 191-row strict corpus plus numastat, numactl, sensors, and
+# vmstat process accounting.
+readonly STRICT_COMPAT_TOTAL=195
 # Current main's 131-row ratchet (which already includes ruby/dc/tcl from
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
@@ -2923,11 +2924,9 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe sensors /usr/bin/sensors \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    # Restrict process tools to stable identity/existence observations. Host
-    # CPU, memory, and RSS counters intentionally remain outside the L2 claim.
-    # shellcheck disable=SC2016
-    strict_compatibility_probe ps bash -c \
-        'set -euo pipefail; pid=$(ps -o pid= -p $$); pid=${pid//[[:space:]]/}; test "$pid" = "$$"; printf "ps-ok\n"' \
+    strict_compatibility_probe ps /usr/bin/ps aux \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe vmstat /usr/bin/vmstat -s \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # shellcheck disable=SC2016
     strict_compatibility_probe top bash -c \
@@ -3040,7 +3039,7 @@ function run_compatibility_corpus {
     strict_compatibility_probe cmp bash -c \
         'set -euo pipefail; d=$(mktemp -d); printf "same\n" >"$d/a"; printf "same\n" >"$d/b"; cmp -s "$d/a" "$d/b"; printf "cmp-ok\n"; rm -rf "$d"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe free /usr/bin/free --bytes \
+    strict_compatibility_probe free /usr/bin/free -m \
         && passed=$((passed + 1)) || failed=$((failed + 1))
 
     if [[ $COMPATIBILITY_MODE == rr ]]; then
