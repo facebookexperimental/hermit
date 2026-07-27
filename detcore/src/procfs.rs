@@ -31,6 +31,9 @@ enum ProcfsKind {
     Loadavg,
     ProcessIo,
     Uptime,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-863): Review canonical guest memory accounting.
+    Meminfo,
     BlockStat,
     ScalingCurFreq,
     Sockstat,
@@ -297,6 +300,7 @@ pub(crate) struct ProcfsFile {
 pub(crate) struct ProcfsSnapshotContext {
     pub(crate) virtual_uptime_seconds: u64,
     pub(crate) virtual_realtime_seconds: i64,
+    pub(crate) virtual_memory_kb: u64,
     pub(crate) virtual_pid: i32,
     pub(crate) virtual_ppid: i32,
     pub(crate) virtual_pty_count: usize,
@@ -322,6 +326,9 @@ impl ProcfsFile {
             "/proc/diskstats" => ProcfsKind::Diskstats,
             "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-863): Review canonical guest memory accounting.
+            "/proc/meminfo" => ProcfsKind::Meminfo,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-914): Review host-global inode counter normalization.
             "/proc/sys/fs/inode-nr" => ProcfsKind::InodeNr,
@@ -488,6 +495,7 @@ impl ProcfsFile {
         let ProcfsSnapshotContext {
             virtual_uptime_seconds,
             virtual_realtime_seconds,
+            virtual_memory_kb,
             virtual_pid,
             virtual_ppid,
             virtual_pty_count,
@@ -515,6 +523,7 @@ impl ProcfsFile {
             ProcfsKind::Loadavg => sanitize_loadavg(&contents),
             ProcfsKind::ProcessIo => sanitize_process_io(&contents),
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
+            ProcfsKind::Meminfo => sanitize_meminfo(&contents, virtual_memory_kb),
             ProcfsKind::BlockStat => sanitize_block_stat(&contents),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
@@ -1100,6 +1109,30 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
     } else {
         format!("{virtual_uptime_seconds}.00 0.00\n").into_bytes()
     }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-863): Review canonical /proc/meminfo guest accounting.
+/// Replaces host-global memory pressure with Hermit's configured guest memory.
+fn sanitize_meminfo(contents: &[u8], virtual_memory_kb: u64) -> Vec<u8> {
+    if contents.is_empty() {
+        return Vec::new();
+    }
+    format!(
+        "MemTotal:       {virtual_memory_kb} kB\n\
+         MemFree:        {virtual_memory_kb} kB\n\
+         MemAvailable:   {virtual_memory_kb} kB\n\
+         Buffers:        0 kB\n\
+         Cached:         0 kB\n\
+         SwapCached:     0 kB\n\
+         Active:         0 kB\n\
+         Inactive:       0 kB\n\
+         Shmem:          0 kB\n\
+         SReclaimable:   0 kB\n\
+         SwapTotal:      0 kB\n\
+         SwapFree:       0 kB\n"
+    )
+    .into_bytes()
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2792,6 +2825,12 @@ mod tests {
             ProcfsKind::Uptime
         );
         assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/meminfo"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Meminfo
+        );
+        assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/net/sockstat"))
                 .unwrap()
                 .kind,
@@ -4186,6 +4225,26 @@ total_commit_ms 0\n"
 
         let invalid_counter = b"nr_free_pages many\n";
         assert_eq!(sanitize_vmstat(invalid_counter), invalid_counter);
+    }
+
+    #[test]
+    fn meminfo_uses_configured_guest_memory() {
+        assert_eq!(
+            sanitize_meminfo(b"MemTotal: 791462432 kB\n", 1_048_576),
+            b"MemTotal:       1048576 kB\n\
+              MemFree:        1048576 kB\n\
+              MemAvailable:   1048576 kB\n\
+              Buffers:        0 kB\n\
+              Cached:         0 kB\n\
+              SwapCached:     0 kB\n\
+              Active:         0 kB\n\
+              Inactive:       0 kB\n\
+              Shmem:          0 kB\n\
+              SReclaimable:   0 kB\n\
+              SwapTotal:      0 kB\n\
+              SwapFree:       0 kB\n"
+        );
+        assert!(sanitize_meminfo(b"", 1_048_576).is_empty());
     }
 
     #[test]

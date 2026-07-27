@@ -361,6 +361,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let virtual_uptime_seconds = self.calculate_uptime(guest).await?;
         let virtual_realtime_seconds = i64::try_from(thread_observe_time(guest).await.as_secs())
             .map_err(|_| Errno::EOVERFLOW)?;
+        // TODO-HUMAN-REVIEW(PR-863): Use configured guest memory for meminfo.
+        let virtual_memory_kb = guest.config().memory / 1024;
         // TODO-HUMAN-REVIEW(PR-723): Review injected identity snapshot reads.
         let virtual_pid = guest.inject(syscalls::Getpid::new()).await? as i32;
         let virtual_ppid = guest.inject(syscalls::Getppid::new()).await? as i32;
@@ -399,6 +401,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 ProcfsSnapshotContext {
                     virtual_uptime_seconds,
                     virtual_realtime_seconds,
+                    virtual_memory_kb,
                     virtual_pid,
                     virtual_ppid,
                     virtual_pty_count,

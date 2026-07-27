@@ -299,12 +299,12 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
-# Current main's 187-row strict corpus plus lsirq, mpstat-softirqs, and lsmod.
-readonly STRICT_COMPAT_TOTAL=190
+# Current main's 190-row strict corpus plus free(1).
+readonly STRICT_COMPAT_TOTAL=191
 # Current main's 131-row ratchet (which already includes ruby/dc/tcl from
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
-readonly RR_COMPAT_EXPECTED=143
+readonly RR_COMPAT_EXPECTED=144
 readonly LITEINST_COMPAT_EXPECTED=855
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
@@ -323,7 +323,6 @@ E9PATCH_COMPAT_NO_DIAGNOSTIC=0
 # executable corpus. They remain in the canonical denominator and table.
 declare -Ar COMPAT_SUMMARY_KNOWN_FAILURES=(
     [timeout]="parent waits indefinitely in rt_sigsuspend for the delayed child"
-    [free]="live /proc/meminfo values differ between otherwise identical runs"
     # Explicit --strict now fail-closes on unsupported syscalls (PR #644). These
     # programs each require a syscall Detcore does not yet determinize, so they
     # correctly abort under fail-closed --strict; they only passed the envelope
@@ -374,7 +373,7 @@ declare -Ar RR_COMPAT_PASSING_LABELS=(
     [xargs]=1 [iconv]=1 [ar]=1 [as]=1 [ld]=1 [nm]=1 [objcopy]=1
     [objdump]=1 [ranlib]=1 [readelf]=1 [size]=1 [strip]=1 [addr2line]=1
     [c++filt]=1 [elfedit]=1 [gprof]=1 [cpp]=1 [gcov]=1
-    [ruby]=1 [dc]=1 [tcl]=1
+    [ruby]=1 [dc]=1 [tcl]=1 [free]=1
 )
 # mktemp remains excluded: SIGCHLD delivery can race the command-substitution pipe EOF
 # during replay, changing deterministic log order while preserving output and exit status.
@@ -3035,8 +3034,8 @@ function run_compatibility_corpus {
     strict_compatibility_probe cmp bash -c \
         'set -euo pipefail; d=$(mktemp -d); printf "same\n" >"$d/a"; printf "same\n" >"$d/b"; cmp -s "$d/a" "$d/b"; printf "cmp-ok\n"; rm -rf "$d"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    # free is intentionally absent: its live /proc/meminfo values differ
-    # between otherwise identical strict runs.
+    strict_compatibility_probe free /usr/bin/free --bytes \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
 
     if [[ $COMPATIBILITY_MODE == rr ]]; then
         if ((RR_COMPAT_CANARY_FAILED == 1)); then
