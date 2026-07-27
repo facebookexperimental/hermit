@@ -23,6 +23,9 @@ env:
   RUSTDOCFLAGS: -D warnings
 
 jobs:
+  # GitHub Actions supports timeout-minutes on jobs, not at workflow scope.
+  # This workflow has one independent five-minute job, so its job timeout is
+  # also stronger than the requested 60-minute workflow ceiling.
   # This scarce lane is a sub-five-minute hardware capability smoke only:
   #   * retired-conditional-branch PMU timer delivery,
   #   * CPUID faulting used to mask RDRAND/RDSEED, and
@@ -56,21 +59,25 @@ jobs:
     # TODO-HUMAN-REVIEW(#647)
     - name: Remove stale checkout locks
       run: |
-        if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
-          find "$GITHUB_WORKSPACE/.git" -type f -name "*.lock" -print -delete
-        fi
+        timeout --foreground --kill-after=5s 30s bash -euo pipefail -c '
+          if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+            find "$GITHUB_WORKSPACE/.git" -type f -name "*.lock" -print -delete
+          fi
+        '
 
     - uses: actions/checkout@v4
     - name: Initialize DAG runner
-      run: git submodule update --init agent-utils
+      run: timeout --foreground --kill-after=10s 60s git submodule update --init agent-utils
     - name: Require hardware capabilities
       run: |
-        test -r /proc/sys/kernel/perf_event_paranoid
-        test -r /dev/kvm -a -w /dev/kvm
-        command -v cc
-        command -v flock
+        timeout --foreground --kill-after=5s 30s bash -euo pipefail -c '
+          test -r /proc/sys/kernel/perf_event_paranoid
+          test -r /dev/kvm -a -w /dev/kvm
+          command -v cc
+          command -v flock
+        '
     - name: PMU, CPUID-faulting, and KVM smoke DAG
-      run: env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner flock /tmp/hermit-self-hosted-pmu.lock ci/run-dag.sh hardware -j 2 --perf-dir "$RUNNER_TEMP/hermit-hardware-dag-perf" -v
+      run: timeout --foreground --kill-after=10s 270s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner flock /tmp/hermit-self-hosted-pmu.lock ci/run-dag.sh hardware -j 2 --perf-dir "$RUNNER_TEMP/hermit-hardware-dag-perf" -v
     - name: Upload hardware DAG performance report
       if: always()
       uses: actions/upload-artifact@v4

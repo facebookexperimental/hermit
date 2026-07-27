@@ -48,6 +48,9 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --hardware-only             # PMU/CPUID-dependent tests only
 #   ./validate.sh --verbose                  # stream each gate's command, PID,
 #                                            # elapsed time, and subprocess output
+# Every foreground/background gate has a process-tree timeout. Override the
+# profile default with VALIDATE_GATE_TIMEOUT_SECONDS; tune TERM-to-KILL grace
+# with VALIDATE_TIMEOUT_KILL_GRACE_SECONDS.
 # A fully-green full run labels the current PR `locally-validated` by default.
 # PR_NUMBER=N overrides branch-based PR detection. Use --no-label-pr or
 # VALIDATE_LABEL_PR=0 to disable the non-fatal GitHub update.
@@ -4000,7 +4003,7 @@ function run_hardware_validation {
         futex_wait_parent::bottom_detcore \
         futex_wait_parent::default_detcore \
         futex_wait_parent::middle_detcore
-    run_exact_detcore_cases "PMU parallel memory-and-print" tests_parallelism 900 \
+    run_exact_detcore_cases "PMU parallel memory-and-print" tests_parallelism 600 \
         mem_print_race::bottom_detcore \
         mem_print_race::default_detcore \
         mem_print_race::middle_detcore \
@@ -4137,7 +4140,7 @@ function run_super_diagnostic_suite {
     # unrelated PR heads. Preserve weekly coverage without making every PR wait
     # for the same host-sensitive hang.
     run_exact_detcore_cases "Weekly PMU parallel memory diagnostic" \
-        tests_parallelism 900 \
+        tests_parallelism 600 \
         mem_race::bottom_detcore \
         mem_race::default_detcore \
         mem_race::middle_detcore \
