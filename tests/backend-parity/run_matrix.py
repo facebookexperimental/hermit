@@ -162,6 +162,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             0,
             None,
         ),
+        "shared_anonymous_mmap": (
+            [str(fixtures.binary("mmap_determinism")), "shared"],
+            0,
+            None,
+        ),
         "pthread_lifecycle": (
             [str(fixtures.binary("pthread_lifecycle"))],
             0,
@@ -371,6 +376,7 @@ def run_case(
                 "virtual_clock": b"clock matrix success\n",
                 "heap_growth": b"heap ",
                 "anonymous_mmap_layout": b"multiple ",
+                "shared_anonymous_mmap": b"shared ",
                 "random_sources": b"getrandom[0]=",
                 "virtual_pid": b"pid=",
             }

@@ -9,12 +9,12 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 15/15 | 100% |
-| DBI | 14/15 | 93% |
-| KVM | 13/15 | 87% |
+| ptrace | 16/16 | 100% |
+| DBI | 15/16 | 94% |
+| KVM | 14/16 | 88% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 14/15 number above is deliberately
+measures the backend's own Reverie suite. The 15/16 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, and application executable-memory
@@ -26,21 +26,22 @@ an anonymous mapping, transitions it from writable to executable, and calls it.
 The memory-advice row checks accepted and rejected advice, address validation,
 and file-backed `MADV_DONTNEED` restoration; KVM instead enforces its documented
 deterministic `ENOSYS` refusal for `MADV_DONTNEED`. The memory-layout rows check
-that `sbrk`/`brk` growth and ordered one-, two-, and three-page anonymous
-mappings produce the same address sequences across repeated runs of each
-backend; they deliberately permit different backend-local layouts. Hosted
+that `sbrk`/`brk` growth, ordered one-, two-, and three-page private anonymous
+mappings, and a written two-page shared anonymous mapping produce the same
+address sequences across repeated runs of each backend; they deliberately
+permit different backend-local layouts. Hosted
 pthread startup can still stall during native startup and remains the sole DBI
 gap; child-thread random sources remain covered by that lifecycle gap rather
 than the random-source pair.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
-thirteen pairs, including its bounded cooperative pthread lifecycle, executable
+fourteen pairs, including its bounded cooperative pthread lifecycle, executable
 memory, deterministic memory-advice policy, clock, PID, and synthetic CPUID
-probes, plus repeatable heap growth and anonymous mapping layout. Its remaining
-gaps are the threaded random-source fixture, where child-thread syscalls bypass
-per-child Detcore callbacks and the KVM personality repeats fixed random
-streams across workers, and process wait accounting, because KVM child
-processes do not run through per-child Detcore callbacks.
+probes, plus repeatable heap growth and private/shared anonymous mapping
+layouts. Its remaining gaps are the threaded random-source fixture, where
+child-thread syscalls bypass per-child Detcore callbacks and the KVM personality
+repeats fixed random streams across workers, and process wait accounting,
+because KVM child processes do not run through per-child Detcore callbacks.
 
 ## Matrix
 
@@ -55,6 +56,7 @@ processes do not run through per-child Detcore callbacks.
 | `memory_advice` | pass | pass | pass |
 | `heap_growth` | pass | pass | pass |
 | `anonymous_mmap_layout` | pass | pass | pass |
+| `shared_anonymous_mmap` | pass | pass | pass |
 | `pthread_lifecycle` | pass | gap | pass |
 | `process_wait_lifecycle` | pass | pass | gap |
 | `cpuid_policy` | pass | pass | pass |
