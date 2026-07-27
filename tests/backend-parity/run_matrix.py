@@ -113,6 +113,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/syscall_file_metadata.c",
                 (),
             ),
+            "io_uring_fallback": (
+                REPOSITORY / "tests/c/io_uring_fallback.c",
+                ("-D_GNU_SOURCE",),
+            ),
             "madvise_determinism": (
                 REPOSITORY / "tests/c/madvise_determinism.c",
                 (),
@@ -159,6 +163,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             [str(fixtures.binary("syscall_file_metadata"))],
             0,
             b"syscall-file-metadata-ok count=20\n",
+        ),
+        "io_uring_fallback": (
+            [str(fixtures.binary("io_uring_fallback"))],
+            0,
+            b"io_uring blocked; epoll fallback ready\n",
         ),
         "executable_mmap": (
             [str(fixtures.binary("mmap_exec"))],

@@ -9,22 +9,22 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 18/18 | 100% |
-| DBI | 17/18 | 94% |
-| KVM | 15/18 | 83% |
+| ptrace | 19/19 | 100% |
+| DBI | 18/19 | 95% |
+| KVM | 16/19 | 84% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 17/18 number above is deliberately
+measures the backend's own Reverie suite. The 18/19 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
 file-mutation and file-metadata contracts, plus deterministic memory-advice and
-memory-layout behavior. The wait contract covers deterministic `wait4`/`waitid`
-results, at
-least one SIGCHLD handler delivery (standard signals may coalesce), complete
-reaping, and zeroed child CPU accounting. The executable-memory contract writes
-machine code into an anonymous mapping, transitions it from writable to
-executable, and calls it.
+memory-layout behavior. It also deterministically refuses io_uring and verifies
+that epoll remains available as a fallback. The wait contract covers
+deterministic `wait4`/`waitid` results, at least one SIGCHLD handler delivery
+(standard signals may coalesce), complete reaping, and zeroed child CPU
+accounting. The executable-memory contract writes machine code into an
+anonymous mapping, transitions it from writable to executable, and calls it.
 The memory-advice row checks accepted and rejected advice, address validation,
 and file-backed `MADV_DONTNEED` restoration; KVM instead enforces its documented
 deterministic `ENOSYS` refusal for `MADV_DONTNEED`. The memory-layout rows check
@@ -42,17 +42,19 @@ The file-metadata row checks positional I/O, ownership and access operations,
 hard and symbolic links, path/fd/symlink extended attributes, a shared file
 mapping, readahead, and range synchronization. It permits documented filesystem
 policy failures for extended attributes but not an unimplemented syscall.
+The io_uring fallback row requires all three io_uring entry points to return
+deterministic `ENOSYS`, then checks that `epoll_create1` still succeeds.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
-fifteen pairs, including its bounded cooperative pthread lifecycle, executable
+sixteen pairs, including its bounded cooperative pthread lifecycle, executable
 memory, deterministic memory-advice policy, clock, PID, and synthetic CPUID
-probes, plus file mutation, repeatable heap growth, and private/shared anonymous mapping
-layouts. Its remaining gaps are file metadata, because its personality does not
-implement extended-attribute syscalls; the threaded random-source fixture,
-where child-thread syscalls bypass per-child Detcore callbacks and the KVM
-personality repeats fixed random streams across workers; and process wait
-accounting, because KVM child processes do not run through per-child Detcore
-callbacks.
+probes, plus file mutation, io_uring refusal with epoll fallback, repeatable heap
+growth, and private/shared anonymous mapping layouts. Its remaining gaps are
+file metadata, because its personality does not implement extended-attribute
+syscalls; the threaded random-source fixture, where child-thread syscalls bypass
+per-child Detcore callbacks and the KVM personality repeats fixed random streams
+across workers; and process wait accounting, because KVM child processes do not
+run through per-child Detcore callbacks.
 
 ## Matrix
 
@@ -65,6 +67,7 @@ callbacks.
 | `file_read` | pass | pass | pass |
 | `file_mutation` | pass | pass | pass |
 | `file_metadata` | pass | pass | gap |
+| `io_uring_fallback` | pass | pass | pass |
 | `executable_mmap` | pass | pass | pass |
 | `memory_advice` | pass | pass | pass |
 | `heap_growth` | pass | pass | pass |
