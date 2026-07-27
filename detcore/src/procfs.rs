@@ -63,6 +63,9 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-941): Review transparent-hugepage counter normalization.
     ThpCounter,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-939): Review NUMA node VM accounting normalization.
+    NodeVmstat,
 }
 
 const THP_COUNTERS: &[&str] = &[
@@ -208,6 +211,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-939): Review NUMA node VM accounting normalization.
+            other if is_node_vmstat_path(other) => ProcfsKind::NodeVmstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-928): Review per-process host scheduler normalization.
             "/proc/self/sched" => ProcfsKind::SelfSched,
@@ -357,6 +363,7 @@ impl ProcfsFile {
             ProcfsKind::Rtc => sanitize_rtc(&contents, virtual_realtime_seconds),
             ProcfsKind::DentryState => sanitize_dentry_state(&contents),
             ProcfsKind::Locks => sanitize_locks(&contents),
+            ProcfsKind::NodeVmstat => sanitize_node_vmstat(&contents),
             ProcfsKind::ThpCounter => sanitize_thp_counter(&contents),
         });
     }
@@ -897,6 +904,47 @@ fn sanitize_pty_nr(contents: &[u8]) -> Vec<u8> {
     } else {
         b"0\n".to_vec()
     }
+}
+
+fn is_node_vmstat_path(path: &str) -> bool {
+    let relative = path
+        .strip_prefix("/sys/devices/system/node/")
+        .unwrap_or(path);
+    let Some(node) = relative.strip_suffix("/vmstat") else {
+        return false;
+    };
+    let Some(index) = node.strip_prefix("node") else {
+        return false;
+    };
+    !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-939): Review the zeroed node VM accounting policy.
+fn sanitize_node_vmstat(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let mut fields = body.split_whitespace();
+        let (Some(name), Some(value), None) = (fields.next(), fields.next(), fields.next()) else {
+            return contents.to_vec();
+        };
+        if value.parse::<u64>().is_err() {
+            return contents.to_vec();
+        }
+
+        normalized.extend_from_slice(name.as_bytes());
+        normalized.extend_from_slice(b" 0");
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1890,6 +1938,43 @@ mod tests {
         ] {
             assert!(ProcfsFile::from_path(Path::new(path)).is_none(), "{path}");
         }
+    }
+
+    #[test]
+    fn recognizes_only_numa_node_vmstat_paths() {
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/sys/devices/system/node/node0/vmstat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::NodeVmstat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("node12/vmstat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::NodeVmstat
+        );
+        assert!(ProcfsFile::from_path(Path::new("node/vmstat")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("node0/meminfo")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("/proc/vmstat")).is_none());
+    }
+
+    #[test]
+    fn node_vmstat_preserves_fields_and_zeros_accounting() {
+        let contents = b"nr_free_pages 3859604\nnuma_hit 197122344154\nnr_writeback 38\n";
+        assert_eq!(
+            sanitize_node_vmstat(contents),
+            b"nr_free_pages 0\nnuma_hit 0\nnr_writeback 0\n"
+        );
+        assert!(sanitize_node_vmstat(b"").is_empty());
+        assert_eq!(
+            sanitize_node_vmstat(b"nr_free_pages unknown\n"),
+            b"nr_free_pages unknown\n"
+        );
+        assert_eq!(
+            sanitize_node_vmstat(b"nr_free_pages 1 extra\n"),
+            b"nr_free_pages 1 extra\n"
+        );
     }
 
     #[test]
