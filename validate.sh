@@ -304,7 +304,7 @@ readonly STRICT_COMPAT_TOTAL=181
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
 readonly RR_COMPAT_EXPECTED=143
-readonly LITEINST_COMPAT_EXPECTED=280
+readonly LITEINST_COMPAT_EXPECTED=305
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
@@ -830,7 +830,7 @@ function run_full_backend_gates {
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
     run_check "LiteInst backend smoke" liteinst_backend_available
-    run_check "LiteInst compatibility baseline (280 programs)" run_liteinst_compatibility_envelope
+    run_check "LiteInst compatibility baseline (305 programs)" run_liteinst_compatibility_envelope
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -1595,6 +1595,31 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe ul-version /usr/bin/ul --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe setsid-version /usr/bin/setsid --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe setarch-version /usr/bin/setarch --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe readprofile-version /usr/sbin/readprofile --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe rtcwake-version /usr/sbin/rtcwake --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe agetty-version /usr/sbin/agetty --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe resizepart-version /usr/sbin/resizepart --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe fincore-version /usr/bin/fincore --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe scriptlive-version /usr/bin/scriptlive --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe lastb-version /usr/bin/lastb --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe renice-version /usr/bin/renice --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe blockdev-version /usr/sbin/blockdev --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sfdisk-version /usr/sbin/sfdisk --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe fdisk-version /usr/sbin/fdisk --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe fsck-version /usr/sbin/fsck --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe mkfs-version /usr/sbin/mkfs --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe bootctl-version /usr/bin/bootctl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe kernel-install-version /usr/bin/kernel-install --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe oomctl-version /usr/bin/oomctl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe portablectl-version /usr/bin/portablectl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe userdbctl-version /usr/bin/userdbctl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-cat-version /usr/bin/systemd-cat --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-cgtop-version /usr/bin/systemd-cgtop --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-mount-version /usr/bin/systemd-mount --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-run-version /usr/bin/systemd-run --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-socket-activate-version /usr/bin/systemd-socket-activate --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-stdio-bridge-version /usr/bin/systemd-stdio-bridge --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-sysusers-version /usr/bin/systemd-sysusers --version && passed=$((passed + 1)) || failed=$((failed + 1))
 
     total=$((passed + failed))
     if ((total != LITEINST_COMPAT_EXPECTED)); then
@@ -3418,7 +3443,7 @@ fi
 if ((LITEINST_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
     if ((failures == 0)); then
-        run_check "LiteInst compatibility baseline (280 programs)" run_liteinst_compatibility_envelope
+        run_check "LiteInst compatibility baseline (305 programs)" run_liteinst_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
