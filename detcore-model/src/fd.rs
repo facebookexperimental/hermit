@@ -88,4 +88,43 @@ impl OpenFileId {
     pub const fn new(creator: DetTid, sequence: u64) -> Self {
         Self { creator, sequence }
     }
+
+    // TODO-HUMAN-REVIEW(PR-886): Review stable socket-cookie identity encoding.
+    /// Encode the ordinary per-task open sequence as a deterministic socket cookie.
+    ///
+    /// Linux promises that live socket cookies are unique and that descriptor aliases
+    /// for one open file description share a cookie. Detcore's virtual task IDs and
+    /// open-file sequences provide those same properties for realistic descriptor
+    /// counts while avoiding the kernel's host-global cookie allocator.
+    pub fn deterministic_socket_cookie(self) -> u64 {
+        let creator = self.creator.as_raw() as u32 as u64;
+        (creator << 32) | (self.sequence & u32::MAX as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deterministic_socket_cookies_track_open_file_identity() {
+        let first = OpenFileId::new(DetTid::from_raw(3), 7);
+        let alias = first;
+        let next = OpenFileId::new(DetTid::from_raw(3), 8);
+        let other_task = OpenFileId::new(DetTid::from_raw(4), 7);
+
+        assert_ne!(first.deterministic_socket_cookie(), 0);
+        assert_eq!(
+            first.deterministic_socket_cookie(),
+            alias.deterministic_socket_cookie()
+        );
+        assert_ne!(
+            first.deterministic_socket_cookie(),
+            next.deterministic_socket_cookie()
+        );
+        assert_ne!(
+            first.deterministic_socket_cookie(),
+            other_task.deterministic_socket_cookie()
+        );
+    }
 }
