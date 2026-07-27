@@ -607,7 +607,7 @@ impl ProcfsFile {
             ProcfsKind::UnixSockets => sanitize_unix_sockets(&contents),
             ProcfsKind::BtrfsCommitStats => sanitize_btrfs_commit_stats(&contents),
             ProcfsKind::SysfsRtcDate | ProcfsKind::SysfsRtcTime | ProcfsKind::SysfsRtcEpoch => {
-                sanitize_sysfs_rtc_attribute(&contents, self.kind)
+                sanitize_sysfs_rtc_attribute(&contents, self.kind, virtual_realtime_seconds)
             }
             ProcfsKind::ThpCounter => sanitize_thp_counter(&contents),
             ProcfsKind::InterruptCounters => sanitize_interrupt_counters(&contents),
@@ -1238,30 +1238,34 @@ fn sanitize_cppc_feedback(contents: &[u8]) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-963): Review fixed virtual RTC attribute values.
-fn sanitize_sysfs_rtc_attribute(contents: &[u8], kind: ProcfsKind) -> Vec<u8> {
+// TODO-HUMAN-REVIEW(PR-963): Review virtual RTC attribute values.
+fn sanitize_sysfs_rtc_attribute(
+    contents: &[u8],
+    kind: ProcfsKind,
+    virtual_realtime_seconds: i64,
+) -> Vec<u8> {
     let has_newline = contents.ends_with(b"\n");
     let value = contents.strip_suffix(b"\n").unwrap_or(contents);
-    let (valid, fixed): (bool, &[u8]) = match kind {
-        ProcfsKind::SysfsRtcDate => (
-            matches_digit_separated(value, 10, &[(4, b'-'), (7, b'-')]),
-            b"2026-01-01",
-        ),
-        ProcfsKind::SysfsRtcTime => (
-            matches_digit_separated(value, 8, &[(2, b':'), (5, b':')]),
-            b"00:00:00",
-        ),
-        ProcfsKind::SysfsRtcEpoch => (
-            !value.is_empty() && value.iter().all(u8::is_ascii_digit),
-            b"1767225600",
-        ),
+    let valid = match kind {
+        ProcfsKind::SysfsRtcDate => matches_digit_separated(value, 10, &[(4, b'-'), (7, b'-')]),
+        ProcfsKind::SysfsRtcTime => matches_digit_separated(value, 8, &[(2, b':'), (5, b':')]),
+        ProcfsKind::SysfsRtcEpoch => !value.is_empty() && value.iter().all(u8::is_ascii_digit),
         _ => return contents.to_vec(),
     };
     if !valid {
         return contents.to_vec();
     }
+    let Some(now) = DateTime::<Utc>::from_timestamp(virtual_realtime_seconds, 0) else {
+        return contents.to_vec();
+    };
+    let fixed = match kind {
+        ProcfsKind::SysfsRtcDate => now.format("%Y-%m-%d").to_string(),
+        ProcfsKind::SysfsRtcTime => now.format("%H:%M:%S").to_string(),
+        ProcfsKind::SysfsRtcEpoch => virtual_realtime_seconds.to_string(),
+        _ => unreachable!("validated sysfs RTC kind changed"),
+    };
 
-    let mut normalized = fixed.to_vec();
+    let mut normalized = fixed.into_bytes();
     if has_newline {
         normalized.push(b'\n');
     }
@@ -3845,18 +3849,18 @@ mod tests {
     }
 
     #[test]
-    fn sysfs_rtc_uses_the_fixed_virtual_epoch() {
+    fn sysfs_rtc_uses_the_virtual_realtime() {
         assert_eq!(
-            sanitize_sysfs_rtc_attribute(b"2026-07-27\n", ProcfsKind::SysfsRtcDate),
+            sanitize_sysfs_rtc_attribute(b"2026-07-27\n", ProcfsKind::SysfsRtcDate, 1_767_225_600,),
             b"2026-01-01\n"
         );
         assert_eq!(
-            sanitize_sysfs_rtc_attribute(b"12:24:03\n", ProcfsKind::SysfsRtcTime),
-            b"00:00:00\n"
+            sanitize_sysfs_rtc_attribute(b"12:24:03\n", ProcfsKind::SysfsRtcTime, 1_767_229_261,),
+            b"01:01:01\n"
         );
         assert_eq!(
-            sanitize_sysfs_rtc_attribute(b"1785155071", ProcfsKind::SysfsRtcEpoch),
-            b"1767225600"
+            sanitize_sysfs_rtc_attribute(b"1785155071", ProcfsKind::SysfsRtcEpoch, 1_735_689_600,),
+            b"1735689600"
         );
         for (malformed, kind) in [
             (b"2026/07/27\n".as_slice(), ProcfsKind::SysfsRtcDate),
@@ -3864,7 +3868,10 @@ mod tests {
             (b"-1\n".as_slice(), ProcfsKind::SysfsRtcEpoch),
             (b"\n".as_slice(), ProcfsKind::SysfsRtcEpoch),
         ] {
-            assert_eq!(sanitize_sysfs_rtc_attribute(malformed, kind), malformed);
+            assert_eq!(
+                sanitize_sysfs_rtc_attribute(malformed, kind, 1_767_225_600),
+                malformed
+            );
         }
     }
 
