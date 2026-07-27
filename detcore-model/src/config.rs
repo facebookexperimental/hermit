@@ -50,6 +50,44 @@ pub struct Config {
     #[clap(skip = true)]
     pub backend_supports_madvise: bool,
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review in-process backend descriptor discovery.
+    /// The execution backend runs Detcore inside the guest and can inspect its live descriptors.
+    #[serde(default)]
+    #[clap(skip)]
+    pub discover_live_file_metadata: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review backend-local guest clock observations.
+    /// Guest clock reads use per-thread logical time instead of the global RPC arrival order.
+    #[serde(default)]
+    #[clap(skip)]
+    pub use_thread_local_clock_reads: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review host-clock futex deadline detection.
+    /// Direct guest clock reads may bypass backend virtualization, so absolute futex deadlines
+    /// must be classified against both the host and logical clocks.
+    #[serde(default)]
+    #[clap(skip)]
+    pub detect_host_clock_futex_timeouts: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review backend-owned syscall-clobber determinism.
+    /// The execution backend already returns deterministic values for registers clobbered by a
+    /// syscall instruction, so Detcore must not write the complete register set back afterward.
+    #[serde(default)]
+    #[clap(skip)]
+    pub syscall_clobbers_virtualized_by_backend: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review backend-local exit-group RPC cancellation.
+    /// Logically killed guest threads need an explicit scheduler response because the backend
+    /// does not rely on ptrace's kernel-driven exit-group teardown.
+    #[serde(default)]
+    #[clap(skip)]
+    pub cancel_killed_thread_rpcs: bool,
+
     /// Epoch of the logical time.
     ///
     /// This is the datetime from which all time and date modtimes begin and

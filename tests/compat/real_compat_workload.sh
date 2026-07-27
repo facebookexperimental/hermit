@@ -65,29 +65,28 @@ function verify_archive_roundtrip {
 function fetch_localhost_payload {
     (
         local client=$1
+        local response_bytes
         local server_pid=
+        local server_status=0
         local status=0
-        local ready=0
-        local attempt
 
         trap 'if [[ -n $server_pid ]]; then kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; fi' EXIT
         prepare_archive_fixture
-        /usr/bin/python3 -B -c \
-            'import functools, http.server, pathlib, sys; handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=sys.argv[1]); server = http.server.HTTPServer(("127.0.0.1", 18765), handler); pathlib.Path(sys.argv[2]).touch(); server.handle_request()' \
-            "$WORK_DIR/source" "$WORK_DIR/ready" >"$WORK_DIR/server.log" 2>&1 &
+        response_bytes=$(wc -c <"$WORK_DIR/source/payload.txt")
+        {
+            printf 'HTTP/1.0 200 OK\r\nContent-Length: %s\r\nConnection: close\r\n\r\n' \
+                "$response_bytes"
+            cat "$WORK_DIR/source/payload.txt"
+        } >"$WORK_DIR/response.http"
+
+        /usr/bin/nc --send-only -l 127.0.0.1 18765 \
+            <"$WORK_DIR/response.http" >"$WORK_DIR/server.log" 2>&1 &
         server_pid=$!
 
-        for ((attempt = 0; attempt < 500; attempt += 1)); do
-            if [[ -e $WORK_DIR/ready ]]; then
-                ready=1
-                break
-            fi
-            sleep 0.01
-        done
-        if ((ready == 0)); then
-            printf 'localhost fixture did not become ready\n' >&2
-            status=1
-        elif [[ $client == wget ]]; then
+        # Yield one deterministic logical interval so Ncat reaches listen(2)
+        # before the client connects, without a second readiness process.
+        sleep 0.1
+        if [[ $client == wget ]]; then
             /usr/bin/wget --quiet \
                 --output-document="$WORK_DIR/output/payload.txt" \
                 http://127.0.0.1:18765/payload.txt || status=$?
@@ -97,11 +96,20 @@ function fetch_localhost_payload {
                 http://127.0.0.1:18765/payload.txt || status=$?
         fi
 
-        kill "$server_pid" 2>/dev/null || true
-        wait "$server_pid" 2>/dev/null || true
+        if ((status != 0)); then
+            kill "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+        elif wait "$server_pid"; then
+            :
+        else
+            server_status=$?
+        fi
         server_pid=
         if ((status != 0)); then
             return "$status"
+        fi
+        if ((server_status != 0)); then
+            return "$server_status"
         fi
 
         cmp "$WORK_DIR/source/payload.txt" "$WORK_DIR/output/payload.txt"

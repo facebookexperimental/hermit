@@ -187,6 +187,15 @@ fn rebase_absolute_timeout(
     logical_now + Duration::from_nanos(deadline.as_nanos().saturating_sub(clock_now.as_nanos()))
 }
 
+fn absolute_timeout_uses_host_clock(
+    deadline: LogicalTime,
+    host_clock_now: LogicalTime,
+    logical_now: LogicalTime,
+) -> bool {
+    deadline.as_nanos().abs_diff(host_clock_now.as_nanos())
+        < deadline.as_nanos().abs_diff(logical_now.as_nanos())
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     async fn futex_timeout_deadline<G: Guest<Self>>(
         &self,
@@ -203,7 +212,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let now = thread_observe_time(guest).await;
                 Ok(Some(now + Duration::from_nanos(nanos)))
             }
-            FutexTimeout::Absolute(deadline) if self.cfg.virtualize_time => Ok(Some(deadline)),
+            FutexTimeout::Absolute(deadline)
+                if self.cfg.virtualize_time && !self.cfg.detect_host_clock_futex_timeouts =>
+            {
+                Ok(Some(deadline))
+            }
             FutexTimeout::Absolute(deadline) => {
                 let clockid = if futex_flags & libc::FUTEX_CLOCK_REALTIME != 0 {
                     syscalls::ClockId::CLOCK_REALTIME
@@ -214,13 +227,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let mut stack = guest.stack().await;
                 let clock_output = syscalls::TimespecMutPtr(stack.reserve());
                 let _stack_guard = stack.commit()?;
-                self.record_or_replay(
-                    guest,
-                    syscalls::ClockGettime::new()
-                        .with_clockid(clockid)
-                        .with_tp(Some(clock_output)),
-                )
-                .await?;
+                let clock_call = syscalls::ClockGettime::new()
+                    .with_clockid(clockid)
+                    .with_tp(Some(clock_output));
+                if self.cfg.virtualize_time && self.cfg.detect_host_clock_futex_timeouts {
+                    // Read the same live host clock as a direct guest vDSO call. Replaying a
+                    // recorded value here would compare this run's host-domain deadline with the
+                    // previous run's clock and turn a short timeout into an arbitrary long one.
+                    guest.inject(Syscall::from(clock_call)).await?;
+                } else {
+                    self.record_or_replay(guest, clock_call).await?;
+                }
                 let clock_now = match parse_futex_timeout(
                     libc::FUTEX_WAIT_BITSET,
                     guest.memory().read_value(clock_output.0)?,
@@ -229,6 +246,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                     FutexTimeout::Relative(_) => unreachable!(),
                 };
                 let logical_now = thread_observe_time(guest).await;
+                if self.cfg.virtualize_time
+                    && !absolute_timeout_uses_host_clock(deadline, clock_now, logical_now)
+                {
+                    return Ok(Some(deadline));
+                }
                 Ok(Some(rebase_absolute_timeout(
                     deadline,
                     clock_now,
@@ -448,12 +470,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                     SchedValue::Value(num) => num,
                     SchedValue::TimeOut => panic!("impossible, futex wake doesn't have a timeout"),
                 };
-                trace!(
-                    "[detcore, dtid {}] emulated futex wake committed, memory value is {}, expected {}",
-                    &dettid,
-                    guest.memory().read_value(ptr).unwrap(),
-                    call.val(),
-                );
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#845): Review exited-thread futex diagnostics.
+                match guest.memory().read_value(ptr) {
+                    Ok(observed) => trace!(
+                        "[detcore, dtid {}] emulated futex wake committed, memory value is {}, expected {}",
+                        &dettid,
+                        observed,
+                        call.val(),
+                    ),
+                    Err(error) => trace!(
+                        "[detcore, dtid {}] skipped post-wake futex memory diagnostic: {}",
+                        &dettid, error,
+                    ),
+                }
                 let _ = futex_action(
                     guest,
                     FutexAction::WakeFinished(0),
@@ -487,15 +517,24 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .await;
                     let res = if ans != Some(SchedValue::TimeOut) {
                         let expected = call.val();
-                        let observed = guest.memory().read_value(ptr).unwrap();
-                        trace!(
-                            "[detcore, dtid {}] after (emulated) futex wait, memory value is {}, expected {}",
-                            &dettid, observed, expected,
-                        );
-                        if expected == observed {
-                            debug!(
-                                "WARNING: fishy that the futex value did not change before wakeup. Weird application-level protocol.\n"
-                            );
+                        // AUTONOMOUS-BOT-IMPLEMENTED
+                        // TODO-HUMAN-REVIEW(#845): Review exited-thread futex diagnostics.
+                        match guest.memory().read_value(ptr) {
+                            Ok(observed) => {
+                                trace!(
+                                    "[detcore, dtid {}] after (emulated) futex wait, memory value is {}, expected {}",
+                                    &dettid, observed, expected,
+                                );
+                                if expected == observed {
+                                    debug!(
+                                        "WARNING: fishy that the futex value did not change before wakeup. Weird application-level protocol.\n"
+                                    );
+                                }
+                            }
+                            Err(error) => trace!(
+                                "[detcore, dtid {}] skipped post-wait futex memory diagnostic: {}",
+                                &dettid, error,
+                            ),
                         }
                         Ok(0)
                     } else {
@@ -1205,6 +1244,31 @@ mod tests {
             ),
             logical_now
         );
+    }
+
+    #[test]
+    fn absolute_futex_timeout_detects_host_and_logical_clock_domains() {
+        let host_monotonic_now = LogicalTime::from_secs(374_766);
+        let logical_now = LogicalTime::from_secs(1_640_995_199);
+        let delta = Duration::from_millis(100);
+
+        assert!(absolute_timeout_uses_host_clock(
+            host_monotonic_now + delta,
+            host_monotonic_now,
+            logical_now
+        ));
+        assert!(!absolute_timeout_uses_host_clock(
+            logical_now + delta,
+            host_monotonic_now,
+            logical_now
+        ));
+
+        let host_realtime_now = LogicalTime::from_secs(1_785_142_800);
+        assert!(absolute_timeout_uses_host_clock(
+            host_realtime_now + delta,
+            host_realtime_now,
+            logical_now
+        ));
     }
 
     #[test]

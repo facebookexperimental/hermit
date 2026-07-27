@@ -8,8 +8,12 @@
 
 //! SaBRe plugin that executes Hermit's Detcore tool inside each guest process.
 
+use std::ffi::CString;
 use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -48,6 +52,26 @@ fn remember_coordinator_socket(
         let requested = requested.map(PathBuf::from)?;
         Some(slot.get_or_init(|| requested).clone())
     })
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-845): Review SaBRe guest comm-name restoration.
+fn guest_comm_from_args(args: impl IntoIterator<Item = OsString>) -> Option<CString> {
+    let program = args.into_iter().next()?;
+    let name = Path::new(&program).file_name()?.as_bytes();
+    CString::new(&name[..name.len().min(15)]).ok()
+}
+
+fn restore_guest_comm_name(thread_id: u32) {
+    if thread_id != unsafe { libc::getpid() as u32 } {
+        return;
+    }
+    let Some(name) = guest_comm_from_args(std::env::args_os()) else {
+        return;
+    };
+    unsafe {
+        libc::prctl(libc::PR_SET_NAME, name.as_ptr() as usize, 0, 0, 0);
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -173,6 +197,7 @@ impl reverie_sabre::Tool for Plugin {
     }
 
     fn on_thread_start(&self, thread_id: u32) {
+        restore_guest_comm_name(thread_id);
         self.adapter.handle_thread_start(thread_id);
     }
 
@@ -184,6 +209,26 @@ impl reverie_sabre::Tool for Plugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_comm_uses_target_basename_and_linux_limit() {
+        assert_eq!(
+            guest_comm_from_args(
+                ["/usr/bin/bash", "-c", "exit 0"]
+                    .into_iter()
+                    .map(OsString::from)
+            )
+            .unwrap()
+            .to_bytes(),
+            b"bash"
+        );
+        assert_eq!(
+            guest_comm_from_args(["abcdefghijklmnop"].into_iter().map(OsString::from))
+                .unwrap()
+                .to_bytes(),
+            b"abcdefghijklmno"
+        );
+    }
 
     #[test]
     fn rpc_socket_uses_sabre_private_environment_namespace() {

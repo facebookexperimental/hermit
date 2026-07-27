@@ -35,6 +35,8 @@ use std::fs;
 use std::io;
 use std::io::Write;
 use std::os::fd::FromRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -507,6 +509,65 @@ fn resolve_sabre_binary() -> Result<PathBuf, Error> {
 }
 
 const SABRE_RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
+const SABRE_STAGING_DIRECTORY: &str = "/dev/shm";
+
+struct StagedSabreProgram {
+    path: PathBuf,
+}
+
+impl Drop for StagedSabreProgram {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn sabre_program_needs_neutral_name(program: &Path) -> bool {
+    program
+        .file_name()
+        .is_some_and(|name| name.as_bytes().starts_with(b"ld"))
+}
+
+// TODO-HUMAN-REVIEW(PR-845): Review the neutral-name workaround for SaBRe's
+// dynamic-loader prefix collision.
+fn stage_sabre_program_in(
+    program: &Path,
+    staging_directory: &Path,
+) -> Result<Option<StagedSabreProgram>, Error> {
+    if !sabre_program_needs_neutral_name(program) {
+        return Ok(None);
+    }
+
+    let path = staging_directory.join(format!("hermit-sabre-program-{}", std::process::id()));
+    let mut source = fs::File::open(program).map_err(|error| {
+        anyhow!(
+            "failed to open SaBRe guest executable {} for neutral-name staging: {error}",
+            program.display()
+        )
+    })?;
+    let mut staged = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&path)
+        .map_err(|error| {
+            anyhow!(
+                "failed to stage SaBRe guest executable {} as {}: {error}",
+                program.display(),
+                path.display()
+            )
+        })?;
+    if let Err(error) = io::copy(&mut source, &mut staged) {
+        let _ = fs::remove_file(&path);
+        return Err(anyhow!(
+            "failed to stage SaBRe guest executable {} as {}: {error}",
+            program.display(),
+            path.display()
+        ));
+    }
+    drop(staged);
+
+    Ok(Some(StagedSabreProgram { path }))
+}
 
 // TODO-HUMAN-REVIEW(PR-738): Review controller/plugin artifact separation.
 fn sabre_runtime_library_path() -> io::Result<PathBuf> {
@@ -649,6 +710,10 @@ async fn run_sabre(
             command.get_program()
         )
     })?;
+    let staged_program = stage_sabre_program_in(&program, Path::new(SABRE_STAGING_DIRECTORY))?;
+    let launch_program = staged_program
+        .as_ref()
+        .map_or(program.as_path(), |staged| staged.path.as_path());
 
     let socket_dir = tempfile::Builder::new()
         .prefix("hermit-sabre-rpc-")
@@ -665,7 +730,11 @@ async fn run_sabre(
     .map_err(|error| anyhow!("failed to start SaBRe coordinator RPC: {error}"))?;
     let server_task = tokio::spawn(async move { server.serve().await });
 
-    command.prepend_args([plugin.as_os_str(), OsStr::new("--"), program.as_os_str()]);
+    command.prepend_args([
+        plugin.as_os_str(),
+        OsStr::new("--"),
+        launch_program.as_os_str(),
+    ]);
     command.program(&sabre);
     command.env(SABRE_RPC_SOCKET_ENV, &socket_path);
     command.env_remove("SABRE_BINARY");
@@ -695,7 +764,8 @@ async fn run_sabre(
             return Err(error);
         }
     };
-    if !supervised.status.success() {
+    let requires_forced_shutdown = !supervised.status.success();
+    if requires_forced_shutdown {
         global.force_shutdown_with_error();
     }
     tracing::info!(
@@ -710,12 +780,15 @@ async fn run_sabre(
     };
 
     shutdown_sabre_rpc(server_task, &global, SABRE_RPC_DISCONNECT_TIMEOUT).await?;
-    let global = Arc::try_unwrap(global).map_err(|global| {
+    let mut global = Arc::try_unwrap(global).map_err(|global| {
         anyhow!(
             "SaBRe coordinator stopped with {} live RPC reference(s)",
             Arc::strong_count(&global) - 1
         )
     })?;
+    if requires_forced_shutdown {
+        global.cancel_internal_scheduler().await;
+    }
     global
         .clean_up(print_summary, print_summary_to_json_file)
         .await;
@@ -1039,6 +1112,11 @@ fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig 
         );
         config.max_timeslice = None;
     }
+    config.discover_live_file_metadata = backend == Backend::Sabre;
+    config.use_thread_local_clock_reads = backend == Backend::Sabre;
+    config.detect_host_clock_futex_timeouts = backend == Backend::Sabre;
+    config.syscall_clobbers_virtualized_by_backend = backend == Backend::Sabre;
+    config.cancel_killed_thread_rpcs = backend == Backend::Sabre;
     config
 }
 
@@ -1452,8 +1530,10 @@ mod tests {
     use super::prepare_backend_config;
     use super::resolve_kvm_shebang;
     use super::resolve_sabre_binary_from;
+    use super::sabre_program_needs_neutral_name;
     use super::sabre_runtime_unavailable_reason;
     use super::shutdown_sabre_rpc;
+    use super::stage_sabre_program_in;
     use super::stop_sabre_rpc_server;
     use super::wait_for_sabre_rpc_disconnects;
 
@@ -1482,6 +1562,23 @@ mod tests {
                 .max_timeslice
                 .is_some()
         );
+    }
+
+    #[test]
+    fn sabre_backend_config_enables_process_local_capabilities() {
+        let config = super::DetConfig::default();
+        let sabre = prepare_backend_config(config.clone(), Backend::Sabre);
+        assert!(sabre.discover_live_file_metadata);
+        assert!(sabre.use_thread_local_clock_reads);
+        assert!(sabre.detect_host_clock_futex_timeouts);
+        assert!(sabre.syscall_clobbers_virtualized_by_backend);
+        assert!(sabre.cancel_killed_thread_rpcs);
+        let ptrace = prepare_backend_config(config, Backend::Ptrace);
+        assert!(!ptrace.discover_live_file_metadata);
+        assert!(!ptrace.use_thread_local_clock_reads);
+        assert!(!ptrace.detect_host_clock_futex_timeouts);
+        assert!(!ptrace.syscall_clobbers_virtualized_by_backend);
+        assert!(!ptrace.cancel_killed_thread_rpcs);
     }
 
     #[test]
@@ -1568,6 +1665,42 @@ mod tests {
     #[test]
     fn sabre_rpc_socket_uses_private_exec_environment() {
         assert!(SABRE_RPC_SOCKET_ENV.starts_with("REVERIE_SABRE_"));
+    }
+
+    #[test]
+    fn sabre_stages_program_names_that_collide_with_loader_prefix() {
+        assert!(sabre_program_needs_neutral_name(
+            PathBuf::from("/usr/bin/ld").as_path()
+        ));
+        assert!(sabre_program_needs_neutral_name(
+            PathBuf::from("/usr/bin/ld.bfd").as_path()
+        ));
+        assert!(!sabre_program_needs_neutral_name(
+            PathBuf::from("/usr/bin/gold").as_path()
+        ));
+    }
+
+    #[test]
+    fn sabre_neutral_name_staging_preserves_program_bytes_and_cleans_up() {
+        let temp = tempfile::tempdir().unwrap();
+        let program = temp.path().join("ld.test");
+        fs::write(&program, b"linker image").unwrap();
+
+        let staged = stage_sabre_program_in(&program, temp.path())
+            .unwrap()
+            .expect("ld-prefixed program should be staged");
+        let staged_path = staged.path.clone();
+        assert_eq!(fs::read(&staged_path).unwrap(), b"linker image");
+        assert!(
+            staged_path
+                .file_name()
+                .unwrap()
+                .as_encoded_bytes()
+                .starts_with(b"hermit-sabre-program-")
+        );
+
+        drop(staged);
+        assert!(!staged_path.exists());
     }
 
     #[tokio::test(start_paused = true)]

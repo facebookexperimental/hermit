@@ -468,15 +468,32 @@ impl GlobalTool for GlobalState {
         let dtid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
         let time_from_guest = gr.0.as_nanos();
 
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-845): Review SaBRe exec-reload clock recovery.
+        // SaBRe reloads its plugin after exec, so the root thread reconnects
+        // with fresh local state while its scheduler entry remains live.
+        let is_exec_reconnect = matches!(
+            &gr.1,
+            GlobalRequest::CreateChildThread(child_dettid, _, _, None, _)
+                if *child_dettid == dtid
+                    && self.sched.lock().unwrap().next_turns.contains_key(&dtid)
+        );
+        let is_thread_reconnect = matches!(
+            &gr.1,
+            GlobalRequest::StartNewThread(child_dettid, _) if *child_dettid == dtid
+        ) && self.global_time.lock().unwrap().contains_thread(dtid);
+
         // This portion of the time updates "asynchronously", and we can tick it on every rpc:
         // TODO: eventually the vector clock should be in shared memory, and
         // the local clocks should update truly asynchrously.  Therefore it
         // SHOULD be safe to always push through this update on any rpc,
         // removing the conditional above.
-        self.global_time
-            .lock()
-            .unwrap()
-            .update_global_time(dtid, time_from_guest);
+        if !is_exec_reconnect && !is_thread_reconnect {
+            self.global_time
+                .lock()
+                .unwrap()
+                .update_global_time(dtid, time_from_guest);
+        }
 
         // RPC boilerplate. (Hard to generate systematically now though, because of the
         // time payload piggy-backing on each rpc. Maybe eventually once ticking a
@@ -514,21 +531,29 @@ impl GlobalTool for GlobalState {
             }
             // Requested by the parent thread:
             GlobalRequest::CreateChildThread(dettid, parent_detpid, ctid, flags, priority) => {
-                R::CreateChildThread(
-                    self.recv_create_child_thread(
-                        from,
-                        ChildRegistration {
-                            parent_dettid: DetTid::from_raw(from.into()),
-                            parent_detpid,
-                            child_dettid: dettid,
-                            child_tid_addr: ctid,
-                            flags,
-                            maybe_priority: priority,
-                            parent_is_kernel_blocked: false,
-                        },
+                if is_exec_reconnect {
+                    debug!(
+                        "[detcore, dtid {}] reusing scheduler registration after exec",
+                        dtid
+                    );
+                    R::CreateChildThread(())
+                } else {
+                    R::CreateChildThread(
+                        self.recv_create_child_thread(
+                            from,
+                            ChildRegistration {
+                                parent_dettid: DetTid::from_raw(from.into()),
+                                parent_detpid,
+                                child_dettid: dettid,
+                                child_tid_addr: ctid,
+                                flags,
+                                maybe_priority: priority,
+                                parent_is_kernel_blocked: false,
+                            },
+                        )
+                        .await,
                     )
-                    .await,
-                )
+                }
             }
             // Requested by the vfork child on behalf of its kernel-blocked parent:
             GlobalRequest::CreateVforkChildThread(
@@ -1004,20 +1029,34 @@ impl GlobalState {
         dettid: DetTid,
         action: FutexAction,
         futexid: FutexID,
-        _init_read: i32,
+        init_read: i32,
         mask: u32,
     ) -> Option<SchedValue> {
         trace!("[detcore, dtid {}] Futex action: {:?}", &dettid, action);
         let response_iv = {
             let mut sched = self.sched.lock().unwrap();
-            let resp_iv = sched
+            let Some(resp_iv) = sched
                 .next_turns
                 .get(&dettid)
-                .expect("Missing next_turns entry")
-                .resp
-                .clone();
+                .map(|nextturn| nextturn.resp.clone())
+            else {
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-845): Review late RPCs from exit-group siblings.
+                trace!(
+                    "[detcore, dtid {}] ignoring futex action after logical thread removal",
+                    dettid
+                );
+                return Some(SchedValue::Value(nix::errno::Errno::EINTR as u64));
+            };
             match action {
                 FutexAction::WaitRequest(maybe_timeout) => {
+                    if sched.child_tid_was_cleared(futexid, init_read) {
+                        trace!(
+                            "[detcore, dtid {}] late wait on cleared child-TID futex {:?}",
+                            dettid, futexid
+                        );
+                        return Some(SchedValue::Value(0));
+                    }
                     sched.sleep_futex_waiter(&dettid, futexid, maybe_timeout, mask);
                     // block on ivar, below
                 }
@@ -1454,9 +1493,14 @@ where
 {
     let mytime = guest.thread_state().thread_logical_time.clone();
     let resp = guest.send_rpc((mytime, request)).await;
-    // For now, time updates to the guest are disabled.  The guest ONLY tracks
-    // its own work, not global time.
-    assert_eq!(resp.0, None);
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review applying the coordinator clock after exec reload.
+    if let Some(time) = resp.0 {
+        guest
+            .thread_state_mut()
+            .thread_logical_time
+            .advance_to(time);
+    }
     resp
 }
 
@@ -2029,13 +2073,98 @@ mod tests {
     use std::collections::BTreeSet;
     use std::time::Duration;
 
+    use super::FutexAction;
     use super::GlobalState;
     use super::format_unsupported_syscall_warning;
     use crate::config::Config;
     use crate::ivar::Ivar;
     use crate::scheduler::DEFAULT_PRIORITY;
+    use crate::scheduler::SchedValue;
     use crate::scheduler::ThreadNextTurn;
+    use crate::types::DetPid;
     use crate::types::DetTid;
+    use crate::types::FutexID;
+    use crate::types::MmId;
+
+    #[tokio::test]
+    async fn late_futex_rpc_after_thread_removal_returns_eintr() {
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let dettid = DetTid::from_raw(17);
+        let detpid = DetPid::from_raw(17);
+        let response = state
+            .recv_futex_action(
+                reverie::Tid::from_raw(17),
+                dettid,
+                FutexAction::WaitRequest(None),
+                FutexID::private(MmId::initial(detpid), 0x1000),
+                0,
+                u32::MAX,
+            )
+            .await;
+
+        assert!(matches!(
+            response,
+            Some(SchedValue::Value(value)) if value == nix::errno::Errno::EINTR as u64
+        ));
+    }
+
+    #[tokio::test]
+    async fn late_child_tid_wait_after_exit_returns_spurious_wake() {
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let detpid = DetPid::from_raw(17);
+        let child = DetTid::from_raw(18);
+        let futex = FutexID::private(MmId::initial(detpid), 0x1000);
+        state.sched.lock().unwrap().next_turns.insert(
+            detpid,
+            ThreadNextTurn {
+                dettid: detpid,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+            },
+        );
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .wake_futex_child_cleartid(futex, child);
+        assert!(
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .child_tid_was_cleared(futex, child.as_raw())
+        );
+        assert!(
+            !state
+                .sched
+                .lock()
+                .unwrap()
+                .child_tid_was_cleared(futex, child.as_raw() + 1)
+        );
+
+        let response = state
+            .recv_futex_action(
+                reverie::Tid::from_raw(detpid.as_raw()),
+                detpid,
+                FutexAction::WaitRequest(None),
+                futex,
+                child.as_raw(),
+                u32::MAX,
+            )
+            .await;
+
+        assert!(matches!(response, Some(SchedValue::Value(0))));
+        assert!(state.sched.lock().unwrap().blocked.futex_waiters.is_empty());
+    }
 
     #[test]
     fn unsupported_syscall_warning_is_sorted_and_aggregated() {

@@ -687,6 +687,13 @@ impl GlobalTime {
         self.starting_nanos + self.threads_duration(dtid)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review thread-presence detection for backend reconnects.
+    /// Returns whether this clock has observed work from a thread.
+    pub fn contains_thread(&self, dtid: DetTid) -> bool {
+        self.time_vector.contains_key(&dtid)
+    }
+
     /// Project out the time consumed by the work of a given thread, i.e., its running duration.
     pub fn threads_duration(&self, dtid: DetTid) -> LogicalDuration {
         *self.time_vector.get(&dtid).unwrap_or_else(|| {

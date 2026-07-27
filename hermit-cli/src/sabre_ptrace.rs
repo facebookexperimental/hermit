@@ -409,10 +409,22 @@ fn run_blocking(
     if capture_output {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
     }
+    // TODO-HUMAN-REVIEW(PR-845): Review SaBRe launch-time ASLR disabling.
     // PTRACE_TRACEME makes exec stop with SIGTRAP. A pre-exec SIGSTOP would
-    // deadlock std::process::Command on its exec error pipe.
+    // deadlock std::process::Command on its exec error pipe. personality(2)
+    // is async-signal-safe and survives the SaBRe and guest execs.
     unsafe {
-        command.pre_exec(|| ptrace::traceme().map_err(std::io::Error::from));
+        command.pre_exec(|| {
+            let current = libc::personality(0xffff_ffff);
+            if current == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let deterministic = current as libc::c_ulong | libc::ADDR_NO_RANDOMIZE as libc::c_ulong;
+            if libc::personality(deterministic) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            ptrace::traceme().map_err(std::io::Error::from)
+        });
     }
 
     let mut child = command

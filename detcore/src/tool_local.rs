@@ -408,6 +408,43 @@ impl FileMetadata {
         self
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review SaBRe on-demand inherited descriptor discovery.
+    fn discover_fd_from_current_process(&mut self, owner: DetTid, fd: RawFd) -> Result<(), Errno> {
+        if self.file_handles.contains_key(&fd) {
+            return Ok(());
+        }
+
+        let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        let status_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if fd_flags == -1 || status_flags == -1 {
+            return Err(Errno::last());
+        }
+        let raw_stat =
+            stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) }).map_err(|_| Errno::last())?;
+        let file_type = stat::SFlag::from_bits_truncate(raw_stat.st_mode);
+        let ty = if file_type.contains(stat::SFlag::S_IFIFO) {
+            FdType::Pipe
+        } else if file_type.contains(stat::SFlag::S_IFSOCK) {
+            FdType::Socket
+        } else {
+            FdType::Regular
+        };
+        let mut flags = OFlag::from_bits_truncate(status_flags);
+        let physically_nonblocking = flags.contains(OFlag::O_NONBLOCK);
+        // Discovered descriptors have unknown provenance, so an observed
+        // O_NONBLOCK bit must remain guest-visible. Detcore-created scheduler
+        // pipes are registered when created and do not reach this fallback.
+        if fd_flags & libc::FD_CLOEXEC != 0 {
+            flags.insert(OFlag::O_CLOEXEC);
+        }
+        self.add_fd(owner, fd, flags, ty, Some(raw_stat.into()))?;
+        if ty == FdType::Pipe && physically_nonblocking {
+            self.with_detfd(fd, |detfd| detfd.set_physically_nonblocking())?;
+        }
+        Ok(())
+    }
+
     /// get detfd from rawfd, rawfd must be added or dup-ed first.
     fn with_detfd<F, U>(&mut self, fd: RawFd, mut f: F) -> Result<U, Errno>
     where
@@ -620,7 +657,54 @@ mod resource_limits_tests {
 
 #[cfg(test)]
 mod file_metadata_tests {
+    use std::os::fd::AsRawFd;
+
     use super::*;
+
+    #[test]
+    fn on_demand_discovery_finds_a_live_descriptor() {
+        let owner = DetTid::from_raw(9);
+        let file = std::fs::File::open("/dev/null").expect("open test descriptor");
+        let fd = file.as_raw_fd();
+        let mut metadata = FileMetadata::new(owner);
+
+        assert_eq!(metadata.with_detfd(fd, |_| ()), Err(Errno::EBADF));
+        metadata
+            .discover_fd_from_current_process(owner, fd)
+            .expect("live descriptor should be discovered");
+        assert_eq!(
+            metadata
+                .with_detfd(fd, |detfd| detfd.ty())
+                .expect("discovered descriptor should be tracked"),
+            FdType::Regular
+        );
+    }
+
+    #[test]
+    fn discovered_pipe_preserves_inherited_nonblocking() {
+        let owner = DetTid::from_raw(9);
+        let mut fds = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK) },
+            0
+        );
+        let mut metadata = FileMetadata::new(owner);
+
+        metadata
+            .discover_fd_from_current_process(owner, fds[0])
+            .expect("live pipe should be discovered");
+        let flags = metadata
+            .with_detfd(fds[0], |detfd| {
+                (detfd.is_nonblocking(), detfd.physically_nonblocking())
+            })
+            .expect("discovered pipe should be tracked");
+
+        assert_eq!(flags, (true, true));
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
 
     #[test]
     fn fork_copies_slots_but_preserves_open_file_aliases() {
@@ -1003,6 +1087,12 @@ pub struct ThreadState<T> {
     /// Initialized for new threads (shared or fresh), and then overwritten again on `execve`.
     pub file_metadata: Arc<Mutex<FileMetadata>>,
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review backend-gated live descriptor discovery state.
+    /// Whether missing guest descriptors may be inspected in the current process.
+    #[serde(default)]
+    pub(crate) discover_live_file_metadata: bool,
+
     /// POSIX per-process timers created via `timer_create(2)`. Shared among the
     /// threads of a process (`CLONE_THREAD`) and not inherited across `fork`.
     pub(crate) posix_timers: Arc<Mutex<PosixTimers>>,
@@ -1129,6 +1219,19 @@ fn from_atflags(flags: AtFlags) -> OFlag {
 }
 
 impl<T> ThreadState<T> {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review SaBRe orphan-thread memory identity recovery.
+    /// Repair a thread state that a remote backend had to initialize without
+    /// access to its parent's state.
+    pub(crate) fn recover_process_mm_id(&mut self, detpid: DetPid) -> bool {
+        if self.dettid == detpid || self.mm_id != MmId::initial(self.dettid) {
+            return false;
+        }
+
+        self.mm_id = MmId::initial(detpid);
+        true
+    }
+
     pub(crate) fn account_process_cpu_time(&mut self) {
         let user = self.thread_logical_time.user_cpu_time();
         let system = self.thread_logical_time.system_cpu_time();
@@ -1203,6 +1306,17 @@ impl<T> ThreadState<T> {
         let thread_logical_time = DetTime::new(cfg);
         let last_accounted_user_time = thread_logical_time.user_cpu_time();
         let last_accounted_system_time = thread_logical_time.system_cpu_time();
+        let file_metadata = if cfg.discover_live_file_metadata {
+            let mut metadata = FileMetadata::new(pid);
+            for fd in 0..=2 {
+                metadata
+                    .discover_fd_from_current_process(pid, fd)
+                    .expect("SaBRe guest stdio must be open");
+            }
+            metadata
+        } else {
+            FileMetadata::new(pid).setup_stdio(pid.into(), pid)
+        };
         ThreadState {
             dettid: pid,
             detpid: None, // Initialized later.
@@ -1210,9 +1324,8 @@ impl<T> ThreadState<T> {
             memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),
             pedigree: Pedigree::new(), // Root thread.
             stats: ThreadStats::new(),
-            file_metadata: Arc::new(Mutex::new(
-                FileMetadata::new(pid).setup_stdio(pid.into(), pid),
-            )),
+            file_metadata: Arc::new(Mutex::new(file_metadata)),
+            discover_live_file_metadata: cfg.discover_live_file_metadata,
             posix_timers: Arc::new(Mutex::new(PosixTimers::default())),
             resource_limits: Arc::new(Mutex::new(ResourceLimits::default())),
             process_cpu_time: Arc::new(Mutex::new(ProcessCpuTime::default())),
@@ -1347,7 +1460,11 @@ impl<T> ThreadState<T> {
     where
         F: FnMut(&mut DetFd) -> U,
     {
-        self.metadata().with_detfd(fd, f)
+        let mut metadata = self.metadata();
+        if self.discover_live_file_metadata {
+            metadata.discover_fd_from_current_process(self.dettid, fd)?;
+        }
+        metadata.with_detfd(fd, f)
     }
 
     pub(crate) fn count_open_files_at_paths(&self, paths: &[&Path]) -> usize {
@@ -1371,7 +1488,11 @@ impl<T> ThreadState<T> {
         newfd: RawFd,
         flags: OFlag,
     ) -> Result<Option<OpenFileId>, Errno> {
-        self.metadata().dup_fd(oldfd, newfd, flags)
+        let mut metadata = self.metadata();
+        if self.discover_live_file_metadata {
+            metadata.discover_fd_from_current_process(self.dettid, oldfd)?;
+        }
+        metadata.dup_fd(oldfd, newfd, flags)
     }
 
     /// get thread prng, note this rng is deterministic and should not be used
@@ -1585,6 +1706,29 @@ mod timeslice_tests {
     use std::num::NonZeroU64;
 
     use super::*;
+
+    #[test]
+    fn unparented_thread_recovers_process_memory_identity() {
+        let detpid = DetPid::from_raw(4);
+        let dettid = DetTid::from_raw(7);
+        let mut state = ThreadState::new(dettid, &Config::default(), ());
+
+        assert!(state.recover_process_mm_id(detpid));
+        assert_eq!(state.mm_id, MmId::initial(detpid));
+        assert!(!state.recover_process_mm_id(detpid));
+    }
+
+    #[test]
+    fn inherited_thread_keeps_existing_memory_identity() {
+        let detpid = DetPid::from_raw(4);
+        let dettid = DetTid::from_raw(7);
+        let inherited_mm = MmId::initial(detpid).for_exec(detpid);
+        let mut state = ThreadState::new(dettid, &Config::default(), ());
+        state.mm_id = inherited_mm;
+
+        assert!(!state.recover_process_mm_id(detpid));
+        assert_eq!(state.mm_id, inherited_mm);
+    }
 
     fn cpu_snapshot(
         user: u64,

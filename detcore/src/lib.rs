@@ -1108,6 +1108,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                             ))
                         }
                     },
+                    discover_live_file_metadata: pts.1.discover_live_file_metadata,
                     // POSIX timers are shared among threads of a process but are
                     // NOT inherited across fork(2). Share the table for a new
                     // thread (CLONE_THREAD); give a new process a fresh, empty
@@ -1174,6 +1175,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
     async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
         let detpid = DetPid::from_raw(guest.pid().into());
+        let new_dettid = DetTid::from_raw(guest.tid().into()); // TODO(T78538674): virtualize pid/tid:
         trace!(
             "[tid {}] detcore handle_thread_start, pid={}",
             guest.tid(),
@@ -1181,9 +1183,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         );
 
         // Delayed initialization of thread_state for this new thread:
-        guest.thread_state_mut().detpid = Some(detpid);
+        let thread_state = guest.thread_state_mut();
+        thread_state.detpid = Some(detpid);
+        if thread_state.recover_process_mm_id(detpid) {
+            debug!(
+                "[detcore, dtid {}] recovered process memory identity {} for unparented thread state",
+                new_dettid, detpid
+            );
+        }
 
-        let new_dettid = DetTid::from_raw(guest.tid().into()); // TODO(T78538674): virtualize pid/tid:
         assert_eq!(new_dettid, guest.thread_state().dettid);
 
         if guest.is_root_thread() {
@@ -2099,11 +2107,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
         self.post_handler_hook(guest).await;
 
-        // Defense-in-depth: before returning to the guest, force the
-        // syscall-clobbered registers (%rcx/%r11 on x86-64) to deterministic
-        // values so that even a misbehaving guest cannot observe nondeterminism
-        // (or Reverie's private trampoline address) through them.
-        self.canonicalize_syscall_clobbers(guest).await;
+        // Defense-in-depth: unless the backend already owns this guarantee,
+        // force the syscall-clobbered registers (%rcx/%r11 on x86-64) to
+        // deterministic values before returning to the guest.
+        if !self.cfg.syscall_clobbers_virtualized_by_backend {
+            self.canonicalize_syscall_clobbers(guest).await;
+        }
 
         res
     }

@@ -274,6 +274,12 @@ pub struct Scheduler {
     /// Kernel-blocked vfork parents and their children, once registered.
     vfork_barriers: BTreeMap<DetTid, Option<DetTid>>,
 
+    /// Child-TID futexes whose kernel clear may still be racing a guest join.
+    cleared_child_tids: HashMap<FutexID, DetTid>,
+
+    /// Whether exit-group teardown must explicitly cancel parked backend RPCs.
+    cancel_killed_thread_rpcs: bool,
+
     /// Ac table of "locks held": which action is using which resources.
     /// A given resource can be held by at most one action at a given time.
     #[allow(dead_code)]
@@ -895,6 +901,8 @@ impl Scheduler {
             committed_time: Default::default(),
             blocked: Default::default(),
             vfork_barriers: Default::default(),
+            cleared_child_tids: Default::default(),
+            cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
             resources: Default::default(),
             started_up: Default::default(),
             thread_tree: Default::default(),
@@ -1069,7 +1077,12 @@ impl Scheduler {
                 // WARNING: this try_put should potentially turn back into a put(), if we can narrow
                 // down the exit scenarios and ensure that they happen when the guest is running and
                 // has NOT filled its request to the scheduler yet.
-                nextturn.req.try_put(Err(ThreadExited));
+                let request_was_pending = nextturn.req.try_put(Err(ThreadExited)).is_some();
+                if request_was_pending && self.cancel_killed_thread_rpcs {
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(PR-845): Review killed-thread RPC cancellation.
+                    nextturn.resp.try_put(SchedResponse::Signaled());
+                }
                 self.wake_futex_child_cleartid(
                     FutexID::private(mm, nextturn.child_tid_addr),
                     *dtid,
@@ -1246,6 +1259,7 @@ impl Scheduler {
 
     /// Simulate the effect of CLONE_CHILD_CLEARTID.
     pub fn wake_futex_child_cleartid(&mut self, futid: FutexID, dettid: DetTid) {
+        self.cleared_child_tids.insert(futid, dettid);
         debug!(
             "simulate CLONE_CHILD_CLEARTID on futex {:?}, wake one",
             futid
@@ -1253,6 +1267,15 @@ impl Scheduler {
         // Wakes only one thread, as per:
         // https://man7.org/linux/man-pages/man2/set_tid_address.2.html
         self.wake_futex_waiters(dettid, futid, 1, u32::MAX);
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review late CLONE_CHILD_CLEARTID wait recovery.
+    /// Whether a futex word still names the child that was logically cleared.
+    pub(crate) fn child_tid_was_cleared(&self, futid: FutexID, observed: i32) -> bool {
+        self.cleared_child_tids
+            .get(&futid)
+            .is_some_and(|dettid| dettid.as_raw() == observed)
     }
 
     /// Step: Before we select which thread to run, first we check if some internal data
@@ -2811,6 +2834,85 @@ mod test {
         assert_eq!(&v, &[p3, p4, p5]);
         let s = tree.pretty_print();
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn logically_kill_thread_unblocks_pending_rpc() {
+        let config = Config {
+            cancel_killed_thread_rpcs: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        let dettid = DetTid::from_raw(100);
+        let detpid = DetPid::from_raw(100);
+        let response = Ivar::new();
+        scheduler.thread_tree.add_child(dettid, dettid, true);
+        scheduler.next_turns.insert(
+            dettid,
+            ThreadNextTurn {
+                dettid,
+                child_tid_addr: 0,
+                req: Ivar::full(Ok(Resources::new(dettid))),
+                resp: response.clone(),
+            },
+        );
+
+        scheduler.logically_kill_thread(&dettid, &detpid, MmId::initial(detpid));
+
+        assert!(matches!(
+            response.try_read(),
+            Some(SchedResponse::Signaled())
+        ));
+    }
+
+    #[test]
+    fn logically_kill_running_thread_does_not_preload_response() {
+        let config = Config {
+            cancel_killed_thread_rpcs: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        let dettid = DetTid::from_raw(100);
+        let detpid = DetPid::from_raw(100);
+        let request = Ivar::new();
+        let response = Ivar::new();
+        scheduler.thread_tree.add_child(dettid, dettid, true);
+        scheduler.next_turns.insert(
+            dettid,
+            ThreadNextTurn {
+                dettid,
+                child_tid_addr: 0,
+                req: request.clone(),
+                resp: response.clone(),
+            },
+        );
+
+        scheduler.logically_kill_thread(&dettid, &detpid, MmId::initial(detpid));
+
+        assert!(matches!(request.try_read(), Some(Err(ThreadExited))));
+        assert!(response.try_read().is_none());
+    }
+
+    #[test]
+    fn ptrace_kill_leaves_pending_rpc_to_kernel_teardown() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let dettid = DetTid::from_raw(100);
+        let detpid = DetPid::from_raw(100);
+        let response = Ivar::new();
+        scheduler.thread_tree.add_child(dettid, dettid, true);
+        scheduler.next_turns.insert(
+            dettid,
+            ThreadNextTurn {
+                dettid,
+                child_tid_addr: 0,
+                req: Ivar::full(Ok(Resources::new(dettid))),
+                resp: response.clone(),
+            },
+        );
+
+        scheduler.logically_kill_thread(&dettid, &detpid, MmId::initial(detpid));
+
+        assert!(response.try_read().is_none());
     }
 
     #[test]
