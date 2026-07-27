@@ -111,6 +111,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::madvise
         | Sysno::membarrier
         | Sysno::memfd_create
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#775): Deterministic mincore emulation (all-resident).
+        | Sysno::mincore
         | Sysno::mmap
         | Sysno::mremap
         | Sysno::munmap
@@ -764,8 +767,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // --panic-on-unsupported-syscalls stops at the first use.
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed unsupported classifications.
-        Sysno::mincore
-        | Sysno::pidfd_getfd
+        Sysno::pidfd_getfd
         | Sysno::pidfd_send_signal
         | Sysno::preadv
         | Sysno::preadv2
@@ -1255,7 +1257,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [275, 89, 9]);
+        assert_eq!(counts, [276, 89, 8]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1301,6 +1303,12 @@ mod tests {
         );
         assert_eq!(
             classify_syscall(Sysno::madvise),
+            SyscallClassification::Determinized
+        );
+        // mincore is deterministically emulated (all pages resident) rather than
+        // aborting under --strict; it must not slip back to Unsupported.
+        assert_eq!(
+            classify_syscall(Sysno::mincore),
             SyscallClassification::Determinized
         );
         assert_eq!(

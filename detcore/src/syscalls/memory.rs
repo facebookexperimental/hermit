@@ -13,6 +13,7 @@ use reverie::Guest;
 use reverie::syscalls;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Errno;
+use reverie::syscalls::MemoryAccess;
 
 use crate::Detcore;
 use crate::RecordOrReplay;
@@ -196,6 +197,44 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Err(Errno::EINVAL.into())
             }
         }
+    }
+
+    /// Deterministic `mincore(2)`.
+    ///
+    /// Real page residency reflects host memory pressure and is therefore
+    /// nondeterministic, which is why mincore was previously classified as an
+    /// unsupported syscall. GNU grep (and other glibc consumers) invoke mincore
+    /// under the KVM backend on a code path the ptrace backend does not take, so
+    /// leaving it unsupported aborts the guest under `--strict`.
+    ///
+    /// Report every page in the requested range as resident. The residency
+    /// vector is only ever an advisory hint, so a constant answer preserves
+    /// correctness for well-behaved callers while being bitwise-identical across
+    /// runs. This matches the in-process KVM guest executor, which also reports
+    /// full residency.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#775): Review deterministic mincore residency emulation.
+    pub async fn handle_mincore<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Mincore,
+    ) -> Result<i64, Error> {
+        // Linux rejects a start address that is not page-aligned with EINVAL.
+        let start = call.addr().map(AddrMut::as_raw).unwrap_or(0);
+        if !start.is_multiple_of(PAGE_SIZE) {
+            return Err(Errno::EINVAL.into());
+        }
+        let len = call.len();
+        if len == 0 {
+            return Ok(0);
+        }
+        // Match madvise's overflow guard on the requested range.
+        start.checked_add(len).ok_or(Errno::EINVAL)?;
+        let page_count = len.div_ceil(PAGE_SIZE);
+        let vec = call.vec().ok_or(Errno::EFAULT)?;
+        let residency = vec![1u8; page_count];
+        guest.memory().write_exact(vec, &residency)?;
+        Ok(0)
     }
 }
 

@@ -1663,6 +1663,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Fadvise64(_) => Ok(0),
                 Syscall::Mmap(s) => self.handle_mmap(guest, s).await,
                 Syscall::Madvise(s) => self.handle_madvise(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#775)
+                Syscall::Mincore(s) => self.handle_mincore(guest, s).await,
                 Syscall::Munmap(s) => self.handle_munmap(guest, s).await,
                 Syscall::Mremap(s) => self.handle_mremap(guest, s).await,
                 Syscall::Stat(s) => self.handle_stat_family(guest, s.into()).await,
