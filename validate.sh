@@ -304,7 +304,7 @@ readonly STRICT_COMPAT_TOTAL=181
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
 readonly RR_COMPAT_EXPECTED=143
-readonly LITEINST_COMPAT_EXPECTED=643
+readonly LITEINST_COMPAT_EXPECTED=669
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
@@ -830,7 +830,7 @@ function run_full_backend_gates {
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
     run_check "LiteInst backend smoke" liteinst_backend_available
-    run_check "LiteInst compatibility baseline (643 programs)" run_liteinst_compatibility_envelope
+    run_check "LiteInst compatibility baseline (669 programs)" run_liteinst_compatibility_envelope
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -1958,6 +1958,32 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe x86-64-redhat-linux-gxx-version /usr/bin/x86_64-redhat-linux-g++ --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe x86-64-redhat-linux-gcc-version /usr/bin/x86_64-redhat-linux-gcc --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe x86-64-redhat-linux-gcc-11-version /usr/bin/x86_64-redhat-linux-gcc-11 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe acyclic-help /usr/bin/acyclic '-?' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe bcomps-version /usr/bin/bcomps -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ccomps-version /usr/bin/ccomps -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe cluster-version /usr/bin/cluster -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe dijkstra-help /usr/bin/dijkstra '-?' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe dot2gxl-help /usr/bin/dot2gxl '-?' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe edgepaint-version /usr/bin/edgepaint -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gc-version /usr/bin/gc -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gml2gv-help /usr/bin/gml2gv '-?' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe graphml2gv-help /usr/bin/graphml2gv '-?' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gv2gml-help /usr/bin/gv2gml '-?' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gv2gxl-help /usr/bin/gv2gxl '-?' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gvcolor-version /usr/bin/gvcolor -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gvgen-help /usr/bin/gvgen '-?' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gvmap-version /usr/bin/gvmap -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gvpack-version /usr/bin/gvpack -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gxl2dot-help /usr/bin/gxl2dot '-?' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gxl2gv-help /usr/bin/gxl2gv '-?' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe mm2gv-help /usr/bin/mm2gv '-?' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe nop-version /usr/bin/nop -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe osage-version /usr/bin/osage -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe patchwork-version /usr/bin/patchwork -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe prune-help /usr/bin/prune '-?' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sccmap-version /usr/bin/sccmap -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe tred-version /usr/bin/tred -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe unflatten-help /usr/bin/unflatten '-?' && passed=$((passed + 1)) || failed=$((failed + 1))
 
     total=$((passed + failed))
     if ((total != LITEINST_COMPAT_EXPECTED)); then
@@ -3781,7 +3807,7 @@ fi
 if ((LITEINST_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
     if ((failures == 0)); then
-        run_check "LiteInst compatibility baseline (643 programs)" run_liteinst_compatibility_envelope
+        run_check "LiteInst compatibility baseline (669 programs)" run_liteinst_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
