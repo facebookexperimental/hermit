@@ -15,6 +15,7 @@ mod memory;
 mod misc;
 mod namespace;
 mod signal;
+pub(crate) mod socket_timestamp_ioctl;
 mod sysinfo;
 mod threads;
 mod time;
