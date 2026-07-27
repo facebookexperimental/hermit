@@ -304,7 +304,7 @@ readonly STRICT_COMPAT_TOTAL=181
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
 readonly RR_COMPAT_EXPECTED=143
-readonly LITEINST_COMPAT_EXPECTED=581
+readonly LITEINST_COMPAT_EXPECTED=609
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
@@ -830,7 +830,7 @@ function run_full_backend_gates {
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
     run_check "LiteInst backend smoke" liteinst_backend_available
-    run_check "LiteInst compatibility baseline (581 programs)" run_liteinst_compatibility_envelope
+    run_check "LiteInst compatibility baseline (609 programs)" run_liteinst_compatibility_envelope
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -1896,6 +1896,34 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe split-file-22-version /usr/bin/split-file-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe verify-uselistorder-22-version /usr/bin/verify-uselistorder-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe yaml2obj-22-version /usr/bin/yaml2obj-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-addr2line-version /usr/bin/aarch64-linux-gnu-addr2line --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-ar-version /usr/bin/aarch64-linux-gnu-ar --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-as-version /usr/bin/aarch64-linux-gnu-as --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-cxx-version /usr/bin/aarch64-linux-gnu-c++ --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-cxxfilt-version /usr/bin/aarch64-linux-gnu-c++filt --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-cpp-version /usr/bin/aarch64-linux-gnu-cpp --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-elfedit-version /usr/bin/aarch64-linux-gnu-elfedit --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-gxx-version /usr/bin/aarch64-linux-gnu-g++ --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-gcc-version /usr/bin/aarch64-linux-gnu-gcc --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-gcov-version /usr/bin/aarch64-linux-gnu-gcov --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-gcov-dump-version /usr/bin/aarch64-linux-gnu-gcov-dump --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-gcov-tool-version /usr/bin/aarch64-linux-gnu-gcov-tool --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-gprof-version /usr/bin/aarch64-linux-gnu-gprof --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-ld-version /usr/bin/aarch64-linux-gnu-ld --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-ld-bfd-version /usr/bin/aarch64-linux-gnu-ld.bfd --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-lto-dump-version /usr/bin/aarch64-linux-gnu-lto-dump --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-nm-version /usr/bin/aarch64-linux-gnu-nm --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-objcopy-version /usr/bin/aarch64-linux-gnu-objcopy --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-objdump-version /usr/bin/aarch64-linux-gnu-objdump --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-ranlib-version /usr/bin/aarch64-linux-gnu-ranlib --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-readelf-version /usr/bin/aarch64-linux-gnu-readelf --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-size-version /usr/bin/aarch64-linux-gnu-size --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-strings-version /usr/bin/aarch64-linux-gnu-strings --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe aarch64-linux-gnu-strip-version /usr/bin/aarch64-linux-gnu-strip --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe llvm-cas-22-help /usr/bin/llvm-cas-22 --help && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe llvm-debuginfod-22-help /usr/bin/llvm-debuginfod-22 --help && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe llvm-debuginfod-find-22-help /usr/bin/llvm-debuginfod-find-22 --help && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe llvm-tli-checker-22-help /usr/bin/llvm-tli-checker-22 --help && passed=$((passed + 1)) || failed=$((failed + 1))
 
     total=$((passed + failed))
     if ((total != LITEINST_COMPAT_EXPECTED)); then
@@ -3719,7 +3747,7 @@ fi
 if ((LITEINST_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
     if ((failures == 0)); then
-        run_check "LiteInst compatibility baseline (581 programs)" run_liteinst_compatibility_envelope
+        run_check "LiteInst compatibility baseline (609 programs)" run_liteinst_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
