@@ -29,6 +29,7 @@ enum ProcfsKind {
     // TODO-HUMAN-REVIEW(PR-951): Review key-user resource normalization.
     KeyUsers,
     Pressure,
+    Buddyinfo,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -60,6 +61,9 @@ impl ProcfsFile {
             "/proc/pressure/cpu" | "/proc/pressure/io" | "/proc/pressure/memory" => {
                 ProcfsKind::Pressure
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-905): Review buddy allocator normalization.
+            "/proc/buddyinfo" => ProcfsKind::Buddyinfo,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -110,6 +114,7 @@ impl ProcfsFile {
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
             ProcfsKind::KeyUsers => sanitize_key_users(&contents),
             ProcfsKind::Pressure => sanitize_pressure(&contents),
+            ProcfsKind::Buddyinfo => sanitize_buddyinfo(&contents),
         });
         self.offset = 0;
     }
@@ -412,6 +417,39 @@ fn parse_key_user_pair(field: &str) -> Option<(u64, u64)> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-905): Review the /proc/buddyinfo field policy.
+fn sanitize_buddyinfo(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let fields = body.split_whitespace().collect::<Vec<_>>();
+        let is_buddy_row = fields.len() >= 5
+            && fields[0] == "Node"
+            && fields[1].ends_with(',')
+            && fields[2] == "zone"
+            && fields[4..].iter().all(|field| field.parse::<u64>().is_ok());
+
+        if is_buddy_row {
+            normalized.extend_from_slice(fields[..4].join(" ").as_bytes());
+            for _ in &fields[4..] {
+                normalized.extend_from_slice(b" 0");
+            }
+        } else {
+            normalized.extend_from_slice(body.as_bytes());
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-866): Review the /proc/net/sockstat field policy.
 fn sanitize_sockstat(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
@@ -570,6 +608,12 @@ mod tests {
                 ProcfsKind::Pressure
             );
         }
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/buddyinfo"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Buddyinfo
+        );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
@@ -682,6 +726,19 @@ mod tests {
         assert_eq!(
             sanitize_uptime(b"156980.56 37990755.08\n", 120),
             b"120.00 0.00\n"
+        );
+    }
+
+    #[test]
+    fn buddyinfo_preserves_topology_and_zeros_free_lists() {
+        let contents = b"Node 0, zone DMA 0 1 2 3\n\
+Node 1, zone Normal 42 17 5 1\n\
+malformed buddy row\n";
+        assert_eq!(
+            sanitize_buddyinfo(contents),
+            b"Node 0, zone DMA 0 0 0 0\n\
+Node 1, zone Normal 0 0 0 0\n\
+malformed buddy row\n"
         );
     }
 
