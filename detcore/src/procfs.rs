@@ -27,6 +27,7 @@ enum ProcfsKind {
     BlockStat,
     ScalingCurFreq,
     Sockstat,
+    SmapsRollup,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-944): Review AVX-512 elapsed-time normalization.
     ArchStatus,
@@ -124,6 +125,9 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-937): Review smaps rollup accounting normalization.
+            "/proc/self/smaps_rollup" => ProcfsKind::SmapsRollup,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-944): Review AVX-512 elapsed-time normalization.
             "/proc/self/arch_status" => ProcfsKind::ArchStatus,
             "/proc/swaps" => ProcfsKind::Swaps,
@@ -215,6 +219,7 @@ impl ProcfsFile {
             ProcfsKind::BlockStat => sanitize_block_stat(&contents),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::SmapsRollup => sanitize_smaps_rollup(&contents),
             ProcfsKind::ArchStatus => sanitize_arch_status(&contents),
             ProcfsKind::Swaps => sanitize_swaps(&contents),
             ProcfsKind::Smaps => sanitize_smaps(&contents),
@@ -759,6 +764,38 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-937): Review the /proc/self/smaps_rollup field policy.
+fn sanitize_smaps_rollup(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let accounting_label = body.split_once(':').and_then(|(label, value)| {
+            let mut fields = value.split_whitespace();
+            let amount = fields.next()?;
+            (amount.parse::<u64>().is_ok()
+                && fields.next() == Some("kB")
+                && fields.next().is_none())
+            .then_some(label)
+        });
+        if let Some(label) = accounting_label {
+            normalized.extend_from_slice(label.as_bytes());
+            normalized.extend_from_slice(b":\t0 kB");
+        } else {
+            normalized.extend_from_slice(body.as_bytes());
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-944): Review the /proc/self/arch_status field policy.
 fn sanitize_arch_status(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
@@ -1181,6 +1218,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Sockstat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/smaps_rollup"))
+                .unwrap()
+                .kind,
+            ProcfsKind::SmapsRollup
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/self/arch_status"))
@@ -1747,6 +1790,24 @@ x86_Thread_features_locked:\t\n"
         assert_eq!(
             sanitize_arch_status(b"AVX512_elapsed_ms:\tunknown\n"),
             b"AVX512_elapsed_ms:\tunknown\n"
+        );
+    }
+
+    #[test]
+    fn smaps_rollup_hides_physical_page_accounting() {
+        let contents = b"71000000-7ffffffff000 ---p 00000000 00:00 0 [rollup]\n\
+Rss:                2216 kB\n\
+Pss:                 311 kB\n\
+Pss_File:            131 kB\n\
+THPeligible:    0\n";
+
+        assert_eq!(
+            sanitize_smaps_rollup(contents),
+            b"71000000-7ffffffff000 ---p 00000000 00:00 0 [rollup]\n\
+Rss:\t0 kB\n\
+Pss:\t0 kB\n\
+Pss_File:\t0 kB\n\
+THPeligible:    0\n"
         );
     }
 
