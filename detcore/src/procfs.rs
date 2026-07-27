@@ -27,6 +27,7 @@ enum ProcfsKind {
     BlockStat,
     ScalingCurFreq,
     Sockstat,
+    PtyNr,
     SelfSched,
     Fdinfo,
     AioNr,
@@ -152,6 +153,9 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-933): Review host-global AIO count normalization.
             "/proc/sys/fs/aio-nr" => ProcfsKind::AioNr,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-927): Review host-global PTY count normalization.
+            "/proc/sys/kernel/pty/nr" => ProcfsKind::PtyNr,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -270,6 +274,7 @@ impl ProcfsFile {
             ProcfsKind::BlockStat => sanitize_block_stat(&contents),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::PtyNr => sanitize_pty_nr(&contents),
             ProcfsKind::SelfSched => sanitize_self_sched(&contents),
             ProcfsKind::Fdinfo => sanitize_fdinfo(&contents),
             ProcfsKind::AioNr => sanitize_aio_nr(&contents),
@@ -783,6 +788,16 @@ fn sanitize_swaps(contents: &[u8]) -> Vec<u8> {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-933): Review the /proc/sys/fs/aio-nr policy.
 fn sanitize_aio_nr(contents: &[u8]) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        b"0\n".to_vec()
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-927): Review the /proc/sys/kernel/pty/nr policy.
+fn sanitize_pty_nr(contents: &[u8]) -> Vec<u8> {
     if contents.is_empty() {
         Vec::new()
     } else {
@@ -1462,6 +1477,12 @@ mod tests {
             ProcfsKind::Sockstat
         );
         assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/sys/kernel/pty/nr"))
+                .unwrap()
+                .kind,
+            ProcfsKind::PtyNr
+        );
+        assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/self/sched"))
                 .unwrap()
                 .kind,
@@ -1933,6 +1954,14 @@ malformed buddy row\n"
     fn aio_nr_hides_host_global_reservations() {
         assert_eq!(sanitize_aio_nr(b"3040\n"), b"0\n");
         assert!(sanitize_aio_nr(b"").is_empty());
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-927): Review PTY count fixture coverage.
+    #[test]
+    fn pty_nr_hides_host_global_allocations() {
+        assert_eq!(sanitize_pty_nr(b"107\n"), b"0\n");
+        assert!(sanitize_pty_nr(b"").is_empty());
     }
 
     #[test]
