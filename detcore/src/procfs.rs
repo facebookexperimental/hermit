@@ -31,6 +31,7 @@ enum ProcfsKind {
     Pressure,
     Buddyinfo,
     Schedstat,
+    SoftnetStat,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -68,6 +69,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-907): Review host scheduler accounting normalization.
             "/proc/schedstat" => ProcfsKind::Schedstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-909): Review softnet counter normalization.
+            "/proc/net/softnet_stat" => ProcfsKind::SoftnetStat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -120,6 +124,7 @@ impl ProcfsFile {
             ProcfsKind::Pressure => sanitize_pressure(&contents),
             ProcfsKind::Buddyinfo => sanitize_buddyinfo(&contents),
             ProcfsKind::Schedstat => sanitize_schedstat(&contents),
+            ProcfsKind::SoftnetStat => sanitize_softnet_stat(&contents),
         });
         self.offset = 0;
     }
@@ -575,6 +580,44 @@ fn numbered_label(label: &str, prefix: &str) -> bool {
     })
 }
 
+// TODO-HUMAN-REVIEW(PR-909): Review the preserved CPU-index column.
+/// Preserves the softnet table shape and per-row CPU index while hiding live
+/// network backlog counters maintained by the host kernel.
+fn sanitize_softnet_stat(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let rows = text
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    if rows.is_empty()
+        || rows.iter().any(|fields| {
+            fields.len() < 13
+                || fields.iter().any(|field| {
+                    field.len() != 8 || !field.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        })
+    {
+        return contents.to_vec();
+    }
+
+    let mut normalized = String::with_capacity(text.len());
+    for fields in rows {
+        for (index, field) in fields.into_iter().enumerate() {
+            if index != 0 {
+                normalized.push(' ');
+            }
+            normalized.push_str(if index == 12 { field } else { "00000000" });
+        }
+        normalized.push('\n');
+    }
+    if !text.ends_with('\n') {
+        normalized.pop();
+    }
+    normalized.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,6 +708,12 @@ mod tests {
                 .kind,
             ProcfsKind::Schedstat
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/net/softnet_stat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::SoftnetStat
+        );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
@@ -713,6 +762,19 @@ mod tests {
         assert_eq!(
             sanitize_key_users(b"0: 15 15/15 15/1000000 2499/25000000 extra\n"),
             b"0: 15 15/15 15/1000000 2499/25000000 extra\n"
+        );
+    }
+
+    #[test]
+    fn softnet_stat_preserves_cpu_indices_and_zeros_counters() {
+        let input = b"00908c97 00000002 0000009e 00000004 00000005 00000006 00000007 00000008 00000009 0000000a 0000000b 0000000c 00000003 0000000e 0000000f\n";
+        assert_eq!(
+            sanitize_softnet_stat(input),
+            b"00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000003 00000000 00000000\n"
+        );
+        assert_eq!(
+            sanitize_softnet_stat(b"not a softnet row\n"),
+            b"not a softnet row\n"
         );
     }
 
