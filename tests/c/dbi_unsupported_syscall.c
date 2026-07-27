@@ -18,12 +18,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-// mincore remains Unsupported and exercises the aggregate warning. The
+// pidfd_getfd remains Unsupported and exercises the aggregate warning. The
 // process-local get_robust_list query is a reviewed passthrough and ensures the
-// fixture also covers a classified call before returning. The zero-length
-// mincore probe and robust-list head are stable across repeat runs.
+// fixture also covers a classified call before returning. The invalid pidfd
+// probe and robust-list head are stable across repeat runs.
 static int call_unsupported(void) {
-  (void)syscall(SYS_mincore, NULL, 0, NULL);
+  (void)syscall(SYS_pidfd_getfd, -1, 0, 0);
   void *robust_head = NULL;
   size_t robust_len = 0;
   if (syscall(SYS_get_robust_list, 0, &robust_head, &robust_len) < 0) {
