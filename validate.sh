@@ -303,7 +303,7 @@ readonly STRICT_COMPAT_TOTAL=181
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
 readonly RR_COMPAT_EXPECTED=143
-readonly LITEINST_COMPAT_EXPECTED=203
+readonly LITEINST_COMPAT_EXPECTED=230
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
@@ -827,7 +827,7 @@ function run_full_backend_gates {
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
     run_check "LiteInst backend smoke" liteinst_backend_available
-    run_check "LiteInst compatibility baseline (203 programs)" run_liteinst_compatibility_envelope
+    run_check "LiteInst compatibility baseline (230 programs)" run_liteinst_compatibility_envelope
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -1515,6 +1515,33 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe systemd-escape /usr/bin/systemd-escape --path /tmp/hermit-compat && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe sysctl-ostype /usr/sbin/sysctl -n kernel.ostype && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe php-version /usr/bin/php -v && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe basenc /usr/bin/basenc --base64 README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe chcon-version /usr/bin/chcon --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe runcon-version /usr/bin/runcon --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe lsblk-version /usr/bin/lsblk --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe lslocks-version /usr/bin/lslocks --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe lsns-version /usr/bin/lsns --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe prlimit-live /usr/bin/prlimit --nofile && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe setpriv-dump /usr/bin/setpriv --dump && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe nsenter-version /usr/bin/nsenter --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe unshare-version /usr/bin/unshare --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe choom-pid1 /usr/bin/choom -p 1 && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe rename-version /usr/bin/rename --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe script-version /usr/bin/script --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe scriptreplay-version /usr/bin/scriptreplay --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe utmpdump-version /usr/bin/utmpdump --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe uuidgen-name /usr/bin/uuidgen --sha1 --namespace @dns --name hermit && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemctl-version /usr/bin/systemctl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe journalctl-version /usr/bin/journalctl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe busctl-version /usr/bin/busctl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe cmake-echo /usr/bin/cmake -E echo cmake-ok && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe pkgconf-zlib /usr/bin/pkgconf --modversion zlib && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe git-inside /usr/bin/git rev-parse --is-inside-work-tree && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe findmnt-fstype /usr/bin/findmnt -n -o FSTYPE / && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-unescape /usr/bin/systemd-escape --unescape 'tmp-hermit\x2dcompat' && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-detect-virt /usr/bin/systemd-detect-virt && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-path /usr/bin/systemd-path temporary && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-id128 /usr/bin/systemd-id128 machine-id && passed=$((passed + 1)) || failed=$((failed + 1))
 
     total=$((passed + failed))
     if ((total != LITEINST_COMPAT_EXPECTED)); then
@@ -3272,7 +3299,7 @@ fi
 if ((LITEINST_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
     if ((failures == 0)); then
-        run_check "LiteInst compatibility baseline (203 programs)" run_liteinst_compatibility_envelope
+        run_check "LiteInst compatibility baseline (230 programs)" run_liteinst_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
