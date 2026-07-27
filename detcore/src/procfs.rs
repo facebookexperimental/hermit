@@ -40,6 +40,7 @@ enum ProcfsKind {
     Pressure,
     Buddyinfo,
     Schedstat,
+    SelfSchedstat,
     SoftnetStat,
     FileNr,
     FileMax,
@@ -173,6 +174,9 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-907): Review host scheduler accounting normalization.
             "/proc/schedstat" => ProcfsKind::Schedstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-922): Review per-process host scheduler normalization.
+            "/proc/self/schedstat" => ProcfsKind::SelfSchedstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-909): Review softnet counter normalization.
             "/proc/net/softnet_stat" => ProcfsKind::SoftnetStat,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -258,6 +262,7 @@ impl ProcfsFile {
             ProcfsKind::Pressure => sanitize_pressure(&contents),
             ProcfsKind::Buddyinfo => sanitize_buddyinfo(&contents),
             ProcfsKind::Schedstat => sanitize_schedstat(&contents),
+            ProcfsKind::SelfSchedstat => sanitize_self_schedstat(&contents),
             ProcfsKind::SoftnetStat => sanitize_softnet_stat(&contents),
             ProcfsKind::FileNr => sanitize_file_nr(&contents),
             ProcfsKind::FileMax => sanitize_file_max(&contents),
@@ -1134,6 +1139,24 @@ fn numbered_label(label: &str, prefix: &str) -> bool {
     })
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-922): Review the /proc/self/schedstat field policy.
+fn sanitize_self_schedstat(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let fields = text.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 3 || fields.iter().any(|field| field.parse::<u64>().is_err()) {
+        return contents.to_vec();
+    }
+
+    if text.ends_with('\n') {
+        b"0 0 0\n".to_vec()
+    } else {
+        b"0 0 0".to_vec()
+    }
+}
+
 // TODO-HUMAN-REVIEW(PR-909): Review the single-CPU softnet policy.
 /// Exposes Hermit's single virtual CPU and hides host CPU count, hotplug state,
 /// CPU identifiers, and live network backlog counters.
@@ -1369,6 +1392,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Schedstat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/schedstat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::SelfSchedstat
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/net/softnet_stat"))
@@ -1824,6 +1853,24 @@ timestamp 0\n\
 cpu0 0 0 0 0 0 0 0 0 0\n\
 domain0 SMT 00000003 0 0 0\n"
         );
+    }
+
+    #[test]
+    fn self_schedstat_hides_host_scheduler_accounting() {
+        assert_eq!(
+            sanitize_self_schedstat(b"3029609 1559338 150\n"),
+            b"0 0 0\n"
+        );
+        assert_eq!(sanitize_self_schedstat(b"3029609 1559338 150"), b"0 0 0");
+    }
+
+    #[test]
+    fn self_schedstat_leaves_unknown_formats_untouched() {
+        let extra_field = b"3029609 1559338 150 4\n";
+        assert_eq!(sanitize_self_schedstat(extra_field), extra_field);
+
+        let invalid_counter = b"3029609 waiting 150\n";
+        assert_eq!(sanitize_self_schedstat(invalid_counter), invalid_counter);
     }
 
     #[test]
