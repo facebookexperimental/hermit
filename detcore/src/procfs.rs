@@ -78,6 +78,11 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-966): Review Btrfs commit telemetry normalization.
     BtrfsCommitStats,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-963): Review sysfs RTC clock normalization.
+    SysfsRtcDate,
+    SysfsRtcTime,
+    SysfsRtcEpoch,
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -205,6 +210,27 @@ fn is_cpuidle_counter_path(path: &Path) -> bool {
         && !state_index.is_empty()
         && state_index.bytes().all(|byte| byte.is_ascii_digit())
         && matches!(counter, "time" | "usage" | "above" | "below" | "rejected")
+}
+
+fn sysfs_rtc_kind(path: &Path) -> Option<ProcfsKind> {
+    let relative = path.strip_prefix("/sys/class/rtc").ok()?;
+    let mut components = relative.iter();
+    let rtc = components.next()?.to_str()?;
+    let leaf = components.next()?.to_str()?;
+    if components.next().is_some() {
+        return None;
+    }
+    let rtc_index = rtc.strip_prefix("rtc")?;
+    if rtc_index.is_empty() || !rtc_index.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    match leaf {
+        "date" => Some(ProcfsKind::SysfsRtcDate),
+        "time" => Some(ProcfsKind::SysfsRtcTime),
+        "since_epoch" => Some(ProcfsKind::SysfsRtcEpoch),
+        _ => None,
+    }
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -348,7 +374,8 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-941): Review transparent-hugepage counter normalization.
             other if is_thp_counter_path(Path::new(other)) => ProcfsKind::ThpCounter,
-            _ => return None,
+            // TODO-HUMAN-REVIEW(PR-963): Review sysfs RTC clock normalization.
+            _ => sysfs_rtc_kind(&path)?,
         };
         Some(Self {
             kind,
@@ -414,6 +441,9 @@ impl ProcfsFile {
             ProcfsKind::CppcFeedback => sanitize_cppc_feedback(&contents),
             ProcfsKind::UnixSockets => sanitize_unix_sockets(&contents),
             ProcfsKind::BtrfsCommitStats => sanitize_btrfs_commit_stats(&contents),
+            ProcfsKind::SysfsRtcDate | ProcfsKind::SysfsRtcTime | ProcfsKind::SysfsRtcEpoch => {
+                sanitize_sysfs_rtc_attribute(&contents, self.kind)
+            }
             ProcfsKind::ThpCounter => sanitize_thp_counter(&contents),
         });
     }
@@ -800,6 +830,47 @@ fn sanitize_cppc_feedback(contents: &[u8]) -> Vec<u8> {
         normalized.push(b'\n');
     }
     normalized
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-963): Review fixed virtual RTC attribute values.
+fn sanitize_sysfs_rtc_attribute(contents: &[u8], kind: ProcfsKind) -> Vec<u8> {
+    let has_newline = contents.ends_with(b"\n");
+    let value = contents.strip_suffix(b"\n").unwrap_or(contents);
+    let (valid, fixed): (bool, &[u8]) = match kind {
+        ProcfsKind::SysfsRtcDate => (
+            matches_digit_separated(value, 10, &[(4, b'-'), (7, b'-')]),
+            b"2021-12-31",
+        ),
+        ProcfsKind::SysfsRtcTime => (
+            matches_digit_separated(value, 8, &[(2, b':'), (5, b':')]),
+            b"23:59:59",
+        ),
+        ProcfsKind::SysfsRtcEpoch => (
+            !value.is_empty() && value.iter().all(u8::is_ascii_digit),
+            b"1640995199",
+        ),
+        _ => return contents.to_vec(),
+    };
+    if !valid {
+        return contents.to_vec();
+    }
+
+    let mut normalized = fixed.to_vec();
+    if has_newline {
+        normalized.push(b'\n');
+    }
+    normalized
+}
+
+fn matches_digit_separated(value: &[u8], expected_len: usize, separators: &[(usize, u8)]) -> bool {
+    value.len() == expected_len
+        && value.iter().enumerate().all(|(index, byte)| {
+            separators
+                .iter()
+                .find_map(|(position, separator)| (*position == index).then_some(*separator))
+                .map_or_else(|| byte.is_ascii_digit(), |separator| *byte == separator)
+        })
 }
 
 fn sanitize_loadavg(contents: &[u8]) -> Vec<u8> {
@@ -2568,6 +2639,54 @@ mod tests {
             b"ref:123 del:456 extra\n",
         ] {
             assert_eq!(sanitize_cppc_feedback(malformed), malformed);
+        }
+    }
+
+    #[test]
+    fn recognizes_only_numbered_sysfs_rtc_clock_attributes() {
+        for (path, kind) in [
+            ("/sys/class/rtc/rtc0/date", ProcfsKind::SysfsRtcDate),
+            ("/sys/class/rtc/rtc12/time", ProcfsKind::SysfsRtcTime),
+            (
+                "/sys/class/rtc/rtc315/since_epoch",
+                ProcfsKind::SysfsRtcEpoch,
+            ),
+        ] {
+            assert_eq!(ProcfsFile::from_path(Path::new(path)).unwrap().kind, kind);
+        }
+
+        for path in [
+            "/sys/class/rtc/rtc/date",
+            "/sys/class/rtc/rtcX/time",
+            "/sys/class/rtc/rtc0/hctosys",
+            "/sys/class/rtc/rtc0/device/time",
+            "/tmp/rtc0/since_epoch",
+        ] {
+            assert!(ProcfsFile::from_path(Path::new(path)).is_none());
+        }
+    }
+
+    #[test]
+    fn sysfs_rtc_uses_the_fixed_virtual_epoch() {
+        assert_eq!(
+            sanitize_sysfs_rtc_attribute(b"2026-07-27\n", ProcfsKind::SysfsRtcDate),
+            b"2021-12-31\n"
+        );
+        assert_eq!(
+            sanitize_sysfs_rtc_attribute(b"12:24:03\n", ProcfsKind::SysfsRtcTime),
+            b"23:59:59\n"
+        );
+        assert_eq!(
+            sanitize_sysfs_rtc_attribute(b"1785155071", ProcfsKind::SysfsRtcEpoch),
+            b"1640995199"
+        );
+        for (malformed, kind) in [
+            (b"2026/07/27\n".as_slice(), ProcfsKind::SysfsRtcDate),
+            (b"12:24\n".as_slice(), ProcfsKind::SysfsRtcTime),
+            (b"-1\n".as_slice(), ProcfsKind::SysfsRtcEpoch),
+            (b"\n".as_slice(), ProcfsKind::SysfsRtcEpoch),
+        ] {
+            assert_eq!(sanitize_sysfs_rtc_attribute(malformed, kind), malformed);
         }
     }
 
