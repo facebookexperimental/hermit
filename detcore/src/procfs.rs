@@ -42,15 +42,25 @@ enum ProcfsKind {
     InodeState,
     Protocols,
     BtrfsBytesReserved,
+    BtrfsBytesPinned,
     Rtc,
 }
 
 fn is_btrfs_bytes_reserved_path(path: &Path) -> bool {
+    is_btrfs_allocation_gauge_path(path, "bytes_reserved")
+}
+
+// TODO-HUMAN-REVIEW(PR-971): Review Btrfs pinned-space path recognition.
+fn is_btrfs_bytes_pinned_path(path: &Path) -> bool {
+    is_btrfs_allocation_gauge_path(path, "bytes_pinned")
+}
+
+fn is_btrfs_allocation_gauge_path(path: &Path, gauge: &str) -> bool {
     let Ok(relative) = path.strip_prefix("/sys/fs/btrfs") else {
         return false;
     };
     let mut components = relative.iter();
-    let (Some(uuid), Some("allocation"), Some(class), Some("bytes_reserved"), None) = (
+    let (Some(uuid), Some("allocation"), Some(class), Some(candidate_gauge), None) = (
         components.next().and_then(|part| part.to_str()),
         components.next().and_then(|part| part.to_str()),
         components.next().and_then(|part| part.to_str()),
@@ -60,15 +70,20 @@ fn is_btrfs_bytes_reserved_path(path: &Path) -> bool {
         return false;
     };
 
-    let canonical_uuid = uuid.len() == 36
-        && uuid.bytes().enumerate().all(|(index, byte)| {
+    candidate_gauge == gauge
+        && is_btrfs_uuid(uuid)
+        && matches!(class, "data" | "metadata" | "system")
+}
+
+fn is_btrfs_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
             if matches!(index, 8 | 13 | 18 | 23) {
                 byte == b'-'
             } else {
-                byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
             }
-        });
-    canonical_uuid && matches!(class, "data" | "metadata" | "system")
+        })
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -148,6 +163,9 @@ impl ProcfsFile {
             }
             other if is_process_io_path(other) => ProcfsKind::ProcessIo,
             other if is_block_stat_path(other) => ProcfsKind::BlockStat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-971): Review Btrfs pinned-space normalization.
+            other if is_btrfs_bytes_pinned_path(Path::new(other)) => ProcfsKind::BtrfsBytesPinned,
             _ => return None,
         };
         Some(Self {
@@ -196,6 +214,7 @@ impl ProcfsFile {
             ProcfsKind::InodeState => sanitize_inode_state(&contents),
             ProcfsKind::Protocols => sanitize_protocols(&contents),
             ProcfsKind::BtrfsBytesReserved => sanitize_btrfs_bytes_reserved(&contents),
+            ProcfsKind::BtrfsBytesPinned => sanitize_btrfs_bytes_pinned(&contents),
             ProcfsKind::Rtc => sanitize_rtc(&contents, virtual_realtime_seconds),
         });
     }
@@ -463,6 +482,22 @@ fn sanitize_btrfs_bytes_reserved(contents: &[u8]) -> Vec<u8> {
         .and_then(|value| value.parse::<u64>().ok())
         .is_some();
     if !valid_value {
+        return contents.to_vec();
+    }
+
+    if has_newline {
+        b"0\n".to_vec()
+    } else {
+        b"0".to_vec()
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-971): Review Btrfs bytes_pinned normalization.
+fn sanitize_btrfs_bytes_pinned(contents: &[u8]) -> Vec<u8> {
+    let has_newline = contents.ends_with(b"\n");
+    let value = contents.strip_suffix(b"\n").unwrap_or(contents);
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
         return contents.to_vec();
     }
 
@@ -1247,6 +1282,51 @@ mod tests {
             b"unknown\n",
         ] {
             assert_eq!(sanitize_btrfs_bytes_reserved(malformed), malformed);
+        }
+    }
+
+    #[test]
+    fn recognizes_only_btrfs_pinned_space_gauges() {
+        const UUID: &str = "63152d54-3f28-408a-80a2-46e53b5c0bda";
+        for class in ["data", "metadata", "system"] {
+            let path = format!("/sys/fs/btrfs/{UUID}/allocation/{class}/bytes_pinned");
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(&path)).unwrap().kind,
+                ProcfsKind::BtrfsBytesPinned
+            );
+        }
+
+        let reserved_path = format!("/sys/fs/btrfs/{UUID}/allocation/data/bytes_reserved");
+        assert_eq!(
+            ProcfsFile::from_path(Path::new(&reserved_path))
+                .unwrap()
+                .kind,
+            ProcfsKind::BtrfsBytesReserved
+        );
+
+        for path in [
+            "/sys/fs/btrfs/63152D54-3f28-408a-80a2-46e53b5c0bda/allocation/data/bytes_pinned",
+            "/sys/fs/btrfs/not-a-uuid/allocation/data/bytes_pinned",
+            "/sys/fs/btrfs/63152d54-3f28-408a-80a2-46e53b5c0bda/allocation/global/bytes_pinned",
+            "/sys/fs/btrfs/63152d54-3f28-408a-80a2-46e53b5c0bda/allocation/data/bytes_pinned/extra",
+            "/tmp/63152d54-3f28-408a-80a2-46e53b5c0bda/allocation/data/bytes_pinned",
+        ] {
+            assert!(ProcfsFile::from_path(Path::new(path)).is_none());
+        }
+    }
+
+    #[test]
+    fn btrfs_pinned_space_gauge_is_fixed() {
+        assert_eq!(sanitize_btrfs_bytes_pinned(b"66535424\n"), b"0\n");
+        assert_eq!(sanitize_btrfs_bytes_pinned(b"66535424"), b"0");
+        for malformed in [
+            b"".as_slice(),
+            b"-1\n",
+            b"123 456\n",
+            b"123\n\n",
+            b"unknown\n",
+        ] {
+            assert_eq!(sanitize_btrfs_bytes_pinned(malformed), malformed);
         }
     }
 
