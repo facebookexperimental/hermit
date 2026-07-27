@@ -73,6 +73,17 @@ fn unix_autobind_address(port: u16) -> libc::sockaddr_un {
     address
 }
 
+// TODO-HUMAN-REVIEW(PR-904): Review the TCP_INFO compatibility boundary.
+/// Retain the logical TCP state and negotiated option header while hiding all
+/// host timing, rate, packet, and byte counters.
+fn canonicalize_tcp_info(info: &mut [u8]) {
+    for (offset, byte) in info.iter_mut().enumerate() {
+        if !matches!(offset, 0 | 1 | 5 | 6) {
+            *byte = 0;
+        }
+    }
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     /// Inject an extra fstat to retrieve file metadata.
     async fn inject_fstat<G: Guest<Self>>(
@@ -1571,6 +1582,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .memory()
                 .write_exact(optval.cast::<u8>(), &zero_cpu[..returned_len])?;
         }
+        if result == 0
+            && call.level() == libc::IPPROTO_TCP
+            && call.optname() == libc::TCP_INFO
+            && let (Some(optval), Some(optlen)) = (call.optval(), call.optlen())
+        {
+            let returned_len: libc::socklen_t = guest.memory().read_value(optlen)?;
+            let mut info = vec![0; returned_len as usize];
+            let optval = optval.cast::<u8>();
+            guest.memory().read_exact(optval, info.as_mut_slice())?;
+            canonicalize_tcp_info(&mut info);
+            guest.memory().write_exact(optval, info.as_slice())?;
+        }
 
         Ok(result)
     }
@@ -2049,6 +2072,7 @@ mod test {
     use nix::fcntl::OFlag;
 
     use super::UNIX_AUTOBIND_NAME_LEN;
+    use super::canonicalize_tcp_info;
     use super::unix_autobind_address;
     use super::unix_autobind_addrlen;
 
@@ -2074,5 +2098,24 @@ mod test {
             unix_autobind_addrlen() as usize,
             std::mem::offset_of!(libc::sockaddr_un, sun_path) + UNIX_AUTOBIND_NAME_LEN
         );
+    }
+
+    #[test]
+    fn tcp_info_retains_only_logical_connection_header() {
+        let mut info = [0xff; 16];
+        canonicalize_tcp_info(&mut info);
+
+        for (offset, byte) in info.into_iter().enumerate() {
+            let expected = if matches!(offset, 0 | 1 | 5 | 6) {
+                0xff
+            } else {
+                0
+            };
+            assert_eq!(byte, expected, "unexpected byte at offset {offset}");
+        }
+
+        for len in 0..8 {
+            canonicalize_tcp_info(&mut [0xff; 8][..len]);
+        }
     }
 }
