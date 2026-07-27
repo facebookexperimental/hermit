@@ -47,6 +47,15 @@ fn is_supported_prctl_option(option: libc::c_int) -> bool {
             | libc::PR_SET_THP_DISABLE
             | libc::PR_GET_THP_DISABLE
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#919)
+            //
+            // Dumpability is per-process state initialized deterministically by
+            // ordinary exec and subsequently controlled only by the guest. Keep
+            // Linux's 0/1 validation and state transitions rather than refusing
+            // applications that explicitly disable or restore core-dump access.
+            | libc::PR_SET_DUMPABLE
+            | libc::PR_GET_DUMPABLE
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#802)
             //
             // PR_{SET,GET}_KEEPCAPS only read/toggle the calling thread's
@@ -578,12 +587,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prctl_support_covers_deterministic_thread_controls() {
+    fn prctl_support_covers_deterministic_controls() {
         for option in [
             libc::PR_SET_NAME,
             libc::PR_GET_NAME,
             libc::PR_SET_THP_DISABLE,
             libc::PR_GET_THP_DISABLE,
+            // Deterministic per-process dumpability state.
+            libc::PR_SET_DUMPABLE,
+            libc::PR_GET_DUMPABLE,
             // Deterministic per-thread capability-retention flag used by setpriv.
             libc::PR_SET_KEEPCAPS,
             libc::PR_GET_KEEPCAPS,
