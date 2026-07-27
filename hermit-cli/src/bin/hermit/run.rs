@@ -120,6 +120,12 @@ pub struct RunOpts {
     #[clap(long)]
     pin_threads: bool,
 
+    /// Override the processor-specific PMU skid margin, in retired conditional branches. Larger
+    /// values schedule the overflow interrupt earlier and can increase single-stepping overhead.
+    // TODO-HUMAN-REVIEW(PR-991): Review the ptrace PMU skid-margin CLI override.
+    #[clap(long, value_name = "RCBS")]
+    skid_margin: Option<u64>,
+
     /// Mount a file or directory. This uses the same syntax as Docker's `--mount` option. The
     /// source must exist on the host. For simple bind mounts into guest `/tmp`, use `--bind`.
     #[clap(long, value_name = "path")]
@@ -433,6 +439,9 @@ impl fmt::Display for RunOpts {
 
         if let Some(backend) = self.backend {
             write!(f, " --backend={}", backend.as_str())?;
+        }
+        if let Some(skid_margin) = self.skid_margin {
+            write!(f, " --skid-margin={skid_margin}")?;
         }
         if self.no_sequentialize_threads {
             write!(f, " --no-sequentialize-threads")?;
@@ -998,6 +1007,32 @@ fn timeslice_flags_parse_and_round_trip() {
 }
 
 #[test]
+fn skid_margin_override_parses_and_round_trips() {
+    let mut opts = RunOpts::parse_from(["fakehermit", "--skid-margin=500", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+
+    assert_eq!(opts.skid_margin, Some(500));
+    assert_eq!(format!("{opts}"), " --skid-margin=500 -- fakeprog");
+}
+
+#[test]
+fn skid_margin_override_rejects_non_ptrace_backends() {
+    for backend in ["dbi", "kvm", "liteinst", "sabre"] {
+        let mut opts = RunOpts::parse_from([
+            "fakehermit",
+            &format!("--backend={backend}"),
+            "--skid-margin=500",
+            "fakeprog",
+        ]);
+        let error = opts.validate_args_with_perf_support(true).unwrap_err();
+        assert!(
+            error.to_string().contains("requires the ptrace backend"),
+            "unexpected {backend} error: {error}"
+        );
+    }
+}
+
+#[test]
 fn deprecated_preemption_timeout_alias_round_trips_canonically() {
     let mut ro = RunOpts::parse_from(["fakehermit", "--preemption-timeout=100000", "fakeprog"]);
     ro.validate_args_with_perf_support(true).unwrap();
@@ -1423,6 +1458,7 @@ impl RunOpts {
         } else if backend != Backend::Kvm {
             backend.ensure_available()?;
         }
+        self.install_pmu_config()?;
         // The KVM backend reaches real reverie-kvm code from its dispatch path
         // and reports an accurate, program-specific error there, so it is not
         // pre-empted by the generic availability probe above. E9patch is a CLI
@@ -1488,7 +1524,15 @@ impl RunOpts {
     }
 
     fn validate_args_with_perf_support(&mut self, perf_supported: bool) -> Result<(), Error> {
-        let liteinst_backend = self.selected_backend() == Backend::Liteinst;
+        let backend = self.selected_backend();
+        let liteinst_backend = backend == Backend::Liteinst;
+        if self.skid_margin.is_some()
+            && (self.namespace_only || !matches!(backend, Backend::Ptrace | Backend::E9patch))
+        {
+            anyhow::bail!(
+                "--skid-margin configures the Reverie ptrace PMU timer and requires the ptrace backend"
+            );
+        }
         let config = &mut self.det_opts.det_config;
 
         config.has_uts_namespace = !self.no_namespace;
@@ -1644,6 +1688,18 @@ impl RunOpts {
         }
 
         Ok(())
+    }
+
+    fn install_pmu_config(&self) -> Result<(), Error> {
+        let Some(skid_margin) = self.skid_margin else {
+            return Ok(());
+        };
+        let config = reverie_ptrace::PmuConfig::new().with_skid_margin_override(skid_margin);
+        reverie_ptrace::set_pmu_config(config).map_err(|_| {
+            anyhow::anyhow!(
+                "Reverie PMU configuration was initialized before --skid-margin could be applied"
+            )
+        })
     }
 
     fn validate_mount_sources(&self) -> Result<(), Error> {
