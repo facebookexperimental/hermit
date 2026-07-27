@@ -27,6 +27,7 @@ enum ProcfsKind {
     BlockStat,
     ScalingCurFreq,
     Sockstat,
+    Fdinfo,
     AioNr,
     NumaMaps,
     SmapsRollup,
@@ -153,6 +154,15 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-931): Review fdinfo backing-identity normalization.
+            other
+                if other.strip_prefix("/proc/self/fdinfo/").is_some_and(|fd| {
+                    !fd.is_empty() && fd.bytes().all(|byte| byte.is_ascii_digit())
+                }) =>
+            {
+                ProcfsKind::Fdinfo
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-934): Review host NUMA observation normalization.
             "/proc/self/numa_maps" => ProcfsKind::NumaMaps,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -256,6 +266,7 @@ impl ProcfsFile {
             ProcfsKind::BlockStat => sanitize_block_stat(&contents),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::Fdinfo => sanitize_fdinfo(&contents),
             ProcfsKind::AioNr => sanitize_aio_nr(&contents),
             ProcfsKind::NumaMaps => sanitize_numa_maps(&contents),
             ProcfsKind::SmapsRollup => sanitize_smaps_rollup(&contents),
@@ -825,6 +836,31 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-931): Review the /proc/self/fdinfo field policy.
+fn sanitize_fdinfo(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        if body.starts_with("mnt_id:") {
+            normalized.extend_from_slice(b"mnt_id:\t0");
+        } else if body.starts_with("ino:") {
+            normalized.extend_from_slice(b"ino:\t0");
+        } else {
+            normalized.extend_from_slice(body.as_bytes());
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-934): Review the /proc/self/numa_maps field policy.
 fn sanitize_numa_maps(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
@@ -1342,6 +1378,14 @@ mod tests {
                 .kind,
             ProcfsKind::Sockstat
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/fdinfo/17"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Fdinfo
+        );
+        assert!(ProcfsFile::from_path(Path::new("/proc/self/fdinfo/")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("/proc/self/fdinfo/stdin")).is_none());
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/sys/fs/aio-nr"))
                 .unwrap()
@@ -2029,6 +2073,24 @@ THPeligible:    0\n"
 
         let invalid_counter = b"71000000 default active=recent N0=1\n";
         assert_eq!(sanitize_numa_maps(invalid_counter), invalid_counter);
+    }
+
+    #[test]
+    fn fdinfo_hides_backing_identity_only() {
+        let contents = b"pos:\t1\n\
+flags:\t0100002\n\
+mnt_id:\t16368\n\
+ino:\t47761541\n\
+eventfd-count: 0000000000000007\n";
+
+        assert_eq!(
+            sanitize_fdinfo(contents),
+            b"pos:\t1\n\
+flags:\t0100002\n\
+mnt_id:\t0\n\
+ino:\t0\n\
+eventfd-count: 0000000000000007\n"
+        );
     }
 
     #[test]
