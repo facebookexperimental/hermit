@@ -147,6 +147,27 @@ pub fn is_kernel_keyring_syscall(sysno: Sysno) -> bool {
     syscall_classification::is_kernel_keyring_syscall(sysno)
 }
 
+/// Returns whether Detcore deterministically refuses `sysno` with a fixed
+/// errno in strict mode without consulting the host.
+///
+/// This is the boundary backends that execute guest syscalls outside Detcore's
+/// `handle_syscall_event` dispatcher (the DBI copied-child fast path and the
+/// KVM executor) consult to enforce the same fixed refusal the ptrace path
+/// enforces. It deliberately excludes emulated / no-op / host-forwarding
+/// families (credential no-ops, `timer_create`, AF_UNIX autobind, `openat2`,
+/// `copy_file_range`), because fail-closing a copied child for those would
+/// diverge from the ptrace path rather than match it.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-978): Review the copied-DBI-child deterministic-refusal surface.
+pub fn is_deterministically_refused_syscall(sysno: Sysno) -> bool {
+    syscall_classification::is_deterministically_refused_syscall(sysno)
+}
+
+/// Returns whether `sysno` is refused only when strict execution is enabled.
+pub fn is_strict_only_deterministic_refusal_syscall(sysno: Sysno) -> bool {
+    syscall_classification::is_strict_only_deterministic_refusal_syscall(sysno)
+}
+
 use tool_local::PosixTimers;
 use tool_local::ProcessCpuTime;
 pub use tool_local::ThreadState;
@@ -852,6 +873,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             if config.virtualize_cpuid {
                 subscription.cpuid();
             }
+
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-978): Keep the passthru-opt allow-list in sync
+            // with the deterministic-refusal boundary. Even under the performance
+            // opt-in, Detcore MUST still see every syscall it deterministically
+            // refuses with a fixed ENOSYS/EPERM; otherwise passthru_opt would let
+            // strict guests execute those syscalls natively against the host,
+            // exactly the leak the DBI copied-child path also had to close.
+            subscription.syscalls(Sysno::iter().filter(|sysno| {
+                syscall_classification::is_deterministically_refused_syscall(*sysno)
+            }));
 
             // Make sure we also intercept everything that the record-or-replay tool
             // wants.

@@ -1180,6 +1180,65 @@ pub(crate) const fn is_host_kernel_probe_syscall(sysno: Sysno) -> bool {
     )
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-978): Review the aggregate deterministic-refusal
+// boundary used to enforce the same fixed refusal in backends that execute
+// guest syscalls outside Detcore's `handle_syscall_event` dispatcher.
+/// True for every syscall Detcore refuses with a fixed errno in the strict
+/// dispatcher *without consulting the host* -- the deterministic-refusal
+/// boundary. Classifying a syscall this way in the ptrace path only enforces the
+/// isolation boundary where the shared Detcore dispatcher runs. A backend that
+/// lets a guest execute a syscall natively outside that dispatcher (most
+/// importantly the DBI copied pre-exec child fast path, which runs on the
+/// DynamoRIO client stack with no Detcore tool) would otherwise reach the host
+/// and leak or mutate the very state the classification is meant to hide. Such a
+/// backend must fail closed for these syscalls in strict mode instead.
+///
+/// This is the union of the individual family predicates whose dispatch arm in
+/// `Detcore::handle_syscall_event` returns `Err(Error::Errno(..))` unconditionally
+/// or under `panic_on_unsupported_syscalls`. It deliberately excludes families
+/// Detcore *emulates* with real semantics (for example the credential-identity
+/// no-ops, `timer_create`, and the socket-identity handlers), because failing a
+/// copied child closed for an emulated syscall would diverge from the ptrace
+/// path rather than match it. Keep this in sync with those dispatch arms.
+pub(crate) const fn is_strict_only_deterministic_refusal_syscall(sysno: Sysno) -> bool {
+    // These families preserve native behavior outside strict mode for rr and
+    // application compatibility, but fail closed under strict execution.
+    matches!(sysno, Sysno::rseq)
+        || is_zero_copy_pipe_syscall(sysno)
+        || is_kernel_keyring_syscall(sysno)
+}
+
+pub(crate) const fn is_deterministically_refused_syscall(sysno: Sysno) -> bool {
+    is_strict_only_deterministic_refusal_syscall(sysno)
+        || is_unimplemented_enosys_syscall(sysno)
+        || is_futex2_enosys_syscall(sysno)
+        || is_privileged_admin_refused_syscall(sysno)
+        || is_mount_ns_admin_refused_syscall(sysno)
+        || is_unsupported_async_ipc_syscall(sysno)
+        || is_remap_file_pages_enosys_syscall(sysno)
+        || is_landlock_sandbox_syscall(sysno)
+        || is_process_isolation_refused_syscall(sysno)
+        || is_privileged_observation_refused_syscall(sysno)
+        || is_perf_event_enosys_syscall(sysno)
+        || is_mount_introspection_enosys_syscall(sysno)
+        || is_host_security_identity_probe_syscall(sysno)
+        || is_optional_memory_feature_syscall(sysno)
+        || is_host_kernel_probe_syscall(sysno)
+        || matches!(
+            sysno,
+            Sysno::openat2
+                | Sysno::copy_file_range
+                | Sysno::clock_settime
+                | Sysno::futimesat
+                | Sysno::io_uring_setup
+                | Sysno::io_uring_enter
+                | Sysno::io_uring_register
+                | Sysno::name_to_handle_at
+                | Sysno::epoll_ctl_old
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1970,6 +2029,78 @@ mod tests {
                     "{sysno:?} is flagged by the helper but not in the reviewed refusal set"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn deterministic_refusal_aggregate_includes_fixed_error_families() {
+        // The aggregate predicate is the union of the fixed-ENOSYS/EPERM refusal
+        // families the strict dispatcher rejects without consulting the host.
+        // Backends that execute guest syscalls outside Detcore's dispatcher
+        // (the DBI copied-child fast path, the KVM executor) consult this
+        // predicate to enforce the same fixed refusal, so representative members
+        // of every family must be present.
+        let refused_members = [
+            Sysno::rseq,
+            Sysno::perf_event_open,
+            Sysno::splice,
+            Sysno::tee,
+            Sysno::vmsplice,
+            Sysno::keyctl,
+            Sysno::add_key,
+            Sysno::request_key,
+            Sysno::landlock_create_ruleset,
+            Sysno::mount,
+            Sysno::remap_file_pages,
+            Sysno::name_to_handle_at,
+            Sysno::openat2,
+            Sysno::copy_file_range,
+            Sysno::clock_settime,
+            Sysno::futimesat,
+            Sysno::io_uring_setup,
+            Sysno::io_uring_enter,
+            Sysno::io_uring_register,
+            Sysno::epoll_ctl_old,
+        ];
+        for sysno in refused_members {
+            assert!(
+                is_deterministically_refused_syscall(sysno),
+                "{sysno:?} should be in the deterministic-refusal aggregate"
+            );
+        }
+
+        // Emulated / no-op / host-forwarding families must be EXCLUDED: fail-
+        // closing a copied child for these would diverge from the ptrace path,
+        // which emulates or forwards them rather than refusing.
+        let excluded = [
+            Sysno::setuid,       // credential no-op success
+            Sysno::setgid,       // credential no-op success
+            Sysno::timer_create, // emulated
+            Sysno::bind,         // AF_UNIX autobind emulated
+            Sysno::read,         // ordinary passthrough
+            Sysno::write,        // ordinary passthrough
+            Sysno::getpid,       // virtualized
+        ];
+        for sysno in excluded {
+            assert!(
+                !is_deterministically_refused_syscall(sysno),
+                "{sysno:?} must NOT be in the deterministic-refusal aggregate (it is emulated/forwarded)"
+            );
+        }
+
+        for sysno in [
+            Sysno::rseq,
+            Sysno::splice,
+            Sysno::tee,
+            Sysno::vmsplice,
+            Sysno::keyctl,
+            Sysno::add_key,
+            Sysno::request_key,
+        ] {
+            assert!(is_strict_only_deterministic_refusal_syscall(sysno));
+        }
+        for sysno in [Sysno::openat2, Sysno::perf_event_open, Sysno::clock_settime] {
+            assert!(!is_strict_only_deterministic_refusal_syscall(sysno));
         }
     }
 }
