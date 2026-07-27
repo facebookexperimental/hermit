@@ -304,7 +304,7 @@ readonly STRICT_COMPAT_TOTAL=181
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
 readonly RR_COMPAT_EXPECTED=143
-readonly LITEINST_COMPAT_EXPECTED=305
+readonly LITEINST_COMPAT_EXPECTED=330
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
@@ -830,7 +830,7 @@ function run_full_backend_gates {
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
     run_check "LiteInst backend smoke" liteinst_backend_available
-    run_check "LiteInst compatibility baseline (305 programs)" run_liteinst_compatibility_envelope
+    run_check "LiteInst compatibility baseline (330 programs)" run_liteinst_compatibility_envelope
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -1560,7 +1560,7 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe systemd-notify-version /usr/bin/systemd-notify --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe getcap-readme /usr/sbin/getcap README.md && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe setcap-help /usr/sbin/setcap -h && passed=$((passed + 1)) || failed=$((failed + 1))
-    liteinst_compatibility_probe capsh-print /usr/sbin/capsh --print && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe iostat-version /usr/bin/iostat -V && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe getpcaps-pid1 /usr/sbin/getpcaps 1 && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe sestatus /usr/bin/sestatus && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe diff3-version /usr/bin/diff3 --version && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -1620,6 +1620,31 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe systemd-socket-activate-version /usr/bin/systemd-socket-activate --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe systemd-stdio-bridge-version /usr/bin/systemd-stdio-bridge --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe systemd-sysusers-version /usr/bin/systemd-sysusers --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-tmpfiles-version /usr/bin/systemd-tmpfiles --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-tty-ask-password-agent-version /usr/bin/systemd-tty-ask-password-agent --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe chmem-version /usr/bin/chmem --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe eject-version /usr/bin/eject --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe getfattr-version /usr/bin/getfattr --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe setfattr-version /usr/bin/setfattr --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe bison-version /usr/bin/bison --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe flex-version /usr/bin/flex --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe dot-version /usr/bin/dot -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe bat-version /usr/bin/bat --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe cscope-version /usr/bin/cscope --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe lspci-version /usr/sbin/lspci --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe dos2unix-version /usr/bin/dos2unix --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe fish-version /usr/bin/fish --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gawk-version /usr/bin/gawk --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe eu-addr2line-version /usr/bin/eu-addr2line --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe eu-ar-version /usr/bin/eu-ar --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe eu-nm-version /usr/bin/eu-nm --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe eu-readelf-version /usr/bin/eu-readelf --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe eu-size-version /usr/bin/eu-size --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe eu-strings-version /usr/bin/eu-strings --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ed-version /usr/bin/ed --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe patch-version /usr/bin/patch --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe vmstat-version /usr/bin/vmstat --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe strace-version /usr/bin/strace --version && passed=$((passed + 1)) || failed=$((failed + 1))
 
     total=$((passed + failed))
     if ((total != LITEINST_COMPAT_EXPECTED)); then
@@ -3443,7 +3468,7 @@ fi
 if ((LITEINST_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
     if ((failures == 0)); then
-        run_check "LiteInst compatibility baseline (305 programs)" run_liteinst_compatibility_envelope
+        run_check "LiteInst compatibility baseline (330 programs)" run_liteinst_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
