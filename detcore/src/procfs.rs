@@ -8,7 +8,10 @@
 
 //! Deterministic snapshots for volatile procfs and sysfs files.
 
+use std::collections::BTreeMap;
+use std::path::Component;
 use std::path::Path;
+use std::path::PathBuf;
 
 use chrono::DateTime;
 use chrono::Utc;
@@ -209,6 +212,7 @@ pub(crate) struct ProcfsFile {
 impl ProcfsFile {
     /// Recognizes procfs files that contain observed volatile fields.
     pub(crate) fn from_path(path: &Path) -> Option<Self> {
+        let path = normalize_observed_path(path)?;
         let kind = match path.to_str()? {
             "/proc/self/stat" => ProcfsKind::Stat,
             "/proc/self/status" => ProcfsKind::Status,
@@ -424,6 +428,24 @@ impl ProcfsFile {
     pub(crate) fn set_offset(&mut self, offset: usize) {
         self.offset = offset;
     }
+}
+
+fn normalize_observed_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) => return None,
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Some(normalized)
 }
 
 fn is_process_io_path(path: &str) -> bool {
@@ -1644,91 +1666,154 @@ fn sanitize_rtc(contents: &[u8], virtual_realtime_seconds: i64) -> Vec<u8> {
 // order. A granted lock and the blocked waiters queued behind it share one
 // `SEQ`, and a waiter row is marked with `->`.
 //
-// Rather than collapse every identity to a single constant (which would make
-// two distinct locked files indistinguishable and break holder/waiter
-// grouping), remap each *distinct* raw sequence, PID, and device:inode to a
-// dense synthetic value. Equal raw values map to equal synthetic values, so
-// same-object, same-owner, and holder/waiter equivalences survive while the
-// host-specific magnitudes do not. Rows are grouped by their (virtual)
-// sequence with the granted holder ahead of its waiters, giving a byte-stable
-// snapshot without scattering a group across a global sort. A row we cannot
-// classify is redacted to a sentinel rather than passed through, so an
-// unrecognized kernel extension fails safe instead of leaking raw identities.
+// Rather than collapse every identity to a single constant, derive dense IDs
+// from stable lock semantics. Equal raw values remain equal, distinct objects
+// stay distinct, holder/waiter groups stay adjacent, and raw ID renumbering or
+// row reordering does not change the resulting snapshot. An unknown format
+// fails the complete snapshot closed instead of leaking any raw identities.
 fn sanitize_locks(contents: &[u8]) -> Vec<u8> {
-    use std::collections::BTreeMap;
-
     let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
+        return Vec::new();
     };
     if text.is_empty() {
         return Vec::new();
     }
 
+    #[derive(Clone)]
     struct LockRow {
-        details: usize,
-        seq: String,
+        sequence: String,
+        waiter: bool,
         fields: Vec<String>,
+        owner_index: usize,
+        object_index: usize,
     }
 
-    let mut rows = Vec::new();
-    let mut redactions = 0usize;
-    // Distinct raw values, kept sorted so the dense assignment is reproducible.
-    let mut seqs = BTreeMap::new();
-    let mut pids = BTreeMap::new();
-    let mut objs = BTreeMap::new();
+    let mut rows: Vec<LockRow> = Vec::new();
     for line in text.lines() {
         let fields = line
             .split_whitespace()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        let details = usize::from(fields.get(1).is_some_and(|field| field == "->")) + 1;
-        let well_formed = fields.len() >= details + 7
-            && fields.first().is_some_and(|field| field.ends_with(':'))
-            && fields[details + 4].split(':').count() == 3;
-        if !well_formed {
-            redactions += 1;
-            continue;
+        let waiter = fields.get(1).is_some_and(|field| field == "->");
+        let details = usize::from(waiter) + 1;
+        let owner_index = details + 3;
+        let object_index = details + 4;
+        let Some(sequence) = fields
+            .first()
+            .and_then(|field| field.strip_suffix(':'))
+            .filter(|field| !field.is_empty() && field.bytes().all(|byte| byte.is_ascii_digit()))
+        else {
+            return Vec::new();
+        };
+        if fields.len() != details + 7
+            || fields[owner_index].parse::<i64>().is_err()
+            || fields[object_index].split(':').count() != 3
+        {
+            return Vec::new();
         }
-
-        let seq = fields[0].trim_end_matches(':').to_owned();
-        seqs.insert(seq.clone(), 0usize);
-        pids.insert(fields[details + 3].clone(), 0usize);
-        objs.insert(fields[details + 4].clone(), 0usize);
         rows.push(LockRow {
-            details,
-            seq,
+            sequence: sequence.to_owned(),
+            waiter,
             fields,
+            owner_index,
+            object_index,
         });
     }
 
-    // Assign dense identities in sorted order of the distinct raw values.
-    for (index, value) in seqs.values_mut().enumerate() {
-        *value = index;
+    let mut object_signatures: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in &rows {
+        let mut signature = row.fields.clone();
+        signature[0] = if row.waiter { "waiter" } else { "holder" }.to_owned();
+        signature[row.owner_index] = "owner".to_owned();
+        signature[row.object_index] = "object".to_owned();
+        object_signatures
+            .entry(row.fields[row.object_index].clone())
+            .or_default()
+            .push(signature.join(" "));
     }
-    for (index, value) in pids.values_mut().enumerate() {
-        *value = index + 1;
+    let mut objects = object_signatures.into_iter().collect::<Vec<_>>();
+    for (_, signatures) in &mut objects {
+        signatures.sort_unstable();
     }
-    for (index, value) in objs.values_mut().enumerate() {
-        *value = index + 1;
-    }
-
+    objects.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    let object_ids = objects
+        .into_iter()
+        .enumerate()
+        .map(|(index, (object, _))| (object, index + 1))
+        .collect::<BTreeMap<_, _>>();
     for row in &mut rows {
-        let details = row.details;
-        row.fields[0] = format!("{}:", seqs[&row.seq]);
-        row.fields[details + 3] = pids[&row.fields[details + 3]].to_string();
-        row.fields[details + 4] = format!("00:00:{}", objs[&row.fields[details + 4]]);
+        let object_id = object_ids[&row.fields[row.object_index]];
+        row.fields[row.object_index] = format!("00:00:{object_id}");
     }
 
-    // Group by virtual sequence, holder (details == 1) before its waiters, so a
-    // lock and the tasks blocked on it stay adjacent and in a stable order.
-    rows.sort_by(|a, b| {
-        (seqs[&a.seq], a.details, &a.fields).cmp(&(seqs[&b.seq], b.details, &b.fields))
+    let mut owner_signatures: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+    for row in &rows {
+        let owner = row.fields[row.owner_index]
+            .parse::<i64>()
+            .expect("owner was validated above");
+        if owner == -1 {
+            continue;
+        }
+        let mut signature = row.fields.clone();
+        signature[0] = if row.waiter { "waiter" } else { "holder" }.to_owned();
+        signature[row.owner_index] = "owner".to_owned();
+        owner_signatures
+            .entry(owner)
+            .or_default()
+            .push(signature.join(" "));
+    }
+    let mut owners = owner_signatures.into_iter().collect::<Vec<_>>();
+    for (_, signatures) in &mut owners {
+        signatures.sort_unstable();
+    }
+    owners.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    let owner_ids = owners
+        .into_iter()
+        .enumerate()
+        .map(|(index, (owner, _))| (owner, index + 1))
+        .collect::<BTreeMap<_, _>>();
+    for row in &mut rows {
+        let owner = row.fields[row.owner_index]
+            .parse::<i64>()
+            .expect("owner was validated above");
+        if owner != -1 {
+            row.fields[row.owner_index] = owner_ids[&owner].to_string();
+        }
+    }
+
+    let mut groups: BTreeMap<String, Vec<LockRow>> = BTreeMap::new();
+    for row in rows {
+        groups.entry(row.sequence.clone()).or_default().push(row);
+    }
+    let mut groups = groups.into_values().collect::<Vec<_>>();
+    for rows in &mut groups {
+        rows.sort_by(|left, right| {
+            left.waiter
+                .cmp(&right.waiter)
+                .then_with(|| left.fields.cmp(&right.fields))
+        });
+    }
+    groups.sort_by_key(|rows| {
+        rows.iter()
+            .map(|row| {
+                let mut fields = row.fields.clone();
+                fields[0] = "sequence:".to_owned();
+                fields.join(" ")
+            })
+            .collect::<Vec<_>>()
     });
 
-    let mut normalized: Vec<String> = rows.iter().map(|row| row.fields.join(" ")).collect();
-    normalized.extend(std::iter::repeat_n("REDACTED".to_owned(), redactions));
-
-    let mut normalized = normalized.join("\n").into_bytes();
+    let normalized_rows = groups
+        .into_iter()
+        .enumerate()
+        .flat_map(|(sequence, rows)| {
+            rows.into_iter().map(move |mut row| {
+                row.fields[0] = format!("{}:", sequence + 1);
+                row.fields.join(" ")
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut normalized = normalized_rows.join("\n").into_bytes();
     if text.ends_with('\n') {
         normalized.push(b'\n');
     }
@@ -1923,6 +2008,12 @@ mod tests {
                 .kind,
             ProcfsKind::Locks
         );
+        for alias in ["/proc/./locks", "/proc/self/../locks"] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(alias)).unwrap().kind,
+                ProcfsKind::Locks
+            );
+        }
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/self/smaps"))
                 .unwrap()
@@ -2731,13 +2822,24 @@ nr_switches : -1\n";
         assert_ne!(pid_of(lines[holder]), pid_of(lines[waiter]));
         assert_ne!(pid_of(lines[holder]), pid_of(flock));
 
-        // Fail safe, not open: an unclassifiable row is redacted rather than
-        // passed through with its raw kernel identities.
-        assert_eq!(sanitize_locks(b"malformed row\n"), b"REDACTED\n");
+        let renumbered_and_reordered = b"800: FLOCK ADVISORY WRITE 9000 00:fe:9001 0 EOF\n\
+700: OFDLCK ADVISORY WRITE 8000 00:fe:9002 0 EOF\n\
+900: -> POSIX ADVISORY WRITE 7000 00:fe:9001 0 EOF\n\
+900: POSIX ADVISORY WRITE 8000 00:fe:9001 0 EOF\n";
         assert_eq!(
-            sanitize_locks(b"74: POSIX ADVISORY WRITE 480 08:02:1111 0 EOF\nmalformed\n"),
-            b"0: POSIX ADVISORY WRITE 1 00:00:1 0 EOF\nREDACTED\n"
+            sanitize_locks(contents),
+            sanitize_locks(renumbered_and_reordered),
+            "raw ID renumbering and row order changed the virtual graph"
         );
+
+        // Fail closed, not open: one unclassifiable row suppresses the entire
+        // snapshot instead of mixing a sentinel with partially trusted data.
+        assert!(sanitize_locks(b"malformed row\n").is_empty());
+        assert!(
+            sanitize_locks(b"74: POSIX ADVISORY WRITE 480 08:02:1111 0 EOF\nmalformed\n")
+                .is_empty()
+        );
+        assert!(sanitize_locks(&[0xff, 0xfe]).is_empty());
         assert!(sanitize_locks(b"").is_empty());
     }
 

@@ -34,13 +34,6 @@ fn proc_locks_consumers_are_deterministic_under_strict_verify() {
             String::from_utf8_lossy(&compile.stderr)
         );
 
-        // Plain `--strict` surfaces the guest's stdout, so assert content: the
-        // guest holds one WRITE lock, so `/proc/locks` must contain at least one
-        // row, and every row's device:inode column must have been rewritten to
-        // the synthetic `00:00:<n>` form. A raw host row would carry a nonzero
-        // major/minor (for example `08:02:1234567`), so this proves the snapshot
-        // is mediated rather than passed through, without depending on a quiet
-        // host `/proc/locks`.
         let strict = Command::new("timeout")
             .args(["--kill-after", "5s", "90s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
@@ -48,6 +41,7 @@ fn proc_locks_consumers_are_deterministic_under_strict_verify() {
                 "run",
                 "--backend=ptrace",
                 "--strict",
+                "--panic-on-unsupported-syscalls",
                 "--base-env=minimal",
                 "--",
             ])
@@ -60,24 +54,10 @@ fn proc_locks_consumers_are_deterministic_under_strict_verify() {
             strict.status.success(),
             "{name} failed strict run\nstdout:\n{strict_out}\nstderr:\n{strict_err}"
         );
-        let lock_rows: Vec<&str> = strict_out
-            .lines()
-            .filter(|line| line.split_whitespace().count() >= 7 && line.contains(':'))
-            .collect();
         assert!(
-            !lock_rows.is_empty(),
-            "{name}: guest lock produced no /proc/locks rows\nstdout:\n{strict_out}"
+            strict_out.contains("proc-locks-virtual-graph-and-aliases-ok"),
+            "{name}: content/alias probe omitted its marker\nstdout:\n{strict_out}\nstderr:\n{strict_err}"
         );
-        for row in &lock_rows {
-            let object = row
-                .split_whitespace()
-                .nth_back(2)
-                .expect("lock row has an object column");
-            assert!(
-                object.starts_with("00:00:"),
-                "{name}: unsanitized backing object {object:?} in row {row:?}"
-            );
-        }
 
         let output = Command::new("timeout")
             .args(["--kill-after", "5s", "90s"])
@@ -89,6 +69,7 @@ fn proc_locks_consumers_are_deterministic_under_strict_verify() {
                 "--backend=ptrace",
                 "--strict",
                 "--verify",
+                "--panic-on-unsupported-syscalls",
                 "--base-env=minimal",
                 "--",
             ])

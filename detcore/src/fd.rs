@@ -271,6 +271,16 @@ impl DetFd {
         self.description().resource.clone()
     }
 
+    /// Path used to open this file description, when it was observable.
+    pub(crate) fn path(&self) -> Option<PathBuf> {
+        self.description().path.clone()
+    }
+
+    /// Record the resolved path used to open this file description.
+    pub(crate) fn set_path<P: AsRef<Path>>(&self, path: P) {
+        self.description().path = Some(path.as_ref().to_path_buf());
+    }
+
     /// Attach deterministic procfs snapshot state to this open file description.
     pub(crate) fn set_procfs(&self, procfs: ProcfsFile) {
         self.description().procfs = Some(procfs);
