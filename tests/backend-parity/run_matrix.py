@@ -157,6 +157,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             0,
             None,
         ),
+        "anonymous_mmap_layout": (
+            [str(fixtures.binary("mmap_determinism")), "multiple"],
+            0,
+            None,
+        ),
         "pthread_lifecycle": (
             [str(fixtures.binary("pthread_lifecycle"))],
             0,
@@ -365,6 +370,7 @@ def run_case(
             required_markers = {
                 "virtual_clock": b"clock matrix success\n",
                 "heap_growth": b"heap ",
+                "anonymous_mmap_layout": b"multiple ",
                 "random_sources": b"getrandom[0]=",
                 "virtual_pid": b"pid=",
             }
