@@ -22,6 +22,10 @@ use serde::Serialize;
 enum ProcfsKind {
     Stat,
     Status,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-964): Review thread-self procfs identity normalization.
+    ThreadStat,
+    ThreadStatus,
     Cpuinfo,
     Diskstats,
     Loadavg,
@@ -283,6 +287,7 @@ fn sysfs_rtc_kind(path: &Path) -> Option<ProcfsKind> {
 pub(crate) struct ProcfsFile {
     kind: ProcfsKind,
     target_fd: Option<i32>,
+    bound_thread_identity: Option<(i32, i32, i32)>,
     contents: Option<Vec<u8>>,
     offset: usize,
 }
@@ -307,6 +312,10 @@ impl ProcfsFile {
         let kind = match path_text {
             "/proc/self/stat" => ProcfsKind::Stat,
             "/proc/self/status" => ProcfsKind::Status,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-964): Review the thread-self aliases.
+            "/proc/thread-self/stat" => ProcfsKind::ThreadStat,
+            "/proc/thread-self/status" => ProcfsKind::ThreadStatus,
             "/proc/cpuinfo" => ProcfsKind::Cpuinfo,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-861): Review deterministic kernel I/O accounting.
@@ -447,6 +456,7 @@ impl ProcfsFile {
         Some(Self {
             kind,
             target_fd,
+            bound_thread_identity: None,
             contents: None,
             offset: 0,
         })
@@ -455,6 +465,21 @@ impl ProcfsFile {
     /// Returns true until the underlying procfs content has been captured.
     pub(crate) fn needs_snapshot(&self) -> bool {
         self.contents.is_none()
+    }
+
+    /// Returns true when the procfs inode binds to the thread that opened it.
+    pub(crate) fn needs_bound_thread_identity(&self) -> bool {
+        matches!(self.kind, ProcfsKind::ThreadStat | ProcfsKind::ThreadStatus)
+    }
+
+    /// Binds a thread-self procfs inode to its opener's process identity.
+    // TODO-HUMAN-REVIEW(PR-964): Review open-time procfs thread binding.
+    pub(crate) fn bind_thread_identity(&mut self, tgid: i32, tid: i32, ppid: i32) {
+        assert!(
+            self.needs_bound_thread_identity(),
+            "only thread-self procfs files bind an opener identity"
+        );
+        self.bound_thread_identity = Some((tgid, tid, ppid));
     }
 
     /// Normalizes and stores a complete snapshot captured from the kernel.
@@ -470,7 +495,21 @@ impl ProcfsFile {
         } = context;
         self.contents = Some(match self.kind {
             ProcfsKind::Stat => sanitize_stat(&contents, virtual_pid, virtual_ppid),
-            ProcfsKind::Status => sanitize_status(&contents, virtual_pid, virtual_ppid),
+            ProcfsKind::Status => {
+                sanitize_status(&contents, virtual_pid, virtual_pid, virtual_ppid)
+            }
+            ProcfsKind::ThreadStat => {
+                let (_, tid, ppid) = self
+                    .bound_thread_identity
+                    .expect("thread-self stat was not bound when opened");
+                sanitize_stat(&contents, tid, ppid)
+            }
+            ProcfsKind::ThreadStatus => {
+                let (tgid, tid, ppid) = self
+                    .bound_thread_identity
+                    .expect("thread-self status was not bound when opened");
+                sanitize_status(&contents, tgid, tid, ppid)
+            }
             ProcfsKind::Cpuinfo => sanitize_cpuinfo(&contents),
             ProcfsKind::Diskstats => sanitize_diskstats(&contents),
             ProcfsKind::Loadavg => sanitize_loadavg(&contents),
@@ -721,7 +760,12 @@ fn sanitize_stat(contents: &[u8], virtual_pid: i32, virtual_ppid: i32) -> Vec<u8
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#553)
 // TODO-HUMAN-REVIEW(PR-723): Review /proc status identity field normalization.
-fn sanitize_status(contents: &[u8], virtual_pid: i32, virtual_ppid: i32) -> Vec<u8> {
+fn sanitize_status(
+    contents: &[u8],
+    virtual_tgid: i32,
+    virtual_pid: i32,
+    virtual_ppid: i32,
+) -> Vec<u8> {
     const TGID: &[u8] = b"Tgid:";
     const PID: &[u8] = b"Pid:";
     const PPID: &[u8] = b"PPid:";
@@ -740,11 +784,11 @@ fn sanitize_status(contents: &[u8], virtual_pid: i32, virtual_ppid: i32) -> Vec<
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
         let has_newline = line.last() == Some(&b'\n');
         let body = line.strip_suffix(b"\n").unwrap_or(line);
-        if body.starts_with(TGID)
-            || body.starts_with(PID)
-            || body.starts_with(NS_TGID)
-            || body.starts_with(NS_PID)
-        {
+        if body.starts_with(TGID) || body.starts_with(NS_TGID) {
+            let label = body.split(|byte| *byte == b':').next().unwrap_or_default();
+            normalized.extend_from_slice(label);
+            normalized.extend_from_slice(format!(":\t{virtual_tgid}").as_bytes());
+        } else if body.starts_with(PID) || body.starts_with(NS_PID) {
             let label = body.split(|byte| *byte == b':').next().unwrap_or_default();
             normalized.extend_from_slice(label);
             normalized.extend_from_slice(format!(":\t{virtual_pid}").as_bytes());
@@ -2712,6 +2756,18 @@ mod tests {
             ProcfsKind::Status
         );
         assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/thread-self/stat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::ThreadStat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/thread-self/status"))
+                .unwrap()
+                .kind,
+            ProcfsKind::ThreadStatus
+        );
+        assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/cpuinfo"))
                 .unwrap()
                 .kind,
@@ -3446,8 +3502,27 @@ mod tests {
     fn status_normalizes_affinity_and_context_switches() {
         let input = b"Name:\tcat\nTgid:\t1234\nPid:\t1234\nPPid:\t1200\nTracerPid:\t0\nNStgid:\t1234\nNSpid:\t1234\nNSpgid:\t1200\nNSsid:\t1190\nSigQ:\t426/2042342\nCpus_allowed:\tffffffff,ffffffff\nCpus_allowed_list:\t0-63\nvoluntary_ctxt_switches:\t120\nnonvoluntary_ctxt_switches:\t3\n";
         assert_eq!(
-            sanitize_status(input, 3, 1),
+            sanitize_status(input, 3, 3, 1),
             b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t1\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/0\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
+        );
+    }
+
+    #[test]
+    fn thread_status_uses_the_identity_bound_when_opened() {
+        let mut file = ProcfsFile::from_path(Path::new("/proc/thread-self/status")).unwrap();
+        assert!(file.needs_bound_thread_identity());
+        file.bind_thread_identity(3, 4, 1);
+        file.initialize(
+            b"Tgid:\t1234\nPid:\t1235\nPPid:\t1200\nNStgid:\t1234\nNSpid:\t1235\n".to_vec(),
+            ProcfsSnapshotContext {
+                virtual_pid: 99,
+                virtual_ppid: 98,
+                ..ProcfsSnapshotContext::default()
+            },
+        );
+        assert_eq!(
+            file.take(usize::MAX).unwrap(),
+            b"Tgid:\t3\nPid:\t4\nPPid:\t1\nNStgid:\t3\nNSpid:\t4\n"
         );
     }
 

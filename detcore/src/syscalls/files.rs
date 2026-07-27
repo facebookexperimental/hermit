@@ -206,7 +206,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                 });
                 self.add_fd(guest, fd, call.flags(), fd_type).await?;
-                let procfs = ProcfsFile::from_path(&observed_path);
+                let mut procfs = ProcfsFile::from_path(&observed_path);
+                if procfs
+                    .as_ref()
+                    .is_some_and(ProcfsFile::needs_bound_thread_identity)
+                {
+                    // TODO-HUMAN-REVIEW(PR-964): Bind thread-self at open time,
+                    // matching procfs inode resolution even if another thread or
+                    // a forked process later reads the shared descriptor.
+                    let tgid = guest.inject(syscalls::Getpid::new()).await? as i32;
+                    let tid = guest.inject(syscalls::Gettid::new()).await? as i32;
+                    let ppid = guest.inject(syscalls::Getppid::new()).await? as i32;
+                    procfs
+                        .as_mut()
+                        .expect("thread identity request lost its procfs file")
+                        .bind_thread_identity(tgid, tid, ppid);
+                }
                 guest.thread_state().with_detfd(fd, |detfd| {
                     detfd.set_path(&observed_path);
                     if let Some(procfs) = procfs.clone() {
