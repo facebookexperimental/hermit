@@ -459,6 +459,17 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::cachestat
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::lsm_list_modules
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-853): Deterministic EPERM for privileged host
+        // observation/control interfaces. Nested ptrace and kcmp expose host
+        // PIDs, permissions, and kernel-object identity; guest perf events
+        // expose nondeterministic PMU state and compete with Detcore's PMU use.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::ptrace
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::kcmp
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::perf_event_open
         // ===== BATCH 51: fail-closed utility syscalls with no deterministic effect =====
         // These three previously fail-closed --strict (aborting real programs such
         // as chrt, ionice, and flock) even though none can change guest-visible
@@ -679,18 +690,15 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::clock_adjtime
         | Sysno::copy_file_range
         | Sysno::get_robust_list
-        | Sysno::kcmp
         | Sysno::lsm_get_self_attr
         | Sysno::lsm_set_self_attr
         | Sysno::mincore
         | Sysno::name_to_handle_at
-        | Sysno::perf_event_open
         | Sysno::pidfd_getfd
         | Sysno::pidfd_open
         | Sysno::pidfd_send_signal
         | Sysno::preadv
         | Sysno::preadv2
-        | Sysno::ptrace
         | Sysno::pwritev
         | Sysno::pwritev2
         | Sysno::readv
@@ -943,6 +951,26 @@ pub(crate) const fn is_process_isolation_refused_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-853): Deterministic privileged-observation refusal set.
+/// Privileged host observation and control interfaces that Detcore deliberately
+/// refuses. Nested `ptrace` and `kcmp` depend on untranslated host PIDs,
+/// permissions, process lifetimes, and kernel-object identity. Guest
+/// `perf_event_open` exposes host PMU availability and nondeterministic counters
+/// while competing with Detcore's own branch-counting PMU resource. A fixed
+/// `EPERM` enforces the guest isolation boundary without entering the host.
+pub(crate) const fn is_privileged_observation_refused_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        Sysno::ptrace
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::kcmp
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::perf_event_open
+    )
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-836): Deterministic ENOSYS refusal set.
 /// Host filesystem and mount-introspection syscalls. `sysfs` reads the
 /// host's filesystem-type table; `statmount` and `listmount` read mount IDs
@@ -1023,7 +1051,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [248, 91, 34]);
+        assert_eq!(counts, [251, 91, 31]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1588,6 +1616,30 @@ mod tests {
                 is_process_isolation_refused_syscall(sysno),
                 refused.contains(&sysno),
                 "{sysno:?} process-isolation helper membership is inconsistent"
+            );
+        }
+    }
+
+    #[test]
+    fn privileged_observation_syscalls_are_determinized_and_consistent() {
+        let refused = [Sysno::ptrace, Sysno::kcmp, Sysno::perf_event_open];
+        for sysno in refused {
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Determinized,
+                "{sysno:?} should be Determinized (deterministic EPERM refusal)"
+            );
+            assert!(
+                is_privileged_observation_refused_syscall(sysno),
+                "{sysno:?} should be in the privileged-observation refusal set"
+            );
+        }
+
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            assert_eq!(
+                is_privileged_observation_refused_syscall(sysno),
+                refused.contains(&sysno),
+                "{sysno:?} privileged-observation helper membership is inconsistent"
             );
         }
     }

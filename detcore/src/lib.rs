@@ -163,6 +163,7 @@ use crate::syscall_classification::is_mount_introspection_enosys_syscall;
 use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
 use crate::syscall_classification::is_optional_memory_feature_syscall;
 use crate::syscall_classification::is_privileged_admin_refused_syscall;
+use crate::syscall_classification::is_privileged_observation_refused_syscall;
 use crate::syscall_classification::is_process_isolation_refused_syscall;
 use crate::syscall_classification::is_unimplemented_enosys_syscall;
 use crate::syscall_classification::is_unsupported_async_ipc_syscall;
@@ -1400,6 +1401,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // around host-global process accounting and cross-process memory.
             SyscallClassification::Determinized
                 if is_process_isolation_refused_syscall(call.number()) =>
+            {
+                Err(Error::Errno(Errno::EPERM))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-853): Refuse nested tracing, host-object
+            // comparison, and guest PMU access at the deterministic boundary.
+            SyscallClassification::Determinized
+                if is_privileged_observation_refused_syscall(call.number()) =>
             {
                 Err(Error::Errno(Errno::EPERM))
             }
