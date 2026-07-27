@@ -105,6 +105,10 @@ class Fixtures:
                 ("-D_GNU_SOURCE",),
             ),
             "mmap_exec": (REPOSITORY / "tests/c/dbi_mmap_exec.c", ()),
+            "madvise_determinism": (
+                REPOSITORY / "tests/c/madvise_determinism.c",
+                (),
+            ),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -138,6 +142,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             [str(fixtures.binary("mmap_exec"))],
             0,
             b"dbi-mmap-exec-ok\n",
+        ),
+        "memory_advice": (
+            [str(fixtures.binary("madvise_determinism"))],
+            0,
+            b"madvise-ok\n",
         ),
         "pthread_lifecycle": (
             [str(fixtures.binary("pthread_lifecycle"))],
@@ -293,6 +302,8 @@ def run_case(
     guest, expected_status, expected_stdout = case_command(name, fixtures)
     if backend == "dbi" and name == "random_sources":
         guest = [*guest, "--root-only"]
+    if backend == "kvm" and name == "memory_advice":
+        guest = [*guest, "--kvm"]
     baseline: bytes | None = None
     started = time.monotonic()
     ptrace_random: bytes | None = None
