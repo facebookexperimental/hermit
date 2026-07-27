@@ -109,6 +109,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/madvise_determinism.c",
                 (),
             ),
+            "mmap_determinism": (
+                REPOSITORY / "tests/c/mmap_determinism.c",
+                (),
+            ),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -147,6 +151,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             [str(fixtures.binary("madvise_determinism"))],
             0,
             b"madvise-ok\n",
+        ),
+        "heap_growth": (
+            [str(fixtures.binary("mmap_determinism")), "heap"],
+            0,
+            None,
         ),
         "pthread_lifecycle": (
             [str(fixtures.binary("pthread_lifecycle"))],
@@ -355,6 +364,7 @@ def run_case(
         if expected_stdout is None:
             required_markers = {
                 "virtual_clock": b"clock matrix success\n",
+                "heap_growth": b"heap ",
                 "random_sources": b"getrandom[0]=",
                 "virtual_pid": b"pid=",
             }

@@ -9,34 +9,37 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 13/13 | 100% |
-| DBI | 12/13 | 92% |
-| KVM | 11/13 | 85% |
+| ptrace | 14/14 | 100% |
+| DBI | 13/14 | 93% |
+| KVM | 12/14 | 86% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 12/13 number above is deliberately
+measures the backend's own Reverie suite. The 13/14 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, and application executable-memory
-contracts, plus deterministic memory-advice behavior. The wait contract covers
-deterministic `wait4`/`waitid` results, at least one SIGCHLD handler delivery
-(standard signals may coalesce), complete reaping, and zeroed child CPU
-accounting. The executable-memory contract writes machine code into an
-anonymous mapping, transitions it from writable to executable, and calls it.
+contracts, plus deterministic memory-advice and heap-growth behavior. The wait
+contract covers deterministic `wait4`/`waitid` results, at least one SIGCHLD
+handler delivery (standard signals may coalesce), complete reaping, and zeroed
+child CPU accounting. The executable-memory contract writes machine code into
+an anonymous mapping, transitions it from writable to executable, and calls it.
 The memory-advice row checks accepted and rejected advice, address validation,
 and file-backed `MADV_DONTNEED` restoration; KVM instead enforces its documented
-deterministic `ENOSYS` refusal for `MADV_DONTNEED`. Hosted pthread startup can
-still stall during native startup and remains the sole DBI gap; child-thread
-random sources remain covered by that lifecycle gap rather than the
-random-source pair.
+deterministic `ENOSYS` refusal for `MADV_DONTNEED`. The heap-growth row checks
+that `sbrk` and `brk` produce the same address sequence across repeated runs of
+each backend; it deliberately permits different backend-local layouts. Hosted
+pthread startup can still stall during native startup and remains the sole DBI
+gap; child-thread random sources remain covered by that lifecycle gap rather
+than the random-source pair.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
-eleven pairs, including its bounded cooperative pthread lifecycle, executable
+twelve pairs, including its bounded cooperative pthread lifecycle, executable
 memory, deterministic memory-advice policy, clock, PID, and synthetic CPUID
-probes. Its remaining gaps are the threaded random-source fixture, where
-child-thread syscalls bypass per-child Detcore callbacks and the KVM personality
-repeats fixed random streams across workers, and process wait accounting,
-because KVM child processes do not run through per-child Detcore callbacks.
+probes, plus repeatable heap growth. Its remaining gaps are the threaded
+random-source fixture, where child-thread syscalls bypass per-child Detcore
+callbacks and the KVM personality repeats fixed random streams across workers,
+and process wait accounting, because KVM child processes do not run through
+per-child Detcore callbacks.
 
 ## Matrix
 
@@ -49,6 +52,7 @@ because KVM child processes do not run through per-child Detcore callbacks.
 | `file_read` | pass | pass | pass |
 | `executable_mmap` | pass | pass | pass |
 | `memory_advice` | pass | pass | pass |
+| `heap_growth` | pass | pass | pass |
 | `pthread_lifecycle` | pass | gap | pass |
 | `process_wait_lifecycle` | pass | pass | gap |
 | `cpuid_policy` | pass | pass | pass |
