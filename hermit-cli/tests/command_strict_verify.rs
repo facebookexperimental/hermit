@@ -370,6 +370,21 @@ fn io_accounting_commands_are_deterministic_under_strict_verify() {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-881)
+#[test]
+#[ignore = "e2e: requires hermit + PMU/mount namespaces + util-linux ionice"]
+fn ionice_query_is_deterministic_under_strict_verify() {
+    let _guard = hermit_run_lock();
+    let case = StrictCommandCase {
+        name: "ionice current-process query",
+        candidates: &["/usr/bin/ionice", "/bin/ionice"],
+        args: &["-p", "0"],
+        stdin: None,
+    };
+    assert_l2_under_strict_verify(&case);
+}
+
 #[test]
 #[ignore = "e2e: requires hermit + PMU/mount namespaces + /usr/bin/python3"]
 fn python_prlimit64_query_is_deterministic_under_strict_verify() {

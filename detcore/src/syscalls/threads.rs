@@ -58,6 +58,25 @@ use crate::types::LogicalTime;
 // count. This represents one virtual CPU in a fixed 128-bit kernel mask.
 const VIRTUAL_CPUSET_BYTES: usize = 16;
 
+const IOPRIO_WHO_PROCESS: libc::c_int = 1;
+const IOPRIO_WHO_PGRP: libc::c_int = 2;
+const IOPRIO_WHO_USER: libc::c_int = 3;
+const IOPRIO_CLASS_SHIFT: libc::c_int = 13;
+const IOPRIO_CLASS_BE: libc::c_int = 2;
+const IOPRIO_BE_NORM: libc::c_int = 4;
+const IOPRIO_DEFAULT_EFFECTIVE: libc::c_int =
+    (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | IOPRIO_BE_NORM;
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-881)
+fn virtual_ioprio(which: libc::c_int) -> Result<i64, Errno> {
+    match which {
+        IOPRIO_WHO_PROCESS => Ok(0),
+        IOPRIO_WHO_PGRP | IOPRIO_WHO_USER => Ok(i64::from(IOPRIO_DEFAULT_EFFECTIVE)),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct WaitidSigchldFields {
@@ -1052,27 +1071,47 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
+    /// ioprio_get under Hermit. I/O priority is inert under Detcore's serialized
+    /// scheduler, so process queries observe the fixed raw IOPRIO_CLASS_NONE
+    /// value while group/user queries observe the effective SCHED_OTHER default
+    /// of IOPRIO_CLASS_BE/4, without consulting host block-scheduler state.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-841): Review virtual ioprio_get default.
-    /// Return the fixed default I/O class and priority paired with the existing
-    /// no-op ioprio_set policy. Linux encodes IOPRIO_CLASS_NONE/priority 0 as 0.
+    // TODO-HUMAN-REVIEW(PR-881)
     pub async fn handle_ioprio_get<G: Guest<Self>>(
         &self,
         _guest: &mut G,
         call: syscalls::IoprioGet,
     ) -> Result<i64, Error> {
+        let priority = virtual_ioprio(call.which())?;
+
         info!(
-            "Emulating ioprio_get(which={}, who={}): fixed class none, priority 0",
+            "Emulating ioprio_get(which={}, who={}): fixed priority {}",
             call.which(),
-            call.who()
+            call.who(),
+            priority
         );
-        Ok(0)
+        Ok(priority)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ioprio_query_reports_fixed_raw_and_effective_defaults() {
+        assert_eq!(virtual_ioprio(IOPRIO_WHO_PROCESS), Ok(0));
+        assert_eq!(
+            virtual_ioprio(IOPRIO_WHO_PGRP),
+            Ok(i64::from(IOPRIO_DEFAULT_EFFECTIVE))
+        );
+        assert_eq!(
+            virtual_ioprio(IOPRIO_WHO_USER),
+            Ok(i64::from(IOPRIO_DEFAULT_EFFECTIVE))
+        );
+        assert_eq!(virtual_ioprio(0), Err(Errno::EINVAL));
+        assert_eq!(virtual_ioprio(4), Err(Errno::EINVAL));
+    }
 
     #[test]
     fn waitid_siginfo_canonicalization_clears_only_cpu_accounting() {

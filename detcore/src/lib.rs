@@ -1889,7 +1889,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#791)
                 Syscall::IoprioSet(s) => self.handle_ioprio_set(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-841): Review virtual ioprio_get default.
+                // TODO-HUMAN-REVIEW(PR-881): Review virtual ioprio_get defaults.
                 Syscall::IoprioGet(s) => self.handle_ioprio_get(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#791)

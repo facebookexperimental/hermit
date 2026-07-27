@@ -543,7 +543,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // as chrt, ionice, and flock) even though none can change guest-visible
         // computation under Hermit. Detcore replaces the Linux scheduler, presents a
         // single virtual CPU, and serializes guest threads, so a thread's I/O
-        // priority (ioprio_set) and its Linux scheduling attributes (sched_getattr)
+        // priority (ioprio_get/ioprio_set) and its Linux scheduling attributes (sched_getattr)
         // are inert, and an advisory whole-file lock (flock) is never contended
         // within the serialized container. They are determinized to fixed,
         // host-independent results; see the handlers in lib.rs.
@@ -563,7 +563,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::syslog
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-841): Return the fixed virtual default I/O priority.
+        // TODO-HUMAN-REVIEW(PR-881): Return fixed raw/effective I/O priority defaults.
         | Sysno::ioprio_get
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-841): Linux scheduler attributes are inoperative under Detcore.
