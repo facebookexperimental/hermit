@@ -528,6 +528,12 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // synchronization. The handler records/replays the kernel operation and
         // registers the result as FdType::Pidfd before later fd operations.
         | Sysno::pidfd_open
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#877): Canonicalize fresh kernel namespace inode
+        // identities while preserving ordinary symlink behavior and errors.
+        | Sysno::readlink
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::readlinkat
         // ===== BATCH 51: fail-closed utility syscalls with no deterministic effect =====
         // These three previously fail-closed --strict (aborting real programs such
         // as chrt, ionice, and flock) even though none can change guest-visible
@@ -610,7 +616,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::gettid
         | Sysno::getuid
         | Sysno::mprotect
-        | Sysno::readlink
         | Sysno::set_robust_list
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#663)
@@ -668,8 +673,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(PR-675): Verify stable-filesystem passthrough assumptions.
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::fallocate
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::readlinkat
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::rename
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1177,7 +1180,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [273, 90, 10]);
+        assert_eq!(counts, [275, 88, 10]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1254,6 +1257,11 @@ mod tests {
             classify_syscall(Sysno::copy_file_range),
             SyscallClassification::Determinized
         );
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#877)
+        for sysno in [Sysno::readlink, Sysno::readlinkat] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+        }
         // recvmmsg is the multi-message sibling of recvmsg and must stay
         // Determinized (routed through handle_sendrecv); regression for #788.
         assert_eq!(
@@ -1329,7 +1337,6 @@ mod tests {
             Sysno::getresuid,
             Sysno::munlock,
             Sysno::munlockall,
-            Sysno::readlinkat,
             Sysno::rename,
             Sysno::renameat,
             Sysno::getgroups,
@@ -1353,7 +1360,6 @@ mod tests {
             Sysno::removexattr,
             Sysno::readahead,
             Sysno::renameat2,
-            Sysno::readlinkat,
             Sysno::rmdir,
             Sysno::rt_sigreturn,
             Sysno::setxattr,

@@ -1617,6 +1617,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Fstat(s) => self.handle_stat_family(guest, s.into()).await,
                 Syscall::Newfstatat(s) => self.handle_stat_family(guest, s.into()).await,
                 Syscall::Statx(s) => self.handle_statx(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#877)
+                Syscall::Readlink(s) => self.handle_readlink(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                Syscall::Readlinkat(s) => self.handle_readlinkat(guest, s).await,
                 Syscall::Fcntl(s) => self.handle_fcntl(guest, s).await,
                 Syscall::Ioctl(s) => self.handle_ioctl(guest, s).await,
                 Syscall::Futex(s) => self.handle_futex(guest, s).await,

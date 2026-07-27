@@ -235,6 +235,38 @@ fn common_commands_are_deterministic_under_strict_verify() {
             args: &["/etc/../etc/passwd"],
             stdin: None,
         },
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#877)
+        StrictCommandCase {
+            name: "readlink mount namespace",
+            candidates: &["/usr/bin/readlink", "/bin/readlink"],
+            args: &["/proc/self/ns/mnt"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "readlink executable control",
+            candidates: &["/usr/bin/readlink", "/bin/readlink"],
+            args: &["/proc/self/exe"],
+            stdin: None,
+        },
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        StrictCommandCase {
+            name: "Python PID namespace readlink",
+            candidates: &["/usr/bin/python3"],
+            args: &[
+                "-c",
+                "import os; d=os.open('/', os.O_RDONLY); \
+                 print(os.readlink('/proc/self/ns/pid', dir_fd=d))",
+            ],
+            stdin: None,
+        },
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        StrictCommandCase {
+            name: "Perl user namespace readlink",
+            candidates: &["/usr/bin/perl", "/bin/perl"],
+            args: &["-e", "print readlink('/proc/self/ns/user'), qq(\\n)"],
+            stdin: None,
+        },
         StrictCommandCase {
             name: "md5sum",
             candidates: &["/usr/bin/md5sum", "/bin/md5sum"],

@@ -13,6 +13,7 @@ pub mod helpers;
 mod io;
 mod memory;
 mod misc;
+mod namespace;
 mod signal;
 mod sysinfo;
 mod threads;
