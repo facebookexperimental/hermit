@@ -658,6 +658,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
             })?;
 
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-973): Refuse sendfile from a procfs input so it
+        // cannot bypass the deterministic ProcfsFile snapshot. A procfs fd is
+        // classified `FdType::Regular`, so it would otherwise pass the type
+        // guard below and copy live kernel bytes straight to the output fd,
+        // reintroducing the nondeterminism the mediated read()/write() path
+        // sanitizes. Failing closed with ENOSYS makes callers fall back to
+        // that mediated path (glibc's sendfile does exactly this).
+        let in_is_procfs = guest
+            .thread_state()
+            .with_detfd(call.in_fd(), |detfd| detfd.procfs_position().is_some())?;
+        if in_is_procfs {
+            return Err(Errno::ENOSYS.into());
+        }
+
         if !matches!(in_type, FdType::Regular | FdType::Memfd)
             || !matches!(out_type, FdType::Regular | FdType::Memfd)
         {
