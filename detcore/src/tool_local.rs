@@ -83,15 +83,10 @@ pub struct FileMetadata {
 
 /// A single POSIX per-process interval timer created by `timer_create(2)`.
 ///
-/// Detcore tracks enough state to make the `timer_*` syscalls deterministic
-/// under `--strict`, but it does **not** deliver timer-expiration signals: an
-/// armed timer is recorded and its remaining time reported against the
-/// deterministic virtual clock, yet it never actually fires. This is sufficient
-/// for programs that merely arm a long watchdog timer at startup (e.g. CPython
-/// arms a 300s `CLOCK_MONOTONIC`/`SIGRTMIN` watchdog and lets the process exit
-/// long before it could expire), but a program that depends on receiving the
-/// timer signal will not observe it. Deterministic timer-signal delivery is
-/// future work.
+/// Detcore records arming against virtual time and schedules supported
+/// `SIGEV_SIGNAL` notifications through the deterministic scheduler.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#869)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PosixTimer {
     /// Reload interval for periodic timers, in nanoseconds (0 => one-shot).
@@ -99,6 +94,9 @@ struct PosixTimer {
     /// Absolute virtual-time deadline of the next expiration, or `None` when the
     /// timer is disarmed (`it_value == 0`).
     deadline: Option<LogicalTime>,
+    /// Signal number configured by `timer_create`, or `None` for notifications
+    /// that Detcore cannot deliver through its scheduler.
+    signal: Option<i32>,
 }
 
 /// The set of POSIX timers owned by a *process*.
@@ -116,8 +114,10 @@ pub struct PosixTimers {
 }
 
 impl PosixTimers {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
     /// Allocate a new (disarmed) timer, returning its deterministic id.
-    pub(crate) fn create(&mut self) -> i32 {
+    pub(crate) fn create(&mut self, signal: Option<i32>) -> i32 {
         let id = self.next_id;
         self.next_id += 1;
         self.timers.insert(
@@ -125,6 +125,7 @@ impl PosixTimers {
             PosixTimer {
                 interval_ns: 0,
                 deadline: None,
+                signal,
             },
         );
         id
@@ -143,7 +144,10 @@ impl PosixTimers {
         now: LogicalTime,
     ) -> Option<(u64, u64)> {
         let timer = self.timers.get_mut(&id)?;
-        let old = (remaining_ns(timer.deadline, now), timer.interval_ns);
+        let old = (
+            remaining_ns(timer.deadline, timer.interval_ns, now),
+            timer.interval_ns,
+        );
         timer.interval_ns = interval_ns;
         timer.deadline = deadline;
         Some(old)
@@ -153,12 +157,21 @@ impl PosixTimers {
     /// `None` if the id is unknown.
     pub(crate) fn gettime(&self, id: i32, now: LogicalTime) -> Option<(u64, u64)> {
         let timer = self.timers.get(&id)?;
-        Some((remaining_ns(timer.deadline, now), timer.interval_ns))
+        Some((
+            remaining_ns(timer.deadline, timer.interval_ns, now),
+            timer.interval_ns,
+        ))
     }
 
     /// Whether a timer with this id currently exists.
     pub(crate) fn contains(&self, id: i32) -> bool {
         self.timers.contains_key(&id)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
+    pub(crate) fn signal(&self, id: i32) -> Option<Option<i32>> {
+        self.timers.get(&id).map(|timer| timer.signal)
     }
 
     /// Remove a timer; returns whether it existed.
@@ -212,11 +225,16 @@ impl ResourceLimits {
 }
 
 /// Nanoseconds remaining until `deadline` relative to `now`, saturating at 0.
-/// A disarmed timer (`None`) or an already-elapsed deadline reports 0, which is
-/// how the kernel reports an expired/disarmed timer via `timer_gettime`.
-fn remaining_ns(deadline: Option<LogicalTime>, now: LogicalTime) -> u64 {
+/// A disarmed timer (`None`) or an elapsed one-shot reports 0. Periodic timers
+/// advance arithmetically to their next virtual deadline.
+fn remaining_ns(deadline: Option<LogicalTime>, interval_ns: u64, now: LogicalTime) -> u64 {
     match deadline {
-        Some(d) => d.as_nanos().saturating_sub(now.as_nanos()),
+        Some(d) if d > now => d.as_nanos() - now.as_nanos(),
+        Some(d) if interval_ns != 0 => {
+            let elapsed = now.as_nanos() - d.as_nanos();
+            interval_ns - (elapsed % interval_ns)
+        }
+        Some(_) => 0,
         None => 0,
     }
 }
@@ -460,15 +478,15 @@ mod posix_timers_tests {
     #[test]
     fn ids_are_deterministic_and_sequential() {
         let mut timers = PosixTimers::default();
-        assert_eq!(timers.create(), 0);
-        assert_eq!(timers.create(), 1);
-        assert_eq!(timers.create(), 2);
+        assert_eq!(timers.create(None), 0);
+        assert_eq!(timers.create(Some(libc::SIGALRM)), 1);
+        assert_eq!(timers.create(None), 2);
     }
 
     #[test]
     fn settime_reports_previous_arming_and_remaining_uses_virtual_clock() {
         let mut timers = PosixTimers::default();
-        let id = timers.create();
+        let id = timers.create(None);
 
         // Arm a one-shot timer for 100ns at t=0. A freshly created timer was
         // disarmed, so the reported old value is zero.
@@ -484,7 +502,7 @@ mod posix_timers_tests {
     #[test]
     fn resetting_reports_old_remaining() {
         let mut timers = PosixTimers::default();
-        let id = timers.create();
+        let id = timers.create(None);
         timers.settime(id, 0, Some(t(100)), t(0));
         // Re-arm at t=30 (70ns remained) with a periodic 50ns timer.
         let old = timers
@@ -494,10 +512,24 @@ mod posix_timers_tests {
         assert_eq!(timers.gettime(id, t(30)), Some((170, 50)));
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
+    #[test]
+    fn periodic_remaining_advances_past_each_deadline() {
+        let mut timers = PosixTimers::default();
+        let id = timers.create(Some(libc::SIGALRM));
+        timers.settime(id, 50, Some(t(100)), t(0));
+
+        assert_eq!(timers.gettime(id, t(100)), Some((50, 50)));
+        assert_eq!(timers.gettime(id, t(125)), Some((25, 50)));
+        assert_eq!(timers.gettime(id, t(150)), Some((50, 50)));
+        assert_eq!(timers.signal(id), Some(Some(libc::SIGALRM)));
+    }
+
     #[test]
     fn disarm_and_unknown_ids() {
         let mut timers = PosixTimers::default();
-        let id = timers.create();
+        let id = timers.create(None);
         timers.settime(id, 0, Some(t(100)), t(0));
         // Disarm: value of 0 -> deadline None -> remaining 0.
         timers.settime(id, 0, None, t(10));
@@ -512,7 +544,7 @@ mod posix_timers_tests {
     #[test]
     fn delete_removes_timer() {
         let mut timers = PosixTimers::default();
-        let id = timers.create();
+        let id = timers.create(None);
         assert!(timers.contains(id));
         assert!(timers.remove(id));
         assert!(!timers.contains(id));

@@ -25,17 +25,37 @@ pub struct TimedEvents {
     // Inner btreeset is *always* non-empty:
     map: BTreeMap<LogicalTime, BTreeSet<TimedEvent>>,
 
-    // There is only one alarm allowed at a time per process, so we keep track of the current alarm
-    // for each process and replace it if any other is inserted.
-    alarm_times: BTreeMap<DetPid, LogicalTime>,
+    // Keep one alarm(2)/setitimer(2) event per process and one event per POSIX timer id.
+    signal_timers: BTreeMap<SignalTimerId, SignalTimerState>,
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#869)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum SignalTimerId {
+    Alarm(DetPid),
+    Posix(DetPid, i32),
+}
+
+impl SignalTimerId {
+    pub(super) fn process(self) -> DetPid {
+        match self {
+            Self::Alarm(pid) | Self::Posix(pid, _) => pid,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SignalTimerState {
+    deadline: LogicalTime,
+    interval: LogicalTime,
 }
 
 /// An event that occurs at a particular time in the execution, typically at an offset in the future.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TimedEvent {
-    // An upcoming alarm, destined for particular pids, with a designated tid in that process (if it
-    // still exists).
-    AlarmEvt(DetPid, DetTid, Signal),
+    // An upcoming timer signal, destined for a process with a preferred target thread.
+    SignalEvt(SignalTimerId, DetTid, Signal),
 
     /// A timed event on a particular thread (sleep, timeout, etc)
     ThreadEvt(DetTid),
@@ -45,7 +65,9 @@ impl fmt::Display for TimedEvent {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             TimedEvent::ThreadEvt(dt) => write!(f, "ThreadEvt({})", dt),
-            TimedEvent::AlarmEvt(dp, dt, sig) => write!(f, "AlarmEvt({},{},{})", dp, dt, sig),
+            TimedEvent::SignalEvt(id, dt, sig) => {
+                write!(f, "SignalEvt({:?},{},{})", id, dt, sig)
+            }
         }
     }
 }
@@ -61,22 +83,30 @@ impl TimedEvents {
         }
     }
 
-    // Return the last absolute alarm time for this pid, if any.
-    pub fn insert_alarm(
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
+    fn insert_signal_timer(
         &mut self,
+        id: SignalTimerId,
         ns: LogicalTime,
-        dp: DetPid,
         dt: DetTid,
         sig: Signal,
-    ) -> Option<LogicalTime> {
-        let old = self.alarm_times.insert(dp, ns);
-        self.clear_old_alarm(dp, old);
+        interval: LogicalTime,
+    ) -> Option<SignalTimerState> {
+        let old = self.signal_timers.insert(
+            id,
+            SignalTimerState {
+                deadline: ns,
+                interval,
+            },
+        );
+        self.clear_old_signal_timer(id, old);
 
         let set = self.map.entry(ns).or_default();
-        let evt = TimedEvent::AlarmEvt(dp, dt, sig);
+        let evt = TimedEvent::SignalEvt(id, dt, sig);
         if !set.insert(evt) {
             panic!(
-                "TimedEvents::insert should not insert an alarm event which is *already* in the set: {}",
+                "TimedEvents::insert_signal_timer should not insert an event which is already in the set: {}",
                 evt
             );
         }
@@ -84,20 +114,35 @@ impl TimedEvents {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#663)
-    fn clear_old_alarm(&mut self, dp: DetPid, old: Option<LogicalTime>) {
-        if let Some(time) = old {
+    // TODO-HUMAN-REVIEW(#869)
+    // Return the last alarm state for this pid, if any.
+    pub fn insert_alarm(
+        &mut self,
+        ns: LogicalTime,
+        dp: DetPid,
+        dt: DetTid,
+        sig: Signal,
+        interval: LogicalTime,
+    ) -> Option<(LogicalTime, LogicalTime)> {
+        self.insert_signal_timer(SignalTimerId::Alarm(dp), ns, dt, sig, interval)
+            .map(|state| (state.deadline, state.interval))
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
+    fn clear_old_signal_timer(&mut self, id: SignalTimerId, old: Option<SignalTimerState>) {
+        if let Some(state) = old {
             // The `map` entry may already be gone if the alarm fired (was
             // popped by `pop_if_before`) before being cleared. Clearing an
             // already-fired alarm is a no-op rather than an invariant break.
-            let Some(set) = self.map.get_mut(&time) else {
+            let Some(set) = self.map.get_mut(&state.deadline) else {
                 return;
             };
 
             // Could use a drain_filter here, but it is nightly only:
             let mut to_remove = None;
             for evt in set.iter() {
-                if matches!(evt, TimedEvent::AlarmEvt(evt_dp, _, _) if *evt_dp == dp) {
+                if matches!(evt, TimedEvent::SignalEvt(evt_id, _, _) if *evt_id == id) {
                     assert!(to_remove.is_none());
                     to_remove = Some(*evt);
                 }
@@ -109,22 +154,67 @@ impl TimedEvents {
             // Preserve the invariant that `map` never holds an empty set, which
             // `is_empty()` and `iter()` rely on.
             if set.is_empty() {
-                self.map.remove(&time);
+                self.map.remove(&state.deadline);
             }
         }
     }
 
     // Return the time of any previous alarm on this process.
-    pub fn remove_alarm(&mut self, dp: DetPid) -> Option<LogicalTime> {
-        let old = self.alarm_times.remove(&dp);
-        self.clear_old_alarm(dp, old);
+    pub fn remove_alarm(&mut self, dp: DetPid) -> Option<(LogicalTime, LogicalTime)> {
+        self.remove_signal_timer(SignalTimerId::Alarm(dp))
+            .map(|state| (state.deadline, state.interval))
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
+    pub fn insert_posix_timer(
+        &mut self,
+        ns: LogicalTime,
+        dp: DetPid,
+        dt: DetTid,
+        timer_id: i32,
+        sig: Signal,
+        interval: LogicalTime,
+    ) {
+        self.insert_signal_timer(SignalTimerId::Posix(dp, timer_id), ns, dt, sig, interval);
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
+    pub fn remove_posix_timer(&mut self, dp: DetPid, timer_id: i32) {
+        self.remove_signal_timer(SignalTimerId::Posix(dp, timer_id));
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
+    fn remove_signal_timer(&mut self, id: SignalTimerId) -> Option<SignalTimerState> {
+        let old = self.signal_timers.remove(&id);
+        self.clear_old_signal_timer(id, old);
         old
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-841): Review non-mutating logical alarm lookup.
     pub fn alarm_time(&self, dp: DetPid) -> Option<LogicalTime> {
-        self.alarm_times.get(&dp).copied()
+        self.signal_timers
+            .get(&SignalTimerId::Alarm(dp))
+            .map(|state| state.deadline)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
+    pub fn remove_process_timers(&mut self, dp: DetPid) {
+        let ids: Vec<_> = self
+            .signal_timers
+            .keys()
+            .copied()
+            .filter(|id| match id {
+                SignalTimerId::Alarm(pid) | SignalTimerId::Posix(pid, _) => *pid == dp,
+            })
+            .collect();
+        for id in ids {
+            self.remove_signal_timer(id);
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -133,11 +223,13 @@ impl TimedEvents {
 
     /// Return the next event if its target time of occurrence is before the supplied time.
     /// Being a "pop", this destructively removes the entry.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
     pub fn pop_if_before(
         &mut self,
         current_time: LogicalTime,
     ) -> Option<(LogicalTime, TimedEvent)> {
-        if let Some(mut entry) = self.map.first_entry() {
+        let (time_ns, evt) = if let Some(mut entry) = self.map.first_entry() {
             let time_ns = *entry.key();
             if time_ns <= current_time {
                 let set = entry.get_mut();
@@ -145,24 +237,30 @@ impl TimedEvents {
                 if set.is_empty() {
                     entry.remove();
                 }
-                // Once an alarm fires it is no longer pending, so drop its
-                // `alarm_times` bookkeeping. Otherwise that entry would dangle,
-                // pointing at a `map` time that no longer exists: the next
-                // `insert_alarm`/`remove_alarm` for this process would panic in
-                // `clear_old_alarm`, and `register_alarm` would report a bogus
-                // "seconds remaining" for the already-fired alarm.
-                if let TimedEvent::AlarmEvt(dp, _, _) = evt
-                    && self.alarm_times.get(&dp) == Some(&time_ns)
-                {
-                    self.alarm_times.remove(&dp);
-                }
                 Some((time_ns, evt))
             } else {
                 None
             }
         } else {
             None
+        }?;
+
+        if let TimedEvent::SignalEvt(id, _, _) = evt
+            && self
+                .signal_timers
+                .get(&id)
+                .is_some_and(|state| state.deadline == time_ns)
+        {
+            let state = self.signal_timers.get_mut(&id).unwrap();
+            if state.interval == LogicalTime::ZERO {
+                self.signal_timers.remove(&id);
+            } else {
+                state.deadline = time_ns + state.interval;
+                let next_deadline = state.deadline;
+                self.map.entry(next_deadline).or_default().insert(evt);
+            }
         }
+        Some((time_ns, evt))
     }
 
     /// Pop the next event unconditionally, if available.
@@ -224,7 +322,7 @@ mod test {
         LogicalTime::from_nanos(ns)
     }
 
-    /// Regression: an alarm that fires (is popped) must clear its `alarm_times`
+    /// Regression: an alarm that fires (is popped) must clear its timer
     /// bookkeeping so a subsequent alarm for the same process does not panic in
     /// `clear_old_alarm`. This reproduces the openssl-speed crash, where a
     /// SIGALRM fires and then the next timing round arms another alarm.
@@ -234,21 +332,24 @@ mod test {
         let p = pid(100);
 
         assert_eq!(
-            ev.insert_alarm(at(1000), p, tid(100), Signal::SIGALRM),
+            ev.insert_alarm(at(1000), p, tid(100), Signal::SIGALRM, LogicalTime::ZERO,),
             None
         );
 
         // The alarm fires: the scheduler pops the due event.
         assert_eq!(
             ev.pop(),
-            Some((at(1000), TimedEvent::AlarmEvt(p, tid(100), Signal::SIGALRM)))
+            Some((
+                at(1000),
+                TimedEvent::SignalEvt(SignalTimerId::Alarm(p), tid(100), Signal::SIGALRM),
+            ))
         );
         assert!(ev.is_empty());
 
         // Arming a new alarm must see no stale previous alarm (the old one has
         // already fired) and must not panic.
         assert_eq!(
-            ev.insert_alarm(at(2000), p, tid(100), Signal::SIGALRM),
+            ev.insert_alarm(at(2000), p, tid(100), Signal::SIGALRM, LogicalTime::ZERO,),
             None
         );
         assert_eq!(ev.len(), 1);
@@ -262,23 +363,41 @@ mod test {
         let deadline = at(1_000);
 
         assert_eq!(
-            ev.insert_alarm(deadline, first_pid, tid(101), Signal::SIGALRM),
+            ev.insert_alarm(
+                deadline,
+                first_pid,
+                tid(101),
+                Signal::SIGALRM,
+                LogicalTime::ZERO,
+            ),
             None
         );
         assert_eq!(
-            ev.insert_alarm(deadline, second_pid, tid(201), Signal::SIGALRM),
+            ev.insert_alarm(
+                deadline,
+                second_pid,
+                tid(201),
+                Signal::SIGALRM,
+                LogicalTime::ZERO,
+            ),
             None
         );
 
-        assert_eq!(ev.remove_alarm(first_pid), Some(deadline));
+        assert_eq!(
+            ev.remove_alarm(first_pid),
+            Some((deadline, LogicalTime::ZERO))
+        );
         assert_eq!(
             ev.iter().collect::<Vec<_>>(),
             vec![(
                 deadline,
-                TimedEvent::AlarmEvt(second_pid, tid(201), Signal::SIGALRM)
+                TimedEvent::SignalEvt(SignalTimerId::Alarm(second_pid), tid(201), Signal::SIGALRM,)
             )]
         );
-        assert_eq!(ev.remove_alarm(second_pid), Some(deadline));
+        assert_eq!(
+            ev.remove_alarm(second_pid),
+            Some((deadline, LogicalTime::ZERO))
+        );
         assert!(ev.is_empty());
     }
 
@@ -287,7 +406,7 @@ mod test {
     fn cancel_after_fire_does_not_panic() {
         let mut ev = TimedEvents::default();
         let p = pid(100);
-        ev.insert_alarm(at(1000), p, tid(100), Signal::SIGALRM);
+        ev.insert_alarm(at(1000), p, tid(100), Signal::SIGALRM, LogicalTime::ZERO);
         let _ = ev.pop(); // fire
         assert_eq!(ev.remove_alarm(p), None);
         assert!(ev.is_empty());
@@ -300,19 +419,58 @@ mod test {
         let mut ev = TimedEvents::default();
         let p = pid(100);
         assert_eq!(
-            ev.insert_alarm(at(1000), p, tid(100), Signal::SIGALRM),
+            ev.insert_alarm(at(1000), p, tid(100), Signal::SIGALRM, LogicalTime::ZERO,),
             None
         );
         assert_eq!(
-            ev.insert_alarm(at(2000), p, tid(100), Signal::SIGALRM),
-            Some(at(1000))
+            ev.insert_alarm(at(2000), p, tid(100), Signal::SIGALRM, LogicalTime::ZERO,),
+            Some((at(1000), LogicalTime::ZERO))
         );
         // Only the replacement remains; the emptied 1000ns slot is gone.
         assert_eq!(ev.len(), 1);
         assert_eq!(
             ev.pop(),
-            Some((at(2000), TimedEvent::AlarmEvt(p, tid(100), Signal::SIGALRM)))
+            Some((
+                at(2000),
+                TimedEvent::SignalEvt(SignalTimerId::Alarm(p), tid(100), Signal::SIGALRM),
+            ))
         );
+        assert!(ev.is_empty());
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
+    #[test]
+    fn periodic_alarm_rearms_at_its_interval() {
+        let mut ev = TimedEvents::default();
+        let p = pid(100);
+        let event = TimedEvent::SignalEvt(SignalTimerId::Alarm(p), tid(100), Signal::SIGALRM);
+        ev.insert_alarm(at(1000), p, tid(100), Signal::SIGALRM, at(250));
+
+        assert_eq!(ev.pop_if_before(at(1000)), Some((at(1000), event)));
+        assert_eq!(ev.pop_if_before(at(1249)), None);
+        assert_eq!(ev.pop_if_before(at(1250)), Some((at(1250), event)));
+        assert_eq!(ev.remove_alarm(p), Some((at(1500), at(250))));
+        assert!(ev.is_empty());
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
+    #[test]
+    fn posix_timer_does_not_replace_process_alarm() {
+        let mut ev = TimedEvents::default();
+        let p = pid(100);
+        ev.insert_alarm(at(1000), p, tid(100), Signal::SIGALRM, LogicalTime::ZERO);
+        ev.insert_posix_timer(at(500), p, tid(100), 7, Signal::SIGUSR1, LogicalTime::ZERO);
+
+        assert_eq!(
+            ev.pop(),
+            Some((
+                at(500),
+                TimedEvent::SignalEvt(SignalTimerId::Posix(p, 7), tid(100), Signal::SIGUSR1,),
+            ))
+        );
+        assert_eq!(ev.remove_alarm(p), Some((at(1000), LogicalTime::ZERO)));
         assert!(ev.is_empty());
     }
 }

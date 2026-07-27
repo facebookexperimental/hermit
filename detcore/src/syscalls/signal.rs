@@ -96,10 +96,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             let remaining = register_alarm(
                 guest,
                 LogicalTime::from_secs(call.seconds() as u64),
+                LogicalTime::ZERO,
                 Signal::SIGALRM,
             )
             .await;
-            Ok(logical_time_to_alarm_seconds(remaining))
+            Ok(logical_time_to_alarm_seconds(remaining.0))
         } else {
             info!(
                 "[dtid {}] Running without scheduler, so letting alarm call through...",
@@ -111,7 +112,8 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
-    /// Schedule a one-shot real-time interval timer on Detcore logical time.
+    // TODO-HUMAN-REVIEW(#869)
+    /// Schedule a one-shot or periodic real-time interval timer on Detcore logical time.
     pub async fn handle_setitimer<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -130,15 +132,13 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let value = call.value().ok_or(Errno::EFAULT)?;
         let timer: libc::itimerval = guest.memory().read_value(value)?;
-        if timeval_to_logical_time(timer.it_interval)? != LogicalTime::ZERO {
-            return Err(Error::Errno(Errno::ENOSYS));
-        }
-
+        let interval = timeval_to_logical_time(timer.it_interval)?;
         let duration = timeval_to_logical_time(timer.it_value)?;
-        let remaining = register_alarm(guest, duration, Signal::SIGALRM).await;
+        let (remaining, old_interval) =
+            register_alarm(guest, duration, interval, Signal::SIGALRM).await;
         if let Some(old_value) = call.ovalue() {
             let old_timer = libc::itimerval {
-                it_interval: logical_time_to_timeval(LogicalTime::ZERO),
+                it_interval: logical_time_to_timeval(old_interval),
                 it_value: logical_time_to_timeval(remaining),
             };
             guest.memory().write_value(old_value, &old_timer)?;

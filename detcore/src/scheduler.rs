@@ -1085,7 +1085,7 @@ impl Scheduler {
             .into_iter()
             .any(|tid| self.next_turns.contains_key(&tid));
         if !live_process_thread {
-            self.blocked.timed_waiters.remove_alarm(*detpid);
+            self.blocked.timed_waiters.remove_process_timers(*detpid);
         }
     }
 
@@ -1315,7 +1315,7 @@ impl Scheduler {
         {
             match evt {
                 TimedEvent::ThreadEvt(dtid) => self.wake_timed_event(time_ns, dtid),
-                TimedEvent::AlarmEvt(dpid, dtid, sig) => self.fire_alarm(dpid, dtid, sig),
+                TimedEvent::SignalEvt(id, dtid, sig) => self.fire_alarm(id.process(), dtid, sig),
             }
         }
     }
@@ -1683,7 +1683,9 @@ impl Scheduler {
 
                 match evt {
                     TimedEvent::ThreadEvt(dtid) => self.wake_timed_event(event_ns, dtid),
-                    TimedEvent::AlarmEvt(dpid, dtid, sig) => self.fire_alarm(dpid, dtid, sig),
+                    TimedEvent::SignalEvt(id, dtid, sig) => {
+                        self.fire_alarm(id.process(), dtid, sig)
+                    }
                 }
                 return Err(SkipTurn);
             }
@@ -2361,7 +2363,7 @@ impl Scheduler {
                             return ThreadStatus::NotRunning;
                         }
                     }
-                    TimedEvent::AlarmEvt(_, _, _) => {}
+                    TimedEvent::SignalEvt(_, _, _) => {}
                 }
             }
             if self.blocked.external_io_blockers.contains_key(&dtid) {
@@ -2566,6 +2568,7 @@ impl Scheduler {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
+    // TODO-HUMAN-REVIEW(#869)
     // Returns the logical duration until any previously scheduled alarm, if any (zero otherwise).
     pub fn register_alarm(
         &mut self,
@@ -2573,8 +2576,9 @@ impl Scheduler {
         dettid: DetTid,
         now: LogicalTime,
         duration: LogicalTime,
+        interval: LogicalTime,
         sig: Signal,
-    ) -> LogicalTime {
+    ) -> (LogicalTime, LogicalTime) {
         let old = if duration == LogicalTime::ZERO {
             // Alarm of 0 cancels any pending signal.
             self.blocked.timed_waiters.remove_alarm(detpid)
@@ -2582,14 +2586,36 @@ impl Scheduler {
             let target_time = now + duration;
             self.blocked
                 .timed_waiters
-                .insert_alarm(target_time, detpid, dettid, sig)
+                .insert_alarm(target_time, detpid, dettid, sig, interval)
         };
-        if let Some(old_target_time) = old {
+        if let Some((old_target_time, old_interval)) = old {
             let remain_ns: u64 = old_target_time.as_nanos().saturating_sub(now.as_nanos());
-            LogicalTime::from_nanos(remain_ns)
+            (LogicalTime::from_nanos(remain_ns), old_interval)
         } else {
             // Return 0 if no previous alarm, as per https://man7.org/linux/man-pages/man2/alarm.2.html
-            LogicalTime::ZERO
+            (LogicalTime::ZERO, LogicalTime::ZERO)
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
+    pub fn register_posix_timer(
+        &mut self,
+        detpid: DetPid,
+        dettid: DetTid,
+        timer_id: i32,
+        deadline: Option<LogicalTime>,
+        interval: LogicalTime,
+        sig: Signal,
+    ) {
+        if let Some(deadline) = deadline {
+            self.blocked
+                .timed_waiters
+                .insert_posix_timer(deadline, detpid, dettid, timer_id, sig, interval);
+        } else {
+            self.blocked
+                .timed_waiters
+                .remove_posix_timer(detpid, timer_id);
         }
     }
 
@@ -2796,14 +2822,25 @@ mod test {
         let duration = LogicalTime::from_nanos(250);
 
         assert_eq!(
-            scheduler.register_alarm(detpid, dettid, now, duration, Signal::SIGALRM),
-            LogicalTime::ZERO
+            scheduler.register_alarm(
+                detpid,
+                dettid,
+                now,
+                duration,
+                LogicalTime::ZERO,
+                Signal::SIGALRM,
+            ),
+            (LogicalTime::ZERO, LogicalTime::ZERO)
         );
         assert_eq!(
             scheduler.blocked.timed_waiters.iter().collect::<Vec<_>>(),
             vec![(
                 LogicalTime::from_nanos(1_250),
-                TimedEvent::AlarmEvt(detpid, dettid, Signal::SIGALRM)
+                TimedEvent::SignalEvt(
+                    timed_waiters::SignalTimerId::Alarm(detpid),
+                    dettid,
+                    Signal::SIGALRM,
+                )
             )]
         );
         assert_eq!(
@@ -2822,9 +2859,10 @@ mod test {
                 dettid,
                 cancel_time,
                 LogicalTime::ZERO,
+                LogicalTime::ZERO,
                 Signal::SIGALRM
             ),
-            LogicalTime::from_nanos(150)
+            (LogicalTime::from_nanos(150), LogicalTime::ZERO)
         );
         assert!(scheduler.blocked.timed_waiters.is_empty());
     }

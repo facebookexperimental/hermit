@@ -9,6 +9,7 @@
 //! System calls for dealing with threads and concurrency.
 use std::time::Duration;
 
+use nix::sys::signal::Signal;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
@@ -32,6 +33,7 @@ use crate::resources::Resources;
 use crate::scheduler::Priority;
 use crate::scheduler::entropy_to_priority;
 use crate::tool_global::ResumeStatus;
+use crate::tool_global::register_posix_timer;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
@@ -379,9 +381,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
     /// timer_create: allocate a per-process POSIX timer and hand back a
-    /// deterministic id. The timer's arming is tracked (in the process-local
-    /// `PosixTimers` table) but expiration signals are not delivered.
+    /// deterministic id, retaining any scheduler-deliverable signal.
     pub async fn handle_timer_create<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -390,22 +393,42 @@ impl<T: RecordOrReplay> Detcore<T> {
         // The kernel writes the new timer id here; a null pointer is EFAULT.
         let timerid_ptr = call.timerid().ok_or(Errno::EFAULT)?;
         let clockid = call.clockid();
+        let signal = if let Some(event_ptr) = call.sevp() {
+            let event: libc::sigevent = guest.memory().read_value(event_ptr)?;
+            match event.sigev_notify {
+                libc::SIGEV_NONE => None,
+                // Linux uses 4 for SIGEV_THREAD_ID. Treat it as process-directed
+                // until Detcore tracks per-timer thread targeting.
+                libc::SIGEV_SIGNAL | 4 => {
+                    if !(1..=64).contains(&event.sigev_signo) {
+                        return Err(Errno::EINVAL.into());
+                    }
+                    Signal::try_from(event.sigev_signo).ok()
+                }
+                _ => return Err(Errno::ENOSYS.into()),
+            }
+        } else {
+            Some(Signal::SIGALRM)
+        };
         let id = {
             let mut timers = guest.thread_state().posix_timers.lock().unwrap();
-            timers.create()
+            timers.create(signal.map(|sig| sig as i32))
         };
         guest
             .memory()
             .write_value(timerid_ptr, &(id as libc::c_int))?;
         detlog!(
-            "[dtid {}] timer_create(clockid={:?}) => deterministic timer id {} (arming tracked; signal delivery not emulated)",
+            "[dtid {}] timer_create(clockid={:?}) => deterministic timer id {}, signal {:?}",
             guest.thread_state().dettid,
             clockid,
             id,
+            signal,
         );
         Ok(0)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
     /// timer_settime: arm or disarm a timer against the deterministic virtual
     /// clock. The old arming is reported through `old_value` when requested.
     pub async fn handle_timer_settime<G: Guest<Self>>(
@@ -429,11 +452,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(now + Duration::from_nanos(value_ns))
         };
 
-        let old = {
+        let (old, signal_number) = {
             let mut timers = guest.thread_state().posix_timers.lock().unwrap();
-            timers.settime(id, interval_ns, deadline, now)
+            let old = timers.settime(id, interval_ns, deadline, now);
+            let signal = timers.signal(id);
+            (old, signal)
         };
         let (old_remaining_ns, old_interval_ns) = old.ok_or(Errno::EINVAL)?;
+        let signal_number = signal_number.ok_or(Errno::EINVAL)?;
 
         if let Some(old_ptr) = call.old_value() {
             let old_spec = libc::itimerspec {
@@ -443,8 +469,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest.memory().write_value(old_ptr, &old_spec)?;
         }
 
+        if let Some(signal) = signal_number.and_then(|signum| Signal::try_from(signum).ok()) {
+            register_posix_timer(
+                guest,
+                id,
+                deadline,
+                LogicalTime::from_nanos(interval_ns),
+                signal,
+            )
+            .await;
+        }
+
         detlog!(
-            "[dtid {}] timer_settime(id={}, interval_ns={}, value_ns={}) armed against virtual clock (not delivered)",
+            "[dtid {}] timer_settime(id={}, interval_ns={}, value_ns={}) armed against virtual clock",
             guest.thread_state().dettid,
             id,
             interval_ns,
@@ -476,8 +513,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
-    /// timer_getoverrun: we never deliver expirations, so the overrun count is
-    /// always 0 for a live timer.
+    /// timer_getoverrun: coalesced expiration accounting is not modeled, so the
+    /// overrun count is always 0 for a live timer.
     pub async fn handle_timer_getoverrun<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -497,6 +534,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
     /// timer_delete: destroy a timer created by `timer_create`.
     pub async fn handle_timer_delete<G: Guest<Self>>(
         &self,
@@ -504,11 +543,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::TimerDelete,
     ) -> Result<i64, Error> {
         let id = call.timerid();
+        let signal_number = guest
+            .thread_state()
+            .posix_timers
+            .lock()
+            .unwrap()
+            .signal(id)
+            .ok_or(Errno::EINVAL)?;
         let existed = {
             let mut timers = guest.thread_state().posix_timers.lock().unwrap();
             timers.remove(id)
         };
         if existed {
+            if let Some(signal) = signal_number.and_then(|signum| Signal::try_from(signum).ok()) {
+                register_posix_timer(guest, id, None, LogicalTime::ZERO, signal).await;
+            }
             detlog!(
                 "[dtid {}] timer_delete(id={})",
                 guest.thread_state().dettid,

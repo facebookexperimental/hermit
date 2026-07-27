@@ -1944,9 +1944,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#663)
                 Syscall::Setrlimit(s) => self.handle_setrlimit(guest, s).await,
 
-                // POSIX per-process timers. Arming is tracked against the virtual
-                // clock so these verify deterministically under --strict; timer
-                // expiration signals are not delivered (see handle_timer_create).
+                // POSIX per-process timers use the virtual clock and scheduler
+                // for deterministic arming and supported signal delivery.
                 Syscall::TimerCreate(s) => self.handle_timer_create(guest, s).await,
                 Syscall::TimerSettime(s) => self.handle_timer_settime(guest, s).await,
                 Syscall::TimerGettime(s) => self.handle_timer_gettime(guest, s).await,

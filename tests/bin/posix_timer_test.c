@@ -9,11 +9,9 @@
 /*
  * Regression probe for SIGEV_SIGNAL delivery from POSIX timers.
  *
- * Detcore currently tracks timer_create/timer_settime state under --strict,
- * but does not deliver the configured signal when the timer expires. Keep the
- * wait bounded: native Linux should handle SIGALRM after 10 ms and exit zero,
- * while the current strict Hermit run reaches the 100 ms virtual-time deadline
- * and reports the missing signal instead of hanging.
+ * Keep the wait bounded: native Linux and strict Hermit should handle SIGALRM
+ * after 10 ms and exit zero. The upper deadline turns a missing scheduler
+ * delivery into a prompt regression failure instead of a hang.
  */
 
 #define _POSIX_C_SOURCE 200809L

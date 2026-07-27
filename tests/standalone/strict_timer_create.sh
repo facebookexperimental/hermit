@@ -13,11 +13,9 @@
 # second blocker, membarrier, appeared right after.
 #
 # Detcore now emulates timer_create/timer_settime/timer_gettime/timer_getoverrun/
-# timer_delete (arming tracked against the virtual clock; expiration signals are
-# not delivered) and treats membarrier as a no-op (guest threads are serialized
-# onto one logical CPU, so barriers are trivially satisfied). This test guards
-# that a program using the timer family runs to completion AND verifies as
-# deterministic under --strict, with no GLIBC_TUNABLES workaround.
+# timer_delete, including supported SIGEV_SIGNAL delivery against virtual time,
+# and periodic ITIMER_REAL delivery. This test guards both timer state and
+# signal delivery under --strict, with no GLIBC_TUNABLES workaround.
 #
 # It compiles a tiny self-contained C guest so it does not depend on a system
 # Python being present. If a C compiler is unavailable it is skipped.
@@ -39,7 +37,9 @@ if ! command -v "$cc_bin" > /dev/null 2>&1; then
 fi
 
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-src="$here/../c/timer_create_determinism.c"
+state_src="$here/../c/timer_create_determinism.c"
+signal_src="$here/../bin/posix_timer_test.c"
+periodic_src="$here/../c/periodic_setitimer_delivery.c"
 
 work=$(mktemp -d strict_timer_test_XXXXXXX)
 function on_exit {
@@ -47,18 +47,24 @@ function on_exit {
 }
 trap on_exit EXIT
 
-guest="$work/timer_guest"
+state_guest="$work/timer_state_guest"
+signal_guest="$work/timer_signal_guest"
+periodic_guest="$work/periodic_setitimer_guest"
 # -lrt is a no-op on glibc >= 2.34 (timer_* live in libc) but keeps older glibc
 # happy.
-"$cc_bin" -O2 -o "$guest" "$src" -lrt
+"$cc_bin" -O2 -o "$state_guest" "$state_src" -lrt
+"$cc_bin" -std=c11 -O2 -Wall -Wextra -Werror -o "$signal_guest" "$signal_src" -lrt
+"$cc_bin" -std=c11 -O2 -Wall -Wextra -Werror -o "$periodic_guest" "$periodic_src"
 
-if "$hermit" run --strict --verify -- "$guest" < /dev/null 2>&1 \
-    | grep -q "Determinism verified"; then
-    echo "ok: timer family verified deterministic under --strict"
-else
-    echo "FAIL: timer guest did not verify deterministic under --strict"
-    "$hermit" run --strict --verify -- "$guest" < /dev/null 2>&1 | tail -20
-    exit 1
-fi
+for guest in "$state_guest" "$signal_guest" "$periodic_guest"; do
+    if "$hermit" run --strict --verify -- "$guest" < /dev/null 2>&1 \
+        | grep -q "Determinism verified"; then
+        echo "ok: $(basename "$guest") verified deterministic under --strict"
+    else
+        echo "FAIL: $(basename "$guest") did not verify deterministic under --strict"
+        "$hermit" run --strict --verify -- "$guest" < /dev/null 2>&1 | tail -20
+        exit 1
+    fi
+done
 
 echo "Test succeeded."

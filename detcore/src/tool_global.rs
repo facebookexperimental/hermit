@@ -584,10 +584,11 @@ impl GlobalTool for GlobalState {
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#663)
-            GlobalRequest::RegisterAlarm(dpid, dtid, duration, sig) => {
+            // TODO-HUMAN-REVIEW(#869)
+            GlobalRequest::RegisterAlarm(dpid, dtid, duration, interval, sig) => {
                 let now = self.global_time.lock().unwrap().as_nanos();
                 let remaining = self
-                    .recv_register_alarm(dpid, dtid, now, duration, sig)
+                    .recv_register_alarm(dpid, dtid, now, duration, interval, sig)
                     .await;
                 R::RegisterAlarm(remaining)
             }
@@ -596,6 +597,13 @@ impl GlobalTool for GlobalState {
             GlobalRequest::AlarmRemaining(dpid) => {
                 let now = self.global_time.lock().unwrap().as_nanos();
                 R::AlarmRemaining(self.sched.lock().unwrap().alarm_remaining(dpid, now))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#869)
+            GlobalRequest::RegisterPosixTimer(dpid, dtid, timer_id, deadline, interval, sig) => {
+                self.recv_register_posix_timer(dpid, dtid, timer_id, deadline, interval, sig)
+                    .await;
+                R::RegisterPosixTimer(())
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#663)
@@ -1216,6 +1224,7 @@ impl GlobalState {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
+    // TODO-HUMAN-REVIEW(#869)
     /// Register an alarm (delayed signal delivery) with the global scheduler.
     pub async fn recv_register_alarm(
         &self,
@@ -1223,12 +1232,31 @@ impl GlobalState {
         dettid: DetTid,
         now: LogicalTime,
         duration: LogicalTime,
+        interval: LogicalTime,
         sig: SigWrapper,
-    ) -> LogicalTime {
+    ) -> (LogicalTime, LogicalTime) {
         self.sched
             .lock()
             .unwrap()
-            .register_alarm(detpid, dettid, now, duration, sig.0)
+            .register_alarm(detpid, dettid, now, duration, interval, sig.0)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
+    /// Register, re-arm, or disarm a POSIX timer in the global scheduler.
+    pub async fn recv_register_posix_timer(
+        &self,
+        detpid: DetPid,
+        dettid: DetTid,
+        timer_id: i32,
+        deadline: Option<LogicalTime>,
+        interval: LogicalTime,
+        sig: SigWrapper,
+    ) {
+        self.sched
+            .lock()
+            .unwrap()
+            .register_posix_timer(detpid, dettid, timer_id, deadline, interval, sig.0);
     }
 }
 
@@ -1297,8 +1325,21 @@ pub enum GlobalRequest {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
+    // TODO-HUMAN-REVIEW(#869)
     /// Basically performs an alarm syscall, takes a logical duration.
-    RegisterAlarm(DetPid, DetTid, LogicalTime, SigWrapper),
+    RegisterAlarm(DetPid, DetTid, LogicalTime, LogicalTime, SigWrapper),
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
+    /// Register, re-arm, or disarm one POSIX timer.
+    RegisterPosixTimer(
+        DetPid,
+        DetTid,
+        i32,
+        Option<LogicalTime>,
+        LogicalTime,
+        SigWrapper,
+    ),
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query RPC.
@@ -1346,7 +1387,11 @@ pub enum GlobalResponse {
     TraceSchedEvent(TraceSchedEventResponse),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
-    RegisterAlarm(LogicalTime),
+    // TODO-HUMAN-REVIEW(#869)
+    RegisterAlarm((LogicalTime, LogicalTime)),
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#869)
+    RegisterPosixTimer(()),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query RPC.
     AlarmRemaining(LogicalTime),
@@ -1870,9 +1915,15 @@ where
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#663)
+// TODO-HUMAN-REVIEW(#869)
 /// Register an alarm (delayed signal delivery) with the global scheduler.
 /// Returns the logical duration remaining until any previously scheduled alarm.
-pub async fn register_alarm<G, T>(guest: &mut G, duration: LogicalTime, sig: Signal) -> LogicalTime
+pub async fn register_alarm<G, T>(
+    guest: &mut G,
+    duration: LogicalTime,
+    interval: LogicalTime,
+    sig: Signal,
+) -> (LogicalTime, LogicalTime)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -1881,7 +1932,7 @@ where
     let detpid = guest.thread_state().detpid.expect("detpid unset");
     let resp = send_and_update_time(
         guest,
-        GlobalRequest::RegisterAlarm(detpid, dettid, duration, SigWrapper(sig)),
+        GlobalRequest::RegisterAlarm(detpid, dettid, duration, interval, SigWrapper(sig)),
     )
     .await;
     match resp.1 {
@@ -1902,6 +1953,39 @@ where
     let resp = send_and_update_time(guest, GlobalRequest::AlarmRemaining(detpid)).await;
     match resp.1 {
         GlobalResponse::AlarmRemaining(remaining) => remaining,
+        _ => unreachable!(),
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#869)
+/// Register, re-arm, or disarm a POSIX timer with the global scheduler.
+pub async fn register_posix_timer<G, T>(
+    guest: &mut G,
+    timer_id: i32,
+    deadline: Option<LogicalTime>,
+    interval: LogicalTime,
+    sig: Signal,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let dettid = guest.thread_state().dettid;
+    let detpid = guest.thread_state().detpid.expect("detpid unset");
+    let resp = send_and_update_time(
+        guest,
+        GlobalRequest::RegisterPosixTimer(
+            detpid,
+            dettid,
+            timer_id,
+            deadline,
+            interval,
+            SigWrapper(sig),
+        ),
+    )
+    .await;
+    match resp.1 {
+        GlobalResponse::RegisterPosixTimer(()) => {}
         _ => unreachable!(),
     }
 }

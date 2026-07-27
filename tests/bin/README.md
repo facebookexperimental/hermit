@@ -111,18 +111,17 @@ Native Linux delivers the signal and exits 0:
 PASS: SIGALRM delivered after POSIX timer expiration
 ```
 
-The current ptrace backend does not synthesize the configured signal when the
-emulated timer expires. With default logging and no relaxations, this command:
+The ptrace backend synthesizes the configured signal when the virtual timer
+expires. With default logging and no relaxations, this command:
 
 ```sh
 target/release/hermit run --strict -- ./posix_timer_test
 ```
 
-exits 1 after advancing past the bounded virtual-time deadline:
+exits 0 and prints:
 
 ```text
-FAIL: SIGALRM was not delivered within 100 ms of virtual time
+PASS: SIGALRM delivered after POSIX timer expiration
 ```
 
-The expected failure should become a success assertion when deterministic
-`SIGEV_SIGNAL` delivery is implemented.
+The bounded failure path remains in the guest to catch lost timer events.
