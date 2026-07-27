@@ -1,6 +1,0 @@
-metric	unit	ptrace	kvm	kvm_advantage
-syscall_interception	ns/call	562656.3332999999	10069.046000000002	55.87980562408791
-pipe_boundary	ns/boundary	576221.1100000001	25306.051499999994	22.770091572760776
-syscall_host_context_switches	switches/call	6.0144	0.0001	60144.0
-pipe_host_context_switches	switches/boundary	6.0185	0.0005	12037.0
-cat_throughput	MiB/s	73.61610250652109	136.31002508862687	1.851633276517895

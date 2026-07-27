@@ -261,19 +261,11 @@ if [[ $run_rr -eq 1 && $rr_count -gt 0 ]]; then
     rm -f "$rr_log"
 fi
 
-# OSS apps: detect integration tests and experiment evidence dirs.
+# OSS apps: detect integration tests.
 declare -a oss_apps=()
 for t in leveldb redis_strict sqlite_veryquick python_stdlib language_runtime_determinism; do
     [[ -f "$repo_root/hermit-cli/tests/$t.rs" ]] && oss_apps+=("test:$t")
 done
-if [[ -d "$repo_root/experiments" ]]; then
-    for d in "$repo_root"/experiments/*/; do
-        base=$(basename "$d")
-        case "$base" in
-            lulesh*|ninja*|leveldb*|redis*|sqlite*) oss_apps+=("experiment:$base") ;;
-        esac
-    done
-fi
 oss_count=${#oss_apps[@]}
 
 # ---------------------------------------------------------------------------

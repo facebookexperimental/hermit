@@ -106,7 +106,7 @@ fn run_deterministic_workload(
     mode: &str,
     iteration: usize,
 ) -> Output {
-    let workload = repository().join("experiments/redis-strict/workload.sh");
+    let workload = repository().join("hermit-cli/tests/fixtures/redis-strict/workload.sh");
     let instance = format!("cargo-{}-{iteration}", std::process::id());
     let port = unused_loopback_port();
     // Compatibility workloads keep deterministic defaults while normal mode reports any
@@ -241,7 +241,7 @@ fn redis_workload_refuses_to_control_a_preexisting_server() {
         .trim()
         .to_owned();
 
-    let workload = repository().join("experiments/redis-strict/workload.sh");
+    let workload = repository().join("hermit-cli/tests/fixtures/redis-strict/workload.sh");
     let output = Command::new("/bin/sh")
         .arg(workload)
         .arg(&redis_server)
@@ -282,7 +282,7 @@ fn redis_workload_refuses_to_control_a_preexisting_server() {
 #[ignore = "downloads and builds pinned Redis, then runs the extended strict suite"]
 fn redis_source_build_and_extended_suite_under_strict_hermit() {
     let _guard = hermit_redis_lock();
-    let runner = repository().join("experiments/redis-strict/run.sh");
+    let runner = repository().join("hermit-cli/tests/fixtures/redis-strict/run.sh");
     let mut command = Command::new("timeout");
     command
         .arg("900")

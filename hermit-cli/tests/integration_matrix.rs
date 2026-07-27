@@ -157,12 +157,12 @@ fn fixture() -> Fixture {
         .expect("failed to write basic command fixture");
     fs::write(
         root.join("node_worker.js"),
-        include_str!("../../experiments/shared-futex-verify_20260722/node_worker.js"),
+        include_str!("../../tests/shared-futex-verify/node_worker.js"),
     )
     .expect("failed to write Node.js fixture");
     fs::write(
         root.join("Threaded.java"),
-        include_str!("../../experiments/shared-futex-verify_20260722/Threaded.java"),
+        include_str!("../../tests/shared-futex-verify/Threaded.java"),
     )
     .expect("failed to write Java fixture");
     fs::write(

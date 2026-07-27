@@ -984,7 +984,7 @@ fn run_kvm_cpuid_policy_is_deterministic() {
     let binary = build_root.join("cpuid_probe");
     let compile = Command::new(compiler)
         .args(["-O2", "-g", "-std=c11", "-Wall", "-Wextra", "-Werror"])
-        .arg(repository.join("experiments/backend-parity_20260722/fixtures/cpuid_probe.c"))
+        .arg(repository.join("tests/backend-parity/fixtures/cpuid_probe.c"))
         .arg("-o")
         .arg(&binary)
         .output()

@@ -49,7 +49,7 @@ initramfs, starts QEMU under Hermit, and requires the kernel marker before the
 90-second host timeout:
 
 ```bash
-./experiments/qemu-boot-debug/smoke_test.sh
+./tests/qemu-boot/smoke_test.sh
 ```
 
 It writes the initramfs and console log under `target/qemu-boot-smoke/`. Set
@@ -60,7 +60,7 @@ KERNEL_IMAGE=/path/to/arch/x86/boot/bzImage \
 QEMU_BIN=/path/to/qemu-system-x86_64 \
 HERMIT_BIN=target/release/hermit \
 QEMU_BOOT_TIMEOUT_SECONDS=90 \
-  ./experiments/qemu-boot-debug/smoke_test.sh
+  ./tests/qemu-boot/smoke_test.sh
 ```
 
 The test passes only when QEMU exits successfully, the console contains
@@ -98,8 +98,8 @@ the current evidence does not claim L2.
 Do not add `--no-sequentialize-threads` or disable preemption when evaluating
 the strict profile. Those options select the compatibility profile below.
 
-The source-revisioned trace analysis is in
-[`STRICT_BOOT_20260723.md`](../experiments/qemu-boot-debug/STRICT_BOOT_20260723.md).
+The source-revisioned trace analysis is preserved in the parent workspace's
+[`STRICT_BOOT_20260723.md`](https://github.com/rrnewton/dev-hermit/blob/main/experiments/hermit-experiments-migration_20260727/qemu-boot-debug/STRICT_BOOT_20260723.md).
 
 ## Fast compatibility command
 
@@ -261,7 +261,7 @@ manually from the repository root with:
 out=target/qemu-boot-smoke
 mkdir -p "$out/initramfs-root"
 gcc -Os -nostdlib -static -fno-stack-protector -fno-pie -no-pie \
-  experiments/shared-futex-verify_20260722/qemu_init.c \
+  tests/shared-futex-verify/qemu_init.c \
   -o "$out/initramfs-root/init"
 (
   cd "$out/initramfs-root"
@@ -296,10 +296,10 @@ reboot: Power down
 
 ## Evidence
 
-The preserved experiment in
-[`experiments/qemu-boot-debug/`](../experiments/qemu-boot-debug/) contains the
+The preserved experiment in the parent workspace's
+[`qemu-boot-debug/`](https://github.com/rrnewton/dev-hermit/tree/main/experiments/hermit-experiments-migration_20260727/qemu-boot-debug) contains the
 original six-mode comparison plus the strict current-main follow-up. The fast
 compatibility row is `virtual_minimal_fixed_icount`; the strict L1 row is
 `strict_current_main_ppoll` in
-[`results.csv`](../experiments/qemu-boot-debug/results.csv). Large raw traces
+[`results.csv`](https://github.com/rrnewton/dev-hermit/blob/main/experiments/hermit-experiments-migration_20260727/qemu-boot-debug/results.csv). Large raw traces
 and console logs are intentionally excluded.

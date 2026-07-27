@@ -28,7 +28,7 @@ fn compression_tools_are_deterministic_under_strict_hermit() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository root");
-    let runner = repo_root.join("experiments/compression/run.sh");
+    let runner = repo_root.join("hermit-cli/tests/fixtures/compression/run.sh");
     let artifact_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("compression");
     if artifact_root.exists() {
         fs::remove_dir_all(&artifact_root).expect("failed to remove stale compression artifacts");

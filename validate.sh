@@ -805,7 +805,7 @@ function run_full_backend_gates {
     if ! backend_selector_supported; then
         note_backend_skip "KVM/DBI" "backend selector is unavailable"
         run_check "Real backend compatibility matrix" \
-            python3 experiments/backend-parity_20260722/run_matrix.py \
+            python3 tests/backend-parity/run_matrix.py \
             "${backends[@]}" --probe-gaps --output "$BACKEND_COMPAT_RESULTS"
         return
     fi
@@ -823,7 +823,7 @@ function run_full_backend_gates {
     fi
 
     run_check "Real backend compatibility matrix" \
-        python3 experiments/backend-parity_20260722/run_matrix.py \
+        python3 tests/backend-parity/run_matrix.py \
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
     run_check "LiteInst backend smoke" liteinst_backend_available
@@ -2892,14 +2892,10 @@ function apply_locally_validated_label {
 }
 
 # fbsource import lints require the Meta copyright header on every imported Rust
-# source file. experiments/ is durable local research and is not imported to
-# fbsource, so it is exempt. `head -n 8` permits a rust-script shebang first.
+# source file. `head -n 8` permits a rust-script shebang first.
 function check_copyright_headers {
     local missing=0 f
     while IFS= read -r f; do
-        case "$f" in
-            experiments/*) continue ;;
-        esac
         if ! head -n 8 "$f" | grep -q 'Copyright (c) Meta Platforms'; then
             printf '  missing Meta copyright header: %s\n' "$f"
             missing=$((missing + 1))
@@ -3007,7 +3003,7 @@ function run_hosted_only_suite {
     run_check "Portable command strict verification" cargo test -p hermit --test command_strict_verify -- --ignored --test-threads=1
     run_check "Portable ignored syscall regressions" cargo test -p hermit --test epoll_determinism --test rcx_canonicalization -- --ignored --test-threads=1
     run_check "rr suite source contract" cargo test -p hermit --test rr_suite rr_scratch_directories_are_fresh_and_cleaned -- --exact
-    run_check "DynamoRIO DBI backend parity" python3 experiments/backend-parity_20260722/run_matrix.py --backend dbi --require-backend
+    run_check "DynamoRIO DBI backend parity" python3 tests/backend-parity/run_matrix.py --backend dbi --require-backend
     run_check "Portable working-envelope levels" run_hosted_envelope_levels
 
     run_check_with_timeout 1200 "Strict compatibility envelope" run_strict_compatibility_envelope
@@ -3099,7 +3095,7 @@ function run_hardware_validation {
     run_check "Record/replay working-envelope level" run_hardware_envelope_record_replay
     run_check "Record/replay compatibility baseline" run_rr_compatibility_envelope
     run_check "Debugger integration tests" ./tests/debugger/run_debugger_tests.sh
-    run_check "Ptrace backend parity" python3 experiments/backend-parity_20260722/run_matrix.py --backend ptrace
+    run_check "Ptrace backend parity" python3 tests/backend-parity/run_matrix.py --backend ptrace
 
     print_summary
     ((failures == 0))
@@ -3344,7 +3340,7 @@ if ((QEMU_L2_ONLY == 1)); then
         cargo build --release -p hermit
     if ((failures == 0)); then
         run_check "QEMU strict L2 boot (heavyweight)" \
-            ./experiments/qemu-boot-debug/strict_l2_test.sh
+            ./tests/qemu-boot/strict_l2_test.sh
     fi
     print_summary
     ((failures == 0))

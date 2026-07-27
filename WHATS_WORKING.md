@@ -427,7 +427,7 @@ Notes:
   `--no-virtualize-cpuid` (CPUID faulting on this host), `-icount shift=0,sleep=off` (single
   instruction-derived guest clock; the alternative is Hermit-side `--no-virtualize-time
   --no-virtualize-metadata`).
-- Corroborated by the preserved experiment `experiments/qemu-boot-debug/results.csv`, row
+- Corroborated by the [preserved parent-workspace experiment](https://github.com/rrnewton/dev-hermit/blob/main/experiments/hermit-experiments-migration_20260727/qemu-boot-debug/results.csv), row
   `virtual_minimal_fixed_icount` → `complete_boot`, `exit 0`, coherent `1000.031MHz` clock.
 - Under strict, Hermit prints an explicit VMM warning (mutually-inconsistent RDTSC vs
   virtualized `clock_gettime` can corrupt guest clock calibration).

@@ -74,7 +74,7 @@ fn sqlite_veryquick_is_deterministic_under_strict_hermit() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository root");
-    let runner = repo_root.join("experiments/sqlite-veryquick/run.sh");
+    let runner = repo_root.join("hermit-cli/tests/fixtures/sqlite-veryquick/run.sh");
     let hermit =
         std::env::var_os("HERMIT_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_hermit").into());
     let artifact_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("sqlite-veryquick");

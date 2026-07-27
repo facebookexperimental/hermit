@@ -253,7 +253,7 @@
     {
       "group": "ptrace", "job": "parity",
       "desc": "Ptrace backend parity matrix",
-      "cmd": "python3 experiments/backend-parity_20260722/run_matrix.py --backend ptrace",
+      "cmd": "python3 tests/backend-parity/run_matrix.py --backend ptrace",
       "deps": ["build.workspace"],
       "timeout": 1800,
       "hint": {"resources": {"pmu": 1}, "est_duration_s": 300,

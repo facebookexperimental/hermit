@@ -204,7 +204,7 @@
     {
       "group": "test", "job": "dbi_parity",
       "desc": "DynamoRIO DBI backend parity matrix",
-      "cmd": "python3 experiments/backend-parity_20260722/run_matrix.py --backend dbi --require-backend",
+      "cmd": "python3 tests/backend-parity/run_matrix.py --backend dbi --require-backend",
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,

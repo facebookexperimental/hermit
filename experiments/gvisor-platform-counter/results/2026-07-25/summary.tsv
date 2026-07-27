@@ -1,4 +1,0 @@
-backend	samples	counted_syscalls	median_wall_ns	median_wall_ns_per_count	median_platform_switch_ns	median_switch_ns_per_count	profile
-systrap	5	100001	838128817	8381.20435795642	821488300	8214.80085199148	opt
-kvm	5	100001	316140049	3161.368876311237	93823041	938.2210277897221	opt
-reverie	5	100002	3311500428	33114.34199316014			debug
