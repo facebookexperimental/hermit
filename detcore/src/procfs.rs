@@ -86,6 +86,9 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-961): Review proc netlink identity normalization.
     NetlinkSockets,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-960): Review per-CPU host interrupt normalization.
+    IrqPerCpuCount,
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -381,6 +384,9 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-941): Review transparent-hugepage counter normalization.
             other if is_thp_counter_path(Path::new(other)) => ProcfsKind::ThpCounter,
             // TODO-HUMAN-REVIEW(PR-963): Review sysfs RTC clock normalization.
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-960): Review per-CPU host interrupt normalization.
+            _ if is_irq_per_cpu_count_path(&path) => ProcfsKind::IrqPerCpuCount,
             _ => sysfs_rtc_kind(&path)?,
         };
         Some(Self {
@@ -416,6 +422,7 @@ impl ProcfsFile {
             ProcfsKind::BlockStat => sanitize_block_stat(&contents),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::IrqPerCpuCount => sanitize_irq_per_cpu_count(&contents),
             ProcfsKind::PtyNr => sanitize_pty_nr(&contents),
             ProcfsKind::SelfSched => sanitize_self_sched(&contents),
             ProcfsKind::Fdinfo => sanitize_fdinfo(&contents),
@@ -1341,6 +1348,49 @@ fn parse_decimal(field: &str) -> Option<u64> {
     field.parse().ok()
 }
 
+fn is_irq_per_cpu_count_path(path: &Path) -> bool {
+    if path.file_name().and_then(|leaf| leaf.to_str()) != Some("per_cpu_count") {
+        return false;
+    }
+    let Some(irq_directory) = path.parent() else {
+        return false;
+    };
+    let Some(irq) = irq_directory.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    !irq.is_empty()
+        && irq.bytes().all(|byte| byte.is_ascii_digit())
+        && irq_directory.parent() == Some(Path::new("/sys/kernel/irq"))
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-960): Review the /sys/kernel/irq/<IRQ>/per_cpu_count field policy.
+fn sanitize_irq_per_cpu_count(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let has_newline = text.ends_with('\n');
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    if body.contains('\n') {
+        return contents.to_vec();
+    }
+
+    let fields = body.split(',').collect::<Vec<_>>();
+    if fields.is_empty()
+        || fields
+            .iter()
+            .any(|field| field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return contents.to_vec();
+    }
+
+    let mut normalized = vec!["0"; fields.len()].join(",").into_bytes();
+    if has_newline {
+        normalized.push(b'\n');
+    }
+    normalized
+}
+
 fn sockstat_field(fields: &[String], name: &str) -> Option<String> {
     let index = fields.iter().position(|field| field == name)?;
     fields.get(index + 1).cloned()
@@ -2211,6 +2261,17 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Sockstat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/sys/kernel/irq/254/per_cpu_count"))
+                .unwrap()
+                .kind,
+            ProcfsKind::IrqPerCpuCount
+        );
+        assert!(ProcfsFile::from_path(Path::new("/sys/kernel/irq/irq254/per_cpu_count")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("/sys/kernel/irq/254/actions")).is_none());
+        assert!(
+            ProcfsFile::from_path(Path::new("/sys/kernel/irq/254/device/per_cpu_count")).is_none()
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/sys/kernel/pty/nr"))
@@ -3359,6 +3420,27 @@ total_commit_ms 0\n"
             b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n000000001234abcd 4 10 00000001 0 0 0 2 0 12345 extra\n",
         ] {
             assert_eq!(sanitize_netlink_sockets(malformed), malformed);
+        }
+    }
+
+    #[test]
+    fn irq_per_cpu_count_hides_host_interrupt_totals() {
+        assert_eq!(
+            sanitize_irq_per_cpu_count(b"0,17,0,983421,0\n"),
+            b"0,0,0,0,0\n"
+        );
+        assert_eq!(sanitize_irq_per_cpu_count(b"42,0"), b"0,0");
+    }
+
+    #[test]
+    fn irq_per_cpu_count_leaves_unknown_formats_untouched() {
+        for contents in [
+            b"".as_slice(),
+            b"1,,2\n".as_slice(),
+            b"1,2,three\n".as_slice(),
+            b"1,2\n3,4\n".as_slice(),
+        ] {
+            assert_eq!(sanitize_irq_per_cpu_count(contents), contents);
         }
     }
 
