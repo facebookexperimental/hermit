@@ -136,6 +136,17 @@ pub fn is_unsupported_syscall(sysno: Sysno) -> bool {
     )
 }
 
+/// Returns whether `sysno` is a kernel-keyring syscall (`add_key`,
+/// `request_key`, `keyctl`) that Detcore hides behind a deterministic
+/// `CONFIG_KEYS`-absent boundary under strict mode.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-916): Exposed so the copied-DBI-child policy can preserve
+// the same keyring isolation boundary that the reclassification (PR-848) moved
+// out of the Unsupported set.
+pub fn is_kernel_keyring_syscall(sysno: Sysno) -> bool {
+    syscall_classification::is_kernel_keyring_syscall(sysno)
+}
+
 use tool_local::PosixTimers;
 use tool_local::ProcessCpuTime;
 pub use tool_local::ThreadState;
@@ -158,7 +169,6 @@ use crate::syscall_classification::is_credential_identity_noop_syscall;
 use crate::syscall_classification::is_futex2_enosys_syscall;
 use crate::syscall_classification::is_host_kernel_probe_syscall;
 use crate::syscall_classification::is_host_security_identity_probe_syscall;
-use crate::syscall_classification::is_kernel_keyring_syscall;
 use crate::syscall_classification::is_landlock_sandbox_syscall;
 use crate::syscall_classification::is_mount_introspection_enosys_syscall;
 use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
@@ -1388,8 +1398,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-848): Hide unmodeled shared keyrings and
             // request-key upcalls behind the portable CONFIG_KEYS-absent errno.
+            // TODO-HUMAN-REVIEW(PR-916): Only fail closed under the strict
+            // (panic-on-unsupported) policy. A non-strict run keeps the pre-848
+            // host pass-through so the guest observes a real working keyring;
+            // this restores the enabled rr `keyctl` compatibility test, whose
+            // guest asserts add_key + keyctl(SETPERM) succeed. Under strict mode
+            // the deterministic ENOSYS boundary is preserved.
             SyscallClassification::Determinized if is_kernel_keyring_syscall(call.number()) => {
-                Err(Error::Errno(Errno::ENOSYS))
+                if config.panic_on_unsupported_syscalls {
+                    Err(Error::Errno(Errno::ENOSYS))
+                } else {
+                    self.passthrough(guest, call).await
+                }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-855): Strict runs cannot expose unmodeled

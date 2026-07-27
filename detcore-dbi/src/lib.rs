@@ -909,7 +909,22 @@ pub unsafe extern "C" fn reverie_dbi_runtime_exec_failed(_scratch: *mut c_void, 
 /// Applies unsupported-syscall policy in a copied pre-exec DBI child.
 #[unsafe(no_mangle)]
 pub extern "C" fn reverie_dbi_runtime_copied_syscall(sysnum: i64) -> i32 {
-    if !detcore::is_unsupported_syscall(Sysno::from(sysnum as i32)) {
+    let sysno = Sysno::from(sysnum as i32);
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-916): Preserve the kernel-keyring isolation boundary
+    // in copied pre-exec DBI children. These children run no Rust Detcore Tool,
+    // so a Determinized keyring syscall would otherwise execute natively and
+    // mutate host keyrings or trigger request-key upcalls. Under the strict
+    // fail-closed policy, refuse it exactly as the pre-848 Unsupported
+    // classification did (return 1 -> exit the isolated runtime tree). In
+    // non-strict runs fall through to native pass-through, matching the root
+    // process's non-strict keyring behavior.
+    if detcore::is_kernel_keyring_syscall(sysno)
+        && COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire)
+    {
+        return 1;
+    }
+    if !detcore::is_unsupported_syscall(sysno) {
         return 0;
     }
     if COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire) {
@@ -1243,6 +1258,35 @@ mod tests {
         ] {
             assert!(!requires_native_lifecycle(sysnum));
         }
+    }
+
+    // TODO-HUMAN-REVIEW(PR-916): Regression for the copied-DBI-child keyring
+    // isolation boundary. A copied pre-exec child runs no Rust Detcore Tool, so
+    // the gate must refuse the (now Determinized) keyring family in strict mode
+    // rather than let it execute natively against the host keyring.
+    #[test]
+    fn copied_child_refuses_keyring_syscalls_under_strict() {
+        let saved = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+
+        // Strict (panic-on-unsupported): keyring syscalls are refused so the
+        // copied child cannot mutate host keyrings or trigger request-key
+        // upcalls. `1` tells the native client to exit the isolated runtime
+        // tree (fail closed), matching the pre-848 Unsupported behavior.
+        COPIED_PANIC_ON_UNSUPPORTED.store(true, Ordering::Release);
+        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_keyctl), 1);
+        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_add_key), 1);
+        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_request_key), 1);
+        // A supported syscall still runs natively even under strict mode.
+        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_getpid), 0);
+
+        // Non-strict: keyring syscalls fall through to native pass-through,
+        // matching the root process's non-strict keyring behavior.
+        COPIED_PANIC_ON_UNSUPPORTED.store(false, Ordering::Release);
+        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_keyctl), 0);
+        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_add_key), 0);
+        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_request_key), 0);
+
+        COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
     }
 
     #[test]
