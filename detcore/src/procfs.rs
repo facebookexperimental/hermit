@@ -27,6 +27,7 @@ enum ProcfsKind {
     BlockStat,
     ScalingCurFreq,
     Sockstat,
+    NumaMaps,
     SmapsRollup,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-944): Review AVX-512 elapsed-time normalization.
@@ -147,6 +148,9 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-934): Review host NUMA observation normalization.
+            "/proc/self/numa_maps" => ProcfsKind::NumaMaps,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-937): Review smaps rollup accounting normalization.
             "/proc/self/smaps_rollup" => ProcfsKind::SmapsRollup,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -244,6 +248,7 @@ impl ProcfsFile {
             ProcfsKind::BlockStat => sanitize_block_stat(&contents),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::NumaMaps => sanitize_numa_maps(&contents),
             ProcfsKind::SmapsRollup => sanitize_smaps_rollup(&contents),
             ProcfsKind::ArchStatus => sanitize_arch_status(&contents),
             ProcfsKind::Swaps => sanitize_swaps(&contents),
@@ -800,6 +805,50 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-934): Review the /proc/self/numa_maps field policy.
+fn sanitize_numa_maps(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let mut normalized = Vec::with_capacity(contents.len());
+    let mut row_count = 0;
+
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let fields = body.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 2 || u64::from_str_radix(fields[0], 16).is_err() {
+            return contents.to_vec();
+        }
+
+        let mut kept = Vec::with_capacity(fields.len());
+        for field in fields {
+            if let Some(value) = field
+                .strip_prefix("active=")
+                .or_else(|| field.strip_prefix("mapmax="))
+            {
+                if value.parse::<u64>().is_err() {
+                    return contents.to_vec();
+                }
+            } else {
+                kept.push(field);
+            }
+        }
+        normalized.extend_from_slice(kept.join(" ").as_bytes());
+        if has_newline {
+            normalized.push(b'\n');
+        }
+        row_count += 1;
+    }
+
+    if row_count == 0 {
+        contents.to_vec()
+    } else {
+        normalized
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-937): Review the /proc/self/smaps_rollup field policy.
 fn sanitize_smaps_rollup(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
@@ -1254,6 +1303,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Sockstat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/numa_maps"))
+                .unwrap()
+                .kind,
+            ProcfsKind::NumaMaps
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/self/smaps_rollup"))
@@ -1877,6 +1932,27 @@ Pss:\t0 kB\n\
 Pss_File:\t0 kB\n\
 THPeligible:    0\n"
         );
+    }
+
+    #[test]
+    fn numa_maps_hides_host_page_aging_and_sharing_maxima() {
+        let contents = b"71000000 default anon=1 dirty=1 active=0 N0=1 kernelpagesize_kB=4\n\
+7ffff7c00000 default file=/usr/lib64/libc.so.6 mapped=41 mapmax=443 N0=41 kernelpagesize_kB=4\n";
+
+        assert_eq!(
+            sanitize_numa_maps(contents),
+            b"71000000 default anon=1 dirty=1 N0=1 kernelpagesize_kB=4\n\
+7ffff7c00000 default file=/usr/lib64/libc.so.6 mapped=41 N0=41 kernelpagesize_kB=4\n"
+        );
+    }
+
+    #[test]
+    fn numa_maps_leaves_unknown_formats_untouched() {
+        let invalid_address = b"address default anon=1\n";
+        assert_eq!(sanitize_numa_maps(invalid_address), invalid_address);
+
+        let invalid_counter = b"71000000 default active=recent N0=1\n";
+        assert_eq!(sanitize_numa_maps(invalid_counter), invalid_counter);
     }
 
     #[test]
