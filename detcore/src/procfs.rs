@@ -18,8 +18,11 @@ enum ProcfsKind {
     Stat,
     Status,
     Cpuinfo,
+    Diskstats,
     Loadavg,
+    ProcessIo,
     Uptime,
+    BlockStat,
     ScalingCurFreq,
     Sockstat,
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -42,6 +45,9 @@ impl ProcfsFile {
             "/proc/self/stat" => ProcfsKind::Stat,
             "/proc/self/status" => ProcfsKind::Status,
             "/proc/cpuinfo" => ProcfsKind::Cpuinfo,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-861): Review deterministic kernel I/O accounting.
+            "/proc/diskstats" => ProcfsKind::Diskstats,
             "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -60,6 +66,8 @@ impl ProcfsFile {
             {
                 ProcfsKind::ScalingCurFreq
             }
+            other if is_process_io_path(other) => ProcfsKind::ProcessIo,
+            other if is_block_stat_path(other) => ProcfsKind::BlockStat,
             _ => return None,
         };
         Some(Self {
@@ -87,8 +95,11 @@ impl ProcfsFile {
             ProcfsKind::Stat => sanitize_stat(&contents, virtual_pid, virtual_ppid),
             ProcfsKind::Status => sanitize_status(&contents, virtual_pid, virtual_ppid),
             ProcfsKind::Cpuinfo => sanitize_cpuinfo(&contents),
+            ProcfsKind::Diskstats => sanitize_diskstats(&contents),
             ProcfsKind::Loadavg => sanitize_loadavg(&contents),
+            ProcfsKind::ProcessIo => sanitize_process_io(&contents),
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
+            ProcfsKind::BlockStat => sanitize_block_stat(&contents),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
             ProcfsKind::KeyUsers => sanitize_key_users(&contents),
@@ -104,6 +115,20 @@ impl ProcfsFile {
         self.offset = end;
         Some(bytes)
     }
+}
+
+fn is_process_io_path(path: &str) -> bool {
+    path == "/proc/self/io"
+        || path
+            .strip_prefix("/proc/")
+            .and_then(|path| path.strip_suffix("/io"))
+            .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn is_block_stat_path(path: &str) -> bool {
+    path.strip_prefix("/sys/block/")
+        .and_then(|path| path.strip_suffix("/stat"))
+        .is_some_and(|device| !device.is_empty() && !device.contains('/'))
 }
 
 // TODO-HUMAN-REVIEW(PR-723): Review /proc stat identity field normalization.
@@ -212,6 +237,88 @@ fn sanitize_cpuinfo(contents: &[u8]) -> Vec<u8> {
         let body = line.strip_suffix(b"\n").unwrap_or(line);
         if body.starts_with(CPU_MHZ) {
             normalized.extend_from_slice(b"cpu MHz\t\t: 0.000");
+        } else {
+            normalized.extend_from_slice(body);
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-861): Review deterministic kernel I/O accounting values.
+fn sanitize_diskstats(contents: &[u8]) -> Vec<u8> {
+    sanitize_numeric_lines(contents, 3)
+}
+
+fn sanitize_block_stat(contents: &[u8]) -> Vec<u8> {
+    sanitize_numeric_lines(contents, 0)
+}
+
+fn sanitize_numeric_lines(contents: &[u8], stable_fields: usize) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+        let has_newline = line.last() == Some(&b'\n');
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        let fields = body
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty())
+            .collect::<Vec<_>>();
+        let counters = fields.get(stable_fields..).unwrap_or_default();
+        if !counters.is_empty()
+            && counters
+                .iter()
+                .all(|field| field.iter().all(u8::is_ascii_digit))
+        {
+            for (index, field) in fields.iter().take(stable_fields).enumerate() {
+                if index > 0 {
+                    normalized.push(b' ');
+                }
+                normalized.extend_from_slice(field);
+            }
+            for (index, _) in counters.iter().enumerate() {
+                if !normalized.is_empty() && normalized.last() != Some(&b'\n') {
+                    normalized.push(b' ');
+                }
+                let value = match index {
+                    0 | 4 => 1,
+                    2 | 6 => 8,
+                    _ => 0,
+                };
+                normalized.extend_from_slice(value.to_string().as_bytes());
+            }
+        } else {
+            normalized.extend_from_slice(body);
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
+fn sanitize_process_io(contents: &[u8]) -> Vec<u8> {
+    const COUNTERS: &[&[u8]] = &[
+        b"rchar",
+        b"wchar",
+        b"syscr",
+        b"syscw",
+        b"read_bytes",
+        b"write_bytes",
+        b"cancelled_write_bytes",
+    ];
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+        let has_newline = line.last() == Some(&b'\n');
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        let name_end = body.iter().position(|byte| *byte == b':');
+        let name = name_end.map_or(body, |end| &body[..end]);
+        if COUNTERS.contains(&name) {
+            normalized.extend_from_slice(name);
+            normalized.extend_from_slice(b": 0");
         } else {
             normalized.extend_from_slice(body);
         }
@@ -372,6 +479,12 @@ mod tests {
             ProcfsKind::Cpuinfo
         );
         assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/diskstats"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Diskstats
+        );
+        assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/loadavg"))
                 .unwrap()
                 .kind,
@@ -395,6 +508,20 @@ mod tests {
                 .kind,
             ProcfsKind::KeyUsers
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/123/io"))
+                .unwrap()
+                .kind,
+            ProcfsKind::ProcessIo
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/sys/block/nvme0n1/stat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::BlockStat
+        );
+        assert!(ProcfsFile::from_path(Path::new("/proc/not-a-pid/io")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("/sys/block/nvme0n1/size")).is_none());
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
@@ -477,6 +604,24 @@ mod tests {
         assert_eq!(
             sanitize_cpuinfo(input),
             b"processor\t: 0\ncpu MHz\t\t: 0.000\ncache size\t: 1024 KB\n"
+        );
+    }
+
+    #[test]
+    fn io_accounting_counters_use_synthetic_values() {
+        assert_eq!(
+            sanitize_diskstats(b"259 0 nvme0n1 100 2 300 4 500 6 700 8 9 10 11\n"),
+            b"259 0 nvme0n1 1 0 8 0 1 0 8 0 0 0 0\n"
+        );
+        assert_eq!(
+            sanitize_block_stat(b"100 2 300 4 500 6 700 8 9 10 11\n"),
+            b"1 0 8 0 1 0 8 0 0 0 0\n"
+        );
+        assert_eq!(
+            sanitize_process_io(
+                b"rchar: 100\nwchar: 200\nsyscr: 3\nsyscw: 4\nread_bytes: 5\nwrite_bytes: 6\ncancelled_write_bytes: 7\n"
+            ),
+            b"rchar: 0\nwchar: 0\nsyscr: 0\nsyscw: 0\nread_bytes: 0\nwrite_bytes: 0\ncancelled_write_bytes: 0\n"
         );
     }
 

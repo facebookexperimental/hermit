@@ -123,6 +123,35 @@ fn proc_self_cmdline_is_deterministic() {
     });
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-861): Review deterministic kernel I/O accounting coverage.
+#[test]
+fn proc_diskstats_uses_synthetic_counters() {
+    assert_deterministic("/proc/diskstats", |contents| {
+        let text = std::str::from_utf8(contents).expect("diskstats should be UTF-8");
+        for line in text.lines() {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            assert!(fields.len() >= 4, "diskstats line has too few fields");
+            for (index, value) in fields[3..].iter().enumerate() {
+                let expected = match index {
+                    0 | 4 => "1",
+                    2 | 6 => "8",
+                    _ => "0",
+                };
+                assert_eq!(*value, expected, "unexpected disk counter {index}");
+            }
+        }
+    });
+}
+
+#[test]
+fn proc_pid_io_uses_zero_counters() {
+    assert_deterministic("/proc/1/io", |contents| {
+        let text = std::str::from_utf8(contents).expect("process io should be UTF-8");
+        assert!(text.lines().all(|line| line.ends_with(": 0")));
+    });
+}
+
 #[test]
 fn proc_cpuinfo_is_deterministic() {
     assert_deterministic("/proc/cpuinfo", |contents| {

@@ -306,6 +306,38 @@ fn identity_commands_are_deterministic_under_strict_verify() {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-861): Review strict I/O-accounting command coverage.
+#[test]
+#[ignore = "e2e: requires hermit + PMU/mount namespaces + sysstat tools"]
+fn io_accounting_commands_are_deterministic_under_strict_verify() {
+    let _guard = hermit_run_lock();
+    let cases = [
+        StrictCommandCase {
+            name: "iostat disk",
+            candidates: &["/usr/bin/iostat"],
+            args: &["-d", "-x", "1", "1"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "vmstat disk",
+            candidates: &["/usr/bin/vmstat"],
+            args: &["-d", "1", "2"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "pidstat disk",
+            candidates: &["/usr/bin/pidstat"],
+            args: &["-d", "-p", "1", "1", "1"],
+            stdin: None,
+        },
+    ];
+
+    for case in &cases {
+        assert_l2_under_strict_verify(case);
+    }
+}
+
 #[test]
 #[ignore = "e2e: requires hermit + PMU/mount namespaces + /usr/bin/python3"]
 fn python_prlimit64_query_is_deterministic_under_strict_verify() {
