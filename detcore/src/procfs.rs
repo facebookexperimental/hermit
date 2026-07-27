@@ -93,6 +93,12 @@ enum ProcfsKind {
     // TODO-HUMAN-REVIEW(PR-960): Review per-CPU host interrupt normalization.
     IrqPerCpuCount,
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-883): Review interrupt and module accounting snapshots.
+    InterruptCounters,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-883): Review module reference-count normalization.
+    Modules,
+    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-958): Review host-global uevent sequence normalization.
     UeventSeqnum,
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -394,6 +400,10 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-967): Review Unix socket identity normalization.
             "/proc/net/unix" => ProcfsKind::UnixSockets,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-883): Review interrupt and module accounting snapshots.
+            "/proc/interrupts" | "/proc/softirqs" => ProcfsKind::InterruptCounters,
+            "/proc/modules" => ProcfsKind::Modules,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             other if is_cpufreq_policy_value_path(Path::new(other)) => ProcfsKind::ScalingCurFreq,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-950): Review ACPI CPPC feedback normalization.
@@ -501,6 +511,8 @@ impl ProcfsFile {
                 sanitize_sysfs_rtc_attribute(&contents, self.kind)
             }
             ProcfsKind::ThpCounter => sanitize_thp_counter(&contents),
+            ProcfsKind::InterruptCounters => sanitize_interrupt_counters(&contents),
+            ProcfsKind::Modules => sanitize_modules(&contents),
             ProcfsKind::Mountinfo => sanitize_mountinfo(&contents),
             ProcfsKind::RandomUuid => {
                 fixed_snapshot(&contents, b"00000000-0000-4000-8000-000000000000\n")
@@ -2135,6 +2147,72 @@ fn sanitize_zoneinfo(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-883): Review synthetic interrupt and module accounting values.
+fn sanitize_interrupt_counters(contents: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+        let mut line = line.to_vec();
+        let body_end = line
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(line.len());
+
+        if let Some(colon) = line[..body_end].iter().position(|byte| *byte == b':') {
+            let mut cursor = colon + 1;
+            loop {
+                while cursor < body_end && line[cursor].is_ascii_whitespace() {
+                    cursor += 1;
+                }
+                let start = cursor;
+                while cursor < body_end && !line[cursor].is_ascii_whitespace() {
+                    cursor += 1;
+                }
+                if start == cursor || !line[start..cursor].iter().all(u8::is_ascii_digit) {
+                    break;
+                }
+                line[start..cursor].fill(b'0');
+            }
+        }
+        normalized.extend_from_slice(&line);
+    }
+    normalized
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-883): Review synthetic module reference counts.
+fn sanitize_modules(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let mut fields = body
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if fields.len() >= 4 {
+            let holders = if fields[3] == "-" {
+                0
+            } else {
+                fields[3]
+                    .split(',')
+                    .filter(|holder| !holder.is_empty())
+                    .count()
+            };
+            fields[2] = holders.to_string();
+        }
+        normalized.extend_from_slice(fields.join(" ").as_bytes());
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
 fn sanitize_schedstat(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
@@ -3475,6 +3553,45 @@ RAW: inuse 5\n";
 TCP: inuse 3 orphan 0 tw 7 alloc 3 mem 0\n\
 UDP: inuse 4 mem 0\n\
 RAW: inuse 5\n"
+        );
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    #[test]
+    fn recognizes_interrupt_and_module_accounting_paths() {
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/interrupts"))
+                .unwrap()
+                .kind,
+            ProcfsKind::InterruptCounters
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/softirqs"))
+                .unwrap()
+                .kind,
+            ProcfsKind::InterruptCounters
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/modules"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Modules
+        );
+        assert!(ProcfsFile::from_path(Path::new("/proc/devices")).is_none());
+    }
+
+    #[test]
+    fn interrupt_and_module_accounting_is_synthetic() {
+        let interrupts = b"           CPU0       CPU1\n  9:        123          4 IR-PCI-MSI 0-edge acpi\nNMI:          8          9 Non-maskable interrupts\nERR:          5\n";
+        assert_eq!(
+            sanitize_interrupt_counters(interrupts),
+            b"           CPU0       CPU1\n  9:        000          0 IR-PCI-MSI 0-edge acpi\nNMI:          0          0 Non-maskable interrupts\nERR:          0\n"
+        );
+
+        let modules = b"kvm_amd 212992 95 - Live 0x0\nkvm 1200128 1 kvm_amd, Live 0x0\nllc 20480 2 bridge,stp, Live 0x0\n";
+        assert_eq!(
+            sanitize_modules(modules),
+            b"kvm_amd 212992 0 - Live 0x0\nkvm 1200128 1 kvm_amd, Live 0x0\nllc 20480 2 bridge,stp, Live 0x0\n"
         );
     }
 
