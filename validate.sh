@@ -304,7 +304,7 @@ readonly STRICT_COMPAT_TOTAL=181
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
 readonly RR_COMPAT_EXPECTED=143
-readonly LITEINST_COMPAT_EXPECTED=765
+readonly LITEINST_COMPAT_EXPECTED=809
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
@@ -830,7 +830,7 @@ function run_full_backend_gates {
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
     run_check "LiteInst backend smoke" liteinst_backend_available
-    run_check "LiteInst compatibility baseline (765 programs)" run_liteinst_compatibility_envelope
+    run_check "LiteInst compatibility baseline (809 programs)" run_liteinst_compatibility_envelope
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -2080,6 +2080,50 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe ragel-version /usr/bin/ragel -v && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe readtags-version /usr/bin/readtags --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe redis-benchmark-version /usr/bin/redis-benchmark --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe rst2html-version /usr/bin/rst2html --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe rst2man-version /usr/bin/rst2man --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe rst2xml-version /usr/bin/rst2xml --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sensors-version /usr/bin/sensors --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sepdebugcrcfix-version /usr/bin/sepdebugcrcfix --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe setfacl-version /usr/bin/setfacl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe slirp4netns-version /usr/bin/slirp4netns --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe snmpbulkget-version /usr/bin/snmpbulkget -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe snmpbulkwalk-version /usr/bin/snmpbulkwalk -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe snmpget-version /usr/bin/snmpget -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe snmpgetnext-version /usr/bin/snmpgetnext -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe snmpset-version /usr/bin/snmpset -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe snmpstatus-version /usr/bin/snmpstatus -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe snmptable-version /usr/bin/snmptable -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe snmptranslate-version /usr/bin/snmptranslate -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe snmptrap-version /usr/bin/snmptrap -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe snmpwalk-version /usr/bin/snmpwalk -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe soelim-version /usr/bin/soelim --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe source-highlight-version /usr/bin/source-highlight --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sqliterepo-version /usr/bin/sqliterepo_c --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe stress-version /usr/bin/stress --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sudoreplay-version /usr/bin/sudoreplay -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-umount-version /usr/bin/systemd-umount --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe tmux-version /usr/bin/tmux -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe tqdm-version /usr/bin/tqdm --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe tracepath-version /usr/bin/tracepath -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe traceroute-version /usr/bin/traceroute --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe tree-version /usr/bin/tree --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe troff-version /usr/bin/troff --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe unix2dos-version /usr/bin/unix2dos --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe unix2mac-version /usr/bin/unix2mac --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe unlz4-version /usr/bin/unlz4 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe unpigz-version /usr/bin/unpigz --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe unzstd-version /usr/bin/unzstd --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe varlinkctl-version /usr/bin/varlinkctl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe watch-version /usr/bin/watch --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe which-version /usr/bin/which --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe xgettext-version /usr/bin/xgettext --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe xmlsec1-version /usr/bin/xmlsec1 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe xmlwf-version /usr/bin/xmlwf -v && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe xzdec-version /usr/bin/xzdec --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe yaml2obj-version /usr/bin/yaml2obj --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe zsh-version /usr/bin/zsh --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe zstdmt-version /usr/bin/zstdmt --version && passed=$((passed + 1)) || failed=$((failed + 1))
 
     total=$((passed + failed))
     if ((total != LITEINST_COMPAT_EXPECTED)); then
@@ -3903,7 +3947,7 @@ fi
 if ((LITEINST_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
     if ((failures == 0)); then
-        run_check "LiteInst compatibility baseline (765 programs)" run_liteinst_compatibility_envelope
+        run_check "LiteInst compatibility baseline (809 programs)" run_liteinst_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
