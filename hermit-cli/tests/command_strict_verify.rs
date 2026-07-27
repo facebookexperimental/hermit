@@ -454,6 +454,38 @@ fn kernel_activity_commands_are_deterministic_under_strict_verify() {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-865): Review NUMA and sensor command coverage.
+#[test]
+#[ignore = "e2e: requires hermit + PMU/mount namespaces + numactl/lm_sensors tools"]
+fn hardware_accounting_commands_are_deterministic_under_strict_verify() {
+    let _guard = hermit_run_lock();
+    let cases = [
+        StrictCommandCase {
+            name: "numastat",
+            candidates: &["/usr/bin/numastat"],
+            args: &[],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "numactl hardware",
+            candidates: &["/usr/bin/numactl"],
+            args: &["--hardware"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "sensors",
+            candidates: &["/usr/bin/sensors"],
+            args: &[],
+            stdin: None,
+        },
+    ];
+
+    for case in &cases {
+        assert_l2_under_strict_verify(case);
+    }
+}
+
 #[test]
 #[ignore = "e2e: requires hermit + PMU/mount namespaces + /usr/bin/python3"]
 fn python_prlimit64_query_is_deterministic_under_strict_verify() {

@@ -47,7 +47,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libunwind-dev liblzma-dev libxml2-utils lsof lua5.4 m4 make ncal netcat-openbsd nginx nodejs openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
+          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Enable unprivileged user and mount namespaces
         run: |
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then

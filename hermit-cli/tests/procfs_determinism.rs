@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -66,6 +68,32 @@ fn assert_deterministic(path: &str, validate: impl Fn(&[u8])) {
             String::from_utf8_lossy(&output),
         );
     }
+}
+
+fn first_hwmon_input() -> Option<PathBuf> {
+    let mut hwmon_dirs = fs::read_dir("/sys/class/hwmon")
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    hwmon_dirs.sort();
+    for directory in hwmon_dirs {
+        let mut inputs = fs::read_dir(directory)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with("_input"))
+            })
+            .collect::<Vec<_>>();
+        inputs.sort();
+        if let Some(input) = inputs.into_iter().next() {
+            return Some(input);
+        }
+    }
+    None
 }
 
 #[test]
@@ -437,4 +465,28 @@ fn proc_modules_are_deterministic() {
             assert_eq!(fields[2].parse::<usize>().unwrap(), expected);
         }
     });
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-865): Review NUMA and hwmon snapshot coverage.
+#[test]
+fn sysfs_numa_accounting_is_deterministic() {
+    assert_deterministic("/sys/devices/system/node/node0/numastat", |contents| {
+        let text = std::str::from_utf8(contents).expect("numastat should be UTF-8");
+        assert!(text.lines().all(|line| line.ends_with(" 0")));
+    });
+    assert_deterministic("/sys/devices/system/node/node0/meminfo", |contents| {
+        let text = std::str::from_utf8(contents).expect("node meminfo should be UTF-8");
+        assert!(text.contains("MemTotal: 1048576 kB\n"));
+        assert!(text.contains("MemFree: 1048576 kB\n"));
+    });
+}
+
+#[test]
+fn sysfs_hwmon_input_is_deterministic_when_available() {
+    let Some(path) = first_hwmon_input() else {
+        return;
+    };
+    let path = path.to_str().expect("hwmon path should be UTF-8");
+    assert_deterministic(path, |contents| assert_eq!(contents, b"0\n"));
 }
