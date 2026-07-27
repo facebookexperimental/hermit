@@ -192,3 +192,26 @@ fn proc_entropy_available_is_deterministic() {
             .expect("entropy_avail should be numeric");
     });
 }
+
+#[test]
+fn proc_pressure_uses_virtual_zero_values() {
+    for path in [
+        "/proc/pressure/cpu",
+        "/proc/pressure/io",
+        "/proc/pressure/memory",
+    ] {
+        assert_deterministic(path, |contents| {
+            let text = std::str::from_utf8(contents).expect("pressure data should be UTF-8");
+            assert!(text.lines().next().is_some());
+            for line in text.lines() {
+                let mut fields = line.split_whitespace();
+                assert!(matches!(fields.next(), Some("some" | "full")));
+                assert_eq!(fields.next(), Some("avg10=0.00"));
+                assert_eq!(fields.next(), Some("avg60=0.00"));
+                assert_eq!(fields.next(), Some("avg300=0.00"));
+                assert_eq!(fields.next(), Some("total=0"));
+                assert_eq!(fields.next(), None);
+            }
+        });
+    }
+}

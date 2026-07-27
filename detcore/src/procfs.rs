@@ -28,6 +28,7 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-951): Review key-user resource normalization.
     KeyUsers,
+    Pressure,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -54,6 +55,11 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             "/proc/key-users" => ProcfsKind::KeyUsers,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-903): Review host pressure accounting normalization.
+            "/proc/pressure/cpu" | "/proc/pressure/io" | "/proc/pressure/memory" => {
+                ProcfsKind::Pressure
+            }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -103,6 +109,7 @@ impl ProcfsFile {
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
             ProcfsKind::KeyUsers => sanitize_key_users(&contents),
+            ProcfsKind::Pressure => sanitize_pressure(&contents),
         });
         self.offset = 0;
     }
@@ -454,6 +461,37 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
     *field_value = value.to_owned();
 }
 
+fn sanitize_pressure(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let fields = body
+            .split_whitespace()
+            .map(|field| {
+                let Some((name, _)) = field.split_once('=') else {
+                    return field.to_owned();
+                };
+                match name {
+                    "avg10" | "avg60" | "avg300" => format!("{name}=0.00"),
+                    "total" => "total=0".to_owned(),
+                    _ => field.to_owned(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        normalized.extend_from_slice(fields.join(" ").as_bytes());
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,6 +560,16 @@ mod tests {
         );
         assert!(ProcfsFile::from_path(Path::new("/proc/not-a-pid/io")).is_none());
         assert!(ProcfsFile::from_path(Path::new("/sys/block/nvme0n1/size")).is_none());
+        for path in [
+            "/proc/pressure/cpu",
+            "/proc/pressure/io",
+            "/proc/pressure/memory",
+        ] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
+                ProcfsKind::Pressure
+            );
+        }
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
@@ -650,6 +698,18 @@ RAW: inuse 5\n";
 TCP: inuse 3 orphan 0 tw 7 alloc 3 mem 0\n\
 UDP: inuse 4 mem 0\n\
 RAW: inuse 5\n"
+        );
+    }
+
+    #[test]
+    fn pressure_hides_host_stall_averages_and_totals() {
+        let contents = b"some avg10=12.34 avg60=23.45 avg300=34.56 total=123456\n\
+full avg10=1.23 avg60=2.34 avg300=3.45 total=654321\n";
+
+        assert_eq!(
+            sanitize_pressure(contents),
+            b"some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n\
+full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
         );
     }
 
