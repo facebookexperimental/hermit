@@ -117,6 +117,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/io_uring_fallback.c",
                 ("-D_GNU_SOURCE",),
             ),
+            "listmount_enosys": (
+                REPOSITORY / "tests/c/listmount_enosys.c",
+                (),
+            ),
             "process_vm_readv_refusal": (
                 REPOSITORY / "tests/c/process_vm_readv_refusal_probe.c",
                 (),
@@ -176,6 +180,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             [str(fixtures.binary("io_uring_fallback"))],
             0,
             b"io_uring blocked; epoll fallback ready\n",
+        ),
+        "listmount_unavailable": (
+            [str(fixtures.binary("listmount_enosys"))],
+            0,
+            b"listmount deterministically unavailable\n",
         ),
         "process_vm_readv_refusal": (
             [str(fixtures.binary("process_vm_readv_refusal"))],

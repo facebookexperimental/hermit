@@ -9,19 +9,19 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 21/21 | 100% |
-| DBI | 20/21 | 95% |
-| KVM | 18/21 | 86% |
+| ptrace | 22/22 | 100% |
+| DBI | 21/22 | 95% |
+| KVM | 19/22 | 86% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 20/21 number above is deliberately
+measures the backend's own Reverie suite. The 21/22 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
 file-mutation and file-metadata contracts, plus deterministic memory-advice and
-memory-layout behavior. It also deterministically refuses io_uring and verifies
-that epoll remains available as a fallback, and refuses process-memory reads
-and writes with deterministic `EPERM`. The wait contract covers deterministic
+memory-layout behavior. It also deterministically refuses io_uring and listmount,
+verifies that epoll remains available as a fallback, and refuses process-memory
+reads and writes with deterministic `EPERM`. The wait contract covers deterministic
 `wait4`/`waitid` results, at least one SIGCHLD handler delivery (standard signals
 may coalesce), complete reaping, and zeroed child CPU accounting. The
 executable-memory contract writes machine code into an anonymous mapping,
@@ -45,22 +45,24 @@ mapping, readahead, and range synchronization. It permits documented filesystem
 policy failures for extended attributes but not an unimplemented syscall.
 The io_uring fallback row requires all three io_uring entry points to return
 deterministic `ENOSYS`, then checks that `epoll_create1` still succeeds.
+The listmount row requires deterministic `ENOSYS` even when the host kernel
+recognizes the syscall and returns `EINVAL` for the same request.
 The process-memory refusal rows supply valid local and remote iovecs for
 self-targeted `process_vm_readv` and `process_vm_writev` calls. Both require
 deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
-eighteen pairs, including its bounded cooperative pthread lifecycle, executable
+nineteen pairs, including its bounded cooperative pthread lifecycle, executable
 memory, deterministic memory-advice policy, clock, PID, and synthetic CPUID
-probes, plus file mutation, process-memory read/write refusal, io_uring refusal
-with epoll fallback, repeatable heap growth, and private/shared anonymous mapping
-layouts. Its remaining gaps are file metadata, because its personality does not
-implement extended-attribute syscalls; the threaded random-source fixture,
-where child-thread syscalls bypass per-child Detcore callbacks and the KVM
-personality repeats fixed random streams across workers; and process wait
-accounting, because KVM child processes do not run through per-child Detcore
-callbacks.
+probes, plus file mutation, listmount refusal, process-memory read/write refusal,
+io_uring refusal with epoll fallback, repeatable heap growth, and private/shared
+anonymous mapping layouts. Its remaining gaps are file metadata, because its
+personality does not implement extended-attribute syscalls; the threaded
+random-source fixture, where child-thread syscalls bypass per-child Detcore
+callbacks and the KVM personality repeats fixed random streams across workers;
+and process wait accounting, because KVM child processes do not run through
+per-child Detcore callbacks.
 
 ## Matrix
 
@@ -74,6 +76,7 @@ callbacks.
 | `file_mutation` | pass | pass | pass |
 | `file_metadata` | pass | pass | gap |
 | `io_uring_fallback` | pass | pass | pass |
+| `listmount_unavailable` | pass | pass | pass |
 | `process_vm_readv_refusal` | pass | pass | pass |
 | `process_vm_writev_refusal` | pass | pass | pass |
 | `executable_mmap` | pass | pass | pass |
