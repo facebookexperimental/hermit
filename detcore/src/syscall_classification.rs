@@ -620,6 +620,10 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::gettid
         | Sysno::getuid
         | Sysno::mprotect
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-889): Review process-local robust-list
+        // queries under fixed guest address and PID namespaces.
+        | Sysno::get_robust_list
         | Sysno::set_robust_list
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#663)
@@ -760,8 +764,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // --panic-on-unsupported-syscalls stops at the first use.
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed unsupported classifications.
-        Sysno::get_robust_list
-        | Sysno::mincore
+        Sysno::mincore
         | Sysno::pidfd_getfd
         | Sysno::pidfd_send_signal
         | Sysno::preadv
@@ -1197,7 +1200,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [275, 88, 10]);
+        assert_eq!(counts, [275, 89, 9]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1488,6 +1491,18 @@ mod tests {
         for sysno in [Sysno::pidfd_getfd, Sysno::pidfd_send_signal] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
         }
+    }
+
+    #[test]
+    fn get_robust_list_is_a_reviewed_passthrough() {
+        assert_eq!(
+            classify_syscall(Sysno::get_robust_list),
+            SyscallClassification::PassThrough
+        );
+        assert_eq!(
+            classify_syscall(Sysno::set_robust_list),
+            SyscallClassification::PassThrough
+        );
     }
 
     #[test]

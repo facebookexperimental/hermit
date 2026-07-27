@@ -18,16 +18,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-// getitimer is modeled against Detcore's logical alarm state; the following
-// get_robust_list remains Unsupported and forwards under the default policy.
-// Together they verify that a determinized call no longer enters the aggregate
-// warning while the unsupported robust-list query still does.
+// mincore remains Unsupported and exercises the aggregate warning. The
+// process-local get_robust_list query is a reviewed passthrough and ensures the
+// fixture also covers a classified call before returning. The zero-length
+// mincore probe and robust-list head are stable across repeat runs.
 static int call_unsupported(void) {
-  struct itimerval itv;
-  if (syscall(SYS_getitimer, ITIMER_REAL, &itv) < 0) {
-    perror("getitimer");
-    return 1;
-  }
+  (void)syscall(SYS_mincore, NULL, 0, NULL);
   void *robust_head = NULL;
   size_t robust_len = 0;
   if (syscall(SYS_get_robust_list, 0, &robust_head, &robust_len) < 0) {

@@ -459,7 +459,7 @@ fn run_ptrace_verify_reemits_unsupported_syscall_warning() {
     let args = ["--log", "warn", "run", "--verify", "--", program];
     let output = hermit(&args);
     assert_success(&output, &args);
-    let warning = "syscalls get_robust_list used but not yet supported";
+    let warning = "syscalls mincore used but not yet supported";
     assert_eq!(
         stderr(&output).matches(warning).count(),
         1,
@@ -480,7 +480,7 @@ fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
     assert_success(&normal, &normal_args);
     assert_eq!(stdout(&normal), "dbi-unsupported-ok\n");
     let normal_stderr = stderr(&normal);
-    let warning = "syscalls get_robust_list used but not yet supported";
+    let warning = "syscalls mincore used but not yet supported";
     assert_eq!(
         normal_stderr.matches(warning).count(),
         1,
