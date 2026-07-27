@@ -100,6 +100,10 @@ class Fixtures:
         local = SCRIPT_DIR / "fixtures"
         sources: dict[str, tuple[Path, tuple[str, ...]]] = {
             "pthread_lifecycle": (local / "pthread_lifecycle.c", ("-pthread",)),
+            "process_wait_lifecycle": (
+                REPOSITORY / "tests/c/dbi_wait_lifecycle.c",
+                ("-D_GNU_SOURCE",),
+            ),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -133,6 +137,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             [str(fixtures.binary("pthread_lifecycle"))],
             0,
             b"threads=4 total=10\n",
+        ),
+        "process_wait_lifecycle": (
+            [str(fixtures.binary("process_wait_lifecycle"))],
+            0,
+            b"wait4=7 waitid=9 sigchld=2 reaped=2 cpu=zero\n",
         ),
         "cpuid_policy": (
             [str(fixtures.binary("cpuid_probe"))],

@@ -9,24 +9,27 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 10/10 | 100% |
-| DBI | 9/10 | 90% |
-| KVM | 9/10 | 90% |
+| ptrace | 11/11 | 100% |
+| DBI | 10/11 | 91% |
+| KVM | 9/11 | 82% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 9/10 number above is deliberately
+measures the backend's own Reverie suite. The 10/11 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
-The current DBI path satisfies the virtual clock, virtual PID, and root-thread
-random-source contracts. Its hosted pthread lifecycle case can still stall
-during native startup and remains the sole gap; child-thread random sources
-remain covered by that lifecycle gap rather than this pair.
+The current DBI path satisfies the virtual clock, virtual PID, root-thread
+random-source, and process wait lifecycle contracts. The wait contract covers
+deterministic `wait4`/`waitid` results, SIGCHLD delivery, complete reaping, and
+zeroed child CPU accounting. Hosted pthread startup can still stall during
+native startup and remains the sole DBI gap; child-thread random sources remain
+covered by that lifecycle gap rather than the random-source pair.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
 nine pairs, including its bounded cooperative pthread lifecycle and
-deterministic clock, PID, and synthetic CPUID probes. The remaining gap is the
-threaded random-source fixture: child-thread syscalls bypass per-child Detcore
-callbacks, and the KVM personality's fixed random streams repeat across worker
-threads.
+deterministic clock, PID, and synthetic CPUID probes. Its remaining gaps are
+the threaded random-source fixture, where child-thread syscalls bypass
+per-child Detcore callbacks and the KVM personality repeats fixed random
+streams across workers, and process wait accounting, because KVM child
+processes do not run through per-child Detcore callbacks.
 
 ## Matrix
 
@@ -38,6 +41,7 @@ threads.
 | `exit_status` | pass | pass | pass |
 | `file_read` | pass | pass | pass |
 | `pthread_lifecycle` | pass | gap | pass |
+| `process_wait_lifecycle` | pass | pass | gap |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
 | `random_sources` | pass | pass | gap |
