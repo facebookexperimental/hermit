@@ -84,6 +84,15 @@ fn is_supported_prctl_option(option: libc::c_int) -> bool {
             // applications that explicitly disable or restore core-dump access.
             | libc::PR_SET_DUMPABLE
             | libc::PR_GET_DUMPABLE
+            // TODO-HUMAN-REVIEW(PR-924)
+            //
+            // Timer slack is a per-thread kernel control for coalescing timer
+            // wakeups. Detcore virtualizes sleeps and thread scheduling, so
+            // passthrough preserves Linux's set/get behavior without changing
+            // guest ordering or logical time. Recording the result also keeps
+            // the inherited default stable during replay.
+            | libc::PR_SET_TIMERSLACK
+            | libc::PR_GET_TIMERSLACK
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#802)
             //
@@ -659,6 +668,9 @@ mod tests {
             // Deterministic per-process dumpability state.
             libc::PR_SET_DUMPABLE,
             libc::PR_GET_DUMPABLE,
+            // Deterministic per-thread timer-coalescing controls.
+            libc::PR_SET_TIMERSLACK,
+            libc::PR_GET_TIMERSLACK,
             // Deterministic per-thread capability-retention flag used by setpriv.
             libc::PR_SET_KEEPCAPS,
             libc::PR_GET_KEEPCAPS,

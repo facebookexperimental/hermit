@@ -248,6 +248,25 @@ fn prctl_keepcaps_round_trips_deterministically() {
 }
 
 #[test]
+fn prctl_timer_slack_round_trips_deterministically() {
+    // Timer slack only controls host timer coalescing. Detcore virtualizes
+    // sleeps and thread scheduling, so preserving Linux's per-thread set/get
+    // behavior cannot change guest ordering or logical time.
+    det_test_fn_sequential_without_pmu(|| unsafe {
+        let original = libc::prctl(libc::PR_GET_TIMERSLACK);
+        assert!(original > 0, "timer slack must be positive");
+
+        const REQUESTED_SLACK_NS: libc::c_int = 1_000_000;
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, REQUESTED_SLACK_NS), 0);
+        assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), REQUESTED_SLACK_NS);
+
+        // A zero value restores the thread's inherited default timer slack.
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, 0), 0);
+        assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), original);
+    });
+}
+
+#[test]
 fn sched_affinity_is_normalized_to_virtual_cpu_zero() {
     det_test_fn_sequential_without_pmu(|| {
         const VIRTUAL_CPUSET_BYTES: usize = 16;
