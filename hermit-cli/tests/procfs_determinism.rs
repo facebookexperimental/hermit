@@ -20,6 +20,10 @@ fn hermit_run_lock() -> MutexGuard<'static, ()> {
 }
 
 fn read_procfs(path: &str) -> Vec<u8> {
+    read_procfs_at_epoch(path, None)
+}
+
+fn read_procfs_at_epoch(path: &str, epoch: Option<&str>) -> Vec<u8> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command.args([
         "--log=error",
@@ -27,10 +31,11 @@ fn read_procfs(path: &str) -> Vec<u8> {
         "--base-env=minimal",
         "--no-virtualize-cpuid",
         "--max-timeslice=disabled",
-        "--",
-        "/bin/cat",
-        path,
     ]);
+    if let Some(epoch) = epoch {
+        command.arg(format!("--epoch={epoch}"));
+    }
+    command.args(["--", "/bin/cat", path]);
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -293,4 +298,53 @@ fn proc_zoneinfo_uses_virtual_zero_values() {
         assert!(saw_cpu);
         assert!(saw_accounting);
     });
+}
+
+#[test]
+fn proc_rtc_tracks_custom_epoch_and_virtual_time() {
+    let _guard = hermit_run_lock();
+    let epoch = "2000-12-31T23:59:59+00:00";
+    let initial = read_procfs_at_epoch("/proc/driver/rtc", Some(epoch));
+    let initial = std::str::from_utf8(&initial).expect("rtc should be UTF-8");
+    assert!(initial.contains("rtc_time\t: 23:59:59\n"));
+    assert!(initial.contains("rtc_date\t: 2000-12-31\n"));
+    assert!(initial.contains("alarm_IRQ\t: no\n"));
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command.args([
+        "--log=error",
+        "run",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+        "--epoch=2000-12-31T23:59:59+00:00",
+        "--",
+        "/usr/bin/python3",
+        "-c",
+        "import time; time.sleep(2); print(open('/proc/driver/rtc').read(), end='')",
+    ]);
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    assert!(
+        output.status.success(),
+        "RTC virtual-time probe failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let advanced = String::from_utf8(output.stdout).expect("rtc should be UTF-8");
+    let advanced_time = advanced
+        .lines()
+        .find_map(|line| line.strip_prefix("rtc_time\t: "))
+        .expect("RTC output omitted rtc_time");
+    assert_ne!(
+        advanced_time, "23:59:59",
+        "RTC did not advance with virtual time:\n{advanced}"
+    );
+    assert!(
+        advanced.contains("rtc_date\t: 2001-01-01\n"),
+        "RTC did not cross the configured epoch day:\n{advanced}"
+    );
 }

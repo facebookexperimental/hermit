@@ -290,6 +290,7 @@ impl DetFd {
         &self,
         contents: Vec<u8>,
         virtual_uptime_seconds: u64,
+        virtual_realtime_seconds: i64,
         virtual_pid: i32,
         virtual_ppid: i32,
     ) {
@@ -297,7 +298,13 @@ impl DetFd {
             .procfs
             .as_mut()
             .expect("procfs fd disappeared while taking its snapshot")
-            .initialize(contents, virtual_uptime_seconds, virtual_pid, virtual_ppid);
+            .initialize(
+                contents,
+                virtual_uptime_seconds,
+                virtual_realtime_seconds,
+                virtual_pid,
+                virtual_ppid,
+            );
     }
 
     /// Read from the deterministic procfs snapshot at its shared offset.
@@ -433,7 +440,7 @@ mod tests {
             OpenFileId::new(owner, 0),
         );
         original.set_procfs(ProcfsFile::from_path(Path::new("/proc/sys/fs/file-nr")).unwrap());
-        original.initialize_procfs(b"15\t0\t1000\n".to_vec(), 0, 1, 0);
+        original.initialize_procfs(b"15\t0\t1000\n".to_vec(), 0, 0, 1, 0);
         let duplicate = original.clone().with_fd(4);
 
         assert_eq!(original.take_procfs(2).unwrap(), b"0\t");

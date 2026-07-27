@@ -330,6 +330,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<(), Error> {
         let contents = self.snapshot_procfs(guest, call).await?;
         let virtual_uptime_seconds = self.calculate_uptime(guest).await?;
+        let virtual_realtime_seconds = i64::try_from(thread_observe_time(guest).await.as_secs())
+            .map_err(|_| Errno::EOVERFLOW)?;
         // TODO-HUMAN-REVIEW(PR-723): Review injected identity snapshot reads.
         let virtual_pid = guest.inject(syscalls::Getpid::new()).await? as i32;
         let virtual_ppid = guest.inject(syscalls::Getppid::new()).await? as i32;
@@ -337,6 +339,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             detfd.initialize_procfs(
                 contents.clone(),
                 virtual_uptime_seconds,
+                virtual_realtime_seconds,
                 virtual_pid,
                 virtual_ppid,
             );
