@@ -538,6 +538,7 @@ version = "0.0.0"
 dependencies = [
  "detcore",
  "libc",
+ "rand",
  "reverie",
  "reverie-dbi",
  "serde_json",

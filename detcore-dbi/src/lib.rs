@@ -39,6 +39,7 @@ use detcore::Config;
 use detcore::Detcore;
 use detcore::GlobalState;
 use detcore::UnsupportedSyscallError;
+use rand::RngExt as _;
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::Pid;
@@ -58,6 +59,9 @@ use reverie_dbi::SyscallInvoker;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const MAX_OBSERVED_BUFFER: usize = 1024 * 1024;
+const RANDOM_FILL_CHUNK_BYTES: usize = 4096;
+const GETRANDOM_MAX_BYTES: usize = (i32::MAX as usize) & !4095;
+const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | libc::GRND_INSECURE;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review the inherited DBI report descriptor.
@@ -270,6 +274,124 @@ fn update_memory_hash(sysnum: i64, args: &[u64], read_memory: MemoryReader) {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     MEMORY_HASH.fetch_add(hash, Ordering::SeqCst);
+}
+
+fn getrandom_flags_are_valid(flags: u64) -> bool {
+    let flags = flags as u32;
+    let random = flags & libc::GRND_RANDOM != 0;
+    let insecure = flags & libc::GRND_INSECURE != 0;
+
+    flags & !GETRANDOM_ALLOWED_FLAGS == 0 && !(random && insecure)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GetrandomProbe {
+    requested: usize,
+    writable: usize,
+}
+
+impl GetrandomProbe {
+    fn consumed(self) -> usize {
+        if self.writable == self.requested {
+            return self.requested;
+        }
+
+        let failed_chunk = self.writable / RANDOM_FILL_CHUNK_BYTES;
+        ((failed_chunk + 1) * RANDOM_FILL_CHUNK_BYTES).min(self.requested)
+    }
+}
+
+fn write_process_memory(
+    pid: i32,
+    remote_address: usize,
+    bytes: &[u8],
+    mut invoke: impl FnMut(&[u64; 6]) -> i64,
+) -> Result<usize, Errno> {
+    let page_size = 4096;
+    let mut written = 0;
+    while written < bytes.len() {
+        let Some(remote) = remote_address.checked_add(written) else {
+            return Ok(written);
+        };
+        let segment_len = (page_size - remote % page_size).min(bytes.len() - written);
+        let local_iov = libc::iovec {
+            iov_base: bytes[written..].as_ptr().cast_mut().cast(),
+            iov_len: segment_len,
+        };
+        let remote_iov = libc::iovec {
+            iov_base: remote as *mut c_void,
+            iov_len: segment_len,
+        };
+        let process_vm_writev_args = [
+            pid as u64,
+            (&raw const local_iov) as u64,
+            1,
+            (&raw const remote_iov) as u64,
+            1,
+            0,
+        ];
+        let result = loop {
+            let result = invoke(&process_vm_writev_args);
+            if result != -(Errno::EINTR.into_raw() as i64) {
+                break result;
+            }
+        };
+        if result == -(Errno::EFAULT.into_raw() as i64) {
+            return Ok(written);
+        }
+        if result < 0 {
+            return Err(Errno::EIO);
+        }
+        let count = (result as usize).min(segment_len);
+        if count == 0 {
+            return Ok(written);
+        }
+        written += count;
+    }
+    Ok(written)
+}
+
+fn getrandom_writable_prefix(
+    args: &[u64],
+    mut write: impl FnMut(usize, &[u8]) -> Result<usize, Errno>,
+) -> Option<Result<GetrandomProbe, Errno>> {
+    if args[1] == 0 || !getrandom_flags_are_valid(args[2]) {
+        return None;
+    }
+
+    let requested = (args[1] as usize).min(GETRANDOM_MAX_BYTES);
+    let zeros = [0_u8; RANDOM_FILL_CHUNK_BYTES];
+    let mut writable = 0;
+    while writable < requested {
+        let Some(remote) = (args[0] as usize).checked_add(writable) else {
+            break;
+        };
+        let chunk_len = (requested - writable).min(RANDOM_FILL_CHUNK_BYTES);
+        let count = match write(remote, &zeros[..chunk_len]) {
+            Ok(count) => count.min(chunk_len),
+            Err(error) => return Some(Err(error)),
+        };
+        writable += count;
+        if count < chunk_len {
+            break;
+        }
+    }
+    Some(Ok(GetrandomProbe {
+        requested,
+        writable,
+    }))
+}
+
+fn advance_getrandom_prng(prng: &mut impl rand::Rng, bytes: usize) {
+    let mut words = [0_u64; RANDOM_FILL_CHUNK_BYTES / std::mem::size_of::<u64>()];
+    let mut advanced = 0;
+    while advanced < bytes {
+        let chunk_len = (bytes - advanced).min(RANDOM_FILL_CHUNK_BYTES);
+        let chunk =
+            unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), chunk_len) };
+        prng.fill(chunk);
+        advanced += chunk_len;
+    }
 }
 
 fn report_fd_is_available() -> bool {
@@ -819,6 +941,35 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         unsafe { emit(message.as_ptr(), message.len()) };
     }
     let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
+    let mut dispatch_args: [u64; 6] = raw_args.try_into().expect("six syscall arguments");
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-849): Review fault-safe DBI getrandom writes.
+    // Probe with deterministic zeros through process_vm_writev, then let Detcore overwrite
+    // the entire writable prefix before the application resumes.
+    let getrandom_probe = if sysnum == libc::SYS_getrandom {
+        match getrandom_writable_prefix(raw_args, |remote, bytes| {
+            write_process_memory(pid, remote, bytes, |process_vm_writev_args| unsafe {
+                invoke_syscall(
+                    context as usize,
+                    libc::SYS_process_vm_writev,
+                    process_vm_writev_args.as_ptr(),
+                )
+            })
+        }) {
+            Some(Ok(probe)) => {
+                dispatch_args[1] = probe.writable as u64;
+                Some(probe)
+            }
+            Some(Err(error)) => {
+                unsafe { result.write(-(error.into_raw() as i64)) };
+                TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+                return 1;
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     if sysnum == libc::SYS_execveat {
         unsafe { result.write(-(Errno::ENOSYS.into_raw() as i64)) };
         TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
@@ -852,12 +1003,12 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     let syscall = Syscall::from_raw(
         Sysno::from(sysnum as i32),
         SyscallArgs::new(
-            raw_args[0] as usize,
-            raw_args[1] as usize,
-            raw_args[2] as usize,
-            raw_args[3] as usize,
-            raw_args[4] as usize,
-            raw_args[5] as usize,
+            dispatch_args[0] as usize,
+            dispatch_args[1] as usize,
+            dispatch_args[2] as usize,
+            dispatch_args[3] as usize,
+            dispatch_args[4] as usize,
+            dispatch_args[5] as usize,
         ),
     );
 
@@ -939,7 +1090,10 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         let message = b"detcore-dbi: dispatching first syscall through Detcore\n";
         unsafe { emit(message.as_ptr(), message.len()) };
     }
-    let outcome = reverie_dbi::run_tool_syscall(
+    let getrandom_prng = getrandom_probe
+        .filter(|probe| probe.writable < probe.requested)
+        .map(|probe| (probe, thread.state.prng.clone()));
+    let mut outcome = reverie_dbi::run_tool_syscall(
         tool,
         context as usize,
         tid,
@@ -952,6 +1106,20 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         invoke_syscall,
         read_registers,
     );
+    if let Some((probe, original_prng)) = getrandom_prng {
+        // The shortened safe write must consume exactly the stream portion that the shared
+        // Detcore handler consumes before its first guest-memory fault.
+        thread.state.prng = original_prng;
+        advance_getrandom_prng(&mut thread.state.prng, probe.consumed());
+        if matches!(outcome, Ok(DbiSyscallOutcome::Suppress(_))) {
+            let value = if probe.writable == 0 {
+                -(Errno::EFAULT.into_raw() as i64)
+            } else {
+                probe.writable as i64
+            };
+            outcome = Ok(DbiSyscallOutcome::Suppress(value));
+        }
+    }
     match outcome {
         Ok(DbiSyscallOutcome::Suppress(value)) => {
             unsafe { result.write(value) };
@@ -1041,6 +1209,81 @@ mod tests {
         ] {
             assert!(!requires_native_lifecycle(sysnum));
         }
+    }
+
+    #[test]
+    fn getrandom_flag_validation_matches_detcore_policy() {
+        for flags in [
+            0,
+            u64::from(libc::GRND_NONBLOCK),
+            u64::from(libc::GRND_RANDOM),
+            u64::from(libc::GRND_NONBLOCK | libc::GRND_RANDOM),
+            1_u64 << 32,
+        ] {
+            assert!(getrandom_flags_are_valid(flags), "flags={flags:#x}");
+        }
+        assert!(!getrandom_flags_are_valid(u64::from(
+            libc::GRND_RANDOM | libc::GRND_INSECURE
+        )));
+        assert!(!getrandom_flags_are_valid(0x8000_0000));
+    }
+
+    #[test]
+    fn getrandom_probe_uses_zero_writes_and_tracks_shared_consumption() {
+        let args = [0x1000, 16, 0, 0, 0, 0];
+        let partial = getrandom_writable_prefix(&args, |remote, bytes| {
+            assert_eq!(remote, 0x1000);
+            assert_eq!(bytes, [0_u8; 16]);
+            Ok(8)
+        });
+        let partial = partial.unwrap().unwrap();
+        assert_eq!(
+            partial,
+            GetrandomProbe {
+                requested: 16,
+                writable: 8,
+            }
+        );
+        assert_eq!(partial.consumed(), 16);
+
+        let huge = [1, u64::MAX, 0, 0, 0, 0];
+        let fault = getrandom_writable_prefix(&huge, |_, _| Ok(0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(fault.writable, 0);
+        assert_eq!(fault.requested, GETRANDOM_MAX_BYTES);
+        assert_eq!(fault.consumed(), RANDOM_FILL_CHUNK_BYTES);
+
+        let invalid_flags = [0x1000, 16, 0x8000_0000, 0, 0, 0];
+        let mut invoked = false;
+        assert_eq!(
+            getrandom_writable_prefix(&invalid_flags, |_, _| {
+                invoked = true;
+                Ok(16)
+            }),
+            None
+        );
+        assert!(!invoked);
+    }
+
+    #[test]
+    fn process_memory_writer_retries_interrupts_and_stops_at_faults() {
+        let mut calls = 0;
+        let written = write_process_memory(7, 0x1ff8, &[0_u8; 16], |args| {
+            assert_eq!(args[0], 7);
+            assert_eq!(args[2], 1);
+            assert_eq!(args[4], 1);
+            calls += 1;
+            match calls {
+                1 => -(Errno::EINTR.into_raw() as i64),
+                2 => 8,
+                3 => -(Errno::EFAULT.into_raw() as i64),
+                _ => unreachable!(),
+            }
+        })
+        .unwrap();
+        assert_eq!(written, 8);
+        assert_eq!(calls, 3);
     }
 
     #[test]

@@ -10,15 +10,16 @@ A `gap` must have a concrete implementation reason.
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
 | ptrace | 10/10 | 100% |
-| DBI | 8/10 | 80% |
+| DBI | 9/10 | 90% |
 | KVM | 9/10 | 90% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 8/10 number above is deliberately
+measures the backend's own Reverie suite. The 9/10 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
-The current DBI path satisfies the virtual clock and virtual PID contracts. Its
-hosted pthread lifecycle case can still stall during native startup, and the
-threaded random-source fixture remains a gap.
+The current DBI path satisfies the virtual clock, virtual PID, and root-thread
+random-source contracts. Its hosted pthread lifecycle case can still stall
+during native startup and remains the sole gap; child-thread random sources
+remain covered by that lifecycle gap rather than this pair.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
 nine pairs, including its bounded cooperative pthread lifecycle and
@@ -39,12 +40,16 @@ threads.
 | `pthread_lifecycle` | pass | gap | pass |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
-| `random_sources` | pass | gap | gap |
+| `random_sources` | pass | pass | gap |
 | `virtual_pid` | pass | pass | pass |
 
 The authoritative reasons live in `matrix.tsv`, next to the status they
 justify. The runner executes each passing pair three times and checks exit
 status, stdout, and (for determinism cases) byte-identical repeated output.
+The DBI random-source contract also compares the root thread's post-fault
+random stream byte-for-byte with a ptrace reference run. It deliberately uses
+the fixture's root-only mode because hosted DBI pthread startup remains a
+separate declared gap.
 These repeat-run results are compatibility evidence, not an L1/L2 assurance
 level: the runner disables timeslicing and does not pass `--strict --verify`.
 

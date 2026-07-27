@@ -265,12 +265,34 @@ def run_with_timeout(command: list[str]) -> subprocess.CompletedProcess[bytes] |
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
+def root_random_output(stdout: bytes) -> bytes:
+    """Select output driven by the root thread's random stream."""
+    return b"\n".join(
+        line for line in stdout.splitlines() if not line.startswith(b"thread-")
+    )
+
+
 def run_case(
     hermit: Path, backend: str, name: str, fixtures: Fixtures
 ) -> tuple[str, str, float]:
     guest, expected_status, expected_stdout = case_command(name, fixtures)
+    if backend == "dbi" and name == "random_sources":
+        guest = [*guest, "--root-only"]
     baseline: bytes | None = None
     started = time.monotonic()
+    ptrace_random: bytes | None = None
+    if backend == "dbi" and name == "random_sources":
+        reference = run_with_timeout(hermit_command(hermit, "ptrace", guest, name))
+        if reference is None:
+            return "FAIL", "ptrace reference timed out", time.monotonic() - started
+        if reference.returncode != expected_status:
+            diagnostic = reference.stderr.decode(errors="replace").strip()
+            return (
+                "FAIL",
+                f"ptrace reference exited {reference.returncode}: {diagnostic[-300:]}",
+                time.monotonic() - started,
+            )
+        ptrace_random = root_random_output(reference.stdout)
     for iteration in range(RUNS):
         command = hermit_command(hermit, backend, guest, name)
         result = run_with_timeout(command)
@@ -323,6 +345,12 @@ def run_case(
                 return (
                     "FAIL",
                     f"run {iteration + 1} output differed from run 1",
+                    time.monotonic() - started,
+                )
+            if ptrace_random is not None and root_random_output(result.stdout) != ptrace_random:
+                return (
+                    "FAIL",
+                    f"run {iteration + 1} root random stream differed from ptrace",
                     time.monotonic() - started,
                 )
     return "PASS", f"{RUNS}/{RUNS} runs matched", time.monotonic() - started

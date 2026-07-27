@@ -160,7 +160,11 @@ static void* thread_main(void* argument) {
   return NULL;
 }
 
-int main(void) {
+int main(int argc, char** argv) {
+  int root_only = argc == 2 && strcmp(argv[1], "--root-only") == 0;
+  if (argc != 1 && !root_only) {
+    return 8;
+  }
   uint8_t getrandom_samples[SAMPLES][BYTES];
   uint8_t urandom_samples[SAMPLES][BYTES];
   uint8_t random_samples[SAMPLES][BYTES];
@@ -181,22 +185,24 @@ int main(void) {
     }
   }
 
-  for (int thread = 0; thread < THREADS; thread++) {
-    if (pthread_create(&threads[thread], NULL, thread_main,
-                       &thread_results[thread]) != 0) {
-      return 3;
+  if (!root_only) {
+    for (int thread = 0; thread < THREADS; thread++) {
+      if (pthread_create(&threads[thread], NULL, thread_main,
+                         &thread_results[thread]) != 0) {
+        return 3;
+      }
     }
-  }
-  for (int thread = 0; thread < THREADS; thread++) {
-    if (pthread_join(threads[thread], NULL) != 0 ||
-        thread_results[thread].error != 0) {
-      return 4;
-    }
-    for (int previous = 0; previous < thread; previous++) {
-      if (memcmp(&thread_results[thread].sample,
-                 &thread_results[previous].sample,
-                 sizeof(struct sample)) == 0) {
-        return 5;
+    for (int thread = 0; thread < THREADS; thread++) {
+      if (pthread_join(threads[thread], NULL) != 0 ||
+          thread_results[thread].error != 0) {
+        return 4;
+      }
+      for (int previous = 0; previous < thread; previous++) {
+        if (memcmp(&thread_results[thread].sample,
+                   &thread_results[previous].sample,
+                   sizeof(struct sample)) == 0) {
+          return 5;
+        }
       }
     }
   }
@@ -206,11 +212,13 @@ int main(void) {
     print_bytes("urandom", sample, urandom_samples[sample]);
     print_bytes("random", sample, random_samples[sample]);
   }
-  for (int thread = 0; thread < THREADS; thread++) {
-    print_bytes("thread-getrandom", thread,
-                thread_results[thread].sample.getrandom_bytes);
-    print_bytes("thread-urandom", thread,
-                thread_results[thread].sample.urandom_bytes);
+  if (!root_only) {
+    for (int thread = 0; thread < THREADS; thread++) {
+      print_bytes("thread-getrandom", thread,
+                  thread_results[thread].sample.getrandom_bytes);
+      print_bytes("thread-urandom", thread,
+                  thread_results[thread].sample.urandom_bytes);
+    }
   }
   return 0;
 }
