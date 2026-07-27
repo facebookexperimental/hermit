@@ -158,6 +158,7 @@ use crate::syscall_classification::is_credential_identity_noop_syscall;
 use crate::syscall_classification::is_landlock_sandbox_syscall;
 use crate::syscall_classification::is_mount_introspection_enosys_syscall;
 use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
+use crate::syscall_classification::is_optional_memory_feature_syscall;
 use crate::syscall_classification::is_privileged_admin_refused_syscall;
 use crate::syscall_classification::is_process_isolation_refused_syscall;
 use crate::syscall_classification::is_unimplemented_enosys_syscall;
@@ -1487,6 +1488,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // syscall injection and capability probes expose host-kernel state,
             // so Hermit presents a fixed kernel-without-seccomp boundary.
             SyscallClassification::Determinized if call.number() == Sysno::seccomp => {
+                Err(Error::Errno(Errno::ENOSYS))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-839): Optional modern memory APIs vary with
+            // host kernel configuration, CET support, and pidfd lifecycle.
+            // Present the portable feature-absence result instead.
+            SyscallClassification::Determinized
+                if is_optional_memory_feature_syscall(call.number()) =>
+            {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
