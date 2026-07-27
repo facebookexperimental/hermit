@@ -229,6 +229,10 @@ fn report_rcb_overshoot(
     error!("{}", message);
 }
 
+fn rcb_timer_overshot(delta_rcbs: u64, last_timer: u64) -> bool {
+    delta_rcbs > last_timer
+}
+
 fn choose_rcb_timer(
     max_rcbs_remaining: u64,
     current_rcbs: u64,
@@ -374,7 +378,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
             if thread_state.end_of_timeslice.is_some() {
                 if let Some(last_timer) = thread_state.last_rcb_timer
-                    && delta_rcbs >= last_timer
+                    && rcb_timer_overshot(delta_rcbs, last_timer)
                     && precise_timers
                 {
                     report_rcb_overshoot(
@@ -2259,6 +2263,7 @@ mod rcb_overshoot_tests {
     use tracing::span::Record;
     use tracing::subscriber::with_default;
 
+    use super::rcb_timer_overshot;
     use super::report_rcb_overshoot;
 
     struct ErrorSubscriber(Arc<Mutex<Option<String>>>);
@@ -2309,6 +2314,13 @@ mod rcb_overshoot_tests {
         assert!(error.contains("16249"), "{error}");
         assert!(error.contains("139"), "{error}");
         assert!(error.contains("100"), "{error}");
+    }
+
+    #[test]
+    fn exact_rcb_timer_hit_is_not_an_overshoot() {
+        assert!(!rcb_timer_overshot(100, 100));
+        assert!(!rcb_timer_overshot(99, 100));
+        assert!(rcb_timer_overshot(101, 100));
     }
 
     #[test]
