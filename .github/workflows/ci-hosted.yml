@@ -7,8 +7,13 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Hosted capacity is elastic. Do not add a concurrency group here: every push
-# and pull-request run should finish even while the self-hosted queue backs up.
+# Keep the active run and only the newest pending run for each pull request or
+# branch. GitHub replaces an older pending run in the group without cancelling
+# the active run when cancel-in-progress is false.
+concurrency:
+  group: hosted-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   NEXTEST_VERSION: "0.9.100"

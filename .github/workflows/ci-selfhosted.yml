@@ -15,11 +15,11 @@ on:
         type: boolean
         default: false
 
-# Preserve every running self-hosted result. Main pushes use a SHA-specific
-# group because GitHub replaces an older pending run in a shared group even
-# when cancel-in-progress is false; pull request updates remain grouped.
+# Keep the active run and only the newest pending run for each pull request or
+# branch. GitHub replaces an older pending run in the group without cancelling
+# the active run when cancel-in-progress is false.
 concurrency:
-  group: selfhosted-${{ github.event_name == 'push' && github.sha || github.event.pull_request.number || github.ref }}
+  group: selfhosted-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
 env:
