@@ -147,9 +147,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-841): Review logical one-shot getitimer emulation.
-    /// Report Detcore's logical one-shot ITIMER_REAL state without consulting
-    /// host elapsed time. Repeating and CPU-time timers remain unsupported.
+    // TODO-HUMAN-REVIEW(PR-892)
+    /// Return interval-timer state from Detcore's logical scheduler.
     pub async fn handle_getitimer<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -162,14 +161,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
             return Ok(guest.inject(call).await?);
         }
-        if call.which() != libc::ITIMER_REAL {
-            return Err(Error::Errno(Errno::ENOSYS));
-        }
 
+        let remaining = match call.which() {
+            libc::ITIMER_REAL => alarm_remaining(guest).await,
+            libc::ITIMER_VIRTUAL | libc::ITIMER_PROF => LogicalTime::ZERO,
+            _ => return Err(Errno::EINVAL.into()),
+        };
         let value = call.value().ok_or(Errno::EFAULT)?;
         let timer = libc::itimerval {
             it_interval: logical_time_to_timeval(LogicalTime::ZERO),
-            it_value: logical_time_to_timeval(alarm_remaining(guest).await),
+            it_value: logical_time_to_timeval(remaining),
         };
         guest.memory().write_value(value, &timer)?;
         Ok(0)

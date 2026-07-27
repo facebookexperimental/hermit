@@ -94,7 +94,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getdents
         | Sysno::getdents64
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-841): Query the logical one-shot ITIMER_REAL state.
+        // TODO-HUMAN-REVIEW(PR-892): Query logical interval-timer state.
         | Sysno::getitimer
         | Sysno::getrandom
         | Sysno::getrusage
