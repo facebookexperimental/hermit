@@ -1656,6 +1656,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(PR-887): Present a stable pre-4.5-kernel
                 // boundary so callers use determinized read/write copying.
                 Syscall::CopyFileRange(_) => Err(Error::Errno(Errno::ENOSYS)),
+                // TODO-HUMAN-REVIEW(#794): vectored scatter/gather I/O, mirroring
+                // read/pread64/pwrite64/writev.
+                Syscall::Readv(s) => self.handle_readv(guest, s).await,
+                Syscall::Preadv(s) => self.handle_preadv(guest, s).await,
+                Syscall::Preadv2(s) => self.handle_preadv2(guest, s).await,
+                Syscall::Pwritev(s) => self.handle_pwritev(guest, s).await,
+                Syscall::Pwritev2(s) => self.handle_pwritev2(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#683)
                 Syscall::Pwrite64(s) => self.handle_pwrite64(guest, s).await,

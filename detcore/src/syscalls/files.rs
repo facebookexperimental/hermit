@@ -908,6 +908,153 @@ impl<T: RecordOrReplay> Detcore<T> {
         result
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#794)
+    /// SYS_readv system call: the vectored form of `read`.
+    ///
+    /// Mirrors [`Self::handle_writev`] for the read direction. Detcore adds
+    /// open-file resource ordering and, for physically nonblocking pipe/socket
+    /// fds, the nonblocking scheduler integration; otherwise the vectored read is
+    /// recorded/replayed as one kernel operation so its iovec order is preserved.
+    pub async fn handle_readv<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Readv,
+    ) -> Result<i64, Error> {
+        let (fd_type, physically_nonblocking, resource) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (detfd.ty(), detfd.physically_nonblocking(), detfd.resource())
+            })?;
+
+        if let Some(resource) = resource {
+            let request = guest.thread_state().mk_request(resource, Permission::R);
+            resource_request(guest, request).await;
+        }
+
+        let res = if physically_nonblocking
+            && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
+        {
+            self.execute_nonblockable_fd_syscall(guest, call).await
+        } else {
+            Ok(self.record_or_replay(guest, call).await?)
+        };
+
+        resource_release_all(guest).await;
+        res
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#794)
+    /// SYS_preadv system call: the vectored form of `pread64`.
+    ///
+    /// Positioned reads target seekable files and do not block, so this mirrors
+    /// [`Self::handle_pread64`]'s ordering and records/replays the single kernel
+    /// operation.
+    pub async fn handle_preadv<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Preadv,
+    ) -> Result<i64, Error> {
+        let resource = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.resource())?;
+
+        if let Some(resource) = resource {
+            let request = guest.thread_state().mk_request(resource, Permission::R);
+            resource_request(guest, request).await;
+        }
+
+        let res = self.record_or_replay(guest, call).await;
+        resource_release_all(guest).await;
+        Ok(res?)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#794)
+    /// SYS_preadv2 system call: `preadv` with a trailing per-call flags argument,
+    /// which record/replay forwards unchanged.
+    pub async fn handle_preadv2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Preadv2,
+    ) -> Result<i64, Error> {
+        let resource = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.resource())?;
+
+        if let Some(resource) = resource {
+            let request = guest.thread_state().mk_request(resource, Permission::R);
+            resource_request(guest, request).await;
+        }
+
+        let res = self.record_or_replay(guest, call).await;
+        resource_release_all(guest).await;
+        Ok(res?)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#794)
+    /// SYS_pwritev system call: the vectored form of `pwrite64`.
+    ///
+    /// Positioned writes target seekable files and do not block, so this mirrors
+    /// [`Self::handle_pwrite64`]'s ordering, records/replays the single kernel
+    /// operation, and bumps the virtual mtime on a successful write.
+    pub async fn handle_pwritev<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Pwritev,
+    ) -> Result<i64, Error> {
+        let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
+            (detfd.resource(), detfd.stat().map(|stat| stat.inode))
+        })?;
+        let resource = resource.or_else(|| raw_ino.map(ResourceID::FileContents));
+
+        if let Some(resource) = resource {
+            let request = guest.thread_state().mk_request(resource, Permission::W);
+            resource_request(guest, request).await;
+        }
+
+        let result = self.record_or_replay(guest, call).await.map_err(Into::into);
+
+        if guest.config().virtualize_metadata && matches!(&result, Ok(written) if *written > 0) {
+            let inode = raw_ino.expect("virtualized metadata requires stat data for tracked fds");
+            touch_file(guest, inode).await;
+        }
+
+        resource_release_all(guest).await;
+        result
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#794)
+    /// SYS_pwritev2 system call: `pwritev` with a trailing per-call flags
+    /// argument, which record/replay forwards unchanged.
+    pub async fn handle_pwritev2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Pwritev2,
+    ) -> Result<i64, Error> {
+        let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
+            (detfd.resource(), detfd.stat().map(|stat| stat.inode))
+        })?;
+        let resource = resource.or_else(|| raw_ino.map(ResourceID::FileContents));
+
+        if let Some(resource) = resource {
+            let request = guest.thread_state().mk_request(resource, Permission::W);
+            resource_request(guest, request).await;
+        }
+
+        let result = self.record_or_replay(guest, call).await.map_err(Into::into);
+
+        if guest.config().virtualize_metadata && matches!(&result, Ok(written) if *written > 0) {
+            let inode = raw_ino.expect("virtualized metadata requires stat data for tracked fds");
+            touch_file(guest, inode).await;
+        }
+
+        resource_release_all(guest).await;
+        result
+    }
+
     /// SYS_mmap system call.
     pub async fn handle_mmap<G: Guest<Self>>(
         &self,
