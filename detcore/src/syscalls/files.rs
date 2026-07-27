@@ -348,6 +348,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         // TODO-HUMAN-REVIEW(PR-723): Review injected identity snapshot reads.
         let virtual_pid = guest.inject(syscalls::Getpid::new()).await? as i32;
         let virtual_ppid = guest.inject(syscalls::Getppid::new()).await? as i32;
+        let virtual_pty_count = guest.thread_state().count_open_files_at_paths(&[
+            std::path::Path::new("/dev/ptmx"),
+            std::path::Path::new("/dev/pts/ptmx"),
+        ]);
+        let target_fd = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_target_fd())?;
+        let fdinfo_identity = if let Some(target_fd) = target_fd {
+            let (cached_inode, logical_flags, open_file_id) =
+                guest.thread_state().with_detfd(target_fd, |detfd| {
+                    (
+                        detfd.stat().map(|stat| stat.inode),
+                        detfd.status_flags(),
+                        detfd.open_file_id(),
+                    )
+                })?;
+            let raw_inode = match cached_inode {
+                Some(inode) => inode,
+                None => self.inject_fstat(guest, target_fd).await?.st_ino,
+            };
+            let (virtual_inode, _) = determinize_inode(guest, raw_inode).await;
+            Some((
+                virtual_inode,
+                logical_flags,
+                open_file_id.deterministic_socket_cookie(),
+            ))
+        } else {
+            None
+        };
         guest.thread_state().with_detfd(call.fd(), |detfd| {
             detfd.initialize_procfs(
                 contents.clone(),
@@ -355,6 +384,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 virtual_realtime_seconds,
                 virtual_pid,
                 virtual_ppid,
+                virtual_pty_count,
+                fdinfo_identity,
             );
         })?;
         Ok(())

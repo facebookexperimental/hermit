@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::os::fd::BorrowedFd;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -308,6 +309,18 @@ impl FileMetadata {
         let id = OpenFileId::new(creator, self.next_open_file_sequence);
         self.next_open_file_sequence += 1;
         id
+    }
+
+    fn count_open_files_at_paths(&self, paths: &[&Path]) -> usize {
+        self.file_handles
+            .values()
+            .filter(|fd| {
+                fd.path()
+                    .is_some_and(|path| paths.iter().any(|candidate| path == *candidate))
+            })
+            .map(DetFd::open_file_id)
+            .collect::<BTreeSet<_>>()
+            .len()
     }
 
     pub(crate) fn fork_for(&self, child: DetTid) -> Self {
@@ -1335,6 +1348,10 @@ impl<T> ThreadState<T> {
         F: FnMut(&mut DetFd) -> U,
     {
         self.metadata().with_detfd(fd, f)
+    }
+
+    pub(crate) fn count_open_files_at_paths(&self, paths: &[&Path]) -> usize {
+        self.metadata().count_open_files_at_paths(paths)
     }
 
     /// remove a rawfd

@@ -306,6 +306,8 @@ impl DetFd {
         virtual_realtime_seconds: i64,
         virtual_pid: i32,
         virtual_ppid: i32,
+        virtual_pty_count: usize,
+        fdinfo_identity: Option<(u64, i32, u64)>,
     ) {
         self.description()
             .procfs
@@ -317,6 +319,8 @@ impl DetFd {
                 virtual_realtime_seconds,
                 virtual_pid,
                 virtual_ppid,
+                virtual_pty_count,
+                fdinfo_identity,
             );
     }
 
@@ -341,6 +345,13 @@ impl DetFd {
         self.description().procfs.as_ref().map(ProcfsFile::position)
     }
 
+    pub(crate) fn procfs_target_fd(&self) -> Option<i32> {
+        self.description()
+            .procfs
+            .as_ref()
+            .and_then(ProcfsFile::target_fd)
+    }
+
     /// Update the cursor shared by every alias of a procfs open file.
     pub(crate) fn set_procfs_offset(&self, offset: usize) {
         self.description()
@@ -358,6 +369,10 @@ impl DetFd {
     /// Whether Detcore has made the open file description physically nonblocking.
     pub fn physically_nonblocking(&self) -> bool {
         self.description().physically_nonblocking
+    }
+
+    pub(crate) fn status_flags(&self) -> i32 {
+        self.description().status_flags
     }
 
     /// Mark every alias of this open file description physically nonblocking.
@@ -468,7 +483,7 @@ mod tests {
             OpenFileId::new(owner, 0),
         );
         original.set_procfs(ProcfsFile::from_path(Path::new("/proc/sys/fs/file-nr")).unwrap());
-        original.initialize_procfs(b"15\t0\t1000\n".to_vec(), 0, 0, 1, 0);
+        original.initialize_procfs(b"15\t0\t1000\n".to_vec(), 0, 0, 1, 0, 0, None);
         let duplicate = original.clone().with_fd(4);
 
         assert_eq!(original.take_procfs(2).unwrap(), b"0\t");

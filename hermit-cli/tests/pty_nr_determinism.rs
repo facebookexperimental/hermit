@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -47,6 +48,47 @@ fn pty_nr_consumers_verify() {
     assert!(
         Path::new("/proc/sys/kernel/pty/nr").is_file(),
         "/proc/sys/kernel/pty/nr is required"
+    );
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("pty-nr");
+    fs::create_dir_all(&build_root).expect("failed to create pty-nr build directory");
+    let probe = build_root.join("pty-nr-count");
+    let compile = Command::new("cc")
+        .args(["-O2", "-std=gnu11", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/pty_nr_count.c"))
+        .arg("-o")
+        .arg(&probe)
+        .output()
+        .expect("failed to compile pty count probe");
+    assert!(
+        compile.status.success(),
+        "pty count probe compilation failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let probe_output = Command::new("timeout")
+        .args(["--kill-after", "5s", "90s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=off",
+            "run",
+            "--backend=ptrace",
+            "--strict",
+            "--panic-on-unsupported-syscalls",
+            "--base-env=minimal",
+            "--",
+        ])
+        .arg(&probe)
+        .output()
+        .expect("failed to run pty count probe");
+    assert!(
+        probe_output.status.success()
+            && String::from_utf8_lossy(&probe_output.stdout)
+                .contains("pty-count-tracks-open-files-ok"),
+        "pty count probe failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&probe_output.stdout),
+        String::from_utf8_lossy(&probe_output.stderr)
     );
     let cases = [
         ProgramCase {

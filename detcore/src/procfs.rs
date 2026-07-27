@@ -34,6 +34,7 @@ enum ProcfsKind {
     SelfSched,
     Fdinfo,
     AioNr,
+    AioMaxNr,
     NumaMaps,
     SmapsRollup,
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -275,6 +276,7 @@ fn sysfs_rtc_kind(path: &Path) -> Option<ProcfsKind> {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ProcfsFile {
     kind: ProcfsKind,
+    target_fd: Option<i32>,
     contents: Option<Vec<u8>>,
     offset: usize,
 }
@@ -283,7 +285,9 @@ impl ProcfsFile {
     /// Recognizes procfs files that contain observed volatile fields.
     pub(crate) fn from_path(path: &Path) -> Option<Self> {
         let path = normalize_observed_path(path)?;
-        let kind = match path.to_str()? {
+        let path_text = path.to_str()?;
+        let target_fd = parse_fdinfo_target(path_text);
+        let kind = match path_text {
             "/proc/self/stat" => ProcfsKind::Stat,
             "/proc/self/status" => ProcfsKind::Status,
             "/proc/cpuinfo" => ProcfsKind::Cpuinfo,
@@ -306,6 +310,7 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-933): Review host-global AIO count normalization.
             "/proc/sys/fs/aio-nr" => ProcfsKind::AioNr,
+            "/proc/sys/fs/aio-max-nr" => ProcfsKind::AioMaxNr,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-927): Review host-global PTY count normalization.
             "/proc/sys/kernel/pty/nr" => ProcfsKind::PtyNr,
@@ -323,29 +328,23 @@ impl ProcfsFile {
             other if is_node_vmstat_path(other) => ProcfsKind::NodeVmstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-928): Review per-process host scheduler normalization.
-            "/proc/self/sched" => ProcfsKind::SelfSched,
+            other if is_process_file_path(other, "sched") => ProcfsKind::SelfSched,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-931): Review fdinfo backing-identity normalization.
-            other
-                if other.strip_prefix("/proc/self/fdinfo/").is_some_and(|fd| {
-                    !fd.is_empty() && fd.bytes().all(|byte| byte.is_ascii_digit())
-                }) =>
-            {
-                ProcfsKind::Fdinfo
-            }
+            _ if target_fd.is_some() => ProcfsKind::Fdinfo,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-934): Review host NUMA observation normalization.
-            "/proc/self/numa_maps" => ProcfsKind::NumaMaps,
+            other if is_process_file_path(other, "numa_maps") => ProcfsKind::NumaMaps,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-937): Review smaps rollup accounting normalization.
-            "/proc/self/smaps_rollup" => ProcfsKind::SmapsRollup,
+            other if is_process_file_path(other, "smaps_rollup") => ProcfsKind::SmapsRollup,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-944): Review AVX-512 elapsed-time normalization.
-            "/proc/self/arch_status" => ProcfsKind::ArchStatus,
+            other if is_process_file_path(other, "arch_status") => ProcfsKind::ArchStatus,
             "/proc/swaps" => ProcfsKind::Swaps,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-949): Review per-mapping memory accounting normalization.
-            "/proc/self/smaps" => ProcfsKind::Smaps,
+            other if is_process_file_path(other, "smaps") => ProcfsKind::Smaps,
             "/proc/key-users" => ProcfsKind::KeyUsers,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-903): Review host pressure accounting normalization.
@@ -395,25 +394,12 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-967): Review Unix socket identity normalization.
             "/proc/net/unix" => ProcfsKind::UnixSockets,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
-            // a live hardware reading that differs run-to-run and breaks tools
-            // like `lscpu` under `--verify`. These are opened relative to a
-            // `/sys/devices/system/cpu` directory fd, so match on the suffix
-            // rather than an absolute path.
-            other
-                if other.ends_with("cpufreq/scaling_cur_freq")
-                    || other.ends_with("cpufreq/cpuinfo_cur_freq") =>
-            {
-                ProcfsKind::ScalingCurFreq
-            }
+            other if is_cpufreq_policy_value_path(Path::new(other)) => ProcfsKind::ScalingCurFreq,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-950): Review ACPI CPPC feedback normalization.
             other if is_cppc_feedback_path(Path::new(other)) => ProcfsKind::CppcFeedback,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-932): Review average-frequency snapshot normalization.
-            // `cpuinfo_avg_freq` is another driver-provided live hardware
-            // reading, distinct from the static cpuinfo min/max limits.
-            other if other.ends_with("cpufreq/cpuinfo_avg_freq") => ProcfsKind::ScalingCurFreq,
             other if is_process_io_path(other) => ProcfsKind::ProcessIo,
             other if is_block_stat_path(other) => ProcfsKind::BlockStat,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -439,6 +425,7 @@ impl ProcfsFile {
         };
         Some(Self {
             kind,
+            target_fd,
             contents: None,
             offset: 0,
         })
@@ -458,6 +445,8 @@ impl ProcfsFile {
         virtual_realtime_seconds: i64,
         virtual_pid: i32,
         virtual_ppid: i32,
+        virtual_pty_count: usize,
+        fdinfo_identity: Option<(u64, i32, u64)>,
     ) {
         self.contents = Some(match self.kind {
             ProcfsKind::Stat => sanitize_stat(&contents, virtual_pid, virtual_ppid),
@@ -475,10 +464,11 @@ impl ProcfsFile {
             ProcfsKind::BtrfsBytesMayUse => sanitize_btrfs_bytes_may_use(&contents),
             ProcfsKind::BlockInflight => sanitize_block_inflight(&contents),
             ProcfsKind::IrqPerCpuCount => sanitize_irq_per_cpu_count(&contents),
-            ProcfsKind::PtyNr => sanitize_pty_nr(&contents),
+            ProcfsKind::PtyNr => sanitize_pty_nr(&contents, virtual_pty_count),
             ProcfsKind::SelfSched => sanitize_self_sched(&contents),
-            ProcfsKind::Fdinfo => sanitize_fdinfo(&contents),
+            ProcfsKind::Fdinfo => sanitize_fdinfo(&contents, fdinfo_identity),
             ProcfsKind::AioNr => sanitize_aio_nr(&contents),
+            ProcfsKind::AioMaxNr => sanitize_aio_nr(&contents),
             ProcfsKind::NumaMaps => sanitize_numa_maps(&contents),
             ProcfsKind::SmapsRollup => sanitize_smaps_rollup(&contents),
             ProcfsKind::ArchStatus => sanitize_arch_status(&contents),
@@ -542,6 +532,10 @@ impl ProcfsFile {
     pub(crate) fn set_offset(&mut self, offset: usize) {
         self.offset = offset;
     }
+
+    pub(crate) fn target_fd(&self) -> Option<i32> {
+        self.target_fd
+    }
 }
 
 fn normalize_observed_path(path: &Path) -> Option<PathBuf> {
@@ -560,6 +554,74 @@ fn normalize_observed_path(path: &Path) -> Option<PathBuf> {
         }
     }
     Some(normalized)
+}
+
+fn is_process_file_path(path: &str, filename: &str) -> bool {
+    let Some(relative) = path.strip_prefix("/proc/") else {
+        return false;
+    };
+    let components = relative.split('/').collect::<Vec<_>>();
+    match components.as_slice() {
+        [task, candidate] => is_proc_task_name(task) && *candidate == filename,
+        [process, "task", thread, candidate] => {
+            is_proc_process_name(process) && is_numeric_id(thread) && *candidate == filename
+        }
+        _ => false,
+    }
+}
+
+fn parse_fdinfo_target(path: &str) -> Option<i32> {
+    let relative = path.strip_prefix("/proc/")?;
+    let components = relative.split('/').collect::<Vec<_>>();
+    let fd = match components.as_slice() {
+        [task, "fdinfo", fd] if is_proc_task_name(task) => *fd,
+        [process, "task", thread, "fdinfo", fd]
+            if is_proc_process_name(process) && is_numeric_id(thread) =>
+        {
+            *fd
+        }
+        _ => return None,
+    };
+    fd.parse().ok()
+}
+
+const VIRTUAL_CPU_FREQUENCY_KHZ: u64 = 1_000_000;
+
+fn is_cpufreq_policy_value_path(path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix("/sys/devices/system/cpu") else {
+        return false;
+    };
+    let components = relative
+        .iter()
+        .filter_map(|component| component.to_str())
+        .collect::<Vec<_>>();
+    let attribute = match components.as_slice() {
+        [cpu, "cpufreq", attribute]
+            if cpu.strip_prefix("cpu").is_some_and(|id| {
+                !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())
+            }) =>
+        {
+            *attribute
+        }
+        ["cpufreq", policy, attribute]
+            if policy.strip_prefix("policy").is_some_and(|id| {
+                !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())
+            }) =>
+        {
+            *attribute
+        }
+        _ => return false,
+    };
+    matches!(
+        attribute,
+        "scaling_cur_freq"
+            | "cpuinfo_cur_freq"
+            | "cpuinfo_avg_freq"
+            | "cpuinfo_min_freq"
+            | "cpuinfo_max_freq"
+            | "scaling_min_freq"
+            | "scaling_max_freq"
+    )
 }
 
 fn is_process_io_path(path: &str) -> bool {
@@ -707,7 +769,7 @@ fn sanitize_cpuinfo(contents: &[u8]) -> Vec<u8> {
         let has_newline = line.last() == Some(&b'\n');
         let body = line.strip_suffix(b"\n").unwrap_or(line);
         if body.starts_with(CPU_MHZ) {
-            normalized.extend_from_slice(b"cpu MHz\t\t: 0.000");
+            normalized.extend_from_slice(b"cpu MHz\t\t: 1000.000");
         } else {
             normalized.extend_from_slice(body);
         }
@@ -803,17 +865,16 @@ fn sanitize_process_io(contents: &[u8]) -> Vec<u8> {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-764)
 // TODO-HUMAN-REVIEW(PR-932): Review average-frequency snapshot normalization.
-/// Normalizes a cpufreq `scaling_cur_freq` / `cpuinfo_cur_freq` snapshot. The
-/// instantaneous core frequency is a live hardware reading that varies between
-/// otherwise identical runs, so replace it with a fixed value. This mirrors the
-/// `cpu MHz` zeroing already done for `/proc/cpuinfo` in [`sanitize_cpuinfo`],
-/// and keeps the static `cpuinfo_max_freq`/`scaling_max_freq` files untouched.
+/// Expose one coherent virtual cpufreq policy across current, average, and
+/// min/max attributes.
 fn sanitize_scaling_cur_freq(contents: &[u8]) -> Vec<u8> {
-    if contents.is_empty() {
-        Vec::new()
-    } else {
-        b"0\n".to_vec()
+    let Ok(value) = std::str::from_utf8(contents) else {
+        return Vec::new();
+    };
+    if value.trim().parse::<u64>().is_err() {
+        return Vec::new();
     }
+    format!("{VIRTUAL_CPU_FREQUENCY_KHZ}\n").into_bytes()
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1145,21 +1206,26 @@ fn sanitize_swaps(contents: &[u8]) -> Vec<u8> {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-933): Review the /proc/sys/fs/aio-nr policy.
 fn sanitize_aio_nr(contents: &[u8]) -> Vec<u8> {
-    if contents.is_empty() {
-        Vec::new()
-    } else {
-        b"0\n".to_vec()
-    }
+    let Ok(value) = std::str::from_utf8(contents) else {
+        return Vec::new();
+    };
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map_or_else(Vec::new, |_| b"0\n".to_vec())
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-927): Review the /proc/sys/kernel/pty/nr policy.
-fn sanitize_pty_nr(contents: &[u8]) -> Vec<u8> {
-    if contents.is_empty() {
-        Vec::new()
-    } else {
-        b"0\n".to_vec()
+fn sanitize_pty_nr(contents: &[u8], virtual_count: usize) -> Vec<u8> {
+    let Ok(value) = std::str::from_utf8(contents) else {
+        return Vec::new();
+    };
+    if value.trim().parse::<u64>().is_err() {
+        return Vec::new();
     }
+    format!("{virtual_count}\n").into_bytes()
 }
 
 fn is_node_vmstat_path(path: &str) -> bool {
@@ -1579,18 +1645,89 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
         "numa_pages_migrated",
         "total_numa_faults",
     ];
+    const STABLE_INTEGER_FIELDS: &[&str] = &[
+        "se.load.weight",
+        "policy",
+        "prio",
+        "se.slice",
+        "ext.enabled",
+        "numa_preferred_nid",
+    ];
 
     let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
+        return Vec::new();
     };
     let mut normalized = Vec::with_capacity(contents.len());
     let mut core_fields_seen = [false; 3];
+    let mut header_seen = false;
 
-    for line in text.split_inclusive('\n') {
+    for (line_index, line) in text.split_inclusive('\n').enumerate() {
         let has_newline = line.ends_with('\n');
         let body = line.strip_suffix('\n').unwrap_or(line);
+        if line_index == 0 {
+            let Some((name, details)) = body.rsplit_once(" (") else {
+                return Vec::new();
+            };
+            let Some(details) = details.strip_suffix(')') else {
+                return Vec::new();
+            };
+            let Some((pid, threads)) = details.split_once(", #threads: ") else {
+                return Vec::new();
+            };
+            if pid.parse::<i32>().is_err() || threads.parse::<u64>().is_err() {
+                return Vec::new();
+            }
+            normalized.extend_from_slice(format!("{name} (0, #threads: 1)").as_bytes());
+            if has_newline {
+                normalized.push(b'\n');
+            }
+            header_seen = true;
+            continue;
+        }
         let Some((left, right)) = body.split_once(':') else {
-            normalized.extend_from_slice(body.as_bytes());
+            if !body.is_empty() && body.bytes().all(|byte| byte == b'-') {
+                normalized.extend_from_slice(body.as_bytes());
+            } else if body.starts_with("current_node=") {
+                let fields = body
+                    .replace(',', "")
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                if fields.len() != 2
+                    || !fields.iter().all(|field| {
+                        field.split_once('=').is_some_and(|(name, value)| {
+                            matches!(name, "current_node" | "numa_group_id")
+                                && value.parse::<i64>().is_ok()
+                        })
+                    })
+                {
+                    return Vec::new();
+                }
+                normalized.extend_from_slice(b"current_node=0, numa_group_id=0");
+            } else if body.starts_with("numa_faults ") {
+                let fields = body.split_whitespace().skip(1).collect::<Vec<_>>();
+                let expected = [
+                    "node",
+                    "task_private",
+                    "task_shared",
+                    "group_private",
+                    "group_shared",
+                ];
+                if fields.len() != expected.len()
+                    || !fields.iter().zip(expected).all(|(field, expected)| {
+                        field.split_once('=').is_some_and(|(name, value)| {
+                            name == expected && value.parse::<u64>().is_ok()
+                        })
+                    })
+                {
+                    return Vec::new();
+                }
+                normalized.extend_from_slice(
+                    b"numa_faults node=0 task_private=0 task_shared=0 group_private=0 group_shared=0",
+                );
+            } else {
+                return Vec::new();
+            }
             if has_newline {
                 normalized.push(b'\n');
             }
@@ -1600,20 +1737,25 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
         let replacement = if let Some(index) = FLOAT_FIELDS.iter().position(|field| *field == label)
         {
             let Ok(value) = right.trim().parse::<f64>() else {
-                return contents.to_vec();
+                return Vec::new();
             };
             if !value.is_finite() || value.is_sign_negative() {
-                return contents.to_vec();
+                return Vec::new();
             }
             core_fields_seen[index] = true;
             Some("0.000000")
         } else if INTEGER_FIELDS.contains(&label) {
             if right.trim().parse::<u128>().is_err() {
-                return contents.to_vec();
+                return Vec::new();
             }
             Some("0")
-        } else {
+        } else if STABLE_INTEGER_FIELDS.contains(&label) {
+            if right.trim().parse::<i128>().is_err() {
+                return Vec::new();
+            }
             None
+        } else {
+            return Vec::new();
         };
 
         if let Some(value) = replacement {
@@ -1628,18 +1770,21 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
         }
     }
 
-    if core_fields_seen.iter().all(|seen| *seen) {
+    if header_seen && core_fields_seen.iter().all(|seen| *seen) {
         normalized
     } else {
-        contents.to_vec()
+        Vec::new()
     }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-931): Review the /proc/self/fdinfo field policy.
-fn sanitize_fdinfo(contents: &[u8]) -> Vec<u8> {
+fn sanitize_fdinfo(contents: &[u8], identity: Option<(u64, i32, u64)>) -> Vec<u8> {
+    let Some((virtual_inode, logical_flags, virtual_open_file)) = identity else {
+        return Vec::new();
+    };
     let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
+        return Vec::new();
     };
 
     let mut normalized = Vec::with_capacity(contents.len());
@@ -1647,10 +1792,41 @@ fn sanitize_fdinfo(contents: &[u8]) -> Vec<u8> {
         let has_newline = line.ends_with('\n');
         let body = line.strip_suffix('\n').unwrap_or(line);
         if body.starts_with("mnt_id:") {
-            normalized.extend_from_slice(b"mnt_id:\t0");
+            normalized.extend_from_slice(b"mnt_id:\t1");
         } else if body.starts_with("ino:") {
-            normalized.extend_from_slice(b"ino:\t0");
+            normalized.extend_from_slice(format!("ino:\t{virtual_inode}").as_bytes());
+        } else if body.starts_with("flags:") {
+            normalized.extend_from_slice(format!("flags:\t{logical_flags:07o}").as_bytes());
+        } else if body.starts_with("eventfd-id:") {
+            normalized.extend_from_slice(format!("eventfd-id: {virtual_open_file}").as_bytes());
+        } else if body.starts_with("Pid:") {
+            normalized.extend_from_slice(b"Pid:\t1");
+        } else if body.starts_with("NSpid:") {
+            normalized.extend_from_slice(b"NSpid:\t1");
+        } else if body.starts_with("tfd:")
+            || body.starts_with("inotify ")
+            || body.starts_with("lock:")
+        {
+            return Vec::new();
         } else {
+            let allowed = body.split_once(':').is_some_and(|(label, _)| {
+                matches!(
+                    label,
+                    "pos"
+                        | "eventfd-count"
+                        | "eventfd-semaphore"
+                        | "sigmask"
+                        | "clockid"
+                        | "ticks"
+                        | "settime flags"
+                        | "it_value"
+                        | "it_interval"
+                        | "seals"
+                )
+            });
+            if !allowed {
+                return Vec::new();
+            }
             normalized.extend_from_slice(body.as_bytes());
         }
         if has_newline {
@@ -1707,6 +1883,20 @@ fn sanitize_numa_maps(contents: &[u8]) -> Vec<u8> {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-937): Review the /proc/self/smaps_rollup field policy.
 fn sanitize_smaps_rollup(contents: &[u8]) -> Vec<u8> {
+    const HOST_ACCOUNTING_FIELDS: &[&str] = &[
+        "Rss",
+        "Pss",
+        "Pss_Dirty",
+        "Pss_Anon",
+        "Pss_File",
+        "Pss_Shmem",
+        "Shared_Clean",
+        "Shared_Dirty",
+        "Private_Clean",
+        "Referenced",
+        "KSM",
+        "SwapPss",
+    ];
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
     };
@@ -1723,7 +1913,8 @@ fn sanitize_smaps_rollup(contents: &[u8]) -> Vec<u8> {
                 && fields.next().is_none())
             .then_some(label)
         });
-        if let Some(label) = accounting_label {
+        if let Some(label) = accounting_label.filter(|label| HOST_ACCOUNTING_FIELDS.contains(label))
+        {
             normalized.extend_from_slice(label.as_bytes());
             normalized.extend_from_slice(b":\t0 kB");
         } else {
@@ -1776,19 +1967,9 @@ fn sanitize_smaps(contents: &[u8]) -> Vec<u8> {
         "Shared_Clean",
         "Shared_Dirty",
         "Private_Clean",
-        "Private_Dirty",
         "Referenced",
-        "Anonymous",
         "KSM",
-        "LazyFree",
-        "AnonHugePages",
-        "ShmemPmdMapped",
-        "FilePmdMapped",
-        "Shared_Hugetlb",
-        "Private_Hugetlb",
-        "Swap",
         "SwapPss",
-        "Locked",
     ];
 
     let Ok(text) = std::str::from_utf8(contents) else {
@@ -1822,7 +2003,11 @@ fn sanitize_smaps(contents: &[u8]) -> Vec<u8> {
                 accounting_count += 1;
             } else {
                 let valid_static_field = match label {
-                    "Size" | "KernelPageSize" | "MMUPageSize" => is_smaps_kilobyte_value(value),
+                    "Size" | "KernelPageSize" | "MMUPageSize" | "Private_Dirty" | "Anonymous"
+                    | "LazyFree" | "AnonHugePages" | "ShmemPmdMapped" | "FilePmdMapped"
+                    | "Shared_Hugetlb" | "Private_Hugetlb" | "Swap" | "Locked" => {
+                        is_smaps_kilobyte_value(value)
+                    }
                     "THPeligible" | "ProtectionKey" => is_smaps_integer_value(value),
                     "VmFlags" => value
                         .split_whitespace()
@@ -2502,18 +2687,27 @@ mod tests {
                 .kind,
             ProcfsKind::PtyNr
         );
-        assert_eq!(
-            ProcfsFile::from_path(Path::new("/proc/self/sched"))
-                .unwrap()
-                .kind,
-            ProcfsKind::SelfSched
-        );
-        assert_eq!(
-            ProcfsFile::from_path(Path::new("/proc/self/fdinfo/17"))
-                .unwrap()
-                .kind,
-            ProcfsKind::Fdinfo
-        );
+        for path in [
+            "/proc/self/sched",
+            "/proc/thread-self/sched",
+            "/proc/123/sched",
+            "/proc/self/task/456/sched",
+        ] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
+                ProcfsKind::SelfSched
+            );
+        }
+        for path in [
+            "/proc/self/fdinfo/17",
+            "/proc/thread-self/fdinfo/17",
+            "/proc/123/fdinfo/17",
+            "/proc/self/task/456/fdinfo/17",
+        ] {
+            let procfs = ProcfsFile::from_path(Path::new(path)).unwrap();
+            assert_eq!(procfs.kind, ProcfsKind::Fdinfo);
+            assert_eq!(procfs.target_fd(), Some(17));
+        }
         assert!(ProcfsFile::from_path(Path::new("/proc/self/fdinfo/")).is_none());
         assert!(ProcfsFile::from_path(Path::new("/proc/self/fdinfo/stdin")).is_none());
         assert_eq!(
@@ -2521,6 +2715,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::AioNr
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/sys/fs/aio-max-nr"))
+                .unwrap()
+                .kind,
+            ProcfsKind::AioMaxNr
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/self/numa_maps"))
@@ -2717,31 +2917,22 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_cpufreq_current_frequency_by_suffix() {
-        // Opened relative to a `/sys/devices/system/cpu` directory fd.
-        assert_eq!(
-            ProcfsFile::from_path(Path::new("cpu0/cpufreq/scaling_cur_freq"))
-                .unwrap()
-                .kind,
-            ProcfsKind::ScalingCurFreq
+    fn recognizes_coherent_cpufreq_policy_paths() {
+        for path in [
+            "/sys/devices/system/cpu/cpu3/cpufreq/cpuinfo_cur_freq",
+            "/sys/devices/system/cpu/cpu3/cpufreq/cpuinfo_avg_freq",
+            "/sys/devices/system/cpu/cpu3/cpufreq/scaling_min_freq",
+            "/sys/devices/system/cpu/cpufreq/policy3/cpuinfo_avg_freq",
+            "/sys/devices/system/cpu/cpufreq/policy3/cpuinfo_max_freq",
+        ] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
+                ProcfsKind::ScalingCurFreq
+            );
+        }
+        assert!(
+            ProcfsFile::from_path(Path::new("/tmp/cpufreq/policy3/cpuinfo_avg_freq")).is_none()
         );
-        assert_eq!(
-            ProcfsFile::from_path(Path::new(
-                "/sys/devices/system/cpu/cpu3/cpufreq/cpuinfo_cur_freq"
-            ))
-            .unwrap()
-            .kind,
-            ProcfsKind::ScalingCurFreq
-        );
-        assert_eq!(
-            ProcfsFile::from_path(Path::new("cpu0/cpufreq/cpuinfo_avg_freq"))
-                .unwrap()
-                .kind,
-            ProcfsKind::ScalingCurFreq
-        );
-        // The static min/max limits are deterministic and must not be rewritten.
-        assert!(ProcfsFile::from_path(Path::new("cpu0/cpufreq/cpuinfo_max_freq")).is_none());
-        assert!(ProcfsFile::from_path(Path::new("cpu0/cpufreq/scaling_max_freq")).is_none());
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2839,7 +3030,7 @@ mod tests {
 
     #[test]
     fn scaling_cur_freq_is_fixed() {
-        assert_eq!(sanitize_scaling_cur_freq(b"2483951\n"), b"0\n");
+        assert_eq!(sanitize_scaling_cur_freq(b"2483951\n"), b"1000000\n");
         assert!(sanitize_scaling_cur_freq(b"").is_empty());
     }
 
@@ -3173,7 +3364,7 @@ mod tests {
         let input = b"processor\t: 0\ncpu MHz\t\t: 2994.183\ncache size\t: 1024 KB\n";
         assert_eq!(
             sanitize_cpuinfo(input),
-            b"processor\t: 0\ncpu MHz\t\t: 0.000\ncache size\t: 1024 KB\n"
+            b"processor\t: 0\ncpu MHz\t\t: 1000.000\ncache size\t: 1024 KB\n"
         );
     }
 
@@ -3267,8 +3458,8 @@ malformed buddy row\n"
     // TODO-HUMAN-REVIEW(PR-927): Review PTY count fixture coverage.
     #[test]
     fn pty_nr_hides_host_global_allocations() {
-        assert_eq!(sanitize_pty_nr(b"107\n"), b"0\n");
-        assert!(sanitize_pty_nr(b"").is_empty());
+        assert_eq!(sanitize_pty_nr(b"107\n", 2), b"2\n");
+        assert!(sanitize_pty_nr(b"", 2).is_empty());
     }
 
     #[test]
@@ -3424,7 +3615,7 @@ MMUPageSize:           4 kB\n\
 Rss:\t0 kB\n\
 Pss:\t0 kB\n\
 Shared_Clean:\t0 kB\n\
-Private_Dirty:\t0 kB\n\
+Private_Dirty:         0 kB\n\
 THPeligible:           0\n\
 ProtectionKey:         0\n\
 VmFlags: rd ex mr mw me ac\n"
@@ -3467,6 +3658,8 @@ x86_Thread_features_locked:\t\n"
 Rss:                2216 kB\n\
 Pss:                 311 kB\n\
 Pss_File:            131 kB\n\
+Locked:                12 kB\n\
+Swap:                   8 kB\n\
 THPeligible:    0\n";
 
         assert_eq!(
@@ -3475,6 +3668,8 @@ THPeligible:    0\n";
 Rss:\t0 kB\n\
 Pss:\t0 kB\n\
 Pss_File:\t0 kB\n\
+Locked:                12 kB\n\
+Swap:                   8 kB\n\
 THPeligible:    0\n"
         );
     }
@@ -3509,52 +3704,56 @@ ino:\t47761541\n\
 eventfd-count: 0000000000000007\n";
 
         assert_eq!(
-            sanitize_fdinfo(contents),
+            sanitize_fdinfo(contents, Some((9007, 0o100002, 42))),
             b"pos:\t1\n\
 flags:\t0100002\n\
-mnt_id:\t0\n\
-ino:\t0\n\
+mnt_id:\t1\n\
+ino:\t9007\n\
 eventfd-count: 0000000000000007\n"
         );
     }
 
     #[test]
     fn self_sched_hides_host_scheduler_accounting() {
-        let contents = b"cat (3, #threads: 1)\n\
+        let contents = b"cat (3, #threads: 7)\n\
 se.exec_start : 377650149.445644\n\
 se.vruntime : 133948666.432951\n\
 se.sum_exec_runtime : 3.637972\n\
 nr_switches : 149\n\
 se.avg.load_avg : 749\n\
-policy : 0\n";
+policy : 0\n\
+current_node=7, numa_group_id=91\n\
+numa_faults node=7 task_private=8 task_shared=9 group_private=10 group_shared=11\n";
 
         assert_eq!(
             sanitize_self_sched(contents),
-            b"cat (3, #threads: 1)\n\
+            b"cat (0, #threads: 1)\n\
 se.exec_start : 0.000000\n\
 se.vruntime : 0.000000\n\
 se.sum_exec_runtime : 0.000000\n\
 nr_switches : 0\n\
 se.avg.load_avg : 0\n\
-policy : 0\n"
+policy : 0\n\
+current_node=0, numa_group_id=0\n\
+numa_faults node=0 task_private=0 task_shared=0 group_private=0 group_shared=0\n"
         );
     }
 
     #[test]
-    fn self_sched_leaves_unknown_formats_untouched() {
+    fn self_sched_fails_closed_on_unknown_formats() {
         let missing_core_field = b"se.exec_start : 1.0\nse.vruntime : 2.0\n";
-        assert_eq!(sanitize_self_sched(missing_core_field), missing_core_field);
+        assert!(sanitize_self_sched(missing_core_field).is_empty());
 
         let invalid_counter = b"se.exec_start : NaN\n\
 se.vruntime : 2.0\n\
 se.sum_exec_runtime : 3.0\n";
-        assert_eq!(sanitize_self_sched(invalid_counter), invalid_counter);
+        assert!(sanitize_self_sched(invalid_counter).is_empty());
 
         let negative_counter = b"se.exec_start : 1.0\n\
 se.vruntime : 2.0\n\
 se.sum_exec_runtime : 3.0\n\
 nr_switches : -1\n";
-        assert_eq!(sanitize_self_sched(negative_counter), negative_counter);
+        assert!(sanitize_self_sched(negative_counter).is_empty());
     }
 
     #[test]
@@ -3781,7 +3980,15 @@ total_commit_ms 0\n"
     #[test]
     fn snapshot_supports_partial_reads() {
         let mut file = ProcfsFile::from_path(Path::new("/proc/self/status")).unwrap();
-        file.initialize(b"voluntary_ctxt_switches:\t12\n".to_vec(), 120, 0, 3, 1);
+        file.initialize(
+            b"voluntary_ctxt_switches:\t12\n".to_vec(),
+            120,
+            0,
+            3,
+            1,
+            0,
+            None,
+        );
         assert_eq!(file.take(5).unwrap(), b"volun");
         assert_eq!(file.take(128).unwrap(), b"tary_ctxt_switches:\t0\n");
         assert!(file.take(1).unwrap().is_empty());
@@ -3790,7 +3997,7 @@ total_commit_ms 0\n"
     #[test]
     fn snapshot_supports_positional_reads_and_rewinds() {
         let mut file = ProcfsFile::from_path(Path::new("/proc/sys/fs/file-nr")).unwrap();
-        file.initialize(b"245853\t0\t1048576\n".to_vec(), 0, 0, 1, 0);
+        file.initialize(b"245853\t0\t1048576\n".to_vec(), 0, 0, 1, 0, 0, None);
 
         assert_eq!(file.take(2).unwrap(), b"0\t");
         assert_eq!(file.take_at(4, 1).unwrap(), b"9");
