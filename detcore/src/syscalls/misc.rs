@@ -120,6 +120,18 @@ fn setpriority_result(which: i32) -> Result<i64, Errno> {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-857): Deterministic empty kernel-log action policy.
+fn deterministic_syslog_result(action: i32, len: usize) -> Result<i64, Errno> {
+    const SYSLOG_ACTION_CONSOLE_LEVEL: i32 = 8;
+
+    match action {
+        0..=7 | 9..=10 => Ok(0),
+        SYSLOG_ACTION_CONSOLE_LEVEL if (1..=8).contains(&len) => Ok(0),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
 fn from_str(s: &str) -> [i8; 65] {
     let mut ret: [i8; 65] = [0; 65];
     for (i, ch) in s.bytes().take(64).enumerate() {
@@ -313,6 +325,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Getpriority,
     ) -> Result<i64, Error> {
         Ok(getpriority_result(call.which())?)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-857): Deterministic syslog(2) virtualization.
+    /// Present an empty kernel ring buffer. Reads and size queries return zero,
+    /// controls are inert, and invalid actions preserve Linux's EINVAL boundary.
+    pub async fn handle_syslog<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        call: syscalls::Syslog,
+    ) -> Result<i64, Error> {
+        Ok(deterministic_syslog_result(call.priority(), call.len())?)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -690,5 +714,20 @@ mod tests {
             Detcore::<crate::record_or_replay::NoopTool>::handle_process_madvise(3, 0),
             Err(Error::Errno(Errno::EPERM))
         ));
+    }
+
+    #[test]
+    fn syslog_exposes_an_empty_log_and_validates_actions() {
+        for action in 0..=7 {
+            assert_eq!(deterministic_syslog_result(action, 0), Ok(0));
+        }
+        for action in [9, 10] {
+            assert_eq!(deterministic_syslog_result(action, 0), Ok(0));
+        }
+        assert_eq!(deterministic_syslog_result(8, 1), Ok(0));
+        assert_eq!(deterministic_syslog_result(8, 8), Ok(0));
+        assert_eq!(deterministic_syslog_result(8, 0), Err(Errno::EINVAL));
+        assert_eq!(deterministic_syslog_result(8, 9), Err(Errno::EINVAL));
+        assert_eq!(deterministic_syslog_result(11, 0), Err(Errno::EINVAL));
     }
 }

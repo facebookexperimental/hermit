@@ -504,6 +504,16 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::flock
         | Sysno::ioprio_set
         | Sysno::sched_getattr
+        // TODO-HUMAN-REVIEW(PR-857): Review deterministic NTP and kernel-log
+        // virtualization. Query-only timex calls report Hermit's virtual clock
+        // and an unsynchronized discipline, while mutation modes are refused.
+        // syslog exposes an empty ring buffer and never reads host dmesg state.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::adjtimex
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::clock_adjtime
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::syslog
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-841): Return the fixed virtual default I/O priority.
         | Sysno::ioprio_get
@@ -706,9 +716,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // --panic-on-unsupported-syscalls stops at the first use.
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed unsupported classifications.
-        Sysno::adjtimex
-        | Sysno::clock_adjtime
-        | Sysno::get_robust_list
+        Sysno::get_robust_list
         | Sysno::lsm_get_self_attr
         | Sysno::lsm_set_self_attr
         | Sysno::mincore
@@ -730,7 +738,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::shmctl
         | Sysno::shmdt
         | Sysno::shmget
-        | Sysno::syslog
         | Sysno::ustat
         => SyscallClassification::Unsupported,
         // ===== END UNSUPPORTED SYSCALLS =====
@@ -1102,7 +1109,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [256, 91, 26]);
+        assert_eq!(counts, [259, 91, 23]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1365,6 +1372,13 @@ mod tests {
         for sysno in [Sysno::semget, Sysno::semop, Sysno::shmget, Sysno::shmat] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
             assert!(!is_unsupported_async_ipc_syscall(sysno));
+        }
+    }
+
+    #[test]
+    fn clock_discipline_and_kernel_log_syscalls_are_determinized() {
+        for sysno in [Sysno::adjtimex, Sysno::clock_adjtime, Sysno::syslog] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }
     }
 

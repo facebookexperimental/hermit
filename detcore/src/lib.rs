@@ -1674,6 +1674,39 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-841): Review logical one-shot getitimer emulation.
                 Syscall::Getitimer(s) => self.handle_getitimer(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-857): Virtual NTP query and fixed mutation refusal.
+                Syscall::Adjtimex(s) => {
+                    if virtualize_time {
+                        self.handle_adjtimex(guest, s).await
+                    } else {
+                        self.handle_unsupported_syscall(
+                            guest,
+                            call,
+                            dettid,
+                            config.panic_on_unsupported_syscalls,
+                        )
+                        .await
+                    }
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-857): Clock-id form of virtual NTP query.
+                Syscall::ClockAdjtime(s) => {
+                    if virtualize_time {
+                        self.handle_clock_adjtime(guest, s).await
+                    } else {
+                        self.handle_unsupported_syscall(
+                            guest,
+                            call,
+                            dettid,
+                            config.panic_on_unsupported_syscalls,
+                        )
+                        .await
+                    }
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-857): Empty virtual kernel ring buffer.
+                Syscall::Syslog(s) => self.handle_syslog(guest, s).await,
                 Syscall::ArchPrctl(s) => self.handle_arch_prctl(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)

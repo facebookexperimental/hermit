@@ -13,6 +13,7 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
 use reverie::syscalls;
+use reverie::syscalls::ClockId;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
@@ -65,6 +66,27 @@ fn ns_to_timespec(ns: u64) -> libc::timespec {
         tv_sec: (ns / 1_000_000_000) as libc::time_t,
         tv_nsec: (ns % 1_000_000_000) as libc::c_long,
     }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-857): Query-only timex mode boundary.
+fn timex_mode_is_query(modes: libc::c_uint) -> bool {
+    modes == 0 || modes == libc::ADJ_OFFSET_SS_READ
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-857): Host-independent NTP discipline snapshot.
+fn deterministic_timex(now: Timespec) -> libc::timex {
+    // SAFETY: `libc::timex` contains only integer fields and padding; zero is a
+    // valid baseline for the fields not modeled by Hermit.
+    let mut tx: libc::timex = unsafe { std::mem::zeroed() };
+    tx.status = libc::STA_UNSYNC;
+    tx.tick = 10_000;
+    tx.time = libc::timeval {
+        tv_sec: now.tv_sec,
+        tv_usec: now.tv_nsec / 1_000,
+    };
+    tx
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -192,6 +214,49 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest.memory().write_value(res, &t)?;
 
         Ok(0)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-857): Deterministic adjtimex query/refusal policy.
+    /// Report Hermit's virtual clock with a fixed unsynchronized discipline.
+    /// Adjustment modes are capability-gated host mutations and receive EPERM.
+    pub async fn handle_adjtimex<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Adjtimex,
+    ) -> Result<i64, Error> {
+        self.write_deterministic_timex(guest, call.buf()).await
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-857): Deterministic clock_adjtime query/refusal policy.
+    /// Apply the adjtimex policy to CLOCK_REALTIME. Linux does not permit NTP
+    /// adjustment of the other fixed clock IDs, so reject them with EOPNOTSUPP.
+    pub async fn handle_clock_adjtime<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::ClockAdjtime,
+    ) -> Result<i64, Error> {
+        if call.clockid() != ClockId::CLOCK_REALTIME {
+            return Err(Errno::EOPNOTSUPP.into());
+        }
+        self.write_deterministic_timex(guest, call.buf()).await
+    }
+
+    async fn write_deterministic_timex<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        buf: Option<reverie::syscalls::AddrMut<'_, libc::timex>>,
+    ) -> Result<i64, Error> {
+        let buf = buf.ok_or(Errno::EFAULT)?;
+        let request: libc::timex = guest.memory().read_value(buf)?;
+        if !timex_mode_is_query(request.modes) {
+            return Err(Errno::EPERM.into());
+        }
+
+        let now: Timespec = thread_observe_time(guest).await.into();
+        guest.memory().write_value(buf, &deterministic_timex(now))?;
+        Ok(libc::TIME_ERROR as i64)
     }
 
     /// Helper function to wait a given period, which may either succeed or be interrupted by a signal.
@@ -453,5 +518,30 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             Err(Errno::EINVAL.into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timex_policy_distinguishes_queries_from_mutations() {
+        assert!(timex_mode_is_query(0));
+        assert!(timex_mode_is_query(libc::ADJ_OFFSET_SS_READ));
+        assert!(!timex_mode_is_query(libc::ADJ_OFFSET));
+        assert!(!timex_mode_is_query(libc::ADJ_FREQUENCY));
+    }
+
+    #[test]
+    fn timex_snapshot_is_unsynchronized_and_uses_virtual_time() {
+        let tx = deterministic_timex(Timespec {
+            tv_sec: 123,
+            tv_nsec: 456_789_000,
+        });
+        assert_eq!(tx.status, libc::STA_UNSYNC);
+        assert_eq!(tx.tick, 10_000);
+        assert_eq!(tx.time.tv_sec, 123);
+        assert_eq!(tx.time.tv_usec, 456_789);
     }
 }
