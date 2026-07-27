@@ -289,6 +289,8 @@ readonly STRICT_COMPAT_HERMIT_BIN
 readonly STRICT_COMPAT_TIMEOUT=60
 readonly BACKEND_COMPAT_RESULTS="$VALIDATION_TMP_DIR/backend-compat-results.tsv"
 readonly COMPAT_SUMMARY_RESULTS="$VALIDATION_TMP_DIR/compat-summary-results.tsv"
+VALIDATE_RESULTS_FILE=${VALIDATE_RESULTS_FILE:-"$ROOT_DIR/target/validate-results.txt"}
+readonly VALIDATE_RESULTS_FILE
 readonly REAL_COMPAT_FIXTURES="$ROOT_DIR/target/real-compat-fixtures-$$"
 readonly E9PATCH_NSSWITCH_FILE="$VALIDATION_TMP_DIR/e9patch-nsswitch.conf"
 readonly REAL_COMPAT_WORKLOAD="$ROOT_DIR/tests/compat/real_compat_workload.sh"
@@ -348,6 +350,19 @@ declare -Ar HOSTED_STRICT_SUPER_ONLY=(
 )
 HOSTED_STRICT_DIAGNOSTIC_FAILURE_COUNT=0
 declare -A COMPAT_SUMMARY_CELLS=()
+declare -ar COMPAT_SUMMARY_CATEGORIES=(
+    coreutils
+    interpreters
+    build-toolchain
+    text-data
+    archive-compression
+    filesystem-storage
+    process-scheduling
+    system-introspection
+    networking
+    applications
+    other
+)
 
 # Commands remain owned by the strict corpus below; this exact set only selects
 # rows measured to pass R/R.
@@ -862,13 +877,54 @@ function record_compatibility_result {
 }
 
 function compat_summary_programs {
-    awk '
-        /^function run_compatibility_corpus \{/ { in_corpus = 1; next }
-        in_corpus && /^function / { exit }
-        in_corpus && ($1 == "strict_compatibility_probe" ||
-                      $1 == "functional_compatibility_probe") { print $2 }
-    ' "$ROOT_DIR/validate.sh"
-    printf "%s\n" "${!COMPAT_SUMMARY_KNOWN_FAILURES[@]}"
+    local key
+
+    for key in "${!COMPAT_SUMMARY_CELLS[@]}"; do
+        printf "%s\n" "${key%:*}"
+    done
+}
+
+function compatibility_category {
+    case "$1" in
+        arch|b2sum|base32|base64|basename|basenc|bracket|cat|cksum|comm|cp|csplit|cut|date|dd|df|dirname|du|echo|env|expand|expr|factor|fmt|fold|head|id|install|join|ln|ls|md5sum|mkdir|mkfifo|mktemp|mv|nice|nl|nohup|nproc|numfmt|od|paste|pathchk|pinky|pr|printenv|printf|ptx|pwd|readlink|realpath|rm|rmdir|seq|sha1sum|sha224sum|sha256sum|sha384sum|sha512sum|shred|shuf|sleep|sort|split|stat|stdbuf|sum|sync|tac|tee|test|timeout|touch|tr|true|truncate|tsort|tty|uname|unexpand|uniq|users|wc|wc-lines|whoami|xargs|yes)
+            printf "coreutils" ;;
+        awk|bash|bc|dc|java|lua|node|perl|python3|ruby|tcl)
+            printf "interpreters" ;;
+        addr2line|ar|as|c++filt|cargo|clang|cmake|cpp|elfedit|flex|g++|gcc|gcov|gprof|javac|ld|m4|make|nm|objcopy|objdump|pkg-config|ranlib|readelf|rustc|shell-build|size|strings|strip)
+            printf "build-toolchain" ;;
+        col|colrm|column|diff|diff3|dos2unix|egrep|envsubst|fgrep|file|find|grep|hexdump|iconv|msgfmt|msgunfmt|patch|rev|sed|xxd)
+            printf "text-data" ;;
+        bzip2|bzip2-roundtrip|cpio-roundtrip|crc32|gzip|gzip-roundtrip|tar|tar-roundtrip|xz|xz-roundtrip|zip-unzip|zstd|zstd-roundtrip)
+            printf "archive-compression" ;;
+        chmod|chown|cmp|fallocate|findmnt|mountpoint|namei|setfacl|setfattr)
+            printf "filesystem-storage" ;;
+        chrt|flock|getopt|groups|ionice|kill|logger|logname|lsof|pgrep|pkill|ps|taskset|time|top)
+            printf "process-scheduling" ;;
+        cal|free|getconf|hostname|iostat|lscpu|lsirq|lsmod|mpstat-softirqs|numactl-hardware|numastat|pidstat-disk|sar-resource-tables|sensors-version|sysctl-random-uuid|uptime|uuidgen|vmstat|vmstat-disk)
+            printf "system-introspection" ;;
+        curl|curl-localhost|ip|netcat|socat|ss|wget|wget-localhost)
+            printf "networking" ;;
+        cscope|git|jq|openssl|sqlite3|xmllint)
+            printf "applications" ;;
+        *) printf "other" ;;
+    esac
+}
+
+function compatibility_count_cell {
+    local output_variable=$1
+    local category=$2
+    local backend=$3
+    local -n _pass_counts=$4
+    local -n _measured_counts=$5
+    local key="$category:$backend"
+    local passed=${_pass_counts[$key]:-0}
+    local measured=${_measured_counts[$key]:-0}
+
+    if ((measured == 0)); then
+        printf -v "$output_variable" "N/A"
+    else
+        printf -v "$output_variable" "%s/%s" "$passed" "$measured"
+    fi
 }
 
 function backend_parity_program_name {
@@ -973,48 +1029,103 @@ function compatibility_status {
 
 function print_compatibility_summary {
     local program
+    local category
+    local backend
+    local category_cell
     local ptrace
     local kvm
     local dbi
     local sabre
     local status
     local total=0
-    local ptrace_pass=0
-    local kvm_pass=0
-    local dbi_pass=0
-    local sabre_pass=0
+    local category_programs
+    local raw_tmp="$VALIDATE_RESULTS_FILE.tmp.$$"
     local rendered="$VALIDATION_TMP_DIR/compat-summary-rendered.tsv"
+    local -a programs=()
+    local -a backends=(ptrace kvm dbi sabre)
+    local -A category_totals=()
+    local -A pass_counts=()
+    local -A measured_counts=()
     load_compatibility_results
+    mapfile -t programs < <(compat_summary_programs | sort -u)
 
     : >"$rendered"
-    while read -r program; do
-        [[ -n $program ]] || continue
+    for program in "${programs[@]}"; do
+        category=$(compatibility_category "$program")
         backend_compatibility_cell ptrace "$program" ptrace
         backend_compatibility_cell kvm "$program" kvm
         backend_compatibility_cell dbi "$program" dbi
         backend_compatibility_cell sabre "$program" sabre
         compatibility_status status "$program" "$ptrace" "$kvm" "$dbi" "$sabre"
-        printf "%s\t%s\t%s\t%s\t%s\t%s\n" \
-            "$program" "$ptrace" "$kvm" "$dbi" "$sabre" "$status" >>"$rendered"
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+            "$program" "$category" "$ptrace" "$kvm" "$dbi" "$sabre" "$status" \
+            >>"$rendered"
         total=$((total + 1))
-        [[ $ptrace == PASS ]] && ptrace_pass=$((ptrace_pass + 1))
-        [[ $kvm == PASS ]] && kvm_pass=$((kvm_pass + 1))
-        [[ $dbi == PASS ]] && dbi_pass=$((dbi_pass + 1))
-        [[ $sabre == PASS ]] && sabre_pass=$((sabre_pass + 1))
-    done < <(compat_summary_programs | sort -u)
+        category_totals[$category]=$((${category_totals[$category]:-0} + 1))
+        for backend in "${backends[@]}"; do
+            backend_compatibility_cell category_cell "$program" "$backend"
+            case "$category_cell" in
+                PASS)
+                    pass_counts["$category:$backend"]=$((${pass_counts["$category:$backend"]:-0} + 1))
+                    measured_counts["$category:$backend"]=$((${measured_counts["$category:$backend"]:-0} + 1))
+                    ;;
+                FAIL)
+                    measured_counts["$category:$backend"]=$((${measured_counts["$category:$backend"]:-0} + 1))
+                    ;;
+            esac
+        done
+    done
 
-    printf "\nCOMPAT SUMMARY (%s total programs)\n" "$total"
-    printf "%-24s | %-7s | %-7s | %-7s | %-7s | %s\n" \
-        "Program" "ptrace" "KVM" "DBI" "SaBRe" "Status"
-    printf "%s\n" "-------------------------|---------|---------|---------|---------|----------------"
-    while IFS=$'\t' read -r program ptrace kvm dbi sabre status; do
-        printf "%-24s | %-7s | %-7s | %-7s | %-7s | %s\n" \
-            "$program" "$ptrace" "$kvm" "$dbi" "$sabre" "$status"
-    done <"$rendered"
-    printf "%-24s | %-7s | %-7s | %-7s | %-7s |\n" \
-        "TOTAL" "$ptrace_pass/$total" "$kvm_pass/$total" \
-        "$dbi_pass/$total" "$sabre_pass/$total"
-    printf "N/A means this profile did not measure that backend/program.\n"
+    mkdir -p "$(dirname "$VALIDATE_RESULTS_FILE")"
+    {
+        printf "Hermit compatibility results\n"
+        printf "profile\t%s\n" "$VALIDATION_PROFILE"
+        printf "program\tcategory\tptrace\tKVM\tDBI\tSaBRe\tstatus\n"
+        cat "$rendered"
+    } >"$raw_tmp"
+    mv "$raw_tmp" "$VALIDATE_RESULTS_FILE"
+
+    if ((total == 0)); then
+        return 0
+    fi
+
+    printf "\nCOMPATIBILITY SUMMARY (%s recorded programs)\n" "$total"
+    printf "%-22s | %8s | %9s | %9s | %9s | %9s\n" \
+        "Category" "Programs" "ptrace" "KVM" "DBI" "SaBRe"
+    printf "%s\n" "-----------------------|----------|-----------|-----------|-----------|----------"
+    for category in "${COMPAT_SUMMARY_CATEGORIES[@]}"; do
+        category_programs=${category_totals[$category]:-0}
+        ((category_programs > 0)) || continue
+        compatibility_count_cell ptrace "$category" ptrace pass_counts measured_counts
+        compatibility_count_cell kvm "$category" kvm pass_counts measured_counts
+        compatibility_count_cell dbi "$category" dbi pass_counts measured_counts
+        compatibility_count_cell sabre "$category" sabre pass_counts measured_counts
+        printf "%-22s | %8s | %9s | %9s | %9s | %9s\n" \
+            "$category" "$category_programs" "$ptrace" "$kvm" "$dbi" "$sabre"
+    done
+
+    for backend in "${backends[@]}"; do
+        pass_counts["total:$backend"]=0
+        measured_counts["total:$backend"]=0
+        for category in "${COMPAT_SUMMARY_CATEGORIES[@]}"; do
+            pass_counts["total:$backend"]=$((${pass_counts["total:$backend"]} + ${pass_counts["$category:$backend"]:-0}))
+            measured_counts["total:$backend"]=$((${measured_counts["total:$backend"]} + ${measured_counts["$category:$backend"]:-0}))
+        done
+    done
+    compatibility_count_cell ptrace total ptrace pass_counts measured_counts
+    compatibility_count_cell kvm total kvm pass_counts measured_counts
+    compatibility_count_cell dbi total dbi pass_counts measured_counts
+    compatibility_count_cell sabre total sabre pass_counts measured_counts
+    printf "%-22s | %8s | %9s | %9s | %9s | %9s\n" \
+        "TOTAL" "$total" "$ptrace" "$kvm" "$dbi" "$sabre"
+    printf "P/M means passing/measured; failures are M-P and unmeasured rows are excluded from M.\n"
+    for backend in "${backends[@]}"; do
+        printf "  %-7s %s passed, %s failed, %s unmeasured\n" \
+            "$backend:" "${pass_counts["total:$backend"]}" \
+            "$((${measured_counts["total:$backend"]} - ${pass_counts["total:$backend"]}))" \
+            "$((total - ${measured_counts["total:$backend"]}))"
+    done
+    printf "Raw per-program results: %s\n" "$VALIDATE_RESULTS_FILE"
 }
 
 function super_probe_command {
