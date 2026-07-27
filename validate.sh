@@ -304,7 +304,7 @@ readonly STRICT_COMPAT_TOTAL=181
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
 readonly RR_COMPAT_EXPECTED=143
-readonly LITEINST_COMPAT_EXPECTED=555
+readonly LITEINST_COMPAT_EXPECTED=581
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
@@ -830,7 +830,7 @@ function run_full_backend_gates {
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
     run_check "LiteInst backend smoke" liteinst_backend_available
-    run_check "LiteInst compatibility baseline (555 programs)" run_liteinst_compatibility_envelope
+    run_check "LiteInst compatibility baseline (581 programs)" run_liteinst_compatibility_envelope
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -1870,6 +1870,32 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe llvm-remarkutil-22-version /usr/bin/llvm-remarkutil-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe llvm-rtdyld-22-version /usr/bin/llvm-rtdyld-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe llvm-sim-22-version /usr/bin/llvm-sim-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe filecheck-22-version /usr/bin/FileCheck-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe bugpoint-22-version /usr/bin/bugpoint-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe dsymutil-22-version /usr/bin/dsymutil-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe llc-22-version /usr/bin/llc-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe lli-22-version /usr/bin/lli-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe llvm-nm-22-version /usr/bin/llvm-nm-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe llvm-objcopy-22-version /usr/bin/llvm-objcopy-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe llvm-objdump-22-version /usr/bin/llvm-objdump-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe llvm-size-22-version /usr/bin/llvm-size-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe llvm-split-22-version /usr/bin/llvm-split-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe llvm-stress-22-version /usr/bin/llvm-stress-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe llvm-strings-22-version /usr/bin/llvm-strings-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe llvm-strip-22-version /usr/bin/llvm-strip-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe llvm-symbolizer-22-version /usr/bin/llvm-symbolizer-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe llvm-tblgen-22-version /usr/bin/llvm-tblgen-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe llvm-undname-22-version /usr/bin/llvm-undname-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe llvm-windres-22-version /usr/bin/llvm-windres-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe llvm-xray-22-version /usr/bin/llvm-xray-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe obj2yaml-22-version /usr/bin/obj2yaml-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe opt-22-version /usr/bin/opt-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe reduce-chunk-list-22-version /usr/bin/reduce-chunk-list-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sancov-22-version /usr/bin/sancov-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sanstats-22-version /usr/bin/sanstats-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe split-file-22-version /usr/bin/split-file-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe verify-uselistorder-22-version /usr/bin/verify-uselistorder-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe yaml2obj-22-version /usr/bin/yaml2obj-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
 
     total=$((passed + failed))
     if ((total != LITEINST_COMPAT_EXPECTED)); then
@@ -3693,7 +3719,7 @@ fi
 if ((LITEINST_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
     if ((failures == 0)); then
-        run_check "LiteInst compatibility baseline (555 programs)" run_liteinst_compatibility_envelope
+        run_check "LiteInst compatibility baseline (581 programs)" run_liteinst_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
