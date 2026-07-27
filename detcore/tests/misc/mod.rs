@@ -788,6 +788,65 @@ fn unix_autobind_names_are_deterministic() {
 }
 
 #[test]
+fn netlink_autobind_port_ids_are_deterministic() {
+    det_test_fn_sequential_without_pmu(|| {
+        fn bind_netlink(protocol: libc::c_int) -> (libc::c_int, u32) {
+            let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, protocol) };
+            assert!(fd >= 0, "Netlink socket creation failed for {protocol}");
+
+            let mut requested: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+            requested.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+            assert_eq!(
+                unsafe {
+                    libc::bind(
+                        fd,
+                        (&requested as *const libc::sockaddr_nl).cast(),
+                        std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+                    )
+                },
+                0,
+                "Netlink autobind failed for {protocol}"
+            );
+
+            let mut observed: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+            let mut observed_len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+            assert_eq!(
+                unsafe {
+                    libc::getsockname(
+                        fd,
+                        (&mut observed as *mut libc::sockaddr_nl).cast(),
+                        &mut observed_len,
+                    )
+                },
+                0,
+                "Netlink getsockname failed for {protocol}"
+            );
+            assert_eq!(
+                observed_len as usize,
+                std::mem::size_of::<libc::sockaddr_nl>()
+            );
+            assert_eq!(observed.nl_family, libc::AF_NETLINK as libc::sa_family_t);
+            assert_ne!(observed.nl_pid, 0);
+            assert_eq!(observed.nl_groups, 0);
+            (fd, observed.nl_pid)
+        }
+
+        for (protocol, label) in [
+            (libc::NETLINK_ROUTE, "route"),
+            (libc::NETLINK_USERSOCK, "usersock"),
+            (libc::NETLINK_GENERIC, "generic"),
+        ] {
+            let (first_fd, first_port_id) = bind_netlink(protocol);
+            let (second_fd, second_port_id) = bind_netlink(protocol);
+            assert_ne!(first_port_id, second_port_id);
+            println!("{label}={first_port_id},{second_port_id}");
+            assert_eq!(unsafe { libc::close(first_fd) }, 0);
+            assert_eq!(unsafe { libc::close(second_fd) }, 0);
+        }
+    });
+}
+
+#[test]
 fn shared_futex_modes_are_supported_and_validate_bitsets() {
     det_test_fn_sequential_without_pmu(|| {
         let futex = 0_u32;

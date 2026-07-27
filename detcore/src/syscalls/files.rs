@@ -87,6 +87,9 @@ fn canonicalize_tcp_info(info: &mut [u8]) {
 // Hermit exposes exactly one isolated guest network namespace.
 const DETERMINISTIC_NETNS_COOKIE: u64 = 1;
 
+// Above Linux's PID range and below the high-bit IDs used by kernel autobind.
+const DETERMINISTIC_NETLINK_PORT_ID_BASE: u32 = 0x4000_0000;
+
 impl<T: RecordOrReplay> Detcore<T> {
     /// Inject an extra fstat to retrieve file metadata.
     async fn inject_fstat<G: Guest<Self>>(
@@ -1693,6 +1696,37 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .with_umyaddr(Some(autobind_addr.cast()))
                 .with_addrlen(unix_autobind_addrlen());
             return Ok(self.record_or_replay(guest, deterministic_bind).await?);
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-880): Review deterministic Netlink autobind identities.
+        } else if sockaddr_family == libc::AF_NETLINK as u16
+            && call.addrlen() >= std::mem::size_of::<libc::sockaddr_nl>() as i32
+        {
+            let mut sockaddr_nl: libc::sockaddr_nl = guest
+                .memory()
+                .read_value(addr.cast::<libc::sockaddr_nl>())?;
+            if sockaddr_nl.nl_pid == 0 {
+                let mytime = guest.thread_state().thread_logical_time.clone();
+                let resp = guest
+                    .send_rpc((mytime, GlobalRequest::RequestPort(open_file_id)))
+                    .await;
+                match resp.1 {
+                    GlobalResponse::RequestPort(port) => {
+                        sockaddr_nl.nl_pid = DETERMINISTIC_NETLINK_PORT_ID_BASE | u32::from(port);
+                        let mut stack = guest.stack().await;
+                        let deterministic_addr: AddrMut<libc::sockaddr_nl> = stack.reserve();
+                        let _stack_guard = stack.commit()?;
+                        guest
+                            .memory()
+                            .write_value(deterministic_addr, &sockaddr_nl)?;
+                        let deterministic_bind = call.with_umyaddr(Some(deterministic_addr.cast()));
+                        return Ok(self.record_or_replay(guest, deterministic_bind).await?);
+                    }
+                    GlobalResponse::PortFull => {
+                        return Err(reverie::Error::from(nix::errno::Errno::EADDRINUSE));
+                    }
+                    _ => unreachable!(),
+                }
+            }
         } else if sockaddr_family == libc::AF_INET as u16 {
             // For IPv4
             let mut sockaddr_in: libc::sockaddr_in = guest
