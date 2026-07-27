@@ -21,6 +21,24 @@ struct ProgramCase {
     args: &'static [&'static str],
 }
 
+const SCHEDSTAT_ALIAS_CHECK: &str = r#"
+import os
+import threading
+
+pid = os.getpid()
+tid = threading.get_native_id()
+paths = [
+    "/proc/self/schedstat",
+    "/proc/thread-self/schedstat",
+    f"/proc/{pid}/schedstat",
+    f"/proc/self/task/{tid}/schedstat",
+    f"/proc/{pid}/task/{tid}/schedstat",
+]
+for path in paths:
+    with open(path, "rb") as schedstat:
+        assert schedstat.read() == b"0 0 0\n", path
+"#;
+
 fn hermit_run_lock() -> MutexGuard<'static, ()> {
     HERMIT_RUN_LOCK
         .lock()
@@ -128,6 +146,11 @@ fn self_schedstat_consumers_are_deterministic_under_strict_verify() {
             name: "cut self schedstat",
             candidates: &["/usr/bin/cut", "/bin/cut"],
             args: &["-d", " ", "-f", "1-3", "/proc/self/schedstat"],
+        },
+        ProgramCase {
+            name: "process and thread schedstat aliases",
+            candidates: &["/usr/bin/python3", "/bin/python3"],
+            args: &["-c", SCHEDSTAT_ALIAS_CHECK],
         },
     ];
 

@@ -197,7 +197,7 @@ impl ProcfsFile {
             "/proc/schedstat" => ProcfsKind::Schedstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-922): Review per-process host scheduler normalization.
-            "/proc/self/schedstat" => ProcfsKind::SelfSchedstat,
+            other if is_process_schedstat_path(other) => ProcfsKind::SelfSchedstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-909): Review softnet counter normalization.
             "/proc/net/softnet_stat" => ProcfsKind::SoftnetStat,
@@ -335,6 +335,32 @@ fn is_process_io_path(path: &str) -> bool {
             .strip_prefix("/proc/")
             .and_then(|path| path.strip_suffix("/io"))
             .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn is_process_schedstat_path(path: &str) -> bool {
+    let Some(relative) = path.strip_prefix("/proc/") else {
+        return false;
+    };
+    let components = relative.split('/').collect::<Vec<_>>();
+    match components.as_slice() {
+        [task, "schedstat"] => is_proc_task_name(task),
+        [process, "task", thread, "schedstat"] => {
+            is_proc_process_name(process) && is_numeric_id(thread)
+        }
+        _ => false,
+    }
+}
+
+fn is_proc_task_name(name: &str) -> bool {
+    matches!(name, "self" | "thread-self") || is_numeric_id(name)
+}
+
+fn is_proc_process_name(name: &str) -> bool {
+    name == "self" || is_numeric_id(name)
+}
+
+fn is_numeric_id(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn is_block_stat_path(path: &str) -> bool {
@@ -1569,12 +1595,6 @@ mod tests {
             ProcfsKind::Schedstat
         );
         assert_eq!(
-            ProcfsFile::from_path(Path::new("/proc/self/schedstat"))
-                .unwrap()
-                .kind,
-            ProcfsKind::SelfSchedstat
-        );
-        assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/net/softnet_stat"))
                 .unwrap()
                 .kind,
@@ -1634,6 +1654,19 @@ mod tests {
                 .kind,
             ProcfsKind::DentryState
         );
+        for path in [
+            "/proc/self/schedstat",
+            "/proc/thread-self/schedstat",
+            "/proc/123/schedstat",
+            "/proc/self/task/456/schedstat",
+            "/proc/123/task/456/schedstat",
+        ] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
+                ProcfsKind::SelfSchedstat
+            );
+        }
+        assert!(ProcfsFile::from_path(Path::new("/proc/self/task/nope/schedstat")).is_none());
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
