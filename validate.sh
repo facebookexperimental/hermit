@@ -328,7 +328,6 @@ declare -Ar COMPAT_SUMMARY_KNOWN_FAILURES=(
     # previously because --strict used to forward unsupported syscalls.
     # (chrt/ioprio_set-based ionice/flock were determinized in PR-batch-51 and
     # are now measured as ordinary passing rows below.)
-    [lsof]="fail-closed --strict rejects the unsupported close_range syscall"
     [make]="fail-closed --strict rejects the unsupported setresuid syscall"
     [curl-localhost]="fail-closed --strict rejects the unsupported shutdown syscall in the localhost fetch"
     [wget-localhost]="fail-closed --strict rejects the unsupported shutdown syscall in the localhost fetch"
@@ -2066,8 +2065,8 @@ function run_compatibility_corpus {
             && passed=$((passed + 1)) || failed=$((failed + 1))
         functional_compatibility_probe ss /usr/sbin/ss -V \
             && passed=$((passed + 1)) || failed=$((failed + 1))
-        tally_known_failclosed_probe passed failed known_flaky lsof \
-            functional_compatibility_probe lsof /usr/bin/lsof -v
+        functional_compatibility_probe lsof /usr/bin/lsof -v \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
         functional_compatibility_probe lscpu /usr/bin/lscpu --version \
             && passed=$((passed + 1)) || failed=$((failed + 1))
     fi

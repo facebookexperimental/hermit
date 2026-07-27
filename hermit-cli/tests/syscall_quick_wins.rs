@@ -70,6 +70,9 @@ fn deterministic_passthrough_syscalls_verify() {
         "munlock",
         "munlockall",
         "fsync",
+        "sendfile",
+        "close_range",
+        "seccomp",
         "shutdown",
     ] {
         assert!(

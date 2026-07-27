@@ -413,6 +413,21 @@ impl FileMetadata {
         (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())
     }
 
+    /// Remove every modeled descriptor in an inclusive close_range interval.
+    fn remove_fd_range(&mut self, first: u32, last: u32) -> Vec<OpenFileId> {
+        let mut descriptors: Vec<_> = self
+            .file_handles
+            .keys()
+            .copied()
+            .filter(|fd| *fd >= 0 && first <= *fd as u32 && *fd as u32 <= last)
+            .collect();
+        descriptors.sort_unstable();
+        descriptors
+            .into_iter()
+            .filter_map(|fd| self.remove_fd(fd))
+            .collect()
+    }
+
     /// dup raw fds.
     fn dup_fd(
         &mut self,
@@ -684,6 +699,29 @@ mod file_metadata_tests {
             Some(target_id),
             "replacing the target must release its last OFD alias"
         );
+    }
+
+    #[test]
+    fn close_range_removes_selected_slots_and_releases_final_aliases() {
+        let owner = DetTid::from_raw(35);
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .add_fd(owner, 3, OFlag::empty(), FdType::Regular, None)
+            .expect("source should be inserted");
+        metadata
+            .dup_fd(3, 4, OFlag::empty())
+            .expect("duplicate should be inserted");
+        metadata
+            .add_fd(owner, 100, OFlag::empty(), FdType::Regular, None)
+            .expect("high fd should be inserted");
+        let high_id = metadata
+            .with_detfd(100, |fd| fd.open_file_id())
+            .expect("high fd should exist");
+
+        assert_eq!(metadata.remove_fd_range(4, 100), [high_id]);
+        assert!(metadata.with_detfd(3, |_| ()).is_ok());
+        assert_eq!(metadata.with_detfd(4, |_| ()), Err(Errno::EBADF));
+        assert_eq!(metadata.with_detfd(100, |_| ()), Err(Errno::EBADF));
     }
 
     #[test]
@@ -1249,6 +1287,11 @@ impl<T> ThreadState<T> {
     /// remove a rawfd
     pub fn remove_fd(&self, fd: RawFd) -> Option<OpenFileId> {
         self.metadata().remove_fd(fd)
+    }
+
+    /// Remove every modeled descriptor in an inclusive close_range interval.
+    pub(crate) fn remove_fd_range(&self, first: u32, last: u32) -> Vec<OpenFileId> {
+        self.metadata().remove_fd_range(first, last)
     }
 
     /// dup raw fds.

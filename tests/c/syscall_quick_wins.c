@@ -9,6 +9,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/seccomp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,8 +65,56 @@ int main(void) {
     return 1;
   }
   require_zero(syscall(SYS_fsync, fd), "fsync");
-  if (close(fd) != 0 || unlink(path) != 0) {
-    perror("close/unlink");
+
+  char sendfile_path[128];
+  snprintf(sendfile_path, sizeof(sendfile_path),
+           "/tmp/hermit-syscall-sendfile-%ld", (long)getpid());
+  int sendfile_fd = open(sendfile_path, O_CREAT | O_TRUNC | O_RDWR, 0600);
+  if (sendfile_fd < 0 || lseek(fd, 0, SEEK_SET) != 0) {
+    perror("open/lseek sendfile");
+    return 1;
+  }
+  off_t offset = 0;
+  if (syscall(SYS_sendfile, sendfile_fd, fd, &offset, 1) != 1 || offset != 1) {
+    perror("sendfile");
+    return 1;
+  }
+  char copied = '\0';
+  if (lseek(sendfile_fd, 0, SEEK_SET) != 0 ||
+      read(sendfile_fd, &copied, 1) != 1 || copied != 'x') {
+    fputs("sendfile did not copy the expected byte\n", stderr);
+    return 1;
+  }
+  if (close(fd) != 0 || close(sendfile_fd) != 0 || unlink(path) != 0 ||
+      unlink(sendfile_path) != 0) {
+    perror("close/unlink sendfile files");
+    return 1;
+  }
+
+  int range_fd = open("/dev/null", O_RDONLY);
+  if (range_fd < 0) {
+    perror("open close_range fixture");
+    return 1;
+  }
+  int high_fd = fcntl(range_fd, F_DUPFD_CLOEXEC, 100);
+  if (high_fd < 100 || close(range_fd) != 0) {
+    perror("prepare close_range");
+    return 1;
+  }
+  require_zero(syscall(SYS_close_range, (unsigned int)high_fd,
+                       (unsigned int)high_fd, 0),
+               "close_range");
+  errno = 0;
+  if (fcntl(high_fd, F_GETFD) != -1 || errno != EBADF) {
+    fputs("close_range left its descriptor open\n", stderr);
+    return 1;
+  }
+
+  struct seccomp_notif_sizes sizes;
+  errno = 0;
+  if (syscall(SYS_seccomp, SECCOMP_GET_NOTIF_SIZES, 0, &sizes) != -1 ||
+      errno != ENOSYS) {
+    fputs("seccomp capability probe did not return ENOSYS\n", stderr);
     return 1;
   }
 
@@ -86,7 +135,7 @@ int main(void) {
   }
 
   printf("syscall-quick-wins-ok uids=%u:%u:%u gids=%u:%u:%u vm=ok fs=ok "
-         "net=ok\n",
+         "net=ok fd=ok security=ok\n",
          ruid, euid, suid, rgid, egid, sgid);
   return 0;
 }

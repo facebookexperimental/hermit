@@ -194,6 +194,40 @@ impl<T: RecordOrReplay> Detcore<T> {
         res.map_err(Error::from)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-838): Review close_range descriptor-table synchronization.
+    /// Close a contiguous descriptor range and mirror successful closes in Detcore.
+    ///
+    /// The pinned Reverie revision exposes close_range as `Syscall::Other`. The
+    /// common flags=0 operation cannot block and is deterministic for the
+    /// process-local descriptor table. CLOSE_RANGE_UNSHARE and
+    /// CLOSE_RANGE_CLOEXEC need separate shared-table modeling, so return ENOSYS
+    /// for nonzero flags rather than letting strict execution silently diverge.
+    pub async fn handle_close_range<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        let Syscall::Other(_, args) = call else {
+            unreachable!("close_range unexpectedly gained a typed variant")
+        };
+        let first = args.arg0 as u32;
+        let last = args.arg1 as u32;
+        let flags = args.arg2 as u32;
+        if flags != 0 {
+            return Err(Errno::ENOSYS.into());
+        }
+
+        let result = self.record_or_replay(guest, call).await;
+        if result.is_ok() {
+            let released = guest.thread_state_mut().remove_fd_range(first, last);
+            for open_file_id in released {
+                self.release_port_for_open_file(guest, open_file_id).await;
+            }
+        }
+        result.map_err(Error::from)
+    }
+
     /// flock under Hermit. `flock(2)` places an advisory whole-file lock. Detcore
     /// serializes guest threads onto a single virtual CPU, so a lock is never
     /// truly contended within the run: a blocking `LOCK_EX`/`LOCK_SH` would
@@ -459,6 +493,61 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Err(error) => break Err(error.into()),
             }
         }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-838): Review regular-file sendfile mediation.
+    /// Copy data between tracked regular files or memfds.
+    ///
+    /// The kernel advances the input offset (or the explicit offset pointer) and
+    /// destination offset atomically with the copy. Detcore serializes destination
+    /// writes while the strict scheduler orders the stable input read, and routes
+    /// the syscall through record/replay so that the result and offset update stay
+    /// ordered with other file operations. Socket and pipe destinations can block
+    /// and need the nonblocking scheduler path; return ENOSYS for those endpoint
+    /// types so libc/application fallbacks use Detcore's existing read/write
+    /// handlers instead.
+    pub async fn handle_sendfile<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Sendfile,
+    ) -> Result<i64, Error> {
+        let in_type = guest
+            .thread_state()
+            .with_detfd(call.in_fd(), |detfd| detfd.ty())?;
+        let (out_type, out_resource, out_inode) =
+            guest.thread_state().with_detfd(call.out_fd(), |detfd| {
+                (
+                    detfd.ty(),
+                    detfd.resource(),
+                    detfd.stat().map(|stat| stat.inode),
+                )
+            })?;
+
+        if !matches!(in_type, FdType::Regular | FdType::Memfd)
+            || !matches!(out_type, FdType::Regular | FdType::Memfd)
+        {
+            return Err(Errno::ENOSYS.into());
+        }
+
+        let dettid = guest.thread_state().dettid;
+        let mut resources = Resources::new(dettid);
+        if let Some(resource) = out_resource.or_else(|| out_inode.map(ResourceID::FileContents)) {
+            resources.insert(resource, Permission::W);
+        }
+        resources.fyi("sendfile");
+        resource_request(guest, resources).await;
+
+        let result = self
+            .record_or_replay(guest, call)
+            .await
+            .map_err(Error::from);
+        if guest.config().virtualize_metadata && matches!(&result, Ok(copied) if *copied > 0) {
+            let inode = out_inode.expect("virtualized metadata requires stat data for sendfile");
+            touch_file(guest, inode).await;
+        }
+        resource_release_all(guest).await;
+        result
     }
 
     /// SYS_write system call.
