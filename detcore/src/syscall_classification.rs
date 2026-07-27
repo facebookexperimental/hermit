@@ -523,6 +523,11 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::kcmp
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::perf_event_open
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-862): Review pidfd creation and descriptor-model
+        // synchronization. The handler records/replays the kernel operation and
+        // registers the result as FdType::Pidfd before later fd operations.
+        | Sysno::pidfd_open
         // ===== BATCH 51: fail-closed utility syscalls with no deterministic effect =====
         // These three previously fail-closed --strict (aborting real programs such
         // as chrt, ionice, and flock) even though none can change guest-visible
@@ -751,7 +756,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         Sysno::get_robust_list
         | Sysno::mincore
         | Sysno::pidfd_getfd
-        | Sysno::pidfd_open
         | Sysno::pidfd_send_signal
         | Sysno::preadv
         | Sysno::preadv2
@@ -1173,7 +1177,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [272, 90, 11]);
+        assert_eq!(counts, [273, 90, 10]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1445,6 +1449,17 @@ mod tests {
     fn clock_discipline_and_kernel_log_syscalls_are_determinized() {
         for sysno in [Sysno::adjtimex, Sysno::clock_adjtime, Sysno::syslog] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+        }
+    }
+
+    #[test]
+    fn pidfd_open_is_determinized_while_cross_process_operations_remain_unsupported() {
+        assert_eq!(
+            classify_syscall(Sysno::pidfd_open),
+            SyscallClassification::Determinized
+        );
+        for sysno in [Sysno::pidfd_getfd, Sysno::pidfd_send_signal] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
         }
     }
 

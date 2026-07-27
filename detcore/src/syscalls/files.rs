@@ -1888,6 +1888,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(fd as i64)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-862): pidfd creation and Detcore FD registration.
+    /// Create a pidfd through record/replay and synchronize the descriptor with
+    /// Detcore's metadata before fcntl, poll, close, or waitid can observe it.
+    pub async fn handle_pidfd_open<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::PidfdOpen,
+    ) -> Result<i64, Error> {
+        let allowed_flags = libc::O_NONBLOCK as u32;
+        if call.flags() & !allowed_flags != 0 {
+            return Err(Errno::EINVAL.into());
+        }
+
+        let fd = self.record_or_replay(guest, call).await? as RawFd;
+        let flags = OFlag::O_CLOEXEC | OFlag::from_bits_truncate(call.flags() as libc::c_int);
+        self.add_fd(guest, fd, flags, FdType::Pidfd).await?;
+        Ok(fd as i64)
+    }
+
     /// userfaultfd system call.
     pub async fn handle_userfaultfd<G: Guest<Self>>(
         &self,

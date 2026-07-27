@@ -748,6 +748,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::inotify_add_watch,
                 Sysno::inotify_rm_watch,
                 Sysno::memfd_create,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-862): Keep modeled pidfd creation intercepted.
+                Sysno::pidfd_open,
                 Sysno::userfaultfd,
                 Sysno::io_uring_setup,
                 Sysno::io_uring_enter,
@@ -1794,6 +1797,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::InotifyAddWatch(s) => self.handle_inotify_add_watch(guest, s).await,
                 Syscall::InotifyRmWatch(s) => self.handle_inotify_rm_watch(guest, s).await,
                 Syscall::MemfdCreate(s) => self.handle_memfd_create(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-862): Record/replay and register pidfds.
+                Syscall::PidfdOpen(s) => self.handle_pidfd_open(guest, s).await,
                 Syscall::Userfaultfd(s) => self.handle_userfaultfd(guest, s).await,
                 Syscall::Accept(s) => self.handle_accept4(guest, s.into()).await,
                 Syscall::Accept4(s) => self.handle_accept4(guest, s).await,
@@ -2136,6 +2142,11 @@ mod subscription_tests {
             subscriptions
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::pwrite64)
+        );
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::pidfd_open)
         );
     }
 }

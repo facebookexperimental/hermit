@@ -30,15 +30,15 @@ lane either need no hardware event handling or explicitly pass:
 --max-timeslice=disabled --no-virtualize-cpuid
 ```
 
-The selector covers exactly 472 of the 884 Cargo-discovered cases:
+The selector covers exactly 474 of the 886 Cargo-discovered cases:
 
 | Group | Cases | Selector |
 | --- | ---: | --- |
-| Workspace unit, bin, and doc baseline | 328 | Existing regular-job selection |
+| Workspace unit, bin, and doc baseline | 329 | Existing regular-job selection |
 | Detcore misc without CPUID probes | 20 | `tests_misc`, excluding two RDRAND/CPUID cases and three bounded diagnostics |
 | Detcore parallel without RCB scheduling | 5 | Raw/noop cases, excluding generated `detcore` variants |
 | Flaky guest crate contract | 1 | The crate's standalone Cargo test |
-| Portable Hermit integration cases | 118 | Non-KVM CLI, non-python3-verify LiteInst, strict/verify modes, clock-discipline, futex2, and process-isolation refusals, non-JVM apps, commands, time, memory, procfs, signals, Python, and rr source contract |
+| Portable Hermit integration cases | 119 | Non-KVM CLI, non-python3-verify LiteInst, strict/verify modes, clock-discipline, futex2, pidfd creation, and process-isolation refusals, non-JVM apps, commands, time, memory, procfs, signals, Python, and rr source contract |
 
 The same lane enforces the 12 portable L1-L4 working-envelope cells and runs
 the 181-row strict compatibility corpus with the debug Hermit binary and PMU/CPUID disabled.

@@ -134,7 +134,7 @@
     {
       "group": "test", "job": "hermit_integration",
       "desc": "Portable Hermit integration targets (batched compile, serial test binaries)",
-      "cmd": "cargo test -p hermit --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test clock_determinism --test clock_discipline_determinism --test epoll_determinism --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test mmap_determinism --test process_isolation_refusals --test procfs_determinism --test python_stdlib --test signal_determinism --test softnet_stat_determinism --test sockstat_determinism -- --test-threads=1",
+      "cmd": "cargo test -p hermit --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test clock_determinism --test clock_discipline_determinism --test epoll_determinism --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test mmap_determinism --test pidfd_creation --test process_isolation_refusals --test procfs_determinism --test python_stdlib --test signal_determinism --test softnet_stat_determinism --test sockstat_determinism -- --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 1200,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 300,
