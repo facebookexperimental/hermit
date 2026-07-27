@@ -5,6 +5,7 @@ exit_zero	pass	pass	pass	-	-
 exit_status	pass	pass	pass	-	-
 file_read	pass	pass	pass	-	-
 file_mutation	pass	pass	pass	-	-
+file_metadata	pass	pass	gap	-	KVM personality does not implement extended-attribute syscalls, so setxattr returns ENOSYS
 executable_mmap	pass	pass	pass	-	-
 memory_advice	pass	pass	pass	-	-
 heap_growth	pass	pass	pass	-	-

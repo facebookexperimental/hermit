@@ -109,6 +109,10 @@ class Fixtures:
                 REPOSITORY / "tests/c/syscall_file_io.c",
                 (),
             ),
+            "syscall_file_metadata": (
+                REPOSITORY / "tests/c/syscall_file_metadata.c",
+                (),
+            ),
             "madvise_determinism": (
                 REPOSITORY / "tests/c/madvise_determinism.c",
                 (),
@@ -150,6 +154,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             [str(fixtures.binary("syscall_file_io"))],
             0,
             b"syscall-file-io-ok count=5\n",
+        ),
+        "file_metadata": (
+            [str(fixtures.binary("syscall_file_metadata"))],
+            0,
+            b"syscall-file-metadata-ok count=20\n",
         ),
         "executable_mmap": (
             [str(fixtures.binary("mmap_exec"))],
