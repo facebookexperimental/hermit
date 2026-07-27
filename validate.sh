@@ -303,7 +303,7 @@ readonly STRICT_COMPAT_TOTAL=181
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
 readonly RR_COMPAT_EXPECTED=143
-readonly LITEINST_COMPAT_EXPECTED=230
+readonly LITEINST_COMPAT_EXPECTED=255
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
@@ -827,7 +827,7 @@ function run_full_backend_gates {
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
     run_check "LiteInst backend smoke" liteinst_backend_available
-    run_check "LiteInst compatibility baseline (230 programs)" run_liteinst_compatibility_envelope
+    run_check "LiteInst compatibility baseline (255 programs)" run_liteinst_compatibility_envelope
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -1542,6 +1542,31 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe systemd-detect-virt /usr/bin/systemd-detect-virt && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe systemd-path /usr/bin/systemd-path temporary && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe systemd-id128 /usr/bin/systemd-id128 machine-id && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe lsblk-live /usr/bin/lsblk -dn -o NAME,TYPE && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe localectl-version /usr/bin/localectl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe loginctl-version /usr/bin/loginctl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe networkctl-version /usr/bin/networkctl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe hostnamectl-version /usr/bin/hostnamectl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe timedatectl-version /usr/bin/timedatectl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe resolvectl-version /usr/bin/resolvectl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe coredumpctl-version /usr/bin/coredumpctl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe udevadm-version /usr/bin/udevadm --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-analyze-version /usr/bin/systemd-analyze --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-cgls-version /usr/bin/systemd-cgls --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-delta-version /usr/bin/systemd-delta --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-notify-version /usr/bin/systemd-notify --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe getcap-readme /usr/sbin/getcap README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe setcap-help /usr/sbin/setcap -h && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe capsh-print /usr/sbin/capsh --print && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe getpcaps-pid1 /usr/sbin/getpcaps 1 && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sestatus /usr/bin/sestatus && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe diff3-version /usr/bin/diff3 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe dir /usr/bin/dir -d README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe vdir /usr/bin/vdir -d README.md && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe chgrp-version /usr/bin/chgrp --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe envsubst-version /usr/bin/envsubst --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ctest-version /usr/bin/ctest --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe cpack-version /usr/bin/cpack --version && passed=$((passed + 1)) || failed=$((failed + 1))
 
     total=$((passed + failed))
     if ((total != LITEINST_COMPAT_EXPECTED)); then
@@ -3295,7 +3320,7 @@ fi
 if ((LITEINST_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
     if ((failures == 0)); then
-        run_check "LiteInst compatibility baseline (230 programs)" run_liteinst_compatibility_envelope
+        run_check "LiteInst compatibility baseline (255 programs)" run_liteinst_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
