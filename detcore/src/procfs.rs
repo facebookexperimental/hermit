@@ -22,6 +22,9 @@ enum ProcfsKind {
     Uptime,
     ScalingCurFreq,
     Sockstat,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-951): Review key-user resource normalization.
+    KeyUsers,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -44,6 +47,7 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            "/proc/key-users" => ProcfsKind::KeyUsers,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -87,6 +91,7 @@ impl ProcfsFile {
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::KeyUsers => sanitize_key_users(&contents),
         });
         self.offset = 0;
     }
@@ -249,6 +254,50 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-951): Review the /proc/key-users quota accounting policy.
+fn sanitize_key_users(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let fields = body.split_whitespace().collect::<Vec<_>>();
+        let [uid, usage, key_counts, key_quota, byte_quota] = fields.as_slice() else {
+            return contents.to_vec();
+        };
+        let Some(uid) = uid
+            .strip_suffix(':')
+            .filter(|uid| uid.parse::<u32>().is_ok())
+        else {
+            return contents.to_vec();
+        };
+        if usage.parse::<u64>().is_err() || parse_key_user_pair(key_counts).is_none() {
+            return contents.to_vec();
+        }
+        let Some((_, max_keys)) = parse_key_user_pair(key_quota) else {
+            return contents.to_vec();
+        };
+        let Some((_, max_bytes)) = parse_key_user_pair(byte_quota) else {
+            return contents.to_vec();
+        };
+
+        normalized.extend_from_slice(format!("{uid}: 0 0/0 0/{max_keys} 0/{max_bytes}").as_bytes());
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
+fn parse_key_user_pair(field: &str) -> Option<(u64, u64)> {
+    let (current, maximum) = field.split_once('/')?;
+    Some((current.parse().ok()?, maximum.parse().ok()?))
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-866): Review the /proc/net/sockstat field policy.
 fn sanitize_sockstat(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
@@ -340,6 +389,12 @@ mod tests {
                 .kind,
             ProcfsKind::Sockstat
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/key-users"))
+                .unwrap()
+                .kind,
+            ProcfsKind::KeyUsers
+        );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
@@ -369,6 +424,26 @@ mod tests {
     fn scaling_cur_freq_is_fixed() {
         assert_eq!(sanitize_scaling_cur_freq(b"2483951\n"), b"0\n");
         assert!(sanitize_scaling_cur_freq(b"").is_empty());
+    }
+
+    #[test]
+    fn key_users_preserves_uids_and_quota_limits() {
+        let contents = b"0: 15 15/15 15/1000000 2499/25000000\n\
+1000: 2 1/2 1/200 77/20000\n";
+        assert_eq!(
+            sanitize_key_users(contents),
+            b"0: 0 0/0 0/1000000 0/25000000\n\
+1000: 0 0/0 0/200 0/20000\n"
+        );
+        assert!(sanitize_key_users(b"").is_empty());
+        assert_eq!(
+            sanitize_key_users(b"0: 15 15/15 invalid 2499/25000000\n"),
+            b"0: 15 15/15 invalid 2499/25000000\n"
+        );
+        assert_eq!(
+            sanitize_key_users(b"0: 15 15/15 15/1000000 2499/25000000 extra\n"),
+            b"0: 15 15/15 15/1000000 2499/25000000 extra\n"
+        );
     }
 
     #[test]
