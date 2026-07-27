@@ -30,15 +30,15 @@ lane either need no hardware event handling or explicitly pass:
 --max-timeslice=disabled --no-virtualize-cpuid
 ```
 
-The selector covers exactly 457 of the 868 Cargo-discovered cases:
+The selector covers exactly 460 of the 872 Cargo-discovered cases:
 
 | Group | Cases | Selector |
 | --- | ---: | --- |
-| Workspace unit, bin, and doc baseline | 319 | Existing regular-job selection |
+| Workspace unit, bin, and doc baseline | 321 | Existing regular-job selection |
 | Detcore misc without CPUID probes | 18 | `tests_misc`, excluding two RDRAND/CPUID cases and three bounded diagnostics |
 | Detcore parallel without RCB scheduling | 5 | Raw/noop cases, excluding generated `detcore` variants |
 | Flaky guest crate contract | 1 | The crate's standalone Cargo test |
-| Portable Hermit integration cases | 114 | Non-KVM CLI, non-python3-verify LiteInst, strict/verify modes, non-JVM apps, commands, time, memory, procfs, signals, Python, and rr source contract |
+| Portable Hermit integration cases | 115 | Non-KVM CLI, non-python3-verify LiteInst, strict/verify modes, non-JVM apps, commands, time, memory, procfs, signals, Python, and rr source contract |
 
 The same lane enforces the 12 portable L1-L4 working-envelope cells and runs
 the 181-row strict compatibility corpus with the debug Hermit binary and PMU/CPUID disabled.
@@ -53,7 +53,7 @@ not part of the CI contract.
 
 ## Hardware lane
 
-The remaining 411 Cargo cases are outside the blocking hosted subset. The
+The remaining 412 Cargo cases are outside the blocking hosted subset. The
 per-PR hardware lane executes 319 blocking cases, 18 cases run as bounded
 nonblocking diagnostics (eleven hosted and seven hardware), the weekly `super`
 tier executes 69 long or relaxed cases, and five existing gaps remain explicit:
