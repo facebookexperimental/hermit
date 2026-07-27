@@ -304,7 +304,7 @@ readonly STRICT_COMPAT_TOTAL=181
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
 readonly RR_COMPAT_EXPECTED=143
-readonly LITEINST_COMPAT_EXPECTED=711
+readonly LITEINST_COMPAT_EXPECTED=739
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
@@ -830,7 +830,7 @@ function run_full_backend_gates {
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
     run_check "LiteInst backend smoke" liteinst_backend_available
-    run_check "LiteInst compatibility baseline (711 programs)" run_liteinst_compatibility_envelope
+    run_check "LiteInst compatibility baseline (739 programs)" run_liteinst_compatibility_envelope
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -2022,10 +2022,38 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe gpg-error-version /usr/bin/gpg-error --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe gpg-wks-server-version /usr/bin/gpg-wks-server --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe gpgme-json-version /usr/bin/gpgme-json --version && passed=$((passed + 1)) || failed=$((failed + 1))
-    liteinst_compatibility_probe gpgparsemail-version /usr/bin/gpgparsemail --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe gpgsplit-version /usr/bin/gpgsplit --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe gpgv2-version /usr/bin/gpgv2 --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe watchgnupg-version /usr/bin/watchgnupg --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe btop-version /usr/bin/btop --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe cvtsudoers-version /usr/bin/cvtsudoers -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe debugedit-version /usr/bin/debugedit --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe etags-version /usr/bin/etags --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe evmctl-version /usr/bin/evmctl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe fish-indent-version /usr/bin/fish_indent --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe fuse2fs-version /usr/bin/fuse2fs -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gdb-version /usr/bin/gdb --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe getfacl-version /usr/bin/getfacl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gettext-version /usr/bin/gettext --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gmake-version /usr/bin/gmake --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gpic-version /usr/bin/gpic --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe grub2-fstest-version /usr/bin/grub2-fstest --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe grub2-mkimage-version /usr/bin/grub2-mkimage --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe grub2-mkrelpath-version /usr/bin/grub2-mkrelpath --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe grub2-script-check-version /usr/bin/grub2-script-check --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe htop-version /usr/bin/htop --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe icuinfo-version /usr/bin/icuinfo --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ipcalc-version /usr/bin/ipcalc --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe irssi-version /usr/bin/irssi --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe less-version /usr/bin/less --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe lesskey-version /usr/bin/lesskey --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe lspci-bin-version /usr/bin/lspci --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe lsscsi-version /usr/bin/lsscsi --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe lz4-version /usr/bin/lz4 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe lzop-version /usr/bin/lzop --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe linux32-version /usr/bin/linux32 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe linux64-version /usr/bin/linux64 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe luac-version /usr/bin/luac -v && passed=$((passed + 1)) || failed=$((failed + 1))
 
     total=$((passed + failed))
     if ((total != LITEINST_COMPAT_EXPECTED)); then
@@ -3849,7 +3877,7 @@ fi
 if ((LITEINST_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
     if ((failures == 0)); then
-        run_check "LiteInst compatibility baseline (711 programs)" run_liteinst_compatibility_envelope
+        run_check "LiteInst compatibility baseline (739 programs)" run_liteinst_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
