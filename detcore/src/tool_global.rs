@@ -592,6 +592,12 @@ impl GlobalTool for GlobalState {
                 R::RegisterAlarm(remaining)
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query RPC.
+            GlobalRequest::AlarmRemaining(dpid) => {
+                let now = self.global_time.lock().unwrap().as_nanos();
+                R::AlarmRemaining(self.sched.lock().unwrap().alarm_remaining(dpid, now))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#663)
             GlobalRequest::ResolveKillTargets(dpid) => {
                 R::ResolveKillTargets(self.sched.lock().unwrap().process_signal_targets(dpid))
@@ -1295,6 +1301,11 @@ pub enum GlobalRequest {
     RegisterAlarm(DetPid, DetTid, LogicalTime, SigWrapper),
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query RPC.
+    /// Return the logical time remaining on a process's one-shot alarm.
+    AlarmRemaining(DetPid),
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     /// Query live threads before translating process-directed signal delivery.
     ResolveKillTargets(DetPid),
@@ -1336,6 +1347,9 @@ pub enum GlobalResponse {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     RegisterAlarm(LogicalTime),
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query RPC.
+    AlarmRemaining(LogicalTime),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     ResolveKillTargets(Vec<DetTid>),
@@ -1872,6 +1886,22 @@ where
     .await;
     match resp.1 {
         GlobalResponse::RegisterAlarm(x) => x,
+        _ => unreachable!(),
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-841): Review logical alarm query API.
+/// Return the logical duration remaining on the process's one-shot alarm.
+pub async fn alarm_remaining<G, T>(guest: &mut G) -> LogicalTime
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let detpid = guest.thread_state().detpid.expect("detpid unset");
+    let resp = send_and_update_time(guest, GlobalRequest::AlarmRemaining(detpid)).await;
+    match resp.1 {
+        GlobalResponse::AlarmRemaining(remaining) => remaining,
         _ => unreachable!(),
     }
 }

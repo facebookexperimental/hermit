@@ -1013,6 +1013,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-841): Review virtual sched_setattr no-op policy.
+    /// Linux scheduler attributes cannot affect Detcore's replacement
+    /// scheduler. Accept the request as a deterministic no-op, matching the
+    /// existing sched_setscheduler and sched_setparam policy.
+    pub async fn handle_sched_setattr<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        call: syscalls::SchedSetattr,
+    ) -> Result<i64, Error> {
+        info!(
+            "Suppressing sched_setattr(pid={}, flags={}); Linux scheduler attributes are virtual",
+            call.pid(),
+            call.flags()
+        );
+        Ok(0)
+    }
+
     /// ioprio_set under Hermit. Detcore serializes guest threads onto one virtual
     /// CPU, so the block-layer I/O scheduling class and priority cannot change
     /// guest-visible computation. Accept and suppress the request as a
@@ -1030,6 +1048,23 @@ impl<T: RecordOrReplay> Detcore<T> {
             call.which(),
             call.who(),
             call.priority()
+        );
+        Ok(0)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-841): Review virtual ioprio_get default.
+    /// Return the fixed default I/O class and priority paired with the existing
+    /// no-op ioprio_set policy. Linux encodes IOPRIO_CLASS_NONE/priority 0 as 0.
+    pub async fn handle_ioprio_get<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        call: syscalls::IoprioGet,
+    ) -> Result<i64, Error> {
+        info!(
+            "Emulating ioprio_get(which={}, who={}): fixed class none, priority 0",
+            call.which(),
+            call.who()
         );
         Ok(0)
     }

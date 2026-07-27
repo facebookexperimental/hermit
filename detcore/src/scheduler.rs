@@ -2592,6 +2592,18 @@ impl Scheduler {
             LogicalTime::ZERO
         }
     }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-841): Review logical ITIMER_REAL state queries.
+    pub fn alarm_remaining(&self, detpid: DetPid, now: LogicalTime) -> LogicalTime {
+        self.blocked
+            .timed_waiters
+            .alarm_time(detpid)
+            .map(|deadline| {
+                LogicalTime::from_nanos(deadline.as_nanos().saturating_sub(now.as_nanos()))
+            })
+            .unwrap_or(LogicalTime::ZERO)
+    }
 }
 
 #[cfg(test)]
@@ -2793,6 +2805,14 @@ mod test {
                 LogicalTime::from_nanos(1_250),
                 TimedEvent::AlarmEvt(detpid, dettid, Signal::SIGALRM)
             )]
+        );
+        assert_eq!(
+            scheduler.alarm_remaining(detpid, LogicalTime::from_nanos(1_100)),
+            LogicalTime::from_nanos(150)
+        );
+        assert_eq!(
+            scheduler.alarm_remaining(detpid, LogicalTime::from_nanos(1_300)),
+            LogicalTime::ZERO
         );
 
         let cancel_time = LogicalTime::from_nanos(1_100);

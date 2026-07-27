@@ -121,6 +121,12 @@ impl TimedEvents {
         old
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-841): Review non-mutating logical alarm lookup.
+    pub fn alarm_time(&self, dp: DetPid) -> Option<LogicalTime> {
+        self.alarm_times.get(&dp).copied()
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
     }

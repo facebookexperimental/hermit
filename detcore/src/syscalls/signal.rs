@@ -28,6 +28,7 @@ use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::tool_global::ResumeStatus;
+use crate::tool_global::alarm_remaining;
 use crate::tool_global::register_alarm;
 use crate::tool_global::resolve_kill_targets;
 use crate::tool_global::resource_request;
@@ -142,6 +143,35 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
             guest.memory().write_value(old_value, &old_timer)?;
         }
+        Ok(0)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-841): Review logical one-shot getitimer emulation.
+    /// Report Detcore's logical one-shot ITIMER_REAL state without consulting
+    /// host elapsed time. Repeating and CPU-time timers remain unsupported.
+    pub async fn handle_getitimer<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Getitimer,
+    ) -> Result<i64, Error> {
+        if !guest.config().sequentialize_threads {
+            info!(
+                "[dtid {}] Running without scheduler, so letting getitimer call through...",
+                guest.thread_state().dettid
+            );
+            return Ok(guest.inject(call).await?);
+        }
+        if call.which() != libc::ITIMER_REAL {
+            return Err(Error::Errno(Errno::ENOSYS));
+        }
+
+        let value = call.value().ok_or(Errno::EFAULT)?;
+        let timer = libc::itimerval {
+            it_interval: logical_time_to_timeval(LogicalTime::ZERO),
+            it_value: logical_time_to_timeval(alarm_remaining(guest).await),
+        };
+        guest.memory().write_value(value, &timer)?;
         Ok(0)
     }
 
