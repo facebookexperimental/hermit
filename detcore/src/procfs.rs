@@ -27,6 +27,9 @@ enum ProcfsKind {
     BlockStat,
     ScalingCurFreq,
     Sockstat,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-944): Review AVX-512 elapsed-time normalization.
+    ArchStatus,
     Smaps,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-951): Review key-user resource normalization.
@@ -120,6 +123,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-944): Review AVX-512 elapsed-time normalization.
+            "/proc/self/arch_status" => ProcfsKind::ArchStatus,
             "/proc/swaps" => ProcfsKind::Swaps,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-949): Review per-mapping memory accounting normalization.
@@ -209,6 +215,7 @@ impl ProcfsFile {
             ProcfsKind::BlockStat => sanitize_block_stat(&contents),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::ArchStatus => sanitize_arch_status(&contents),
             ProcfsKind::Swaps => sanitize_swaps(&contents),
             ProcfsKind::Smaps => sanitize_smaps(&contents),
             ProcfsKind::KeyUsers => sanitize_key_users(&contents),
@@ -752,6 +759,33 @@ fn replace_sockstat_field(fields: &mut [String], name: &str, value: &str) {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-944): Review the /proc/self/arch_status field policy.
+fn sanitize_arch_status(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let elapsed = body
+            .strip_prefix("AVX512_elapsed_ms:")
+            .map(str::trim)
+            .and_then(|value| value.parse::<u64>().ok());
+        if elapsed.is_some() {
+            normalized.extend_from_slice(b"AVX512_elapsed_ms:\t0");
+        } else {
+            normalized.extend_from_slice(body.as_bytes());
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-949): Review the /proc/self/smaps accounting field policy.
 fn sanitize_smaps(contents: &[u8]) -> Vec<u8> {
     const ACCOUNTING_FIELDS: &[&str] = &[
@@ -1147,6 +1181,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Sockstat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/arch_status"))
+                .unwrap()
+                .kind,
+            ProcfsKind::ArchStatus
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/swaps"))
@@ -1690,6 +1730,24 @@ VmFlags: rd ex mr mw me ac\n"
 
         let invalid_header = b"not-a-range r-xp 00000000 00:00 0\nPss: 3 kB\n";
         assert_eq!(sanitize_smaps(invalid_header), invalid_header);
+    }
+
+    #[test]
+    fn arch_status_uses_logical_avx512_elapsed_time() {
+        let contents = b"AVX512_elapsed_ms:\t48\n\
+x86_Thread_features:\t\tshstk\n\
+x86_Thread_features_locked:\t\n";
+
+        assert_eq!(
+            sanitize_arch_status(contents),
+            b"AVX512_elapsed_ms:\t0\n\
+x86_Thread_features:\t\tshstk\n\
+x86_Thread_features_locked:\t\n"
+        );
+        assert_eq!(
+            sanitize_arch_status(b"AVX512_elapsed_ms:\tunknown\n"),
+            b"AVX512_elapsed_ms:\tunknown\n"
+        );
     }
 
     #[test]
