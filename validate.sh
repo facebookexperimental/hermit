@@ -304,7 +304,7 @@ readonly STRICT_COMPAT_TOTAL=181
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
 readonly RR_COMPAT_EXPECTED=143
-readonly LITEINST_COMPAT_EXPECTED=480
+readonly LITEINST_COMPAT_EXPECTED=505
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
@@ -830,7 +830,7 @@ function run_full_backend_gates {
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
     run_check "LiteInst backend smoke" liteinst_backend_available
-    run_check "LiteInst compatibility baseline (480 programs)" run_liteinst_compatibility_envelope
+    run_check "LiteInst compatibility baseline (505 programs)" run_liteinst_compatibility_envelope
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -1795,6 +1795,31 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe gcov-tool-version /usr/bin/gcov-tool --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe eu-elflint-version /usr/bin/eu-elflint --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe eu-srcfiles-version /usr/bin/eu-srcfiles --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe eu-stack-version /usr/bin/eu-stack --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ld-gold-version /usr/bin/ld.gold --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe cc-version /usr/bin/cc --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe cxx-version /usr/bin/c++ --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe conmon-version /usr/bin/conmon --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe rpmkeys-version /usr/bin/rpmkeys --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe rpmdb-version /usr/bin/rpmdb --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe rpmbuild-version /usr/bin/rpmbuild --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe rpmspec-version /usr/bin/rpmspec --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gpgv-version /usr/bin/gpgv --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gpg-connect-agent-version /usr/bin/gpg-connect-agent --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sdiff-version /usr/bin/sdiff --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe zipinfo-version /usr/bin/zipinfo -v && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe zipcloak-version /usr/bin/zipcloak -v && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe zipnote-version /usr/bin/zipnote -v && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe zipsplit-version /usr/bin/zipsplit -v && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe xsltproc-version /usr/bin/xsltproc --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe redis-server-version /usr/bin/redis-server --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe clang-22-version /usr/bin/clang-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe clangxx-22-version /usr/bin/clang++-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe clang-cl-22-version /usr/bin/clang-cl-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe clang-cpp-22-version /usr/bin/clang-cpp-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe clang-scan-deps-22-version /usr/bin/clang-scan-deps-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe llvm-ranlib-22-version /usr/bin/llvm-ranlib-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe llvm-readelf-22-version /usr/bin/llvm-readelf-22 --version && passed=$((passed + 1)) || failed=$((failed + 1))
 
     total=$((passed + failed))
     if ((total != LITEINST_COMPAT_EXPECTED)); then
@@ -3618,7 +3643,7 @@ fi
 if ((LITEINST_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
     if ((failures == 0)); then
-        run_check "LiteInst compatibility baseline (480 programs)" run_liteinst_compatibility_envelope
+        run_check "LiteInst compatibility baseline (505 programs)" run_liteinst_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
