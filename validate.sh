@@ -304,7 +304,7 @@ readonly STRICT_COMPAT_TOTAL=181
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
 readonly RR_COMPAT_EXPECTED=143
-readonly LITEINST_COMPAT_EXPECTED=694
+readonly LITEINST_COMPAT_EXPECTED=711
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
@@ -830,7 +830,7 @@ function run_full_backend_gates {
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
     run_check "LiteInst backend smoke" liteinst_backend_available
-    run_check "LiteInst compatibility baseline (694 programs)" run_liteinst_compatibility_envelope
+    run_check "LiteInst compatibility baseline (711 programs)" run_liteinst_compatibility_envelope
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -2009,6 +2009,23 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe rpmverify-version /usr/bin/rpmverify --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe podman-compose-help /usr/bin/podman-compose --help && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe rpm2extents-dump-help /usr/bin/rpm2extents_dump --help && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe audit2allow-version /usr/bin/audit2allow --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe audit2why-version /usr/bin/audit2why --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe semodule-expand-version /usr/bin/semodule_expand -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe semodule-link-version /usr/bin/semodule_link -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe semodule-package-help /usr/bin/semodule_package --help && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe host-version /usr/bin/host -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe named-checkzone-version /usr/bin/named-checkzone -v && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe named-compilezone-version /usr/bin/named-compilezone -v && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe dirmngr-version /usr/bin/dirmngr --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe dirmngr-client-version /usr/bin/dirmngr-client --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gpg-error-version /usr/bin/gpg-error --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gpg-wks-server-version /usr/bin/gpg-wks-server --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gpgme-json-version /usr/bin/gpgme-json --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gpgparsemail-version /usr/bin/gpgparsemail --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gpgsplit-version /usr/bin/gpgsplit --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe gpgv2-version /usr/bin/gpgv2 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe watchgnupg-version /usr/bin/watchgnupg --version && passed=$((passed + 1)) || failed=$((failed + 1))
 
     total=$((passed + failed))
     if ((total != LITEINST_COMPAT_EXPECTED)); then
@@ -3832,7 +3849,7 @@ fi
 if ((LITEINST_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
     if ((failures == 0)); then
-        run_check "LiteInst compatibility baseline (694 programs)" run_liteinst_compatibility_envelope
+        run_check "LiteInst compatibility baseline (711 programs)" run_liteinst_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
