@@ -156,7 +156,9 @@ mod mem_print_race {
     use detcore_testutils::test_fn_with_config;
     use pretty_assertions::assert_eq;
     use reverie::ExitStatus;
-    const NUM_ELEMENTS: usize = 50_000_000;
+    // Keep enough atomic operations to observe robust interleaving without making
+    // the ptrace variants spend minutes exercising the same scheduling path.
+    const NUM_ELEMENTS: usize = 2_000_000;
     const CHUNKS: usize = 5;
 
     fn raw() -> u64 {
@@ -203,7 +205,7 @@ mod mem_print_race {
 
     #[test]
     fn raw_run_par_mode() {
-        // In raw executions, these will typically be around 900K switches:
+        // Raw executions should still produce many more switches than this minimum.
         raw_assert(1)();
     }
 
@@ -221,7 +223,7 @@ mod mem_print_race {
             test_fn_with_config::<Detcore, _>(raw_assert(2 * CHUNKS as u64 - 10), cfg, false)
                 .unwrap()
         } else {
-            // In bottom/middle modes, this will typically do about 150K switches:
+            // Bottom/middle modes run concurrently and should interleave naturally.
             test_fn_with_config::<Detcore, _>(raw_assert(1), cfg, false).unwrap()
         };
         reverie_ptrace::testing::print_tracee_output(&output);
