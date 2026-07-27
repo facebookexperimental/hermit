@@ -44,6 +44,7 @@ enum ProcfsKind {
     BtrfsBytesReserved,
     BtrfsBytesPinned,
     Rtc,
+    DentryState,
 }
 
 fn is_btrfs_bytes_reserved_path(path: &Path) -> bool {
@@ -110,6 +111,9 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-914): Review host-global inode counter normalization.
             "/proc/sys/fs/inode-nr" => ProcfsKind::InodeNr,
             "/proc/sys/fs/inode-state" => ProcfsKind::InodeState,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-918): Review host-global dentry counter normalization.
+            "/proc/sys/fs/dentry-state" => ProcfsKind::DentryState,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
@@ -216,6 +220,7 @@ impl ProcfsFile {
             ProcfsKind::BtrfsBytesReserved => sanitize_btrfs_bytes_reserved(&contents),
             ProcfsKind::BtrfsBytesPinned => sanitize_btrfs_bytes_pinned(&contents),
             ProcfsKind::Rtc => sanitize_rtc(&contents, virtual_realtime_seconds),
+            ProcfsKind::DentryState => sanitize_dentry_state(&contents),
         });
     }
 
@@ -636,6 +641,16 @@ fn sanitize_inode_state(contents: &[u8]) -> Vec<u8> {
         Vec::new()
     } else {
         b"0\t0\t0\t0\t0\t0\t0\n".to_vec()
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-918): Review the /proc/sys/fs/dentry-state field policy.
+fn sanitize_dentry_state(contents: &[u8]) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        b"0\t0\t45\t0\t0\t0\n".to_vec()
     }
 }
 
@@ -1182,6 +1197,12 @@ mod tests {
                 .kind,
             ProcfsKind::Rtc
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/sys/fs/dentry-state"))
+                .unwrap()
+                .kind,
+            ProcfsKind::DentryState
+        );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
@@ -1429,6 +1450,17 @@ malformed buddy row\n"
         assert_eq!(sanitize_file_max(b"1048576\n"), b"9223372036854775807\n");
         assert!(sanitize_file_nr(b"").is_empty());
         assert!(sanitize_file_max(b"").is_empty());
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-918): Review dentry counter fixture coverage.
+    #[test]
+    fn dentry_state_hides_host_global_cache_counters() {
+        assert_eq!(
+            sanitize_dentry_state(b"1888773\t1374220\t45\t0\t212904\t0\n"),
+            b"0\t0\t45\t0\t0\t0\n"
+        );
+        assert!(sanitize_dentry_state(b"").is_empty());
     }
 
     #[test]
