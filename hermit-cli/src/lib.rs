@@ -722,7 +722,9 @@ async fn run_sabre(
     Ok(output)
 }
 /// Guest-physical memory available to the single-process KVM personality.
-const KVM_GUEST_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+// The KVM personality is a sparse MAP_NORESERVE address space. QEMU needs room
+// for its own ELF mappings in addition to the nested machine's RAM mapping.
+const KVM_GUEST_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Maximum `#!` interpreter indirection levels, matching the Linux kernel's
 /// `BINPRM_MAX_RECURSION` limit for chained script interpreters.

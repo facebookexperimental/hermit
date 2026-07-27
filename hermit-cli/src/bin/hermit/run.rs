@@ -2059,6 +2059,7 @@ impl RunOpts {
         eprintln!(":: {}", "Run2...".yellow().bold());
         let out2 = self.run_verify(log2_file, global)?;
 
+        let kvm_output_only = self.selected_backend() == Backend::Kvm;
         let status = compare_two_runs(
             ComparedRun {
                 output: &out1,
@@ -2069,9 +2070,14 @@ impl RunOpts {
                 log: log2_path,
             },
             ComparisonOptions {
-                success_message: "Success: deterministic. Determinism verified.",
+                success_message: if kvm_output_only {
+                    "Success: KVM guest output and exit status matched."
+                } else {
+                    "Success: deterministic. Determinism verified."
+                },
                 failure_message: "Failure: nondeterministic.",
                 verbose: self.verify_verbose,
+                compare_logs: !kvm_output_only,
             },
         )?;
 

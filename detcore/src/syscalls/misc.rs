@@ -39,6 +39,35 @@ const ARCH_SHSTK_UNLOCK: libc::c_int = 0x5004;
 const ARCH_SHSTK_STATUS: libc::c_int = 0x5005;
 const ARCH_SHSTK_VALID_MASK: usize = 0b11;
 
+const SECCOMP_SET_MODE_STRICT: u32 = 0;
+const SECCOMP_SET_MODE_FILTER: u32 = 1;
+const SECCOMP_GET_ACTION_AVAIL: u32 = 2;
+const SECCOMP_GET_NOTIF_SIZES: u32 = 3;
+const SECCOMP_FILTER_FLAG_TSYNC: u32 = 1;
+
+fn seccomp_result(op: u32, flags: u32, has_args: bool) -> Result<i64, Errno> {
+    if op > SECCOMP_GET_NOTIF_SIZES {
+        return Err(Errno::EINVAL);
+    }
+    if op == SECCOMP_SET_MODE_STRICT && (flags != 0 || has_args) {
+        return Err(Errno::EINVAL);
+    }
+    if op == SECCOMP_SET_MODE_FILTER && flags & !SECCOMP_FILTER_FLAG_TSYNC != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if matches!(
+        op,
+        SECCOMP_SET_MODE_FILTER | SECCOMP_GET_ACTION_AVAIL | SECCOMP_GET_NOTIF_SIZES
+    ) && !has_args
+    {
+        return Err(Errno::EFAULT);
+    }
+
+    // Hermit cannot enforce a guest-installed BPF policy in every backend.
+    // Report the operation as unsupported instead of claiming a filter exists.
+    Err(Errno::EOPNOTSUPP)
+}
+
 fn is_supported_prctl_option(option: libc::c_int) -> bool {
     matches!(
         option,
@@ -195,6 +224,16 @@ fn write_random_chunk(
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// Validates seccomp capability probes without installing guest filters.
+    // TODO-HUMAN-REVIEW(PR-874): Review deterministic seccomp probe validation.
+    pub async fn handle_seccomp<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        call: syscalls::Seccomp,
+    ) -> Result<i64, Error> {
+        seccomp_result(call.op(), call.flags(), call.args().is_some()).map_err(Into::into)
+    }
+
     fn write_arch_prctl_u64<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -695,6 +734,22 @@ mod tests {
             assert_eq!(getpriority_result(which), Err(Errno::EINVAL));
             assert_eq!(setpriority_result(which), Err(Errno::EINVAL));
         }
+    }
+
+    #[test]
+    fn seccomp_tsync_null_probe_matches_linux_validation() {
+        assert_eq!(
+            seccomp_result(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, false,),
+            Err(Errno::EFAULT)
+        );
+        assert_eq!(
+            seccomp_result(SECCOMP_SET_MODE_FILTER, 1 << 31, false),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            seccomp_result(SECCOMP_SET_MODE_FILTER, 0, true),
+            Err(Errno::EOPNOTSUPP)
+        );
     }
 
     #[test]

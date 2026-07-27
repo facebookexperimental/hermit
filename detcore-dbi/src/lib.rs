@@ -680,6 +680,7 @@ pub extern "C" fn reverie_dbi_runtime_ready(image_generation: u64) -> i32 {
 /// The native client must pass a valid writable `scratch` pointer, a live
 /// DynamoRIO `context`, and callback pointers valid for this application.
 // TODO-HUMAN-REVIEW(PR-743): Review the native thread initialization ABI and state handoff.
+// TODO-HUMAN-REVIEW(PR-874): Review compatibility with Reverie's expanded DBI callback ABI.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
@@ -775,6 +776,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
 /// `scratch` must name the initialized parent state, `context` must be its
 /// live DynamoRIO context, and callback pointers must remain valid.
 // TODO-HUMAN-REVIEW(PR-743): Review parent-side native child registration.
+// TODO-HUMAN-REVIEW(PR-874): Review register-writer propagation to child registration.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
@@ -918,6 +920,21 @@ pub extern "C" fn reverie_dbi_runtime_copied_syscall(sysnum: i64) -> i32 {
     }
 }
 
+// TODO-HUMAN-REVIEW(PR-874): Review deferred DBI syscall encoding.
+unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut u64) {
+    let (sysno, syscall_args) = syscall.into_parts();
+    unsafe { number.write(sysno.id() as i64) };
+    let values = [
+        syscall_args.arg0 as u64,
+        syscall_args.arg1 as u64,
+        syscall_args.arg2 as u64,
+        syscall_args.arg3 as u64,
+        syscall_args.arg4 as u64,
+        syscall_args.arg5 as u64,
+    ];
+    unsafe { std::slice::from_raw_parts_mut(args, values.len()) }.copy_from_slice(&values);
+}
+
 /// Dispatches one DynamoRIO syscall event through the real Detcore Tool.
 ///
 /// # Safety
@@ -927,6 +944,7 @@ pub extern "C" fn reverie_dbi_runtime_copied_syscall(sysnum: i64) -> i32 {
 #[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 // TODO-HUMAN-REVIEW(PR-587): Confirm native process dispatch pauses only exec.
+// TODO-HUMAN-REVIEW(PR-874): Review deferred-syscall and register-writer ABI compatibility.
 pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     context: *mut c_void,
     scratch: *mut c_void,
@@ -1140,18 +1158,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             1
         }
         Ok(DbiSyscallOutcome::ExecuteOriginal(syscall)) => {
-            let (sysno, args) = syscall.into_parts();
-            unsafe { deferred_sysnum.write(sysno.id() as i64) };
-            let args = [
-                args.arg0 as u64,
-                args.arg1 as u64,
-                args.arg2 as u64,
-                args.arg3 as u64,
-                args.arg4 as u64,
-                args.arg5 as u64,
-            ];
-            unsafe { std::slice::from_raw_parts_mut(deferred_args, args.len()) }
-                .copy_from_slice(&args);
+            unsafe { write_deferred_syscall(syscall, deferred_sysnum, deferred_args) };
             2
         }
         Err(Error::Tool(error)) => {

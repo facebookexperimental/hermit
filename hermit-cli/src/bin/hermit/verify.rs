@@ -32,6 +32,7 @@ pub(crate) struct ComparisonOptions<'a> {
     pub success_message: &'a str,
     pub failure_message: &'a str,
     pub verbose: bool,
+    pub compare_logs: bool,
 }
 
 pub fn temp_log_files(name1: &str, name2: &str) -> io::Result<(NamedTempFile, NamedTempFile)> {
@@ -131,32 +132,37 @@ pub fn compare_two_runs(
         }
     }
 
-    eprintln!(
-        ":: {} {} and {}",
-        "Comparing logs...".yellow().bold(),
-        log1.display(),
-        log2.display()
-    );
-
-    let mut diff_options = logdiff::LogDiffOpts {
-        strip_lines: true,
-        syscall_history: 5,
-        ..Default::default()
-    };
-    if options.verbose {
-        diff_options.comparison = logdiff::LogComparisonMode::FullTrace;
-        diff_options.strip_lines = false;
-        diff_options.syscall_history = 10;
-    }
-
-    if logdiff::log_diff(log1.as_ref(), log2.as_ref(), &diff_options) {
-        failed = true;
-        eprintln!(":: {}", "Log differences found between runs.".red().bold());
+    if options.compare_logs {
         eprintln!(
-            ":: {}: {} {}",
-            "Respective Logs retained for further inspection".red(),
+            ":: {} {} and {}",
+            "Comparing logs...".yellow().bold(),
             log1.display(),
             log2.display()
+        );
+        let mut diff_options = logdiff::LogDiffOpts {
+            strip_lines: true,
+            syscall_history: 5,
+            ..Default::default()
+        };
+        if options.verbose {
+            diff_options.comparison = logdiff::LogComparisonMode::FullTrace;
+            diff_options.strip_lines = false;
+            diff_options.syscall_history = 10;
+        }
+
+        if logdiff::log_diff(log1.as_ref(), log2.as_ref(), &diff_options) {
+            failed = true;
+            eprintln!(":: {}", "Log differences found between runs.".red().bold());
+            eprintln!(
+                ":: {}: {} {}",
+                "Respective Logs retained for further inspection".red(),
+                log1.display(),
+                log2.display()
+            );
+        }
+    } else {
+        eprintln!(
+            ":: KVM concurrent mode: comparing guest output and exit status; internal syscall trace order is not deterministic"
         );
     }
 
@@ -241,6 +247,7 @@ mod tests {
                 success_message: "verified",
                 failure_message: "failed",
                 verbose: false,
+                compare_logs: true,
             },
         )
     }
@@ -268,6 +275,36 @@ mod tests {
 
         assert_eq!(
             compare(&left, log1, &right, log2).unwrap(),
+            ExitStatus::Exited(0)
+        );
+    }
+
+    #[test]
+    fn output_only_mode_ignores_internal_log_order() {
+        let left = output(0, b"console", b"warning");
+        let right = output(0, b"console", b"warning");
+        let (left_log, right_log) = empty_logs();
+        fs::write(&left_log, "DETLOG root event A\n").unwrap();
+        fs::write(&right_log, "DETLOG root event B\n").unwrap();
+
+        assert_eq!(
+            compare_two_runs(
+                ComparedRun {
+                    output: &left,
+                    log: left_log,
+                },
+                ComparedRun {
+                    output: &right,
+                    log: right_log,
+                },
+                ComparisonOptions {
+                    success_message: "verified",
+                    failure_message: "failed",
+                    verbose: false,
+                    compare_logs: false,
+                },
+            )
+            .unwrap(),
             ExitStatus::Exited(0)
         );
     }

@@ -214,6 +214,14 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // state, so handle_shutdown forwards it via record_or_replay exactly like
         // handle_listen/handle_setsockopt (KVM ratchet round 12).
         | Sysno::shutdown
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-874): Review deterministic seccomp probe
+        // validation. Hermit returns Linux argument-validation errors for
+        // capability probes but refuses real filters because they can block
+        // ptrace-runtime syscall injection.
+        // QEMU probes SECCOMP_FILTER_FLAG_TSYNC with a NULL filter. Return the
+        // Linux validation errno without installing an unenforceable filter.
+        | Sysno::seccomp
         | Sysno::tgkill
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#812): signal-sending siblings of the already
@@ -432,15 +440,10 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::keyctl
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-838): Review close_range descriptor-table
-        // synchronization and the deterministic seccomp compatibility refusal.
+        // synchronization.
         // The close_range handler serializes the kernel operation and removes the
-        // same descriptor slots from Detcore's model. Seccomp support is hidden
-        // because installing a guest filter can block the injected syscalls used
-        // by the ptrace runtime, while its capability probes otherwise expose
-        // host-kernel configuration. A fixed ENOSYS presents a stable
-        // kernel-without-seccomp boundary.
+        // same descriptor slots from Detcore's model.
         | Sysno::close_range
-        | Sysno::seccomp
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-838): Review regular-file sendfile mediation.
         // The handler serializes destination writes and forwards the copy through
@@ -1276,6 +1279,10 @@ mod tests {
         // Determinized (routed through handle_shutdown); regression for #818.
         assert_eq!(
             classify_syscall(Sysno::shutdown),
+            SyscallClassification::Determinized
+        );
+        assert_eq!(
+            classify_syscall(Sysno::seccomp),
             SyscallClassification::Determinized
         );
         for sysno in [

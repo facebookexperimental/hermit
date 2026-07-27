@@ -168,6 +168,12 @@ impl Subcommand {
                  liteinst run`; other subcommands do not use the preload runtime"
             );
         }
+        if backend == Some(hermit::Backend::Kvm) && !matches!(self, Subcommand::Run(_)) {
+            anyhow::bail!(
+                "the KVM backend is available only through `hermit --backend kvm run`; record \
+                 and replay require the ptrace runtime's sequentialized scheduler"
+            );
+        }
         Ok(())
     }
 
@@ -336,6 +342,27 @@ mod tests {
             .validate_backend_scope(Some(Backend::Liteinst))
             .unwrap_err();
         assert!(error.to_string().contains("only through"));
+    }
+
+    #[test]
+    fn kvm_is_rejected_outside_run_instead_of_silently_recording_with_ptrace() {
+        use hermit::Backend;
+
+        let args = Args::try_parse_from([
+            "hermit",
+            "--backend",
+            "kvm",
+            "record",
+            "start",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        let error = args
+            .command
+            .validate_backend_scope(Some(Backend::Kvm))
+            .unwrap_err();
+        assert!(error.to_string().contains("require the ptrace runtime"));
     }
 
     #[test]

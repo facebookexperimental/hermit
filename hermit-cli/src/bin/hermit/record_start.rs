@@ -410,6 +410,7 @@ impl StartOpts {
                 success_message: "Success: replay matched recording.",
                 failure_message: "Recording output did not match replay output!",
                 verbose: false,
+                compare_logs: true,
             },
         )
     }
