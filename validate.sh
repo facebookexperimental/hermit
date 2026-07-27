@@ -299,7 +299,8 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
-readonly STRICT_COMPAT_TOTAL=187
+# Current main's 187-row strict corpus plus lsirq, mpstat-softirqs, and lsmod.
+readonly STRICT_COMPAT_TOTAL=190
 # Current main's 131-row ratchet (which already includes ruby/dc/tcl from
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
@@ -2909,6 +2910,13 @@ function run_compatibility_corpus {
     strict_compatibility_probe sysctl-random-uuid /usr/sbin/sysctl kernel.random.uuid \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe sar-resource-tables /usr/bin/sar -v 1 1 \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe lsirq /usr/bin/lsirq --noheadings \
+        --output IRQ,TOTAL,NAME \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe mpstat-softirqs /usr/bin/mpstat -I SCPU 1 1 \
+        && passed=$((passed + 1)) || failed=$((failed + 1))
+    strict_compatibility_probe lsmod /usr/sbin/lsmod \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Restrict process tools to stable identity/existence observations. Host
     # CPU, memory, and RSS counters intentionally remain outside the L2 claim.
