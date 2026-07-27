@@ -81,9 +81,12 @@ fn softnet_stat_consumers_are_deterministic_under_strict_verify() {
             args: &["/proc/net/softnet_stat"],
         },
         ProgramCase {
-            name: "awk softnet table",
+            name: "awk virtual softnet CPU row",
             candidates: &["/usr/bin/awk", "/bin/awk"],
-            args: &["{ print }", "/proc/net/softnet_stat"],
+            args: &[
+                "NF != 15 || $13 != \"00000000\" { exit 1 } END { if (NR != 1) exit 1 }",
+                "/proc/net/softnet_stat",
+            ],
         },
         ProgramCase {
             name: "sed softnet table",

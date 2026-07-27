@@ -820,42 +820,13 @@ fn numbered_label(label: &str, prefix: &str) -> bool {
     })
 }
 
-// TODO-HUMAN-REVIEW(PR-909): Review the preserved CPU-index column.
-/// Preserves the softnet table shape and per-row CPU index while hiding live
-/// network backlog counters maintained by the host kernel.
-fn sanitize_softnet_stat(contents: &[u8]) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
-    };
-    let rows = text
-        .lines()
-        .map(|line| line.split_whitespace().collect::<Vec<_>>())
-        .collect::<Vec<_>>();
-    if rows.is_empty()
-        || rows.iter().any(|fields| {
-            fields.len() < 13
-                || fields.iter().any(|field| {
-                    field.len() != 8 || !field.bytes().all(|byte| byte.is_ascii_hexdigit())
-                })
-        })
-    {
-        return contents.to_vec();
-    }
-
-    let mut normalized = String::with_capacity(text.len());
-    for fields in rows {
-        for (index, field) in fields.into_iter().enumerate() {
-            if index != 0 {
-                normalized.push(' ');
-            }
-            normalized.push_str(if index == 12 { field } else { "00000000" });
-        }
-        normalized.push('\n');
-    }
-    if !text.ends_with('\n') {
-        normalized.pop();
-    }
-    normalized.into_bytes()
+// TODO-HUMAN-REVIEW(PR-909): Review the single-CPU softnet policy.
+/// Exposes Hermit's single virtual CPU and hides host CPU count, hotplug state,
+/// CPU identifiers, and live network backlog counters.
+fn sanitize_softnet_stat(_contents: &[u8]) -> Vec<u8> {
+    const VIRTUAL_SOFTNET_STAT: &[u8] =
+        b"00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000\n";
+    VIRTUAL_SOFTNET_STAT.to_vec()
 }
 
 fn zero_decimal_runs(text: &str) -> String {
@@ -1116,16 +1087,12 @@ mod tests {
     }
 
     #[test]
-    fn softnet_stat_preserves_cpu_indices_and_zeros_counters() {
-        let input = b"00908c97 00000002 0000009e 00000004 00000005 00000006 00000007 00000008 00000009 0000000a 0000000b 0000000c 00000003 0000000e 0000000f\n";
-        assert_eq!(
-            sanitize_softnet_stat(input),
-            b"00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000003 00000000 00000000\n"
-        );
-        assert_eq!(
-            sanitize_softnet_stat(b"not a softnet row\n"),
-            b"not a softnet row\n"
-        );
+    fn softnet_stat_synthesizes_one_virtual_cpu_row() {
+        let input = b"00908c97 00000002 0000009e 00000004 00000005 00000006 00000007 00000008 00000009 0000000a 0000000b 0000000c 00000003 0000000e 0000000f\n\
+00123456 00000012 00000034 00000056 00000078 0000009a 000000bc 000000de 000000f0 00000011 00000022 00000033 00000007 00000044 00000055\n";
+        let expected = b"00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000\n";
+        assert_eq!(sanitize_softnet_stat(input), expected);
+        assert_eq!(sanitize_softnet_stat(b"not a softnet row\n"), expected);
     }
 
     #[test]
