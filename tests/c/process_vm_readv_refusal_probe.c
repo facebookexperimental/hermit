@@ -20,20 +20,27 @@
 #endif
 
 int main(void) {
-  unsigned char byte = 0;
-  struct iovec local = {.iov_base = &byte, .iov_len = sizeof(byte)};
-  struct iovec remote = {.iov_base = (void *)(uintptr_t)1,
-                         .iov_len = sizeof(byte)};
+  unsigned char source = 0x5a;
+  unsigned char destination = 0xa5;
+  struct iovec local = {
+      .iov_base = &destination,
+      .iov_len = sizeof(destination),
+  };
+  struct iovec remote = {
+      .iov_base = &source,
+      .iov_len = sizeof(source),
+  };
 
   errno = 0;
-  long result = syscall(SYS_process_vm_readv, 1, &local, 1, &remote, 1, 0);
-  if (result == -1 && errno == EPERM) {
+  long result = syscall(SYS_process_vm_readv, getpid(), &local, 1, &remote, 1, 0);
+  if (result == -1 && errno == EPERM && destination == 0xa5) {
     puts("process-vm-readv-refused-ok");
     return 0;
   }
 
   fprintf(stderr,
-          "process_vm_readv: expected EPERM, got result=%ld errno=%d\n",
-          result, errno);
+          "process_vm_readv: expected EPERM/no copy, got result=%ld errno=%d "
+          "destination=%#x\n",
+          result, errno, destination);
   return 1;
 }
