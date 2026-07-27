@@ -1,19 +1,13 @@
 # Hermit
 
-Hermit is a reproducible container for x86-64 Linux programs. It runs an
-unmodified guest under the [Reverie](https://github.com/facebookexperimental/reverie)
-ptrace backend and controls sources of nondeterminism including thread
-scheduling, time, random data, CPUID results, and selected file metadata.
+Hermit is a deterministic execution environment for x86-64 Linux programs. It
+runs an unmodified guest under the
+[Reverie](https://github.com/facebookexperimental/reverie) ptrace backend and
+controls sources of nondeterminism including thread scheduling, time, random
+data, CPUID results, and selected file metadata.
 
 Hermit is useful for repeatable execution, controlled concurrency testing,
 record/replay experiments, and diagnosing schedule-sensitive failures.
-
-> [!WARNING]
->
-> Hermit is in maintenance mode. Linux compatibility is substantial but
-> incomplete, especially for uncommon syscalls and complex record/replay
-> workloads. Hermit is not a security boundary, and changing files or external
-> network responses remain inputs to the guest.
 
 ## Requirements
 
@@ -133,7 +127,7 @@ unsupported because the inherited seccomp filter would outlive the preload
 runtime. RCB preemption and CPUID/RDTSC interception are not implemented.
 The default Hermit namespace path is supported; `--no-namespace` remains an
 explicit option for trusted guests. The in-process preload is experimental and
-must not be treated as a security boundary for hostile code.
+continues to receive compatibility and lifecycle improvements.
 The release installation package supplies the DynamoRIO, SaBRe, LiteInst, and
 e9patch runtime artifacts. KVM requires read-write `/dev/kvm` access plus its
 guest-kernel Linux ABI.
