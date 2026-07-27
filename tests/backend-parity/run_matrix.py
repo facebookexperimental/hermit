@@ -105,6 +105,10 @@ class Fixtures:
                 ("-D_GNU_SOURCE",),
             ),
             "mmap_exec": (REPOSITORY / "tests/c/dbi_mmap_exec.c", ()),
+            "syscall_file_io": (
+                REPOSITORY / "tests/c/syscall_file_io.c",
+                (),
+            ),
             "madvise_determinism": (
                 REPOSITORY / "tests/c/madvise_determinism.c",
                 (),
@@ -142,6 +146,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
         "exit_zero": (["/bin/true"], 0, b""),
         "exit_status": (["/bin/sh", "-c", "exit 23"], 23, b""),
         "file_read": (["/bin/cat", str(fixture_input)], 0, fixture_input.read_bytes()),
+        "file_mutation": (
+            [str(fixtures.binary("syscall_file_io"))],
+            0,
+            b"syscall-file-io-ok count=5\n",
+        ),
         "executable_mmap": (
             [str(fixtures.binary("mmap_exec"))],
             0,

@@ -4,6 +4,7 @@ argument_forwarding	pass	pass	pass	-	-
 exit_zero	pass	pass	pass	-	-
 exit_status	pass	pass	pass	-	-
 file_read	pass	pass	pass	-	-
+file_mutation	pass	pass	pass	-	-
 executable_mmap	pass	pass	pass	-	-
 memory_advice	pass	pass	pass	-	-
 heap_growth	pass	pass	pass	-	-
