@@ -371,6 +371,43 @@ fn io_accounting_commands_are_deterministic_under_strict_verify() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-873): Review kernel pseudo-file command coverage.
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + util-linux/procps/sysstat"]
+fn kernel_pseudofile_commands_are_deterministic_under_strict_verify() {
+    let _guard = hermit_run_lock();
+    let cases = [
+        StrictCommandCase {
+            name: "findmnt",
+            candidates: &["/usr/bin/findmnt", "/bin/findmnt"],
+            args: &[
+                "--kernel",
+                "--list",
+                "--output",
+                "TARGET,SOURCE,FSTYPE,OPTIONS",
+            ],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "sysctl random UUID",
+            candidates: &["/usr/sbin/sysctl", "/usr/bin/sysctl"],
+            args: &["kernel.random.uuid"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "sar resource tables",
+            candidates: &["/usr/bin/sar"],
+            args: &["-v", "1", "1"],
+            stdin: None,
+        },
+    ];
+
+    for case in &cases {
+        assert_l2_under_strict_verify(case);
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-881)
 #[test]
 #[ignore = "e2e: requires hermit + PMU/mount namespaces + util-linux ionice"]

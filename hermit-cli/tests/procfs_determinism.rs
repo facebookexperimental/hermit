@@ -348,3 +348,36 @@ fn proc_rtc_tracks_custom_epoch_and_virtual_time() {
         "RTC did not cross the configured epoch day:\n{advanced}"
     );
 }
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-873): Review mountinfo and UUID snapshots.
+#[test]
+fn proc_self_mountinfo_hides_private_temp_roots() {
+    fn private_mount_records() -> Vec<String> {
+        let contents = read_procfs("/proc/self/mountinfo");
+        let text = std::str::from_utf8(&contents).expect("mountinfo should be UTF-8");
+        assert!(!text.contains("/tmpvol/.tmp"));
+        text.lines()
+            .filter(|line| line.contains("/tmpvol/.hermit/"))
+            .filter_map(|line| line.split_once(" /tmpvol/.hermit/"))
+            .map(|(_, stable)| format!("/tmpvol/.hermit/{stable}"))
+            .collect()
+    }
+
+    let _guard = hermit_run_lock();
+    let first = private_mount_records();
+    for run in 2..=RUNS {
+        assert_eq!(
+            first,
+            private_mount_records(),
+            "private mount records differed between run 1 and run {run}"
+        );
+    }
+}
+
+#[test]
+fn proc_random_uuid_is_deterministic() {
+    assert_deterministic("/proc/sys/kernel/random/uuid", |contents| {
+        assert_eq!(contents, b"00000000-0000-4000-8000-000000000000\n");
+    });
+}

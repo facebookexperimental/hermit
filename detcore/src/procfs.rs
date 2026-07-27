@@ -59,6 +59,8 @@ enum ProcfsKind {
     BtrfsBytesPinned,
     Rtc,
     DentryState,
+    Mountinfo,
+    RandomUuid,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-945): Review host swap-usage normalization.
     Swaps,
@@ -295,6 +297,10 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-918): Review host-global dentry counter normalization.
             "/proc/sys/fs/dentry-state" => ProcfsKind::DentryState,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-873): Review deterministic kernel pseudo-file snapshots.
+            "/proc/self/mountinfo" => ProcfsKind::Mountinfo,
+            "/proc/sys/kernel/random/uuid" => ProcfsKind::RandomUuid,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-933): Review host-global AIO count normalization.
             "/proc/sys/fs/aio-nr" => ProcfsKind::AioNr,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -498,6 +504,10 @@ impl ProcfsFile {
                 sanitize_sysfs_rtc_attribute(&contents, self.kind)
             }
             ProcfsKind::ThpCounter => sanitize_thp_counter(&contents),
+            ProcfsKind::Mountinfo => sanitize_mountinfo(&contents),
+            ProcfsKind::RandomUuid => {
+                fixed_snapshot(&contents, b"00000000-0000-4000-8000-000000000000\n")
+            }
         });
     }
 
@@ -1935,6 +1945,57 @@ fn sanitize_schedstat(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-873): Review private mount-root normalization.
+fn sanitize_mountinfo(contents: &[u8]) -> Vec<u8> {
+    const TEMP_ROOT_PREFIXES: &[&[u8]] = &[b"/tmpvol/.tmp", b"/tmp/.tmp"];
+
+    fn is_private_temp_root(root: &[u8]) -> bool {
+        let Some(suffix) = TEMP_ROOT_PREFIXES
+            .iter()
+            .find_map(|prefix| root.strip_prefix(*prefix))
+        else {
+            return false;
+        };
+        suffix.len() == 6 && suffix.iter().all(u8::is_ascii_alphanumeric)
+    }
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+        let has_newline = line.last() == Some(&b'\n');
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        let fields = body.split(|byte| *byte == b' ').collect::<Vec<_>>();
+
+        if fields.len() >= 5 && is_private_temp_root(fields[3]) {
+            for (index, field) in fields.iter().enumerate() {
+                if index > 0 {
+                    normalized.push(b' ');
+                }
+                if index == 3 {
+                    normalized.extend_from_slice(b"/tmpvol/.hermit");
+                    normalized.extend_from_slice(fields[4]);
+                } else {
+                    normalized.extend_from_slice(field);
+                }
+            }
+        } else {
+            normalized.extend_from_slice(body);
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
+fn fixed_snapshot(contents: &[u8], replacement: &[u8]) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        replacement.to_vec()
+    }
+}
+
 fn numbered_label(label: &str, prefix: &str) -> bool {
     label.strip_prefix(prefix).is_some_and(|suffix| {
         !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
@@ -2636,6 +2697,38 @@ mod tests {
         // The static min/max limits are deterministic and must not be rewritten.
         assert!(ProcfsFile::from_path(Path::new("cpu0/cpufreq/cpuinfo_max_freq")).is_none());
         assert!(ProcfsFile::from_path(Path::new("cpu0/cpufreq/scaling_max_freq")).is_none());
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    #[test]
+    fn recognizes_mount_and_random_uuid_paths() {
+        for (path, kind) in [
+            ("/proc/self/mountinfo", ProcfsKind::Mountinfo),
+            ("/proc/sys/kernel/random/uuid", ProcfsKind::RandomUuid),
+        ] {
+            assert_eq!(ProcfsFile::from_path(Path::new(path)).unwrap().kind, kind);
+        }
+    }
+
+    #[test]
+    fn private_mount_roots_are_guest_stable() {
+        let input = b"37 29 0:31 /tmpvol/.tmpAb12Z9 /tmp rw - btrfs /dev/md0 rw\n38 29 0:31 /host/data /data ro - btrfs /dev/md0 ro\n39 29 0:31 /tmp/.tmp654321 /etc/group ro - btrfs /dev/md0 ro\n";
+        assert_eq!(
+            sanitize_mountinfo(input),
+            b"37 29 0:31 /tmpvol/.hermit/tmp /tmp rw - btrfs /dev/md0 rw\n38 29 0:31 /host/data /data ro - btrfs /dev/md0 ro\n39 29 0:31 /tmpvol/.hermit/etc/group /etc/group ro - btrfs /dev/md0 ro\n"
+        );
+    }
+
+    #[test]
+    fn random_uuid_is_synthetic() {
+        assert_eq!(
+            fixed_snapshot(
+                b"24e63f35-232a-43e2-8799-b151e9833f45\n",
+                b"00000000-0000-4000-8000-000000000000\n"
+            ),
+            b"00000000-0000-4000-8000-000000000000\n"
+        );
+        assert!(fixed_snapshot(b"", b"0\n").is_empty());
     }
 
     #[test]
