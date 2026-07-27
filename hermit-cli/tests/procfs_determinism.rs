@@ -260,3 +260,37 @@ fn is_numbered_label(label: &str, prefix: &str) -> bool {
         !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
     })
 }
+
+#[test]
+fn proc_zoneinfo_uses_virtual_zero_values() {
+    assert_deterministic("/proc/zoneinfo", |contents| {
+        let text = std::str::from_utf8(contents).expect("zoneinfo should be UTF-8");
+        let mut saw_node = false;
+        let mut saw_cpu = false;
+        let mut saw_accounting = false;
+
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("Node ") {
+                assert!(trimmed.contains(", zone"));
+                saw_node = true;
+            } else if let Some(cpu) = trimmed.strip_prefix("cpu: ") {
+                cpu.parse::<u32>().expect("invalid zoneinfo CPU label");
+                saw_cpu = true;
+            } else {
+                assert!(
+                    trimmed
+                        .bytes()
+                        .filter(u8::is_ascii_digit)
+                        .all(|byte| byte == b'0'),
+                    "zoneinfo retained a nonzero host quantity: {line}"
+                );
+                saw_accounting |= trimmed.starts_with("nr_inactive_anon ");
+            }
+        }
+
+        assert!(saw_node);
+        assert!(saw_cpu);
+        assert!(saw_accounting);
+    });
+}

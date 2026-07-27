@@ -34,6 +34,7 @@ enum ProcfsKind {
     SoftnetStat,
     FileNr,
     FileMax,
+    Zoneinfo,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -78,6 +79,9 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-910): Review host file-table normalization.
             "/proc/sys/fs/file-nr" => ProcfsKind::FileNr,
             "/proc/sys/fs/file-max" => ProcfsKind::FileMax,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-913): Review host memory-zone accounting normalization.
+            "/proc/zoneinfo" => ProcfsKind::Zoneinfo,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -133,6 +137,7 @@ impl ProcfsFile {
             ProcfsKind::SoftnetStat => sanitize_softnet_stat(&contents),
             ProcfsKind::FileNr => sanitize_file_nr(&contents),
             ProcfsKind::FileMax => sanitize_file_max(&contents),
+            ProcfsKind::Zoneinfo => sanitize_zoneinfo(&contents),
         });
     }
 
@@ -583,6 +588,28 @@ fn sanitize_pressure(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
+fn sanitize_zoneinfo(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let trimmed = body.trim_start();
+        if trimmed.starts_with("Node ") || trimmed.starts_with("cpu: ") {
+            normalized.extend_from_slice(body.as_bytes());
+        } else {
+            normalized.extend_from_slice(zero_decimal_runs(body).as_bytes());
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
 fn sanitize_schedstat(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
@@ -659,6 +686,23 @@ fn sanitize_softnet_stat(contents: &[u8]) -> Vec<u8> {
         normalized.pop();
     }
     normalized.into_bytes()
+}
+
+fn zero_decimal_runs(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut in_digits = false;
+    for character in text.chars() {
+        if character.is_ascii_digit() {
+            if !in_digits {
+                normalized.push('0');
+                in_digits = true;
+            }
+        } else {
+            in_digits = false;
+            normalized.push(character);
+        }
+    }
+    normalized
 }
 
 #[cfg(test)]
@@ -768,6 +812,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::FileMax
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/zoneinfo"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Zoneinfo
         );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
@@ -962,6 +1012,26 @@ domain0 SMT 00000003 1 2 3\n";
 timestamp 0\n\
 cpu0 0 0 0 0 0 0 0 0 0\n\
 domain0 SMT 00000003 0 0 0\n"
+        );
+    }
+
+    #[test]
+    fn zoneinfo_hides_host_memory_accounting() {
+        let contents = b"Node 3, zone    DMA32\n\
+  pages free     2816\n\
+      nr_inactive_anon 39937459\n\
+        protection: (0, 2117, 772897)\n\
+    cpu: 7\n\
+              count:    12\n";
+
+        assert_eq!(
+            sanitize_zoneinfo(contents),
+            b"Node 3, zone    DMA32\n\
+  pages free     0\n\
+      nr_inactive_anon 0\n\
+        protection: (0, 0, 0)\n\
+     cpu: 7\n\
+               count:    0\n"
         );
     }
 
