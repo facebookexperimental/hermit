@@ -1329,7 +1329,7 @@ fn run_kvm_reports_hostname() {
     let output = hermit(&args);
 
     assert_success(&output, &args);
-    assert_eq!(stdout(&output), "reverie-kvm\n");
+    assert_eq!(stdout(&output), "hermetic-container.local\n");
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
