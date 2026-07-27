@@ -111,9 +111,9 @@ fn sysfs_rtc_consumers_verify() {
         return;
     }
 
-    assert_normalized_attribute(RTC_DATE, b"2021-12-31\n");
-    assert_normalized_attribute(RTC_TIME, b"23:59:59\n");
-    assert_normalized_attribute(RTC_EPOCH, b"1640995199\n");
+    assert_normalized_attribute(RTC_DATE, b"2026-01-01\n");
+    assert_normalized_attribute(RTC_TIME, b"00:00:00\n");
+    assert_normalized_attribute(RTC_EPOCH, b"1767225600\n");
 
     let cases = [
         ProgramCase {

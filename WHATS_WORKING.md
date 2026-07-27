@@ -391,7 +391,7 @@ Notable results and honest caveats:
 
 - **Virtual time makes clock-reading programs verify.** C `std::chrono::steady_clock` diff is
   byte-identical across two independent `--strict` runs (`diff_ns=1010030`) though it varies
-  natively; batch 32 pins all clocks to the virtual epoch `1640995199` (2021-12-31 23:59:59 UTC).
+  natively; batch 32 pins all clocks to the virtual epoch `1767225600` (2026-01-01 00:00:00 UTC).
 - **Synchronous fault + signal paths are deterministic:** `mprotect(PROT_READ)`→SIGSEGV caught
   via `sigsetjmp`/`siglongjmp` (batch 34) and `SA_SIGINFO` delivery (batch 31) both verify at L2.
 - **Raw-futex and lock-heavy multithreading verify** (batch 39: 3-state Drepper `futex` mutex

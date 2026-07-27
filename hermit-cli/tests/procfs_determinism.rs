@@ -188,7 +188,7 @@ fn proc_system_cpu_accounting_is_deterministic() {
                 }
             );
         }
-        assert!(text.contains("btime 1640995079\n"));
+        assert!(text.contains("btime 1767225480\n"));
     });
 }
 

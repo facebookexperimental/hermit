@@ -91,7 +91,7 @@ pub struct Config {
     /// Epoch of the logical time.
     ///
     /// This is the datetime from which all time and date modtimes begin and
-    /// monotonically increase. It is in RFC3339 format such as: 2021-12-31T23:59:59Z"
+    /// monotonically increase. It is in RFC3339 format such as `2026-01-01T00:00:00Z`.
     #[clap(
         long,
         env = "HERMIT_EPOCH",
@@ -936,7 +936,7 @@ impl std::error::Error for ParseTimesliceError {
 ///
 /// N.B. Default to a reasonable date. Some programs (like zip) have trouble with the
 /// original unix epoch (time zero).
-pub static DEFAULT_EPOCH_STR: &str = "2021-12-31T23:59:59Z";
+pub static DEFAULT_EPOCH_STR: &str = "2026-01-01T00:00:00Z";
 
 impl Config {
     /// Construct the config using environment variables only, not CLI args.
@@ -979,6 +979,13 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_epoch_is_2026() {
+        assert_eq!(DEFAULT_EPOCH_STR, "2026-01-01T00:00:00Z");
+        let epoch = DEFAULT_EPOCH_STR.parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(epoch.timestamp(), 1_767_225_600);
+    }
 
     #[test]
     fn runs_post_fork_parses_all_modes_and_defaults_to_child() {

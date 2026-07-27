@@ -1245,15 +1245,15 @@ fn sanitize_sysfs_rtc_attribute(contents: &[u8], kind: ProcfsKind) -> Vec<u8> {
     let (valid, fixed): (bool, &[u8]) = match kind {
         ProcfsKind::SysfsRtcDate => (
             matches_digit_separated(value, 10, &[(4, b'-'), (7, b'-')]),
-            b"2021-12-31",
+            b"2026-01-01",
         ),
         ProcfsKind::SysfsRtcTime => (
             matches_digit_separated(value, 8, &[(2, b':'), (5, b':')]),
-            b"23:59:59",
+            b"00:00:00",
         ),
         ProcfsKind::SysfsRtcEpoch => (
             !value.is_empty() && value.iter().all(u8::is_ascii_digit),
-            b"1640995199",
+            b"1767225600",
         ),
         _ => return contents.to_vec(),
     };
@@ -3848,15 +3848,15 @@ mod tests {
     fn sysfs_rtc_uses_the_fixed_virtual_epoch() {
         assert_eq!(
             sanitize_sysfs_rtc_attribute(b"2026-07-27\n", ProcfsKind::SysfsRtcDate),
-            b"2021-12-31\n"
+            b"2026-01-01\n"
         );
         assert_eq!(
             sanitize_sysfs_rtc_attribute(b"12:24:03\n", ProcfsKind::SysfsRtcTime),
-            b"23:59:59\n"
+            b"00:00:00\n"
         );
         assert_eq!(
             sanitize_sysfs_rtc_attribute(b"1785155071", ProcfsKind::SysfsRtcEpoch),
-            b"1640995199"
+            b"1767225600"
         );
         for (malformed, kind) in [
             (b"2026/07/27\n".as_slice(), ProcfsKind::SysfsRtcDate),
@@ -4003,9 +4003,9 @@ mod tests {
             sanitize_system_stat(
                 b"cpu  1 2 3 4 5 6 7 8 9 10\ncpu0 1 2 3 4 5 6 7 8 9 10\nintr 9 8 7\nbtime 1234\nprocesses 55\n",
                 120,
-                1_640_995_079,
+                1_767_225_480,
             ),
-            b"cpu 12000 0 0 0 0 0 0 0 0 0\ncpu0 12000 0 0 0 0 0 0 0 0 0\nintr 0 0 0\nbtime 1640995079\nprocesses 0\n"
+            b"cpu 12000 0 0 0 0 0 0 0 0 0\ncpu0 12000 0 0 0 0 0 0 0 0 0\nintr 0 0 0\nbtime 1767225480\nprocesses 0\n"
         );
     }
 
