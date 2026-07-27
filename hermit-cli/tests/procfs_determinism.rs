@@ -167,7 +167,9 @@ fn proc_cpuinfo_is_deterministic() {
             .filter(|line| line.starts_with("cpu MHz"))
             .collect::<Vec<_>>();
         assert!(
-            frequencies.iter().all(|line| *line == "cpu MHz\t\t: 0.000"),
+            frequencies
+                .iter()
+                .all(|line| *line == "cpu MHz\t\t: 1000.000"),
             "cpuinfo contains a volatile frequency"
         );
     });

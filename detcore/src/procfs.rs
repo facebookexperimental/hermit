@@ -1752,6 +1752,12 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
         "ext.enabled",
         "numa_preferred_nid",
     ];
+    const UCLAMP_FIELDS: &[(&str, &str)] = &[
+        ("uclamp.min", "0"),
+        ("uclamp.max", "1024"),
+        ("effective uclamp.min", "0"),
+        ("effective uclamp.max", "1024"),
+    ];
 
     let Ok(text) = std::str::from_utf8(contents) else {
         return Vec::new();
@@ -1843,6 +1849,13 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
             }
             core_fields_seen[index] = true;
             Some("0.000000")
+        } else if let Some((_, replacement)) =
+            UCLAMP_FIELDS.iter().find(|(field, _)| *field == label)
+        {
+            if right.trim().parse::<u128>().is_err() {
+                return Vec::new();
+            }
+            Some(*replacement)
         } else if INTEGER_FIELDS.contains(&label) {
             if right.trim().parse::<u128>().is_err() {
                 return Vec::new();
@@ -3971,6 +3984,10 @@ se.vruntime : 133948666.432951\n\
 se.sum_exec_runtime : 3.637972\n\
 nr_switches : 149\n\
 se.avg.load_avg : 749\n\
+uclamp.min : 128\n\
+uclamp.max : 768\n\
+effective uclamp.min : 256\n\
+effective uclamp.max : 512\n\
 policy : 0\n\
 current_node=7, numa_group_id=91\n\
 numa_faults node=7 task_private=8 task_shared=9 group_private=10 group_shared=11\n";
@@ -3983,6 +4000,10 @@ se.vruntime : 0.000000\n\
 se.sum_exec_runtime : 0.000000\n\
 nr_switches : 0\n\
 se.avg.load_avg : 0\n\
+uclamp.min : 0\n\
+uclamp.max : 1024\n\
+effective uclamp.min : 0\n\
+effective uclamp.max : 1024\n\
 policy : 0\n\
 current_node=0, numa_group_id=0\n\
 numa_faults node=0 task_private=0 task_shared=0 group_private=0 group_shared=0\n"
