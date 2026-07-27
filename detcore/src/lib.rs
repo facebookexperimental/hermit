@@ -1566,6 +1566,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(PR-838): Review regular-file sendfile mediation.
                 Syscall::Sendfile(s) => self.handle_sendfile(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-887): Present a stable pre-4.5-kernel
+                // boundary so callers use determinized read/write copying.
+                Syscall::CopyFileRange(_) => Err(Error::Errno(Errno::ENOSYS)),
+                // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#683)
                 Syscall::Pwrite64(s) => self.handle_pwrite64(guest, s).await,
                 // This syscall is advisory; fixed success preserves its API contract.
