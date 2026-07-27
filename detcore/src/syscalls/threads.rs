@@ -263,7 +263,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Remove it from Detcore's run queue before entering that blocking call.
         if is_vfork && self.cfg.sequentialize_threads {
             let mut resources = Resources::new(parent_dettid);
-            resources.insert(ResourceID::BlockingExternalIO(vfork_op_id), Permission::RW);
+            resources.insert(ResourceID::BlockingVfork(vfork_op_id), Permission::RW);
             resources.fyi("clone_vfork");
             resource_request(guest, resources).await;
         }

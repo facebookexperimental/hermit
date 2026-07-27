@@ -797,6 +797,10 @@ impl GlobalState {
         {
             let mut sched = self.sched.lock().unwrap();
 
+            if parent_is_kernel_blocked && self.cfg.sequentialize_threads {
+                sched.complete_vfork_registration(parent_dettid, child_dettid);
+            }
+
             // Don't fill in the request, as the child will do it:
             let _entry = sched
                 .next_turns

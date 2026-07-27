@@ -271,6 +271,9 @@ pub struct Scheduler {
     /// INVARIANT: Thread IDs in `blocked` are absent from `run_queue`.
     pub blocked: BlockedPool,
 
+    /// Kernel-blocked vfork parents and their children, once registered.
+    vfork_barriers: BTreeMap<DetTid, Option<DetTid>>,
+
     /// Ac table of "locks held": which action is using which resources.
     /// A given resource can be held by at most one action at a given time.
     #[allow(dead_code)]
@@ -891,6 +894,7 @@ impl Scheduler {
             bg_action_pool: Default::default(),
             committed_time: Default::default(),
             blocked: Default::default(),
+            vfork_barriers: Default::default(),
             resources: Default::default(),
             started_up: Default::default(),
             thread_tree: Default::default(),
@@ -1258,10 +1262,46 @@ impl Scheduler {
         &mut self,
         global_time: &Arc<Mutex<GlobalTime>>,
     ) -> Result<(), SkipTurn> {
+        self.step2a_wait_for_vfork_barrier()?;
         self.step2b_process_timed(); // May populate run_queue.
         self.step2c_process_io_blockers()?;
         self.step2d_handle_empty_queue(global_time)?;
         Ok(())
+    }
+
+    /// Keep scheduling inside an active vfork until the parent can continue.
+    /// Before child registration no guest may run; afterward step 3 admits only
+    /// the child. A failed clone reaches the parent continuation without a child.
+    fn step2a_wait_for_vfork_barrier(&mut self) -> Result<(), SkipTurn> {
+        let completed_parents: Vec<_> = self
+            .vfork_barriers
+            .keys()
+            .copied()
+            .filter(|parent| {
+                self.next_turns
+                    .get(parent)
+                    .and_then(|turn| turn.req.try_read())
+                    .is_some_and(|request| match request {
+                        Ok(resources) => resources.resources.keys().any(|resource| {
+                            matches!(resource, ResourceID::BlockedExternalContinue(_))
+                        }),
+                        Err(ThreadExited) => true,
+                    })
+            })
+            .collect();
+        for parent in completed_parents {
+            self.vfork_barriers.remove(&parent);
+        }
+
+        if self.vfork_barriers.values().all(Option::is_some) {
+            Ok(())
+        } else {
+            trace!(
+                "waiting for vfork child registration from parents {:?}",
+                self.vfork_barriers
+            );
+            Err(SkipTurn)
+        }
     }
 
     /// Check whether it is time for the *earliest* time-based event to execute INSTEAD of
@@ -1681,7 +1721,19 @@ impl Scheduler {
         if self.run_queue.is_empty() {
             None
         } else {
-            let next_dtid = self.run_queue.tentative_pop_next().expect("impossible");
+            let next_dtid = if self.vfork_barriers.is_empty() {
+                self.run_queue.tentative_pop_next().expect("impossible")
+            } else {
+                let child = self
+                    .vfork_barriers
+                    .values()
+                    .flatten()
+                    .find(|child| self.run_queue.contains_tid(**child))
+                    .copied()?;
+                self.run_queue
+                    .tentative_pop_tid(child)
+                    .expect("vfork child disappeared from run queue")
+            };
             let nextturn = self.next_turns.get(&next_dtid).unwrap_or_else(|| {
                 panic!(
                 "[sched-step3] internal error: dettid {} queued but missing entry in next_turns",
@@ -1814,7 +1866,10 @@ impl Scheduler {
             }
 
             // Thread BEGINS [potentially] blocking external IO
-            ResourceID::BlockingExternalIO(op_id) => {
+            ResourceID::BlockingExternalIO(op_id) | ResourceID::BlockingVfork(op_id) => {
+                if matches!(rid, ResourceID::BlockingVfork(_)) {
+                    assert!(self.vfork_barriers.insert(dettid, None).is_none());
+                }
                 info!(
                     "[scheduler] >>>>>>>\n\n COMMIT turn {}, BACKGROUND dettid {} (maybe-blocking)",
                     self.turn, dettid
@@ -1875,6 +1930,15 @@ impl Scheduler {
             ResourceID::SchedYield => Ok(()),
             ResourceID::InboundSignal(_) => Ok(()),
         }
+    }
+
+    // TODO-HUMAN-REVIEW(PR-868): Review the vfork registration scheduler barrier.
+    pub(crate) fn complete_vfork_registration(&mut self, parent: DetTid, child: DetTid) {
+        let registered_child = self
+            .vfork_barriers
+            .get_mut(&parent)
+            .unwrap_or_else(|| panic!("vfork child registered without a pending parent {parent}"));
+        assert!(registered_child.replace(child).is_none());
     }
 
     /// Inner helper for just the core priority changing.
@@ -2601,6 +2665,42 @@ mod test {
         assert_eq!(first_sequence, second_sequence);
         assert!(first_sequence.contains(&true));
         assert!(first_sequence.contains(&false));
+    }
+
+    #[test]
+    fn vfork_registration_barrier_blocks_until_child_registration() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let parent = DetTid::from_raw(3);
+        let child = DetTid::from_raw(5);
+        scheduler.vfork_barriers.insert(parent, None);
+
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+        scheduler.complete_vfork_registration(parent, child);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert_eq!(scheduler.vfork_barriers.get(&parent), Some(&Some(child)));
+    }
+
+    #[test]
+    fn vfork_registration_barrier_releases_failed_clone() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let parent = DetTid::from_raw(3);
+        let op_id = ExternalOpId::new(parent, 7);
+        let mut continuation = Resources::new(parent);
+        continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+
+        scheduler.vfork_barriers.insert(parent, None);
+        scheduler.next_turns.insert(
+            parent,
+            ThreadNextTurn {
+                dettid: parent,
+                child_tid_addr: 0,
+                req: Ivar::full(Ok(continuation)),
+                resp: Ivar::new(),
+            },
+        );
+
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert!(scheduler.vfork_barriers.is_empty());
     }
 
     #[test]

@@ -168,6 +168,7 @@ pub struct RunQueue {
     /// Used to lock the queue from other changes while we are tentatively popping from it, and also
     /// cache the result.
     tentative_selection: Option<DetTid>,
+    tentative_selection_is_exact: bool,
 
     /// A thread that explicitly yielded must not be selected again until some
     /// other runnable thread receives a turn.
@@ -210,6 +211,7 @@ impl RunQueue {
             last_front_turn: 0,
             sched_strategy: ss,
             tentative_selection: None,
+            tentative_selection_is_exact: false,
             yielded_skip: None,
             prng: Pcg64Mcg::seed_from_u64(seed),
             sticky_random_param: srp,
@@ -398,6 +400,7 @@ impl RunQueue {
     /// Postcondition: if return a `Some` value, the RunQueue enters a *locked* state where
     /// commit or undo must happen before any other mutations to the structure.
     pub fn tentative_pop_next(&mut self) -> Option<DetTid> {
+        assert!(!self.tentative_selection_is_exact);
         let skip = self
             .yielded_skip
             .filter(|tid| self.queue.len() > 1 && self.contains_tid(*tid));
@@ -454,6 +457,18 @@ impl RunQueue {
         self.tentative_selection
     }
 
+    // TODO-HUMAN-REVIEW(PR-868): Review exact run-queue selection for vfork barriers.
+    /// Begin a pop transaction for one specific queued thread, bypassing the
+    /// configured scheduling heuristic without changing the thread's priority.
+    pub fn tentative_pop_tid(&mut self, tid: DetTid) -> Option<DetTid> {
+        assert!(self.tentative_selection.is_none());
+        if self.contains_tid(tid) {
+            self.tentative_selection = Some(tid);
+            self.tentative_selection_is_exact = true;
+        }
+        self.tentative_selection
+    }
+
     /// Complete the tentative pop operation, readying the RunQueue for future operations.  This
     /// operation is only permissible when the queue is locked, i.e. the tentative_pop has
     /// previously returned `Some`.
@@ -463,33 +478,44 @@ impl RunQueue {
             .tentative_selection
             .take()
             .expect("tentative_pop to already returned a `Some`");
+        let exact = std::mem::take(&mut self.tentative_selection_is_exact);
 
-        let ret = match self.sched_strategy {
-            SchedHeuristic::None | SchedHeuristic::ConnectBind | SchedHeuristic::Random => {
-                let key = *self
-                    .queue
-                    .iter()
-                    .find(|(_k, v)| v.tid == tentative_selection)
-                    .map(|(k, _v)| k)
-                    .unwrap();
-                self.queue.remove(&key).map(|v| v.tid)
-            }
-            SchedHeuristic::StickyRandom => {
-                let tid = self.sticky_random_selection.unwrap();
-                // Probability of staying to our current thread on the next round.
-                // If the generated random number is smaller than what we set, we switch threads.
-                if self.random_range(0f64, 1f64) <= 1.0 - self.sticky_random_param {
-                    self.sticky_random_selection = None;
+        let ret = if exact {
+            let key = *self
+                .queue
+                .iter()
+                .find(|(_key, value)| value.tid == tentative_selection)
+                .map(|(key, _value)| key)
+                .unwrap();
+            self.queue.remove(&key).map(|value| value.tid)
+        } else {
+            match self.sched_strategy {
+                SchedHeuristic::None | SchedHeuristic::ConnectBind | SchedHeuristic::Random => {
+                    let key = *self
+                        .queue
+                        .iter()
+                        .find(|(_k, v)| v.tid == tentative_selection)
+                        .map(|(k, _v)| k)
+                        .unwrap();
+                    self.queue.remove(&key).map(|v| v.tid)
                 }
+                SchedHeuristic::StickyRandom => {
+                    let tid = self.sticky_random_selection.unwrap();
+                    // Probability of staying to our current thread on the next round.
+                    // If the generated random number is smaller than what we set, we switch threads.
+                    if self.random_range(0f64, 1f64) <= 1.0 - self.sticky_random_param {
+                        self.sticky_random_selection = None;
+                    }
 
-                let key = *self
-                    .queue
-                    .iter()
-                    .find(|(_k, v)| v.tid == tid)
-                    .map(|(k, _v)| k)
-                    .unwrap();
+                    let key = *self
+                        .queue
+                        .iter()
+                        .find(|(_k, v)| v.tid == tid)
+                        .map(|(k, _v)| k)
+                        .unwrap();
 
-                self.queue.remove(&key).map(|v| v.tid)
+                    self.queue.remove(&key).map(|v| v.tid)
+                }
             }
         }
         .expect("to always return a DetTid");
@@ -518,6 +544,7 @@ impl RunQueue {
     pub fn undo_tentative_pop(&mut self) {
         assert!(self.tentative_selection.is_some());
         self.tentative_selection = None;
+        self.tentative_selection_is_exact = false;
     }
 
     /// Return how many things have been queued.
@@ -606,6 +633,27 @@ mod tests {
                 queue.push_back(peer, LAST_PRIORITY);
                 assert_eq!(queue.tentative_pop_next(), Some(yielding), "{strategy:?}");
             }
+        }
+    }
+
+    #[test]
+    fn exact_selection_bypasses_priority_and_heuristic() {
+        for strategy in [
+            SchedHeuristic::None,
+            SchedHeuristic::ConnectBind,
+            SchedHeuristic::Random,
+            SchedHeuristic::StickyRandom,
+        ] {
+            let higher_priority = DetTid::from_raw(1);
+            let selected = DetTid::from_raw(2);
+            let mut queue = RunQueue::new(strategy, 0, 1.0);
+            queue.push_back(higher_priority, FIRST_PRIORITY);
+            queue.push_back(selected, LAST_PRIORITY);
+
+            assert_eq!(queue.tentative_pop_tid(selected), Some(selected));
+            assert_eq!(queue.commit_tentative_pop(), selected);
+            assert!(queue.contains_tid(higher_priority));
+            assert!(!queue.contains_tid(selected));
         }
     }
 
