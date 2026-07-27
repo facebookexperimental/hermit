@@ -15,10 +15,11 @@ on:
         type: boolean
         default: false
 
-# Preserve every self-hosted result: queued and running jobs must not be
-# cancelled when a newer commit arrives for the same pull request or branch.
+# Preserve every running self-hosted result. Main pushes use a SHA-specific
+# group because GitHub replaces an older pending run in a shared group even
+# when cancel-in-progress is false; pull request updates remain grouped.
 concurrency:
-  group: selfhosted-${{ github.event.pull_request.number || github.ref }}
+  group: selfhosted-${{ github.event_name == 'push' && github.sha || github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
 env:
