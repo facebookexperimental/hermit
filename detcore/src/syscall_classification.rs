@@ -431,6 +431,17 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // callers take their portable read/write fallback.
         | Sysno::copy_file_range
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-855): Strict-mode ENOSYS for zero-copy pipe
+        // transfers. Detcore does not model kernel pipe-buffer ownership or
+        // vmsplice page pinning. Fail-closed runs expose the portable fallback
+        // boundary; legacy non-strict runs retain record/replay pass-through.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::splice
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::tee
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::vmsplice
+        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-844): Deterministic EPERM for host-global
         // process accounting and cross-process memory access. Detcore does not
         // model host process-accounting state or translate/synchronize target
@@ -719,11 +730,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::shmctl
         | Sysno::shmdt
         | Sysno::shmget
-        | Sysno::splice
         | Sysno::syslog
-        | Sysno::tee
         | Sysno::ustat
-        | Sysno::vmsplice => SyscallClassification::Unsupported,
+        => SyscallClassification::Unsupported,
         // ===== END UNSUPPORTED SYSCALLS =====
 
         // `Sysno` is `#[non_exhaustive]` outside its crate. The const ABI guards above
@@ -1006,6 +1015,25 @@ pub(crate) const fn is_mount_introspection_enosys_syscall(sysno: Sysno) -> bool 
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-855): Strict zero-copy pipe fallback set.
+/// Linux zero-copy pipe transfers. Their observable blocking and buffer
+/// ownership depend on kernel pipe state, while `vmsplice` can additionally
+/// pin guest pages beyond the syscall boundary. Strict/fail-closed runs return
+/// `ENOSYS`, the documented signal for callers to use read/write fallbacks.
+/// Non-strict runs retain legacy record/replay forwarding for compatibility.
+pub(crate) const fn is_zero_copy_pipe_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        Sysno::splice
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::tee
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::vmsplice
+    )
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-848): Deterministic kernel-keyring refusal set.
 /// Kernel key-management syscalls that Detcore does not model. Keyring serials,
 /// quotas, permissions, contents, and `request_key` user-space upcalls expose
@@ -1074,7 +1102,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [253, 91, 29]);
+        assert_eq!(counts, [256, 91, 26]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1499,6 +1527,30 @@ mod tests {
                 is_mount_introspection_enosys_syscall(sysno),
                 refused.contains(&sysno),
                 "{sysno:?} mount-introspection helper membership is inconsistent"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_copy_pipe_syscalls_are_determinized_and_consistent() {
+        let syscalls = [Sysno::splice, Sysno::tee, Sysno::vmsplice];
+        for sysno in syscalls {
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Determinized,
+                "{sysno:?} should be Determinized"
+            );
+            assert!(
+                is_zero_copy_pipe_syscall(sysno),
+                "{sysno:?} should be in the zero-copy pipe set"
+            );
+        }
+
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            assert_eq!(
+                is_zero_copy_pipe_syscall(sysno),
+                syscalls.contains(&sysno),
+                "{sysno:?} zero-copy pipe helper membership is inconsistent"
             );
         }
     }

@@ -155,9 +155,9 @@ use crate::resources::ResourceID;
 use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
 use crate::syscall_classification::is_credential_identity_noop_syscall;
-use crate::syscall_classification::is_kernel_keyring_syscall;
-use crate::syscall_classification::is_host_kernel_probe_syscall;
 use crate::syscall_classification::is_futex2_enosys_syscall;
+use crate::syscall_classification::is_host_kernel_probe_syscall;
+use crate::syscall_classification::is_kernel_keyring_syscall;
 use crate::syscall_classification::is_landlock_sandbox_syscall;
 use crate::syscall_classification::is_mount_introspection_enosys_syscall;
 use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
@@ -168,6 +168,7 @@ use crate::syscall_classification::is_process_isolation_refused_syscall;
 use crate::syscall_classification::is_remap_file_pages_enosys_syscall;
 use crate::syscall_classification::is_unimplemented_enosys_syscall;
 use crate::syscall_classification::is_unsupported_async_ipc_syscall;
+use crate::syscall_classification::is_zero_copy_pipe_syscall;
 use crate::syscalls::helpers::with_guest_rip;
 use crate::syscalls::helpers::with_guest_time;
 use crate::tool_global::resource_request;
@@ -1381,6 +1382,19 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // request-key upcalls behind the portable CONFIG_KEYS-absent errno.
             SyscallClassification::Determinized if is_kernel_keyring_syscall(call.number()) => {
                 Err(Error::Errno(Errno::ENOSYS))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-855): Strict runs cannot expose unmodeled
+            // pipe-buffer ownership or vmsplice page pinning. Return ENOSYS so
+            // callers use read/write fallbacks, but preserve the legacy normal-
+            // mode pass-through used by the existing rr splice compatibility
+            // test.
+            SyscallClassification::Determinized if is_zero_copy_pipe_syscall(call.number()) => {
+                if config.panic_on_unsupported_syscalls {
+                    Err(Error::Errno(Errno::ENOSYS))
+                } else {
+                    self.passthrough(guest, call).await
+                }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#722): Deterministic EPERM for privileged
