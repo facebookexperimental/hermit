@@ -10,15 +10,15 @@ A `gap` must have a concrete implementation reason.
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
 | ptrace | 10/10 | 100% |
-| DBI | 6/10 | 60% |
+| DBI | 8/10 | 80% |
 | KVM | 9/10 | 90% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 6/10 number above is deliberately
+measures the backend's own Reverie suite. The 8/10 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
-Conflating the two would overstate Detcore parity because the current DBI client
-observes most syscalls but only rewrites `write` and CPUID; it does not yet use
-Detcore's scheduler, virtual clock, PID model, or random model.
+The current DBI path satisfies the virtual clock and virtual PID contracts. Its
+hosted pthread lifecycle case can still stall during native startup, and the
+threaded random-source fixture remains a gap.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
 nine pairs, including its bounded cooperative pthread lifecycle and
@@ -38,9 +38,9 @@ threads.
 | `file_read` | pass | pass | pass |
 | `pthread_lifecycle` | pass | gap | pass |
 | `cpuid_policy` | pass | pass | pass |
-| `virtual_clock` | pass | gap | pass |
+| `virtual_clock` | pass | pass | pass |
 | `random_sources` | pass | gap | gap |
-| `virtual_pid` | pass | gap | pass |
+| `virtual_pid` | pass | pass | pass |
 
 The authoritative reasons live in `matrix.tsv`, next to the status they
 justify. The runner executes each passing pair three times and checks exit
@@ -73,8 +73,9 @@ python3 tests/backend-parity/run_matrix.py --backend ptrace
 Run DBI with the pinned DynamoRIO runtime and client built by Cargo:
 
 ```bash
-cargo build -p hermit
-python3 tests/backend-parity/run_matrix.py --backend dbi --require-backend
+cargo build --release -p hermit
+python3 tests/backend-parity/run_matrix.py \
+    --hermit target/release/hermit --backend dbi --require-backend
 ```
 
 Run KVM on a host with read-write `/dev/kvm` access:

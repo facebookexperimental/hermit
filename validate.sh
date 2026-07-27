@@ -3028,7 +3028,8 @@ function run_hosted_only_suite {
     run_check "Portable command strict verification" cargo test -p hermit --test command_strict_verify -- --ignored --test-threads=1
     run_check "Portable ignored syscall regressions" cargo test -p hermit --test epoll_determinism --test rcx_canonicalization -- --ignored --test-threads=1
     run_check "rr suite source contract" cargo test -p hermit --test rr_suite rr_scratch_directories_are_fresh_and_cleaned -- --exact
-    run_check "DynamoRIO DBI backend parity" python3 tests/backend-parity/run_matrix.py --backend dbi --require-backend
+    run_check "Build release Hermit for DBI parity" cargo build --release -p hermit
+    run_check "DynamoRIO DBI backend parity" python3 tests/backend-parity/run_matrix.py --hermit target/release/hermit --backend dbi --require-backend
     run_check "Portable working-envelope levels" run_hosted_envelope_levels
 
     run_check_with_timeout 1200 "Strict compatibility envelope" run_strict_compatibility_envelope

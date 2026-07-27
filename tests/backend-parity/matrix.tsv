@@ -4,8 +4,8 @@ argument_forwarding	pass	pass	pass	-	-
 exit_zero	pass	pass	pass	-	-
 exit_status	pass	pass	pass	-	-
 file_read	pass	pass	pass	-	-
-pthread_lifecycle	pass	gap	pass	Hosted DynamoRIO sideline runtime exits before Detcore readiness for linked pthread guests	-
+pthread_lifecycle	pass	gap	pass	Hosted release DynamoRIO can stall during native pthread startup before Detcore readiness	-
 cpuid_policy	pass	pass	pass	-	-
-virtual_clock	pass	gap	pass	DBI observes syscalls but does not route clock calls through Detcore virtual time	-
+virtual_clock	pass	pass	pass	-	-
 random_sources	pass	gap	gap	DBI observes syscalls but does not route random sources through Detcore	KVM child-thread syscalls bypass Detcore callbacks and the personality repeats fixed random samples across workers
-virtual_pid	pass	gap	pass	DBI uses the host process identity and has no Detcore PID model	-
+virtual_pid	pass	pass	pass	-	-

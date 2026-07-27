@@ -30,6 +30,15 @@
                "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
     },
     {
+      "group": "build", "job": "dbi_release",
+      "desc": "Build release Hermit for DynamoRIO DBI",
+      "cmd": "cargo build --release -p hermit",
+      "deps": ["build.workspace"],
+      "timeout": 1200,
+      "hint": {"est_duration_s": 240, "rss_baseline_bytes": 5368709120,
+               "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
+    },
+    {
       "group": "lint", "job": "rustfmt",
       "desc": "Rustfmt (cargo fmt --all -- --check)",
       "cmd": "cargo fmt --all -- --check",
@@ -204,8 +213,8 @@
     {
       "group": "test", "job": "dbi_parity",
       "desc": "DynamoRIO DBI backend parity matrix",
-      "cmd": "python3 tests/backend-parity/run_matrix.py --backend dbi --require-backend",
-      "deps": ["build.workspace"],
+      "cmd": "python3 tests/backend-parity/run_matrix.py --hermit target/release/hermit --backend dbi --require-backend",
+      "deps": ["build.dbi_release"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
