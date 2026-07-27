@@ -170,6 +170,138 @@ fn timespec_from_duration(duration: Duration) -> Timespec {
     }
 }
 
+const SCM_TIMESTAMP_OLD: libc::c_int = 29;
+const SCM_TIMESTAMPNS_OLD: libc::c_int = 35;
+const SCM_TIMESTAMPING_OLD: libc::c_int = 37;
+const SCM_TIMESTAMP_NEW: libc::c_int = 63;
+const SCM_TIMESTAMPNS_NEW: libc::c_int = 64;
+const SCM_TIMESTAMPING_NEW: libc::c_int = 65;
+const MAX_CONTROL_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy)]
+enum SocketTimestampKind {
+    Timeval,
+    Timespec,
+    Timestamping,
+}
+
+fn cmsg_align(length: usize) -> usize {
+    let alignment = std::mem::size_of::<usize>();
+    (length + alignment - 1) & !(alignment - 1)
+}
+
+fn read_control_value<T: Copy>(bytes: &[u8]) -> Option<T> {
+    if bytes.len() < std::mem::size_of::<T>() {
+        return None;
+    }
+    // SAFETY: the length check guarantees a complete T, and read_unaligned
+    // permits the control buffer's byte alignment.
+    Some(unsafe { bytes.as_ptr().cast::<T>().read_unaligned() })
+}
+
+fn write_control_value<T: Copy>(bytes: &mut [u8], value: T) -> bool {
+    if bytes.len() < std::mem::size_of::<T>() {
+        return false;
+    }
+    // SAFETY: the length check guarantees room for T, and write_unaligned
+    // permits the control buffer's byte alignment.
+    unsafe { bytes.as_mut_ptr().cast::<T>().write_unaligned(value) };
+    true
+}
+
+fn socket_timestamp_messages(control: &[u8]) -> Vec<(usize, SocketTimestampKind)> {
+    let header_len = cmsg_align(std::mem::size_of::<libc::cmsghdr>());
+    let mut messages = Vec::new();
+    let mut offset = 0usize;
+
+    while let Some(header_bytes) = control.get(offset..) {
+        let Some(header) = read_control_value::<libc::cmsghdr>(header_bytes) else {
+            break;
+        };
+        if header.cmsg_len < header_len {
+            break;
+        }
+        let Some(end) = offset.checked_add(header.cmsg_len) else {
+            break;
+        };
+        if end > control.len() {
+            break;
+        }
+
+        if header.cmsg_level == libc::SOL_SOCKET {
+            let data_offset = offset + header_len;
+            let data_len = header.cmsg_len - header_len;
+            let kind = match header.cmsg_type {
+                SCM_TIMESTAMP_OLD | SCM_TIMESTAMP_NEW
+                    if data_len >= std::mem::size_of::<libc::timeval>() =>
+                {
+                    Some(SocketTimestampKind::Timeval)
+                }
+                SCM_TIMESTAMPNS_OLD | SCM_TIMESTAMPNS_NEW
+                    if data_len >= std::mem::size_of::<libc::timespec>() =>
+                {
+                    Some(SocketTimestampKind::Timespec)
+                }
+                SCM_TIMESTAMPING_OLD | SCM_TIMESTAMPING_NEW
+                    if data_len >= 3 * std::mem::size_of::<libc::timespec>() =>
+                {
+                    Some(SocketTimestampKind::Timestamping)
+                }
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                messages.push((data_offset, kind));
+            }
+        }
+
+        let step = cmsg_align(header.cmsg_len);
+        let Some(next) = offset.checked_add(step) else {
+            break;
+        };
+        if next <= offset {
+            break;
+        }
+        offset = next;
+    }
+    messages
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-901)
+fn canonicalize_socket_timestamps(control: &mut [u8], now: LogicalTime) -> usize {
+    let messages = socket_timestamp_messages(control);
+    let timespec = libc::timespec {
+        tv_sec: now.as_secs() as libc::time_t,
+        tv_nsec: now.subsec_nanos() as libc::c_long,
+    };
+    let timeval = libc::timeval {
+        tv_sec: timespec.tv_sec,
+        tv_usec: (timespec.tv_nsec / 1_000) as libc::suseconds_t,
+    };
+
+    for (offset, kind) in &messages {
+        match kind {
+            SocketTimestampKind::Timeval => {
+                let _ = write_control_value(&mut control[*offset..], timeval);
+            }
+            SocketTimestampKind::Timespec => {
+                let _ = write_control_value(&mut control[*offset..], timespec);
+            }
+            SocketTimestampKind::Timestamping => {
+                let size = std::mem::size_of::<libc::timespec>();
+                let _ = write_control_value(&mut control[*offset..], timespec);
+                let zero = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                let _ = write_control_value(&mut control[*offset + size..], zero);
+                let _ = write_control_value(&mut control[*offset + 2 * size..], zero);
+            }
+        }
+    }
+    messages.len()
+}
+
 fn sanitize_ppoll_signal_mask(mask: u64) -> u64 {
     let signal_bit = (reverie::PERF_EVENT_SIGNAL as usize) - 1;
     mask & !(1_u64 << signal_bit)
@@ -896,7 +1028,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.execute_nonblockable_fd_syscall(guest, call).await
     }
 
-    /// Handles all of: recvfrom, recvmsg, sendto, sendmsg, sendmmsg syscalls (MAYHANG)
+    /// Handles recvfrom, sendto, sendmsg, and sendmmsg syscalls (MAYHANG).
     pub async fn handle_sendrecv<
         G: Guest<Self>,
         C: SyscallInfo + NonblockableSyscall + Into<Syscall>,
@@ -906,6 +1038,38 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: C,
     ) -> Result<i64, Error> {
         self.execute_nonblockable_fd_syscall(guest, call).await
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-901)
+    /// Receive one message and replace host socket timestamps with logical time.
+    pub async fn handle_recvmsg<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Recvmsg,
+    ) -> Result<i64, Error> {
+        let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
+        let Some(message_address) = call.msg() else {
+            return Ok(result);
+        };
+        let message: libc::msghdr = guest.memory().read_value(message_address)?;
+        if message.msg_control.is_null() || message.msg_controllen == 0 {
+            return Ok(result);
+        }
+
+        let control_len = message.msg_controllen.min(MAX_CONTROL_BYTES);
+        let control_address: AddrMut<'_, u8> =
+            AddrMut::from_raw(message.msg_control as usize).ok_or(Errno::EFAULT)?;
+        let mut control = vec![0; control_len];
+        guest.memory().read_exact(control_address, &mut control)?;
+        if socket_timestamp_messages(&control).is_empty() {
+            return Ok(result);
+        }
+
+        let now = thread_observe_time(guest).await;
+        canonicalize_socket_timestamps(&mut control, now);
+        guest.memory().write_exact(control_address, &control)?;
+        Ok(result)
     }
 }
 
@@ -963,5 +1127,75 @@ mod tests {
             }),
             Err(Errno::EINVAL)
         );
+    }
+
+    #[test]
+    fn socket_timestamp_control_messages_use_logical_time() {
+        let header_len = cmsg_align(std::mem::size_of::<libc::cmsghdr>());
+        let timeval_len = std::mem::size_of::<libc::timeval>();
+        let timespec_len = std::mem::size_of::<libc::timespec>();
+        let first_len = header_len + timeval_len;
+        let second_offset = cmsg_align(first_len);
+        let second_len = header_len + timespec_len;
+        let third_offset = second_offset + cmsg_align(second_len);
+        let third_len = header_len + std::mem::size_of::<i32>();
+        let mut control = vec![0; third_offset + cmsg_align(third_len)];
+
+        assert!(write_control_value(
+            &mut control,
+            libc::cmsghdr {
+                cmsg_len: first_len,
+                cmsg_level: libc::SOL_SOCKET,
+                cmsg_type: SCM_TIMESTAMP_OLD,
+            }
+        ));
+        assert!(write_control_value(
+            &mut control[header_len..],
+            libc::timeval {
+                tv_sec: 99,
+                tv_usec: 88,
+            }
+        ));
+        assert!(write_control_value(
+            &mut control[second_offset..],
+            libc::cmsghdr {
+                cmsg_len: second_len,
+                cmsg_level: libc::SOL_SOCKET,
+                cmsg_type: SCM_TIMESTAMPNS_OLD,
+            }
+        ));
+        assert!(write_control_value(
+            &mut control[second_offset + header_len..],
+            libc::timespec {
+                tv_sec: 77,
+                tv_nsec: 66,
+            }
+        ));
+        assert!(write_control_value(
+            &mut control[third_offset..],
+            libc::cmsghdr {
+                cmsg_len: third_len,
+                cmsg_level: libc::SOL_SOCKET,
+                cmsg_type: libc::SCM_RIGHTS,
+            }
+        ));
+        assert!(write_control_value(
+            &mut control[third_offset + header_len..],
+            42_i32
+        ));
+        let unrelated_message = control[third_offset..].to_vec();
+
+        assert_eq!(
+            canonicalize_socket_timestamps(&mut control, LogicalTime::from_nanos(2_345_678_901)),
+            2
+        );
+        let timeval = read_control_value::<libc::timeval>(&control[header_len..]).unwrap();
+        assert_eq!(timeval.tv_sec, 2);
+        assert_eq!(timeval.tv_usec, 345_678);
+        let timespec =
+            read_control_value::<libc::timespec>(&control[second_offset + header_len..]).unwrap();
+        assert_eq!(timespec.tv_sec, 2);
+        assert_eq!(timespec.tv_nsec, 345_678_901);
+        assert_eq!(control[third_offset..], unrelated_message);
     }
 }
