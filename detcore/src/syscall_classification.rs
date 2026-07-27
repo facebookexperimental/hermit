@@ -425,6 +425,19 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::process_mrelease
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::map_shadow_stack
+        // TODO-HUMAN-REVIEW(PR-847): Deterministic ENOSYS for host-kernel
+        // feature and state probes that Detcore does not model. BPF operations
+        // depend on kernel configuration, capabilities, and security policy;
+        // cachestat exposes mutable host page-cache residency; and
+        // lsm_list_modules exposes the host's active security stack. A fixed
+        // ENOSYS presents a stable unavailable-feature boundary and lets callers
+        // take their normal fallback paths.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::bpf
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::cachestat
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::lsm_list_modules
         // ===== BATCH 51: fail-closed utility syscalls with no deterministic effect =====
         // These three previously fail-closed --strict (aborting real programs such
         // as chrt, ionice, and flock) even though none can change guest-visible
@@ -643,8 +656,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed unsupported classifications.
         Sysno::add_key
         | Sysno::adjtimex
-        | Sysno::bpf
-        | Sysno::cachestat
         | Sysno::clock_adjtime
         | Sysno::copy_file_range
         | Sysno::futex_requeue
@@ -655,7 +666,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::kcmp
         | Sysno::keyctl
         | Sysno::lsm_get_self_attr
-        | Sysno::lsm_list_modules
         | Sysno::lsm_set_self_attr
         | Sysno::mincore
         | Sysno::name_to_handle_at
@@ -928,6 +938,25 @@ pub(crate) const fn is_optional_memory_feature_syscall(sysno: Sysno) -> bool {
     matches!(
         sysno,
         Sysno::memfd_secret | Sysno::process_mrelease | Sysno::map_shadow_stack
+    )
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-847): Deterministic host-kernel probe refusal set.
+/// Host feature and mutable-state probes that Detcore deliberately presents as
+/// unavailable. Forwarding these would expose kernel BPF support and security
+/// policy, live page-cache residency, or the host LSM stack. A fixed `ENOSYS`
+/// is host-independent and gives feature-detecting callers their normal
+/// unavailable-kernel fallback.
+pub(crate) const fn is_host_kernel_probe_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        Sysno::bpf
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::cachestat
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::lsm_list_modules
     )
 }
 
@@ -1379,6 +1408,27 @@ mod tests {
                 is_optional_memory_feature_syscall(sysno),
                 refused.contains(&sysno),
                 "{sysno:?} optional-memory helper membership is inconsistent"
+            );
+        }
+    }
+
+    #[test]
+    fn host_kernel_probe_syscalls_are_determinized_and_consistent() {
+        let probes = [Sysno::bpf, Sysno::cachestat, Sysno::lsm_list_modules];
+        for sysno in probes {
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Determinized,
+                "{sysno:?} should use deterministic ENOSYS"
+            );
+            assert!(is_host_kernel_probe_syscall(sysno));
+        }
+
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            assert_eq!(
+                is_host_kernel_probe_syscall(sysno),
+                probes.contains(&sysno),
+                "{sysno:?} host-kernel probe membership is inconsistent"
             );
         }
     }

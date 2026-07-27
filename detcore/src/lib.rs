@@ -155,6 +155,7 @@ use crate::resources::ResourceID;
 use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
 use crate::syscall_classification::is_credential_identity_noop_syscall;
+use crate::syscall_classification::is_host_kernel_probe_syscall;
 use crate::syscall_classification::is_landlock_sandbox_syscall;
 use crate::syscall_classification::is_mount_introspection_enosys_syscall;
 use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
@@ -1473,6 +1474,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // (Syscall::Other) in the pinned Reverie, so dispatch on the Sysno
             // before the typed match below.
             SyscallClassification::Determinized if is_landlock_sandbox_syscall(call.number()) => {
+                Err(Error::Errno(Errno::ENOSYS))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-847): Refuse unmodeled host-kernel probes
+            // with a fixed ENOSYS so guest behavior does not depend on BPF/LSM
+            // configuration or mutable page-cache state.
+            SyscallClassification::Determinized if is_host_kernel_probe_syscall(call.number()) => {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
