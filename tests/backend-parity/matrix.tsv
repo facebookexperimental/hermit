@@ -8,6 +8,7 @@ file_mutation	pass	pass	pass	-	-
 file_metadata	pass	pass	gap	-	KVM personality does not implement extended-attribute syscalls, so setxattr returns ENOSYS
 io_uring_fallback	pass	pass	pass	-	-
 process_vm_readv_refusal	pass	pass	pass	-	-
+process_vm_writev_refusal	pass	pass	pass	-	-
 executable_mmap	pass	pass	pass	-	-
 memory_advice	pass	pass	pass	-	-
 heap_growth	pass	pass	pass	-	-
