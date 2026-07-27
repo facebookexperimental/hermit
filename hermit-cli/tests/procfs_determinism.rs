@@ -215,3 +215,48 @@ fn proc_pressure_uses_virtual_zero_values() {
         });
     }
 }
+
+#[test]
+fn proc_schedstat_uses_virtual_zero_values() {
+    assert_deterministic("/proc/schedstat", |contents| {
+        let text = std::str::from_utf8(contents).expect("schedstat should be UTF-8");
+        let mut saw_timestamp = false;
+        let mut saw_cpu = false;
+        let mut saw_domain = false;
+
+        for line in text.lines() {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            match fields.first().copied() {
+                Some("version") => {
+                    assert_eq!(fields.len(), 2);
+                    fields[1].parse::<u32>().expect("invalid schedstat version");
+                }
+                Some("timestamp") => {
+                    assert_eq!(fields, ["timestamp", "0"]);
+                    saw_timestamp = true;
+                }
+                Some(label) if is_numbered_label(label, "cpu") => {
+                    assert!(fields[1..].iter().all(|field| *field == "0"));
+                    saw_cpu = true;
+                }
+                Some(label) if is_numbered_label(label, "domain") => {
+                    assert!(fields.len() >= 3);
+                    assert!(fields[3..].iter().all(|field| *field == "0"));
+                    saw_domain = true;
+                }
+                Some(label) => panic!("unexpected schedstat row {label}: {line}"),
+                None => {}
+            }
+        }
+
+        assert!(saw_timestamp);
+        assert!(saw_cpu);
+        assert!(saw_domain);
+    });
+}
+
+fn is_numbered_label(label: &str, prefix: &str) -> bool {
+    label.strip_prefix(prefix).is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
