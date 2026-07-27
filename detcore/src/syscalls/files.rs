@@ -13,6 +13,7 @@ use std::net::Ipv6Addr;
 use std::path::PathBuf;
 
 use nix::fcntl::OFlag;
+use rand::RngExt as _;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
@@ -395,6 +396,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
+        let needs_random_uuid = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_random_uuid())?;
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-955): Review deterministic kernel UUID generation.
+        let random_uuid =
+            needs_random_uuid.then(|| guest.thread_state_mut().thread_prng().random::<[u8; 16]>());
         guest.thread_state().with_detfd(call.fd(), |detfd| {
             detfd.initialize_procfs(
                 contents.clone(),
@@ -406,6 +414,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     virtual_ppid,
                     virtual_pty_count,
                     fdinfo_identity,
+                    random_uuid,
                 },
             );
         })?;

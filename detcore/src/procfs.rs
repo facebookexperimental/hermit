@@ -305,6 +305,7 @@ pub(crate) struct ProcfsSnapshotContext {
     pub(crate) virtual_ppid: i32,
     pub(crate) virtual_pty_count: usize,
     pub(crate) fdinfo_identity: Option<(u64, i32, u64)>,
+    pub(crate) random_uuid: Option<[u8; 16]>,
 }
 
 impl ProcfsFile {
@@ -489,8 +490,16 @@ impl ProcfsFile {
         self.bound_thread_identity = Some((tgid, tid, ppid));
     }
 
+    /// Returns true when this snapshot consumes deterministic random bytes.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-955): Review deterministic kernel UUID generation.
+    pub(crate) fn needs_random_uuid(&self) -> bool {
+        self.kind == ProcfsKind::RandomUuid
+    }
+
     /// Normalizes and stores a complete snapshot captured from the kernel.
     // TODO-HUMAN-REVIEW(PR-723): Review procfs snapshot identity normalization.
+    // TODO-HUMAN-REVIEW(PR-955): Review deterministic UUID snapshot input.
     pub(crate) fn initialize(&mut self, contents: Vec<u8>, context: ProcfsSnapshotContext) {
         let ProcfsSnapshotContext {
             virtual_uptime_seconds,
@@ -500,6 +509,7 @@ impl ProcfsFile {
             virtual_ppid,
             virtual_pty_count,
             fdinfo_identity,
+            random_uuid,
         } = context;
         self.contents = Some(match self.kind {
             ProcfsKind::Stat => sanitize_stat(&contents, virtual_pid, virtual_ppid),
@@ -572,9 +582,10 @@ impl ProcfsFile {
             ProcfsKind::InterruptCounters => sanitize_interrupt_counters(&contents),
             ProcfsKind::Modules => sanitize_modules(&contents),
             ProcfsKind::Mountinfo => sanitize_mountinfo(&contents),
-            ProcfsKind::RandomUuid => {
-                fixed_snapshot(&contents, b"00000000-0000-4000-8000-000000000000\n")
-            }
+            ProcfsKind::RandomUuid => sanitize_random_uuid(
+                &contents,
+                random_uuid.expect("random UUID snapshot omitted deterministic bytes"),
+            ),
         });
     }
 
@@ -788,6 +799,16 @@ fn sanitize_status(
     const CPUS_ALLOWED_LIST: &[u8] = b"Cpus_allowed_list:";
     const VOLUNTARY: &[u8] = b"voluntary_ctxt_switches:";
     const NONVOLUNTARY: &[u8] = b"nonvoluntary_ctxt_switches:";
+    const MEMORY_ACCOUNTING_FIELDS: &[&[u8]] = &[
+        b"VmHWM",
+        b"VmRSS",
+        b"RssAnon",
+        b"RssFile",
+        b"RssShmem",
+        b"VmPTE",
+        b"VmSwap",
+        b"HugetlbPages",
+    ];
 
     let mut normalized = Vec::with_capacity(contents.len());
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
@@ -826,6 +847,14 @@ fn sanitize_status(
         } else if body.starts_with(NONVOLUNTARY) {
             normalized.extend_from_slice(NONVOLUNTARY);
             normalized.extend_from_slice(b"\t0");
+        } else if body
+            .split(|byte| *byte == b':')
+            .next()
+            .is_some_and(|label| MEMORY_ACCOUNTING_FIELDS.contains(&label))
+        {
+            let label = body.split(|byte| *byte == b':').next().unwrap_or_default();
+            normalized.extend_from_slice(label);
+            normalized.extend_from_slice(b":\t0 kB");
         } else {
             normalized.extend_from_slice(body);
         }
@@ -1751,6 +1780,10 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
         "se.slice",
         "ext.enabled",
         "numa_preferred_nid",
+        "uclamp.min",
+        "uclamp.max",
+        "effective uclamp.min",
+        "effective uclamp.max",
     ];
     const UCLAMP_FIELDS: &[(&str, &str)] = &[
         ("uclamp.min", "0"),
@@ -1866,6 +1899,11 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
                 return Vec::new();
             }
             None
+        } else if right.trim().parse::<u128>().is_ok() {
+            // New kernels may append observational scheduler counters. Keep
+            // forward-compatible numeric telemetry deterministic without
+            // accepting malformed or negative unknown fields.
+            Some("0")
         } else {
             return Vec::new();
         };
@@ -2394,12 +2432,49 @@ fn sanitize_mountinfo(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
-fn fixed_snapshot(contents: &[u8], replacement: &[u8]) -> Vec<u8> {
-    if contents.is_empty() {
-        Vec::new()
-    } else {
-        replacement.to_vec()
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-955): Review deterministic kernel UUID generation.
+fn sanitize_random_uuid(contents: &[u8], mut random: [u8; 16]) -> Vec<u8> {
+    const HYPHENS: &[usize] = &[8, 13, 18, 23];
+
+    if contents.len() != 37 || contents[36] != b'\n' {
+        return contents.to_vec();
     }
+    for (index, byte) in contents[..36].iter().copied().enumerate() {
+        if HYPHENS.contains(&index) {
+            if byte != b'-' {
+                return contents.to_vec();
+            }
+        } else if !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte) {
+            return contents.to_vec();
+        }
+    }
+    if contents[14] != b'4' || !matches!(contents[19], b'8' | b'9' | b'a' | b'b') {
+        return contents.to_vec();
+    }
+
+    random[6] = (random[6] & 0x0f) | 0x40;
+    random[8] = (random[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}\n",
+        random[0],
+        random[1],
+        random[2],
+        random[3],
+        random[4],
+        random[5],
+        random[6],
+        random[7],
+        random[8],
+        random[9],
+        random[10],
+        random[11],
+        random[12],
+        random[13],
+        random[14],
+        random[15]
+    )
+    .into_bytes()
 }
 
 fn numbered_label(label: &str, prefix: &str) -> bool {
@@ -3156,15 +3231,26 @@ mod tests {
     }
 
     #[test]
-    fn random_uuid_is_synthetic() {
+    fn random_uuid_uses_deterministic_v4_bytes_or_fails_open() {
+        let kernel_uuid = b"24e63f35-232a-43e2-8799-b151e9833f45\n";
         assert_eq!(
-            fixed_snapshot(
-                b"24e63f35-232a-43e2-8799-b151e9833f45\n",
-                b"00000000-0000-4000-8000-000000000000\n"
-            ),
+            sanitize_random_uuid(kernel_uuid, [0; 16]),
             b"00000000-0000-4000-8000-000000000000\n"
         );
-        assert!(fixed_snapshot(b"", b"0\n").is_empty());
+        assert_eq!(
+            sanitize_random_uuid(kernel_uuid, [0xff; 16]),
+            b"ffffffff-ffff-4fff-bfff-ffffffffffff\n"
+        );
+
+        for malformed in [
+            b"24e63f35-232a-1e32-8799-b151e9833f45\n".as_slice(),
+            b"24e63f35-232a-4e32-c799-b151e9833f45\n",
+            b"24E63F35-232A-4E32-8799-B151E9833F45\n",
+            b"24e63f35-232a-4e32-8799-b151e9833f45",
+            b"not-a-uuid\n",
+        ] {
+            assert_eq!(sanitize_random_uuid(malformed, [0; 16]), malformed);
+        }
     }
 
     #[test]
@@ -3552,10 +3638,10 @@ mod tests {
     // TODO-HUMAN-REVIEW(#553)
     #[test]
     fn status_normalizes_affinity_and_context_switches() {
-        let input = b"Name:\tcat\nTgid:\t1234\nPid:\t1234\nPPid:\t1200\nTracerPid:\t0\nNStgid:\t1234\nNSpid:\t1234\nNSpgid:\t1200\nNSsid:\t1190\nSigQ:\t426/2042342\nCpus_allowed:\tffffffff,ffffffff\nCpus_allowed_list:\t0-63\nvoluntary_ctxt_switches:\t120\nnonvoluntary_ctxt_switches:\t3\n";
+        let input = b"Name:\tcat\nTgid:\t1234\nPid:\t1234\nPPid:\t1200\nTracerPid:\t0\nNStgid:\t1234\nNSpid:\t1234\nNSpgid:\t1200\nNSsid:\t1190\nSigQ:\t426/2042342\nVmHWM:\t1572 kB\nVmRSS:\t1568 kB\nRssFile:\t1452 kB\nCpus_allowed:\tffffffff,ffffffff\nCpus_allowed_list:\t0-63\nvoluntary_ctxt_switches:\t120\nnonvoluntary_ctxt_switches:\t3\n";
         assert_eq!(
             sanitize_status(input, 3, 3, 1),
-            b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t1\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/0\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
+            b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t1\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/0\nVmHWM:\t0 kB\nVmRSS:\t0 kB\nRssFile:\t0 kB\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
         );
     }
 
@@ -3989,6 +4075,8 @@ uclamp.max : 768\n\
 effective uclamp.min : 256\n\
 effective uclamp.max : 512\n\
 policy : 0\n\
+uclamp.max : 1024\n\
+new.kernel.counter : 55\n\
 current_node=7, numa_group_id=91\n\
 numa_faults node=7 task_private=8 task_shared=9 group_private=10 group_shared=11\n";
 
@@ -4005,6 +4093,8 @@ uclamp.max : 1024\n\
 effective uclamp.min : 0\n\
 effective uclamp.max : 1024\n\
 policy : 0\n\
+uclamp.max : 1024\n\
+new.kernel.counter : 0\n\
 current_node=0, numa_group_id=0\n\
 numa_faults node=0 task_private=0 task_shared=0 group_private=0 group_shared=0\n"
         );

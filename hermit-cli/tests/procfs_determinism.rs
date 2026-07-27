@@ -403,7 +403,19 @@ fn proc_self_mountinfo_hides_private_temp_roots() {
 #[test]
 fn proc_random_uuid_is_deterministic() {
     assert_deterministic("/proc/sys/kernel/random/uuid", |contents| {
-        assert_eq!(contents, b"00000000-0000-4000-8000-000000000000\n");
+        let uuid = contents
+            .strip_suffix(b"\n")
+            .expect("random UUID should end with a newline");
+        assert_eq!(uuid.len(), 36);
+        assert_eq!(uuid[14], b'4');
+        assert!(matches!(uuid[19], b'8' | b'9' | b'a' | b'b'));
+        for (index, byte) in uuid.iter().copied().enumerate() {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                assert_eq!(byte, b'-');
+            } else {
+                assert!(byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+            }
+        }
     });
 }
 
