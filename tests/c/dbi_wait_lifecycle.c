@@ -16,16 +16,16 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+static void fail(const char *message) {
+  fprintf(stderr, "%s: %s\n", message, strerror(errno));
+  exit(1);
+}
+
 static volatile sig_atomic_t sigchld_count;
 
 static void on_sigchld(int signal_number) {
   (void)signal_number;
   ++sigchld_count;
-}
-
-static void fail(const char *message) {
-  fprintf(stderr, "%s: %s\n", message, strerror(errno));
-  exit(1);
 }
 
 int main(void) {
@@ -67,14 +67,15 @@ int main(void) {
     return 4;
   if (info.si_utime != 0 || info.si_stime != 0)
     return 5;
-  if (sigchld_count != 2)
+  // AUTONOMOUS-BOT-IMPLEMENTED
+  // TODO-HUMAN-REVIEW(#878): Confirm the portable coalesced-SIGCHLD contract.
+  if (sigchld_count < 1 || sigchld_count > 2)
     return 6;
-
   if (waitpid(first, NULL, WNOHANG) != -1 || errno != ECHILD)
     return 7;
   if (waitpid(second, NULL, WNOHANG) != -1 || errno != ECHILD)
     return 8;
 
-  printf("wait4=7 waitid=9 sigchld=2 reaped=2 cpu=zero\n");
+  printf("wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n");
   return 0;
 }

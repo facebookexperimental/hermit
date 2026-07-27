@@ -4,6 +4,7 @@ argument_forwarding	pass	pass	pass	-	-
 exit_zero	pass	pass	pass	-	-
 exit_status	pass	pass	pass	-	-
 file_read	pass	pass	pass	-	-
+executable_mmap	pass	pass	pass	-	-
 pthread_lifecycle	pass	gap	pass	Hosted release DynamoRIO can stall during native pthread startup before Detcore readiness	-
 process_wait_lifecycle	pass	pass	gap	-	KVM child processes bypass per-child Detcore callbacks, so deterministic wait accounting is not enforced
 cpuid_policy	pass	pass	pass	-	-

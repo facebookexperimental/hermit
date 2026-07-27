@@ -9,22 +9,25 @@ A `gap` must have a concrete implementation reason.
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 11/11 | 100% |
-| DBI | 10/11 | 91% |
-| KVM | 9/11 | 82% |
+| ptrace | 12/12 | 100% |
+| DBI | 11/12 | 92% |
+| KVM | 10/12 | 83% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 10/11 number above is deliberately
+measures the backend's own Reverie suite. The 11/12 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
-random-source, and process wait lifecycle contracts. The wait contract covers
-deterministic `wait4`/`waitid` results, SIGCHLD delivery, complete reaping, and
-zeroed child CPU accounting. Hosted pthread startup can still stall during
-native startup and remains the sole DBI gap; child-thread random sources remain
-covered by that lifecycle gap rather than the random-source pair.
+random-source, process wait lifecycle, and application executable-memory
+contracts. The wait contract covers deterministic `wait4`/`waitid` results,
+at least one SIGCHLD handler delivery (standard signals may coalesce), complete
+reaping, and zeroed child CPU accounting. The executable-memory contract writes
+machine code into an anonymous mapping, transitions it from writable to
+executable, and calls it. Hosted pthread startup can still stall during native
+startup and remains the sole DBI gap; child-thread random sources remain covered
+by that lifecycle gap rather than the random-source pair.
 
-KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
-nine pairs, including its bounded cooperative pthread lifecycle and
+KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes ten
+pairs, including its bounded cooperative pthread lifecycle, executable memory,
 deterministic clock, PID, and synthetic CPUID probes. Its remaining gaps are
 the threaded random-source fixture, where child-thread syscalls bypass
 per-child Detcore callbacks and the KVM personality repeats fixed random
@@ -40,6 +43,7 @@ processes do not run through per-child Detcore callbacks.
 | `exit_zero` | pass | pass | pass |
 | `exit_status` | pass | pass | pass |
 | `file_read` | pass | pass | pass |
+| `executable_mmap` | pass | pass | pass |
 | `pthread_lifecycle` | pass | gap | pass |
 | `process_wait_lifecycle` | pass | pass | gap |
 | `cpuid_policy` | pass | pass | pass |

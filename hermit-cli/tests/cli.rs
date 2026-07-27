@@ -707,7 +707,7 @@ fn run_dbi_verifies_process_wait_lifecycle() {
     assert_success(&output, &args);
     assert_eq!(
         stdout(&output),
-        "wait4=7 waitid=9 sigchld=2 reaped=2 cpu=zero\n"
+        "wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n"
     );
     assert!(
         stderr(&output).contains(":: Success: deterministic. Determinism verified."),

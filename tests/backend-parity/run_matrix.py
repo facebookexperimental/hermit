@@ -104,6 +104,7 @@ class Fixtures:
                 REPOSITORY / "tests/c/dbi_wait_lifecycle.c",
                 ("-D_GNU_SOURCE",),
             ),
+            "mmap_exec": (REPOSITORY / "tests/c/dbi_mmap_exec.c", ()),
             "cpuid_probe": (local / "cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
@@ -133,6 +134,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
         "exit_zero": (["/bin/true"], 0, b""),
         "exit_status": (["/bin/sh", "-c", "exit 23"], 23, b""),
         "file_read": (["/bin/cat", str(fixture_input)], 0, fixture_input.read_bytes()),
+        "executable_mmap": (
+            [str(fixtures.binary("mmap_exec"))],
+            0,
+            b"dbi-mmap-exec-ok\n",
+        ),
         "pthread_lifecycle": (
             [str(fixtures.binary("pthread_lifecycle"))],
             0,
@@ -141,7 +147,7 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
         "process_wait_lifecycle": (
             [str(fixtures.binary("process_wait_lifecycle"))],
             0,
-            b"wait4=7 waitid=9 sigchld=2 reaped=2 cpu=zero\n",
+            b"wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n",
         ),
         "cpuid_policy": (
             [str(fixtures.binary("cpuid_probe"))],
