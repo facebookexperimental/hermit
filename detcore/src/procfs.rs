@@ -27,6 +27,7 @@ enum ProcfsKind {
     BlockStat,
     ScalingCurFreq,
     Sockstat,
+    AioNr,
     NumaMaps,
     SmapsRollup,
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -146,6 +147,9 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-918): Review host-global dentry counter normalization.
             "/proc/sys/fs/dentry-state" => ProcfsKind::DentryState,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-933): Review host-global AIO count normalization.
+            "/proc/sys/fs/aio-nr" => ProcfsKind::AioNr,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -252,6 +256,7 @@ impl ProcfsFile {
             ProcfsKind::BlockStat => sanitize_block_stat(&contents),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::AioNr => sanitize_aio_nr(&contents),
             ProcfsKind::NumaMaps => sanitize_numa_maps(&contents),
             ProcfsKind::SmapsRollup => sanitize_smaps_rollup(&contents),
             ProcfsKind::ArchStatus => sanitize_arch_status(&contents),
@@ -757,6 +762,16 @@ fn sanitize_swaps(contents: &[u8]) -> Vec<u8> {
         }
     }
     normalized
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-933): Review the /proc/sys/fs/aio-nr policy.
+fn sanitize_aio_nr(contents: &[u8]) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        b"0\n".to_vec()
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1328,6 +1343,12 @@ mod tests {
             ProcfsKind::Sockstat
         );
         assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/sys/fs/aio-nr"))
+                .unwrap()
+                .kind,
+            ProcfsKind::AioNr
+        );
+        assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/self/numa_maps"))
                 .unwrap()
                 .kind,
@@ -1771,6 +1792,14 @@ malformed buddy row\n"
             b"0\t0\t45\t0\t0\t0\n"
         );
         assert!(sanitize_dentry_state(b"").is_empty());
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-933): Review AIO count fixture coverage.
+    #[test]
+    fn aio_nr_hides_host_global_reservations() {
+        assert_eq!(sanitize_aio_nr(b"3040\n"), b"0\n");
+        assert!(sanitize_aio_nr(b"").is_empty());
     }
 
     #[test]
