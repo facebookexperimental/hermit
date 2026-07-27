@@ -1372,6 +1372,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // TODO-HUMAN-REVIEW(PR-836): Host filesystem and mount
             // introspection are outside the deterministic model. Return the
             // portable feature-absence errno so callers use /proc fallbacks.
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-859): Extend this boundary to obsolete ustat
+            // host-filesystem capacity counters.
             SyscallClassification::Determinized
                 if is_mount_introspection_enosys_syscall(call.number()) =>
             {
@@ -1468,6 +1471,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // record/replay (mirrors the io_uring refusal). Untyped
             // (Syscall::Other) in the pinned Reverie, so dispatch on the Sysno
             // before the typed match below.
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-859): Include System V semaphore and shared-
+            // memory objects in the existing CONFIG_SYSVIPC refusal boundary.
             SyscallClassification::Determinized
                 if is_unsupported_async_ipc_syscall(call.number()) =>
             {

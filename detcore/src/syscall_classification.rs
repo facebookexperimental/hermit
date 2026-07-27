@@ -337,6 +337,10 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::listmount
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-859): Deterministic ENOSYS for obsolete ustat
+        // host-filesystem capacity and free-space introspection.
+        | Sysno::ustat
+        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#731): Deterministic ENOSYS for the
         // asynchronous and message-passing I/O and IPC interfaces Detcore does
         // not model. Linux native AIO (io_setup/io_destroy/io_submit/io_cancel/
@@ -352,10 +356,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // identical across --verify and record/replay. This mirrors the
         // existing io_uring ENOSYS refusal. These are untyped (Syscall::Other)
         // in the pinned Reverie, so the dispatcher matches on the Sysno before
-        // the typed match below. System V semaphores (sem*) and shared memory
-        // (shm*) are deliberately left unclassified: they are common
-        // intra-container synchronization/sharing primitives whose refusal would
-        // be a real capability regression and needs a dedicated decision.
+        // the typed match below.
         | Sysno::io_setup
         | Sysno::io_destroy
         | Sysno::io_submit
@@ -376,6 +377,26 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(PR-882): Review the deterministic
         // feature-absence boundary for legacy nonlinear memory mappings.
         | Sysno::remap_file_pages
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-859): Extend the System V ENOSYS boundary to
+        // semaphore and shared-memory objects whose host IDs and state are not
+        // represented in Detcore.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::semctl
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::semget
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::semop
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::semtimedop
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::shmat
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::shmctl
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::shmdt
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::shmget
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#827): Deterministic ENOSYS for the Landlock
         // unprivileged-sandbox syscalls (landlock_create_ruleset,
@@ -730,15 +751,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::pwritev2
         | Sysno::readv
         | Sysno::restart_syscall
-        | Sysno::semctl
-        | Sysno::semget
-        | Sysno::semop
-        | Sysno::semtimedop
-        | Sysno::shmat
-        | Sysno::shmctl
-        | Sysno::shmdt
-        | Sysno::shmget
-        | Sysno::ustat
         => SyscallClassification::Unsupported,
         // ===== END UNSUPPORTED SYSCALLS =====
 
@@ -893,20 +905,21 @@ pub(crate) const fn is_credential_identity_noop_syscall(sysno: Sysno) -> bool {
 // TODO-HUMAN-REVIEW(#731): Deterministic ENOSYS refusal set.
 /// Asynchronous and message-passing I/O and IPC interfaces Detcore does not
 /// model: Linux native AIO (`io_setup`/`io_destroy`/`io_submit`/`io_cancel`/
-/// `io_getevents`/`io_pgetevents`), POSIX message queues (`mq_*`), and System V
-/// message queues (`msg*`). AIO completion is kernel-driven and lives outside
-/// the guest's logical time, and the message-queue families operate on global,
-/// key/name-addressed kernel objects that persist across runs and are shared
-/// with the whole host. Forwarding them (the legacy pass-through) is
-/// nondeterministic and a container-isolation hole, so Detcore refuses them with
-/// a fixed `ENOSYS`: exactly the errno a kernel built without AIO,
+/// `io_getevents`/`io_pgetevents`), POSIX message queues (`mq_*`), and all three
+/// System V IPC families (`msg*`, `sem*`, and `shm*`). AIO completion is
+/// kernel-driven and lives outside the guest's logical time, and the IPC
+/// families operate on global, key-addressed kernel objects that persist across
+/// runs and are shared with the whole host. Forwarding them (the legacy
+/// pass-through) is nondeterministic and a container-isolation hole, so Detcore
+/// refuses them with a fixed `ENOSYS`: exactly the errno a kernel built without AIO,
 /// `CONFIG_POSIX_MQUEUE`, or `CONFIG_SYSVIPC` returns. The result is never
 /// forwarded to the host and is bitwise-identical across `--verify` and
-/// record/replay, mirroring the existing `io_uring` ENOSYS refusal. System V
-/// semaphores and shared memory are deliberately excluded (common
-/// intra-container primitives that need a dedicated decision). These are untyped
-/// (`Syscall::Other`) in the pinned Reverie, so the dispatcher matches on the
-/// `Sysno` before the typed match.
+/// record/replay, mirroring the existing `io_uring` ENOSYS refusal. These are
+/// untyped (`Syscall::Other`) in the pinned Reverie, so the dispatcher matches
+/// on the `Sysno` before the typed match.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-859): Review the System V semaphore/shared-memory
+// capability boundary added to the existing deterministic IPC refusal set.
 pub(crate) const fn is_unsupported_async_ipc_syscall(sysno: Sysno) -> bool {
     matches!(
         sysno,
@@ -926,6 +939,22 @@ pub(crate) const fn is_unsupported_async_ipc_syscall(sysno: Sysno) -> bool {
             | Sysno::msgsnd
             | Sysno::msgrcv
             | Sysno::msgctl
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::semctl
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::semget
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::semop
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::semtimedop
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::shmat
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::shmctl
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::shmdt
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::shmget
     )
 }
 
@@ -1011,14 +1040,22 @@ pub(crate) const fn is_privileged_observation_refused_syscall(sysno: Sysno) -> b
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-836): Deterministic ENOSYS refusal set.
-/// Host filesystem and mount-introspection syscalls. `sysfs` reads the
-/// host's filesystem-type table; `statmount` and `listmount` read mount IDs
-/// and topology from the active mount namespace. Neither source is part of a
-/// deterministic guest's modeled state, so forwarding them would expose
-/// changing host data. A fixed `ENOSYS` matches kernels that lack these APIs
-/// and directs feature-probing callers to their portable `/proc` fallbacks.
+/// Host filesystem and mount-introspection syscalls. `sysfs` reads the host's
+/// filesystem-type table, `statmount` and `listmount` read mount IDs and
+/// topology, and obsolete `ustat` reads live capacity counters by host device
+/// number. None of these sources is part of a deterministic guest's modeled
+/// state, so forwarding them would expose changing host data. A fixed `ENOSYS`
+/// directs callers to portable `/proc` or `statfs` fallbacks.
 pub(crate) const fn is_mount_introspection_enosys_syscall(sysno: Sysno) -> bool {
-    matches!(sysno, Sysno::sysfs | Sysno::statmount | Sysno::listmount)
+    matches!(
+        sysno,
+        Sysno::sysfs
+            | Sysno::statmount
+            | Sysno::listmount
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-859): Obsolete host filesystem statistics.
+            | Sysno::ustat
+    )
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1109,7 +1146,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [259, 91, 23]);
+        assert_eq!(counts, [268, 91, 14]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1344,7 +1381,7 @@ mod tests {
         }
         // Batch 7: asynchronous and message-passing I/O and IPC interfaces
         // Detcore does not model are refused with a deterministic ENOSYS (Linux
-        // native AIO, POSIX message queues, System V message queues); see
+        // native AIO, POSIX message queues, and all System V IPC families); see
         // is_unsupported_async_ipc_syscall.
         for sysno in [
             Sysno::io_setup,
@@ -1363,15 +1400,17 @@ mod tests {
             Sysno::msgsnd,
             Sysno::msgrcv,
             Sysno::msgctl,
+            Sysno::semctl,
+            Sysno::semget,
+            Sysno::semop,
+            Sysno::semtimedop,
+            Sysno::shmat,
+            Sysno::shmctl,
+            Sysno::shmdt,
+            Sysno::shmget,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
             assert!(is_unsupported_async_ipc_syscall(sysno));
-        }
-        // System V semaphores and shared memory are deliberately still
-        // unsupported (intra-container primitives pending a dedicated decision).
-        for sysno in [Sysno::semget, Sysno::semop, Sysno::shmget, Sysno::shmat] {
-            assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
-            assert!(!is_unsupported_async_ipc_syscall(sysno));
         }
     }
 
@@ -1523,7 +1562,12 @@ mod tests {
 
     #[test]
     fn mount_introspection_syscalls_are_determinized_and_consistent() {
-        let refused = [Sysno::sysfs, Sysno::statmount, Sysno::listmount];
+        let refused = [
+            Sysno::sysfs,
+            Sysno::statmount,
+            Sysno::listmount,
+            Sysno::ustat,
+        ];
         for sysno in refused {
             assert_eq!(
                 classify_syscall(sysno),
