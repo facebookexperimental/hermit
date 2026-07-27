@@ -8,12 +8,6 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, closed]
   workflow_dispatch:
-    inputs:
-      qemu_l2:
-        description: Run the optional heavyweight QEMU strict-L2 boot gate
-        required: false
-        type: boolean
-        default: false
 
 # Keep the active run and only the newest pending run for each pull request or
 # branch. GitHub replaces an older pending run in the group without cancelling
@@ -29,66 +23,15 @@ env:
   RUSTDOCFLAGS: -D warnings
 
 jobs:
-  # AUTONOMOUS-BOT-IMPLEMENTED
-  # TODO-HUMAN-REVIEW(#553)
-  qemu-l2:
-    name: QEMU strict L2 boot (optional heavyweight)
-    if: >-
-      ${{
-        github.repository == 'rrnewton/hermit' &&
-        github.event_name == 'workflow_dispatch' &&
-        inputs.qemu_l2
-      }}
-    runs-on: [self-hosted, Linux, X64, hermit, pmu]
-    timeout-minutes: 60
-
-    steps:
-    # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#647)
-    - name: Remove stale checkout locks
-      run: |
-        if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
-          find "$GITHUB_WORKSPACE/.git" -type f -name "*.lock" -print -delete
-        fi
-
-    - uses: actions/checkout@v4
-      with:
-        submodules: recursive
-    - name: Dependencies
-      run: |
-        # Refresh the (partial) self-hosted package index first, install the hard
-        # link deps strictly, then the rest best-effort so a missing package does
-        # not fail the step before the preflight can report a clear diagnosis.
-        if command -v dnf >/dev/null; then
-          sudo dnf makecache || echo "::notice::dnf makecache failed; using existing metadata"
-          sudo dnf install -y gcc-c++ libunwind-devel xz-devel
-          for pkg in cmake zlib-devel cpio gzip qemu-system-x86-core; do
-            sudo dnf install -y "$pkg" || echo "::notice::$pkg unavailable; skipping"
-          done
-        elif command -v apt-get >/dev/null; then
-          sudo apt-get update || echo "::notice::apt-get update failed; using existing package index"
-          sudo apt-get install -y g++ libunwind-dev liblzma-dev
-          for pkg in cmake zlib1g-dev cpio gzip qemu-system-x86; do
-            sudo apt-get install -y "$pkg" || echo "::notice::$pkg unavailable; skipping"
-          done
-        else
-          echo "::error::Unsupported package manager; QEMU L2 dependencies are unavailable"
-          exit 1
-        fi
-    - name: QEMU and namespace preflight
-      run: |
-        command -v flock
-        command -v qemu-system-x86_64
-        test -r /boot/vmlinuz
-        unshare --user --map-root-user --pid --fork --uts --net --mount \
-          sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
-    - name: Validate QEMU strict L2 boot
-      env:
-        KERNEL_IMAGE: /boot/vmlinuz
-      run: flock /tmp/hermit-self-hosted-pmu.lock ./validate.sh --qemu-l2-only --no-label-pr
-
+  # This scarce lane is a sub-five-minute hardware capability smoke only:
+  #   * retired-conditional-branch PMU timer delivery,
+  #   * CPUID faulting used to mask RDRAND/RDSEED, and
+  #   * strict guest execution through /dev/kvm.
+  # Full workspace builds, lint, portable tests, record/replay matrices,
+  # language runtimes, debugger tests, and heavyweight QEMU boots belong on
+  # hosted or scheduled CI.
   hardware:
-    name: PMU and CPUID tests (self-hosted)
+    name: Hardware smoke tests (self-hosted)
     if: >-
       ${{
         github.repository == 'rrnewton/hermit' &&
@@ -103,8 +46,8 @@ jobs:
           )
         )
       }}
-    runs-on: [self-hosted, Linux, X64, hermit, pmu, pmu-serial]
-    timeout-minutes: 240
+    runs-on: [self-hosted, Linux, X64, hermit, pmu]
+    timeout-minutes: 5
     env:
       DETCORE_TEST_RUST_LOG: "off"
 
@@ -118,42 +61,15 @@ jobs:
         fi
 
     - uses: actions/checkout@v4
-      with:
-        submodules: recursive
-    - uses: actions/setup-go@v5
-      with:
-        go-version: stable
-        cache: false
-    - name: Dependencies
-      run: |
-        # Install compiler/linker dependencies strictly. Runtime and debugger
-        # packages are best-effort here because this runner has a partial package
-        # mirror; the following preflight reports any missing capability clearly.
-        if command -v dnf >/dev/null; then
-          sudo dnf makecache || echo "::notice::dnf makecache failed; using existing metadata"
-          sudo dnf install -y gcc-c++ libunwind-devel xz-devel
-          for pkg in cmake zlib-devel redis sqlite ruby nodejs java-latest-openjdk-devel ocaml python3-test gdb lldb; do
-            sudo dnf install -y "$pkg" || echo "::notice::$pkg unavailable; checking existing tools"
-          done
-        elif command -v apt-get >/dev/null; then
-          sudo apt-get update || echo "::notice::apt-get update failed; using existing package index"
-          sudo apt-get install -y g++ libunwind-dev liblzma-dev
-          for pkg in cmake zlib1g-dev redis-server redis-tools sqlite3 ruby nodejs default-jdk-headless ocaml-nox libpython3.12-testsuite gdb lldb; do
-            sudo apt-get install -y "$pkg" || echo "::notice::$pkg unavailable; checking existing tools"
-          done
-        else
-          echo "::error::Unsupported package manager"
-          exit 1
-        fi
-    - name: Require hardware and runtime capabilities
+    - name: Initialize DAG runner
+      run: git submodule update --init agent-utils
+    - name: Require hardware capabilities
       run: |
         test -r /proc/sys/kernel/perf_event_paranoid
         test -r /dev/kvm -a -w /dev/kvm
+        command -v cc
         command -v flock
-        command -v go ruby node javac java ocamlopt python3 redis-server redis-cli sqlite3 gdb lldb
-        python3 -c 'import test.support'
-        unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
-    - name: PMU and CPUID test DAG
+    - name: PMU, CPUID-faulting, and KVM smoke DAG
       run: env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner flock /tmp/hermit-self-hosted-pmu.lock ci/run-dag.sh hardware -j 2 --perf-dir "$RUNNER_TEMP/hermit-hardware-dag-perf" -v
     - name: Upload hardware DAG performance report
       if: always()
