@@ -304,7 +304,7 @@ readonly STRICT_COMPAT_TOTAL=181
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
 readonly RR_COMPAT_EXPECTED=143
-readonly LITEINST_COMPAT_EXPECTED=355
+readonly LITEINST_COMPAT_EXPECTED=380
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
@@ -830,7 +830,7 @@ function run_full_backend_gates {
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
     run_check "LiteInst backend smoke" liteinst_backend_available
-    run_check "LiteInst compatibility baseline (355 programs)" run_liteinst_compatibility_envelope
+    run_check "LiteInst compatibility baseline (380 programs)" run_liteinst_compatibility_envelope
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -1670,6 +1670,31 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe pg-dump-version /usr/bin/pg_dump --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe redis-cli-version /usr/bin/redis-cli --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe eu-elfcompress-version /usr/bin/eu-elfcompress --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe fc-cat-version /usr/bin/fc-cat --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe fc-list-version /usr/bin/fc-list --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe fc-match-version /usr/bin/fc-match --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe fc-pattern-version /usr/bin/fc-pattern --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe fc-query-version /usr/bin/fc-query --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe fc-scan-version /usr/bin/fc-scan --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe fc-validate-version /usr/bin/fc-validate --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe circo-version /usr/bin/circo -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe fdp-version /usr/bin/fdp -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe neato-version /usr/bin/neato -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe sfdp-version /usr/bin/sfdp -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe twopi-version /usr/bin/twopi -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe eu-objdump-version /usr/bin/eu-objdump --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe eu-ranlib-version /usr/bin/eu-ranlib --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe eu-strip-version /usr/bin/eu-strip --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe eu-unstrip-version /usr/bin/eu-unstrip --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe chronyc-version /usr/bin/chronyc -v && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe cpupower-version /usr/bin/cpupower --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe expect-version /usr/bin/expect -v && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe kmod-version /usr/bin/kmod --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe rpm-version /usr/bin/rpm --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ipmitool-version /usr/bin/ipmitool -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe man-version /usr/bin/man --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-hwdb-version /usr/bin/systemd-hwdb --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe systemd-creds-version /usr/bin/systemd-creds --version && passed=$((passed + 1)) || failed=$((failed + 1))
 
     total=$((passed + failed))
     if ((total != LITEINST_COMPAT_EXPECTED)); then
@@ -3493,7 +3518,7 @@ fi
 if ((LITEINST_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
     if ((failures == 0)); then
-        run_check "LiteInst compatibility baseline (355 programs)" run_liteinst_compatibility_envelope
+        run_check "LiteInst compatibility baseline (380 programs)" run_liteinst_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
