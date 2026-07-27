@@ -1460,7 +1460,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Getsockopt,
     ) -> Result<i64, Error> {
-        Ok(self.record_or_replay(guest, call).await?)
+        let result = self.record_or_replay(guest, call).await?;
+
+        // TODO-HUMAN-REVIEW(PR-898): Hermit exposes one virtual CPU, so do not
+        // leak the host CPU that processed a socket's most recent packet.
+        if result == 0
+            && call.level() == libc::SOL_SOCKET
+            && call.optname() == libc::SO_INCOMING_CPU
+            && let (Some(optval), Some(optlen)) = (call.optval(), call.optlen())
+        {
+            let returned_len: libc::socklen_t = guest.memory().read_value(optlen)?;
+            let zero_cpu = 0_i32.to_ne_bytes();
+            let returned_len = (returned_len as usize).min(zero_cpu.len());
+            guest
+                .memory()
+                .write_exact(optval.cast::<u8>(), &zero_cpu[..returned_len])?;
+        }
+
+        Ok(result)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
