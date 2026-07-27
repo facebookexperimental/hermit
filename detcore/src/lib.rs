@@ -1405,9 +1405,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-860): Host LSM attributes, opaque file
-            // handles, and mount IDs are outside Detcore's model. Present a
-            // stable feature-absence boundary instead of forwarding probes.
+            // TODO-HUMAN-REVIEW(PR-860): Host LSM attributes are outside
+            // Detcore's model. Present a stable feature-absence boundary
+            // instead of forwarding probes.
             SyscallClassification::Determinized
                 if is_host_security_identity_probe_syscall(call.number()) =>
             {
@@ -1808,6 +1808,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-862): Record/replay and register pidfds.
                 Syscall::PidfdOpen(s) => self.handle_pidfd_open(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-899): Host object handles and mount IDs
+                // are outside Detcore's filesystem identity model.
+                Syscall::NameToHandleAt(_) => Err(Error::Errno(Errno::EOPNOTSUPP)),
                 Syscall::Userfaultfd(s) => self.handle_userfaultfd(guest, s).await,
                 Syscall::Accept(s) => self.handle_accept4(guest, s.into()).await,
                 Syscall::Accept4(s) => self.handle_accept4(guest, s).await,

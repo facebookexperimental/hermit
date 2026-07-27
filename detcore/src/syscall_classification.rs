@@ -472,14 +472,14 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::vmsplice
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-860): Deterministic ENOSYS for host security
-        // and filesystem identity probes. Detcore does not model host LSM
-        // attributes or opaque filesystem handles/mount IDs; feature absence
-        // keeps those host-specific values outside the deterministic guest.
+        // probes. Detcore does not model host LSM attributes.
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::lsm_get_self_attr
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::lsm_set_self_attr
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-899): Opaque filesystem handles and mount IDs
+        // remain outside Detcore's filesystem identity model.
         | Sysno::name_to_handle_at
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-844): Deterministic EPERM for host-global
@@ -1095,10 +1095,8 @@ pub(crate) const fn is_mount_introspection_enosys_syscall(sysno: Sysno) -> bool 
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-860): Host security/filesystem identity refusal set.
-/// Host-backed security and filesystem identity probes. LSM self-attributes
-/// depend on the kernel's configured and active security modules, while
-/// `name_to_handle_at` exports opaque filesystem handles and mount IDs. None of
-/// that state belongs to Detcore's deterministic model, so report the standard
+/// Host-backed security probes. LSM self-attributes depend on the kernel's
+/// configured and active security modules, so report the standard
 /// feature-absence errno and direct callers to portable fallbacks.
 pub(crate) const fn is_host_security_identity_probe_syscall(sysno: Sysno) -> bool {
     matches!(
@@ -1107,8 +1105,6 @@ pub(crate) const fn is_host_security_identity_probe_syscall(sysno: Sysno) -> boo
         Sysno::lsm_get_self_attr
             // AUTONOMOUS-BOT-IMPLEMENTED
             | Sysno::lsm_set_self_attr
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            | Sysno::name_to_handle_at
     )
 }
 
@@ -1675,11 +1671,7 @@ mod tests {
 
     #[test]
     fn host_security_identity_probes_are_determinized_and_consistent() {
-        let refused = [
-            Sysno::lsm_get_self_attr,
-            Sysno::lsm_set_self_attr,
-            Sysno::name_to_handle_at,
-        ];
+        let refused = [Sysno::lsm_get_self_attr, Sysno::lsm_set_self_attr];
         for sysno in refused {
             assert_eq!(
                 classify_syscall(sysno),
@@ -1699,6 +1691,14 @@ mod tests {
                 "{sysno:?} host security/identity helper membership is inconsistent"
             );
         }
+    }
+
+    #[test]
+    fn filesystem_handle_export_is_determinized() {
+        assert_eq!(
+            classify_syscall(Sysno::name_to_handle_at),
+            SyscallClassification::Determinized
+        );
     }
 
     #[test]
