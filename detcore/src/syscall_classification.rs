@@ -80,6 +80,15 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::fstat
         | Sysno::fstatfs
         | Sysno::futex
+        // TODO-HUMAN-REVIEW(PR-852): Review the futex2 feature-absence boundary.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::futex_requeue
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::futex_wait
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::futex_waitv
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::futex_wake
         | Sysno::futimesat
         | Sysno::getcpu
         | Sysno::getdents
@@ -669,10 +678,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         Sysno::adjtimex
         | Sysno::clock_adjtime
         | Sysno::copy_file_range
-        | Sysno::futex_requeue
-        | Sysno::futex_wait
-        | Sysno::futex_waitv
-        | Sysno::futex_wake
         | Sysno::get_robust_list
         | Sysno::kcmp
         | Sysno::lsm_get_self_attr
@@ -736,6 +741,20 @@ pub(crate) const fn is_unimplemented_enosys_syscall(sysno: Sysno) -> bool {
             | Sysno::tuxcall
             | Sysno::uselib
             | Sysno::vserver
+    )
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-852): Deterministic futex2 ENOSYS refusal set.
+/// Detcore models the established `futex(2)` ABI but not futex2's vector waits,
+/// sized values, or requeue rules. Refusing the complete family with `ENOSYS`
+/// matches kernels without the relevant interfaces and directs feature-probing
+/// runtimes to their legacy-futex fallback without exposing the host kernel
+/// version or blocking outside Detcore's scheduler.
+pub(crate) const fn is_futex2_enosys_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::futex_requeue | Sysno::futex_wait | Sysno::futex_waitv | Sysno::futex_wake
     )
 }
 
@@ -1004,7 +1023,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [244, 91, 38]);
+        assert_eq!(counts, [248, 91, 34]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1304,6 +1323,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn futex2_syscalls_are_determinized_and_consistent() {
+        for sysno in [
+            Sysno::futex_requeue,
+            Sysno::futex_wait,
+            Sysno::futex_waitv,
+            Sysno::futex_wake,
+        ] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+            assert!(is_futex2_enosys_syscall(sysno));
+        }
+        assert!(!is_futex2_enosys_syscall(Sysno::futex));
     }
 
     #[test]

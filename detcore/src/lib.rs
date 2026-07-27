@@ -157,6 +157,7 @@ use crate::syscall_classification::classify_syscall;
 use crate::syscall_classification::is_credential_identity_noop_syscall;
 use crate::syscall_classification::is_kernel_keyring_syscall;
 use crate::syscall_classification::is_host_kernel_probe_syscall;
+use crate::syscall_classification::is_futex2_enosys_syscall;
 use crate::syscall_classification::is_landlock_sandbox_syscall;
 use crate::syscall_classification::is_mount_introspection_enosys_syscall;
 use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
@@ -1354,6 +1355,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized
                 if is_unimplemented_enosys_syscall(call.number()) =>
             {
+                Err(Error::Errno(Errno::ENOSYS))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-852): Review the futex2 fallback contract.
+            // Detcore models legacy futex but not the newer vector/sized futex2
+            // ABI. Match a kernel without futex2 so runtimes take their
+            // established legacy-futex fallback without consulting the host.
+            SyscallClassification::Determinized if is_futex2_enosys_syscall(call.number()) => {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
