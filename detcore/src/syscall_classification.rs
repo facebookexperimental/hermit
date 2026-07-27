@@ -383,6 +383,10 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msgrcv
         | Sysno::msgctl
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-876): Review the deterministic
+        // feature-absence boundary for guest performance monitoring.
+        | Sysno::perf_event_open
+        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-882): Review the deterministic
         // feature-absence boundary for legacy nonlinear memory mappings.
         | Sysno::remap_file_pages
@@ -518,14 +522,11 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-853): Deterministic EPERM for privileged host
         // observation/control interfaces. Nested ptrace and kcmp expose host
-        // PIDs, permissions, and kernel-object identity; guest perf events
-        // expose nondeterministic PMU state and compete with Detcore's PMU use.
+        // PIDs, permissions, and kernel-object identity.
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::ptrace
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::kcmp
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::perf_event_open
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-862): Review pidfd creation and descriptor-model
         // synchronization. The handler records/replays the kernel operation and
@@ -1040,19 +1041,32 @@ pub(crate) const fn is_process_isolation_refused_syscall(sysno: Sysno) -> bool {
 // TODO-HUMAN-REVIEW(PR-853): Deterministic privileged-observation refusal set.
 /// Privileged host observation and control interfaces that Detcore deliberately
 /// refuses. Nested `ptrace` and `kcmp` depend on untranslated host PIDs,
-/// permissions, process lifetimes, and kernel-object identity. Guest
-/// `perf_event_open` exposes host PMU availability and nondeterministic counters
-/// while competing with Detcore's own branch-counting PMU resource. A fixed
-/// `EPERM` enforces the guest isolation boundary without entering the host.
+/// permissions, process lifetimes, and kernel-object identity. A fixed `EPERM`
+/// enforces the guest isolation boundary without entering the host.
 pub(crate) const fn is_privileged_observation_refused_syscall(sysno: Sysno) -> bool {
     matches!(
         sysno,
         // AUTONOMOUS-BOT-IMPLEMENTED
         Sysno::ptrace
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            | Sysno::kcmp
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            | Sysno::perf_event_open
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::kcmp
+    )
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-876): Review the deterministic feature-absence
+// boundary for guest performance monitoring.
+/// Performance monitoring depends on host PMU hardware, kernel configuration,
+/// `perf_event_paranoid`, and process capabilities. Detcore does not model
+/// counter state, overflow delivery, or perf-event file descriptors, so guest
+/// `perf_event_open` calls receive the fixed `ENOSYS` result used by kernels
+/// built without performance-event support. Hermit's host-side scheduler PMU
+/// remains outside the guest syscall path and is unaffected.
+pub(crate) const fn is_perf_event_enosys_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        Sysno::perf_event_open
     )
 }
 
@@ -1844,7 +1858,7 @@ mod tests {
 
     #[test]
     fn privileged_observation_syscalls_are_determinized_and_consistent() {
-        let refused = [Sysno::ptrace, Sysno::kcmp, Sysno::perf_event_open];
+        let refused = [Sysno::ptrace, Sysno::kcmp];
         for sysno in refused {
             assert_eq!(
                 classify_syscall(sysno),
@@ -1862,6 +1876,23 @@ mod tests {
                 is_privileged_observation_refused_syscall(sysno),
                 refused.contains(&sysno),
                 "{sysno:?} privileged-observation helper membership is inconsistent"
+            );
+        }
+    }
+
+    #[test]
+    fn perf_event_open_is_deterministically_unavailable() {
+        assert_eq!(
+            classify_syscall(Sysno::perf_event_open),
+            SyscallClassification::Determinized
+        );
+        assert!(is_perf_event_enosys_syscall(Sysno::perf_event_open));
+
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            assert_eq!(
+                is_perf_event_enosys_syscall(sysno),
+                sysno == Sysno::perf_event_open,
+                "{sysno:?} perf-event helper membership is inconsistent"
             );
         }
     }
