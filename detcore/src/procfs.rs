@@ -290,6 +290,11 @@ impl ProcfsFile {
             {
                 ProcfsKind::ScalingCurFreq
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-932): Review average-frequency snapshot normalization.
+            // `cpuinfo_avg_freq` is another driver-provided live hardware
+            // reading, distinct from the static cpuinfo min/max limits.
+            other if other.ends_with("cpufreq/cpuinfo_avg_freq") => ProcfsKind::ScalingCurFreq,
             other if is_process_io_path(other) => ProcfsKind::ProcessIo,
             other if is_block_stat_path(other) => ProcfsKind::BlockStat,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -634,6 +639,7 @@ fn sanitize_process_io(contents: &[u8]) -> Vec<u8> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-764)
+// TODO-HUMAN-REVIEW(PR-932): Review average-frequency snapshot normalization.
 /// Normalizes a cpufreq `scaling_cur_freq` / `cpuinfo_cur_freq` snapshot. The
 /// instantaneous core frequency is a live hardware reading that varies between
 /// otherwise identical runs, so replace it with a fixed value. This mirrors the
@@ -1909,6 +1915,12 @@ mod tests {
             ))
             .unwrap()
             .kind,
+            ProcfsKind::ScalingCurFreq
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("cpu0/cpufreq/cpuinfo_avg_freq"))
+                .unwrap()
+                .kind,
             ProcfsKind::ScalingCurFreq
         );
         // The static min/max limits are deterministic and must not be rewritten.
