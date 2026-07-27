@@ -58,6 +58,22 @@ fn is_supported_prctl_option(option: libc::c_int) -> bool {
             // "keep process capabilities failed: Function not implemented".
             | libc::PR_SET_KEEPCAPS
             | libc::PR_GET_KEEPCAPS
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#824)
+            //
+            // PR_{SET,GET}_PDEATHSIG only read/toggle the calling thread's
+            // parent-death-signal attribute. PR_SET_PDEATHSIG validates its
+            // signal argument (a valid signal or 0 succeeds, anything else
+            // faults EINVAL) and PR_GET_PDEATHSIG reports the value the guest
+            // previously set. The result is a pure function of the guest's own
+            // prior prctl calls and its argument, never host state, so
+            // passthrough is deterministic and bitwise-identical across runs.
+            // The registered signal only ever fires on parent death, which is a
+            // deterministically scheduled event under Hermit. Supporting it lets
+            // `setpriv --pdeathsig` run under --strict instead of aborting with
+            // "set parent death signal failed: Function not implemented".
+            | libc::PR_SET_PDEATHSIG
+            | libc::PR_GET_PDEATHSIG
     )
 }
 
@@ -571,6 +587,9 @@ mod tests {
             // Deterministic per-thread capability-retention flag used by setpriv.
             libc::PR_SET_KEEPCAPS,
             libc::PR_GET_KEEPCAPS,
+            // Deterministic per-thread parent-death-signal flag used by setpriv.
+            libc::PR_SET_PDEATHSIG,
+            libc::PR_GET_PDEATHSIG,
         ] {
             assert!(is_supported_prctl_option(option));
         }
