@@ -4,8 +4,7 @@ on:
   push:
     branches: [ "main" ]
   # Keep stacked pull requests covered before they are retargeted to main. A
-  # closed event enters the same concurrency group and cancels any stale run;
-  # the hardware job itself skips that event.
+  # closed events still enter the workflow, but the hardware job skips them.
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, closed]
   workflow_dispatch:
@@ -16,11 +15,11 @@ on:
         type: boolean
         default: false
 
-# Self-hosted capacity is scarce, so a newer commit replaces an older run for
-# the same pull request or branch.
+# Preserve every self-hosted result: queued and running jobs must not be
+# cancelled when a newer commit arrives for the same pull request or branch.
 concurrency:
   group: selfhosted-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
