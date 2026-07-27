@@ -23,6 +23,7 @@ use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
 
 use crate::record_or_replay::RecordOrReplay;
+use crate::tool_global::determinize_inode;
 use crate::tool_local::Detcore;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -85,6 +86,55 @@ fn canonical_namespace_target(path: &Path) -> Option<&'static [u8]> {
     canonical_namespace_name(namespace)
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-972): Review proc-fd path alias coverage.
+fn normalized_absolute_parts(path: &Path) -> Option<Vec<&OsStr>> {
+    if !path.is_absolute() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(part) => parts.push(part),
+            Component::ParentDir => {
+                parts.pop()?;
+            }
+            Component::Prefix(_) => return None,
+        }
+    }
+    Some(parts)
+}
+
+fn decimal_u32(component: &OsStr) -> Option<u32> {
+    let value = component.to_str()?;
+    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.parse().ok())?
+}
+
+fn decimal_fd(component: &OsStr) -> Option<i32> {
+    let value = component.to_str()?;
+    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.parse().ok())?
+}
+
+/// Returns the optional numeric proc subject and the descriptor number.
+fn proc_fd_target(path: &Path) -> Option<(Option<u32>, i32)> {
+    let parts = normalized_absolute_parts(path)?;
+    match parts.as_slice() {
+        [dev, fd_dir, fd] if *dev == "dev" && *fd_dir == "fd" => Some((None, decimal_fd(fd)?)),
+        [proc, subject, fd_dir, fd] if *proc == "proc" && *fd_dir == "fd" => {
+            let subject = match subject.to_str()? {
+                "self" | "thread-self" => None,
+                _ => Some(decimal_u32(subject)?),
+            };
+            Some((subject, decimal_fd(fd)?))
+        }
+        _ => None,
+    }
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#877)
@@ -101,7 +151,29 @@ impl<T: RecordOrReplay> Detcore<T> {
         S: Into<Syscall>,
     {
         let result = self.record_or_replay(guest, syscall).await?;
-        let Some(target) = canonical_namespace_target(&path) else {
+        if result <= 0 {
+            return Ok(result);
+        }
+
+        let target = if let Some(target) = canonical_namespace_target(&path) {
+            target.to_vec()
+        } else if let Some((subject, fd)) = proc_fd_target(&path) {
+            if let Some(subject) = subject {
+                let current_pid = guest.inject(syscalls::Getpid::new()).await?;
+                if current_pid != i64::from(subject) {
+                    return Ok(result);
+                }
+            }
+
+            let stat = self.inject_fstat(guest, fd).await?;
+            let kind = match stat.st_mode & libc::S_IFMT {
+                libc::S_IFIFO => "pipe",
+                libc::S_IFSOCK => "socket",
+                _ => return Ok(result),
+            };
+            let (inode, _) = determinize_inode(guest, stat.st_ino).await;
+            format!("{kind}:[{inode}]").into_bytes()
+        } else {
             return Ok(result);
         };
 
@@ -135,7 +207,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Readlinkat,
     ) -> Result<i64, Error> {
         let path: PathBuf = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
-        self.finish_namespace_readlink(guest, path, call.buf(), call.buf_len(), call)
+        let observed_path = if path.is_absolute() || call.dirfd() == libc::AT_FDCWD {
+            path
+        } else {
+            guest
+                .thread_state()
+                .with_detfd(call.dirfd(), |detfd| detfd.path())?
+                .map_or(path.clone(), |directory| directory.join(path))
+        };
+        self.finish_namespace_readlink(guest, observed_path, call.buf(), call.buf_len(), call)
             .await
     }
 }
@@ -175,5 +255,32 @@ mod tests {
             canonical_namespace_target(Path::new("/proc/self/ns/unknown")),
             None
         );
+    }
+
+    #[test]
+    fn recognizes_proc_fd_aliases_and_lexical_normalization() {
+        for (path, expected) in [
+            ("/proc/self/fd/1", (None, 1)),
+            ("/proc/thread-self/fd/20", (None, 20)),
+            ("/proc/123/fd/7", (Some(123), 7)),
+            ("/proc/self/fd/../fd/9", (None, 9)),
+            ("/dev/fd/3", (None, 3)),
+        ] {
+            assert_eq!(proc_fd_target(Path::new(path)), Some(expected), "{path}");
+        }
+    }
+
+    #[test]
+    fn rejects_non_proc_fd_targets() {
+        for path in [
+            "/proc/self/fd/",
+            "/proc/self/fd/stdout",
+            "/proc/self/fd/1/status",
+            "/proc/not-a-pid/fd/1",
+            "/dev/fd/-1",
+            "proc/self/fd/1",
+        ] {
+            assert_eq!(proc_fd_target(Path::new(path)), None, "{path}");
+        }
     }
 }

@@ -92,7 +92,7 @@ const DETERMINISTIC_NETLINK_PORT_ID_BASE: u32 = 0x4000_0000;
 
 impl<T: RecordOrReplay> Detcore<T> {
     /// Inject an extra fstat to retrieve file metadata.
-    async fn inject_fstat<G: Guest<Self>>(
+    pub(crate) async fn inject_fstat<G: Guest<Self>>(
         &self,
         guest: &mut G,
         raw_fd: RawFd,
