@@ -299,8 +299,8 @@ if [[ ! $RR_COMPAT_PHASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly RR_COMPAT_PHASE_TIMEOUT_SECONDS
-# Current main's 191-row strict corpus plus numastat, numactl, sensors, and
-# vmstat process accounting.
+# Current main's 191-row strict corpus plus numastat, numactl,
+# sensors-version, and vmstat process accounting.
 readonly STRICT_COMPAT_TOTAL=195
 # Current main's 131-row ratchet (which already includes ruby/dc/tcl from
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
@@ -330,8 +330,10 @@ declare -Ar COMPAT_SUMMARY_KNOWN_FAILURES=(
     # previously because --strict used to forward unsupported syscalls.
     # (chrt/ioprio_set-based ionice/flock were determinized in PR-batch-51 and
     # are now measured as ordinary passing rows below.)
+    [curl-localhost]="fail-closed --strict rejects the unsupported shutdown syscall on some hosts"
     [lsof]="fail-closed --strict rejects the unsupported close_range syscall"
     [make]="fail-closed --strict rejects the unsupported setresuid syscall"
+    [wget-localhost]="fail-closed --strict rejects the unsupported shutdown syscall on some hosts"
 )
 declare -Ar HOSTED_STRICT_DIAGNOSTIC_FAILURES=(
     [top]="live process-table reads differ on the GitHub-hosted runner"
@@ -2706,10 +2708,10 @@ function run_compatibility_corpus {
             && passed=$((passed + 1)) || failed=$((failed + 1))
         functional_compatibility_probe cpio-roundtrip /usr/bin/cpio --version \
             && passed=$((passed + 1)) || failed=$((failed + 1))
-        functional_compatibility_probe wget-localhost /usr/bin/wget --version \
-            && passed=$((passed + 1)) || failed=$((failed + 1))
-        functional_compatibility_probe curl-localhost /usr/bin/curl --version \
-            && passed=$((passed + 1)) || failed=$((failed + 1))
+        tally_known_failclosed_probe passed failed known_flaky wget-localhost \
+            functional_compatibility_probe wget-localhost /usr/bin/wget --version
+        tally_known_failclosed_probe passed failed known_flaky curl-localhost \
+            functional_compatibility_probe curl-localhost /usr/bin/curl --version
     elif [[ $COMPATIBILITY_MODE == sabre ]]; then
         real_compatibility_probe gzip-roundtrip \
             && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -2955,14 +2957,19 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe numactl-hardware /usr/bin/numactl --hardware \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe sensors /usr/bin/sensors \
+    # Bare `sensors` exits 1 when the runner has no physical sensor devices.
+    strict_compatibility_probe sensors-version /usr/bin/sensors --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe ps /usr/bin/ps aux \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe vmstat /usr/bin/vmstat -s \
         && passed=$((passed + 1)) || failed=$((failed + 1))
+    local top_home="$VALIDATION_TMP_DIR/top-home"
+    local top_config_home="$top_home/.config"
+    mkdir -p "$top_config_home/procps"
     # shellcheck disable=SC2016
-    strict_compatibility_probe top bash -c \
+    strict_compatibility_probe top /usr/bin/env \
+        "HOME=$top_home" "XDG_CONFIG_HOME=$top_config_home" /bin/bash -c \
         'set -euo pipefail; LC_ALL=C /usr/bin/top -b -n 1 -p $$ -w 80 >/dev/null; printf "top-ok\n"' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     # Signal zero checks deterministic guest-process existence without

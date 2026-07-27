@@ -41,7 +41,7 @@ The selector covers exactly 476 of the 889 Cargo-discovered cases:
 | Portable Hermit integration cases | 119 | Non-KVM CLI, non-python3-verify LiteInst, strict/verify modes, clock-discipline, futex2, pidfd creation, and process-isolation refusals, non-JVM apps, commands, time, memory, procfs, signals, Python, and rr source contract |
 
 The same lane enforces the 12 portable L1-L4 working-envelope cells and runs
-the 181-row strict compatibility corpus with the debug Hermit binary and PMU/CPUID disabled.
+the 195-row strict compatibility corpus with the debug Hermit binary and PMU/CPUID disabled.
 The corpus is blocking except for seven bounded diagnostics observed on a
 GitHub-hosted runner with PMU disabled: Rust, Java/Javac, Node.js, the two zstd
 rows, and `top` process-table variance.

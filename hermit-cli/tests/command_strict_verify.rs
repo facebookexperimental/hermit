@@ -60,7 +60,13 @@ fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
             HERMIT_VERIFY_TIMEOUT,
         ])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=off", "run", "--strict", "--verify", "--"])
+        .args(["--log=off", "run", "--strict", "--verify"])
+        .arg(format!("--env=HOME={}", home.path().display()))
+        .arg(format!(
+            "--env=XDG_CONFIG_HOME={}",
+            home.path().join(".config").display()
+        ))
+        .arg("--")
         .arg(&program)
         .args(case.args)
         .env("HOME", home.path())
@@ -516,9 +522,9 @@ fn hardware_accounting_commands_are_deterministic_under_strict_verify() {
             stdin: None,
         },
         StrictCommandCase {
-            name: "sensors",
+            name: "sensors version",
             candidates: &["/usr/bin/sensors"],
-            args: &[],
+            args: &["--version"],
             stdin: None,
         },
     ];
