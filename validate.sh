@@ -76,6 +76,7 @@ function select_validation_level {
 }
 STRICT_COMPAT_ONLY=0
 HOSTED_STRICT_COMPAT_ONLY=0
+HOSTED_STRICT_PROBE_ARGS=0
 RR_COMPAT_ONLY=0
 LITEINST_COMPAT_ONLY=0
 SABRE_COMPAT_ONLY=0
@@ -333,13 +334,15 @@ declare -Ar COMPAT_SUMMARY_KNOWN_FAILURES=(
     [wget-localhost]="fail-closed --strict rejects the unsupported shutdown syscall in the localhost fetch"
 )
 declare -Ar HOSTED_STRICT_DIAGNOSTIC_FAILURES=(
-    [rustc]="timed out on the GitHub-hosted no-PMU runner"
-    [javac]="timed out on the GitHub-hosted no-PMU runner"
-    [java]="timed out on the GitHub-hosted no-PMU runner"
-    [node]="timed out on the GitHub-hosted no-PMU runner"
     [top]="live process-table reads differ on the GitHub-hosted runner"
     [zstd]="timed out on the GitHub-hosted no-PMU runner"
     [zstd-roundtrip]="timed out on the GitHub-hosted no-PMU runner"
+)
+declare -Ar HOSTED_STRICT_SUPER_ONLY=(
+    [rustc]="full compile-link-run workload"
+    [javac]="JVM startup and compile-run workload"
+    [java]="threaded JVM filesystem and digest workload"
+    [node]="Node.js runtime startup workload"
 )
 HOSTED_STRICT_DIAGNOSTIC_FAILURE_COUNT=0
 declare -A COMPAT_SUMMARY_CELLS=()
@@ -1654,7 +1657,8 @@ function strict_compatibility_probe {
     local nonblocking=0
     local probe_timeout=$STRICT_COMPAT_TIMEOUT
     local -a run_args=(run --strict --verify --)
-    if [[ $VALIDATION_PROFILE == hosted-only || $HOSTED_STRICT_COMPAT_ONLY == 1 ]]; then
+    if [[ $VALIDATION_PROFILE == hosted-only || $HOSTED_STRICT_COMPAT_ONLY == 1 \
+        || $HOSTED_STRICT_PROBE_ARGS == 1 ]]; then
         run_args=(run --strict --verify --no-virtualize-cpuid --max-timeslice=disabled --)
         if [[ -n ${HOSTED_STRICT_DIAGNOSTIC_FAILURES[$label]+set} ]]; then
             probe_timeout=20
@@ -1770,6 +1774,30 @@ function functional_compatibility_probe {
     strict_compatibility_probe "$label" env \
         REAL_COMPAT_FIXTURES="$REAL_COMPAT_FIXTURES" \
         bash "$REAL_COMPAT_WORKLOAD" "$label"
+}
+
+# These runtime/compiler workloads consume their full timeout on the no-PMU
+# hosted runner and are explicitly nonblocking there. Keep each row in the
+# compatibility table, but measure it in the scheduled super suite instead of
+# spending 20 seconds per row on every pull request.
+function defer_hosted_strict_diagnostic_to_super {
+    local label=$1
+
+    if [[ $COMPATIBILITY_MODE != strict \
+        || ($VALIDATION_PROFILE != hosted-only && $HOSTED_STRICT_COMPAT_ONLY != 1) \
+        || -z ${HOSTED_STRICT_SUPER_ONLY[$label]+set} ]]; then
+        return 1
+    fi
+
+    printf "  SKIP %-12s scheduled super diagnostic (%s)\n" \
+        "$label" "${HOSTED_STRICT_SUPER_ONLY[$label]}"
+    {
+        printf "=== L2 compatibility: %s ===\n" "$label"
+        printf "Skipped: scheduled super diagnostic (%s)\n\n" \
+            "${HOSTED_STRICT_SUPER_ONLY[$label]}"
+    } >>"$LOG_FILE"
+    record_compatibility_result "$label" N/A "scheduled super diagnostic"
+    return 0
 }
 # Route a compatibility probe whose failure under fail-closed --strict is an
 # accepted unsupported-syscall gap (see COMPAT_SUMMARY_KNOWN_FAILURES; PR #644).
@@ -1918,22 +1946,38 @@ function run_compatibility_corpus {
     fi
     functional_compatibility_probe cargo cargo --version \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    functional_compatibility_probe rustc rustc --version \
-        && passed=$((passed + 1)) || failed=$((failed + 1))
+    if defer_hosted_strict_diagnostic_to_super rustc; then
+        unavailable=$((unavailable + 1))
+    else
+        functional_compatibility_probe rustc rustc --version \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+    fi
     if [[ $COMPATIBILITY_MODE == strict ]]; then
         functional_compatibility_probe clang clang --version \
             && passed=$((passed + 1)) || failed=$((failed + 1))
-        functional_compatibility_probe javac javac -version \
+        if defer_hosted_strict_diagnostic_to_super javac; then
+            unavailable=$((unavailable + 1))
+        else
+            functional_compatibility_probe javac javac -version \
+                && passed=$((passed + 1)) || failed=$((failed + 1))
+        fi
+    fi
+    if defer_hosted_strict_diagnostic_to_super java; then
+        unavailable=$((unavailable + 1))
+    else
+        functional_compatibility_probe java java \
+            -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -version \
             && passed=$((passed + 1)) || failed=$((failed + 1))
     fi
-    functional_compatibility_probe java java \
-        -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -version \
-        && passed=$((passed + 1)) || failed=$((failed + 1))
     strict_compatibility_probe ruby /usr/bin/ruby --disable-gems -e \
         'values = (1..5).map { |value| value * value }; raise "unexpected squares" unless values == [1, 4, 9, 16, 25]; puts values.join(",")' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    strict_compatibility_probe node /bin/node -e 'console.log(42)' \
-        && passed=$((passed + 1)) || failed=$((failed + 1))
+    if defer_hosted_strict_diagnostic_to_super node; then
+        unavailable=$((unavailable + 1))
+    else
+        strict_compatibility_probe node /bin/node -e 'console.log(42)' \
+            && passed=$((passed + 1)) || failed=$((failed + 1))
+    fi
     # Avoid the PATH fbpython wrapper and exercise the system CPython ELF.
     strict_compatibility_probe python3 /usr/bin/python3 -c 'print(42)' \
         && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -3185,12 +3229,40 @@ function run_full_suite {
     run_envelope
 }
 
+function run_hosted_slow_strict_diagnostics {
+    local label
+    local status=0
+    local -a labels=()
+
+    if ! "$ROOT_DIR/tests/compat/prepare_real_compat_fixtures.sh" \
+        "$REAL_COMPAT_FIXTURES" >>"$LOG_FILE" 2>&1; then
+        printf "Unable to prepare functional compatibility fixtures\n"
+        return 1
+    fi
+
+    COMPATIBILITY_MODE=strict
+    HOSTED_STRICT_PROBE_ARGS=1
+    mapfile -t labels < <(printf "%s\n" "${!HOSTED_STRICT_SUPER_ONLY[@]}" | sort)
+    for label in "${labels[@]}"; do
+        if [[ $label == node ]]; then
+            strict_compatibility_probe node /bin/node -e 'console.log(42)' \
+                || status=1
+        else
+            functional_compatibility_probe "$label" "$label" --version \
+                || status=1
+        fi
+    done
+    return "$status"
+}
+
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(#719): Review the weekly placement of slow diagnostics.
 function run_super_diagnostic_suite {
     # These probes are useful for trend detection but do not gate PRs. On the
     # hosted runner they consumed about 20 minutes after the blocking suite had
     # already passed, so keep their signal in the scheduled super tier.
+    run_check_with_timeout 600 "Hosted slow strict compatibility diagnostics" \
+        run_hosted_slow_strict_diagnostics
     # AUTONOMOUS-BOT-IMPLEMENTED
     # TODO-HUMAN-REVIEW(#712): Review bounded routing for no-PMU hangs.
     # The memory-race family repeatedly exhausted its 900-second bound on three
