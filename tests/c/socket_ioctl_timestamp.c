@@ -61,20 +61,76 @@ int main(int argc, char **argv) {
     perror("recv");
     return 3;
   }
+  int duplicate = dup(receiver);
+  if (duplicate < 0) {
+    perror("dup");
+    return 4;
+  }
   if (nanoseconds) {
     struct timespec stamp;
-    if (ioctl(receiver, SIOCGSTAMPNS, &stamp) != 0) {
+    struct timespec repeated;
+    struct timespec aliased;
+    if (ioctl(receiver, SIOCGSTAMPNS, &stamp) != 0 ||
+        ioctl(receiver, SIOCGSTAMPNS, &repeated) != 0 ||
+        ioctl(duplicate, SIOCGSTAMPNS, &aliased) != 0) {
       perror("SIOCGSTAMPNS");
-      return 4;
+      return 5;
+    }
+    if (memcmp(&stamp, &repeated, sizeof(stamp)) != 0 ||
+        memcmp(&stamp, &aliased, sizeof(stamp)) != 0) {
+      fputs("timestamp changed without another receive\n", stderr);
+      return 6;
+    }
+    usleep(2000);
+    if (sendto(sender, "y", 1, 0, (struct sockaddr *)&address, address_len) !=
+            1 ||
+        recv(receiver, &byte, 1, 0) != 1) {
+      perror("second receive");
+      return 7;
+    }
+    struct timespec advanced;
+    if (ioctl(receiver, SIOCGSTAMPNS, &advanced) != 0) {
+      perror("second SIOCGSTAMPNS");
+      return 8;
+    }
+    if (memcmp(&stamp, &advanced, sizeof(stamp)) == 0) {
+      fputs("timestamp did not change after another receive\n", stderr);
+      return 9;
     }
     printf("%ld.%09ld\n", (long)stamp.tv_sec, stamp.tv_nsec);
   } else {
     struct timeval stamp;
-    if (ioctl(receiver, SIOCGSTAMP, &stamp) != 0) {
+    struct timeval repeated;
+    struct timeval aliased;
+    if (ioctl(receiver, SIOCGSTAMP, &stamp) != 0 ||
+        ioctl(receiver, SIOCGSTAMP, &repeated) != 0 ||
+        ioctl(duplicate, SIOCGSTAMP, &aliased) != 0) {
       perror("SIOCGSTAMP");
-      return 4;
+      return 5;
+    }
+    if (memcmp(&stamp, &repeated, sizeof(stamp)) != 0 ||
+        memcmp(&stamp, &aliased, sizeof(stamp)) != 0) {
+      fputs("timestamp changed without another receive\n", stderr);
+      return 6;
+    }
+    usleep(2000);
+    if (sendto(sender, "y", 1, 0, (struct sockaddr *)&address, address_len) !=
+            1 ||
+        recv(receiver, &byte, 1, 0) != 1) {
+      perror("second receive");
+      return 7;
+    }
+    struct timeval advanced;
+    if (ioctl(receiver, SIOCGSTAMP, &advanced) != 0) {
+      perror("second SIOCGSTAMP");
+      return 8;
+    }
+    if (memcmp(&stamp, &advanced, sizeof(stamp)) == 0) {
+      fputs("timestamp did not change after another receive\n", stderr);
+      return 9;
     }
     printf("%ld.%06ld\n", (long)stamp.tv_sec, (long)stamp.tv_usec);
   }
+  close(duplicate);
   return 0;
 }

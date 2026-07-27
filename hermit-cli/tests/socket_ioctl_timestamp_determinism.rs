@@ -31,33 +31,64 @@ fn socket_timestamp_ioctls_use_logical_time() {
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    for mode in ["v4-us", "v4-ns", "v6-us"] {
-        let verify = Command::new("timeout")
-            .args(["--kill-after", "5s", "90s"])
-            .arg(env!("CARGO_BIN_EXE_hermit"))
-            .args([
-                "--log=off",
-                "run",
-                "--backend=ptrace",
-                "--strict",
-                "--verify",
-                "--base-env=minimal",
-                "--",
-            ])
-            .arg(&guest)
-            .arg(mode)
-            .output()
-            .unwrap_or_else(|error| panic!("failed to run {mode}: {error}"));
-        let stdout = String::from_utf8_lossy(&verify.stdout);
-        let stderr = String::from_utf8_lossy(&verify.stderr);
-        assert!(
-            verify.status.success(),
-            "{mode} strict verification failed: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-            verify.status
-        );
-        assert!(
-            stdout.contains("Determinism verified") || stderr.contains("Determinism verified"),
-            "{mode} omitted Hermit's determinism marker\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
+    for backend in ["ptrace", "dbi", "liteinst"] {
+        for mode in ["v4-us", "v4-ns", "v6-us"] {
+            let verify = Command::new("timeout")
+                .args(["--kill-after", "5s", "90s"])
+                .arg(env!("CARGO_BIN_EXE_hermit"))
+                .args(["--log=off", "run"])
+                .arg(format!("--backend={backend}"))
+                .args(["--strict", "--verify", "--base-env=minimal", "--"])
+                .arg(&guest)
+                .arg(mode)
+                .output()
+                .unwrap_or_else(|error| panic!("failed to run {backend}/{mode}: {error}"));
+            let stdout = String::from_utf8_lossy(&verify.stdout);
+            let stderr = String::from_utf8_lossy(&verify.stderr);
+            assert!(
+                verify.status.success(),
+                "{backend}/{mode} strict verification failed: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                verify.status
+            );
+            assert!(
+                stdout.contains("Determinism verified") || stderr.contains("Determinism verified"),
+                "{backend}/{mode} omitted Hermit's determinism marker\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+        }
     }
+
+    let realtime = Command::new("timeout")
+        .args(["--kill-after", "5s", "90s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=off",
+            "run",
+            "--backend=ptrace",
+            "--no-virtualize-time",
+            "--no-virtualize-metadata",
+            "--base-env=minimal",
+            "--",
+        ])
+        .arg(&guest)
+        .arg("v4-us")
+        .output()
+        .expect("failed to run host-clock socket timestamp case");
+    assert!(
+        realtime.status.success(),
+        "host-clock socket timestamp case failed: {}\nstdout:\n{}\nstderr:\n{}",
+        realtime.status,
+        String::from_utf8_lossy(&realtime.stdout),
+        String::from_utf8_lossy(&realtime.stderr)
+    );
+    let seconds: i64 = String::from_utf8_lossy(&realtime.stdout)
+        .trim()
+        .split_once('.')
+        .expect("guest should print a timeval")
+        .0
+        .parse()
+        .expect("guest should print numeric timeval seconds");
+    assert!(
+        seconds >= 1_704_067_200,
+        "--no-virtualize-time returned the fixed logical epoch: {seconds}"
+    );
 }

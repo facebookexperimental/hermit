@@ -16,8 +16,8 @@ use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::ioctl::Request;
 
+use crate::fd::FdType;
 use crate::record_or_replay::RecordOrReplay;
-use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
 use crate::types::LogicalTime;
 
@@ -70,7 +70,7 @@ fn logical_timespec(now: LogicalTime) -> libc::timespec {
 impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-912)
-    /// Preserve kernel validation while replacing host receive time with logical time.
+    /// Return the logical timestamp stored by the last successful socket receive.
     pub async fn handle_socket_timestamp_ioctl<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -90,8 +90,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.with_request(Request::Other(SIOCGSTAMPNS_NEW, address))
             }
         };
-        let result = self.record_or_replay(guest, recorded_call).await?;
-        let now = thread_observe_time(guest).await;
+        if !self.cfg.virtualize_time {
+            return Ok(self.record_or_replay(guest, recorded_call).await?);
+        }
+
+        let now = guest.thread_state().with_detfd(call.fd(), |detfd| {
+            if detfd.ty() != FdType::Socket {
+                return Err(Errno::ENOTTY);
+            }
+            detfd.socket_receive_timestamp().ok_or(Errno::ENOENT)
+        })??;
         match output {
             TimestampOutput::Timeval(address) => {
                 let address = AddrMut::from_raw(address).ok_or(Errno::EFAULT)?;
@@ -104,7 +112,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .write_value(address, &logical_timespec(now))?;
             }
         }
-        Ok(result)
+        Ok(0)
     }
 }
 

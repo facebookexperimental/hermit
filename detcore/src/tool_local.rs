@@ -629,6 +629,11 @@ mod file_metadata_tests {
             .expect("duplicate fd should exist");
         assert_eq!(parent_open, duplicate_open);
 
+        let initial_timestamp = LogicalTime::from_nanos(1_234_567_890);
+        parent
+            .with_detfd(3, |fd| fd.set_socket_receive_timestamp(initial_timestamp))
+            .expect("parent socket should accept a receive timestamp");
+
         let mut child = parent.fork_for(child_tid);
         assert_ne!(parent.files_id, child.files_id);
         assert_ne!(
@@ -646,6 +651,22 @@ mod file_metadata_tests {
             child
                 .with_detfd(3, |fd| fd.open_file_id())
                 .expect("forked fd should retain its open file identity")
+        );
+        assert_eq!(
+            child
+                .with_detfd(3, |fd| fd.socket_receive_timestamp())
+                .expect("forked fd should retain its receive timestamp"),
+            Some(initial_timestamp)
+        );
+        let child_timestamp = LogicalTime::from_nanos(2_345_678_901);
+        child
+            .with_detfd(3, |fd| fd.set_socket_receive_timestamp(child_timestamp))
+            .expect("child socket should update the shared receive timestamp");
+        assert_eq!(
+            parent
+                .with_detfd(4, |fd| fd.socket_receive_timestamp())
+                .expect("parent duplicate should see the child update"),
+            Some(child_timestamp)
         );
 
         parent

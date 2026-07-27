@@ -117,6 +117,8 @@ struct OpenFileDescription {
     resource: Option<ResourceID>,
     /// Deterministic snapshot state for selected procfs files.
     procfs: Option<ProcfsFile>,
+    /// Logical timestamp of the last packet delivered through this socket.
+    socket_receive_timestamp: Option<LogicalTime>,
 }
 
 impl PartialEq for DetFd {
@@ -157,6 +159,7 @@ impl DetFd {
                 stat: None,
                 resource: None,
                 procfs: None,
+                socket_receive_timestamp: None,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             })),
@@ -368,6 +371,17 @@ impl DetFd {
         description.status_flags = flags & !OFlag::O_CLOEXEC.bits();
         description.physically_nonblocking = oflags_nonblocking(flags);
     }
+
+    // TODO-HUMAN-REVIEW(PR-912): Review open-file sharing of socket receive timestamps.
+    /// Record the logical time at which a socket delivered its most recent packet.
+    pub(crate) fn set_socket_receive_timestamp(&self, timestamp: LogicalTime) {
+        self.description().socket_receive_timestamp = Some(timestamp);
+    }
+
+    /// Return the last receive timestamp shared by every alias of this socket.
+    pub(crate) fn socket_receive_timestamp(&self) -> Option<LogicalTime> {
+        self.description().socket_receive_timestamp
+    }
 }
 
 impl fmt::Display for DetFd {
@@ -410,6 +424,10 @@ mod tests {
             !original.is_nonblocking(),
             "status flag changes through one alias must be visible through every alias"
         );
+
+        let timestamp = LogicalTime::from_nanos(2_345_678_901);
+        original.set_socket_receive_timestamp(timestamp);
+        assert_eq!(duplicate.socket_receive_timestamp(), Some(timestamp));
     }
 
     #[test]

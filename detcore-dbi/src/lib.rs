@@ -927,6 +927,14 @@ pub unsafe extern "C" fn reverie_dbi_runtime_exec_failed(_scratch: *mut c_void, 
 pub extern "C" fn reverie_dbi_runtime_copied_syscall(sysnum: i64) -> i32 {
     let sysno = Sysno::from(sysnum as i32);
     let strict = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+    // TODO-HUMAN-REVIEW(PR-981): Copied DBI children cannot enter the Rust
+    // Detcore Tool, and this callback receives no syscall arguments with which
+    // to distinguish timestamp ioctls or timestamp-enabled receive buffers.
+    // Strict mode therefore fails closed for the three syscall classes that can
+    // expose native socket timestamps. Non-strict mode retains native behavior.
+    if matches!(sysno, Sysno::ioctl | Sysno::recvmsg | Sysno::recvmmsg) && strict {
+        return 1;
+    }
     if detcore::is_deterministically_refused_syscall(sysno)
         && (strict || !detcore::is_strict_only_deterministic_refusal_syscall(sysno))
     {
@@ -1465,6 +1473,9 @@ mod tests {
             libc::SYS_keyctl,
             libc::SYS_add_key,
             libc::SYS_request_key,
+            libc::SYS_ioctl,
+            libc::SYS_recvmsg,
+            libc::SYS_recvmmsg,
         ] {
             assert_eq!(
                 reverie_dbi_runtime_copied_syscall(sysnum),
@@ -1484,7 +1495,14 @@ mod tests {
         // while unconditional fixed-error families still fail closed because
         // the copied-child ABI cannot inject their deterministic errno.
         COPIED_PANIC_ON_UNSUPPORTED.store(false, Ordering::Release);
-        for sysnum in [libc::SYS_splice, libc::SYS_keyctl, libc::SYS_read] {
+        for sysnum in [
+            libc::SYS_splice,
+            libc::SYS_keyctl,
+            libc::SYS_ioctl,
+            libc::SYS_recvmsg,
+            libc::SYS_recvmmsg,
+            libc::SYS_read,
+        ] {
             assert_eq!(
                 reverie_dbi_runtime_copied_syscall(sysnum),
                 0,
