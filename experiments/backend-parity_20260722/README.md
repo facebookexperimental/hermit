@@ -11,7 +11,7 @@ A `gap` must have a concrete implementation reason.
 | --- | ---: | ---: |
 | ptrace | 10/10 | 100% |
 | DBI | 6/10 | 60% |
-| KVM | 8/10 | 80% |
+| KVM | 9/10 | 90% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
 measures the backend's own Reverie suite. The 6/10 number above is deliberately
@@ -21,10 +21,11 @@ observes most syscalls but only rewrites `write` and CPUID; it does not yet use
 Detcore's scheduler, virtual clock, PID model, or random model.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
-eight pairs, including deterministic clock, PID, and synthetic CPUID probes.
-The remaining gaps are the pthread lifecycle and the threaded random-source
-fixture; both require guest thread lifecycle support, and the latter also needs
-page-permission fault enforcement.
+nine pairs, including its bounded cooperative pthread lifecycle and
+deterministic clock, PID, and synthetic CPUID probes. The remaining gap is the
+threaded random-source fixture: child-thread syscalls bypass per-child Detcore
+callbacks, and the KVM personality's fixed random streams repeat across worker
+threads.
 
 ## Matrix
 
@@ -35,7 +36,7 @@ page-permission fault enforcement.
 | `exit_zero` | pass | pass | pass |
 | `exit_status` | pass | pass | pass |
 | `file_read` | pass | pass | pass |
-| `pthread_lifecycle` | pass | gap | gap |
+| `pthread_lifecycle` | pass | gap | pass |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | gap | pass |
 | `random_sources` | pass | gap | gap |
@@ -48,10 +49,11 @@ These repeat-run results are compatibility evidence, not an L1/L2 assurance
 level: the runner disables timeslicing and does not pass `--strict --verify`.
 
 Hermit's KVM root process enters the shared tool through
-`run_static_elf_with_tool::<Detcore>`, but forked children currently execute in
-the backend's deterministic `ElfExecutor` personality without per-child
-Detcore tool callbacks. The CPUID row similarly validates reverie-kvm's
-backend-local `KVM_SET_CPUID2` policy, not Detcore CPUID-event parity.
+`run_static_elf_with_tool::<Detcore>`, but child process and thread syscalls
+currently execute in the backend's deterministic `ElfExecutor` personality
+without per-child Detcore tool callbacks. The CPUID row similarly validates
+reverie-kvm's backend-local `KVM_SET_CPUID2` policy, not Detcore CPUID-event
+parity.
 
 ## Running
 
