@@ -384,6 +384,18 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::landlock_add_rule
         | Sysno::landlock_restrict_self
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-848): Deterministic ENOSYS for the unmodeled
+        // kernel-keyring family. Key serials, quotas, permissions, contents,
+        // and request-key upcalls are shared kernel state outside Detcore's
+        // model. Presenting a kernel-without-CONFIG_KEYS boundary keeps feature
+        // probes host-independent and prevents guest keyring mutations/upcalls.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::add_key
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::request_key
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::keyctl
+        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-838): Review close_range descriptor-table
         // synchronization and the deterministic seccomp compatibility refusal.
         // The close_range handler serializes the kernel operation and removes the
@@ -654,8 +666,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // --panic-on-unsupported-syscalls stops at the first use.
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed unsupported classifications.
-        Sysno::add_key
-        | Sysno::adjtimex
+        Sysno::adjtimex
         | Sysno::clock_adjtime
         | Sysno::copy_file_range
         | Sysno::futex_requeue
@@ -664,7 +675,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::futex_wake
         | Sysno::get_robust_list
         | Sysno::kcmp
-        | Sysno::keyctl
         | Sysno::lsm_get_self_attr
         | Sysno::lsm_set_self_attr
         | Sysno::mincore
@@ -680,7 +690,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::pwritev2
         | Sysno::readv
         | Sysno::remap_file_pages
-        | Sysno::request_key
         | Sysno::restart_syscall
         | Sysno::semctl
         | Sysno::semget
@@ -927,6 +936,25 @@ pub(crate) const fn is_mount_introspection_enosys_syscall(sysno: Sysno) -> bool 
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-848): Deterministic kernel-keyring refusal set.
+/// Kernel key-management syscalls that Detcore does not model. Keyring serials,
+/// quotas, permissions, contents, and `request_key` user-space upcalls expose
+/// shared host-kernel state. A fixed `ENOSYS` matches a kernel built without
+/// `CONFIG_KEYS`, lets feature probes take their established fallback, and
+/// prevents the guest from reading, mutating, or triggering host keyrings.
+pub(crate) const fn is_kernel_keyring_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        Sysno::add_key
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::request_key
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::keyctl
+    )
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-839): Deterministic ENOSYS refusal set.
 /// Optional modern memory features that are outside Detcore's model.
 /// `memfd_secret` depends on secret-memory kernel configuration,
@@ -976,7 +1004,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [238, 91, 44]);
+        assert_eq!(counts, [244, 91, 38]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1161,7 +1189,8 @@ mod tests {
             assert_eq!(classify_syscall(sysno), SyscallClassification::PassThrough);
         }
         for sysno in [Sysno::add_key, Sysno::keyctl, Sysno::request_key] {
-            assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+            assert!(is_kernel_keyring_syscall(sysno));
         }
         for sysno in [
             Sysno::chroot,
@@ -1380,6 +1409,30 @@ mod tests {
                 is_mount_introspection_enosys_syscall(sysno),
                 refused.contains(&sysno),
                 "{sysno:?} mount-introspection helper membership is inconsistent"
+            );
+        }
+    }
+
+    #[test]
+    fn kernel_keyring_syscalls_are_determinized_and_consistent() {
+        let refused = [Sysno::add_key, Sysno::request_key, Sysno::keyctl];
+        for sysno in refused {
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Determinized,
+                "{sysno:?} should be Determinized (deterministic ENOSYS refusal)"
+            );
+            assert!(
+                is_kernel_keyring_syscall(sysno),
+                "{sysno:?} should be in the kernel-keyring refusal set"
+            );
+        }
+
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            assert_eq!(
+                is_kernel_keyring_syscall(sysno),
+                refused.contains(&sysno),
+                "{sysno:?} kernel-keyring helper membership is inconsistent"
             );
         }
     }

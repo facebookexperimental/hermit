@@ -155,6 +155,7 @@ use crate::resources::ResourceID;
 use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
 use crate::syscall_classification::is_credential_identity_noop_syscall;
+use crate::syscall_classification::is_kernel_keyring_syscall;
 use crate::syscall_classification::is_host_kernel_probe_syscall;
 use crate::syscall_classification::is_landlock_sandbox_syscall;
 use crate::syscall_classification::is_mount_introspection_enosys_syscall;
@@ -1362,6 +1363,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized
                 if is_mount_introspection_enosys_syscall(call.number()) =>
             {
+                Err(Error::Errno(Errno::ENOSYS))
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-848): Hide unmodeled shared keyrings and
+            // request-key upcalls behind the portable CONFIG_KEYS-absent errno.
+            SyscallClassification::Determinized if is_kernel_keyring_syscall(call.number()) => {
                 Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
