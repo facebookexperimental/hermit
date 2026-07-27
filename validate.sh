@@ -304,7 +304,7 @@ readonly STRICT_COMPAT_TOTAL=181
 # PR #729) plus four descriptor-state and eight writable-filesystem programs
 # adopted from PR #662.
 readonly RR_COMPAT_EXPECTED=143
-readonly LITEINST_COMPAT_EXPECTED=739
+readonly LITEINST_COMPAT_EXPECTED=765
 # Require every measured SaBRe compatibility row.
 # This is a compatibility floor, not a Detcore determinism claim.
 readonly SABRE_COMPAT_EXPECTED=151
@@ -830,7 +830,7 @@ function run_full_backend_gates {
         "${backends[@]}" --probe-gaps --require-backend \
         --output "$BACKEND_COMPAT_RESULTS"
     run_check "LiteInst backend smoke" liteinst_backend_available
-    run_check "LiteInst compatibility baseline (739 programs)" run_liteinst_compatibility_envelope
+    run_check "LiteInst compatibility baseline (765 programs)" run_liteinst_compatibility_envelope
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -2054,6 +2054,32 @@ function run_liteinst_compatibility_envelope {
     liteinst_compatibility_probe linux32-version /usr/bin/linux32 --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe linux64-version /usr/bin/linux64 --version && passed=$((passed + 1)) || failed=$((failed + 1))
     liteinst_compatibility_probe luac-version /usr/bin/luac -v && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe mosh-version /usr/bin/mosh --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe msgfmt-version /usr/bin/msgfmt --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe nano-version /usr/bin/nano --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ncat-version /usr/bin/ncat --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ncdu-version /usr/bin/ncdu --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ngettext-version /usr/bin/ngettext --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe nmap-version /usr/bin/nmap --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe nping-version /usr/bin/nping --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe numactl-version /usr/bin/numactl --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ocamlc-version /usr/bin/ocamlc -version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ocamlopt-version /usr/bin/ocamlopt -version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ocamlrun-version /usr/bin/ocamlrun -version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe parallel-version /usr/bin/parallel --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe passt-version /usr/bin/passt --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe perl532-version /usr/bin/perl5.32.1 -v && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe pigz-version /usr/bin/pigz --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe pngquant-version /usr/bin/pngquant --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe preconv-version /usr/bin/preconv --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe pstree-version /usr/bin/pstree --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe pv-version /usr/bin/pv --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe pygmentize-version /usr/bin/pygmentize -V && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe python39-version /usr/bin/python3.9 --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe pzstd-version /usr/bin/pzstd --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe ragel-version /usr/bin/ragel -v && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe readtags-version /usr/bin/readtags --version && passed=$((passed + 1)) || failed=$((failed + 1))
+    liteinst_compatibility_probe redis-benchmark-version /usr/bin/redis-benchmark --version && passed=$((passed + 1)) || failed=$((failed + 1))
 
     total=$((passed + failed))
     if ((total != LITEINST_COMPAT_EXPECTED)); then
@@ -3877,7 +3903,7 @@ fi
 if ((LITEINST_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
     if ((failures == 0)); then
-        run_check "LiteInst compatibility baseline (739 programs)" run_liteinst_compatibility_envelope
+        run_check "LiteInst compatibility baseline (765 programs)" run_liteinst_compatibility_envelope
     fi
     print_summary
     ((failures == 0))
