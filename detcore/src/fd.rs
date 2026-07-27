@@ -308,6 +308,28 @@ impl DetFd {
             .and_then(|procfs| procfs.take(maximum))
     }
 
+    /// Read a deterministic procfs snapshot without changing its shared cursor.
+    pub(crate) fn take_procfs_at(&self, offset: usize, maximum: usize) -> Option<Vec<u8>> {
+        self.description()
+            .procfs
+            .as_ref()
+            .and_then(|procfs| procfs.take_at(offset, maximum))
+    }
+
+    /// Return the shared procfs cursor and initialized snapshot length.
+    pub(crate) fn procfs_position(&self) -> Option<(usize, Option<usize>)> {
+        self.description().procfs.as_ref().map(ProcfsFile::position)
+    }
+
+    /// Update the cursor shared by every alias of a procfs open file.
+    pub(crate) fn set_procfs_offset(&self, offset: usize) {
+        self.description()
+            .procfs
+            .as_mut()
+            .expect("procfs fd disappeared while updating its offset")
+            .set_offset(offset);
+    }
+
     /// Cached stat data attached to the backing object.
     pub fn stat(&self) -> Option<DetStat> {
         self.description().stat
@@ -399,6 +421,31 @@ mod tests {
         fd.set_nonblocking(false);
         assert!(!fd.is_nonblocking());
         assert!(!fd.physically_nonblocking());
+    }
+
+    #[test]
+    fn procfs_offsets_are_shared_by_dup_aliases() {
+        let owner = DetTid::from_raw(10);
+        let original = DetFd::new(
+            3,
+            OFlag::empty(),
+            FdType::Regular,
+            OpenFileId::new(owner, 0),
+        );
+        original.set_procfs(ProcfsFile::from_path(Path::new("/proc/sys/fs/file-nr")).unwrap());
+        original.initialize_procfs(b"15\t0\t1000\n".to_vec(), 0, 1, 0);
+        let duplicate = original.clone().with_fd(4);
+
+        assert_eq!(original.take_procfs(2).unwrap(), b"0\t");
+        assert_eq!(duplicate.procfs_position().unwrap().0, 2);
+        assert_eq!(duplicate.take_procfs_at(4, 1).unwrap(), b"9");
+        assert_eq!(original.procfs_position().unwrap().0, 2);
+
+        duplicate.set_procfs_offset(0);
+        assert_eq!(
+            original.take_procfs(128).unwrap(),
+            b"0\t0\t9223372036854775807\n"
+        );
     }
 
     #[test]

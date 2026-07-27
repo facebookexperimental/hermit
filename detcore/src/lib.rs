@@ -1592,6 +1592,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Close(s) => self.handle_close(guest, s).await,
                 Syscall::Read(s) => self.handle_read(guest, s).await,
                 Syscall::Pread64(s) => self.handle_pread64(guest, s).await,
+                Syscall::Lseek(s) => self.handle_lseek(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-838): Review regular-file sendfile mediation.
                 Syscall::Sendfile(s) => self.handle_sendfile(guest, s).await,

@@ -32,6 +32,8 @@ enum ProcfsKind {
     Buddyinfo,
     Schedstat,
     SoftnetStat,
+    FileNr,
+    FileMax,
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -72,6 +74,10 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-909): Review softnet counter normalization.
             "/proc/net/softnet_stat" => ProcfsKind::SoftnetStat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-910): Review host file-table normalization.
+            "/proc/sys/fs/file-nr" => ProcfsKind::FileNr,
+            "/proc/sys/fs/file-max" => ProcfsKind::FileMax,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // A cpufreq `*_cur_freq` file reports the instantaneous core clock,
             // a live hardware reading that differs run-to-run and breaks tools
@@ -125,17 +131,34 @@ impl ProcfsFile {
             ProcfsKind::Buddyinfo => sanitize_buddyinfo(&contents),
             ProcfsKind::Schedstat => sanitize_schedstat(&contents),
             ProcfsKind::SoftnetStat => sanitize_softnet_stat(&contents),
+            ProcfsKind::FileNr => sanitize_file_nr(&contents),
+            ProcfsKind::FileMax => sanitize_file_max(&contents),
         });
-        self.offset = 0;
     }
 
     /// Returns the next bytes from the normalized snapshot.
     pub(crate) fn take(&mut self, maximum: usize) -> Option<Vec<u8>> {
-        let contents = self.contents.as_ref()?;
-        let end = self.offset.saturating_add(maximum).min(contents.len());
-        let bytes = contents[self.offset..end].to_vec();
-        self.offset = end;
+        let bytes = self.take_at(self.offset, maximum)?;
+        self.offset = self.offset.saturating_add(bytes.len());
         Some(bytes)
+    }
+
+    /// Returns bytes at an explicit offset without changing the shared cursor.
+    pub(crate) fn take_at(&self, offset: usize, maximum: usize) -> Option<Vec<u8>> {
+        let contents = self.contents.as_ref()?;
+        let start = offset.min(contents.len());
+        let end = start.saturating_add(maximum).min(contents.len());
+        Some(contents[start..end].to_vec())
+    }
+
+    /// Returns the shared cursor and initialized snapshot length.
+    pub(crate) fn position(&self) -> (usize, Option<usize>) {
+        (self.offset, self.contents.as_ref().map(Vec::len))
+    }
+
+    /// Updates the shared cursor used by all aliases of this open file.
+    pub(crate) fn set_offset(&mut self, offset: usize) {
+        self.offset = offset;
     }
 }
 
@@ -460,6 +483,26 @@ fn sanitize_buddyinfo(contents: &[u8]) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-910): Review the /proc/sys/fs/file-nr policy.
+const VIRTUAL_FILE_MAX: u64 = i64::MAX as u64;
+
+fn sanitize_file_nr(contents: &[u8]) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        format!("0\t0\t{VIRTUAL_FILE_MAX}\n").into_bytes()
+    }
+}
+
+fn sanitize_file_max(contents: &[u8]) -> Vec<u8> {
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        format!("{VIRTUAL_FILE_MAX}\n").into_bytes()
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-866): Review the /proc/net/sockstat field policy.
 fn sanitize_sockstat(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
@@ -714,6 +757,18 @@ mod tests {
                 .kind,
             ProcfsKind::SoftnetStat
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/sys/fs/file-nr"))
+                .unwrap()
+                .kind,
+            ProcfsKind::FileNr
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/sys/fs/file-max"))
+                .unwrap()
+                .kind,
+            ProcfsKind::FileMax
+        );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
     }
 
@@ -856,6 +911,17 @@ malformed buddy row\n"
     }
 
     #[test]
+    fn file_nr_hides_host_global_allocations() {
+        assert_eq!(
+            sanitize_file_nr(b"245853\t0\t9223372036854775807\n"),
+            b"0\t0\t9223372036854775807\n"
+        );
+        assert_eq!(sanitize_file_max(b"1048576\n"), b"9223372036854775807\n");
+        assert!(sanitize_file_nr(b"").is_empty());
+        assert!(sanitize_file_max(b"").is_empty());
+    }
+
+    #[test]
     fn sockstat_hides_host_global_allocation_and_memory_counters() {
         let contents = b"sockets: used 41\n\
 TCP: inuse 3 orphan 2 tw 7 alloc 100 mem 200\n\
@@ -906,5 +972,17 @@ domain0 SMT 00000003 0 0 0\n"
         assert_eq!(file.take(5).unwrap(), b"volun");
         assert_eq!(file.take(128).unwrap(), b"tary_ctxt_switches:\t0\n");
         assert!(file.take(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshot_supports_positional_reads_and_rewinds() {
+        let mut file = ProcfsFile::from_path(Path::new("/proc/sys/fs/file-nr")).unwrap();
+        file.initialize(b"245853\t0\t1048576\n".to_vec(), 0, 1, 0);
+
+        assert_eq!(file.take(2).unwrap(), b"0\t");
+        assert_eq!(file.take_at(4, 1).unwrap(), b"9");
+        assert_eq!(file.position().0, 2, "pread must not move the cursor");
+        file.set_offset(0);
+        assert_eq!(file.take(128).unwrap(), b"0\t0\t9223372036854775807\n");
     }
 }

@@ -131,6 +131,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::select
         | Sysno::prlimit64
         | Sysno::pread64
+        | Sysno::lseek
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#683): Confirm positional-write ordering and replay semantics.
         | Sysno::pwrite64
@@ -603,7 +604,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getsid
         | Sysno::gettid
         | Sysno::getuid
-        | Sysno::lseek
         | Sysno::mprotect
         | Sysno::readlink
         | Sysno::set_robust_list
@@ -1173,7 +1173,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [271, 91, 11]);
+        assert_eq!(counts, [272, 90, 11]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1189,7 +1189,7 @@ mod tests {
         );
         assert_eq!(
             classify_syscall(Sysno::lseek),
-            SyscallClassification::PassThrough
+            SyscallClassification::Determinized
         );
         assert_eq!(
             classify_syscall(Sysno::ppoll),
