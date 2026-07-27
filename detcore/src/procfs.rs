@@ -100,6 +100,9 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-956): Review host block queue-depth normalization.
     BlockInflight,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-938): Review host VM accounting normalization.
+    Vmstat,
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -310,6 +313,9 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-938): Review host VM accounting normalization.
+            "/proc/vmstat" => ProcfsKind::Vmstat,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-958): Review host-global uevent sequence normalization.
             "/sys/kernel/uevent_seqnum" => ProcfsKind::UeventSeqnum,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -464,6 +470,7 @@ impl ProcfsFile {
             ProcfsKind::BlockStat => sanitize_block_stat(&contents),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
+            ProcfsKind::Vmstat => sanitize_vmstat(&contents),
             ProcfsKind::UeventSeqnum => sanitize_uevent_seqnum(&contents),
             ProcfsKind::BtrfsBytesMayUse => sanitize_btrfs_bytes_may_use(&contents),
             ProcfsKind::BlockInflight => sanitize_block_inflight(&contents),
@@ -1503,6 +1510,38 @@ fn sanitize_block_inflight(contents: &[u8]) -> Vec<u8> {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-938): Review the /proc/vmstat field policy.
+fn sanitize_vmstat(contents: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let mut normalized = Vec::with_capacity(contents.len());
+    let mut row_count = 0;
+
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let fields = body.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 2 || fields[0].is_empty() || fields[1].parse::<u64>().is_err() {
+            return contents.to_vec();
+        }
+
+        normalized.extend_from_slice(fields[0].as_bytes());
+        normalized.extend_from_slice(b" 0");
+        if has_newline {
+            normalized.push(b'\n');
+        }
+        row_count += 1;
+    }
+
+    if row_count == 0 {
+        contents.to_vec()
+    } else {
+        normalized
+    }
+}
+
 fn sockstat_field(fields: &[String], name: &str) -> Option<String> {
     let index = fields.iter().position(|field| field == name)?;
     fields.get(index + 1).cloned()
@@ -2426,6 +2465,12 @@ mod tests {
             ProcfsKind::Sockstat
         );
         assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/vmstat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Vmstat
+        );
+        assert_eq!(
             ProcfsFile::from_path(Path::new("/sys/block/md0/inflight"))
                 .unwrap()
                 .kind,
@@ -2771,7 +2816,7 @@ mod tests {
         );
         assert!(ProcfsFile::from_path(Path::new("node/vmstat")).is_none());
         assert!(ProcfsFile::from_path(Path::new("node0/meminfo")).is_none());
-        assert!(ProcfsFile::from_path(Path::new("/proc/vmstat")).is_none());
+        // /proc/vmstat is now recognized as ProcfsKind::Vmstat (PR-938).
     }
 
     #[test]
@@ -3709,6 +3754,28 @@ total_commit_ms 0\n"
 
         let extra_row = b"1 2\n3 4\n";
         assert_eq!(sanitize_block_inflight(extra_row), extra_row);
+    }
+
+    #[test]
+    fn vmstat_hides_host_vm_accounting() {
+        let contents = b"nr_free_pages 4587515\npgfault 175926829665\noom_kill 30\n";
+        assert_eq!(
+            sanitize_vmstat(contents),
+            b"nr_free_pages 0\npgfault 0\noom_kill 0\n"
+        );
+        assert_eq!(
+            sanitize_vmstat(b"nr_free_pages 4587515"),
+            b"nr_free_pages 0"
+        );
+    }
+
+    #[test]
+    fn vmstat_leaves_unknown_formats_untouched() {
+        let extra_field = b"nr_free_pages 4587515 pages\n";
+        assert_eq!(sanitize_vmstat(extra_field), extra_field);
+
+        let invalid_counter = b"nr_free_pages many\n";
+        assert_eq!(sanitize_vmstat(invalid_counter), invalid_counter);
     }
 
     #[test]
