@@ -287,6 +287,17 @@ pub(crate) struct ProcfsFile {
     offset: usize,
 }
 
+/// Guest-visible values used to normalize one procfs snapshot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ProcfsSnapshotContext {
+    pub(crate) virtual_uptime_seconds: u64,
+    pub(crate) virtual_realtime_seconds: i64,
+    pub(crate) virtual_pid: i32,
+    pub(crate) virtual_ppid: i32,
+    pub(crate) virtual_pty_count: usize,
+    pub(crate) fdinfo_identity: Option<(u64, i32, u64)>,
+}
+
 impl ProcfsFile {
     /// Recognizes procfs files that contain observed volatile fields.
     pub(crate) fn from_path(path: &Path) -> Option<Self> {
@@ -448,16 +459,15 @@ impl ProcfsFile {
 
     /// Normalizes and stores a complete snapshot captured from the kernel.
     // TODO-HUMAN-REVIEW(PR-723): Review procfs snapshot identity normalization.
-    pub(crate) fn initialize(
-        &mut self,
-        contents: Vec<u8>,
-        virtual_uptime_seconds: u64,
-        virtual_realtime_seconds: i64,
-        virtual_pid: i32,
-        virtual_ppid: i32,
-        virtual_pty_count: usize,
-        fdinfo_identity: Option<(u64, i32, u64)>,
-    ) {
+    pub(crate) fn initialize(&mut self, contents: Vec<u8>, context: ProcfsSnapshotContext) {
+        let ProcfsSnapshotContext {
+            virtual_uptime_seconds,
+            virtual_realtime_seconds,
+            virtual_pid,
+            virtual_ppid,
+            virtual_pty_count,
+            fdinfo_identity,
+        } = context;
         self.contents = Some(match self.kind {
             ProcfsKind::Stat => sanitize_stat(&contents, virtual_pid, virtual_ppid),
             ProcfsKind::Status => sanitize_status(&contents, virtual_pid, virtual_ppid),
@@ -4108,12 +4118,12 @@ total_commit_ms 0\n"
         let mut file = ProcfsFile::from_path(Path::new("/proc/self/status")).unwrap();
         file.initialize(
             b"voluntary_ctxt_switches:\t12\n".to_vec(),
-            120,
-            0,
-            3,
-            1,
-            0,
-            None,
+            ProcfsSnapshotContext {
+                virtual_uptime_seconds: 120,
+                virtual_pid: 3,
+                virtual_ppid: 1,
+                ..ProcfsSnapshotContext::default()
+            },
         );
         assert_eq!(file.take(5).unwrap(), b"volun");
         assert_eq!(file.take(128).unwrap(), b"tary_ctxt_switches:\t0\n");
@@ -4123,7 +4133,13 @@ total_commit_ms 0\n"
     #[test]
     fn snapshot_supports_positional_reads_and_rewinds() {
         let mut file = ProcfsFile::from_path(Path::new("/proc/sys/fs/file-nr")).unwrap();
-        file.initialize(b"245853\t0\t1048576\n".to_vec(), 0, 0, 1, 0, 0, None);
+        file.initialize(
+            b"245853\t0\t1048576\n".to_vec(),
+            ProcfsSnapshotContext {
+                virtual_pid: 1,
+                ..ProcfsSnapshotContext::default()
+            },
+        );
 
         assert_eq!(file.take(2).unwrap(), b"0\t");
         assert_eq!(file.take_at(4, 1).unwrap(), b"9");

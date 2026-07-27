@@ -38,6 +38,7 @@ use crate::config::SchedHeuristic;
 use crate::dirents::*;
 use crate::fd::*;
 use crate::procfs::ProcfsFile;
+use crate::procfs::ProcfsSnapshotContext;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
@@ -380,12 +381,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest.thread_state().with_detfd(call.fd(), |detfd| {
             detfd.initialize_procfs(
                 contents.clone(),
-                virtual_uptime_seconds,
-                virtual_realtime_seconds,
-                virtual_pid,
-                virtual_ppid,
-                virtual_pty_count,
-                fdinfo_identity,
+                ProcfsSnapshotContext {
+                    virtual_uptime_seconds,
+                    virtual_realtime_seconds,
+                    virtual_pid,
+                    virtual_ppid,
+                    virtual_pty_count,
+                    fdinfo_identity,
+                },
             );
         })?;
         Ok(())

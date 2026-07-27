@@ -22,6 +22,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::procfs::ProcfsFile;
+use crate::procfs::ProcfsSnapshotContext;
 use crate::resources::ResourceID;
 use crate::stat::*;
 use crate::types::RawFd;
@@ -299,29 +300,12 @@ impl DetFd {
 
     /// Initialize the deterministic snapshot shared by all aliases.
     // TODO-HUMAN-REVIEW(PR-723): Review procfs snapshot identity parameters.
-    pub(crate) fn initialize_procfs(
-        &self,
-        contents: Vec<u8>,
-        virtual_uptime_seconds: u64,
-        virtual_realtime_seconds: i64,
-        virtual_pid: i32,
-        virtual_ppid: i32,
-        virtual_pty_count: usize,
-        fdinfo_identity: Option<(u64, i32, u64)>,
-    ) {
+    pub(crate) fn initialize_procfs(&self, contents: Vec<u8>, context: ProcfsSnapshotContext) {
         self.description()
             .procfs
             .as_mut()
             .expect("procfs fd disappeared while taking its snapshot")
-            .initialize(
-                contents,
-                virtual_uptime_seconds,
-                virtual_realtime_seconds,
-                virtual_pid,
-                virtual_ppid,
-                virtual_pty_count,
-                fdinfo_identity,
-            );
+            .initialize(contents, context);
     }
 
     /// Read from the deterministic procfs snapshot at its shared offset.
@@ -483,7 +467,13 @@ mod tests {
             OpenFileId::new(owner, 0),
         );
         original.set_procfs(ProcfsFile::from_path(Path::new("/proc/sys/fs/file-nr")).unwrap());
-        original.initialize_procfs(b"15\t0\t1000\n".to_vec(), 0, 0, 1, 0, 0, None);
+        original.initialize_procfs(
+            b"15\t0\t1000\n".to_vec(),
+            ProcfsSnapshotContext {
+                virtual_pid: 1,
+                ..ProcfsSnapshotContext::default()
+            },
+        );
         let duplicate = original.clone().with_fd(4);
 
         assert_eq!(original.take_procfs(2).unwrap(), b"0\t");
