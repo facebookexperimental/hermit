@@ -157,6 +157,7 @@ use crate::syscall_classification::classify_syscall;
 use crate::syscall_classification::is_credential_identity_noop_syscall;
 use crate::syscall_classification::is_futex2_enosys_syscall;
 use crate::syscall_classification::is_host_kernel_probe_syscall;
+use crate::syscall_classification::is_host_security_identity_probe_syscall;
 use crate::syscall_classification::is_kernel_keyring_syscall;
 use crate::syscall_classification::is_landlock_sandbox_syscall;
 use crate::syscall_classification::is_mount_introspection_enosys_syscall;
@@ -1398,6 +1399,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 } else {
                     self.passthrough(guest, call).await
                 }
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-860): Host LSM attributes, opaque file
+            // handles, and mount IDs are outside Detcore's model. Present a
+            // stable feature-absence boundary instead of forwarding probes.
+            SyscallClassification::Determinized
+                if is_host_security_identity_probe_syscall(call.number()) =>
+            {
+                Err(Error::Errno(Errno::ENOSYS))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#722): Deterministic EPERM for privileged

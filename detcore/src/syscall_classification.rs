@@ -463,6 +463,17 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::vmsplice
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-860): Deterministic ENOSYS for host security
+        // and filesystem identity probes. Detcore does not model host LSM
+        // attributes or opaque filesystem handles/mount IDs; feature absence
+        // keeps those host-specific values outside the deterministic guest.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::lsm_get_self_attr
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::lsm_set_self_attr
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::name_to_handle_at
+        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-844): Deterministic EPERM for host-global
         // process accounting and cross-process memory access. Detcore does not
         // model host process-accounting state or translate/synchronize target
@@ -738,10 +749,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed unsupported classifications.
         Sysno::get_robust_list
-        | Sysno::lsm_get_self_attr
-        | Sysno::lsm_set_self_attr
         | Sysno::mincore
-        | Sysno::name_to_handle_at
         | Sysno::pidfd_getfd
         | Sysno::pidfd_open
         | Sysno::pidfd_send_signal
@@ -1059,6 +1067,25 @@ pub(crate) const fn is_mount_introspection_enosys_syscall(sysno: Sysno) -> bool 
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-860): Host security/filesystem identity refusal set.
+/// Host-backed security and filesystem identity probes. LSM self-attributes
+/// depend on the kernel's configured and active security modules, while
+/// `name_to_handle_at` exports opaque filesystem handles and mount IDs. None of
+/// that state belongs to Detcore's deterministic model, so report the standard
+/// feature-absence errno and direct callers to portable fallbacks.
+pub(crate) const fn is_host_security_identity_probe_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        Sysno::lsm_get_self_attr
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::lsm_set_self_attr
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            | Sysno::name_to_handle_at
+    )
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-855): Strict zero-copy pipe fallback set.
 /// Linux zero-copy pipe transfers. Their observable blocking and buffer
 /// ownership depend on kernel pipe state, while `vmsplice` can additionally
@@ -1146,7 +1173,7 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [268, 91, 14]);
+        assert_eq!(counts, [271, 91, 11]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1585,6 +1612,34 @@ mod tests {
                 is_mount_introspection_enosys_syscall(sysno),
                 refused.contains(&sysno),
                 "{sysno:?} mount-introspection helper membership is inconsistent"
+            );
+        }
+    }
+
+    #[test]
+    fn host_security_identity_probes_are_determinized_and_consistent() {
+        let refused = [
+            Sysno::lsm_get_self_attr,
+            Sysno::lsm_set_self_attr,
+            Sysno::name_to_handle_at,
+        ];
+        for sysno in refused {
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Determinized,
+                "{sysno:?} should be Determinized (deterministic ENOSYS refusal)"
+            );
+            assert!(
+                is_host_security_identity_probe_syscall(sysno),
+                "{sysno:?} should be in the host security/identity refusal set"
+            );
+        }
+
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            assert_eq!(
+                is_host_security_identity_probe_syscall(sysno),
+                refused.contains(&sysno),
+                "{sysno:?} host security/identity helper membership is inconsistent"
             );
         }
     }
