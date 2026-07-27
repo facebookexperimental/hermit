@@ -59,10 +59,13 @@ timeout --signal=KILL "${timeout_seconds}s" \
   --max-timeslice disabled \
   --no-virtualize-cpuid -- \
   "$qemu_bin" \
+  -nodefaults \
+  -nic none \
   -m 256M \
   -accel tcg,thread=single \
   -smp 1 \
   -icount shift=0,sleep=off \
+  -rtc base=utc,clock=vm \
   -kernel "$kernel_image" \
   -initrd "$initramfs_image" \
   -display none \
@@ -89,7 +92,10 @@ grep -F "$marker" "$console_log" >/dev/null || {
 }
 
 clock_failures='Unable to calibrate against PIT|Clocksource .* skewed|Marking TSC unstable|No current clocksource'
-if grep -E "$clock_failures" "$console_log" >/dev/null; then
+# Hermit's QEMU advisory names these failures as examples. Only reject an
+# occurrence emitted by the timestamped nested-kernel console.
+if grep -E "^\[[[:space:]]*[0-9]+\.[0-9]+\].*($clock_failures)" \
+  "$console_log" >/dev/null; then
   printf 'QEMU boot reached a rejected clock failure. Console follows:\n' >&2
   sed -n '1,240p' "$console_log" >&2
   exit 1

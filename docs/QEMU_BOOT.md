@@ -78,10 +78,13 @@ after 166.486 seconds:
 timeout --kill-after=10s --signal=TERM 180s \
   target/release/hermit --log info run --strict -- \
   qemu-system-x86_64 \
+  -nodefaults \
+  -nic none \
   -m 256M \
   -accel tcg,thread=single \
   -smp 1 \
   -icount shift=0,sleep=off \
+  -rtc base=utc,clock=vm \
   -kernel /boot/vmlinuz \
   -initrd target/qemu-boot-smoke/initramfs.cpio.gz \
   -display none \
@@ -112,10 +115,13 @@ timeout --signal=KILL 90s target/release/hermit --log error run \
   --max-timeslice disabled \
   --no-virtualize-cpuid -- \
   qemu-system-x86_64 \
+  -nodefaults \
+  -nic none \
   -m 256M \
   -accel tcg,thread=single \
   -smp 1 \
   -icount shift=0,sleep=off \
+  -rtc base=utc,clock=vm \
   -kernel /boot/vmlinuz \
   -initrd target/qemu-boot-smoke/initramfs.cpio.gz \
   -display none \
@@ -129,6 +135,10 @@ timeout --signal=KILL 90s target/release/hermit --log error run \
 provide usable CPUID faulting. It exposes host CPUID results and is separate
 from the scheduling and clock configuration. A host on which Hermit's CPUID
 virtualization works may omit this option.
+
+Both profiles use `-nodefaults -nic none` to omit QEMU's unused default
+peripherals and network interface. The serial console remains explicit, and
+`-rtc base=utc,clock=vm` keeps the RTC on QEMU's instruction-derived VM clock.
 
 ## Scheduling profiles
 

@@ -115,10 +115,13 @@ printf 'kernel=%s\ninitramfs=%s\nartifacts=%s\n' \
 # same command under --verify for the L2 comparison.
 guest_command=(
   "$qemu_bin"
+  -nodefaults
+  -nic none
   -m 256M
   -accel 'tcg,thread=single'
   -smp 1
   -icount 'shift=0,sleep=off'
+  -rtc 'base=utc,clock=vm'
   -kernel "$kernel_image"
   -initrd "$initramfs_image"
   -display none
