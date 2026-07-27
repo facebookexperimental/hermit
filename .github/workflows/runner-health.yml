@@ -1,0 +1,57 @@
+name: Self-hosted runner health
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: self-hosted-runner-health
+  cancel-in-progress: true
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  health:
+    name: Check registered runners
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Runner registration requires repository Administration (read) access,
+      # which the workflow's GITHUB_TOKEN does not provide.
+      GH_TOKEN: ${{ secrets.RUNNER_HEALTH_TOKEN }}
+    steps:
+      - name: Check monitoring setup
+        if: env.GH_TOKEN == ''
+        run: >-
+          echo "::warning title=Runner health monitoring disabled::Configure
+          RUNNER_HEALTH_TOKEN with Actions (read) and Administration (read)
+          access to rrnewton/hermit"
+      - uses: actions/checkout@v4
+        if: env.GH_TOKEN != ''
+      - name: Restore offline-state observations
+        if: env.GH_TOKEN != ''
+        uses: actions/cache/restore@v4
+        with:
+          path: target/runner-health/state.tsv
+          key: runner-health-state-${{ github.run_id }}
+          restore-keys: |
+            runner-health-state-
+      - name: Compile health checker
+        if: env.GH_TOKEN != ''
+        run: rustc --edition=2021 scripts/runner_health.rs -o "$RUNNER_TEMP/runner-health"
+      - name: Check runner health
+        if: env.GH_TOKEN != ''
+        run: >-
+          "$RUNNER_TEMP/runner-health"
+          --repo "$GITHUB_REPOSITORY"
+          --offline-threshold-seconds 3600
+          --state-file target/runner-health/state.tsv
+      - name: Save offline-state observations
+        if: always() && env.GH_TOKEN != ''
+        uses: actions/cache/save@v4
+        with:
+          path: target/runner-health/state.tsv
+          key: runner-health-state-${{ github.run_id }}
