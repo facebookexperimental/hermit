@@ -1286,10 +1286,28 @@
       "why": "tests/e2e/language-runtimes/RuntimeProbe.java is owned by tests/e2e/lib/language-runtimes/run.sh: The `RuntimeProbe.java` source is the java runtime payload. The language-runtime driver resolves the interpreter/compiler, injects a sentinel, and validates RANDOM/TIME/THREAD/SYSTEM categories; the generic manifest builder supports only shell, C, and Rust programs."
     },
     {
+      "path": "tests/e2e/language-runtimes/bash-loop-pipe-time.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
+      "why": "tests/e2e/language-runtimes/bash-loop-pipe-time.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It exercises Bash file I/O, loops, pipelines, hashing, and virtual time under strict verification"
+    },
+    {
       "path": "tests/e2e/language-runtimes/javascript.js",
       "disposition": "guest-fixture",
       "runner": "tests/e2e/lib/language-runtimes/run.sh",
       "why": "tests/e2e/language-runtimes/javascript.js is owned by tests/e2e/lib/language-runtimes/run.sh: The `javascript.js` source is the js runtime payload. The language-runtime driver resolves the interpreter/compiler, injects a sentinel, and validates RANDOM/TIME/THREAD/SYSTEM categories; the generic manifest builder supports only shell, C, and Rust programs."
+    },
+    {
+      "path": "tests/e2e/language-runtimes/perl-io-subprocess-time.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
+      "why": "tests/e2e/language-runtimes/perl-io-subprocess-time.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It exercises Perl file I/O, subprocess pipes, hashing, and virtual time under strict verification"
+    },
+    {
+      "path": "tests/e2e/language-runtimes/python-io-subprocess-time.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
+      "why": "tests/e2e/language-runtimes/python-io-subprocess-time.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It exercises Python file I/O, subprocess capture, hashing, and virtual time under strict verification"
     },
     {
       "path": "tests/e2e/language-runtimes/python-random.sh",
