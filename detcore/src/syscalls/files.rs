@@ -570,7 +570,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_position())?;
         let Some((current, snapshot_len)) = procfs_position else {
-            return Ok(guest.inject(Syscall::from(call)).await?);
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#1044): Regular-file lseek must
+            // flow through record_or_replay, exactly as handle_read does for
+            // FdType::Regular. Injecting the seek live here is correct for run
+            // and --verify (the inner NoopTool just re-injects), but under
+            // record/replay the replay descriptor is a virtual placeholder
+            // whose kernel position never advances (reads are served from the
+            // log, not the file). A live SEEK_CUR then returned Ok(0) on replay
+            // versus the recorded offset (e.g. glibc's __tzfile_read rewinds
+            // /etc/localtime with lseek(fd, -N, SEEK_CUR)), diverging the
+            // guest's control flow and desynchronizing the event stream. Routing
+            // through record_or_replay records the offset once and substitutes
+            // the recorded value on replay, keeping the two runs identical.
+            return Ok(self.record_or_replay(guest, call).await?);
         };
 
         let Some(snapshot_len) = snapshot_len else {

@@ -207,6 +207,7 @@ fn workloads() -> &'static [Workload] {
             ("c_pidfd_poll_self", "pidfd_poll_self.c"),
             ("c_recvmsg_scm_rights_mmap", "recvmsg_scm_rights_mmap.c"),
             ("c_record_replay_file_state", "record_replay_file_state.c"),
+            ("c_lseek_seek_cur", "record_replay_lseek_seek_cur.c"),
             ("c_sigpipe_siginfo", "sigpipe_siginfo.c"),
             ("c_ppoll_readv", "ppoll_readv.c"),
             ("c_uname", "uname.c"),
@@ -344,6 +345,34 @@ fn record_replay_matrix() {
 #[test]
 fn record_reopened_inherited_and_cloned_file_state() {
     run_record_replay("c_record_replay_file_state");
+}
+
+/// Regression test for the record/replay regular-file `lseek(SEEK_CUR)` bug.
+///
+/// Detcore's `handle_lseek` live-injected a seek on a non-procfs (regular-file)
+/// descriptor instead of routing it through the record/replay strategy. On
+/// replay the descriptor is a virtual placeholder whose kernel position never
+/// advances (reads are served from the log), so `lseek(fd, -N, SEEK_CUR)`
+/// returned 0 rather than the recorded offset -- the exact pattern glibc's
+/// `__tzfile_read` uses to rewind `/etc/localtime`. The wrong offset injected
+/// an extra read and desynchronized replay at `replayer/mod.rs`.
+///
+/// The fixture is created by the harness rather than by the guest, so it is not
+/// in the replay root and is served as a virtual placeholder on replay -- the
+/// descriptor shape that triggered the bug. Without the fix this aborts replay
+/// with a divergence panic; with it, record and replay stdout match.
+#[test]
+fn record_regular_file_lseek_seek_cur() {
+    let _guard = hermit_record_lock();
+    let fixture_dir = tempfile::tempdir().expect("failed to create lseek fixture directory");
+    let fixture = fixture_dir.path().join("fixture.bin");
+    let bytes: Vec<u8> = (0..1000u32).map(|i| ((i * 37 + 13) % 256) as u8).collect();
+    fs::write(&fixture, &bytes).expect("failed to write lseek fixture");
+    record_replay_command(
+        "regular-file-lseek-seek-cur",
+        &workload("c_lseek_seek_cur").path,
+        &[fixture.as_os_str()],
+    );
 }
 
 #[test]

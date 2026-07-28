@@ -51,6 +51,15 @@
       "hint": {"resources": {"kvm": 1}, "est_duration_s": 15,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
+    },
+    {
+      "group": "compat", "job": "rr_compat",
+      "desc": "Record/replay compatibility ratchet: `validate.sh --rr-compat-only` records and replays each of the 139 expected-pass programs (record start + replay --autopilot) and gates the R/R ratchet. Runs in the privileged lane because the corpus needs the full self-hosted toolchain (gcc/g++/binutils/java/ruby/node/python3/git/sqlite3); the record/replay path itself uses neither PMU preemption nor /dev/kvm, so no hardware resource is reserved.",
+      "cmd": "./validate.sh --rr-compat-only --no-label-pr --verbose",
+      "deps": ["build.privileged_tests"],
+      "timeout": 1500,
+      "hint": {"est_duration_s": 360, "rss_baseline_bytes": 4294967296,
+               "hard_mem_max_bytes": 8589934592, "classification": "latency-bound"}
     }
   ]
 }
