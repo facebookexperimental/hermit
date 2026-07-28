@@ -141,7 +141,7 @@ impl Plugin {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review SaBRe bootstrap-random isolation.
+    // TODO-HUMAN-REVIEW(PR-1117): Review SaBRe bootstrap-random isolation.
     fn handle_post_load_syscall(&self, syscall: &Syscall) -> Option<Result<usize, Errno>> {
         if !self.post_load_syscall_pending.swap(false, Ordering::AcqRel) {
             return None;
