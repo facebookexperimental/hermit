@@ -138,7 +138,7 @@ fn proc_fd_target(path: &Path) -> Option<(Option<u32>, i32)> {
     }
 }
 
-// TODO-HUMAN-REVIEW(PR-N): Review numeric virtual-self proc-fd path rewriting.
+// TODO-HUMAN-REVIEW(PR-1079): Review numeric virtual-self proc-fd path rewriting.
 fn host_self_proc_fd_alias(path: &Path, current_pid: i64) -> Option<PathBuf> {
     let (Some(subject), fd) = proc_fd_target(path)? else {
         return None;

@@ -472,7 +472,7 @@ fn prlimit_new_limit_is_readable(
     read(args[2] as usize, &mut limit)
 }
 
-// TODO-HUMAN-REVIEW(PR-N): Review fault-safe DBI multiplexed-IO input validation.
+// TODO-HUMAN-REVIEW(PR-1079): Review fault-safe DBI multiplexed-IO input validation.
 fn multiplexed_io_inputs_are_readable(
     sysnum: i64,
     args: &[u64],
