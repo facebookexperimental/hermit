@@ -46,6 +46,7 @@ Filters:
   --category CATEGORY     manifest category
   --test ID               exact category/test ID
   --include-occasional    include tests marked occasional
+  --include-manual        include a ci=false cell; requires exact --test and --mode
 
 The run command defaults to all CI-enabled, non-occasional cells in both lanes.
 Naked controls are meta-CI checks and run only when explicitly selected.
@@ -88,6 +89,7 @@ function normalize_metadata {
               backends: (.backends_enabled // []),
               disabled: (.backends_disabled // {}),
               args: (.args // []),
+              guest_args: (.guest_args // {}),
               assert: (.assert // {})
             } | del(.backends_enabled, .backends_disabled))))
         }
@@ -398,6 +400,7 @@ FORMAT=text
 RESULTS=
 JUNIT=
 INCLUDE_OCCASIONAL=0
+INCLUDE_MANUAL=0
 
 function parse_options {
     while (($#)); do
@@ -411,6 +414,7 @@ function parse_options {
             --results) RESULTS=${2:?missing result path}; shift 2 ;;
             --junit) JUNIT=${2:?missing JUnit path}; shift 2 ;;
             --include-occasional) INCLUDE_OCCASIONAL=1; shift ;;
+            --include-manual) INCLUDE_MANUAL=1; shift ;;
             -h|--help) usage; exit 0 ;;
             *) die "unknown option: $1" ;;
         esac
@@ -420,6 +424,10 @@ function parse_options {
     [[ -z $MODE_FILTER ]] || contains "$MODE_FILTER" "${MODES[@]}" || die "invalid mode: $MODE_FILTER"
     [[ -z $BACKEND_FILTER ]] || contains "$BACKEND_FILTER" "${BACKENDS[@]}" || die "invalid backend: $BACKEND_FILTER"
     [[ $FORMAT == text || $FORMAT == json ]] || die "invalid format: $FORMAT"
+    if ((INCLUDE_MANUAL)); then
+        [[ -n $TEST_FILTER && -n $MODE_FILTER ]] ||
+            die "--include-manual requires exact --test and --mode filters"
+    fi
 }
 
 function emit_required_plan {
@@ -432,6 +440,7 @@ function emit_required_plan {
         --arg backend_filter "$BACKEND_FILTER" \
         --arg category_filter "$CATEGORY_FILTER" \
         --arg test_filter "$TEST_FILTER" \
+        --argjson include_manual "$INCLUDE_MANUAL" \
         --argjson include_occasional "$INCLUDE_OCCASIONAL" '
         select($lane_filter == "" or .lane == $lane_filter)
         | select($category_filter == "" or .category == $category_filter)
@@ -440,7 +449,7 @@ function emit_required_plan {
         | . as $test
         | .modes | to_entries[]
         | select($mode_filter == "" or .key == $mode_filter)
-        | select(.value.ci == true or $mode_filter == "naked")
+        | select(.value.ci == true or $mode_filter == "naked" or $include_manual == 1)
         | . as $mode
         | if .key == "naked" then
             select($backend_filter == "")
@@ -609,11 +618,12 @@ function execute_attempt {
     local cell_dir=$5
     local attempt=$6
     local seed=${7:-}
-    local timeout_seconds stdout_file stderr_file guest_tmpdir kind
+    local timeout_seconds stdout_file stderr_file guest_tmpdir kind guest_backend
     timeout_seconds=$(jq -r .timeout_seconds <<<"$metadata")
     stdout_file="$cell_dir/captures/${mode}-${attempt}.stdout"
     stderr_file="$cell_dir/captures/${mode}-${attempt}.stderr"
     kind=$(jq -r .program_kind <<<"$metadata")
+    guest_backend=${backend:-native}
 
     rm -rf "$cell_dir/tmp"
     mkdir -p "$cell_dir/tmp"
@@ -634,12 +644,25 @@ function execute_attempt {
         E2E_TMPDIR="$guest_tmpdir"
         E2E_FIXTURE_DIR="$cell_dir/fixtures"
     )
-    local -a command guest_command profile run_args custom_args
+    local -a command guest_command profile run_args guest_args custom_args
     mapfile -t run_args < <(jq -r '.run_args[]' <<<"$metadata")
+    mapfile -t guest_args < <(
+        jq -r --arg mode "$mode" --arg backend "$guest_backend" \
+            '.modes[$mode].guest_args[$backend][]?' <<<"$metadata"
+    )
     case "$kind" in
-        c|rust) guest_command=("$cell_dir/fixtures/program" "${run_args[@]}") ;;
-        shell) guest_command=("$test" "${run_args[@]}") ;;
-        direct) guest_command=(bash -c "$(jq -r .direct_command <<<"$metadata")") ;;
+        c|rust)
+            guest_command=("$cell_dir/fixtures/program" "${run_args[@]}" "${guest_args[@]}")
+            ;;
+        shell)
+            guest_command=("$test" "${run_args[@]}" "${guest_args[@]}")
+            ;;
+        direct)
+            guest_command=(bash -c "$(jq -r .direct_command <<<"$metadata")")
+            if ((${#guest_args[@]})); then
+                guest_command+=(-- "${guest_args[@]}")
+            fi
+            ;;
         *) die "internal error: unsupported program kind $kind" ;;
     esac
     profile=()
@@ -685,7 +708,7 @@ function execute_attempt {
 
 function append_result {
     local test_id=$1 category=$2 lane=$3 mode=$4 backend=$5 outcome=$6 duration_ms=$7 reason=$8
-    local test_file test_sha256 binary_sha256 effective_args relaxations log_level
+    local test_file test_sha256 binary_sha256 effective_args guest_args guest_backend relaxations log_level
     test_file=${TEST_BY_ID[$test_id]}
     if [[ -f $test_file ]]; then
         test_sha256=$(sha256sum "$test_file" | cut -d' ' -f1)
@@ -697,6 +720,9 @@ function append_result {
     else
         binary_sha256=
     fi
+    guest_backend=${backend:-native}
+    guest_args=$(jq -c --arg mode "$mode" --arg backend "$guest_backend" \
+        '.modes[$mode].guest_args[$backend] // []' <<<"${METADATA_BY_ID[$test_id]}")
     relaxations='[]'
     case "$mode" in
         naked)
@@ -743,6 +769,7 @@ function append_result {
         --arg log_level "$log_level" \
         --argjson duration_ms "$duration_ms" \
         --argjson effective_args "$effective_args" \
+        --argjson guest_args "$guest_args" \
         --argjson relaxations "$relaxations" \
         '{schema:1,run_id:$run_id,hermit_sha:$hermit_sha,source_tree_dirty:$source_tree_dirty,
           binary_sha256:(if $binary_sha256 == "" then null else $binary_sha256 end),
@@ -750,7 +777,8 @@ function append_result {
           backend:(if $backend == "" then null else $backend end),classification:"required",
           outcome:$outcome,duration_ms:$duration_ms,
           log_level:(if $log_level == "" then null else $log_level end),
-          effective_args:$effective_args,relaxations:$relaxations,preprocessor:null,
+          effective_args:$effective_args,guest_args:$guest_args,
+          relaxations:$relaxations,preprocessor:null,
           reason:(if $reason == "" then null else $reason end)}' >>"$RESULTS"
 }
 

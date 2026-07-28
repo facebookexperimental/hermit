@@ -66,14 +66,31 @@ The mode contracts are:
 | `naked` | Opt-in meta-CI only; run natively three to five times and require declared variation |
 | `custom` | Run declared edge-case Hermit arguments and require three to five identical observations |
 
+Any mode may declare backend-specific guest arguments. The harness appends
+these after the guest executable, separately from Hermit's own arguments:
+
+```toml
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace", "kvm"]
+guest_args = { ptrace = ["multi"], kvm = ["multi"] }
+```
+
+Every `guest_args` key must name an enabled backend. Omitted backends receive
+no guest arguments.
+
 `naked` must set `ci = false`; it runs only when explicitly selected. A mode
 with no enabled backend remains visible with `ci = false` and a reason for
 every disabled backend. Regular CI executes only cells with `ci = true`;
-selecting a mode explicitly also exposes enabled manual cells:
+run one enabled manual cell with explicit test and mode filters:
 
 ```sh
-./ci/test_harness.sh run --mode verify --test c-programs/add-key-enosys
+./ci/test_harness.sh run --include-manual --mode verify \
+  --test c-programs/add-key-enosys
 ```
+
+`--include-manual` requires both exact filters so a broad CI command cannot
+accidentally pull the uncalibrated corpus into its run plan.
 
 ## Inventory and validation
 

@@ -422,7 +422,7 @@ fn validate_mode(
     let spec = spec_value
         .as_table()
         .unwrap_or_else(|| die(format!("{id}: modes.{mode} must be a table")));
-    let mut allowed = vec!["ci", "backends_enabled", "backends_disabled"];
+    let mut allowed = vec!["ci", "backends_enabled", "backends_disabled", "guest_args"];
     match mode {
         "naked" => allowed.extend(["runs", "assert"]),
         "chaos" => allowed.extend(["seeds", "assert"]),
@@ -473,6 +473,28 @@ fn validate_mode(
             "{id}: modes.{mode} must partition {:?}; enabled={enabled_set:?}, disabled={disabled_set:?}",
             expected
         ));
+    }
+    if let Some(guest_args) = spec.get("guest_args") {
+        let guest_args = guest_args
+            .as_table()
+            .unwrap_or_else(|| die(format!("{id}: modes.{mode}.guest_args must be a table")));
+        for (backend, args) in guest_args {
+            if !enabled_set.contains(backend.as_str()) {
+                die(format!(
+                    "{id}: modes.{mode}.guest_args.{backend} names a backend that is not enabled"
+                ));
+            }
+            if string_array(
+                Some(args),
+                &format!("{id}.modes.{mode}.guest_args.{backend}"),
+            )
+            .is_empty()
+            {
+                die(format!(
+                    "{id}: modes.{mode}.guest_args.{backend} must contain at least one argument"
+                ));
+            }
+        }
     }
     if ci && enabled.is_empty() {
         die(format!(
@@ -653,6 +675,7 @@ min_distinct = 2
             r#"
 ci = true
 backends_enabled = ["ptrace"]
+guest_args = { ptrace = ["multi"] }
 
 [backends_disabled]
 dbi = "unsupported"
@@ -673,6 +696,32 @@ liteinst = "unsupported"
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].backend, "ptrace");
         assert!(rows[0].ci);
+    }
+
+    #[test]
+    #[should_panic(expected = "names a backend that is not enabled")]
+    fn rejects_guest_args_for_disabled_backend() {
+        let spec = parse_mode(
+            r#"
+ci = false
+backends_enabled = ["ptrace"]
+guest_args = { kvm = ["--kvm"] }
+
+[backends_disabled]
+dbi = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &spec,
+            &mut Vec::new(),
+        );
     }
 
     #[cfg(unix)]
