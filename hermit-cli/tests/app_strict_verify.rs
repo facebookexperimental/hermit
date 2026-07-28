@@ -665,3 +665,139 @@ fn make_gcc_build_is_l1_deterministic_under_strict() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Git subprocess/pipe/pack-negotiation coverage.
+
+/// Build a tiny two-commit Git repository with a fixed identity and fixed
+/// author/committer dates so the fixture is byte-reproducible across hosts and
+/// independent of host `git` config and wall-clock time. Returns the path to
+/// the repository top level, suitable for use in a `file://` clone URL.
+fn build_git_fixture(git: &Path, dir: &Path) -> PathBuf {
+    let src = dir.join("src");
+    fs::create_dir_all(&src).unwrap_or_else(|error| {
+        panic!(
+            "failed to create git fixture dir {}: {error}",
+            src.display()
+        )
+    });
+
+    // Configure every fixture git invocation with a deterministic identity and
+    // timestamp, and neutralize host git config, so the resulting pack is the
+    // same regardless of who runs the test.
+    let git_command = |args: &[&str]| -> Command {
+        let mut command = Command::new(git);
+        command
+            .current_dir(&src)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "hermit-test")
+            .env("GIT_AUTHOR_EMAIL", "hermit-test@example.com")
+            .env("GIT_COMMITTER_NAME", "hermit-test")
+            .env("GIT_COMMITTER_EMAIL", "hermit-test@example.com")
+            .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00 +0000")
+            .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00 +0000")
+            .args(args);
+        command
+    };
+
+    run_build(git_command(&["init", "-q", "-b", "main"]), "git init");
+
+    fs::write(src.join("a.txt"), b"hello\n").expect("failed to write fixture a.txt");
+    fs::create_dir_all(src.join("d")).expect("failed to create fixture subdir");
+    fs::write(src.join("d/b.txt"), b"world\n").expect("failed to write fixture d/b.txt");
+
+    run_build(git_command(&["add", "-A"]), "git add");
+    run_build(git_command(&["commit", "-q", "-m", "c1"]), "git commit c1");
+
+    fs::write(src.join("a.txt"), b"hello\nmore\n").expect("failed to rewrite fixture a.txt");
+    run_build(
+        git_command(&["commit", "-q", "-a", "-m", "c2"]),
+        "git commit c2",
+    );
+
+    src
+}
+
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + git"]
+fn git_clone_file_protocol_is_l1_deterministic_under_strict() {
+    // `git clone file://<src> <dest>` spawns a child `git-upload-pack`, talks to
+    // it over pipes, negotiates a pack, and runs `git-index-pack` on the result.
+    // Two independent `hermit run --strict` clones produce byte-identical
+    // working trees and the same resolved HEAD (assurance level L1).
+    //
+    // This is asserted at L1 (two independent `--strict` runs) rather than via
+    // the built-in `--verify` two-run path. `git clone` is *usually* L2 under
+    // `--strict --verify`, but the fork/exec/pipe scheduling of the git
+    // subprocess tree diverges rarely (~1 run in 25 observed on ptrace) -- the
+    // same vfork / BlockingExternalIO scheduling nondeterminism that makes
+    // gcc/make flaky under `--verify`. The clone *output* is content-addressed
+    // by git and therefore stable, so the L1 comparison of the resulting trees
+    // is the durable, non-flaky regression signal. See
+    // `make_gcc_build_is_l1_deterministic_under_strict` for the same
+    // L1-vs-`--verify` rationale.
+    //
+    // The fixture and clone targets live under `CARGO_TARGET_TMPDIR` (under
+    // `target/` on the real filesystem, not Hermit's isolated guest `/tmp`), so
+    // they are visible to the guest -- a `/tmp` fixture would be invisible and
+    // the clone would fail with "does not appear to be a git repository".
+    let git = required_app("git", &["/usr/bin/git", "/usr/local/bin/git"]);
+    let sh = required_app("sh", &["/bin/sh", "/usr/bin/sh"]);
+
+    let dir = build_dir("git-clone");
+    let src = build_git_fixture(&git, &dir);
+
+    // The checked-out working tree the clone should reproduce identically.
+    const CHECKED_OUT: [&str; 2] = ["a.txt", "d/b.txt"];
+
+    let _guard = hermit_run_lock();
+
+    let mut heads: Vec<String> = Vec::new();
+    let mut trees: Vec<Vec<Vec<u8>>> = Vec::new();
+    for run in 0..2 {
+        // Clone into a distinct absolute path each run so a stale directory can
+        // never mask nondeterminism and no path is embedded in the comparison.
+        let dest = dir.join(format!("dest{run}"));
+        let _ = fs::remove_dir_all(&dest);
+        let script = format!(
+            "GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+             '{git}' clone -q 'file://{src}' '{dest}' && \
+             '{git}' -C '{dest}' rev-parse HEAD",
+            git = git.display(),
+            src = src.display(),
+            dest = dest.display(),
+        );
+        let output = run_once_under_strict(&sh, &["-c", &script]);
+        assert!(
+            output.status.success(),
+            "hermit run --strict git clone (run {run}) failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        heads.push(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        let tree = CHECKED_OUT
+            .iter()
+            .map(|name| {
+                let path = dest.join(name);
+                fs::read(&path).unwrap_or_else(|error| {
+                    panic!("clone did not check out {}: {error}", path.display())
+                })
+            })
+            .collect();
+        trees.push(tree);
+    }
+
+    assert_eq!(
+        heads[0], heads[1],
+        "git clone resolved different HEADs across two --strict runs ({} vs {})",
+        heads[0], heads[1],
+    );
+    for (idx, name) in CHECKED_OUT.iter().enumerate() {
+        assert_eq!(
+            trees[0][idx], trees[1][idx],
+            "git clone produced a non-deterministic `{name}` across two --strict runs (not even L1)"
+        );
+    }
+}
