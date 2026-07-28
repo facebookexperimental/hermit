@@ -35,13 +35,27 @@
 //!   runtimes' scheduling, GC, and static
 //!   initialization are fully determinized.
 //! - **L1 only (output-deterministic under `--strict`, but `--verify`'s
-//!   internal two-run log diff diverges):** the `javac` toolchain driver. Its
-//!   exit code and emitted `.class` are stable across strict runs, but Hermit's
-//!   `--verify` reports `Failure: nondeterministic`, so it is asserted at L1.
+//!   internal two-run log diff diverges):** toolchain drivers such as `javac`
+//!   and a `make`-driven `gcc` build. Their exit code and emitted artifacts are
+//!   byte-stable across strict runs, but Hermit's `--verify` reports `Failure:
+//!   nondeterministic`, so they are asserted at L1.
 //!
 //! The compiled-guest tests build their guests with the host `go`/`javac`
 //! toolchain first and then run the resulting artifact under Hermit, which
 //! isolates managed-runtime determinism from compiler determinism.
+//!
+//! # Why toolchain builds are asserted at L1, not L2
+//!
+//! A build that writes its outputs into the working directory cannot be checked
+//! with the built-in `--verify` path: Hermit runs the guest twice in the *same*
+//! directory, so the second run observes the object files and executable the
+//! first run created. That is a filesystem-state difference (e.g. an early
+//! `newfstatat("app")` returns `ENOENT` in run 1 but `S_IFREG` in run 2), which
+//! is outside Hermit's determinism contract ("Hermit does not make a changing
+//! filesystem deterministic"), not compiler or scheduler nondeterminism. The
+//! `make`+`gcc` test therefore isolates build determinism by compiling into two
+//! separate directories with distinct absolute paths and byte-comparing the
+//! resulting artifacts, exactly as the `javac` L1 test does.
 
 use std::fs;
 use std::io::Read;
@@ -484,4 +498,150 @@ fn javac_is_l1_deterministic_under_strict() {
         class_bytes[0], class_bytes[1],
         "javac emitted a non-deterministic class file across two --strict runs (not even L1)"
     );
+}
+
+// --- L1: a make-driven gcc build is artifact-deterministic under --strict ---
+
+const MAKE_BUILD_MATHLIB_H: &str = r#"#ifndef MATHLIB_H
+#define MATHLIB_H
+long fib(int n);
+long fact(int n);
+#endif
+"#;
+
+const MAKE_BUILD_MATHLIB_C: &str = r#"#include "mathlib.h"
+long fib(int n) {
+    long a = 0, b = 1;
+    for (int i = 0; i < n; i++) {
+        long t = a + b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+long fact(int n) {
+    long r = 1;
+    for (int i = 2; i <= n; i++) {
+        r *= i;
+    }
+    return r;
+}
+"#;
+
+const MAKE_BUILD_MAIN_C: &str = r#"#include <stdio.h>
+#include "mathlib.h"
+int main(void) {
+    for (int i = 0; i < 15; i++) {
+        printf("fib(%d)=%ld fact(%d)=%ld\n", i, fib(i), i, fact(i));
+    }
+    return 0;
+}
+"#;
+
+// Recipe lines are tab-indented, as make requires. Flags are chosen for a
+// reproducible build: -g0 drops DWARF (which would embed the build path),
+// -fno-ident drops the toolchain `.comment`, and -ffile-prefix-map normalizes
+// any embedded build path so artifacts do not depend on the absolute build dir.
+const MAKE_BUILD_MAKEFILE: &str = "\
+CC = gcc\n\
+CFLAGS = -O2 -g0 -fno-ident -ffile-prefix-map=$(CURDIR)=. -Wall\n\
+OBJS = mathlib.o main.o\n\
+\n\
+app: $(OBJS)\n\
+\t$(CC) $(CFLAGS) -o app $(OBJS)\n\
+\n\
+%.o: %.c mathlib.h\n\
+\t$(CC) $(CFLAGS) -c -o $@ $<\n\
+\n\
+clean:\n\
+\trm -f $(OBJS) app\n";
+
+/// Write the minimal `make`+`gcc` project into `dir`.
+fn write_make_project(dir: &Path) {
+    for (name, contents) in [
+        ("mathlib.h", MAKE_BUILD_MATHLIB_H),
+        ("mathlib.c", MAKE_BUILD_MATHLIB_C),
+        ("main.c", MAKE_BUILD_MAIN_C),
+        ("Makefile", MAKE_BUILD_MAKEFILE),
+    ] {
+        let path = dir.join(name);
+        fs::write(&path, contents)
+            .unwrap_or_else(|error| panic!("failed to write {}: {error}", path.display()));
+    }
+}
+
+/// Run `hermit run --strict -- make -B app` with the guest working directory set
+/// to `project_dir`, returning the process output.
+///
+/// Unlike [`run_once_under_strict`], the working directory matters: `make` and
+/// the `gcc` children it spawns resolve the sources and place the artifacts
+/// relative to the cwd, and Hermit gives the guest a private `/tmp`, so an
+/// absolute `make -C /tmp/...` path would not be visible inside the guest. The
+/// inherited cwd is, which is what lets the build find its inputs and write its
+/// outputs where the test reads them back.
+fn run_make_under_strict(make: &Path, project_dir: &Path) -> Output {
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after", HERMIT_VERIFY_KILL_AFTER])
+        .arg(hermit_verify_timeout())
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=off",
+            "run",
+            "--strict",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+        ])
+        .arg(make)
+        .args(["-B", "app"])
+        .current_dir(project_dir);
+
+    run_hermit_command(command)
+}
+
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + make + a C compiler"]
+fn make_gcc_build_is_l1_deterministic_under_strict() {
+    // A `make`-driven C build (make invoking gcc: two translation units plus a
+    // link) produces byte-identical object files and a byte-identical executable
+    // across independent `hermit run --strict` builds (assurance level L1). Like
+    // `javac`, it is asserted at L1 rather than via `--verify`; see the module
+    // docs for why an in-place build defeats `--verify`'s two-run,
+    // same-directory check. Building into two directories with distinct absolute
+    // paths also proves the artifacts do not embed the build path.
+    let make = required_app("make", &["/usr/bin/make", "/usr/local/bin/make"]);
+
+    let _guard = hermit_run_lock();
+
+    const ARTIFACTS: [&str; 3] = ["mathlib.o", "main.o", "app"];
+    let mut builds: Vec<Vec<Vec<u8>>> = Vec::new();
+    for run in 0..2 {
+        let dir = build_dir(&format!("make_gcc_l1_out{run}"));
+        write_make_project(&dir);
+        let output = run_make_under_strict(&make, &dir);
+        assert!(
+            output.status.success(),
+            "hermit run --strict make (run {run}) failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let built = ARTIFACTS
+            .iter()
+            .map(|name| {
+                let path = dir.join(name);
+                fs::read(&path)
+                    .unwrap_or_else(|error| panic!("make did not emit {}: {error}", path.display()))
+            })
+            .collect();
+        builds.push(built);
+    }
+
+    for (idx, name) in ARTIFACTS.iter().enumerate() {
+        assert_eq!(
+            builds[0][idx], builds[1][idx],
+            "make+gcc produced a non-deterministic `{name}` across two --strict runs (not even L1)"
+        );
+    }
 }
