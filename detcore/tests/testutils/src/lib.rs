@@ -135,6 +135,8 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     interrupt_at: vec![],
     fuzz_futexes: false,
     chaos_target_races: false,
+    chaos_per_thread_slowdown: false,
+    chaos_slowdown_max_factor: 10.0,
 });
 
 /// Standardized test config: common options on.
@@ -205,6 +207,8 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     interrupt_at: vec![],
     fuzz_futexes: false,
     chaos_target_races: false,
+    chaos_per_thread_slowdown: false,
+    chaos_slowdown_max_factor: 10.0,
 });
 
 /// Standardized test config: all options on.
@@ -275,6 +279,8 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     interrupt_at: vec![],
     fuzz_futexes: false,
     chaos_target_races: false,
+    chaos_per_thread_slowdown: false,
+    chaos_slowdown_max_factor: 10.0,
 });
 
 /// A basic oracle, which expects a success exit code.

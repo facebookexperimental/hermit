@@ -206,6 +206,32 @@ pub struct Config {
     #[clap(long)]
     pub chaos_target_races: bool,
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1069)
+    /// RR-style stable per-thread slowdown factors. When set (with `--chaos`),
+    /// each thread is assigned a slowdown factor that is CONSTANT for the whole
+    /// run — some threads are consistently slower, some faster — rather than
+    /// redrawing a fresh scheduling priority every timeslice (which averages out
+    /// over a long run by the law of large numbers). The factor scales the mean
+    /// chaos timeslice length only (an out-of-band scheduling budget); it does
+    /// NOT scale guest-visible virtual time, so determinism is preserved and the
+    /// mode is `--strict`-safe. The factor is a pure, replayable function of the
+    /// scheduler seed and the thread's deterministic id, so a fixed seed
+    /// reproduces the same per-thread factors. Mirrors rr's `--nested` /
+    /// chaos-mode per-task priority idea.
+    #[clap(long)]
+    pub chaos_per_thread_slowdown: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1069)
+    /// Maximum ratio between the slowest and fastest per-thread slowdown factor
+    /// for `--chaos-per-thread-slowdown`. Each thread's factor is drawn
+    /// log-uniformly from `[1/R, R]` where `R` is this value, so a thread's mean
+    /// timeslice can be up to `R`x longer or `1/R`x shorter than nominal. Must be
+    /// `>= 1.0`; `1.0` disables the spread (all threads nominal). Default 10.0.
+    #[clap(long, default_value = "10.0", value_name = "double")]
+    pub chaos_slowdown_max_factor: f64,
+
     /// Record the timing of preemption events for future replay or experimentation.
     /// This is only useful in chaos modes.
     #[clap(long)]
@@ -479,6 +505,13 @@ impl Config {
     pub fn validate_invariants(&self) {
         assert!(self.sched_sticky_random_param >= 0.0);
         assert!(self.sched_sticky_random_param <= 1.0);
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1069)
+        assert!(
+            self.chaos_slowdown_max_factor.is_finite() && self.chaos_slowdown_max_factor >= 1.0,
+            "chaos_slowdown_max_factor must be finite and >= 1.0, got {}",
+            self.chaos_slowdown_max_factor
+        );
         if let Some(multiplier) = self.clock_multiplier {
             assert!(
                 multiplier.is_finite() && multiplier > 0.0,
@@ -632,6 +665,16 @@ impl fmt::Display for Config {
         }
         if self.chaos_target_races {
             write!(f, " --chaos-target-races")?;
+        }
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1069)
+        if self.chaos_per_thread_slowdown {
+            write!(f, " --chaos-per-thread-slowdown")?;
+            write!(
+                f,
+                " --chaos-slowdown-max-factor={}",
+                self.chaos_slowdown_max_factor
+            )?;
         }
         if let Some(m) = self.clock_multiplier {
             write!(f, " --clock-multiplier={}", m)?;
@@ -1059,6 +1102,50 @@ mod tests {
 
         config.runs_post_fork = RunsPostFork::Random;
         assert!(config.to_string().contains(" --runs-post-fork=random"));
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1069)
+    #[test]
+    fn chaos_per_thread_slowdown_is_opt_in_and_round_trips() {
+        // Off by default; the factor default is present but inert.
+        let dflt = Config::default();
+        assert!(!dflt.chaos_per_thread_slowdown);
+        assert_eq!(dflt.chaos_slowdown_max_factor, 10.0);
+        // Default (disabled) config does not emit the flags.
+        assert!(!dflt.to_string().contains("--chaos-per-thread-slowdown"));
+
+        let config = Config::parse_from([
+            "detcore",
+            "--chaos",
+            "--chaos-per-thread-slowdown",
+            "--chaos-slowdown-max-factor=4.5",
+        ]);
+        assert!(config.chaos_per_thread_slowdown);
+        assert_eq!(config.chaos_slowdown_max_factor, 4.5);
+
+        // The Display round-trips both flags into the recorded schedule artifact.
+        let rendered = config.to_string();
+        assert!(rendered.contains(" --chaos-per-thread-slowdown"));
+        assert!(rendered.contains(" --chaos-slowdown-max-factor=4.5"));
+        let reparsed = Config::parse_from(
+            std::iter::once("detcore".to_string())
+                .chain(rendered.split_whitespace().map(String::from)),
+        );
+        assert!(reparsed.chaos_per_thread_slowdown);
+        assert_eq!(reparsed.chaos_slowdown_max_factor, 4.5);
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1069)
+    #[test]
+    #[should_panic(expected = "chaos_slowdown_max_factor must be finite and >= 1.0")]
+    fn validate_rejects_chaos_slowdown_max_factor_below_one() {
+        let mut config = Config {
+            chaos_slowdown_max_factor: 0.5,
+            ..Default::default()
+        };
+        config.validate();
     }
 
     #[test]

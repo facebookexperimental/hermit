@@ -215,6 +215,8 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         interrupt_at: vec![],
         fuzz_futexes: false,
         chaos_target_races: false,
+        chaos_per_thread_slowdown: false,
+        chaos_slowdown_max_factor: 10.0,
         fuzz_seed: None,
     };
     if config.max_timeslice.is_some() && !reverie_ptrace::is_perf_supported() {

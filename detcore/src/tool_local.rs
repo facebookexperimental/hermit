@@ -25,6 +25,7 @@ use nix::fcntl::OFlag;
 use nix::sys::stat;
 use nix::unistd::Pid;
 use rand::Rng as _;
+use rand::RngExt as _;
 use rand::SeedableRng;
 use rand_distr::Distribution;
 use rand_distr::Exp;
@@ -1289,6 +1290,52 @@ fn from_atflags(flags: AtFlags) -> OFlag {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1069)
+/// RR-style stable per-thread slowdown factor for chaos scheduling.
+///
+/// Returns the multiplier applied to a thread's *mean* chaos timeslice length.
+/// A factor `> 1.0` means the thread is preempted less often (runs "faster"
+/// between preemptions — a slower relative wall-clock for its peers), `< 1.0`
+/// means it is preempted more often. The factor is drawn log-uniformly from
+/// `[1/max_factor, max_factor]`, so slow and fast are symmetric in log-space
+/// and `1.0` is the geometric center.
+///
+/// The value is a **pure, deterministic function** of `(sched_seed, dettid)`:
+/// it depends on no run-order, no wall-clock, and no shared PRNG state, so it
+/// is stable for a thread across the whole run and reproducible under a fixed
+/// seed (unlike the per-timeslice `chaos_prng` draw, which is redrawn every
+/// slice and averages out over a long run). Threads are perturbed by a fixed
+/// constant so the factor stream differs from other seed-derived streams (e.g.
+/// `post_fork_prng`) that also start from `sched_seed`.
+///
+/// `max_factor <= 1.0` disables the spread and returns `1.0` (nominal) for
+/// every thread; callers validate `max_factor >= 1.0`.
+pub(crate) fn chaos_per_thread_slowdown_factor(
+    sched_seed: u64,
+    dettid: DetTid,
+    max_factor: f64,
+) -> f64 {
+    // `<=` (rather than `!(max_factor > 1.0)`) keeps clippy's partial-ord lint
+    // happy; validate_invariants already rejects non-finite factors upstream.
+    if max_factor <= 1.0 {
+        return 1.0;
+    }
+    // Mix the seed with the (stable) deterministic thread id to give each
+    // thread its own point in the factor distribution. The salt keeps this
+    // stream distinct from other sched_seed-derived streams.
+    const SLOWDOWN_SALT: u64 = 0x736c_6f77_646f_776e; // "slowdown"
+    let mixed = sched_seed
+        ^ SLOWDOWN_SALT
+        ^ ((dettid.as_raw() as u32 as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    let mut prng = Pcg64Mcg::seed_from_u64(mixed);
+    // u in [0,1); map to exponent in [-1, 1) then factor = max_factor^exp,
+    // i.e. a log-uniform draw over [1/max_factor, max_factor).
+    let u: f64 = prng.random::<f64>();
+    let exponent = 2.0 * u - 1.0;
+    max_factor.powf(exponent)
+}
+
 impl<T> ThreadState<T> {
     pub(crate) fn observe_guest_clock(&self, raw: LogicalTime, epoch: LogicalTime) -> LogicalTime {
         self.guest_clock
@@ -1712,7 +1759,32 @@ impl<T> ThreadState<T> {
                 }
             } else {
                 let nanos_per_rcb = NANOS_PER_RCB * cfg.clock_multiplier.unwrap_or(1.0);
-                let target_timeout_rcbs = u64::from(timeout_ns) as f64 / nanos_per_rcb;
+                let mut target_timeout_rcbs = u64::from(timeout_ns) as f64 / nanos_per_rcb;
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-1069)
+                // RR-style stable per-thread slowdown: scale the MEAN chaos
+                // timeslice length by a factor that is constant for this thread
+                // over the whole run (a slower thread gets longer slices, so it
+                // is preempted less often and effectively runs "slower" relative
+                // to its peers). This is an out-of-band scheduling budget: it
+                // changes only WHEN preemptions happen, never the guest-visible
+                // ns-per-RCB mapping, so determinism (L1/L2) is preserved and
+                // the mode is --strict-safe. The factor is a pure function of
+                // (sched_seed, dettid), hence replayable under a fixed seed.
+                if cfg.chaos && cfg.chaos_per_thread_slowdown {
+                    let factor = chaos_per_thread_slowdown_factor(
+                        cfg.sched_seed(),
+                        self.dettid,
+                        cfg.chaos_slowdown_max_factor,
+                    );
+                    target_timeout_rcbs *= factor;
+                    detlog!(
+                        "[dtid {}] CHAOSSLOWDOWN => factor = {}, scaled mean rcbs = {}",
+                        self.dettid,
+                        factor,
+                        target_timeout_rcbs
+                    );
+                }
                 let next_rcbs: u64 = if cfg.chaos {
                     // Average frequency of preemptions per nanosecond:
                     let lambda = 1.0 / target_timeout_rcbs;
@@ -1886,6 +1958,63 @@ mod timeslice_tests {
         assert_eq!(state.open_file_creator, None);
         state.set_open_file_creator(virtual_tid);
         assert_eq!(state.open_file_creator, Some(virtual_tid));
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1069)
+    #[test]
+    fn chaos_per_thread_slowdown_factor_is_stable_and_deterministic() {
+        let seed = 0xdead_beef_u64;
+        let max_factor = 10.0;
+        // Deterministic: same (seed, dettid) -> identical factor, every call.
+        for raw in 1..=64 {
+            let tid = DetTid::from_raw(raw);
+            let a = chaos_per_thread_slowdown_factor(seed, tid, max_factor);
+            let b = chaos_per_thread_slowdown_factor(seed, tid, max_factor);
+            assert_eq!(a, b, "factor must be a pure function of (seed, dettid)");
+            // Log-uniform in [1/R, R].
+            assert!(
+                a >= 1.0 / max_factor - 1e-9 && a <= max_factor + 1e-9,
+                "factor {} out of [1/{max_factor}, {max_factor}] for tid {raw}",
+                a
+            );
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1069)
+    #[test]
+    fn chaos_per_thread_slowdown_factor_varies_across_threads_and_seeds() {
+        let max_factor = 10.0;
+        // Different threads (same seed) get a spread of factors, not all equal.
+        let factors: Vec<f64> = (1..=32)
+            .map(|raw| chaos_per_thread_slowdown_factor(1234, DetTid::from_raw(raw), max_factor))
+            .collect();
+        let first = factors[0];
+        assert!(
+            factors.iter().any(|&f| (f - first).abs() > 1e-6),
+            "per-thread factors should differ across threads"
+        );
+        // Different seeds give a different factor for the same thread.
+        let tid = DetTid::from_raw(7);
+        let f_a = chaos_per_thread_slowdown_factor(1, tid, max_factor);
+        let f_b = chaos_per_thread_slowdown_factor(2, tid, max_factor);
+        assert!(
+            (f_a - f_b).abs() > 1e-12,
+            "different seeds should yield different factors for the same thread"
+        );
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1069)
+    #[test]
+    fn chaos_per_thread_slowdown_factor_disabled_when_max_factor_at_most_one() {
+        // max_factor <= 1.0 disables the spread: every thread is nominal (1.0).
+        for raw in 1..=16 {
+            let tid = DetTid::from_raw(raw);
+            assert_eq!(chaos_per_thread_slowdown_factor(99, tid, 1.0), 1.0);
+            assert_eq!(chaos_per_thread_slowdown_factor(99, tid, 0.5), 1.0);
+        }
     }
 
     fn cpu_snapshot(
