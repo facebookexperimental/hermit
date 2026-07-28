@@ -5,8 +5,15 @@ edition = "2024"
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
 
+# This crate is a preload runtime, not a testable library. Its `.init_array`
+# constructor (src/lib.rs) runs before any Rust test harness and `_exit(127)`s
+# when `REVERIE_LITEINST_COORDINATOR` is unset, so a generated unit-test binary
+# aborts during `nextest --list`. Disable the test/doctest targets: correctness
+# is validated by integrated preload runs, not by an in-process harness.
 [lib]
 crate-type = ["cdylib"]
+test = false
+doctest = false
 
 [dependencies]
 detcore = { version = "0.0.0", path = "../detcore" }

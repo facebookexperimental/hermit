@@ -226,6 +226,58 @@ fn assert_clone_boundary(mode: &str, operation: &str) {
     assert!(!stderr.contains("Bad system call"), "{stderr}");
 }
 
+/// Path to the freshly built `libdetcore_liteinst.so` preload runtime.
+///
+/// [`liteinst_runtime::ensure_liteinst_runtime`] builds it beside the Hermit
+/// test binary, so it lives in the same profile directory.
+fn liteinst_runtime_library() -> PathBuf {
+    liteinst_runtime::ensure_liteinst_runtime();
+    Path::new(env!("CARGO_BIN_EXE_hermit"))
+        .parent()
+        .expect("Hermit test binary should have a profile directory")
+        .join("libdetcore_liteinst.so")
+}
+
+/// Regression guard for the nextest-exclusion fix (`[lib] test = false` in
+/// `detcore-liteinst/Cargo.toml`).
+///
+/// The manifest change only disables the generated unit-test binary; it must
+/// NOT weaken the constructor's fail-closed behavior. Loading the cdylib as a
+/// bare `LD_PRELOAD` without the coordinator socket must still `_exit(127)` from
+/// the `.init_array` constructor before the host program runs — exactly the
+/// abort that broke `nextest --list`, which is now proven to be a deliberate,
+/// preserved security property rather than an accident.
+#[test]
+fn liteinst_preload_fails_closed_without_coordinator_env() {
+    let runtime = liteinst_runtime_library();
+    assert!(
+        runtime.is_file(),
+        "expected LiteInst preload runtime at {}",
+        runtime.display(),
+    );
+
+    let output = Command::new("/bin/true")
+        .env(reverie_liteinst::COORDINATOR_ENV, "") // ensure any inherited value is overwritten...
+        .env_remove(reverie_liteinst::COORDINATOR_ENV) // ...then removed entirely
+        .env("LD_PRELOAD", &runtime)
+        .output()
+        .expect("failed to launch /bin/true under the LiteInst preload");
+
+    assert_eq!(
+        output.status.code(),
+        Some(127),
+        "preload must fail closed with exit 127\nstatus={:?}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("coordinator socket environment variable is missing"),
+        "expected fail-closed diagnostic; stderr={stderr}",
+    );
+}
+
 #[test]
 fn liteinst_thread_clone_fails_closed_without_sigsys() {
     assert_clone_boundary("threads", "pthread_create: Operation not supported");
