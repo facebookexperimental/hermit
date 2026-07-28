@@ -27,8 +27,13 @@
 //!      then reports PASS/FAIL per cell. `--dry-run` prints the commands instead.
 //!   3. **DAG generation.** `dag` emits a `safe-ci-dag-runner` plan (the exact
 //!      `ci/dag/*.json` shape: `resource_caps` / `steps` with `group`/`job`/
-//!      `cmd`/`deps`/`timeout`/`hint`) so manifest buckets run as boxed,
-//!      dependency-ordered nodes via `ci/run-dag.sh`.
+//!      `cmd`/`deps`/`timeout`/`hint`) in the owner's `build -> fan-out` shape:
+//!      a `build-all-c` node (`build-all`, compiles every guest for the lane,
+//!      depends only on cc so it runs in PARALLEL with `cargo build --workspace`)
+//!      fans out to one boxed `run_<bucket>` node per manifest bucket. Each
+//!      bucket node runs with `--no-build` against the prebuilt guests and is
+//!      serialized on the single `hermit_guest` resource. Driven via
+//!      `ci/run-dag.sh`.
 //!
 //! Validation is delegated to `manifest-plan.rs` so the schema rules live in one
 //! place; `validate`/`plan` here are thin proxies to it.
@@ -36,10 +41,11 @@
 //! Usage:
 //!   ./manifest-harness.rs validate
 //!   ./manifest-harness.rs plan [--format text|json] [--lane L]
-//!   ./manifest-harness.rs build <test-id> [--out DIR]
-//!   ./manifest-harness.rs run   <test-id> [--mode M] [--backend B] [--dry-run]
-//!   ./manifest-harness.rs run   --bucket B --lane L [--dry-run]
-//!   ./manifest-harness.rs dag   [--lane portable|privileged] [--format json]
+//!   ./manifest-harness.rs build     <test-id> [--out DIR]
+//!   ./manifest-harness.rs build-all [--lane L] [--out DIR] [--dry-run]
+//!   ./manifest-harness.rs run       <test-id> [--mode M] [--backend B] [--dry-run]
+//!   ./manifest-harness.rs run       --bucket B --lane L [--no-build] [--dry-run]
+//!   ./manifest-harness.rs dag       [--lane portable|privileged] [--format json]
 //!
 //! Environment:
 //!   HERMIT_BIN   Hermit binary for run cells (default: target/debug/hermit).
@@ -251,7 +257,13 @@ fn run_tool(desc: &str, mut cmd: Command) {
 }
 
 /// Build (or resolve) the entry's program, returning how to run it.
-fn build_program(entry: &TestEntry, out_dir: &Path, dry_run: bool) -> Program {
+///
+/// When `no_build` is set, compiled guests (`*.c`/`*.rs`) are NOT recompiled;
+/// the pre-built artifact is resolved from `out_dir` (erroring if absent). This
+/// is what lets the DAG hoist compilation into a single `build-all` node that
+/// fans out to bucket run nodes running with `--no-build` — the owner's
+/// `build-all-c -> [run-bucket-*]` shape — without every run node re-invoking cc.
+fn build_program(entry: &TestEntry, out_dir: &Path, dry_run: bool, no_build: bool) -> Program {
     if let Some(cmd) = &entry.direct {
         return Program::Direct(cmd.clone());
     }
@@ -268,6 +280,18 @@ fn build_program(entry: &TestEntry, out_dir: &Path, dry_run: bool) -> Program {
         .extension()
         .and_then(|x| x.to_str())
         .unwrap_or("");
+    // Pre-built resolution: skip compilation, reuse the artifact from build-all.
+    if no_build && (ext == "c" || ext == "rs") {
+        let out = out_dir.join(sanitized(&entry.id));
+        if !dry_run && !out.exists() {
+            die(format!(
+                "{}: --no-build set but prebuilt artifact is missing: {} (run `build-all` first)",
+                entry.id,
+                out.display()
+            ));
+        }
+        return Program::Binary(out);
+    }
     match ext {
         "sh" => Program::Script(abs),
         "c" => {
@@ -318,6 +342,33 @@ fn build_program(entry: &TestEntry, out_dir: &Path, dry_run: bool) -> Program {
         }
         other => die(format!("{}: unsupported program extension `.{other}`", entry.id)),
     }
+}
+
+/// Compile every `*.c`/`*.rs` guest into `out_dir` (optionally lane-filtered).
+///
+/// This is the `build-all-c` DAG node: it depends only on `cc`/`rustc`, NOT on
+/// the hermit binary, so the scheduler can run it fully in parallel with the
+/// `cargo build --workspace` node. `.sh`/`direct` entries need no build step and
+/// are skipped. Returns the number of guests compiled.
+fn build_all(entries: &[TestEntry], out_dir: &Path, lane: &str, dry_run: bool) -> usize {
+    let mut built = 0usize;
+    for e in entries {
+        if !lane.is_empty() && e.lane != lane {
+            continue;
+        }
+        let is_compiled = e
+            .program
+            .as_deref()
+            .map(|p| p.ends_with(".c") || p.ends_with(".rs"))
+            .unwrap_or(false);
+        if !is_compiled {
+            continue; // .sh / direct have nothing to compile
+        }
+        // Force a real build (no_build = false) so the artifact is produced.
+        build_program(e, out_dir, dry_run, false);
+        built += 1;
+    }
+    built
 }
 
 // ---------------------------------------------------------------------------
@@ -438,9 +489,9 @@ fn prepare_cell(cell: &Path) {
     }
 }
 
-fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run: bool) -> bool {
+fn run_entry(entry: &TestEntry, mode_filter: &str, backend_filter: &str, dry_run: bool, no_build: bool) -> bool {
     let out_dir = repo_root().join("target/e2e-harness/build");
-    let prog = build_program(entry, &out_dir, dry_run);
+    let prog = build_program(entry, &out_dir, dry_run, no_build);
     let cell = repo_root().join(format!("target/e2e-harness/runs/{}", sanitized(&entry.id)));
     if !dry_run {
         prepare_cell(&cell);
@@ -577,32 +628,60 @@ fn emit_dag(entries: &[TestEntry], lane: &str) {
         .collect();
     buckets.sort();
 
+    // Does this lane have any compiled guest? If so, hoist compilation into a
+    // dedicated `build-all-c` node that fans out to the bucket run nodes.
+    let has_compiled = entries.iter().any(|e| {
+        e.lane == lane
+            && e.program
+                .as_deref()
+                .map(|p| p.ends_with(".c") || p.ends_with(".rs"))
+                .unwrap_or(false)
+    });
+
     let mut steps: Vec<String> = Vec::new();
-    // Build the workspace (provides the hermit binary the run cells need).
+    // Build the workspace (provides the hermit binary the run cells need). No
+    // deps — runs concurrently with `e2e.build_guests` (guests need only cc).
     steps.push(String::from(
         r#"    {"group":"build","job":"workspace","desc":"Build workspace (cargo build --workspace)","cmd":"cargo build --workspace","timeout":1200,"hint":{"est_duration_s":360,"rss_baseline_bytes":5368709120,"hard_mem_max_bytes":8589934592,"classification":"cpu-bound"}}"#,
     ));
-    // Validate manifests (schema rules enforced by manifest-plan.rs).
+    // Validate manifests (schema rules enforced by manifest-plan.rs). No deps.
     steps.push(String::from(
         r#"    {"group":"e2e","job":"manifest_validate","desc":"Validate centralized e2e manifests (schema v2)","cmd":"./tests/e2e/manifests/manifest-plan.rs","timeout":60,"hint":{"est_duration_s":5,"rss_baseline_bytes":268435456,"hard_mem_max_bytes":1073741824,"classification":"light"}}"#,
     ));
+    // `build-all-c`: compile every .c/.rs guest for the lane ONCE, in parallel
+    // with the cargo workspace build (it needs only cc/rustc, not hermit). This
+    // is the fan-out source; each bucket run node consumes its artifacts.
+    if has_compiled {
+        steps.push(format!(
+            "    {{\"group\":\"e2e\",\"job\":\"build_guests\",\"desc\":{desc},\"cmd\":{cmd},\"deps\":[\"e2e.manifest_validate\"],\"timeout\":900,\"hint\":{{\"est_duration_s\":90,\"rss_baseline_bytes\":536870912,\"hard_mem_max_bytes\":2147483648,\"classification\":\"cpu-bound\"}}}}",
+            desc = json_str(&format!("Compile all C/Rust guests for the {lane} lane (build-all-c, parallel with cargo)")),
+            cmd = json_str(&format!("./tests/e2e/manifests/manifest-harness.rs build-all --lane {lane}")),
+        ));
+    }
     // One boxed run node per bucket, serialized on the hermit_guest resource.
-    // The node timeout is the sum of the bucket's per-test timeouts (the node
-    // runs every test in the bucket serially), floored at the DAG default.
+    // Each depends on build.workspace (hermit binary), build_guests (prebuilt
+    // guests, when present), and manifest_validate; it runs with --no-build so
+    // it never recompiles. Node timeout = sum of the bucket's per-test timeouts,
+    // floored at the DAG default.
     for b in &buckets {
-        let job = format!("manifest_{}", b.replace('-', "_"));
+        let job = format!("run_{}", b.replace('-', "_"));
         let cmd = format!(
-            "./tests/e2e/manifests/manifest-harness.rs run --bucket {b} --lane {lane}"
+            "./tests/e2e/manifests/manifest-harness.rs run --bucket {b} --lane {lane} --no-build"
         );
-        let desc = format!("Manifest bucket `{b}` ({lane} lane): build guests and run all enabled cells");
+        let desc = format!("Manifest bucket `{b}` ({lane} lane): run all enabled cells against prebuilt guests");
         let bucket_timeout: i64 = entries
             .iter()
             .filter(|e| e.bucket == *b && e.lane == lane)
             .map(|e| e.timeout)
             .sum::<i64>()
             .max(600);
+        let deps = if has_compiled {
+            r#"["build.workspace","e2e.build_guests","e2e.manifest_validate"]"#
+        } else {
+            r#"["build.workspace","e2e.manifest_validate"]"#
+        };
         steps.push(format!(
-            "    {{\"group\":\"e2e\",\"job\":{job},\"desc\":{desc},\"cmd\":{cmd},\"deps\":[\"build.workspace\",\"e2e.manifest_validate\"],\"timeout\":{bucket_timeout},\"hint\":{{\"resources\":{{\"hermit_guest\":1}},\"est_duration_s\":150,\"rss_baseline_bytes\":1073741824,\"hard_mem_max_bytes\":3221225472,\"classification\":\"latency-bound\"}}}}",
+            "    {{\"group\":\"e2e\",\"job\":{job},\"desc\":{desc},\"cmd\":{cmd},\"deps\":{deps},\"timeout\":{bucket_timeout},\"hint\":{{\"resources\":{{\"hermit_guest\":1}},\"est_duration_s\":150,\"rss_baseline_bytes\":1073741824,\"hard_mem_max_bytes\":3221225472,\"classification\":\"latency-bound\"}}}}",
             job = json_str(&job),
             desc = json_str(&desc),
             cmd = json_str(&cmd),
@@ -678,11 +757,30 @@ fn main() {
             }
             let entries = load_entries();
             let entry = find_entry(&entries, &id);
-            match build_program(&entry, &out, dry) {
+            match build_program(&entry, &out, dry, false) {
                 Program::Direct(cmd) => println!("direct: {cmd}"),
                 Program::Script(p) => println!("script (runs directly): {}", p.display()),
                 Program::Binary(p) => println!("binary: {}", p.display()),
             }
+        }
+        "build-all" => {
+            // Compile every compiled guest once (the `build-all-c` DAG node).
+            let mut out = repo_root().join("target/e2e-harness/build");
+            let mut lane = String::new();
+            let mut dry = false;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--out" => { out = PathBuf::from(rest[i + 1].clone()); i += 2; }
+                    "--lane" => { lane = rest[i + 1].clone(); i += 2; }
+                    "--dry-run" => { dry = true; i += 1; }
+                    s => die(format!("build-all: unknown option {s}")),
+                }
+            }
+            let entries = load_entries();
+            let n = build_all(&entries, &out, &lane, dry);
+            let scope = if lane.is_empty() { "all lanes".to_string() } else { format!("{lane} lane") };
+            eprintln!("build-all: compiled {n} guest(s) ({scope}) into {}", out.display());
         }
         "run" => {
             let mut id = String::new();
@@ -691,6 +789,7 @@ fn main() {
             let mut mode = String::new();
             let mut backend = String::new();
             let mut dry = false;
+            let mut no_build = false;
             let mut i = 0;
             while i < rest.len() {
                 match rest[i].as_str() {
@@ -699,6 +798,7 @@ fn main() {
                     "--mode" => { mode = rest[i + 1].clone(); i += 2; }
                     "--backend" => { backend = rest[i + 1].clone(); i += 2; }
                     "--dry-run" => { dry = true; i += 1; }
+                    "--no-build" => { no_build = true; i += 1; }
                     s if !s.starts_with("--") => { id = s.to_string(); i += 1; }
                     s => die(format!("run: unknown option {s}")),
                 }
@@ -719,7 +819,7 @@ fn main() {
             }
             let mut failures = 0;
             for e in &selected {
-                if !run_entry(e, &mode, &backend, dry) {
+                if !run_entry(e, &mode, &backend, dry, no_build) {
                     failures += 1;
                 }
             }
@@ -743,7 +843,7 @@ fn main() {
         }
         "" | "-h" | "--help" => {
             eprintln!(
-                "usage: manifest-harness.rs <validate|plan|build|run|dag> [options]\n\
+                "usage: manifest-harness.rs <validate|plan|build|build-all|run|dag> [options]\n\
                  see the header of this script for full option docs."
             );
             exit(if sub.is_empty() { 2 } else { 0 });
