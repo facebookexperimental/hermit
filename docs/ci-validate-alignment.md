@@ -22,8 +22,8 @@ do not belong in the scarce privileged lane.
 
 ## Multi-mode E2E harness
 
-`ci/test_harness.sh` discovers tests from the schema-v2 bucket files under
-`ci/manifests/`. The current category set is:
+`ci/test_harness.sh` discovers tests from the schema-v2 TOML bucket files under
+`tests/e2e/manifests/`. The current category set is:
 
 - `system-utils`
 - `data-handling`
@@ -89,7 +89,7 @@ When adding or changing an E2E test:
 3. Add only locally proven backend combinations to an allowlist.
 4. Run `ci/test_harness.sh validate` and inspect `plan --format json`.
 5. Run the affected mode/backend cells and retain their JSONL/JUnit results.
-6. Update `inventory/test-files.json` with its disposition and runner.
+6. Update `tests/e2e/manifests/inventory/test-files.json` with its disposition and runner.
 7. Update the owning DAG only when a category or capability dependency changes.
 8. Never replace a semantic workload with `--help`, `--version`, or a no-op
    launcher probe.

@@ -1,0 +1,172 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+# Centralized schema-v2 manifest. See README.md.
+
+schema = 2
+bucket = "applications"
+
+[[test]]
+id = "applications/timed-progress-bar"
+description = "A time-driven Python application completes identically under verification"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace","python3"]
+timeout_seconds = 120
+occasional = false
+program = "tests/e2e/applications/timed-progress-bar.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "Elapsed time drives progress but final output is intentionally stable"
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "DBI application coverage is owned by backend parity"
+kvm = "KVM requires the privileged runner"
+sabre = "SaBRe requires its external runtime"
+liteinst = "LiteInst application coverage is owned by backend compatibility"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Focused time and entropy sentinels own the blocking replay contract"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The application is single-threaded"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
+[[test]]
+id = "applications/kvm-python-examples"
+description = "User-facing Python examples run identically with the system interpreter under KVM"
+lane = "privileged"
+requires = ["linux","x86_64","kvm","python3"]
+timeout_seconds = 120
+occasional = false
+program = "tests/e2e/applications/kvm-python-examples.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "The portable Python-random test owns the native nondeterminism control"
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["kvm"]
+[test.modes.verify.backends_disabled]
+ptrace = "This test specifically asserts the KVM execution path"
+dbi = "This test specifically asserts the KVM execution path"
+sabre = "This test specifically asserts the KVM execution path"
+liteinst = "This test specifically asserts the KVM execution path"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "This is a KVM integration test"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The examples are single-threaded"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
+[[test]]
+id = "applications/kvm-shell-environment"
+description = "KVM executes a shell workload with a deterministic environment"
+lane = "privileged"
+requires = ["linux","x86_64","kvm"]
+timeout_seconds = 60
+occasional = false
+program = "tests/e2e/applications/kvm-shell-environment.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This is a privileged KVM backend integration test"
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["kvm"]
+[test.modes.verify.backends_disabled]
+ptrace = "This test specifically asserts the KVM execution path"
+dbi = "This test specifically asserts the KVM execution path"
+sabre = "This test specifically asserts the KVM execution path"
+liteinst = "This test specifically asserts the KVM execution path"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "This is a KVM integration test"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The workload is single-threaded"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"

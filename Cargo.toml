@@ -3,6 +3,7 @@ members = [
   "common/digest",
   "common/edit-distance",
   "common/test-allocator",
+  "ci/manifest-plan",
   "detcore",
   "detcore-model",
   "detcore-dbi",

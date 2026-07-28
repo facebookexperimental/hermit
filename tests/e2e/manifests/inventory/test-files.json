@@ -111,9 +111,9 @@
     },
     {
       "path": "tests/c/clock_determinism.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/system-utils.toml",
+      "why": "Direct C clock matrix compiled implicitly and exercised by verify plus five-run custom assertions"
     },
     {
       "path": "tests/c/clone.c",
@@ -244,8 +244,8 @@
     {
       "path": "tests/c/getpid.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh",
-      "why": "Direct schema-v2 C program compiled implicitly by the manifest harness for verify and replay modes"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
       "path": "tests/c/getsockopt_null.c",
@@ -1096,8 +1096,8 @@
     {
       "path": "tests/chaos/order_violation.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh",
-      "why": "Direct schema-v2 C program compiled implicitly with pthread support for verify and seeded chaos modes"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
       "path": "tests/compat/complex_shell_workload.sh",
@@ -1174,26 +1174,26 @@
     {
       "path": "tests/e2e/applications/kvm-python-examples.sh",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh",
-      "why": "Direct schema-v2 program; modes and backend policy are defined in ci/manifests/*.json"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
       "path": "tests/e2e/applications/kvm-shell-environment.sh",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh",
-      "why": "Direct schema-v2 program; modes and backend policy are defined in ci/manifests/*.json"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
       "path": "tests/e2e/applications/timed-progress-bar.sh",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh",
-      "why": "Direct schema-v2 program; modes and backend policy are defined in ci/manifests/*.json"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
       "path": "tests/e2e/data-handling/archive-roundtrip.sh",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh",
-      "why": "Direct schema-v2 program; modes and backend policy are defined in ci/manifests/*.json"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
       "path": "tests/e2e/determinism-stress/README.md",
@@ -1246,20 +1246,20 @@
     {
       "path": "tests/e2e/determinism-stress/process-chains.sh",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh",
-      "why": "Direct schema-v2 program; modes and backend policy are defined in ci/manifests/*.json"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
       "path": "tests/e2e/determinism-stress/thread-contention.sh",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh",
-      "why": "Direct schema-v2 program; modes and backend policy are defined in ci/manifests/*.json"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
       "path": "tests/e2e/determinism-stress/thread-output.sh",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh",
-      "why": "Direct schema-v2 program; modes and backend policy are defined in ci/manifests/*.json"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
       "path": "tests/e2e/determinism-stress/thread_contention.c",
@@ -1288,8 +1288,8 @@
     {
       "path": "tests/e2e/language-runtimes/python-random.sh",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh",
-      "why": "Direct schema-v2 program; modes and backend policy are defined in ci/manifests/*.json"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
       "path": "tests/e2e/language-runtimes/python.py",
@@ -1520,6 +1520,48 @@
       "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
     },
     {
+      "path": "tests/e2e/manifests/README.md",
+      "disposition": "support-data",
+      "runner": "manifest authors and reviewers",
+      "why": "Documents the load-bearing schema, mode contracts, backend partitions, and inventory workflow"
+    },
+    {
+      "path": "tests/e2e/manifests/applications.toml",
+      "disposition": "manifest-policy",
+      "runner": "ci/test_harness.sh via ci/manifest-plan",
+      "why": "Central application test entries, modes, lanes, observations, and backend exclusion reasons"
+    },
+    {
+      "path": "tests/e2e/manifests/data-handling.toml",
+      "disposition": "manifest-policy",
+      "runner": "ci/test_harness.sh via ci/manifest-plan",
+      "why": "Central data-handling test entries, modes, lanes, observations, and backend exclusion reasons"
+    },
+    {
+      "path": "tests/e2e/manifests/determinism-stress.toml",
+      "disposition": "manifest-policy",
+      "runner": "ci/test_harness.sh via ci/manifest-plan",
+      "why": "Central stress test entries, modes, lanes, observations, and backend exclusion reasons"
+    },
+    {
+      "path": "tests/e2e/manifests/inventory/test-files.json",
+      "disposition": "test-inventory",
+      "runner": "ci/test_harness.sh audit-inventory",
+      "why": "Exhaustive per-file classification checked byte-for-byte against every file below tests/"
+    },
+    {
+      "path": "tests/e2e/manifests/language-runtimes.toml",
+      "disposition": "manifest-policy",
+      "runner": "ci/test_harness.sh via ci/manifest-plan",
+      "why": "Central language-runtime test entries, modes, lanes, observations, and backend exclusion reasons"
+    },
+    {
+      "path": "tests/e2e/manifests/system-utils.toml",
+      "disposition": "manifest-policy",
+      "runner": "ci/test_harness.sh via ci/manifest-plan",
+      "why": "Central system-utility test entries, modes, lanes, observations, and backend exclusion reasons"
+    },
+    {
       "path": "tests/e2e/system-utils/README.md",
       "disposition": "support-data",
       "runner": "documentation or isolated HOME fixture",
@@ -1528,14 +1570,14 @@
     {
       "path": "tests/e2e/system-utils/date-nanoseconds.sh",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh",
-      "why": "Direct schema-v2 program; modes and backend policy are defined in ci/manifests/*.json"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
       "path": "tests/e2e/system-utils/random-device.sh",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh",
-      "why": "Direct schema-v2 program; modes and backend policy are defined in ci/manifests/*.json"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
       "path": "tests/e2e/xdg-config/README.md",

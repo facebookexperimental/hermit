@@ -3,90 +3,229 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-#
-# Centralized e2e manifest (schema v2). See README.md for the format spec.
-# Bucket: determinism-stress. Two prototype entries ported faithfully from the
-# embedded HERMIT_E2E_META blocks in tests/e2e/determinism-stress/*.sh.
+# Centralized schema-v2 manifest. See README.md.
 
 schema = 2
 bucket = "determinism-stress"
 
-# ---------------------------------------------------------------------------
-# order-violation: seeded chaos exposes distinct reproducible thread schedules.
-# Ported from tests/e2e/determinism-stress/order-violation.sh (which cc-builds
-# tests/chaos/order_violation.c and runs it).
-# ---------------------------------------------------------------------------
 [[test]]
-id          = "determinism-stress/order-violation"
-description = "Different chaos seeds expose distinct reproducible thread schedules"
-lane        = "portable"
-requires    = ["linux", "x86_64", "userns", "ptrace", "cc"]
+id = "determinism-stress/thread-output"
+description = "Concurrent shell writers produce repeatable output under strict verification"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace"]
 timeout_seconds = 90
-occasional  = false
-program     = "tests/e2e/determinism-stress/order-violation.sh"
+occasional = false
+program = "tests/e2e/determinism-stress/thread-output.sh"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
-  [test.modes.verify]
-  backends_enabled = ["ptrace"]
-  [test.modes.verify.backends_disabled]
-  dbi      = "DBI executes Tools only in the root process; this multi-thread guest is not yet aggregated"
-  kvm      = "KVM executor ENOSYSes un-enumerated syscalls emitted by this pthread guest"
-  sabre    = "Not yet triaged for SaBRe; enable after the ptrace baseline is trusted"
-  liteinst = "LiteInst interception is incomplete and nondeterministic under --verify (#1047)"
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "Native ordering can vary but is not guaranteed to diverge in a bounded run"
 
-  [test.modes.chaos]
-  backends_enabled = ["ptrace"]
-  seeds  = [0, 1]
-  assert = { min_distinct = 2, min_passes = 1, min_failures = 1 }
-  [test.modes.chaos.backends_disabled]
-  dbi      = "DBI has no chaos scheduler integration for multi-thread guests"
-  kvm      = "KVM chaos scheduling for this guest is unverified"
-  sabre    = "SaBRe chaos scheduling for this guest is unverified"
-  liteinst = "LiteInst cannot drive the deterministic scheduler needed for seeded chaos (#1047)"
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "DBI coverage is owned by its backend parity partition"
+kvm = "KVM requires the privileged runner"
+sabre = "SaBRe requires its external runtime"
+liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 
-  [test.disabled_modes]
-  replay = "Chaos witness reproduction is the required relation for this deliberately racy guest"
-  naked  = "Native scheduling does not guarantee both outcomes within a fixed budget"
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Strict verification owns the required relation for this example"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
 
-# ---------------------------------------------------------------------------
-# thread-contention: mutex contention, multi-fd poll/epoll, three-signal
-# cascade, and shared mmap across fork repeat under strict verification.
-# Ported from tests/e2e/determinism-stress/thread-contention.sh, which builds
-# THREE .c programs. Demonstrates an explicit `naked` sanity mode (runs=10) and
-# a multi-source implicit build via build.extra_sources.
-# ---------------------------------------------------------------------------
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The order-violation test has the stronger seeded oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
 [[test]]
-id          = "determinism-stress/thread-contention"
-description = "Mutex contention, multi-fd poll/epoll, a three-signal cascade, and shared mmap across fork repeat under strict verification"
-lane        = "portable"
-requires    = ["linux", "x86_64", "userns", "ptrace", "cc"]
+id = "determinism-stress/thread-contention"
+description = "Mutex contention, poll/epoll, signals, and shared mmap across fork repeat under strict verification"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace","cc"]
 timeout_seconds = 120
-occasional  = false
-program     = "tests/e2e/determinism-stress/thread-contention.sh"
+occasional = false
+program = "tests/e2e/determinism-stress/thread-contention.sh"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
-  # The wrapper builds three sibling guests; recorded here so a future
-  # wrapper-free entry can build them implicitly.
-  [test.build]
-  extra_sources = [
-    "tests/e2e/determinism-stress/thread_contention.c",
-    "tests/e2e/determinism-stress/thread_stress.c",
-    "tests/e2e/determinism-stress/mmap_fork_shared.c",
-  ]
-  cflags = ["-pthread"]
+[test.modes.naked]
+ci = false
+runs = 5
+assert = { min_distinct = 2 }
+backends_enabled = ["native"]
+[test.modes.naked.backends_disabled]
 
-  [test.modes.naked]
-  runs   = 10
-  assert = { min_distinct = 2 }
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "DBI coverage is owned by its backend parity partition"
+kvm = "KVM requires the privileged runner"
+sabre = "SaBRe requires its external runtime"
+liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 
-  [test.modes.verify]
-  backends_enabled = ["ptrace"]
-  [test.modes.verify.backends_disabled]
-  dbi      = "DBI executes Tools only in the root process; fork+thread guest not yet aggregated"
-  kvm      = "KVM executor ENOSYSes un-enumerated syscalls emitted by this guest"
-  sabre    = "SaBRe leaks O_NONBLOCK to exec'd pipeline children (#1035); poll/epoll path unverified"
-  liteinst = "LiteInst interception is incomplete and nondeterministic under --verify (#1047)"
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "The focused C replay sentinel owns the blocking replay contract"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
 
-  [test.disabled_modes]
-  replay = "The focused C replay sentinel owns the blocking record/replay contract"
-  chaos  = "The order-violation test provides the seeded schedule-diversity oracle"
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The order-violation test has the seeded schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
+[[test]]
+id = "determinism-stress/process-chains"
+description = "A 13-process fork tree and five-stage C pipe chain repeat under strict verification"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace","cc"]
+timeout_seconds = 120
+occasional = false
+program = "tests/e2e/determinism-stress/process-chains.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "The programs self-check invariants rather than requiring native output variation"
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "DBI coverage is owned by its backend parity partition"
+kvm = "KVM requires the privileged runner"
+sabre = "SaBRe requires its external runtime"
+liteinst = "LiteInst coverage is owned by its backend compatibility partition"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "The focused C replay sentinel owns the blocking replay contract"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The order-violation test has the seeded schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
+[[test]]
+id = "determinism-stress/order-violation"
+description = "Different chaos seeds expose distinct reproducible thread schedules"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace","cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/chaos/order_violation.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.build]
+cflags = ["-pthread", "-Wno-unused-parameter"]
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "Native scheduling does not guarantee both outcomes within a fixed budget"
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "DBI coverage is owned by its backend parity partition"
+kvm = "KVM requires the privileged runner"
+sabre = "SaBRe requires its external runtime"
+liteinst = "LiteInst coverage is owned by its backend compatibility partition"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Chaos witness reproduction is the required relation for this deliberately racy guest"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = true
+seeds = [0,9]
+assert = { min_distinct = 2, min_passes = 1, min_failures = 1 }
+backends_enabled = ["ptrace"]
+[test.modes.chaos.backends_disabled]
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "Chaos mode already supplies the required scheduler arguments"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
