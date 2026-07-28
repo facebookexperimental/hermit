@@ -127,6 +127,8 @@ jobs:
           unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
       - name: Privileged PMU and CPUID test DAG
         run: env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner flock /tmp/hermit-privileged-pmu.lock ci/run-dag.sh privileged -j 2 --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
+      - name: Record/replay compatibility ratchet (139 programs)
+        run: ./validate.sh --rr-compat-only --no-label-pr --verbose
       - name: Upload privileged DAG performance report
         if: always()
         uses: actions/upload-artifact@v4

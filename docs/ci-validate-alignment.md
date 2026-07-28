@@ -79,11 +79,16 @@ documentation, and unit-test nodes retain their existing dependencies.
 - PMU overflow/skid validation; and
 - the KVM E2E shell/environment sentinel.
 
+The 139-program record/replay compatibility ratchet runs as a separate step in
+the long merge-group job. It is intentionally outside the five-minute
+privileged smoke DAG, whose workflow enforces a 270-second outer bound.
+
 Both `validate.sh` and GitHub Actions execute these exact DAG files. Use
 `ci/run-dag.sh portable ascii` or `ci/run-dag.sh privileged ascii` to audit the
 dependency layers without running tests. `ci/test_harness.sh audit-ci` hashes
 the ordered step IDs and commands and verifies both callers still delegate to
-the shared plans.
+the shared plans. It also compares the required cells byte-for-byte with
+`ci/expected-e2e-plan.json`, so the blocking denominator cannot silently shrink.
 
 ## Reconciliation checklist
 

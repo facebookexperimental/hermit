@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "cells": [
+    {"test":"applications/kvm-python-examples","category":"applications","lane":"privileged","mode":"verify","backend":"kvm"},
+    {"test":"applications/kvm-shell-environment","category":"applications","lane":"privileged","mode":"verify","backend":"kvm"},
+    {"test":"applications/timed-progress-bar","category":"applications","lane":"portable","mode":"verify","backend":"ptrace"},
+    {"test":"data-handling/archive-roundtrip","category":"data-handling","lane":"portable","mode":"verify","backend":"ptrace"},
+    {"test":"determinism-stress/order-violation","category":"determinism-stress","lane":"portable","mode":"chaos","backend":"ptrace"},
+    {"test":"determinism-stress/order-violation","category":"determinism-stress","lane":"portable","mode":"verify","backend":"ptrace"},
+    {"test":"determinism-stress/process-chains","category":"determinism-stress","lane":"portable","mode":"verify","backend":"ptrace"},
+    {"test":"determinism-stress/thread-contention","category":"determinism-stress","lane":"portable","mode":"verify","backend":"ptrace"},
+    {"test":"determinism-stress/thread-output","category":"determinism-stress","lane":"portable","mode":"verify","backend":"ptrace"},
+    {"test":"language-runtimes/python-random","category":"language-runtimes","lane":"portable","mode":"verify","backend":"ptrace"},
+    {"test":"system-utils/clock-determinism","category":"system-utils","lane":"portable","mode":"custom","backend":"ptrace"},
+    {"test":"system-utils/clock-determinism","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"},
+    {"test":"system-utils/date-nanoseconds","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"},
+    {"test":"system-utils/random-device","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"},
+    {"test":"system-utils/record-getpid","category":"system-utils","lane":"portable","mode":"replay","backend":"ptrace"},
+    {"test":"system-utils/record-getpid","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"}
+  ]
+}

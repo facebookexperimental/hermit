@@ -79,10 +79,15 @@ selecting a mode explicitly also exposes enabled manual cells:
 
 `inventory/test-files.json` classifies every regular file and symlink below
 `tests/` with a disposition, owning runner, and per-file justification. The
-audit compares the inventory byte-for-byte with filesystem discovery, then confirms that every
-manifest program is classified as `manifest-test`. Tests retained under Cargo,
-Buck, integration, QEMU, or suite drivers explain the build flags, arguments,
-expected results, hardware, or shared setup that their owner supplies.
+audit compares the inventory byte-for-byte with filesystem discovery, then
+confirms that every manifest program is classified as `manifest-test`. Tests
+retained under Cargo, Buck, integration, QEMU, or suite drivers explain the
+build flags, arguments, expected results, hardware, or shared setup that their
+owner supplies.
+
+`ci/expected-e2e-plan.json` ratchets the exact blocking cells. Adding, removing,
+or reclassifying a `ci=true` cell fails validation until the expected plan is
+updated in the same review.
 
 Use the load-bearing entrypoints:
 

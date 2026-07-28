@@ -11,6 +11,7 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 TEST_ROOT="$ROOT_DIR/tests/e2e"
 MANIFEST_ROOT="$TEST_ROOT/manifests"
 INVENTORY="$MANIFEST_ROOT/inventory/test-files.json"
+EXPECTED_PLAN="$ROOT_DIR/ci/expected-e2e-plan.json"
 HERMIT_BIN=${HERMIT_BIN:-$ROOT_DIR/target/debug/hermit}
 RESULT_ROOT=${E2E_RESULT_ROOT:-$ROOT_DIR/target/e2e}
 RUN_ID=${E2E_RUN_ID:-"local-$(date +%s)-$$"}
@@ -21,7 +22,7 @@ else
     SOURCE_TREE_DIRTY=false
 fi
 
-readonly ROOT_DIR TEST_ROOT MANIFEST_ROOT INVENTORY HERMIT_BIN RESULT_ROOT RUN_ID SOURCE_TREE_SHA SOURCE_TREE_DIRTY
+readonly ROOT_DIR TEST_ROOT MANIFEST_ROOT INVENTORY EXPECTED_PLAN HERMIT_BIN RESULT_ROOT RUN_ID SOURCE_TREE_SHA SOURCE_TREE_DIRTY
 readonly -a MODES=(verify chaos replay naked custom)
 readonly -a BACKENDS=(ptrace dbi kvm sabre liteinst)
 
@@ -146,7 +147,8 @@ function audit_inventory {
             and (.path | type == "string" and startswith("tests/") and (contains("..") | not))
             and (.disposition | type == "string" and length > 0)
             and (.runner | type == "string" and length > 0)
-            and (.why | type == "string" and length > 0)))
+            and (.why | type == "string" and length > 0)
+            and (. as $entry | ($entry.why | startswith($entry.path + " is owned by " + $entry.runner + ": ")))))
         and ((.files | map(.path) | unique | length) == (.files | length))
     ' "$INVENTORY" >/dev/null || die "test inventory schema violation"
 
@@ -180,37 +182,99 @@ function audit_inventory {
         "$INVENTORY"
 }
 
+function function_body {
+    local name=$1 file=$2
+    awk -v signature="function $name {" '
+        $0 == signature { inside = 1 }
+        inside { print }
+        inside && $0 == "}" { exit }
+    ' "$file"
+}
+
+function assert_workflow_entrypoint {
+    local lane=$1 workflow=$2 expected=$3
+    local -a commands=()
+    mapfile -t commands < <(
+        sed -n -E "s/^[[:space:]]+run: (.*ci\/run-dag\.sh $lane([[:space:]].*)?)$/\1/p" "$workflow"
+    )
+    ((${#commands[@]} == 1)) ||
+        die "GitHub $lane workflow must have exactly one executable ci/run-dag.sh $lane command"
+    [[ ${commands[0]} == "$expected" ]] ||
+        die "GitHub $lane workflow command diverged: ${commands[0]}"
+}
+
+function assert_validate_entrypoint {
+    local lane=$1 function_name=$2 expected=$3
+    local body
+    body=$(function_body "$function_name" "$ROOT_DIR/validate.sh")
+    [[ -n $body ]] || die "validate.sh function is missing: $function_name"
+    [[ $(grep -Ec "^[[:space:]]*run_ci_manifest_lane $lane([[:space:]]|$)" <<<"$body") == 1 ]] ||
+        die "validate.sh $function_name must call run_ci_manifest_lane $lane exactly once"
+    grep -Fqx "$expected" <<<"$body" ||
+        die "validate.sh $function_name command diverged from the audited entrypoint"
+}
+
 function audit_ci_correspondence {
-    local lane dag workflow
+    local lane dag
     for lane in portable privileged; do
         dag="$ROOT_DIR/ci/dag/$lane.json"
-        workflow="$ROOT_DIR/.github/workflows/ci-$lane.yml"
         jq -e '
             .steps | type == "array" and length > 0
             and (map(.group + "." + .job) | unique | length) == length
             and all(.[]; (.cmd | type == "string" and length > 0))
         ' "$dag" >/dev/null || die "invalid or duplicate CI DAG steps: ci/dag/$lane.json"
-        grep -Fq "ci/run-dag.sh $lane" "$workflow" ||
-            die "GitHub $lane workflow does not consume ci/dag/$lane.json"
-        grep -Fq "run_ci_manifest_lane $lane" "$ROOT_DIR/validate.sh" ||
-            die "validate.sh does not consume the $lane CI DAG"
     done
 
-    local portable_fingerprint privileged_fingerprint
+    # These are literal workflow/validate expressions, not local expansions.
+    # shellcheck disable=SC2016
+    assert_workflow_entrypoint portable "$ROOT_DIR/.github/workflows/ci-portable.yml" \
+        'env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh portable --max-mem 14G --perf-dir "$RUNNER_TEMP/hermit-dag-perf" -v'
+    # shellcheck disable=SC2016
+    assert_workflow_entrypoint privileged "$ROOT_DIR/.github/workflows/ci-privileged.yml" \
+        'timeout --foreground --kill-after=10s 270s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner flock /tmp/hermit-privileged-pmu.lock ci/run-dag.sh privileged -j 2 --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
+    # shellcheck disable=SC2016
+    assert_validate_entrypoint portable run_portable_only_suite \
+        '    run_ci_manifest_lane portable "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}"'
+    # shellcheck disable=SC2016
+    assert_validate_entrypoint privileged run_privileged_validation \
+        '    run_ci_manifest_lane privileged "${CI_PRIVILEGED_DAG_TIMEOUT_SECONDS:-7200}"'
+    local runner_body
+    runner_body=$(function_body run_ci_manifest_lane "$ROOT_DIR/validate.sh")
+    # shellcheck disable=SC2016
+    [[ $(grep -Fxc '        ./ci/run-dag.sh "$lane" -j "$jobs" -v' <<<"$runner_body") == 1 ]] ||
+        die "validate.sh run_ci_manifest_lane must execute exactly one audited DAG"
+
+    [[ -f $EXPECTED_PLAN ]] || die "missing E2E denominator ratchet: ${EXPECTED_PLAN#"$ROOT_DIR/"}"
+    jq -e '.schema == 1 and (.cells | type == "array" and length > 0)' "$EXPECTED_PLAN" >/dev/null ||
+        die "invalid E2E denominator ratchet"
+    local scratch current_plan expected_plan
+    scratch=$(mktemp -d)
+    current_plan="$scratch/current-plan.json"
+    expected_plan="$scratch/expected-plan.json"
+    emit_required_plan | jq -sS 'sort_by(.category,.test,.mode,.backend)' >"$current_plan"
+    jq -S '.cells | sort_by(.category,.test,.mode,.backend)' "$EXPECTED_PLAN" >"$expected_plan"
+    if ! diff -u "$expected_plan" "$current_plan"; then
+        rm -rf "$scratch"
+        die "required E2E plan changed; update ci/expected-e2e-plan.json in the same review"
+    fi
+
+    local portable_fingerprint privileged_fingerprint e2e_cells
     portable_fingerprint=$(jq -Sc '.steps | map({id:(.group + "." + .job),cmd})' \
         "$ROOT_DIR/ci/dag/portable.json" | sha256sum | cut -d' ' -f1)
     privileged_fingerprint=$(jq -Sc '.steps | map({id:(.group + "." + .job),cmd})' \
         "$ROOT_DIR/ci/dag/privileged.json" | sha256sum | cut -d' ' -f1)
+    e2e_cells=$(jq length "$current_plan")
+    rm -rf "$scratch"
     jq -n \
         --arg portable_fingerprint "$portable_fingerprint" \
         --arg privileged_fingerprint "$privileged_fingerprint" \
         --argjson portable_steps "$(jq '.steps | length' "$ROOT_DIR/ci/dag/portable.json")" \
         --argjson privileged_steps "$(jq '.steps | length' "$ROOT_DIR/ci/dag/privileged.json")" \
-        --argjson e2e_cells "$(emit_required_plan | jq -s length)" \
+        --argjson e2e_cells "$e2e_cells" \
         '{portable_steps:$portable_steps,privileged_steps:$privileged_steps,
           e2e_cells:$e2e_cells,portable_fingerprint:$portable_fingerprint,
           privileged_fingerprint:$privileged_fingerprint,
-          correspondence:"validate.sh and GitHub execute these same two DAG files"}'
+          correspondence:"validated exact workflow and validate.sh entrypoints plus both DAG fingerprints"}'
 }
 
 LANE_FILTER=
@@ -596,6 +660,7 @@ function run_cell {
         reason="fixture preparation failed"
     elif [[ $mode == naked ]]; then
         local runs min_distinct attempt row status hash
+        local failed_runs=0
         local -a hashes=()
         runs=$(jq -r '.modes.naked.runs // 3' <<<"$metadata")
         min_distinct=$(jq -r '.modes.naked.assert.min_distinct // 2' <<<"$metadata")
@@ -603,10 +668,14 @@ function run_cell {
             row=$(execute_attempt "$test" "$metadata" "$mode" "" "$cell_dir" "$attempt")
             IFS=$'\t' read -r status hash _ _ <<<"$row"
             hashes+=("$hash")
+            [[ $status == 0 ]] || ((failed_runs += 1))
         done
         local distinct
         distinct=$(printf '%s\n' "${hashes[@]}" | LC_ALL=C sort -u | wc -l)
-        if ((distinct < min_distinct)); then
+        if ((failed_runs > 0)); then
+            outcome=FAIL
+            reason="naked control had $failed_runs failed native run(s) across $runs attempts"
+        elif ((distinct < min_distinct)); then
             outcome=FAIL
             reason="naked control observed $distinct distinct outcome(s), need $min_distinct"
         else
