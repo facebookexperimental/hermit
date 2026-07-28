@@ -3,9 +3,9 @@
 Hermit can boot a minimal x86_64 Linux guest with QEMU's TCG accelerator in
 two modes:
 
-- A strict, sequentialized run reached the initramfs marker and powered off in
-  166.486 wall seconds on current main. This is an L1 result; it has not yet
-  been repeated with `--verify` for L2 assurance.
+- The strict, sequentialized profile is verified at L2. The harness boots to
+  the initramfs marker and powers off once as an oracle, then repeats that
+  exact boot twice under `--strict --verify` and compares the Detcore logs.
 - A faster compatibility profile reached the same marker in 13.25 seconds. It
   uses `--no-sequentialize-threads`, so QEMU's host-thread interleavings are not
   controlled by Hermit.
@@ -95,8 +95,29 @@ timeout --kill-after=10s --signal=TERM 180s \
 ```
 
 This command uses the ptrace backend, INFO logging, and no relaxations. A
-successful exit and marker establish L1 only. Add `--verify` for an L2 test;
-the current evidence does not claim L2.
+successful exit and marker establish L1. Use the bounded harness for L2; it
+also rejects the known clock-calibration failures and gives each verifier
+phase its own timeout:
+
+```bash
+env HERMIT_BIN="$PWD/target/release/hermit" \
+    KERNEL_IMAGE=/boot/vmlinuz \
+    QEMU_BIN=/usr/local/bin/qemu-system-x86_64 \
+    QEMU_L2_PHASE_TIMEOUT_SECONDS=360 \
+    bash tests/qemu-boot/strict_l2_test.sh
+```
+
+The harness runs the same QEMU command shown above, first with `run --strict`
+to require `SHARED_FUTEX_QEMU_KERNEL_OK`, then with
+`run --strict --verify`. A 2026-07-28 run on QEMU 10.1.0 and Linux 6.17.13
+compared 516137 messages per verifier run, including 459588 Detcore messages
+and 363693 DETLOG/scheduler COMMIT messages. It found no substantive
+differences and reported:
+
+```text
+:: Success: deterministic. Determinism verified.
+QEMU strict L2 boot passed.
+```
 
 Do not add `--no-sequentialize-threads` or disable preemption when evaluating
 the strict profile. Those options select the compatibility profile below.
@@ -309,7 +330,13 @@ reboot: Power down
 The preserved experiment in the parent workspace's
 [`qemu-boot-debug/`](https://github.com/rrnewton/dev-hermit/tree/main/experiments/hermit-experiments-migration_20260727/qemu-boot-debug) contains the
 original six-mode comparison plus the strict current-main follow-up. The fast
-compatibility row is `virtual_minimal_fixed_icount`; the strict L1 row is
+compatibility row is `virtual_minimal_fixed_icount`; the original strict L1 row is
 `strict_current_main_ppoll` in
 [`results.csv`](https://github.com/rrnewton/dev-hermit/blob/main/experiments/hermit-experiments-migration_20260727/qemu-boot-debug/results.csv). Large raw traces
 and console logs are intentionally excluded.
+
+The source-revisioned
+[`qemu_strict_l2_boot_20260727`](https://github.com/rrnewton/dev-hermit/tree/main/experiments/qemu_strict_l2_boot_20260727)
+experiment records the first successful strict L2 run, including the exact
+Hermit and Reverie revisions, kernel and QEMU versions, guest command, boot
+oracle, and verifier comparison counts.
