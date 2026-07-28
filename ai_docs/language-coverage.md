@@ -63,7 +63,7 @@ version.
 | JVM | `/usr/bin/java`, `/usr/bin/javac` | OpenJDK 26.0.1+8 | Host-selected. |
 | OCaml | `/usr/bin/ocamlopt` | OCaml 4.11.1 | Host-selected. |
 | Python | `/usr/bin/python3` | OSS CPython 3.9.25, GCC 11.5.0 | Explicit path required. |
-| Meta Python | `/usr/local/bin/python3` | fbpython 3.12.13+meta | Rejected for OSS coverage. |
+| Site Python wrapper | PATH-selected `python3` | Site-custom Python 3.12.13 | Rejected for OSS coverage. |
 | Shell | `/usr/bin/bash` | GNU Bash 5.1.8 | Host-selected. |
 | Tcl | `/usr/bin/tclsh` | Tcl 8.6.10 | Used by upstream Redis/SQLite suites in open PRs. |
 
@@ -73,11 +73,10 @@ Installed RPMs include `golang-1.26.4`, `ruby-3.0.7`, `nodejs-16.20.2`,
 
 ### Python interpreter finding
 
-`python3` resolves first to `/usr/local/bin/python3`, which is a symlink to
-Meta fbpython. The OSS interpreter is `/usr/bin/python3`, a symlink to
-`/usr/bin/python3.9` owned by the CentOS `python3` RPM. Runtime tests must use
-the latter explicitly and reject version strings containing `fbpython` or
-`+meta`.
+`python3` resolves first to a site-provided wrapper. The OSS interpreter is
+`/usr/bin/python3`, a symlink to `/usr/bin/python3.9` owned by the CentOS
+`python3` RPM. Runtime tests must use the latter explicitly and reject
+site-custom version strings.
 
 ## Merged Test Inventory
 
@@ -259,12 +258,12 @@ These results are useful evidence but are not merged main-branch coverage.
 | #77 LULESH | C++ LULESH 2.0.3 at `46c2a1d`; GCC 11.5.0 + libgomp | Four-thread OpenMP result matched across 2 and 5 strict runs. | Open PR. |
 | #83 LevelDB | C++ LevelDB at `7ee830d`; compiler selected by CMake | `c_test` plus 15 focused cases pass twice; heavy suite hits 15-minute guard. | Compiler version is not enforced; open PR. |
 | #85 Ninja | C++ Ninja 1.13.1 at `79feac0`, GoogleTest 1.16.0, GCC 11.5.0 | Supported suite matches across two strict runs. | Full child-process cases hit `CLONE_VFORK`; PR body and metadata disagree on 378/32 versus 397/13 supported/excluded counts. |
-| #97 Python stdlib | Meta fbpython 3.12.13+meta | Five modules/539 cases pass via a custom unittest driver. | Not OSS Python; launcher hits `CLONE_VFORK`, regrtest path exits 139. |
+| #97 Python stdlib | Site Python wrapper 3.12.13 | Five modules/539 cases pass via a custom unittest driver. | Not OSS Python; launcher hits `CLONE_VFORK`, regrtest path exits 139. |
 | #98 compression | C implementations, system bzip2 1.0.8 and gzip 1.12 | Three strict compressed-output hashes match. | System binary versions are not pinned; open PR. |
 | #99 Redis | C Redis system 6.2.22 plus pinned Redis 7.2.4; Tcl 8.6 | Fast server/CLI subset plus ignored source suite. | Upstream Tcl suite reaches a `pselect6` timeout; open PR. |
 | #101 SQLite | C/Tcl SQLite 3.51.2 source; system SQLite 3.34.1 | Fast WAL/transaction/index workload deterministic; native upstream has 330,902 assertions. | Strict full suite has 13 reproducible failures and stops before later lock tests. |
 | #104 FP reduction | C/OpenMP, GCC/libgomp selected on host | Six strict IEEE-754 outputs match. | Open PR and compiler version not pinned in the test contract. |
-| #107 Python hash seed | OSS CPython, host `/usr/bin/python3` | Native set order varies; strict output matches. | Open PR; must continue rejecting fbpython. |
+| #107 Python hash seed | OSS CPython, host `/usr/bin/python3` | Native set order varies; strict output matches. | Open PR; must continue rejecting site wrappers. |
 | Shared-futex experiment | Node 16.20.2, Temurin Java 8u492, GCC 11.5.0 | Node workers 3/3, JVM threads 3/3, pthreads 5/5 on PR #53 commit. | Untracked and implementation not present on audited branch. |
 
 ## Priority Gaps
@@ -272,12 +271,12 @@ These results are useful evidence but are not merged main-branch coverage.
 1. Add modeled or explicitly deterministic handling for `pread64` and
    `gettid`, then rerun all six runtimes with fail-closed syscall handling.
 2. Merge a portable OSS Python test and keep `/usr/bin/python3`/version checks;
-   do not let PATH select fbpython.
+   do not let PATH select a site wrapper.
 3. Decide whether the six runtime tests should become required CI. Doing so
    requires explicit, versioned toolchain setup rather than host discovery.
 4. Port the Go lit test and remaining Buck language guests into Cargo.
 5. Resolve `CLONE_VFORK` and `pselect6` blockers before claiming full Ninja,
-   fbpython, or Redis upstream-suite coverage.
+   site-wrapped Python, or Redis upstream-suite coverage.
 6. Reconcile Ninja PR #85's evidence metadata with its PR summary before using
    its test counts in release claims.
 7. Preserve compiler/runtime versions in result metadata for every OSS

@@ -323,19 +323,17 @@ Typical flow for a change:
 Follow `CONTRIBUTING.md`, update documentation for user-visible changes, and
 never publish security vulnerabilities as ordinary issues.
 
-GitHub Issues are the public issue tracker. On Meta devservers, direct GitHub
-API access is unavailable, so set the proxy for every `gh` invocation:
+GitHub Issues are the public issue tracker. In Meta environments, use
+appropriate proxies for accessing the web.
 
 ```bash
-export HTTPS_PROXY=http://fwdproxy:8080
 gh issue list -R rrnewton/hermit
 gh issue view <number> -R rrnewton/hermit
 ```
 
-The proxy is an environment requirement, not an authentication workaround. If
-`gh auth status` fails without it, retry with `HTTPS_PROXY` before concluding
-that the token is invalid. Create, edit, or close issues only when the task
-explicitly calls for that repository-side change.
+Network configuration is an environment requirement, not an authentication
+workaround. Create, edit, or close issues only when the task explicitly calls
+for that repository-side change.
 
 ## Task Closure Policy
 

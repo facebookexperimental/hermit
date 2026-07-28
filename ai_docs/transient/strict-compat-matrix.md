@@ -97,15 +97,15 @@ batches 1 through 12. It reports the commands recorded in TaskGraph by
 | 33 | Rust threads | `./rs_threads` | PASS L2 | 4 | Four threads and `Arc<Mutex>`. |
 | 34 | Go goroutines | `./go_routines` | PASS L2 | 4 | Four goroutines, WaitGroup and mutex. |
 | 35 | CPython threads | `/usr/bin/python3.9 py_threads.py` | PASS L2 | 4 | Four threads and Lock, counter 200000. |
-| 36 | Meta Python threads | `/usr/local/bin/python3 py_threads.py` | FAIL | 4 | Startup reads live `/proc/self` memory statistics; the failure also reproduces single-threaded. |
+| 36 | Site-wrapped Python threads | `python3 py_threads.py` | FAIL | 4 | Startup reads live `/proc/self` memory statistics; the failure also reproduces single-threaded. |
 
 ## Database and structured data
 
 | # | Program | Command | Result | Batch | Notes |
 |---:|---|---|---|---:|---|
 | 37 | sqlite3 | `sqlite3 :memory: 'CREATE TABLE t(x); INSERT INTO t VALUES(1),(2),(3); SELECT sum(x) FROM t;'` | PASS L2 | 5 | Plain strict output is 6. |
-| 38 | Meta Python JSON | `python3 -c 'import json; print(json.dumps({"a":1,"b":[2,3]}))'` | FAIL | 5 | Meta Python runtime threads diverge despite identical guest stdout. |
-| 39 | Meta Python hashlib | `python3 -c 'import hashlib; print(hashlib.sha256(b"hello").hexdigest())'` | FAIL | 5 | Same Meta Python runtime cause. |
+| 38 | Site-wrapped Python JSON | `python3 -c 'import json; print(json.dumps({"a":1,"b":[2,3]}))'` | FAIL | 5 | Site-wrapper runtime threads diverge despite identical guest stdout. |
+| 39 | Site-wrapped Python hashlib | `python3 -c 'import hashlib; print(hashlib.sha256(b"hello").hexdigest())'` | FAIL | 5 | Same site-wrapper runtime cause. |
 | 40 | awk | `awk '{sum+=$1} END{print sum}' nums.txt` | PASS L2 | 5 | Output 100. |
 | 41 | sed | `sed 's/foo/bar/g' text.txt` | PASS L2 | 5 | |
 | 42 | bc | `bc -l pi.bc` | PASS L2 | 5 | File input avoids a pipeline hang; output 3.14159265358979323844. |
@@ -205,9 +205,9 @@ batches 1 through 12. It reports the commands recorded in TaskGraph by
 
 | # | Program | Command | Result | Batch | Notes |
 |---:|---|---|---|---:|---|
-| 109 | Git init/add/commit/log | `env REAL_COMPAT_FIXTURES=/tmp/hermit-real-compat-fixtures bash tests/compat/real_compat_workload.sh git` | PASS L2 | 11 | Retested 2026-07-28 with ptrace, `--strict --verify`, INFO logging, and no relaxations: 34,710/34,710 messages and no substantive differences. The workload selects `/usr/local/bin/git.meta.real` on Meta hosts because `/usr/local/bin/git` is a telemetry wrapper, then falls back to `/usr/bin/git` elsewhere. |
-| 110 | Git log | `/usr/local/bin/git log --oneline -5` | FAIL | 11 | A 15-second outer timeout expired in run 1 with exit 124; never reached L2. |
-| 111 | Git diff | `/usr/local/bin/git diff --stat 'HEAD~1'` | FAIL | 11 | A 15-second outer timeout expired in run 1 with exit 124; never reached L2. |
+| 109 | Git init/add/commit/log | `env REAL_COMPAT_FIXTURES=/tmp/hermit-real-compat-fixtures bash tests/compat/real_compat_workload.sh git` | PASS L2 | 11 | Retested 2026-07-28 with ptrace, `--strict --verify`, INFO logging, and no relaxations: 34,710/34,710 messages and no substantive differences. The workload selects a direct Git executable on hosts where the default command is a site wrapper, then falls back to system Git elsewhere. |
+| 110 | Site-wrapped Git log | `git log --oneline -5` | FAIL | 11 | A 15-second outer timeout expired in run 1 with exit 124; never reached L2. |
+| 111 | Site-wrapped Git diff | `git diff --stat 'HEAD~1'` | FAIL | 11 | A 15-second outer timeout expired in run 1 with exit 124; never reached L2. |
 | 112 | curl | `/usr/bin/curl --version` | PASS L2 | 11 | 2419/2419 messages. |
 | 113 | wget | `/usr/bin/wget --version` | PASS L2 | 11 | 1674/1674 messages. |
 | 114 | ssh | `/usr/bin/ssh -V` | PASS L2 | 11 | 1406/1406 messages. |
@@ -240,7 +240,7 @@ batches 1 through 12. It reports the commands recorded in TaskGraph by
 | Batch 1 default tar extract | Guest euid 0 changes tar to same-owner behavior; archived host uid/gid is unmapped in the user namespace. | Yes: `--no-same-owner` passes L2. |
 | Batch 1 differing-file diff | The command deterministically exits 1, but default verification accepts only successful guest exits. | Yes: `--verify-allow both` passes L2. |
 | Batch 3 gcc and rustc | A parent-versus-fork/vfork-child scheduling race changes child start and RNG seed order. | No complete fix in the batch result; PR #221 was only a partial step. |
-| Batches 4 and 5 Meta Python | Meta runtime startup exposes live procfs memory data and adds runtime threads whose virtual-time/RNG ordering diverges. | Workaround: stock `/usr/bin/python3.9` passes the same probes at L2; no product fix was established by these batches. |
+| Batches 4 and 5 site-wrapped Python | Site-wrapper runtime startup exposes live procfs memory data and adds runtime threads whose virtual-time/RNG ordering diverges. | Workaround: stock `/usr/bin/python3.9` passes the same probes at L2; no product fix was established by these batches. |
 | Batch 6 Ruby | Broken host RubyGems packaging; the same command fails natively. | Workaround: `--disable-gems` passes L2; this is not a Hermit defect. |
 | Batch 7 default tar create | Owner-name resolution enters stateful NSS/nscd AF_UNIX polling; poll readiness differs. | Yes: `--numeric-owner` passes L2. |
 | Batch 10 ps and free | Live procfs memory counters are not virtualized. | No fix recorded in the batch. |

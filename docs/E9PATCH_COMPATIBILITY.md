@@ -96,9 +96,9 @@ exposed an intermittent thread-scheduling divergence that also occurs without
 preprocessing. It remains outside the blocking e9patch matrix until the ptrace
 runtime behavior is stable.
 
-`git-lfs --version` originally hung while waiting for Meta's `/usr/local/bin/git`
-telemetry wrapper and its `scm_telem_log` descendant. Selecting `/usr/bin/git`
-with a controlled `PATH` removes that host-specific hang, but strict verify then
+`git-lfs --version` originally hung while waiting for a site-specific Git
+wrapper and its telemetry child. Selecting the system Git executable with a
+controlled `PATH` removes that host-specific hang, but strict verify then
 exposes the same Go child-start scheduling divergence as `gh`. It also remains
 outside the blocking e9patch matrix pending a shared Detcore scheduler fix.
 

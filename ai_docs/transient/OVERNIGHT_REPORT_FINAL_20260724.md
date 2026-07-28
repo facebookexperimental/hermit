@@ -33,7 +33,7 @@
 | Rust | `rustc 1.99.0-nightly (be8e82435 2026-07-11)` |
 | Cargo | `cargo 1.99.0-nightly (59800466c 2026-07-07)` |
 | cargo-nextest | `0.9.140` |
-| Runtimes present | `/usr/local/bin/python3`, `/usr/local/bin/node`, `/usr/bin/gcc`, `/usr/bin/g++`, `/usr/bin/make`, `/usr/bin/redis-server`, `/usr/bin/sqlite3`, `/usr/local/bin/java` |
+| Runtimes present | Python, Node.js, GCC/G++, Make, Redis, SQLite, and Java |
 
 ## Compatibility matrices
 
@@ -152,7 +152,7 @@ The row counts were measured directly from each merged version of `run_strict_co
 
 | Blocker | Current state | Evidence | Exit criterion |
 | --- | --- | --- | --- |
-| Python/vfork scheduling | [Hermit PR #239](https://github.com/rrnewton/hermit/pull/239) is open, non-draft, `human-review`, and `locally-validated`; no review has been submitted. Portable CI passed; privileged failed because zlib development files were absent. | The exact Meta Python probe on `2df293b` did not reach L2. The PR candidate passed 20/20 L2 repetitions with an empty read-only bind over `/var/run/nscd`; bare-host execution still diverged on live NSCD readiness. Backend ptrace, INFO log, relaxations none. | Human approval and merge; rerun the exact current-main Python probe both with controlled NSCD state and on the bare host, reporting external-state dependence separately. |
+| Python/vfork scheduling | [Hermit PR #239](https://github.com/rrnewton/hermit/pull/239) is open, non-draft, `human-review`, and `locally-validated`; no review has been submitted. Portable CI passed; privileged failed because zlib development files were absent. | The exact site-wrapped Python probe on `2df293b` did not reach L2. The PR candidate passed 20/20 L2 repetitions with an empty read-only bind over `/var/run/nscd`; bare-host execution still diverged on live NSCD readiness. Backend ptrace, INFO log, relaxations none. | Human approval and merge; rerun the exact current-main Python probe both with controlled NSCD state and on the bare host, reporting external-state dependence separately. |
 | DBI fork/process tree | [Reverie issue #31](https://github.com/rrnewton/reverie/issues/31) is open. It is an issue, not a PR. | `ppid()` remains `None`; correct clone/fork ancestry needs native DynamoRIO client tracking. The same issue also tracks precise timers and continuous clock reads. DBI matrix has 17 Run1 timeouts concentrated in pipelines and exec-oriented programs. | Implement native process-tree/lifecycle support and dispatch; rerun the current 61-row corpus under DBI L2. |
 | KVM fork/clone | [Reverie issue #55](https://github.com/rrnewton/reverie/issues/55) is open. It is an issue, not a PR. | 19/26 KVM failures are direct `clone`/fork `ENOSYS`. Correct support needs child registers/address space, inherited descriptors, PID/TID identity, Detcore lifecycle callbacks, and deterministic scheduling. | Both issue reproductions and the 19 affected matrix rows pass KVM L2, with descriptor cleanup regressions. |
 | R/R descriptor state | [Hermit PR #240](https://github.com/rrnewton/hermit/pull/240) is open, draft, and `human-review`; [issue #536](https://github.com/rrnewton/hermit/issues/536) tracks the `EpollWait` EOF hang. | 14 stdout-routing mismatches, five fd-number/order desyncs, and two toolchain replay timeouts. | Land the close fix after review, implement a real replay descriptor table for dup/open/fcntl/write routing, repair epoll lifecycle, then rerun 57 and 61 rows. |

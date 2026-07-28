@@ -336,7 +336,7 @@ These results are deliberately excluded from the 135-pass table:
 | 10 | `tar` with owner names | 7/8 passed | NSS/`nscd` owner-name lookup flake |
 | 11 | `ps aux\|head` | Stdout mismatch with matching detlogs | Live `%CPU`/VSZ/RSS values for the supervisor from `/proc` |
 | 13 | Python `AF_INET` bind with a NUL hostname | Fails natively with `TypeError` | Malformed test; corrected AF_UNIX form is counted above |
-| 15 | Meta `git --version`; `git log -1` | Both hang even in one strict run | Site-specific telemetry subprocess interaction |
+| 15 | Site-wrapped `git --version`; `git log -1` | Both hang even in one strict run | Site-specific wrapper subprocess interaction |
 | 18 | Python `getfqdn()` | 4/5 passed; one resolver error | Flaky host NSS/DNS resolution, not a repeat-output mismatch |
 | 18 | `ss -tlnp` | 0/5; detlog mismatch | Reads changing live netlink socket state and `/proc/<pid>/fd` |
 | 21 | `meminfo\|head` | 0/3; stdout mismatch with identical detlogs | Dynamic host memory counters are passed through, not snapshotted |

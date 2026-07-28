@@ -47,14 +47,14 @@ to replay. `N/A` means the package was not installed.
 | Dynamic ELF | GNU `ls --version` | PASS | PASS | PASS | Dynamically linked baseline. |
 | Shell | `sh -c printf` | PASS | PASS | PASS | Shell built-in, no child process. |
 | Python | System Python `print` | PASS | PASS | PASS | `/usr/bin/python3`; complex imports differ below. |
-| Python | Meta Python `print` | HANG | HANG | BLOCKED | Uses unsupported `CLONE_VFORK`; issue #15. |
+| Python | Site-wrapped Python `print` | HANG | HANG | BLOCKED | Uses unsupported `CLONE_VFORK`; issue #15. |
 | Node | Node 16 `console.log` | PASS | HANG | HANG | Recording is incomplete; replay also leaks stopped processes; issue #19. |
 | Java | OpenJDK 8 `java -version` | PASS | PASS | HANG | Replay outlives `timeout -k`; issue #19. |
 | Go | Go 1.26 `go version` | PASS | PASS | FAIL | Unexpected `Return(3)` event; issue #31. |
 | HTTP client | `curl --version` | PASS | PASS | PASS | No network in this probe. |
 | HTTP client | `wget --version` | PASS | PASS | PASS | No network in this probe. |
 | VCS | System Git `--version` | PASS | PASS | PASS | `/usr/bin/git`; functional Git differs below. |
-| VCS | Meta Git `--version` | HANG | HANG | BLOCKED | Uses unsupported `CLONE_VFORK`; issue #15. |
+| VCS | Site-wrapped Git `--version` | HANG | HANG | BLOCKED | Uses unsupported `CLONE_VFORK`; issue #15. |
 | C compiler | GCC `--version` | PASS | PASS | PASS | Functional compilation differs below. |
 | Build tool | Make `--version` | PASS | PASS | PASS | Functional builds invoke `CLONE_VFORK`. |
 | Build tool | CMake `--version` | N/A | N/A | N/A | CMake was not installed on the test host. |
@@ -106,7 +106,7 @@ The matrix maps to one issue per distinct failure category on the approved
 - [#19](https://github.com/rrnewton/hermit/issues/19): record/replay syscall desynchronization and leaked stopped children. Java and Node hang results were added to this issue rather than filed as a duplicate.
 - [#31](https://github.com/rrnewton/hermit/issues/31): Go and SQLite replay consume unexpected filesystem events.
 
-The tested base does not contain the open `CLONE_VFORK` implementation in [PR #27](https://github.com/rrnewton/hermit/pull/27). Make, Cargo builds, Meta Python, and Meta Git should be retested after that change lands.
+The tested base does not contain the open `CLONE_VFORK` implementation in [PR #27](https://github.com/rrnewton/hermit/pull/27). Make, Cargo builds, and the site-wrapped Python and Git launchers should be retested after that change lands.
 
 ## CI coverage
 
