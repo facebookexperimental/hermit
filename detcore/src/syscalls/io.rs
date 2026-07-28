@@ -1105,6 +1105,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Recvmsg,
     ) -> Result<i64, Error> {
+        // NETLINK_SOCK_DIAG replies carry host-assigned socket inode numbers in
+        // their msg_iov payload (not msg_control). Determinize them so the
+        // binary socket-diag path agrees with the /proc/net/* text sanitizers.
+        if self.cfg.virtualize_metadata
+            && guest
+                .thread_state()
+                .with_detfd(call.sockfd(), |detfd| detfd.is_sock_diag())
+                .unwrap_or(false)
+        {
+            return self.handle_sock_diag_recvmsg(guest, call).await;
+        }
+
         if !self.cfg.virtualize_time {
             return self.execute_nonblockable_fd_syscall(guest, call).await;
         }
@@ -1140,6 +1152,88 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         canonicalize_socket_timestamps(&mut control, now);
         guest.memory().write_exact(control_address, &control)?;
+        Ok(result)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1064)
+    /// Receive a `NETLINK_SOCK_DIAG` dump and zero the host-assigned socket
+    /// inode numbers in the reply so `ss`-style enumeration is deterministic.
+    ///
+    /// The dump lands in `msg_iov` (netlink diag sockets carry no ancillary
+    /// data), possibly scattered across several iovecs, so this reconstructs the
+    /// received bytes contiguously, sanitizes them via `crate::sock_diag`
+    /// (fail-open, zero-only), and writes them back preserving iovec boundaries.
+    async fn handle_sock_diag_recvmsg<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Recvmsg,
+    ) -> Result<i64, Error> {
+        let fd = call.sockfd();
+        let Some(message_address) = call.msg() else {
+            return self.handle_socket_receive(guest, call, fd, true).await;
+        };
+        // Snapshot the header's iovec pointer/count before the receive (they are
+        // stable across it; the kernel fills the pointed-to buffers, not the
+        // array). Extract them as plain scalars so no non-`Send` raw pointer is
+        // held across the await below.
+        let message: libc::msghdr = guest.memory().read_value(message_address)?;
+        let msg_iov = message.msg_iov as usize;
+        let msg_iovlen = message.msg_iovlen;
+
+        let result = self.handle_socket_receive(guest, call, fd, true).await?;
+        let received = usize::try_from(result).unwrap_or(0);
+        if received == 0 || msg_iov == 0 || msg_iovlen == 0 {
+            return Ok(result);
+        }
+
+        let iov_count = msg_iovlen.min(libc::UIO_MAXIOV as usize);
+        let iov_address: AddrMut<'_, libc::iovec> =
+            AddrMut::from_raw(msg_iov).ok_or(Errno::EFAULT)?;
+        // SAFETY: `iovec` is a plain C record; an all-zero value is a valid
+        // staging value immediately overwritten by `read_values`.
+        let mut iovecs: Vec<libc::iovec> = (0..iov_count)
+            .map(|_| unsafe { std::mem::zeroed() })
+            .collect();
+        guest
+            .memory()
+            .read_values(iov_address.into(), &mut iovecs)?;
+
+        // Reconstruct the received bytes contiguously across scatter-gather
+        // segments, bounded by both each iov's capacity and the received count
+        // (which, under MSG_TRUNC, can exceed the buffer capacity).
+        let mut segments: Vec<(AddrMut<'_, u8>, usize)> = Vec::new();
+        let mut buffer: Vec<u8> = Vec::with_capacity(received);
+        let mut remaining = received;
+        for iov in &iovecs {
+            if remaining == 0 {
+                break;
+            }
+            if iov.iov_base.is_null() || iov.iov_len == 0 {
+                continue;
+            }
+            let take = iov.iov_len.min(remaining);
+            let address: AddrMut<'_, u8> =
+                AddrMut::from_raw(iov.iov_base as usize).ok_or(Errno::EFAULT)?;
+            let mut segment = vec![0u8; take];
+            guest.memory().read_exact(address, &mut segment)?;
+            buffer.extend_from_slice(&segment);
+            segments.push((address, take));
+            remaining -= take;
+        }
+
+        if !crate::sock_diag::sanitize_sock_diag_inodes(&mut buffer) {
+            return Ok(result);
+        }
+
+        // Write the sanitized bytes back, preserving the original boundaries.
+        let mut offset = 0;
+        for (address, len) in segments {
+            guest
+                .memory()
+                .write_exact(address, &buffer[offset..offset + len])?;
+            offset += len;
+        }
         Ok(result)
     }
 

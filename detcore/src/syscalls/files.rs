@@ -1725,6 +1725,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 FdType::Socket,
             )
             .await?;
+            self.mark_sock_diag_fd(guest, fd, &call);
             Ok(fd as i64)
         } else {
             // Under run mode, force all sockets to be registered to be nonblocking in the OS:
@@ -1744,8 +1745,23 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await?;
             self.maybe_set_nonblocking_fd(guest, fd);
+            self.mark_sock_diag_fd(guest, fd, &call);
 
             Ok(fd as i64)
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1064)
+    /// Flag `AF_NETLINK`/`NETLINK_SOCK_DIAG` sockets so `handle_recvmsg`
+    /// determinizes the socket inode numbers carried by their binary dump
+    /// replies (see `crate::sock_diag`). Best-effort: if the descriptor lookup
+    /// fails the reply is simply left unsanitized.
+    fn mark_sock_diag_fd<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd, call: &syscalls::Socket) {
+        if call.family() == libc::AF_NETLINK && call.protocol() == libc::NETLINK_SOCK_DIAG {
+            let _ = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.set_sock_diag());
         }
     }
 

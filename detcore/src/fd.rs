@@ -120,6 +120,10 @@ struct OpenFileDescription {
     procfs: Option<ProcfsFile>,
     /// Logical timestamp of the last packet delivered through this socket.
     socket_receive_timestamp: Option<LogicalTime>,
+    /// True when this open file is an `AF_NETLINK`/`NETLINK_SOCK_DIAG` socket,
+    /// whose binary dump replies carry host-assigned socket inode numbers that
+    /// must be determinized (see `crate::sock_diag`).
+    sock_diag: bool,
 }
 
 impl PartialEq for DetFd {
@@ -161,6 +165,7 @@ impl DetFd {
                 resource: None,
                 procfs: None,
                 socket_receive_timestamp: None,
+                sock_diag: false,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             })),
@@ -392,6 +397,21 @@ impl DetFd {
     pub(crate) fn socket_receive_timestamp(&self) -> Option<LogicalTime> {
         self.description().socket_receive_timestamp
     }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1064)
+    /// Mark this open file as a `NETLINK_SOCK_DIAG` socket. Shared across every
+    /// dup/fork alias of the same open file description.
+    pub(crate) fn set_sock_diag(&self) {
+        self.description().sock_diag = true;
+    }
+
+    // TODO-HUMAN-REVIEW(PR-1064)
+    /// Whether this open file is a `NETLINK_SOCK_DIAG` socket whose dump replies
+    /// must have their socket inode numbers determinized.
+    pub(crate) fn is_sock_diag(&self) -> bool {
+        self.description().sock_diag
+    }
 }
 
 impl fmt::Display for DetFd {
@@ -438,6 +458,13 @@ mod tests {
         let timestamp = LogicalTime::from_nanos(2_345_678_901);
         original.set_socket_receive_timestamp(timestamp);
         assert_eq!(duplicate.socket_receive_timestamp(), Some(timestamp));
+
+        assert!(!original.is_sock_diag());
+        original.set_sock_diag();
+        assert!(
+            duplicate.is_sock_diag(),
+            "sock_diag marking through one alias must be visible through every alias"
+        );
     }
 
     #[test]

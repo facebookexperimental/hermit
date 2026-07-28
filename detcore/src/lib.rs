@@ -52,6 +52,7 @@ mod procmaps;
 mod record_or_replay;
 mod resources;
 mod scheduler;
+mod sock_diag;
 mod stat;
 mod syscall_classification;
 mod syscall_time;
