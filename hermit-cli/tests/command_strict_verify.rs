@@ -117,6 +117,12 @@ fn common_commands_are_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();
     let cases = [
         StrictCommandCase {
+            name: "ls",
+            candidates: &["/usr/bin/ls", "/bin/ls"],
+            args: &["-1", "/etc/hostname"],
+            stdin: None,
+        },
+        StrictCommandCase {
             name: "cat",
             candidates: &["/usr/bin/cat", "/bin/cat"],
             args: &["/etc/hostname"],
@@ -139,6 +145,18 @@ fn common_commands_are_deterministic_under_strict_verify() {
             candidates: &["/usr/bin/sort", "/bin/sort"],
             args: &[],
             stdin: Some(b"gamma\nalpha\nbeta\n"),
+        },
+        StrictCommandCase {
+            name: "uniq",
+            candidates: &["/usr/bin/uniq", "/bin/uniq"],
+            args: &["/etc/passwd"],
+            stdin: None,
+        },
+        StrictCommandCase {
+            name: "tail",
+            candidates: &["/usr/bin/tail", "/bin/tail"],
+            args: &["-n", "3", "/etc/passwd"],
+            stdin: None,
         },
         StrictCommandCase {
             name: "env",
