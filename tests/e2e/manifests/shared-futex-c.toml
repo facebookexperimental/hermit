@@ -1,0 +1,111 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+#
+# Generated migration inventory for C guests. See README.md for schema v2.
+
+schema = 2
+bucket = "shared-futex-c"
+
+[[test]]
+id = "shared-futex-c/qemu-exec-init"
+description = "Strict verification for tests/shared-futex-verify/qemu_exec_init.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/shared-futex-verify/qemu_exec_init.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.build]
+  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare", "-std=gnu11", "-nostdlib", "-static", "-fno-stack-protector", "-fno-pie", "-no-pie"]
+
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.disabled_modes]
+naked = "This migration inventories strict verification; it does not assert native nondeterminism"
+replay = "Record/replay qualification is separate from the initial strict-verification migration"
+chaos = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+
+[[test]]
+id = "shared-futex-c/qemu-hello"
+description = "Strict verification for tests/shared-futex-verify/qemu_hello.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/shared-futex-verify/qemu_hello.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.disabled_modes]
+naked = "This migration inventories strict verification; it does not assert native nondeterminism"
+replay = "Record/replay qualification is separate from the initial strict-verification migration"
+chaos = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+
+[[test]]
+id = "shared-futex-c/qemu-init"
+description = "Strict verification for tests/shared-futex-verify/qemu_init.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/shared-futex-verify/qemu_init.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.build]
+  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare", "-std=gnu11", "-nostdlib", "-static", "-fno-stack-protector", "-fno-pie", "-no-pie"]
+
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.disabled_modes]
+naked = "This migration inventories strict verification; it does not assert native nondeterminism"
+replay = "Record/replay qualification is separate from the initial strict-verification migration"
+chaos = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+
+[[test]]
+id = "shared-futex-c/qemu-net-init"
+description = "Strict verification for tests/shared-futex-verify/qemu_net_init.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/shared-futex-verify/qemu_net_init.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.build]
+  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare", "-std=gnu11", "-nostdlib", "-static", "-fno-stack-protector", "-fno-pie", "-no-pie"]
+
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.disabled_modes]
+naked = "This migration inventories strict verification; it does not assert native nondeterminism"
+replay = "Record/replay qualification is separate from the initial strict-verification migration"
+chaos = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"

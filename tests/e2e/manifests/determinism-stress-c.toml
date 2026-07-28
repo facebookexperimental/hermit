@@ -1,0 +1,223 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+#
+# Generated migration inventory for C guests. See README.md for schema v2.
+
+schema = 2
+bucket = "determinism-stress-c"
+
+[[test]]
+id = "determinism-stress-c/fork-tree"
+description = "Strict verification for tests/e2e/determinism-stress/fork_tree.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/determinism-stress/fork_tree.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.disabled_modes]
+naked = "This migration inventories strict verification; it does not assert native nondeterminism"
+replay = "Record/replay qualification is separate from the initial strict-verification migration"
+chaos = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+
+[[test]]
+id = "determinism-stress-c/lock-free"
+description = "Strict verification for tests/e2e/determinism-stress/guests/lock_free.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/determinism-stress/guests/lock_free.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.build]
+  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare"]
+
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.disabled_modes]
+naked = "This migration inventories strict verification; it does not assert native nondeterminism"
+replay = "Record/replay qualification is separate from the initial strict-verification migration"
+chaos = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+
+[[test]]
+id = "determinism-stress-c/pid-tid"
+description = "Strict verification for tests/e2e/determinism-stress/guests/pid_tid.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/determinism-stress/guests/pid_tid.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.disabled_modes]
+naked = "This migration inventories strict verification; it does not assert native nondeterminism"
+replay = "Record/replay qualification is separate from the initial strict-verification migration"
+chaos = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+
+[[test]]
+id = "determinism-stress-c/signal-order"
+description = "Strict verification for tests/e2e/determinism-stress/guests/signal_order.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/determinism-stress/guests/signal_order.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.build]
+  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare"]
+
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.disabled_modes]
+naked = "This migration inventories strict verification; it does not assert native nondeterminism"
+replay = "Record/replay qualification is separate from the initial strict-verification migration"
+chaos = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+
+[[test]]
+id = "determinism-stress-c/mmap-fork-shared"
+description = "Strict verification for tests/e2e/determinism-stress/mmap_fork_shared.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/determinism-stress/mmap_fork_shared.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.disabled_modes]
+naked = "This migration inventories strict verification; it does not assert native nondeterminism"
+replay = "Record/replay qualification is separate from the initial strict-verification migration"
+chaos = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+
+[[test]]
+id = "determinism-stress-c/pipe-chain"
+description = "Strict verification for tests/e2e/determinism-stress/pipe_chain.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/determinism-stress/pipe_chain.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.disabled_modes]
+naked = "This migration inventories strict verification; it does not assert native nondeterminism"
+replay = "Record/replay qualification is separate from the initial strict-verification migration"
+chaos = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+
+[[test]]
+id = "determinism-stress-c/pipe-prefill"
+description = "Strict verification for tests/e2e/determinism-stress/pipe_prefill.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/determinism-stress/pipe_prefill.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.disabled_modes]
+naked = "This migration inventories strict verification; it does not assert native nondeterminism"
+replay = "Record/replay qualification is separate from the initial strict-verification migration"
+chaos = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+
+[[test]]
+id = "determinism-stress-c/thread-contention"
+description = "Strict verification for tests/e2e/determinism-stress/thread_contention.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/determinism-stress/thread_contention.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.disabled_modes]
+naked = "This migration inventories strict verification; it does not assert native nondeterminism"
+replay = "Record/replay qualification is separate from the initial strict-verification migration"
+chaos = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+
+[[test]]
+id = "determinism-stress-c/thread-stress"
+description = "Strict verification for tests/e2e/determinism-stress/thread_stress.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/determinism-stress/thread_stress.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.disabled_modes]
+naked = "This migration inventories strict verification; it does not assert native nondeterminism"
+replay = "Record/replay qualification is separate from the initial strict-verification migration"
+chaos = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"

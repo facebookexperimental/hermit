@@ -1,0 +1,62 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+#
+# Generated migration inventory for C guests. See README.md for schema v2.
+
+schema = 2
+bucket = "chaos-c"
+
+[[test]]
+id = "chaos-c/lock-granularity"
+description = "Strict verification for tests/chaos/lock_granularity.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/chaos/lock_granularity.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.build]
+  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare"]
+
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.disabled_modes]
+naked = "This migration inventories strict verification; it does not assert native nondeterminism"
+replay = "Record/replay qualification is separate from the initial strict-verification migration"
+chaos = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+
+[[test]]
+id = "chaos-c/order-violation"
+description = "Strict verification for tests/chaos/order_violation.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/chaos/order_violation.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.build]
+  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare"]
+
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.disabled_modes]
+naked = "This migration inventories strict verification; it does not assert native nondeterminism"
+replay = "Record/replay qualification is separate from the initial strict-verification migration"
+chaos = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
