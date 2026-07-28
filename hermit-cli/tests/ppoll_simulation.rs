@@ -69,7 +69,7 @@ fn ppoll_waits_use_nonblocking_probes_and_verify() {
         .args(["--kill-after", "5s", "30s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
-            "--log=off",
+            "--log=info",
             "run",
             "--strict",
             "--verify",

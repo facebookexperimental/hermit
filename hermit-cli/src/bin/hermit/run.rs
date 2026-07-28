@@ -49,6 +49,7 @@ use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
 use super::verify::compare_two_runs;
 use super::verify::temp_log_files;
+use super::verify::validate_log_level;
 
 const TMP_DIR: &str = "/tmp";
 const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
@@ -1430,6 +1431,9 @@ impl RunOpts {
         // subcommand (`hermit run --backend X ...`). An explicit subcommand-level
         // value wins; otherwise fall back to the global one.
         self.backend = self.backend.or(global.backend);
+        if self.verify {
+            validate_log_level(global)?;
+        }
         if self.selected_backend() == Backend::Kvm {
             hermit::reserve_kvm_stdin(super::startup_stdin()?)?;
         }

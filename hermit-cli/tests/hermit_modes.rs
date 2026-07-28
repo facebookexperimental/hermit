@@ -808,30 +808,29 @@ fn verify_mode_matrix() {
 }
 
 #[test]
-fn verify_captures_debug_logs_when_a_lower_level_is_requested() {
+fn verify_rejects_explicit_log_levels_below_info() {
     let _guard = hermit_run_lock();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command.args([
-        "--log=error",
-        "run",
-        "--verify",
-        "--base-env=minimal",
-        "--no-virtualize-cpuid",
-        "--max-timeslice=disabled",
-        "--",
-        "/bin/true",
-    ]);
-
-    let output = command_output(command, "verify minimum log level");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("Logs contain "),
-        "missing log counts:\n{stderr}"
-    );
-    assert!(
-        !stderr.contains("Logs contain 0 | 0 messages total"),
-        "verify compared empty logs:\n{stderr}"
-    );
+    for level in ["off", "error", "warn"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                &format!("--log={level}"),
+                "run",
+                "--verify",
+                "--",
+                "/bin/true",
+            ])
+            .output()
+            .unwrap_or_else(|error| panic!("failed to start verify with {level} logs: {error}"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "--log={level} unexpectedly passed"
+        );
+        assert!(
+            stderr.contains("--verify requires --log=info"),
+            "unexpected --log={level} error:\n{stderr}"
+        );
+    }
 }
 
 #[test]

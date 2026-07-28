@@ -35,6 +35,21 @@ pub(crate) struct ComparisonOptions<'a> {
     pub compare_logs: bool,
 }
 
+/// Reject an explicit log level that would suppress the events verification compares.
+///
+/// With no explicit level, the verification paths select `DEBUG` internally.
+pub(crate) fn validate_log_level(global: &GlobalOpts) -> Result<(), Error> {
+    if let Some(level) = global.log
+        && level < LevelFilter::INFO
+    {
+        anyhow::bail!(
+            "--verify requires --log=info or a more verbose level; received --log={}",
+            level.to_string().to_ascii_lowercase()
+        );
+    }
+    Ok(())
+}
+
 pub fn temp_log_files(name1: &str, name2: &str) -> io::Result<(NamedTempFile, NamedTempFile)> {
     let file1 = tempfile::Builder::new()
         .prefix(&format!("{}_log_", name1))
@@ -226,6 +241,37 @@ mod tests {
     fn empty_logs() -> (TempPath, TempPath) {
         let (left, right) = temp_log_files("verify_left", "verify_right").unwrap();
         (left.into_temp_path(), right.into_temp_path())
+    }
+
+    fn global_with_log(log: Option<LevelFilter>) -> GlobalOpts {
+        GlobalOpts {
+            log,
+            log_file: None,
+            backend: None,
+        }
+    }
+
+    #[test]
+    fn verify_rejects_explicit_log_levels_below_info() {
+        for level in [LevelFilter::OFF, LevelFilter::ERROR, LevelFilter::WARN] {
+            let error = validate_log_level(&global_with_log(Some(level))).unwrap_err();
+            assert!(
+                error.to_string().contains("requires --log=info"),
+                "unexpected error for {level}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_accepts_default_and_info_or_more_verbose_logs() {
+        for level in [
+            None,
+            Some(LevelFilter::INFO),
+            Some(LevelFilter::DEBUG),
+            Some(LevelFilter::TRACE),
+        ] {
+            validate_log_level(&global_with_log(level)).unwrap();
+        }
     }
 
     fn compare(

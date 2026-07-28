@@ -65,7 +65,7 @@ fn madvise_policy_verifies_in_run_record_and_kvm_modes() {
             .args(["--kill-after", "5s", "30s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
             .args([
-                "--log=off",
+                "--log=info",
                 "run",
                 "--verify",
                 "--preemption-timeout=disabled",
@@ -88,7 +88,7 @@ fn madvise_policy_verifies_in_run_record_and_kvm_modes() {
             .args(["--kill-after", "5s", "30s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
             .args([
-                "--log=off",
+                "--log=info",
                 "--backend=kvm",
                 "run",
                 "--strict",
@@ -110,7 +110,7 @@ fn madvise_policy_verifies_in_run_record_and_kvm_modes() {
         .args(["--kill-after", "5s", "60s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
-            "--log=off",
+            "--log=info",
             "record",
             "start",
             "--verify",

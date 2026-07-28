@@ -34,7 +34,7 @@ fn copy_file_range_refusal_is_deterministic() {
         .args(["--kill-after", "5s", "90s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
-            "--log=off",
+            "--log=info",
             "run",
             "--backend=ptrace",
             "--strict",

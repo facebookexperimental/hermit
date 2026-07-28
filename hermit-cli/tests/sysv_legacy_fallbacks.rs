@@ -55,7 +55,7 @@ fn sysv_and_legacy_filesystem_features_fall_back_deterministically() {
             .args(["--kill-after", "5s", "90s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
             .args([
-                "--log=off",
+                "--log=info",
                 "run",
                 "--backend=ptrace",
                 "--strict",

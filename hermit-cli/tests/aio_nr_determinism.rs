@@ -73,7 +73,7 @@ fn aio_nr_consumers_verify() {
             .args(["--kill-after", "5s", "90s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
             .args([
-                "--log=off",
+                "--log=info",
                 "run",
                 "--backend=ptrace",
                 "--strict",

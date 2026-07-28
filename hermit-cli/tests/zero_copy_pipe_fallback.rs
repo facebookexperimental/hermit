@@ -55,7 +55,7 @@ fn zero_copy_pipe_syscalls_fall_back_only_in_strict_mode() {
             .args(["--kill-after", "5s", "90s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
             .args([
-                "--log=off",
+                "--log=info",
                 "run",
                 "--backend=ptrace",
                 "--strict",

@@ -29,7 +29,7 @@
 //! # Managed runtimes: Go and the JVM
 //!
 //! This file also covers the Go runtime and the JVM. The results below were
-//! measured with the ptrace backend, `--log=off`, and relaxations
+//! measured with the ptrace backend, `--log=info`, and relaxations
 //! `--no-virtualize-cpuid --max-timeslice=disabled` (which keep strict
 //! determinism; they only accommodate hosts without CPUID/PMU interception),
 //! using Go 1.26.4 (Red Hat 1.26.4-1.el9) and OpenJDK 1.8.0_492.
@@ -203,7 +203,7 @@ fn assert_l2_under_strict_verify(program: &Path, args: &[&str]) {
         .arg(hermit_verify_timeout())
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
-            "--log=off",
+            "--log=info",
             "run",
             "--strict",
             "--verify",

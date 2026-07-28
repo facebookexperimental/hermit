@@ -45,6 +45,7 @@ use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
 use super::verify::compare_two_runs;
 use super::verify::setup_double_run;
+use super::verify::validate_log_level;
 
 #[derive(Debug)]
 struct E9patchRecordOverlay {
@@ -310,6 +311,7 @@ impl StartOpts {
 
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         if self.verify {
+            validate_log_level(global)?;
             self.record_verify(global)
         } else if !self.gdbex.is_empty() {
             self.record_verify_debug(global)

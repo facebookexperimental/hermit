@@ -456,7 +456,7 @@ fn run_ptrace_verify_reemits_unsupported_syscall_warning() {
     let program = dbi_unsupported_syscall_guest()
         .to_str()
         .expect("unsupported-syscall guest path should be UTF-8");
-    let args = ["--log", "warn", "run", "--verify", "--", program];
+    let args = ["--log", "info", "run", "--verify", "--", program];
     let output = hermit(&args);
     assert_success(&output, &args);
     let warning = "syscalls pidfd_getfd used but not yet supported";

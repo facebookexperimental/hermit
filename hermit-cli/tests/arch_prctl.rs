@@ -65,7 +65,7 @@ fn arch_prctl_controls_verify_in_run_and_record_modes() {
             .args(["--kill-after", "5s", "30s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
             .args([
-                "--log=off",
+                "--log=info",
                 "run",
                 "--verify",
                 "--preemption-timeout=disabled",
@@ -87,7 +87,7 @@ fn arch_prctl_controls_verify_in_run_and_record_modes() {
         .args(["--kill-after", "5s", "30s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
-            "--log=off",
+            "--log=info",
             "run",
             "--strict",
             "--verify",
@@ -112,7 +112,7 @@ fn arch_prctl_controls_verify_in_run_and_record_modes() {
         .args(["--kill-after", "5s", "60s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
-            "--log=off",
+            "--log=info",
             "record",
             "start",
             "--verify",

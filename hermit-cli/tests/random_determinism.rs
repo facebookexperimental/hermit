@@ -58,7 +58,7 @@ fn assert_guest_l2(guest: &Path) {
         .args(["--kill-after", "10s", "60s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
-            "--log=off",
+            "--log=info",
             "run",
             "--strict",
             "--verify",

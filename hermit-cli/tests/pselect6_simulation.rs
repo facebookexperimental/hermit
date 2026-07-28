@@ -70,7 +70,7 @@ fn pselect6_preserves_kernel_abi_and_unblocks_scheduler() {
         .args(["--kill-after", "5s", "30s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
-            "--log=off",
+            "--log=info",
             "run",
             "--strict",
             "--verify",

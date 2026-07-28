@@ -60,7 +60,7 @@ fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
             HERMIT_VERIFY_TIMEOUT,
         ])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=off", "run", "--strict", "--verify"])
+        .args(["--log=info", "run", "--strict", "--verify"])
         .arg(format!("--env=HOME={}", home.path().display()))
         .arg(format!(
             "--env=XDG_CONFIG_HOME={}",
@@ -580,7 +580,7 @@ fn python_prlimit64_query_is_deterministic_under_strict_verify() {
             HERMIT_VERIFY_TIMEOUT,
         ])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=off", "run", "--strict", "--verify", "--"])
+        .args(["--log=info", "run", "--strict", "--verify", "--"])
         .arg(&python)
         .args(["-c", query])
         .output()

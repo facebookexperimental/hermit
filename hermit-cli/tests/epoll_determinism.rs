@@ -115,7 +115,7 @@ fn assert_scenario_reaches_l2(scenario: &str) {
         .args(["--kill-after", "10s", "60s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
-            "--log=off",
+            "--log=info",
             "run",
             "--strict",
             "--verify",

@@ -59,7 +59,7 @@ function run_example {
 
     printf '==> ptrace L2: examples/%s\n' "$example"
     timeout --foreground --kill-after=10s "$EXAMPLE_TIMEOUT" \
-        "$HERMIT_BIN" --log=off run \
+        "$HERMIT_BIN" --log=info run \
         --backend ptrace \
         --strict --verify \
         --no-virtualize-cpuid --max-timeslice=disabled \

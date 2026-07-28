@@ -85,7 +85,7 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
         verify
             .args(["--kill-after", "5s", "30s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
-            .args(["--log=off", "run", "--verify", "--base-env=minimal"]);
+            .args(["--log=info", "run", "--verify", "--base-env=minimal"]);
         if strict {
             verify.args(["--strict", "--panic-on-unsupported-syscalls"]);
         }
@@ -135,7 +135,7 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
         .args(["--kill-after", "5s", "60s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
-            "--log=off",
+            "--log=info",
             "record",
             "start",
             "--verify",
