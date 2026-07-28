@@ -28,7 +28,7 @@
 set -euo pipefail
 
 case ${1:-} in
-    --prepare) exit 0 ;;
+    --prepare) command -v hexdump >/dev/null ;;
     --run) exec "${BASH_SOURCE[0]%/*}/../../../examples/devrand.sh" ;;
     *) echo "usage: $0 --prepare|--run" >&2; exit 2 ;;
 esac
