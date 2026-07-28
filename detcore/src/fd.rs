@@ -223,6 +223,11 @@ impl DetFd {
         self
     }
 
+    /// Update the scheduler resource shared by aliases of this open file.
+    pub(crate) fn set_resource<S: Into<Option<ResourceID>>>(&self, resource: S) {
+        self.description().resource = resource.into();
+    }
+
     /// If fd is non blocking
     pub fn is_nonblocking(&self) -> bool {
         oflags_nonblocking(self.description().status_flags)

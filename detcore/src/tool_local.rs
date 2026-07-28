@@ -44,6 +44,7 @@ use crate::memory::MemoryMetadata;
 use crate::preemptions::ThreadHistoryIterator;
 use crate::record_or_replay::NoopTool;
 use crate::record_or_replay::RecordOrReplay;
+use crate::resources::Device;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
@@ -369,7 +370,7 @@ impl FileMetadata {
     }
 
     /// set default fds
-    fn setup_stdio(mut self, pid: Pid, owner: DetTid) -> Self {
+    fn setup_stdio(mut self, _pid: Pid, owner: DetTid) -> Self {
         // guest stdio can be a pipe, which make things difficult
         // hence use a dummy stat here.
         // SAFETY: stating stdin is likely to always be safe
@@ -383,7 +384,7 @@ impl FileMetadata {
             self.allocate_open_file_id(owner),
         )
         .with_stat(stat)
-        .with_resource(ResourceID::Path(format!("/proc/{}/fd/0", pid).into()));
+        .with_resource(ResourceID::Device(Device::ContainerStdin));
         let stdout = DetFd::new(
             1,
             OFlag::empty(),
@@ -391,7 +392,7 @@ impl FileMetadata {
             self.allocate_open_file_id(owner),
         )
         .with_stat(stat)
-        .with_resource(ResourceID::Path(format!("/proc/{}/fd/1", pid).into()));
+        .with_resource(ResourceID::Device(Device::ContainerStdout));
         let stderr = DetFd::new(
             2,
             OFlag::empty(),
@@ -399,7 +400,7 @@ impl FileMetadata {
             self.allocate_open_file_id(owner),
         )
         .with_stat(stat)
-        .with_resource(ResourceID::Path(format!("/proc/{}/fd/2", pid).into()));
+        .with_resource(ResourceID::Device(Device::ContainerStderr));
 
         self.add_detfd(stdin);
         self.add_detfd(stdout);
@@ -439,6 +440,9 @@ impl FileMetadata {
             flags.insert(OFlag::O_CLOEXEC);
         }
         self.add_fd(owner, fd, flags, ty, Some(raw_stat.into()))?;
+        if let Some(resource) = stdio_resource(fd) {
+            self.with_detfd(fd, |detfd| detfd.set_resource(resource.clone()))?;
+        }
         if ty == FdType::Pipe && physically_nonblocking {
             self.with_detfd(fd, |detfd| detfd.set_physically_nonblocking())?;
         }
@@ -514,6 +518,15 @@ impl FileMetadata {
         let replaced = self.file_handles.insert(newfd, detfd);
         Ok(replaced
             .and_then(|detfd| (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())))
+    }
+}
+
+fn stdio_resource(fd: RawFd) -> Option<ResourceID> {
+    match fd {
+        0 => Some(ResourceID::Device(Device::ContainerStdin)),
+        1 => Some(ResourceID::Device(Device::ContainerStdout)),
+        2 => Some(ResourceID::Device(Device::ContainerStderr)),
+        _ => None,
     }
 }
 
@@ -677,6 +690,23 @@ mod file_metadata_tests {
                 .with_detfd(fd, |detfd| detfd.ty())
                 .expect("discovered descriptor should be tracked"),
             FdType::Regular
+        );
+    }
+
+    #[test]
+    fn discovered_stdio_uses_container_wide_resources() {
+        let owner = DetTid::from_raw(9);
+        let mut metadata = FileMetadata::new(owner);
+
+        metadata
+            .discover_fd_from_current_process(owner, libc::STDOUT_FILENO)
+            .expect("live stdout should be discovered");
+
+        assert_eq!(
+            metadata
+                .with_detfd(libc::STDOUT_FILENO, |detfd| detfd.resource())
+                .expect("discovered stdout should be tracked"),
+            Some(ResourceID::Device(Device::ContainerStdout))
         );
     }
 
