@@ -109,7 +109,7 @@ pub struct Config {
     pub backend_requires_thread_directed_process_signals: bool,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review backend-owned capability-control prctls.
+    // TODO-HUMAN-REVIEW(PR-1125): Review backend-owned capability-control prctls.
     /// The execution backend virtualizes capability bounding-set and ambient-capability state.
     #[serde(default)]
     #[clap(skip)]

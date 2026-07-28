@@ -125,7 +125,7 @@ fn is_supported_prctl_option(option: libc::c_int) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-PENDING): Review KVM capability-control prctl forwarding.
+// TODO-HUMAN-REVIEW(PR-1125): Review KVM capability-control prctl forwarding.
 fn is_backend_virtualized_capability_prctl(option: libc::c_int) -> bool {
     matches!(option, libc::PR_CAPBSET_DROP | libc::PR_CAP_AMBIENT)
 }
