@@ -210,16 +210,16 @@ are exclusively **wall-clock reads from worker threads**, not scheduling.
 | nested subshell tree `(echo a; (echo b; echo c))` | PASS |
 | pipeline `seq 1 100 | grep 5 | wc -l` | PASS |
 
-### 3l. Language runtimes — mixed (CPython is the load-sensitive outlier)
+### 3l. Language runtimes — pure-compute witnesses verify
 
 | Runtime | Command | Result |
 |---------|---------|--------|
-| perl | `perl -e 'print 6*7'` | PASS |
+| perl | `perl -e 'print 42'` | **PASS L4 (20/20)** at `96f9953a`; host load averages remained 146–176 during the run. |
 | lua | `lua -e 'print(6*7)'` | PASS |
 | node | `node -e 'console.log(6*7)'` | PASS |
 | java | `java -version` | PASS (OpenJDK 1.8.0_492 Temurin, 5/5 runs) — **requires PR #223** (`saturating_add` fix for `LogicalTime` overflow, #219) |
 | gawk | `gawk 'BEGIN{print 6*7}'` | PASS |
-| python3 (pure compute) | `python3 -c 'print(sum(range(100)))'` | **FLAKY (2/10 PASS under load)** — worker-thread `clock_gettime(CLOCK_MONOTONIC_COARSE)` sub-second divergence (dtid 3). Passes on a lightly-loaded host. |
+| python3 (pure compute) | `python3 -c 'print(sum(range(100)))'` | **PASS L4 (20/20)** at `96f9953a`; host load averages remained 146–181 during the run. |
 | python3 threading | see §3j | **FAIL** — same clock divergence |
 | php | `php -r 'echo 6*7;'` | TIMEOUT (>120 s under load; heavy interpreter startup) |
 | ruby | `ruby -e 'puts 6*7'` | **native broken** — host RubyGems load error (fails outside Hermit too) |
@@ -444,18 +444,18 @@ Sources/binaries kept outside the Hermit-isolated `/tmp`.
 | C++ | batch 40: `g++ -std=c++17` vector/map/`std::thread`+atomic ×400000/regex/`chrono` | **PASS L2** (5/5) |
 | Rust | batch 41 + `rustc -O` integer-sum binary | **PASS L2** (3/3 this session) |
 | Go | `go build` integer-sum binary (`go sum: 4950`) | **PASS L2** (3/3 this session) — Go's multithreaded runtime verifies for this compute workload |
-| Perl | `perl -e 'print 6*7'`; batch 38 (strftime/hash/map/line-count) | **PASS L2** |
+| Perl | `perl -e 'print 42'`; batch 38 (strftime/hash/map/line-count) | **PASS L4 (20/20)** at `96f9953a` under host load averages 146–176. |
 | Lua | `lua -e 'print(6*7)'` | **PASS L2** |
 | Node.js | `node -e 'console.log(6*7)'` | **PASS L2** |
 | Java | `java -version` (OpenJDK 1.8.0_492 Temurin, 5/5) — **requires PR #223** (`saturating_add` `LogicalTime` overflow fix) | **PASS L2** |
 | gawk | `gawk 'BEGIN{print 6*7}'` | **PASS L2** |
-| Python 3 | `python3 -c 'print(sum(range(100)))'` | **CONDITIONAL** — PASS on a lightly-loaded host; **flaky under load** (multi-thread `clock_gettime` sub-second divergence, §6.1) |
+| Python 3 | `python3 -c 'print(sum(range(100)))'` | **PASS L4 (20/20)** at `96f9953a` under host load averages 146–181; threaded Python remains a separate gap (§3j). |
 | Ruby | `ruby -e 'puts 6*7'` | **N/A** — host RubyGems broken (fails outside Hermit too), not a determinism result |
 | PHP | `php -r 'echo 6*7;'` | **N/A** — HHVM JIT, too slow to finish twice under load (timeout), not a determinism result |
 
-The 9 solidly-verifying languages are **C, C++, Rust, Go, Perl, Lua, Node.js, Java (with PR
-#223), and gawk**. Python verifies only on an idle host; Ruby and PHP are excluded for
-host/runtime reasons that are not Hermit determinism failures.
+The nine broad runtime witnesses remain **C, C++, Rust, Go, Perl, Lua, Node.js, Java (with PR
+#223), and gawk**. Python's pure-compute witness now passes the L4 stress threshold, while
+threaded Python remains a separate gap. Ruby and PHP are excluded for host/runtime reasons.
 
 ---
 
@@ -616,7 +616,7 @@ HERMIT=$(pwd)/target/debug/hermit
 # Any single program:
 $HERMIT run --strict --verify -- /bin/echo hello
 
-# A load-sensitive case (pass on idle host, flaky under heavy load):
+# A historically load-sensitive case (20/20 at 96f9953a under load averages 146–181):
 $HERMIT run --strict --verify -- python3 -c 'print(sum(range(100)))'
 
 # Record/replay suite:
@@ -625,6 +625,6 @@ cargo test -p hermit --test record_replay -- --test-threads=1
 
 Multithreaded / network programs are compiled natively and run *under* Hermit, so these
 measure **runtime** determinism (thread scheduling, syscalls, virtual time). Keep sources and
-binaries outside the Hermit-isolated `/tmp` when reproducing. Because the multithreaded-clock
-gap is load-sensitive, quantify flaky cases with repeat runs (e.g. 10×) rather than a single
-trial, and record the host `load average` alongside the result.
+binaries outside the Hermit-isolated `/tmp` when reproducing. Because clock-related failures can
+be load-sensitive, quantify suspected flaky cases with repeat runs rather than a single trial,
+bind results to a commit, and record the host `load average` alongside the result.
