@@ -49,6 +49,16 @@
                "classification": "latency-bound"}
     },
     {
+      "group": "test", "job": "applications_e2e",
+      "desc": "Run application end-to-end strict verification",
+      "cmd": "./tests/e2e/applications/run_all.sh",
+      "deps": ["build.workspace"],
+      "timeout": 300,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 30,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
       "group": "lint", "job": "rustfmt",
       "desc": "Rustfmt (cargo fmt --all -- --check)",
       "cmd": "cargo fmt --all -- --check",

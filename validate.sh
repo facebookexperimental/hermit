@@ -3908,6 +3908,8 @@ function run_hosted_only_suite {
     run_check "cargo-nextest available" ensure_cargo_nextest
     run_check "Build workspace" cargo build --workspace
     run_check "User examples at ptrace L2" ./ci/e2e_commands_bucketed.sh
+    run_check "Application end-to-end strict verification" \
+        ./tests/e2e/applications/run_all.sh
 
     start_check "Test workspace documentation" cargo test --workspace --doc
     start_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings

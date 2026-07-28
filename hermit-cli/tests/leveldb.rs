@@ -67,19 +67,25 @@ fn executable(build_dir: &Path, name: &str) -> PathBuf {
 }
 
 fn strict_run(binary: &Path, args: &[&str]) -> Output {
-    // AUTONOMOUS-BOT-IMPLEMENTED(#657): Hermit diagnostics include host timestamps and are not guest output.
     Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=off", "run", "--strict", "--base-env=minimal", "--"])
+        .args([
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            "--base-env=minimal",
+            "--",
+        ])
         .arg(binary)
         .args(args)
         .output()
         .unwrap_or_else(|error| panic!("failed to run {} under Hermit: {error}", binary.display()))
 }
 
-fn assert_success(output: &Output, label: &str, run: usize) {
+fn assert_success(output: &Output, label: &str) {
     assert!(
         output.status.success(),
-        "{label} run {run} failed with {}\nstdout:\n{}\nstderr:\n{}",
+        "{label} failed with {}\nstdout:\n{}\nstderr:\n{}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
@@ -87,23 +93,12 @@ fn assert_success(output: &Output, label: &str, run: usize) {
 }
 
 fn assert_deterministic(binary: &Path, args: &[&str], label: &str) {
-    let first = strict_run(binary, args);
-    assert_success(&first, label, 1);
-    let second = strict_run(binary, args);
-    assert_success(&second, label, 2);
-
-    assert_eq!(first.status, second.status, "{label} exit status differed");
+    let output = strict_run(binary, args);
+    assert_success(&output, label);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        first.stdout == second.stdout,
-        "{label} stdout differed\nrun 1:\n{}\nrun 2:\n{}",
-        String::from_utf8_lossy(&first.stdout),
-        String::from_utf8_lossy(&second.stdout),
-    );
-    assert!(
-        first.stderr == second.stderr,
-        "{label} stderr differed\nrun 1:\n{}\nrun 2:\n{}",
-        String::from_utf8_lossy(&first.stderr),
-        String::from_utf8_lossy(&second.stderr),
+        stderr.contains("Success: deterministic. Determinism verified."),
+        "{label} did not report successful deterministic verification\nstderr:\n{stderr}",
     );
 }
 
