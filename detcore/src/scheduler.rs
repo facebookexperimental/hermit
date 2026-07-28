@@ -924,7 +924,41 @@ impl Scheduler {
         rs: Resources,
         _global_time: &Arc<Mutex<GlobalTime>>,
     ) {
-        req.put(Ok(rs));
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1041): A guest resource-request RPC can race an
+        // asynchronous signal delivery. `force_unblock_thread` replaces
+        // `next_turns[tid].req` with an already-full Ivar carrying an
+        // `InboundSignal` request (see the `Ivar::full` at the bottom of this
+        // file). If the guest's own resource-request then lands on that same
+        // turn, the previous unconditional `req.put()` panicked with "Ivar
+        // multiple put" (observed intermittently on `timeout 5 echo hi` under
+        // `--strict --verify`, where a 5s SIGALRM races the child's `wait4`).
+        // Tolerate exactly that case: drop the late guest request and let the
+        // signal turn win — the interrupted syscall (e.g. `rt_sigsuspend`)
+        // restarts and re-issues a fresh request on the next turn. Any other
+        // double-put still panics, preserving the write-once Ivar invariant.
+        // Mirrors the `try_put` guard in `logically_kill_thread` (PR-845).
+        if let Some(dropped) = req.try_put(Ok(rs)) {
+            let tolerated = matches!(
+                req.try_read(),
+                Some(Ok(existing))
+                    if existing
+                        .resources
+                        .keys()
+                        .any(|r| matches!(r, ResourceID::InboundSignal(_)))
+            );
+            if tolerated {
+                trace!(
+                    "[request_put] dropping late guest request {:?}; an async inbound signal already filled the request for this turn (req {})",
+                    dropped, req
+                );
+            } else {
+                panic!(
+                    "Ivar multiple put exception in request_put! Attempted to write {:?} to {}; existing content is not an inbound-signal request.",
+                    dropped, req
+                );
+            }
+        }
     }
 
     /// Poll the resource request and *if* it is not currently observed to be full, return
