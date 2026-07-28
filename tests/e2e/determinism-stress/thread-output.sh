@@ -26,7 +26,7 @@
 set -euo pipefail
 
 case ${1:-} in
-    --prepare) exit 0 ;;
+    --prepare) test -x /bin/bash ;;
     --run) exec "${BASH_SOURCE[0]%/*}/../../../examples/race.sh" ;;
     *) echo "usage: $0 --prepare|--run" >&2; exit 2 ;;
 esac
