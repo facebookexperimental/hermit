@@ -64,25 +64,25 @@ fn ppoll_waits_use_nonblocking_probes_and_verify() {
         "ppoll did not use nonblocking scheduler probes\nstdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
     );
 
-    let mut verify_command = Command::new("timeout");
-    verify_command
-        .args(["--kill-after", "5s", "30s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "--log=info",
-            "run",
-            "--strict",
-            "--verify",
-            "--base-env=minimal",
-            "--",
-        ])
-        .arg(&guest);
-    let verify_output = command_output(verify_command, "strict ppoll verification");
-    let verify_stdout = String::from_utf8_lossy(&verify_output.stdout);
-    let verify_stderr = String::from_utf8_lossy(&verify_output.stderr);
-    assert!(
-        verify_stdout.contains("Determinism verified")
-            || verify_stderr.contains("Determinism verified"),
-        "Hermit omitted its determinism marker\nstdout:\n{verify_stdout}\nstderr:\n{verify_stderr}",
-    );
+    for backend in ["ptrace", "dbi"] {
+        let mut verify_command = Command::new("timeout");
+        verify_command
+            .args(["--kill-after", "5s", "30s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--log=info", "run"])
+            .arg(format!("--backend={backend}"))
+            .args(["--strict", "--verify", "--base-env=minimal", "--"])
+            .arg(&guest);
+        let verify_output = command_output(
+            verify_command,
+            &format!("strict {backend} ppoll verification"),
+        );
+        let verify_stdout = String::from_utf8_lossy(&verify_output.stdout);
+        let verify_stderr = String::from_utf8_lossy(&verify_output.stderr);
+        assert!(
+            verify_stdout.contains("Determinism verified")
+                || verify_stderr.contains("Determinism verified"),
+            "Hermit omitted its {backend} determinism marker\nstdout:\n{verify_stdout}\nstderr:\n{verify_stderr}",
+        );
+    }
 }

@@ -472,6 +472,57 @@ fn prlimit_new_limit_is_readable(
     read(args[2] as usize, &mut limit)
 }
 
+// TODO-HUMAN-REVIEW(PR-N): Review fault-safe DBI multiplexed-IO input validation.
+fn multiplexed_io_inputs_are_readable(
+    sysnum: i64,
+    args: &[u64],
+    mut read: impl FnMut(usize, &mut [u8]) -> bool,
+) -> bool {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    if sysnum == libc::SYS_ppoll {
+        if args[2] == 0 {
+            return true;
+        }
+        let mut timeout = [0_u8; std::mem::size_of::<libc::timespec>()];
+        return read(args[2] as usize, &mut timeout);
+    }
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    if sysnum != libc::SYS_pselect6 {
+        return true;
+    }
+
+    let nfds = args[0] as i64;
+    if nfds < 0 {
+        return true;
+    }
+    if args[4] != 0 {
+        let mut timeout = [0_u8; std::mem::size_of::<libc::timespec>()];
+        if !read(args[4] as usize, &mut timeout) {
+            return false;
+        }
+    }
+
+    const INTERNAL_MAX_NFDS: i64 = (std::mem::size_of::<libc::c_ulong>() * 8) as i64;
+    if nfds > INTERNAL_MAX_NFDS {
+        return true;
+    }
+    if nfds > 0 {
+        let mut fd_set = [0_u8; std::mem::size_of::<libc::c_ulong>()];
+        for address in &args[1..=3] {
+            if *address != 0 && !read(*address as usize, &mut fd_set) {
+                return false;
+            }
+        }
+    }
+    if args[5] != 0 {
+        let mut sigmask_argument = [0_u8; 2 * std::mem::size_of::<usize>()];
+        if !read(args[5] as usize, &mut sigmask_argument) {
+            return false;
+        }
+    }
+    true
+}
+
 fn getrandom_flags_are_valid(flags: u64) -> bool {
     let flags = flags as u32;
     let random = flags & libc::GRND_RANDOM != 0;
@@ -1303,6 +1354,13 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
         return 1;
     }
+    if !multiplexed_io_inputs_are_readable(sysnum, raw_args, |address, bytes| unsafe {
+        read_memory(address, bytes.as_mut_ptr(), bytes.len()) != 0
+    }) {
+        unsafe { result.write(-(Errno::EFAULT.into_raw() as i64)) };
+        TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+        return 1;
+    }
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-849): Review fault-safe DBI getrandom writes.
     // Probe with deterministic zeros through process_vm_writev, then let Detcore overwrite
@@ -1682,6 +1740,57 @@ mod tests {
         assert!(prlimit_new_limit_is_readable(
             libc::SYS_getrlimit,
             &limit,
+            |_, _| false,
+        ));
+    }
+
+    #[test]
+    fn multiplexed_io_input_preflight_rejects_unreadable_inputs() {
+        for (sysnum, timeout_index) in [(libc::SYS_ppoll, 2_usize), (libc::SYS_pselect6, 4_usize)] {
+            let mut args = [0; 6];
+            assert!(multiplexed_io_inputs_are_readable(sysnum, &args, |_, _| {
+                false
+            }));
+
+            args[timeout_index] = 1;
+            assert!(!multiplexed_io_inputs_are_readable(
+                sysnum,
+                &args,
+                |_, _| false
+            ));
+            assert!(multiplexed_io_inputs_are_readable(
+                sysnum,
+                &args,
+                |address, bytes| {
+                    address == 1 && bytes.len() == std::mem::size_of::<libc::timespec>()
+                },
+            ));
+        }
+
+        let pselect_sets = [1, 1, 0, 0, 0, 0];
+        assert!(!multiplexed_io_inputs_are_readable(
+            libc::SYS_pselect6,
+            &pselect_sets,
+            |_, _| false,
+        ));
+        assert!(multiplexed_io_inputs_are_readable(
+            libc::SYS_pselect6,
+            &pselect_sets,
+            |address, bytes| {
+                address == 1 && bytes.len() == std::mem::size_of::<libc::c_ulong>()
+            },
+        ));
+
+        let ignored_negative_sets = [u64::MAX, 1, 1, 1, 1, 1];
+        assert!(multiplexed_io_inputs_are_readable(
+            libc::SYS_pselect6,
+            &ignored_negative_sets,
+            |_, _| false,
+        ));
+
+        assert!(multiplexed_io_inputs_are_readable(
+            libc::SYS_read,
+            &[0, 0, 1, 0, 0, 0],
             |_, _| false,
         ));
     }

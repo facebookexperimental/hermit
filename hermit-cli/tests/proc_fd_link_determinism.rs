@@ -134,31 +134,27 @@ fn proc_fd_link_aliases_and_truncation_verify() {
         candidates: &[],
         args: &[],
     };
-    let output = Command::new("timeout")
-        .args(["--kill-after", "10s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "--log",
-            "DEBUG",
-            "run",
-            "--backend=ptrace",
-            "--strict",
-            "--verify",
-            "--",
-        ])
-        .arg(&guest)
-        .output()
-        .expect("failed to start Hermit");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "{} failed strict verification\nstdout:\n{stdout}\nstderr:\n{stderr}",
-        case.name
-    );
-    assert!(
-        stdout.contains("Determinism verified") || stderr.contains("Determinism verified"),
-        "{} omitted Hermit's verification marker\nstdout:\n{stdout}\nstderr:\n{stderr}",
-        case.name
-    );
+    for backend in ["ptrace", "dbi"] {
+        let output = Command::new("timeout")
+            .args(["--kill-after", "10s", "90s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--log", "DEBUG", "run"])
+            .arg(format!("--backend={backend}"))
+            .args(["--strict", "--verify", "--"])
+            .arg(&guest)
+            .output()
+            .expect("failed to start Hermit");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{} failed {backend} strict verification\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            case.name
+        );
+        assert!(
+            stdout.contains("Determinism verified") || stderr.contains("Determinism verified"),
+            "{} omitted {backend} verification marker\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            case.name
+        );
+    }
 }

@@ -9,6 +9,7 @@
 //! Deterministic views of kernel namespace metadata.
 
 use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -16,9 +17,11 @@ use std::path::PathBuf;
 use reverie::Errno;
 use reverie::Error;
 use reverie::Guest;
+use reverie::Stack;
 use reverie::syscalls;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::PathPtr;
 use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
 
@@ -135,22 +138,26 @@ fn proc_fd_target(path: &Path) -> Option<(Option<u32>, i32)> {
     }
 }
 
+// TODO-HUMAN-REVIEW(PR-N): Review numeric virtual-self proc-fd path rewriting.
+fn host_self_proc_fd_alias(path: &Path, current_pid: i64) -> Option<PathBuf> {
+    let (Some(subject), fd) = proc_fd_target(path)? else {
+        return None;
+    };
+    (i64::from(subject) == current_pid).then(|| PathBuf::from(format!("/proc/self/fd/{fd}")))
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#877)
-    async fn finish_namespace_readlink<G, S>(
+    async fn canonicalize_namespace_readlink_result<G>(
         &self,
         guest: &mut G,
         path: PathBuf,
         buffer: Option<AddrMut<'_, libc::c_char>>,
         buffer_len: usize,
-        syscall: S,
+        result: i64,
     ) -> Result<i64, Error>
     where
         G: Guest<Self>,
-        S: Into<Syscall>,
     {
-        let result = self.record_or_replay(guest, syscall).await?;
         if result <= 0 {
             return Ok(result);
         }
@@ -187,6 +194,25 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#877)
+    async fn finish_namespace_readlink<G, S>(
+        &self,
+        guest: &mut G,
+        path: PathBuf,
+        buffer: Option<AddrMut<'_, libc::c_char>>,
+        buffer_len: usize,
+        syscall: S,
+    ) -> Result<i64, Error>
+    where
+        G: Guest<Self>,
+        S: Into<Syscall>,
+    {
+        let result = self.record_or_replay(guest, syscall).await?;
+        self.canonicalize_namespace_readlink_result(guest, path, buffer, buffer_len, result)
+            .await
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#877)
     /// Preserve Linux readlink errors and canonicalize procfs namespace identities.
     pub async fn handle_readlink<G: Guest<Self>>(
         &self,
@@ -194,6 +220,34 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Readlink,
     ) -> Result<i64, Error> {
         let path: PathBuf = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        let host_path = if matches!(proc_fd_target(&path), Some((Some(_), _))) {
+            let current_pid = guest.inject(syscalls::Getpid::new()).await?;
+            host_self_proc_fd_alias(&path, current_pid)
+        } else {
+            None
+        };
+        if let Some(host_path) = host_path {
+            let bytes = host_path.as_os_str().as_bytes();
+            let mut path_buffer = [0_u8; 64];
+            path_buffer[..bytes.len()].copy_from_slice(bytes);
+            let mut stack = guest.stack().await;
+            let path_address = stack.push(path_buffer).cast::<libc::c_char>();
+            let stack_guard = stack.commit()?;
+            let physical_call = call.with_path(PathPtr::from_ptr(
+                path_address.as_raw() as *const libc::c_char
+            ));
+            let result = self.record_or_replay(guest, physical_call).await?;
+            drop(stack_guard);
+            return self
+                .canonicalize_namespace_readlink_result(
+                    guest,
+                    path,
+                    call.buf(),
+                    call.bufsize(),
+                    result,
+                )
+                .await;
+        }
         self.finish_namespace_readlink(guest, path, call.buf(), call.bufsize(), call)
             .await
     }
@@ -268,6 +322,22 @@ mod tests {
         ] {
             assert_eq!(proc_fd_target(Path::new(path)), Some(expected), "{path}");
         }
+    }
+
+    #[test]
+    fn rewrites_only_numeric_virtual_self_proc_fd_aliases() {
+        assert_eq!(
+            host_self_proc_fd_alias(Path::new("/proc/123/fd/7"), 123),
+            Some(PathBuf::from("/proc/self/fd/7"))
+        );
+        assert_eq!(
+            host_self_proc_fd_alias(Path::new("/proc/124/fd/7"), 123),
+            None
+        );
+        assert_eq!(
+            host_self_proc_fd_alias(Path::new("/proc/self/fd/7"), 123),
+            None
+        );
     }
 
     #[test]
