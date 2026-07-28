@@ -82,6 +82,9 @@ documentation, and unit-test nodes retain their existing dependencies.
 The 139-program record/replay compatibility ratchet runs as a separate step in
 the long merge-group job. It is intentionally outside the five-minute
 privileged smoke DAG, whose workflow enforces a 270-second outer bound.
+The DAG's longest configured timeout path is 240 seconds (120-second build plus
+120-second KVM E2E), and the manifest audit fails if later edits exceed the
+outer bound.
 
 Both `validate.sh` and GitHub Actions execute these exact DAG files. Use
 `ci/run-dag.sh portable ascii` or `ci/run-dag.sh privileged ascii` to audit the

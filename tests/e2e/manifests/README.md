@@ -83,7 +83,9 @@ audit compares the inventory byte-for-byte with filesystem discovery, then
 confirms that every manifest program is classified as `manifest-test`. Tests
 retained under Cargo, Buck, integration, QEMU, or suite drivers explain the
 build flags, arguments, expected results, hardware, or shared setup that their
-owner supplies.
+owner supplies. Each exception names its exact owning runner and the file's
+specific role; generic category-only justifications fail review even when the
+inventory is mechanically complete.
 
 `ci/expected-e2e-plan.json` ratchets the exact blocking cells. Adding, removing,
 or reclassifying a `ci=true` cell fails validation until the expected plan is

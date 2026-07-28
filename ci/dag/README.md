@@ -34,8 +34,11 @@ for individual gate commands; `validate.sh` delegates to them.
 
 The privileged DAG is limited to the focused build, CPUID faulting, PMU skid,
 manifest validation, and KVM E2E cells so the required self-hosted smoke stays
-within its 270-second workflow bound. The 139-program record/replay ratchet is
-preserved as a separate step in the long merge-group validation job.
+within its 270-second workflow bound. Each sequential build/KVM segment is
+capped at 120 seconds, yielding a 240-second maximum DAG timeout path; the
+manifest audit recomputes and enforces that bound. The 139-program
+record/replay ratchet is preserved as a separate step in the long merge-group
+validation job.
 
 Closed pull requests trigger a skipped workflow in the same concurrency group,
 which cancels their queued or in-progress PMU run. The `mem_race` family and

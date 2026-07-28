@@ -150,6 +150,15 @@ function audit_inventory {
             and (.why | type == "string" and length > 0)
             and (. as $entry | ($entry.why | startswith($entry.path + " is owned by " + $entry.runner + ": ")))))
         and ((.files | map(.path) | unique | length) == (.files | length))
+        and ([.files[] | select(.disposition != "manifest-test")
+              | . as $entry
+              | ($entry.why | ltrimstr($entry.path + " is owned by " + $entry.runner + ": "))]
+             | length == (unique | length))
+        and all(.files[] | select(.disposition != "manifest-test");
+            (. as $entry
+             | ($entry.why
+                | ltrimstr($entry.path + " is owned by " + $entry.runner + ": ")
+                | length >= 120)))
     ' "$INVENTORY" >/dev/null || die "test inventory schema violation"
 
     local scratch expected actual
@@ -214,6 +223,17 @@ function assert_validate_entrypoint {
         die "validate.sh $function_name command diverged from the audited entrypoint"
 }
 
+function dag_critical_path_seconds {
+    local dag=$1
+    jq -r '
+        (.steps | map({key:(.group + "." + .job), value:.}) | from_entries) as $steps
+        | def critical($id):
+            $steps[$id] as $step
+            | ($step.timeout + ([($step.deps // [])[] | critical(.)] | max // 0));
+          [.steps[] | critical(.group + "." + .job)] | max
+    ' "$dag"
+}
+
 function audit_ci_correspondence {
     local lane dag
     for lane in portable privileged; do
@@ -238,11 +258,25 @@ function audit_ci_correspondence {
     # shellcheck disable=SC2016
     assert_validate_entrypoint privileged run_privileged_validation \
         '    run_ci_manifest_lane privileged "${CI_PRIVILEGED_DAG_TIMEOUT_SECONDS:-7200}"'
+    # The default full validation must delegate to both audited DAGs too.
+    # shellcheck disable=SC2016
+    assert_validate_entrypoint portable run_full_suite \
+        '    run_ci_manifest_lane portable "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}"'
+    # shellcheck disable=SC2016
+    assert_validate_entrypoint privileged run_full_suite \
+        '    run_ci_manifest_lane privileged "${CI_PRIVILEGED_DAG_TIMEOUT_SECONDS:-7200}"'
     local runner_body
     runner_body=$(function_body run_ci_manifest_lane "$ROOT_DIR/validate.sh")
     # shellcheck disable=SC2016
     [[ $(grep -Fxc '        ./ci/run-dag.sh "$lane" -j "$jobs" -v' <<<"$runner_body") == 1 ]] ||
         die "validate.sh run_ci_manifest_lane must execute exactly one audited DAG"
+
+    local privileged_critical_path
+    privileged_critical_path=$(dag_critical_path_seconds "$ROOT_DIR/ci/dag/privileged.json")
+    [[ $privileged_critical_path =~ ^[0-9]+$ ]] ||
+        die "privileged DAG critical path is not an integer: $privileged_critical_path"
+    ((privileged_critical_path <= 270)) ||
+        die "privileged DAG timeout path ${privileged_critical_path}s exceeds workflow bound 270s"
 
     [[ -f $EXPECTED_PLAN ]] || die "missing E2E denominator ratchet: ${EXPECTED_PLAN#"$ROOT_DIR/"}"
     jq -e '.schema == 1 and (.cells | type == "array" and length > 0)' "$EXPECTED_PLAN" >/dev/null ||
@@ -270,8 +304,10 @@ function audit_ci_correspondence {
         --arg privileged_fingerprint "$privileged_fingerprint" \
         --argjson portable_steps "$(jq '.steps | length' "$ROOT_DIR/ci/dag/portable.json")" \
         --argjson privileged_steps "$(jq '.steps | length' "$ROOT_DIR/ci/dag/privileged.json")" \
+        --argjson privileged_critical_path_seconds "$privileged_critical_path" \
         --argjson e2e_cells "$e2e_cells" \
         '{portable_steps:$portable_steps,privileged_steps:$privileged_steps,
+          privileged_critical_path_seconds:$privileged_critical_path_seconds,
           e2e_cells:$e2e_cells,portable_fingerprint:$portable_fingerprint,
           privileged_fingerprint:$privileged_fingerprint,
           correspondence:"validated exact workflow and validate.sh entrypoints plus both DAG fingerprints"}'

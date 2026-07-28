@@ -14,6 +14,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(not(test))]
 use std::process::exit;
 
 use serde_json::json;
@@ -39,9 +40,15 @@ enum Format {
     HarnessJson,
 }
 
+#[cfg(not(test))]
 fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("manifest-plan: {msg}");
     exit(1);
+}
+
+#[cfg(test)]
+fn die(msg: impl std::fmt::Display) -> ! {
+    panic!("manifest-plan: {msg}");
 }
 
 fn parse_format() -> Format {
@@ -556,5 +563,98 @@ fn validate_mode(
             backend,
             ci,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_mode(text: &str) -> Value {
+        text.parse::<Value>().expect("test mode must be valid TOML")
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown keys")]
+    fn rejects_unknown_schema_keys() {
+        let value = parse_mode("known = true\nunknown = false\n");
+        ensure_keys(&value, &["known"], "test");
+    }
+
+    #[test]
+    #[should_panic(expected = "must partition")]
+    fn rejects_incomplete_backend_partition() {
+        let spec = parse_mode(
+            r#"
+ci = false
+backends_enabled = ["ptrace"]
+
+[backends_disabled]
+dbi = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "naked is opt-in meta-CI")]
+    fn rejects_naked_mode_in_regular_ci() {
+        let spec = parse_mode(
+            r#"
+ci = true
+backends_enabled = ["native"]
+runs = 3
+
+[backends_disabled]
+
+[assert]
+min_distinct = 2
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "naked",
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    fn accepts_complete_verify_partition() {
+        let spec = parse_mode(
+            r#"
+ci = true
+backends_enabled = ["ptrace"]
+
+[backends_disabled]
+dbi = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        let mut rows = Vec::new();
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &spec,
+            &mut rows,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].backend, "ptrace");
+        assert!(rows[0].ci);
     }
 }
