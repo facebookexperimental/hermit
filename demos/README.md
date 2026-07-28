@@ -59,7 +59,7 @@ cc -O2 -Wall -Wextra -Werror -std=gnu11 \
   tests/util/pmu_skid.c -o /tmp/pmu-skid-test
 /tmp/pmu-skid-test --iterations 1000
 KERNEL_IMAGE=/path/to/bzImage VERIFY=1 SKID_MARGIN=66276 \
-  DEMO_TIMEOUT_SECONDS=1000 ./demos/05-qemu-busybox.sh
+  DEMO_TIMEOUT_SECONDS=3600 ./demos/05-qemu-busybox.sh
 ```
 
 `SKID_MARGIN` forwards to Hermit's `--skid-margin`; it schedules the PMU
@@ -117,6 +117,14 @@ Current Reverie's 1,000-RCB processor default panicked during L2 Run 1. The
 measured override passed the prior failure point, but Run 1 had not completed
 after nine minutes and was stopped; current-main L2 verification therefore
 remains blocked on practical PMU calibration.
+
+Further diagnostics did not produce an acceptable workaround. Margins of
+10,000 and 40,000 RCBs avoided the assertion but still had not completed Run 1
+after more than 20 minutes. Disabling periodic preemption with
+`--max-timeslice=disabled` left QEMU thread-starved: Run 1 remained incomplete
+after seven minutes while the inner Hermit process used about 3% CPU. QEMU
+therefore needs periodic preemption, but current Reverie's safe calibrated
+preemption path is not practical for this workload on the measured host.
 
 Before the Reverie PMU-default update, an L2 `VERIFY=1` run completed both q35
 boots with the same inputs. Each normalized log contained 759,956 messages,
