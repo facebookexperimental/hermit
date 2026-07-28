@@ -2131,7 +2131,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         exit_status: ExitStatus,
     ) -> Result<(), Error> {
         let dettid = thread_state.dettid;
-        info!(
+        debug!(
             "[detcore, dtid {}] thread exit hook, deregistering from scheduler.",
             dettid
         );

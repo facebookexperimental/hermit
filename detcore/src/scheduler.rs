@@ -1086,11 +1086,6 @@ impl Scheduler {
     /// This is IDEMPOTENT, and it may indeed be called twice, both to proactively remove a thread,
     /// and then reactively in response to an exit hook.
     pub fn logically_kill_thread(&mut self, dtid: &DetTid, detpid: &DetPid, mm: MmId) {
-        info!(
-            "logically_kill: Scheduler removing all knowledge of [det]tid {} in pid {}..",
-            dtid, detpid
-        );
-
         // Remove from runnable queue:
         let _ = self.run_queue.remove_tid(*dtid);
         // Remove from all non-runnable pools:
@@ -1105,6 +1100,10 @@ impl Scheduler {
                 );
             }
             Some(nextturn) => {
+                info!(
+                    "logically_kill: Scheduler removing all knowledge of [det]tid {} in pid {}..",
+                    dtid, detpid
+                );
                 // Put in a dummy request to unblock the scheduler that might be
                 // waiting for the thread to park.
                 //
@@ -1206,7 +1205,7 @@ impl Scheduler {
         // Put the woken thread back into circulation:
         let pos = self.runqueue_push_back(waiterid);
         trace!(
-            "[detcore] Woke one thread, dtid: {}, ivar {:p}, scheduled at position {}",
+            "[detcore] Woke one thread, dtid: {}, ivar {}, scheduled at position {}",
             &waiterid, &waiter_ivar, pos,
         );
         let nxt = self
