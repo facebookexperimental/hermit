@@ -164,6 +164,13 @@ pub fn is_deterministically_refused_syscall(sysno: Sysno) -> bool {
     syscall_classification::is_deterministically_refused_syscall(sysno)
 }
 
+/// Returns the fixed errno when Detcore refuses `sysno` without consulting the host.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1142): Review the fixed-error policy shared with backend fallbacks.
+pub fn deterministic_refusal_errno(sysno: Sysno, strict: bool) -> Option<Errno> {
+    syscall_classification::deterministic_refusal_errno(sysno, strict)
+}
+
 /// Returns whether `sysno` is refused only when strict execution is enabled.
 pub fn is_strict_only_deterministic_refusal_syscall(sysno: Sysno) -> bool {
     syscall_classification::is_strict_only_deterministic_refusal_syscall(sysno)

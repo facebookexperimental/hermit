@@ -883,6 +883,7 @@ async fn run_sabre(
         PathBuf::from(&sabre),
         plugin.clone(),
         fallback_ready,
+        config.panic_on_unsupported_syscalls,
         capture_output,
     )
     .await
