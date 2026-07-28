@@ -2157,15 +2157,15 @@
     },
     {
       "path": "tests/util/curl_to_server_with_ssl.sh",
-      "disposition": "integration-helper",
-      "runner": "validate.sh or Hermit integration targets",
-      "why": "tests/util/curl_to_server_with_ssl.sh is owned by validate.sh or Hermit integration targets: The `curl_to_server_with_ssl` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
+      "disposition": "special-driver",
+      "runner": "manual TLS client/server compatibility entrypoint",
+      "why": "tests/util/curl_to_server_with_ssl.sh is owned by manual TLS client/server compatibility entrypoint: This executable starts ssl_server.py as a coprocess, reads its dynamic address, launches curl through Hermit with nondeterministic-I/O options, and waits for server shutdown. It remains a manual driver because its two-process network lifecycle and dynamic endpoint do not fit the single-program manifest contract."
     },
     {
       "path": "tests/util/hermit_analyze_e2e.sh",
-      "disposition": "integration-helper",
-      "runner": "validate.sh or Hermit integration targets",
-      "why": "tests/util/hermit_analyze_e2e.sh is owned by validate.sh or Hermit integration targets: The `hermit_analyze_e2e` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
+      "disposition": "special-driver",
+      "runner": "manual PMU schedule-search entrypoint",
+      "why": "tests/util/hermit_analyze_e2e.sh is owned by manual PMU schedule-search entrypoint: This executable builds Hermit plus two race fixtures, compiles a freestanding C guest, calibrates optional skid arguments, and invokes hermit_analyze_test.sh with source-location expectations. It remains a manual driver because PMU schedule localization and paired fixture builds require dedicated hardware-aware orchestration."
     },
     {
       "path": "tests/util/hermit_analyze_test.sh",
@@ -2175,9 +2175,9 @@
     },
     {
       "path": "tests/util/hermit_verify_trace_replay.sh",
-      "disposition": "integration-helper",
-      "runner": "validate.sh or Hermit integration targets",
-      "why": "tests/util/hermit_verify_trace_replay.sh is owned by validate.sh or Hermit integration targets: The `hermit_verify_trace_replay` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
+      "disposition": "special-driver",
+      "runner": "manual trace/replay comparison entrypoint",
+      "why": "tests/util/hermit_verify_trace_replay.sh is owned by manual trace/replay comparison entrypoint: This executable records one Hermit schedule, replays it in a second process, and compares exit status, stdout, stderr, and normalized syscall histories before cleaning its logs. It remains a manual driver because its cross-run trace artifacts and four-part comparison exceed a single manifest observation."
     },
     {
       "path": "tests/util/perf_supported.sh",
