@@ -3907,6 +3907,7 @@ function run_hosted_only_suite {
         ./scripts/check-detcore-backend-abstraction.sh
     run_check "cargo-nextest available" ensure_cargo_nextest
     run_check "Build workspace" cargo build --workspace
+    run_check "User examples at ptrace L2" ./ci/e2e_commands_bucketed.sh
 
     start_check "Test workspace documentation" cargo test --workspace --doc
     start_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
@@ -4044,6 +4045,7 @@ function run_hardware_validation {
 
 function run_quick_suite {
     run_check "Build workspace" cargo build --workspace
+    run_check "User examples at ptrace L2" ./ci/e2e_commands_bucketed.sh
     run_check "Detcore core unit tests" cargo test -p detcore --lib
     run_check "Hermit run smoke test" hermit_run_smoke
     run_check "Hermit output determinism" hermit_determinism_check

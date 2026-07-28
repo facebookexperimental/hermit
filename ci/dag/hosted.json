@@ -39,6 +39,16 @@
                "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
     },
     {
+      "group": "test", "job": "examples_ptrace",
+      "desc": "Run every executable user example at ptrace L2",
+      "cmd": "./ci/e2e_commands_bucketed.sh",
+      "deps": ["build.workspace"],
+      "timeout": 600,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 60,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
       "group": "lint", "job": "rustfmt",
       "desc": "Rustfmt (cargo fmt --all -- --check)",
       "cmd": "cargo fmt --all -- --check",
