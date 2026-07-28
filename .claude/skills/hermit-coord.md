@@ -45,6 +45,26 @@ is the operational summary of the coordinator role.
 - Use `with-proxy` for all networked git/gh operations. Every PR comment starts
   with `[coordinator, <model>]`.
 
+## Syscall compatibility tracking
+
+- Treat the per-syscall issues in `rrnewton/hermit` as the canonical public
+  compatibility ledger. They normally use the title `Syscall classification:
+  <name>`. Before dispatching, implementing, or reviewing work for a syscall,
+  search **all states** for that exact syscall and inspect the existing issue;
+  do not create a duplicate merely because the first search result is closed.
+- Link the specific issue URL whenever a task note, compatibility report, PR
+  description, or review comment discusses a concrete syscall. A bare syscall
+  name or unlinked list is not sufficient tracking evidence.
+- Make the issue update part of every new syscall task's acceptance criteria.
+  The implementation agent records the affected backend, mode, exact SHA, test
+  evidence, and PR URL on the existing issue. If no issue exists, create the
+  corresponding issue on `rrnewton/hermit` with the workspace's registered
+  issue wrapper; never create it on `facebookexperimental/hermit`.
+- Keep issue state aligned with landed state. An open PR warrants an evidence
+  comment, not issue closure; close or resolve the tracker only after the change
+  is reachable from fork `main`. Use `with-proxy` for GitHub reads and updates
+  and apply the required role tag to comments.
+
 ## Worktree assignment
 
 Operates on the **parent** and the **primary checkouts** (coordinator-owned
