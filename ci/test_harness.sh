@@ -364,7 +364,7 @@ function emit_required_plan {
         | . as $test
         | .modes | to_entries[]
         | select($mode_filter == "" or .key == $mode_filter)
-        | select($mode_filter != "" or .value.ci == true)
+        | select(.value.ci == true or $mode_filter == "naked")
         | . as $mode
         | if .key == "naked" then
             select($backend_filter == "")
