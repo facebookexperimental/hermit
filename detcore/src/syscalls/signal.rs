@@ -83,6 +83,16 @@ fn deterministic_kill_target(targets: &[DetTid], sig: libc::c_int) -> Result<Det
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-PENDING): Review unmaskable process-group SIGKILL forwarding.
+fn can_forward_process_group_signal(
+    pid: libc::pid_t,
+    sig: libc::c_int,
+    backend_requires_pid_translation: bool,
+) -> bool {
+    pid < -1 && sig == libc::SIGKILL && !backend_requires_pid_translation
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
@@ -300,12 +310,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     // TODO-HUMAN-REVIEW(PR-1058): Review process-pending signal preservation.
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review unmaskable process-group SIGKILL forwarding.
     /// Resolve signal-zero existence checks in the fixed PID namespace, then route an
     /// unambiguous positive-PID process signal through the backend. Backends that can execute
     /// with guest PIDs preserve process-directed delivery; DBI translates it to the sole live
-    /// thread because its native process uses a host PID. Multithreaded process-directed
-    /// delivery, process-group delivery, and broadcast delivery are refused until Detcore models
-    /// eligible signal masks.
+    /// thread because its native process uses a host PID. An unmaskable SIGKILL to a specific
+    /// process group is also safe to preserve on backends whose guests use real namespace PIDs;
+    /// other process-group and broadcast delivery remains refused until Detcore models eligible
+    /// signal masks.
     pub async fn handle_kill<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -320,6 +332,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let tgid = call.pid();
+        if can_forward_process_group_signal(
+            tgid,
+            call.sig(),
+            guest
+                .config()
+                .backend_requires_thread_directed_process_signals,
+        ) {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
         if tgid <= 0 {
             return Err(Errno::ENOSYS.into());
         }
@@ -511,5 +532,14 @@ mod tests {
             Err(Errno::ENOSYS)
         );
         assert_eq!(deterministic_kill_target(&[first, second], 0), Ok(first));
+    }
+
+    #[test]
+    fn process_group_forwarding_is_limited_to_unmaskable_sigkill() {
+        assert!(can_forward_process_group_signal(-42, libc::SIGKILL, false));
+        assert!(!can_forward_process_group_signal(-42, libc::SIGTERM, false));
+        assert!(!can_forward_process_group_signal(0, libc::SIGKILL, false));
+        assert!(!can_forward_process_group_signal(-1, libc::SIGKILL, false));
+        assert!(!can_forward_process_group_signal(-42, libc::SIGKILL, true));
     }
 }

@@ -1647,31 +1647,27 @@ impl Scheduler {
                 return Err(SkipTurn);
             } // End region which should be deleted.
 
-            // Nondeterminsitic algorithm: the unblocked background action jumps back in randomly.
+            // Use the same deterministic-work-first policy as record/replay. Host
+            // completion timing must not decide whether a ready continuation overtakes
+            // guest work that was already runnable. Pollers are excluded because they
+            // commonly wait for the completed operation and would otherwise starve it.
+            let only_pollers = if let Some(fp) = self.run_queue.first_priority() {
+                fp >= LAST_PRIORITY
+            } else {
+                true
+            };
+            if !self.run_queue.is_empty() && !only_pollers {
+                return Ok(());
+            }
+
             if !ready.is_empty() {
-                // Policy: our heuristic to mitigate nondeterminism (even with nondeterministic external
-                // blocking IO) is to only poll it when there is nothing deterministic that is runnable.
-                // TODO: we need to take into account internal polling, which may spin forever.
                 for ready_dtid in &ready {
-                    // TODO: instead record a nondeterministic scheduler event if something is ready.
                     info!(
-                        "[step2] NONDET: Reschedule formerly (external IO) blocked dtid {:?}",
+                        "[step2] Reschedule formerly (external IO) blocked dtid {:?}",
                         ready_dtid
                     );
                     self.blocked.external_io_blockers.remove(ready_dtid);
                     self.run_queue.push_eager_io_repoll(*ready_dtid);
-                }
-                let empty_but_for_pollers = if let Some(fp) = self.run_queue.first_priority() {
-                    fp >= LAST_PRIORITY
-                } else {
-                    true
-                };
-                if !empty_but_for_pollers {
-                    tracing::warn!(
-                        "Nondeterministic external actions {:?} jumped in the middle of runnable work ({} tasks). Need to record this for reproducibility.",
-                        &ready,
-                        self.run_queue.len()
-                    );
                 }
             }
             if self.run_queue.is_empty()
@@ -2795,6 +2791,43 @@ mod test {
 
         assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
         assert!(scheduler.vfork_barriers.is_empty());
+    }
+
+    #[test]
+    fn external_io_continuation_does_not_overtake_runnable_peer() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let signal_waiter = DetTid::from_raw(11);
+        let exiting_child = DetTid::from_raw(17);
+        let op_id = ExternalOpId::new(signal_waiter, 291);
+        let mut continuation = Resources::new(signal_waiter);
+        continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+
+        scheduler.priorities.insert(signal_waiter, DEFAULT_PRIORITY);
+        scheduler.priorities.insert(exiting_child, DEFAULT_PRIORITY);
+        scheduler.runqueue_push_back(exiting_child);
+        scheduler
+            .blocked
+            .external_io_blockers
+            .insert(signal_waiter, op_id);
+        scheduler.next_turns.insert(
+            signal_waiter,
+            ThreadNextTurn {
+                dettid: signal_waiter,
+                child_tid_addr: 0,
+                req: Ivar::full(Ok(continuation)),
+                resp: Ivar::new(),
+            },
+        );
+
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert_eq!(
+            scheduler.blocked.external_io_blockers.get(&signal_waiter),
+            Some(&op_id)
+        );
+        assert_eq!(
+            scheduler.run_queue.tentative_pop_next(),
+            Some(exiting_child)
+        );
     }
 
     #[test]
