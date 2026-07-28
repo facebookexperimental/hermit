@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
@@ -359,6 +360,49 @@ static void check_sysinfo(void) {
       info.mem_unit);
 }
 
+// Regression for sysinfo(2) free-memory determinism. Detcore must derive
+// `freeram` from guest-controlled virtual mappings, not from the resident set
+// size, which the host kernel manages (demand paging, reclaim) and which drifts
+// between otherwise-identical runs. Touching the pages of an existing mapping
+// raises RSS without changing the virtual size, so `freeram` must not move: an
+// RSS-based implementation would report less free memory after the memset and
+// would be nondeterministic across runs (it made `getconf -a` flake ~10% at L2).
+static void check_sysinfo_free_ram_tracks_virtual_size(void) {
+  const size_t region = (size_t)16 * 1024 * 1024;
+  void* mapping = mmap(
+      NULL, region, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mapping == MAP_FAILED) {
+    fail("mmap for free-ram regression");
+  }
+
+  struct sysinfo before = {0};
+  if (sysinfo(&before) != 0) {
+    fail("sysinfo before touch");
+  }
+
+  // Fault in every page: RSS rises by `region`, virtual size is unchanged.
+  memset(mapping, 0x5a, region);
+
+  struct sysinfo after = {0};
+  if (sysinfo(&after) != 0) {
+    fail("sysinfo after touch");
+  }
+
+  if (before.freeram != after.freeram) {
+    fprintf(
+        stderr,
+        "sysinfo freeram changed when only RSS grew: before=%lu after=%lu\n",
+        before.freeram,
+        after.freeram);
+    exit(1);
+  }
+
+  if (munmap(mapping, region) != 0) {
+    fail("munmap for free-ram regression");
+  }
+  puts("sysinfo freeram tracks virtual size");
+}
+
 static void check_times(void) {
   struct tms first_usage;
   struct tms second_usage;
@@ -451,6 +495,7 @@ int main(void) {
   check_rusage(RUSAGE_CHILDREN, "children", 0);
   check_rusage_errors();
   check_sysinfo();
+  check_sysinfo_free_ram_tracks_virtual_size();
   check_times();
   return 0;
 }

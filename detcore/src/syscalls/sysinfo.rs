@@ -306,11 +306,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         })
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1054): Deterministic free-memory accounting for sysinfo(2).
+    /// Report guest-visible free memory as `total_ram` minus the guest's virtual
+    /// address-space size.
+    ///
+    /// The used-memory figure must be a function of guest computation alone, or
+    /// `sysinfo`'s `free_ram` (and therefore glibc `sysconf(_SC_AVPHYS_PAGES)`)
+    /// becomes nondeterministic across `--verify` and record/replay. The virtual
+    /// size (`statm.size`, i.e. `/proc/<pid>/statm` field 1) is the sum of the
+    /// guest's own mappings, which is fixed by the guest's brk/mmap sequence under
+    /// Detcore's deterministic schedule. The resident set size (`statm.resident`),
+    /// used previously, is physical page residency managed by the host kernel
+    /// (demand paging, reclaim, host memory pressure); it drifts by a page or two
+    /// between otherwise-identical runs and made `getconf -a` flake ~10% at L2.
     fn free_ram<G: Guest<Self>>(&self, guest: &mut G, total_ram: u64) -> anyhow::Result<u64> {
         let process = Process::new(guest.pid().as_raw())?;
         let page_size = procfs::page_size();
         let statm = process.statm()?;
-        let used_memory = statm.resident * page_size;
+        let used_memory = statm.size * page_size;
         if used_memory > total_ram {
             return Ok(0);
         }

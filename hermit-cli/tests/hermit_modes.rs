@@ -477,6 +477,7 @@ fn resource_syscalls_are_deterministic_across_five_runs() {
             "rusage thread maxrss",
             "rusage children zero",
             "sysinfo",
+            "sysinfo freeram tracks virtual size",
             "times logical process and child CPU ticks",
         ] {
             assert!(
