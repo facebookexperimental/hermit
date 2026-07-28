@@ -1262,6 +1262,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (d_ino, global_mtime) = determinize_inode(guest, stat.inode).await;
         stat.inode = d_ino; // Reveal only the deterministic inode.
 
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping.
+        // The raw st_dev leaks the kernel's host-wide anonymous block-device
+        // number for procfs/sysfs/tmpfs mounts, which drifts between runs (and
+        // between the two runs of `--verify`). Reveal only a deterministic
+        // device id.
+        stat.dev = determinize_device(guest, stat.dev).await;
+
         let epoch_tp = Timespec {
             tv_sec: cfg.epoch.timestamp(),
             tv_nsec: cfg.epoch.timestamp_subsec_nanos() as i64,

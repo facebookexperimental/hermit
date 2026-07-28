@@ -176,6 +176,64 @@ impl InodePool {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1056): Deterministic remapping of device numbers (st_dev).
+/// Deterministic remapping of device numbers (`st_dev`).
+///
+/// The kernel assigns anonymous block-device numbers to filesystems without a
+/// backing block device (procfs, sysfs, tmpfs, devpts) from a global,
+/// host-wide counter (`get_anon_bdev`). The raw `st_dev` a guest observes for
+/// such a filesystem therefore drifts between otherwise-identical runs — and
+/// even between the two runs of `--verify`, because the first run's mounts are
+/// still live when the second run mounts fresh copies, so the second run's
+/// procfs gets a different anonymous device number. That leaked host state into
+/// a guest-visible `stat`/`statx` field.
+///
+/// We replace each distinct raw device number with a strictly-increasing
+/// synthetic id assigned in first-observation order. Because the guest's
+/// sequence of `stat` calls is fixed by Detcore's deterministic schedule, the
+/// order in which distinct devices are first seen is deterministic, so the
+/// synthetic ids are stable across runs. The remapping preserves device
+/// distinctness (distinct raw devices map to distinct ids) and consistency
+/// (the same raw device always maps to the same id), so `find -xdev`, `du -x`,
+/// and hardlink `(st_dev, st_ino)` identity checks still behave correctly.
+#[derive(Debug)]
+struct DevicePool {
+    devices: HashMap<u64, u64>,
+    next_device: u64,
+}
+
+impl Default for DevicePool {
+    fn default() -> Self {
+        DevicePool::new()
+    }
+}
+
+impl DevicePool {
+    fn new() -> Self {
+        // Start at 1 so no file reports st_dev == 0, which some tools treat as
+        // "no device".
+        DevicePool {
+            devices: HashMap::new(),
+            next_device: 1,
+        }
+    }
+
+    /// Return the deterministic device id for `raw_device`, allocating a new one
+    /// (in first-observation order) the first time a raw device is seen.
+    fn determinize(&mut self, raw_device: u64) -> u64 {
+        match self.devices.get(&raw_device) {
+            Some(dev) => *dev,
+            None => {
+                let new = self.next_device;
+                self.next_device += 1;
+                self.devices.insert(raw_device, new);
+                new
+            }
+        }
+    }
+}
+
 /// Global state associated with the detcore tool.
 ///
 /// This is a singleton, and the one object of this type lives inside a central
@@ -185,6 +243,10 @@ pub struct GlobalState {
     sched: Arc<Mutex<Scheduler>>,
 
     inodes: Arc<Mutex<InodePool>>,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping state.
+    devices: Arc<Mutex<DevicePool>>,
 
     // next port to use if input port is 0
     next_port: AtomicU16,
@@ -290,6 +352,9 @@ impl GlobalState {
             open_file_to_port: Mutex::new(HashMap::new()),
             past_first_execve: AtomicBool::new(false),
             inodes: Arc::new(Mutex::new(InodePool::new())),
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping state.
+            devices: Arc::new(Mutex::new(DevicePool::new())),
             sched_handle: handle,
             cfg: cfg.clone(),
             realtime_start: SystemTime::now(),
@@ -594,6 +659,11 @@ impl GlobalTool for GlobalState {
             ),
             GlobalRequest::DeterminizeInode(ino) => {
                 R::DeterminizeInode(self.recv_determinize_inode(from, ino).await)
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
+            GlobalRequest::DeterminizeDevice(dev) => {
+                R::DeterminizeDevice(self.recv_determinize_device(from, dev).await)
             }
             GlobalRequest::UnlinkInode(d_ino) => {
                 R::UnlinkInode(self.recv_unlink_inode(from, d_ino).await)
@@ -1108,6 +1178,17 @@ impl GlobalState {
         (dino, ns)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
+    async fn recv_determinize_device(&self, from: Tid, raw_device: u64) -> u64 {
+        let det_device = self.devices.lock().unwrap().determinize(raw_device);
+        trace!(
+            "[detcore, dtid {}] resolved (raw) device {} to {}",
+            from, raw_device, det_device
+        );
+        det_device
+    }
+
     async fn recv_unlink_inode(&self, from: Tid, d_ino: DetInode) {
         trace!("[detcore, dtid {}] unlink (det) inode {:?}", from, d_ino);
         self.inodes.lock().unwrap().remove_inode(d_ino);
@@ -1350,6 +1431,12 @@ pub enum GlobalRequest {
     /// Translate nondeterministic to deterministic inode.
     DeterminizeInode(RawInode),
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
+    /// Translate a nondeterministic (host-assigned) device number to a
+    /// deterministic one.
+    DeterminizeDevice(u64),
+
     /// unlink an inode
     UnlinkInode(DetInode),
 
@@ -1420,6 +1507,9 @@ pub enum GlobalResponse {
     FutexAction(Option<SchedValue>),
     /// Return the mtime as well:
     DeterminizeInode((DetInode, LogicalTime)),
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
+    DeterminizeDevice(u64),
     UnlinkInode(()),
     TouchFile(()),
     GlobalTimeLowerBound(LogicalTime),
@@ -1800,6 +1890,21 @@ where
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
+/// Translate a host-assigned device number (`st_dev`) to a deterministic one.
+pub async fn determinize_device<G, T>(guest: &mut G, raw_device: u64) -> u64
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let resp = send_and_update_time(guest, GlobalRequest::DeterminizeDevice(raw_device)).await;
+    match resp.1 {
+        GlobalResponse::DeterminizeDevice(x) => x,
+        _ => unreachable!(),
+    }
+}
+
 /// unlink a detfd, i.e. When `unlink` a file
 #[allow(unused)]
 pub async fn unlink_inode<G, T>(guest: &mut G, d_ino: DetInode)
@@ -2085,6 +2190,42 @@ mod tests {
     use crate::types::DetTid;
     use crate::types::FutexID;
     use crate::types::MmId;
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping test.
+    #[test]
+    fn device_pool_remaps_deterministically() {
+        use super::DevicePool;
+
+        // Raw device numbers a guest might observe; the procfs/tmpfs ones
+        // (large anon-bdev values) are exactly what drifts between runs.
+        let raw_root = 0x20; // e.g. a real block device
+        let raw_proc_run1 = 3_145_792; // anon bdev in run 1
+        let raw_proc_run2 = 3_145_788; // same procfs, different number in run 2
+
+        // Run 1: observe root then proc.
+        let mut pool1 = DevicePool::new();
+        let root1 = pool1.determinize(raw_root);
+        let proc1 = pool1.determinize(raw_proc_run1);
+        // Run 2: same observation order, different raw proc number.
+        let mut pool2 = DevicePool::new();
+        let root2 = pool2.determinize(raw_root);
+        let proc2 = pool2.determinize(raw_proc_run2);
+
+        // The synthetic ids depend only on first-observation order, so they are
+        // identical across the two runs despite the raw proc number differing.
+        assert_eq!(root1, root2);
+        assert_eq!(proc1, proc2);
+
+        // Distinct raw devices get distinct ids; ids start at 1 (never 0).
+        assert_ne!(root1, proc1);
+        assert_eq!(root1, 1);
+        assert_eq!(proc1, 2);
+
+        // Re-observing a raw device is stable within a run.
+        assert_eq!(pool1.determinize(raw_root), root1);
+        assert_eq!(pool1.determinize(raw_proc_run1), proc1);
+    }
 
     #[tokio::test]
     async fn late_futex_rpc_after_thread_removal_returns_eintr() {
