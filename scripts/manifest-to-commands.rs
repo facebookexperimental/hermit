@@ -313,6 +313,7 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
     lines
 }
 
+// TODO-HUMAN-REVIEW(PR-1081): Review the manifest-to-command CLI and generated shell contract.
 fn main() -> ExitCode {
     let root = repo_root();
     let manifests = root.join("tests/e2e/manifests");
