@@ -1,0 +1,2081 @@
+{
+  "schema": 2,
+  "files": [
+    {
+      "path": "tests/Cargo.toml",
+      "disposition": "support-data",
+      "runner": "owning test directory",
+      "why": "Non-executable fixture, configuration, lockfile, or documentation consumed by tests"
+    },
+    {
+      "path": "tests/backend-parity/README.md",
+      "disposition": "support-data",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "Matrix policy or documentation consumed by the backend-parity driver"
+    },
+    {
+      "path": "tests/backend-parity/fixtures/cpuid_probe.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "Backend-parity guest compiled and parameterized by the matrix driver"
+    },
+    {
+      "path": "tests/backend-parity/fixtures/input.txt",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "Backend-parity guest compiled and parameterized by the matrix driver"
+    },
+    {
+      "path": "tests/backend-parity/fixtures/pid_probe.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "Backend-parity guest compiled and parameterized by the matrix driver"
+    },
+    {
+      "path": "tests/backend-parity/fixtures/pthread_lifecycle.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "Backend-parity guest compiled and parameterized by the matrix driver"
+    },
+    {
+      "path": "tests/backend-parity/matrix.tsv",
+      "disposition": "support-data",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "Matrix policy or documentation consumed by the backend-parity driver"
+    },
+    {
+      "path": "tests/backend-parity/run_matrix.py",
+      "disposition": "special-driver",
+      "runner": "portable and privileged backend-parity partitions",
+      "why": "Matrix orchestrator owns backend-specific build, capability, and expected-output policy"
+    },
+    {
+      "path": "tests/bin/README.md",
+      "disposition": "buck-fixture",
+      "runner": "Meta Buck test targets",
+      "why": "Buck-owned guest fixture retained for internal integration coverage; no standalone public harness contract exists"
+    },
+    {
+      "path": "tests/bin/posix_timer_test.c",
+      "disposition": "buck-fixture",
+      "runner": "Meta Buck test targets",
+      "why": "Buck-owned guest fixture retained for internal integration coverage; no standalone public harness contract exists"
+    },
+    {
+      "path": "tests/bin/robust_futex_test.c",
+      "disposition": "buck-fixture",
+      "runner": "Meta Buck test targets",
+      "why": "Buck-owned guest fixture retained for internal integration coverage; no standalone public harness contract exists"
+    },
+    {
+      "path": "tests/c/acct_refusal_probe.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/add_key_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/adjtimex_deterministic.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/arch_prctl_determinism.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/bpf_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/cachestat_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/clock_adjtime_deterministic.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/clock_determinism.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/clone.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/copy_file_range_refusal_probe.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/dbi_copied_tiocgpgrp.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/dbi_exec_failure.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/dbi_execveat_unsupported.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/dbi_mmap_exec.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/dbi_pid_virtualization.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/dbi_prlimit_self.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/dbi_self_sigqueue.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/dbi_unsupported_syscall.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/dbi_wait_lifecycle.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/epoll_determinism.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/fp_reduction_nondeterminism.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/futex_requeue_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/futex_waitv_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/futex_wake_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/getCpu.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/get_robust_list_child.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/get_robust_list_self.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/get_robust_list_thread.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/getitimer_determinism_probe.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/getpid.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh",
+      "why": "Direct schema-v2 C program compiled implicitly by the manifest harness for verify and replay modes"
+    },
+    {
+      "path": "tests/c/getsockopt_null.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/hello_alarm.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/hello_signals.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/io_uring_fallback.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/io_uring_ring_determinism.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/ioctl_fioclex.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/ioctl_siocethtool.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/ipc_determinism.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/just_spin.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/kcmp_eperm.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/keyctl_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/keyctl_passthrough.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/listmount_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/liteinst_advanced.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/lsm_get_self_attr_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/lsm_list_modules_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/lsm_set_self_attr_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/madvise_determinism.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/map_shadow_stack_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/memfd_secret_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/meminfo_available_deterministic.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/meminfo_cached_deterministic.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/meminfo_free_deterministic.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/memoryPress.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/mmap_determinism.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/mmap_stress_determinism.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/name_to_handle_at_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/name_to_handle_directory_eopnotsupp.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/name_to_handle_empty_path_eopnotsupp.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/name_to_handle_regular_eopnotsupp.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/nanosleep-par.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/netlink_autobind_common.h",
+      "disposition": "support-data",
+      "runner": "owning test directory",
+      "why": "Non-executable fixture, configuration, lockfile, or documentation consumed by tests"
+    },
+    {
+      "path": "tests/c/netlink_autobind_generic.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/netlink_autobind_route.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/netlink_autobind_usersock.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/netns_cookie_common.h",
+      "disposition": "support-data",
+      "runner": "owning test directory",
+      "why": "Non-executable fixture, configuration, lockfile, or documentation consumed by tests"
+    },
+    {
+      "path": "tests/c/netns_cookie_tcp4.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/netns_cookie_tcp6.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/netns_cookie_udp4.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/perf_event_hardware_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/perf_event_open_eperm.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/perf_event_software_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/perf_event_watchpoint_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/periodic_setitimer_delivery.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/pidfd_open_self.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/pidfd_poll_self.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/pidfd_waitid_child.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/ppoll_readv.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/ppoll_simulation.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/prctl_dumpable.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/print_memaddrs.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/printf_with_threads.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/proc_fd_link_aliases.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/proc_fdinfo.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/proc_locks.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/process_mrelease_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/process_vm_readv_refusal_probe.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/process_vm_writev_refusal_probe.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/procfs_positioned_probe.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/prodcons_determinism.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/pselect6_simulation.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/ptrace_attach_eperm.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/ptrace_eperm.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/ptrace_seize_eperm.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/ptrace_traceme_eperm.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/pty_nr_count.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/random_sources.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/rcx_canonicalization.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/record_replay_fd_close.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/record_replay_file_state.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/record_replay_lseek_seek_cur.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/record_replay_setsockopt.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/recvmsg_scm_rights_mmap.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/remap_file_pages_anonymous_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/remap_file_pages_memfd_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/remap_file_pages_tmpfile_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/request_key_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/resource_determinism.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/sched_setattr_batch.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/sched_setattr_common.h",
+      "disposition": "support-data",
+      "runner": "owning test directory",
+      "why": "Non-executable fixture, configuration, lockfile, or documentation consumed by tests"
+    },
+    {
+      "path": "tests/c/sched_setattr_idle.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/sched_setattr_other.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/sched_yield_progress.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/scheduler_policy_queries.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/setitimer_determinism.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/sigmask_preemption.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/signal_determinism.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/sigpipe_siginfo.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/sigtimedwait-no-timeout.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/sigtimedwait-timeout-0s.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/sigtimedwait-timeout-1s.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/simple/hello_nostdlib.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/simple/nanosleep-threads-nocrash.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/simple/nanosleep-threads-simple.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/simple/pread64_nostdlib.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/simple/racewrite_nostdlib.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/so_incoming_cpu_tcp4.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/so_incoming_cpu_tcp6.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/so_incoming_cpu_udp4.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/socket_cookie_common.h",
+      "disposition": "support-data",
+      "runner": "owning test directory",
+      "why": "Non-executable fixture, configuration, lockfile, or documentation consumed by tests"
+    },
+    {
+      "path": "tests/c/socket_cookie_tcp.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/socket_cookie_udp.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/socket_cookie_unix.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/socket_ioctl_timestamp.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/socket_timestamp_edge_cases.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/socket_timestamp_timespec.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/socket_timestamp_timeval.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/splice_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/statmount_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/syscall_file_io.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/syscall_file_metadata.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/syscall_quick_wins.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/sysfs_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/sysinfo.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/sysinfo_uptime.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/syslog_deterministic.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/sysv_sem_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/sysv_shm_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/tcp_info_accept4.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/tcp_info_accept6.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/tcp_info_client4.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/tee_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/threadExhaustion.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/thread_self_procfs_handoff.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/thread_sync_determinism.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/timer_create_determinism.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/uname.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/unix_autobind_common.h",
+      "disposition": "support-data",
+      "runner": "owning test directory",
+      "why": "Non-executable fixture, configuration, lockfile, or documentation consumed by tests"
+    },
+    {
+      "path": "tests/c/unix_autobind_dgram.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/unix_autobind_seqpacket.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/unix_autobind_stream.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/ustat_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/util/assert.h",
+      "disposition": "support-data",
+      "runner": "owning test directory",
+      "why": "Non-executable fixture, configuration, lockfile, or documentation consumed by tests"
+    },
+    {
+      "path": "tests/c/vmsplice_enosys.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/wait_on_child.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/c/writev_determinism.c",
+      "disposition": "cargo-fixture",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+    },
+    {
+      "path": "tests/chaos/cas_sequence.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/chaos/hello_chaos.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/chaos/keyvalue.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/chaos/lock_granularity.c",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/chaos/nanosleep-threads-nocrash-rust.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/chaos/order_violation.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh",
+      "why": "Direct schema-v2 C program compiled implicitly with pthread support for verify and seeded chaos modes"
+    },
+    {
+      "path": "tests/compat/complex_shell_workload.sh",
+      "disposition": "special-driver",
+      "runner": "validate.sh compatibility partitions",
+      "why": "Compatibility workload or fixture builder selected by the strict, DBI, SaBRe, LiteInst, or record/replay ratchet"
+    },
+    {
+      "path": "tests/compat/prepare_real_compat_fixtures.sh",
+      "disposition": "special-driver",
+      "runner": "validate.sh compatibility partitions",
+      "why": "Compatibility workload or fixture builder selected by the strict, DBI, SaBRe, LiteInst, or record/replay ratchet"
+    },
+    {
+      "path": "tests/compat/real_compat_workload.sh",
+      "disposition": "special-driver",
+      "runner": "validate.sh compatibility partitions",
+      "why": "Compatibility workload or fixture builder selected by the strict, DBI, SaBRe, LiteInst, or record/replay ratchet"
+    },
+    {
+      "path": "tests/debugger/.gitignore",
+      "disposition": "guest-fixture",
+      "runner": "tests/debugger/run_debugger_tests.sh",
+      "why": "Debugger guest source or documentation consumed by the debugger integration driver"
+    },
+    {
+      "path": "tests/debugger/README.md",
+      "disposition": "guest-fixture",
+      "runner": "tests/debugger/run_debugger_tests.sh",
+      "why": "Debugger guest source or documentation consumed by the debugger integration driver"
+    },
+    {
+      "path": "tests/debugger/guests/debuggee.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/debugger/run_debugger_tests.sh",
+      "why": "Debugger guest source or documentation consumed by the debugger integration driver"
+    },
+    {
+      "path": "tests/debugger/harness.py",
+      "disposition": "guest-fixture",
+      "runner": "tests/debugger/run_debugger_tests.sh",
+      "why": "Debugger guest source or documentation consumed by the debugger integration driver"
+    },
+    {
+      "path": "tests/debugger/run_debugger_tests.sh",
+      "disposition": "special-driver",
+      "runner": "validate.sh privileged debugger gate",
+      "why": "Debugger integration orchestrator requires ptrace ownership and controls its own guest lifecycle"
+    },
+    {
+      "path": "tests/debugger/test_gdb_replay_gdbserver.py",
+      "disposition": "guest-fixture",
+      "runner": "tests/debugger/run_debugger_tests.sh",
+      "why": "Debugger guest source or documentation consumed by the debugger integration driver"
+    },
+    {
+      "path": "tests/debugger/test_gdb_run_gdbserver.py",
+      "disposition": "guest-fixture",
+      "runner": "tests/debugger/run_debugger_tests.sh",
+      "why": "Debugger guest source or documentation consumed by the debugger integration driver"
+    },
+    {
+      "path": "tests/debugger/test_lldb_replay_gdbserver.py",
+      "disposition": "guest-fixture",
+      "runner": "tests/debugger/run_debugger_tests.sh",
+      "why": "Debugger guest source or documentation consumed by the debugger integration driver"
+    },
+    {
+      "path": "tests/debugger/test_lldb_run_gdbserver.py",
+      "disposition": "guest-fixture",
+      "runner": "tests/debugger/run_debugger_tests.sh",
+      "why": "Debugger guest source or documentation consumed by the debugger integration driver"
+    },
+    {
+      "path": "tests/e2e/applications/kvm-python-examples.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh",
+      "why": "Direct schema-v2 program; modes and backend policy are defined in ci/manifests/*.json"
+    },
+    {
+      "path": "tests/e2e/applications/kvm-shell-environment.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh",
+      "why": "Direct schema-v2 program; modes and backend policy are defined in ci/manifests/*.json"
+    },
+    {
+      "path": "tests/e2e/applications/timed-progress-bar.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh",
+      "why": "Direct schema-v2 program; modes and backend policy are defined in ci/manifests/*.json"
+    },
+    {
+      "path": "tests/e2e/data-handling/archive-roundtrip.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh",
+      "why": "Direct schema-v2 program; modes and backend policy are defined in ci/manifests/*.json"
+    },
+    {
+      "path": "tests/e2e/determinism-stress/README.md",
+      "disposition": "support-data",
+      "runner": "documentation or isolated HOME fixture",
+      "why": "Non-executable documentation or deterministic configuration consumed by E2E tests"
+    },
+    {
+      "path": "tests/e2e/determinism-stress/fork_tree.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/e2e category driver",
+      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+    },
+    {
+      "path": "tests/e2e/determinism-stress/guests/lock_free.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/e2e category driver",
+      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+    },
+    {
+      "path": "tests/e2e/determinism-stress/guests/pid_tid.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/e2e category driver",
+      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+    },
+    {
+      "path": "tests/e2e/determinism-stress/guests/signal_order.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/e2e category driver",
+      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+    },
+    {
+      "path": "tests/e2e/determinism-stress/mmap_fork_shared.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/e2e category driver",
+      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+    },
+    {
+      "path": "tests/e2e/determinism-stress/pipe_chain.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/e2e category driver",
+      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+    },
+    {
+      "path": "tests/e2e/determinism-stress/pipe_prefill.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/e2e category driver",
+      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+    },
+    {
+      "path": "tests/e2e/determinism-stress/process-chains.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh",
+      "why": "Direct schema-v2 program; modes and backend policy are defined in ci/manifests/*.json"
+    },
+    {
+      "path": "tests/e2e/determinism-stress/thread-contention.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh",
+      "why": "Direct schema-v2 program; modes and backend policy are defined in ci/manifests/*.json"
+    },
+    {
+      "path": "tests/e2e/determinism-stress/thread-output.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh",
+      "why": "Direct schema-v2 program; modes and backend policy are defined in ci/manifests/*.json"
+    },
+    {
+      "path": "tests/e2e/determinism-stress/thread_contention.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/e2e category driver",
+      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+    },
+    {
+      "path": "tests/e2e/determinism-stress/thread_stress.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/e2e category driver",
+      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+    },
+    {
+      "path": "tests/e2e/language-runtimes/RuntimeProbe.java",
+      "disposition": "guest-fixture",
+      "runner": "tests/e2e category driver",
+      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+    },
+    {
+      "path": "tests/e2e/language-runtimes/javascript.js",
+      "disposition": "guest-fixture",
+      "runner": "tests/e2e category driver",
+      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+    },
+    {
+      "path": "tests/e2e/language-runtimes/python-random.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh",
+      "why": "Direct schema-v2 program; modes and backend policy are defined in ci/manifests/*.json"
+    },
+    {
+      "path": "tests/e2e/language-runtimes/python.py",
+      "disposition": "guest-fixture",
+      "runner": "tests/e2e category driver",
+      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+    },
+    {
+      "path": "tests/e2e/language-runtimes/ruby.rb",
+      "disposition": "guest-fixture",
+      "runner": "tests/e2e category driver",
+      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+    },
+    {
+      "path": "tests/e2e/lib/applications/build_tools.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/applications/common.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/applications/http_server.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/applications/run_all.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/applications/sqlite_on_disk.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/data-handling/archive.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/data-handling/common.bash",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/data-handling/compression.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/data-handling/numerical.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/data-handling/reproducible-build.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/data-handling/run.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/data-handling/text-processing.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/determinism-stress/common.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/determinism-stress/examples.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/determinism-stress/pid-tid.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/determinism-stress/pipe-chain.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/determinism-stress/random.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/determinism-stress/run.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/determinism-stress/signals.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/determinism-stress/syscalls.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/determinism-stress/thread-racing.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/determinism-stress/time-clock.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/language-runtimes/run.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/system-utils/_common.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/system-utils/df.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/system-utils/du.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/system-utils/groups.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/system-utils/hostname.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/system-utils/id.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/system-utils/lscpu.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/system-utils/lshw.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/system-utils/numactl.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/system-utils/proc.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/system-utils/run.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/system-utils/uname.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/lib/system-utils/whoami.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib category run script",
+      "why": "Helper or subtest invoked by its category aggregator; it is not independently runnable because the aggregator supplies shared setup and environment"
+    },
+    {
+      "path": "tests/e2e/system-utils/README.md",
+      "disposition": "support-data",
+      "runner": "documentation or isolated HOME fixture",
+      "why": "Non-executable documentation or deterministic configuration consumed by E2E tests"
+    },
+    {
+      "path": "tests/e2e/system-utils/date-nanoseconds.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh",
+      "why": "Direct schema-v2 program; modes and backend policy are defined in ci/manifests/*.json"
+    },
+    {
+      "path": "tests/e2e/system-utils/random-device.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh",
+      "why": "Direct schema-v2 program; modes and backend policy are defined in ci/manifests/*.json"
+    },
+    {
+      "path": "tests/e2e/xdg-config/README.md",
+      "disposition": "support-data",
+      "runner": "documentation or isolated HOME fixture",
+      "why": "Non-executable documentation or deterministic configuration consumed by E2E tests"
+    },
+    {
+      "path": "tests/e2e/xdg-config/git/config",
+      "disposition": "support-data",
+      "runner": "owning test directory",
+      "why": "Non-executable fixture, configuration, lockfile, or documentation consumed by tests"
+    },
+    {
+      "path": "tests/helpers.bzl",
+      "disposition": "support-data",
+      "runner": "owning test directory",
+      "why": "Non-executable fixture, configuration, lockfile, or documentation consumed by tests"
+    },
+    {
+      "path": "tests/python/hashseed_order.py",
+      "disposition": "guest-fixture",
+      "runner": "hermit-cli integration targets",
+      "why": "Interpreted guest payload invoked by a Rust integration test"
+    },
+    {
+      "path": "tests/python/non_strict/hello.py",
+      "disposition": "guest-fixture",
+      "runner": "hermit-cli integration targets",
+      "why": "Interpreted guest payload invoked by a Rust integration test"
+    },
+    {
+      "path": "tests/qemu-boot/smoke_test.sh",
+      "disposition": "special-driver",
+      "runner": "validate.sh QEMU_L2_ONLY or direct QEMU suite",
+      "why": "QEMU boot driver needs an external kernel, TCG, long phase bounds, and privileged ptrace facilities, so it remains a separately scheduled custom test"
+    },
+    {
+      "path": "tests/qemu-boot/strict_l2_network_test.sh",
+      "disposition": "special-driver",
+      "runner": "validate.sh QEMU_L2_ONLY or direct QEMU suite",
+      "why": "QEMU boot driver needs an external kernel, TCG, long phase bounds, and privileged ptrace facilities, so it remains a separately scheduled custom test"
+    },
+    {
+      "path": "tests/qemu-boot/strict_l2_test.sh",
+      "disposition": "special-driver",
+      "runner": "validate.sh QEMU_L2_ONLY or direct QEMU suite",
+      "why": "QEMU boot driver needs an external kernel, TCG, long phase bounds, and privileged ptrace facilities, so it remains a separately scheduled custom test"
+    },
+    {
+      "path": "tests/qemu-boot/strict_l2_userspace_test.sh",
+      "disposition": "special-driver",
+      "runner": "validate.sh QEMU_L2_ONLY or direct QEMU suite",
+      "why": "QEMU boot driver needs an external kernel, TCG, long phase bounds, and privileged ptrace facilities, so it remains a separately scheduled custom test"
+    },
+    {
+      "path": "tests/reproducible-builds/README.md",
+      "disposition": "guest-fixture",
+      "runner": "tests/reproducible-builds/run.sh",
+      "why": "Pinned nested Cargo fixture consumed only by the reproducible-build driver"
+    },
+    {
+      "path": "tests/reproducible-builds/build-time-0.1.3/Cargo.lock",
+      "disposition": "guest-fixture",
+      "runner": "tests/reproducible-builds/run.sh",
+      "why": "Pinned nested Cargo fixture consumed only by the reproducible-build driver"
+    },
+    {
+      "path": "tests/reproducible-builds/build-time-0.1.3/Cargo.toml",
+      "disposition": "guest-fixture",
+      "runner": "tests/reproducible-builds/run.sh",
+      "why": "Pinned nested Cargo fixture consumed only by the reproducible-build driver"
+    },
+    {
+      "path": "tests/reproducible-builds/build-time-0.1.3/src/lib.rs",
+      "disposition": "guest-fixture",
+      "runner": "tests/reproducible-builds/run.sh",
+      "why": "Pinned nested Cargo fixture consumed only by the reproducible-build driver"
+    },
+    {
+      "path": "tests/reproducible-builds/run.sh",
+      "disposition": "special-driver",
+      "runner": "reproducible-build E2E suite",
+      "why": "Nested Cargo-build orchestrator owns its isolated lockfile, target directory, and repeated artifact comparison"
+    },
+    {
+      "path": "tests/runtime/RuntimeRandom.java",
+      "disposition": "support-data",
+      "runner": "owning test directory",
+      "why": "Non-executable fixture, configuration, lockfile, or documentation consumed by tests"
+    },
+    {
+      "path": "tests/runtime/random.go",
+      "disposition": "support-data",
+      "runner": "owning test directory",
+      "why": "Non-executable fixture, configuration, lockfile, or documentation consumed by tests"
+    },
+    {
+      "path": "tests/runtime/random.js",
+      "disposition": "support-data",
+      "runner": "owning test directory",
+      "why": "Non-executable fixture, configuration, lockfile, or documentation consumed by tests"
+    },
+    {
+      "path": "tests/runtime/random.ml",
+      "disposition": "support-data",
+      "runner": "owning test directory",
+      "why": "Non-executable fixture, configuration, lockfile, or documentation consumed by tests"
+    },
+    {
+      "path": "tests/runtime/random.py",
+      "disposition": "support-data",
+      "runner": "owning test directory",
+      "why": "Non-executable fixture, configuration, lockfile, or documentation consumed by tests"
+    },
+    {
+      "path": "tests/runtime/random.rb",
+      "disposition": "support-data",
+      "runner": "owning test directory",
+      "why": "Non-executable fixture, configuration, lockfile, or documentation consumed by tests"
+    },
+    {
+      "path": "tests/rust/bind_connect_race.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/clock_gettime.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/clock_total_order.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/exit_group.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/futex_and_print.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/futex_timeout.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/futex_wait_child.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/futex_wake_some.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/heap_ptrs.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/interrogate_tty.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/landlock.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/mem_race.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/nanosleep.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/network_hello_world.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/pipe_basics.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/poll.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/poll_spin.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/print_clock_nanosleep_monotonic_abs_race.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/print_clock_nanosleep_monotonic_race.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/print_clock_nanosleep_realtime_abs_race.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/print_nanosleep_race.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/rdtsc.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/recvmmsg.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/sched_yield.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/select.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/shutdown.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/socketpair.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/stack_ptr.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/test_utils/mod.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/thread_random.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/rust/tkill.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+    },
+    {
+      "path": "tests/shared-futex-verify/Threaded.java",
+      "disposition": "guest-fixture",
+      "runner": "tests/qemu-boot/*.sh",
+      "why": "Freestanding initramfs guest source compiled by the QEMU boot drivers; it has no standalone host execution contract"
+    },
+    {
+      "path": "tests/shared-futex-verify/node_worker.js",
+      "disposition": "guest-fixture",
+      "runner": "tests/qemu-boot/*.sh",
+      "why": "Freestanding initramfs guest source compiled by the QEMU boot drivers; it has no standalone host execution contract"
+    },
+    {
+      "path": "tests/shared-futex-verify/qemu_exec_init.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/qemu-boot/*.sh",
+      "why": "Freestanding initramfs guest source compiled by the QEMU boot drivers; it has no standalone host execution contract"
+    },
+    {
+      "path": "tests/shared-futex-verify/qemu_hello.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/qemu-boot/*.sh",
+      "why": "Freestanding initramfs guest source compiled by the QEMU boot drivers; it has no standalone host execution contract"
+    },
+    {
+      "path": "tests/shared-futex-verify/qemu_init.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/qemu-boot/*.sh",
+      "why": "Freestanding initramfs guest source compiled by the QEMU boot drivers; it has no standalone host execution contract"
+    },
+    {
+      "path": "tests/shared-futex-verify/qemu_net_init.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/qemu-boot/*.sh",
+      "why": "Freestanding initramfs guest source compiled by the QEMU boot drivers; it has no standalone host execution contract"
+    },
+    {
+      "path": "tests/shell/non_strict/curl.sh",
+      "disposition": "guest-fixture",
+      "runner": "hermit-cli integration targets",
+      "why": "Interpreted guest payload invoked by a Rust integration test"
+    },
+    {
+      "path": "tests/shell/par_work.sh",
+      "disposition": "guest-fixture",
+      "runner": "hermit-cli integration targets",
+      "why": "Interpreted guest payload invoked by a Rust integration test"
+    },
+    {
+      "path": "tests/shell/py_hello.sh",
+      "disposition": "guest-fixture",
+      "runner": "hermit-cli integration targets",
+      "why": "Interpreted guest payload invoked by a Rust integration test"
+    },
+    {
+      "path": "tests/shell/taskset.sh",
+      "disposition": "guest-fixture",
+      "runner": "hermit-cli integration targets",
+      "why": "Interpreted guest payload invoked by a Rust integration test"
+    },
+    {
+      "path": "tests/standalone/README.md",
+      "disposition": "support-data",
+      "runner": "owning test directory",
+      "why": "Non-executable fixture, configuration, lockfile, or documentation consumed by tests"
+    },
+    {
+      "path": "tests/standalone/cat_proc_uptime.sh",
+      "disposition": "integration-helper",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "Shell workload invoked by a Rust integration test with mode-specific environment and expected output"
+    },
+    {
+      "path": "tests/standalone/curl_client_only.sh",
+      "disposition": "integration-helper",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "Shell workload invoked by a Rust integration test with mode-specific environment and expected output"
+    },
+    {
+      "path": "tests/standalone/env_var_passthru.sh",
+      "disposition": "integration-helper",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "Shell workload invoked by a Rust integration test with mode-specific environment and expected output"
+    },
+    {
+      "path": "tests/standalone/minimal_hello_backtraces.sh",
+      "disposition": "integration-helper",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "Shell workload invoked by a Rust integration test with mode-specific environment and expected output"
+    },
+    {
+      "path": "tests/standalone/network_bind.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary whose assertions are owned by its Rust integration driver"
+    },
+    {
+      "path": "tests/standalone/network_bind_full.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary whose assertions are owned by its Rust integration driver"
+    },
+    {
+      "path": "tests/standalone/replay_and_print_stacktraces.sh",
+      "disposition": "integration-helper",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "Shell workload invoked by a Rust integration test with mode-specific environment and expected output"
+    },
+    {
+      "path": "tests/standalone/replay_chaos_trace.sh",
+      "disposition": "integration-helper",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "Shell workload invoked by a Rust integration test with mode-specific environment and expected output"
+    },
+    {
+      "path": "tests/standalone/replay_trace.sh",
+      "disposition": "integration-helper",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "Shell workload invoked by a Rust integration test with mode-specific environment and expected output"
+    },
+    {
+      "path": "tests/standalone/stacktrace_events.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml and hermit-cli integration targets",
+      "why": "Cargo guest binary whose assertions are owned by its Rust integration driver"
+    },
+    {
+      "path": "tests/standalone/stacktrace_signal.sh",
+      "disposition": "integration-helper",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "Shell workload invoked by a Rust integration test with mode-specific environment and expected output"
+    },
+    {
+      "path": "tests/standalone/strict_setitimer.sh",
+      "disposition": "integration-helper",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "Shell workload invoked by a Rust integration test with mode-specific environment and expected output"
+    },
+    {
+      "path": "tests/standalone/strict_timer_create.sh",
+      "disposition": "integration-helper",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "Shell workload invoked by a Rust integration test with mode-specific environment and expected output"
+    },
+    {
+      "path": "tests/standalone/test_no_networking_network_bind.sh",
+      "disposition": "integration-helper",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "Shell workload invoked by a Rust integration test with mode-specific environment and expected output"
+    },
+    {
+      "path": "tests/standalone/validate_race_example_properties.sh",
+      "disposition": "integration-helper",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "Shell workload invoked by a Rust integration test with mode-specific environment and expected output"
+    },
+    {
+      "path": "tests/stress/README.md",
+      "disposition": "support-data",
+      "runner": "owning test directory",
+      "why": "Non-executable fixture, configuration, lockfile, or documentation consumed by tests"
+    },
+    {
+      "path": "tests/stress/concurrency.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml",
+      "why": "Rust guest or test binary built through the tests workspace package"
+    },
+    {
+      "path": "tests/stress/scheduling_fairness.rs",
+      "disposition": "cargo-binary",
+      "runner": "tests/Cargo.toml",
+      "why": "Rust guest or test binary built through the tests workspace package"
+    },
+    {
+      "path": "tests/util/README.md",
+      "disposition": "integration-helper",
+      "runner": "validate.sh or hermit-cli integration targets",
+      "why": "Shared probe or orchestration helper; its caller supplies hardware checks, arguments, and assertions"
+    },
+    {
+      "path": "tests/util/chaos_stress_wrapper.sh",
+      "disposition": "integration-helper",
+      "runner": "validate.sh or hermit-cli integration targets",
+      "why": "Shared probe or orchestration helper; its caller supplies hardware checks, arguments, and assertions"
+    },
+    {
+      "path": "tests/util/curl_to_server_with_ssl.sh",
+      "disposition": "integration-helper",
+      "runner": "validate.sh or hermit-cli integration targets",
+      "why": "Shared probe or orchestration helper; its caller supplies hardware checks, arguments, and assertions"
+    },
+    {
+      "path": "tests/util/hermit_analyze_e2e.sh",
+      "disposition": "integration-helper",
+      "runner": "validate.sh or hermit-cli integration targets",
+      "why": "Shared probe or orchestration helper; its caller supplies hardware checks, arguments, and assertions"
+    },
+    {
+      "path": "tests/util/hermit_analyze_test.sh",
+      "disposition": "integration-helper",
+      "runner": "validate.sh or hermit-cli integration targets",
+      "why": "Shared probe or orchestration helper; its caller supplies hardware checks, arguments, and assertions"
+    },
+    {
+      "path": "tests/util/hermit_verify_trace_replay.sh",
+      "disposition": "integration-helper",
+      "runner": "validate.sh or hermit-cli integration targets",
+      "why": "Shared probe or orchestration helper; its caller supplies hardware checks, arguments, and assertions"
+    },
+    {
+      "path": "tests/util/perf_supported.sh",
+      "disposition": "integration-helper",
+      "runner": "validate.sh or hermit-cli integration targets",
+      "why": "Shared probe or orchestration helper; its caller supplies hardware checks, arguments, and assertions"
+    },
+    {
+      "path": "tests/util/pmu_skid.c",
+      "disposition": "integration-helper",
+      "runner": "validate.sh or hermit-cli integration targets",
+      "why": "Shared probe or orchestration helper; its caller supplies hardware checks, arguments, and assertions"
+    },
+    {
+      "path": "tests/util/simplest_server.py",
+      "disposition": "integration-helper",
+      "runner": "validate.sh or hermit-cli integration targets",
+      "why": "Shared probe or orchestration helper; its caller supplies hardware checks, arguments, and assertions"
+    },
+    {
+      "path": "tests/util/ssl_server.py",
+      "disposition": "integration-helper",
+      "runner": "validate.sh or hermit-cli integration targets",
+      "why": "Shared probe or orchestration helper; its caller supplies hardware checks, arguments, and assertions"
+    }
+  ]
+}

@@ -7,8 +7,8 @@ with explicit dependencies and resource limits, so the scheduler can run
 independent gates concurrently. On hosts with delegated cgroup v2 support, it
 can also box each node for memory limits and full process-subtree teardown.
 
-- [`portable.json`](portable.json) — mirrors `validate.sh`'s **`--portable-only`**
-  lane (`run_portable_only_suite`), the GitHub-managed portable `regular` job in
+- [`portable.json`](portable.json) — drives `validate.sh`'s **`--portable-only`**
+  lane and the GitHub-managed portable `regular` job in
   [`.github/workflows/ci-portable.yml`](../../.github/workflows/ci-portable.yml).
   No PMU / CPUID interception required.
 - [`privileged.json`](privileged.json) — implements the focused capability
@@ -29,8 +29,8 @@ ci/run-dag.sh portable   ascii                   # visualize instead of run
 `portable.json` drives the required `Regular tests (GitHub-managed portable)` job, and
 `privileged.json` drives both privileged PMU entrypoints. Existing job names,
 the merge-gate contract, and the outer PMU `flock` stay unchanged; only the
-internal scheduler changes. `validate.sh` remains the source of truth for
-individual gate commands.
+internal scheduler changes. The DAG files are the load-bearing source of truth
+for individual gate commands; `validate.sh` delegates to them.
 
 Closed pull requests trigger a skipped workflow in the same concurrency group,
 which cancels their queued or in-progress PMU run. The `mem_race` family and

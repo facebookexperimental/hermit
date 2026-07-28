@@ -1,0 +1,47 @@
+{
+  "schema": 2,
+  "bucket": "data-handling",
+  "tests": [
+    {
+      "id": "data-handling/archive-roundtrip",
+      "category": "data-handling",
+      "description": "Create, extract, and verify a normalized tar archive",
+      "lane": "portable",
+      "program": {"kind": "shell", "path": "tests/e2e/data-handling/archive-roundtrip.sh", "prepare-args": ["--prepare"], "run-args": ["--run"]},
+      "requires": ["linux", "x86_64", "userns", "ptrace"],
+      "timeout-seconds": 60,
+      "observation": {"status": true, "stdout": true, "stderr": false, "artifacts": []},
+      "modes": [
+        {"mode": "naked", "ci": false, "backends-enabled": [], "backends-disabled": [{"backend": "native", "why": "Normalized archive metadata is deterministic by construction"}]},
+        {"mode": "verify", "ci": true, "backends-enabled": ["ptrace"], "backends-disabled": [
+          {"backend": "dbi", "why": "DBI coverage is owned by its backend parity partition"},
+          {"backend": "kvm", "why": "KVM requires the privileged runner"},
+          {"backend": "sabre", "why": "SaBRe requires its external runtime"},
+          {"backend": "liteinst", "why": "LiteInst coverage is owned by its backend compatibility partition"}
+        ]},
+        {"mode": "replay", "ci": false, "backends-enabled": [], "backends-disabled": [
+          {"backend": "ptrace", "why": "The focused C sentinel owns the blocking replay contract"},
+          {"backend": "dbi", "why": "Record/replay is unsupported by DBI"},
+          {"backend": "kvm", "why": "Record/replay is unsupported by KVM"},
+          {"backend": "sabre", "why": "Record/replay is unsupported by SaBRe"},
+          {"backend": "liteinst", "why": "Record/replay is unsupported by LiteInst"}
+        ]},
+        {"mode": "chaos", "ci": false, "backends-enabled": [], "backends-disabled": [
+          {"backend": "ptrace", "why": "The workload is single-threaded"},
+          {"backend": "dbi", "why": "Chaos scheduling is unsupported by DBI"},
+          {"backend": "kvm", "why": "Chaos scheduling is unsupported by KVM"},
+          {"backend": "sabre", "why": "Chaos scheduling is unsupported by SaBRe"},
+          {"backend": "liteinst", "why": "Chaos scheduling is unsupported by LiteInst"}
+        ]},
+        {"mode": "custom", "ci": false, "backends-enabled": [], "backends-disabled": [
+          {"backend": "ptrace", "why": "No edge-case Hermit arguments are required"},
+          {"backend": "dbi", "why": "No edge-case Hermit arguments are required"},
+          {"backend": "kvm", "why": "No edge-case Hermit arguments are required"},
+          {"backend": "sabre", "why": "No edge-case Hermit arguments are required"},
+          {"backend": "liteinst", "why": "No edge-case Hermit arguments are required"}
+        ]}
+      ],
+      "occasional": false
+    }
+  ]
+}

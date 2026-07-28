@@ -9,6 +9,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 TEST_ROOT="$ROOT_DIR/tests/e2e"
+MANIFEST_ROOT="$ROOT_DIR/ci/manifests"
+INVENTORY="$MANIFEST_ROOT/inventory/test-files.json"
 HERMIT_BIN=${HERMIT_BIN:-$ROOT_DIR/target/debug/hermit}
 RESULT_ROOT=${E2E_RESULT_ROOT:-$ROOT_DIR/target/e2e}
 RUN_ID=${E2E_RUN_ID:-"local-$(date +%s)-$$"}
@@ -19,15 +21,8 @@ else
     SOURCE_TREE_DIRTY=false
 fi
 
-readonly ROOT_DIR TEST_ROOT HERMIT_BIN RESULT_ROOT RUN_ID SOURCE_TREE_SHA SOURCE_TREE_DIRTY
-readonly -a CATEGORIES=(
-    system-utils
-    data-handling
-    determinism-stress
-    language-runtimes
-    applications
-)
-readonly -a MODES=(naked verify replay chaos)
+readonly ROOT_DIR TEST_ROOT MANIFEST_ROOT INVENTORY HERMIT_BIN RESULT_ROOT RUN_ID SOURCE_TREE_SHA SOURCE_TREE_DIRTY
+readonly -a MODES=(verify chaos replay naked custom)
 readonly -a BACKENDS=(ptrace dbi kvm sabre liteinst)
 
 function usage {
@@ -37,16 +32,19 @@ Usage:
   ci/test_harness.sh plan [--lane portable|privileged] [--format text|json]
   ci/test_harness.sh run [filters] [--results PATH] [--junit PATH]
   ci/test_harness.sh audit-gaps [--lane portable|privileged] [--format text|json]
+  ci/test_harness.sh audit-inventory
+  ci/test_harness.sh audit-ci
 
 Filters:
   --lane LANE             portable or privileged
-  --mode MODE             naked, verify, replay, or chaos
+  --mode MODE             verify, chaos, replay, naked, or custom
   --backend BACKEND       ptrace, dbi, kvm, sabre, or liteinst
-  --category CATEGORY     one of the five tests/e2e category directories
+  --category CATEGORY     manifest category
   --test ID               exact category/test ID
   --include-occasional    include tests marked occasional
 
-The run command defaults to all required, non-occasional cells in both lanes.
+The run command defaults to all CI-enabled, non-occasional cells in both lanes.
+Naked controls are meta-CI checks and run only when explicitly selected.
 Every selected required cell emits one JSONL record. Verification runs use the
 required INFO level, but diagnostics stay outside the guest-observation hash.
 USAGE
@@ -67,85 +65,117 @@ function contains {
     return 1
 }
 
-function discover_tests {
-    local category
-    for category in "${CATEGORIES[@]}"; do
-        find "$TEST_ROOT/$category" -mindepth 1 -maxdepth 1 -type f -name '*.sh' -print
-    done | LC_ALL=C sort
+function discover_manifests {
+    find "$MANIFEST_ROOT" -mindepth 1 -maxdepth 1 -type f -name '*.json' -print |
+        LC_ALL=C sort
 }
 
-function metadata_json {
-    local test=$1
-    awk '
-        /^# HERMIT_E2E_META_BEGIN$/ { inside = 1; next }
-        /^# HERMIT_E2E_META_END$/ { if (inside) exit }
-        inside { sub(/^# ?/, ""); print }
-    ' "$test"
+function normalize_metadata {
+    jq -c '
+        . + {
+          timeout_seconds: .["timeout-seconds"],
+          program_kind: .program.kind,
+          program_path: .program.path,
+          prepare_args: (.program["prepare-args"] // []),
+          compile_args: (.program["compile-args"] // []),
+          run_args: (.program["run-args"] // []),
+          modes: (.modes | map({
+            key: .mode,
+            value: {
+              backends: .["backends-enabled"],
+              ci: (.ci // false),
+              runs: .runs,
+              seeds: .seeds,
+              args: (.args // []),
+              assert: {
+                min_distinct: .assert["min-distinct"],
+                min_passes: .assert["min-passes"],
+                min_failures: .assert["min-failures"]
+              }
+            }
+          }) | from_entries)
+        }
+        | del(.["timeout-seconds"], .program)
+    '
 }
 
-function validate_metadata {
-    local test=$1
-    local relative=${test#"$TEST_ROOT/"}
-    local category=${relative%%/*}
-    local basename=${relative##*/}
-    local expected_id="$category/${basename%.sh}"
-    local metadata
+function validate_manifest_entry {
+    local manifest=$1
+    local metadata=$2
+    local relative=${manifest#"$ROOT_DIR/"}
 
-    [[ -x $test ]] || die "test is not executable: $relative"
-    bash -n "$test" || die "bash syntax check failed: $relative"
-    metadata=$(metadata_json "$test")
-    [[ -n $metadata ]] || die "missing embedded JSON annotation: $relative"
-
-    jq -e . >/dev/null <<<"$metadata" || die "invalid metadata JSON: $relative"
-    jq -e --arg id "$expected_id" --arg category "$category" '
+    jq -e . >/dev/null <<<"$metadata" || die "invalid test JSON in $relative"
+    jq -e '
         type == "object"
         and ((keys - [
-            "schema", "id", "category", "description", "lane", "requires",
-            "timeout_seconds", "slow_reason", "observation", "modes",
-            "disabled_modes", "occasional", "preprocessors"
+            "id", "category", "description", "lane", "program", "requires",
+            "timeout-seconds", "slow-reason", "observation", "modes",
+            "occasional", "preprocessors"
         ]) | length == 0)
-        and .schema == 1
-        and .id == $id
-        and .category == $category
+        and (.id | type == "string" and test("^[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9-]*$"))
+        and (.category | type == "string" and length > 0)
+        and (. as $test | ($test.id | startswith($test.category + "/")))
         and (.description | type == "string" and length > 0)
         and (.lane == "portable" or .lane == "privileged")
+        and (.program | type == "object")
+        and (.program.kind == "shell" or .program.kind == "c")
+        and (.program.path | type == "string" and startswith("tests/") and (contains("..") | not))
+        and ((.program["prepare-args"] // []) | type == "array" and all(type == "string"))
+        and ((.program["compile-args"] // []) | type == "array" and all(type == "string"))
+        and ((.program["run-args"] // []) | type == "array" and all(type == "string"))
+        and (if .program.kind == "c" then (.program.path | endswith(".c")) else true end)
         and (.requires | type == "array" and all(type == "string"))
-        and (.timeout_seconds | type == "number" and . >= 1 and . <= 1800)
+        and (.["timeout-seconds"] | type == "number" and . >= 1 and . <= 1800)
         and (.observation | type == "object")
         and (.observation.status | type == "boolean")
         and (.observation.stdout | type == "boolean")
         and (.observation.stderr | type == "boolean")
         and (.observation.artifacts | type == "array" and all(type == "string"))
-        and (.modes | type == "object")
-        and (.disabled_modes | type == "object" and all(.[]; type == "string" and length > 0))
-        and (([(.modes | keys[]), (.disabled_modes | keys[])] | sort)
-             == ["chaos", "naked", "replay", "verify"])
+        and (.modes | type == "array" and length == 5)
+        and ((.modes | map(.mode) | sort) == ["chaos", "custom", "naked", "replay", "verify"])
         and ((.occasional // false) | type == "boolean")
         and ((.preprocessors // []) | type == "array" and all(. == "e9patch"))
-    ' >/dev/null <<<"$metadata" || die "metadata schema violation: $relative"
+    ' >/dev/null <<<"$metadata" || die "manifest schema violation in $relative"
 
     jq -e '
-        .modes
-        | to_entries
-        | all(
-            if .key == "naked" then
-                (.value | type == "object")
-                and (.value | has("backends") | not)
-                and ((.value.runs // 3) | type == "number" and . >= 2 and . <= 20)
-                and ((.value.assert.min_distinct // 2) | type == "number" and . >= 2)
+        .modes | all(
+            ((keys - ["mode", "ci", "runs", "seeds", "assert", "args", "backends-enabled", "backends-disabled"]) | length == 0)
+            and (.ci | type == "boolean")
+            and (.["backends-enabled"] | type == "array" and all(type == "string"))
+            and (.["backends-disabled"] | type == "array" and all(
+                type == "object"
+                and ((keys | sort) == ["backend", "why"])
+                and (.backend | type == "string" and length > 0)
+                and (.why | type == "string" and length > 0)))
+            and if .mode == "naked" then
+                (.ci == false)
+                and ((.["backends-enabled"] + (.["backends-disabled"] | map(.backend)) | sort) == ["native"])
+                and ((.runs // 3) | type == "number" and . >= 3 and . <= 5)
+                and ((.assert["min-distinct"] // 2) | type == "number" and . >= 2)
             else
-                (.value | type == "object")
-                and (.value.backends | type == "array" and length > 0)
-                and all(.value.backends[]; . == "ptrace" or . == "dbi" or . == "kvm" or . == "sabre" or . == "liteinst")
+                ((.["backends-enabled"] + (.["backends-disabled"] | map(.backend)) | sort)
+                    == ["dbi", "kvm", "liteinst", "ptrace", "sabre"])
+                and ((.["backends-enabled"] | unique | length) == (.["backends-enabled"] | length))
+                and ((.["backends-disabled"] | map(.backend) | unique | length) == (.["backends-disabled"] | length))
+                and (([.["backends-enabled"][], .["backends-disabled"][].backend] | unique | length) == 5)
+                and (if .ci then (.["backends-enabled"] | length > 0) else true end)
             end
         )
-    ' >/dev/null <<<"$metadata" || die "invalid mode configuration: $relative"
+    ' >/dev/null <<<"$metadata" || die "invalid mode/backend partition in $relative"
 
     jq -e '
-        (.modes.replay.backends // [])
+        (.modes[] | select(.mode == "replay") | .["backends-enabled"])
         | all(. == "ptrace")
     ' >/dev/null <<<"$metadata" ||
-        die "replay currently supports ptrace only; refusing a mislabeled backend: $relative"
+        die "replay currently supports ptrace only in $relative"
+
+    local program_path
+    program_path=$(jq -r .program.path <<<"$metadata")
+    [[ -f $ROOT_DIR/$program_path ]] || die "program does not exist: $program_path ($relative)"
+    if [[ $(jq -r .program.kind <<<"$metadata") == shell ]]; then
+        [[ -x $ROOT_DIR/$program_path ]] || die "program is not executable: $program_path ($relative)"
+        bash -n "$ROOT_DIR/$program_path" || die "bash syntax check failed: $program_path"
+    fi
 
     local artifact
     while IFS= read -r artifact; do
@@ -156,21 +186,117 @@ function validate_metadata {
 }
 
 declare -A TEST_BY_ID=()
+declare -A ID_BY_TEST=()
+declare -A METADATA_BY_ID=()
+declare -A RAW_METADATA_BY_ID=()
 declare -a TESTS=()
+
+function metadata_json {
+    local test=$1
+    local id=${ID_BY_TEST[$test]:-}
+    [[ -n $id ]] || die "internal error: no manifest entry for $test"
+    printf '%s\n' "${METADATA_BY_ID[$id]}"
+}
 
 function load_tests {
     TESTS=()
     TEST_BY_ID=()
-    local test metadata id
-    while IFS= read -r test; do
-        validate_metadata "$test"
-        metadata=$(metadata_json "$test")
-        id=$(jq -r .id <<<"$metadata")
-        [[ -z ${TEST_BY_ID[$id]+x} ]] || die "duplicate test id: $id"
-        TEST_BY_ID[$id]=$test
-        TESTS+=("$test")
-    done < <(discover_tests)
-    ((${#TESTS[@]} > 0)) || die "no tests discovered below $TEST_ROOT"
+    ID_BY_TEST=()
+    METADATA_BY_ID=()
+    RAW_METADATA_BY_ID=()
+    local manifest raw metadata id test relative
+    while IFS= read -r manifest; do
+        jq -e '.schema == 2 and (.bucket | type == "string" and length > 0) and (.tests | type == "array" and length > 0)' \
+            "$manifest" >/dev/null || die "invalid manifest envelope: ${manifest#"$ROOT_DIR/"}"
+        while IFS= read -r raw; do
+            validate_manifest_entry "$manifest" "$raw"
+            id=$(jq -r .id <<<"$raw")
+            relative=$(jq -r .program.path <<<"$raw")
+            test="$ROOT_DIR/$relative"
+            [[ -z ${TEST_BY_ID[$id]+x} ]] || die "duplicate test id: $id"
+            [[ -z ${ID_BY_TEST[$test]+x} ]] || die "program appears in multiple tests: $relative"
+            metadata=$(normalize_metadata <<<"$raw")
+            TEST_BY_ID[$id]=$test
+            ID_BY_TEST[$test]=$id
+            METADATA_BY_ID[$id]=$metadata
+            RAW_METADATA_BY_ID[$id]=$raw
+            TESTS+=("$test")
+        done < <(jq -c '.tests[]' "$manifest")
+    done < <(discover_manifests)
+    ((${#TESTS[@]} > 0)) || die "no tests discovered below $MANIFEST_ROOT"
+}
+
+function audit_inventory {
+    [[ -f $INVENTORY ]] || die "missing test inventory: ${INVENTORY#"$ROOT_DIR/"}"
+    jq -e '
+        .schema == 2
+        and (.files | type == "array" and length > 0)
+        and (.files | all(
+            type == "object"
+            and ((keys | sort) == ["disposition", "path", "runner", "why"])
+            and (.path | type == "string" and startswith("tests/") and (contains("..") | not))
+            and (.disposition | type == "string" and length > 0)
+            and (.runner | type == "string" and length > 0)
+            and (.why | type == "string" and length > 0)))
+        and ((.files | map(.path) | unique | length) == (.files | length))
+    ' "$INVENTORY" >/dev/null || die "test inventory schema violation"
+
+    local scratch expected actual
+    scratch=$(mktemp -d)
+    expected="$scratch/expected"
+    actual="$scratch/actual"
+    find "$ROOT_DIR/tests" -type f -printf 'tests/%P\n' | LC_ALL=C sort >"$expected"
+    jq -r '.files[].path' "$INVENTORY" | LC_ALL=C sort >"$actual"
+    if ! diff -u "$expected" "$actual"; then
+        rm -rf "$scratch"
+        die "test inventory is stale; every file in tests/ must have an explicit disposition"
+    fi
+    rm -rf "$scratch"
+
+    local test id path disposition
+    for test in "${TESTS[@]}"; do
+        id=${ID_BY_TEST[$test]}
+        path=${test#"$ROOT_DIR/"}
+        disposition=$(jq -r --arg path "$path" '.files[] | select(.path == $path) | .disposition' "$INVENTORY")
+        [[ $disposition == manifest-test ]] ||
+            die "central manifest program $id must be disposition=manifest-test in inventory: $path"
+    done
+
+    jq '{files:(.files|length),by_disposition:(.files|group_by(.disposition)|map({key:.[0].disposition,value:length})|from_entries)}' \
+        "$INVENTORY"
+}
+
+function audit_ci_correspondence {
+    local lane dag workflow
+    for lane in portable privileged; do
+        dag="$ROOT_DIR/ci/dag/$lane.json"
+        workflow="$ROOT_DIR/.github/workflows/ci-$lane.yml"
+        jq -e '
+            .steps | type == "array" and length > 0
+            and (map(.group + "." + .job) | unique | length) == length
+            and all(.[]; (.cmd | type == "string" and length > 0))
+        ' "$dag" >/dev/null || die "invalid or duplicate CI DAG steps: ci/dag/$lane.json"
+        grep -Fq "ci/run-dag.sh $lane" "$workflow" ||
+            die "GitHub $lane workflow does not consume ci/dag/$lane.json"
+        grep -Fq "run_ci_manifest_lane $lane" "$ROOT_DIR/validate.sh" ||
+            die "validate.sh does not consume the $lane CI DAG"
+    done
+
+    local portable_fingerprint privileged_fingerprint
+    portable_fingerprint=$(jq -Sc '.steps | map({id:(.group + "." + .job),cmd})' \
+        "$ROOT_DIR/ci/dag/portable.json" | sha256sum | cut -d' ' -f1)
+    privileged_fingerprint=$(jq -Sc '.steps | map({id:(.group + "." + .job),cmd})' \
+        "$ROOT_DIR/ci/dag/privileged.json" | sha256sum | cut -d' ' -f1)
+    jq -n \
+        --arg portable_fingerprint "$portable_fingerprint" \
+        --arg privileged_fingerprint "$privileged_fingerprint" \
+        --argjson portable_steps "$(jq '.steps | length' "$ROOT_DIR/ci/dag/portable.json")" \
+        --argjson privileged_steps "$(jq '.steps | length' "$ROOT_DIR/ci/dag/privileged.json")" \
+        --argjson e2e_cells "$(emit_required_plan | jq -s length)" \
+        '{portable_steps:$portable_steps,privileged_steps:$privileged_steps,
+          e2e_cells:$e2e_cells,portable_fingerprint:$portable_fingerprint,
+          privileged_fingerprint:$privileged_fingerprint,
+          correspondence:"validate.sh and GitHub execute these same two DAG files"}'
 }
 
 LANE_FILTER=
@@ -203,7 +329,6 @@ function parse_options {
     [[ -z $LANE_FILTER ]] || contains "$LANE_FILTER" portable privileged || die "invalid lane: $LANE_FILTER"
     [[ -z $MODE_FILTER ]] || contains "$MODE_FILTER" "${MODES[@]}" || die "invalid mode: $MODE_FILTER"
     [[ -z $BACKEND_FILTER ]] || contains "$BACKEND_FILTER" "${BACKENDS[@]}" || die "invalid backend: $BACKEND_FILTER"
-    [[ -z $CATEGORY_FILTER ]] || contains "$CATEGORY_FILTER" "${CATEGORIES[@]}" || die "invalid category: $CATEGORY_FILTER"
     [[ $FORMAT == text || $FORMAT == json ]] || die "invalid format: $FORMAT"
 }
 
@@ -232,8 +357,12 @@ function emit_required_plan {
         for mode in "${MODES[@]}"; do
             jq -e --arg mode "$mode" '.modes | has($mode)' >/dev/null <<<"$metadata" || continue
             [[ -z $MODE_FILTER || $mode == "$MODE_FILTER" ]] || continue
+            if [[ -z $MODE_FILTER ]]; then
+                jq -e --arg mode "$mode" '.modes[$mode].ci == true' >/dev/null <<<"$metadata" || continue
+            fi
             if [[ $mode == naked ]]; then
                 [[ -z $BACKEND_FILTER ]] || continue
+                jq -e '.modes.naked.backends | index("native") != null' >/dev/null <<<"$metadata" || continue
                 jq -cn --arg test "$id" --arg category "$category" --arg lane "$lane" --arg mode "$mode" \
                     '{test:$test,category:$category,lane:$lane,mode:$mode,backend:null}'
             else
@@ -349,8 +478,24 @@ function prepare_test {
         E2E_TMPDIR="$cell_dir/tmp"
         E2E_FIXTURE_DIR="$cell_dir/fixtures"
     )
+    local metadata kind
+    metadata=$(metadata_json "$test")
+    kind=$(jq -r .program_kind <<<"$metadata")
+    local -a prepare_args=() compile_args=()
+    if [[ $kind == c ]]; then
+        mapfile -t compile_args < <(jq -r '.compile_args[]' <<<"$metadata")
+        if ! run_capture "$stdout_file" "$stderr_file" "$timeout_seconds" \
+            cc -std=c11 -O2 "${compile_args[@]}" \
+            "$test" -o "$cell_dir/fixtures/program"; then
+            echo "C program compilation failed for ${test#"$ROOT_DIR/"}" >&2
+            cat "$stderr_file" >&2
+            return 1
+        fi
+        return 0
+    fi
+    mapfile -t prepare_args < <(jq -r '.prepare_args[]' <<<"$metadata")
     if ! run_capture "$stdout_file" "$stderr_file" "$timeout_seconds" \
-        "${env_args[@]}" "$test" --prepare; then
+        "${env_args[@]}" "$test" "${prepare_args[@]}"; then
         echo "prepare failed for ${test#"$TEST_ROOT/"}" >&2
         cat "$stderr_file" >&2
         return 1
@@ -365,10 +510,14 @@ function execute_attempt {
     local cell_dir=$5
     local attempt=$6
     local seed=${7:-}
-    local timeout_seconds stdout_file stderr_file guest_tmpdir
+    local timeout_seconds stdout_file stderr_file guest_tmpdir program
     timeout_seconds=$(jq -r .timeout_seconds <<<"$metadata")
     stdout_file="$cell_dir/captures/${mode}-${attempt}.stdout"
     stderr_file="$cell_dir/captures/${mode}-${attempt}.stderr"
+    program=$test
+    if [[ $(jq -r .program_kind <<<"$metadata") == c ]]; then
+        program="$cell_dir/fixtures/program"
+    fi
 
     rm -rf "$cell_dir/tmp"
     mkdir -p "$cell_dir/tmp"
@@ -389,7 +538,8 @@ function execute_attempt {
         E2E_TMPDIR="$guest_tmpdir"
         E2E_FIXTURE_DIR="$cell_dir/fixtures"
     )
-    local -a command profile
+    local -a command profile run_args custom_args
+    mapfile -t run_args < <(jq -r '.run_args[]' <<<"$metadata")
     profile=()
     if [[ $(jq -r .lane <<<"$metadata") == portable && $mode != naked ]]; then
         profile=(--no-virtualize-cpuid --max-timeslice=disabled)
@@ -397,19 +547,24 @@ function execute_attempt {
 
     case "$mode" in
         naked)
-            command=("$test" --run)
+            command=("$program" "${run_args[@]}")
             ;;
         verify)
             command=("$HERMIT_BIN" --log=info run --backend "$backend" --strict --verify
-                "${profile[@]}" -- "$test" --run)
+                "${profile[@]}" -- "$program" "${run_args[@]}")
             ;;
         replay)
             command=("$HERMIT_BIN" --log=info --backend "$backend" record start --strict --verify
-                --data-dir "$cell_dir/recording" --record-timeout "$timeout_seconds" -- "$test" --run)
+                --data-dir "$cell_dir/recording" --record-timeout "$timeout_seconds" -- "$program" "${run_args[@]}")
             ;;
         chaos)
             command=("$HERMIT_BIN" --log=off run --backend "$backend" --strict --chaos
-                --sched-heuristic=random "--seed=$seed" "${profile[@]}" -- "$test" --run)
+                --sched-heuristic=random "--seed=$seed" "${profile[@]}" -- "$program" "${run_args[@]}")
+            ;;
+        custom)
+            mapfile -t custom_args < <(jq -r '.modes.custom.args[]' <<<"$metadata")
+            command=("$HERMIT_BIN" --log=info run --backend "$backend"
+                "${custom_args[@]}" -- "$program" "${run_args[@]}")
             ;;
         *) die "internal error: unsupported mode $mode" ;;
     esac
@@ -456,6 +611,11 @@ function append_result {
             effective_args=$(jq -cn --arg backend "$backend" \
                 '["--log=off","run",("--backend=" + $backend),"--strict","--chaos","--sched-heuristic=random"]')
             log_level=off
+            ;;
+        custom)
+            effective_args=$(jq -cn --arg backend "$backend" \
+                '["--log=info","run",("--backend=" + $backend),"<manifest-custom-args>"]')
+            log_level=info
             ;;
     esac
     if [[ $lane == portable && $mode != naked ]]; then
@@ -626,7 +786,9 @@ load_tests
 case "$subcommand" in
     validate)
         (($# == 0)) || true
-        echo "PASS: ${#TESTS[@]} E2E tests have valid syntax and metadata"
+        audit_inventory
+        audit_ci_correspondence
+        echo "PASS: ${#TESTS[@]} E2E tests have valid syntax and centralized schema-v2 manifests"
         emit_required_plan | jq -s '{tests:(map(.test)|unique|length),required_cells:length,by_mode:(group_by(.mode)|map({key:.[0].mode,value:length})|from_entries)}'
         ;;
     plan)
@@ -638,6 +800,12 @@ case "$subcommand" in
         ;;
     audit-gaps)
         print_plan gaps
+        ;;
+    audit-inventory)
+        audit_inventory
+        ;;
+    audit-ci)
+        audit_ci_correspondence
         ;;
     *)
         usage

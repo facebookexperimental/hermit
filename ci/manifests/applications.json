@@ -1,0 +1,129 @@
+{
+  "schema": 2,
+  "bucket": "applications",
+  "tests": [
+    {
+      "id": "applications/timed-progress-bar",
+      "category": "applications",
+      "description": "A time-driven Python application completes identically under verification",
+      "lane": "portable",
+      "program": {"kind": "shell", "path": "tests/e2e/applications/timed-progress-bar.sh", "prepare-args": ["--prepare"], "run-args": ["--run"]},
+      "requires": ["linux", "x86_64", "userns", "ptrace", "python3"],
+      "timeout-seconds": 120,
+      "observation": {"status": true, "stdout": true, "stderr": false, "artifacts": []},
+      "modes": [
+        {"mode": "naked", "ci": false, "backends-enabled": [], "backends-disabled": [{"backend": "native", "why": "Elapsed time drives progress but final output is intentionally stable"}]},
+        {"mode": "verify", "ci": true, "backends-enabled": ["ptrace"], "backends-disabled": [
+          {"backend": "dbi", "why": "DBI application coverage is owned by backend parity"},
+          {"backend": "kvm", "why": "KVM requires the privileged runner"},
+          {"backend": "sabre", "why": "SaBRe requires its external runtime"},
+          {"backend": "liteinst", "why": "LiteInst application coverage is owned by backend compatibility"}
+        ]},
+        {"mode": "replay", "ci": false, "backends-enabled": [], "backends-disabled": [
+          {"backend": "ptrace", "why": "Focused time and entropy sentinels own the blocking replay contract"},
+          {"backend": "dbi", "why": "Record/replay is unsupported by DBI"},
+          {"backend": "kvm", "why": "Record/replay is unsupported by KVM"},
+          {"backend": "sabre", "why": "Record/replay is unsupported by SaBRe"},
+          {"backend": "liteinst", "why": "Record/replay is unsupported by LiteInst"}
+        ]},
+        {"mode": "chaos", "ci": false, "backends-enabled": [], "backends-disabled": [
+          {"backend": "ptrace", "why": "The application is single-threaded"},
+          {"backend": "dbi", "why": "Chaos scheduling is unsupported by DBI"},
+          {"backend": "kvm", "why": "Chaos scheduling is unsupported by KVM"},
+          {"backend": "sabre", "why": "Chaos scheduling is unsupported by SaBRe"},
+          {"backend": "liteinst", "why": "Chaos scheduling is unsupported by LiteInst"}
+        ]},
+        {"mode": "custom", "ci": false, "backends-enabled": [], "backends-disabled": [
+          {"backend": "ptrace", "why": "No edge-case Hermit arguments are required"},
+          {"backend": "dbi", "why": "No edge-case Hermit arguments are required"},
+          {"backend": "kvm", "why": "No edge-case Hermit arguments are required"},
+          {"backend": "sabre", "why": "No edge-case Hermit arguments are required"},
+          {"backend": "liteinst", "why": "No edge-case Hermit arguments are required"}
+        ]}
+      ],
+      "occasional": false
+    },
+    {
+      "id": "applications/kvm-python-examples",
+      "category": "applications",
+      "description": "User-facing Python examples run identically with the system interpreter under KVM",
+      "lane": "privileged",
+      "program": {"kind": "shell", "path": "tests/e2e/applications/kvm-python-examples.sh", "prepare-args": ["--prepare"], "run-args": ["--run"]},
+      "requires": ["linux", "x86_64", "kvm", "python3"],
+      "timeout-seconds": 120,
+      "observation": {"status": true, "stdout": true, "stderr": false, "artifacts": []},
+      "modes": [
+        {"mode": "naked", "ci": false, "backends-enabled": [], "backends-disabled": [{"backend": "native", "why": "The portable Python-random test owns the native nondeterminism control"}]},
+        {"mode": "verify", "ci": true, "backends-enabled": ["kvm"], "backends-disabled": [
+          {"backend": "ptrace", "why": "This test specifically asserts the KVM execution path"},
+          {"backend": "dbi", "why": "This test specifically asserts the KVM execution path"},
+          {"backend": "sabre", "why": "This test specifically asserts the KVM execution path"},
+          {"backend": "liteinst", "why": "This test specifically asserts the KVM execution path"}
+        ]},
+        {"mode": "replay", "ci": false, "backends-enabled": [], "backends-disabled": [
+          {"backend": "ptrace", "why": "This is a KVM integration test"},
+          {"backend": "dbi", "why": "Record/replay is unsupported by DBI"},
+          {"backend": "kvm", "why": "Record/replay is unsupported by KVM"},
+          {"backend": "sabre", "why": "Record/replay is unsupported by SaBRe"},
+          {"backend": "liteinst", "why": "Record/replay is unsupported by LiteInst"}
+        ]},
+        {"mode": "chaos", "ci": false, "backends-enabled": [], "backends-disabled": [
+          {"backend": "ptrace", "why": "The examples are single-threaded"},
+          {"backend": "dbi", "why": "Chaos scheduling is unsupported by DBI"},
+          {"backend": "kvm", "why": "Chaos scheduling is unsupported by KVM"},
+          {"backend": "sabre", "why": "Chaos scheduling is unsupported by SaBRe"},
+          {"backend": "liteinst", "why": "Chaos scheduling is unsupported by LiteInst"}
+        ]},
+        {"mode": "custom", "ci": false, "backends-enabled": [], "backends-disabled": [
+          {"backend": "ptrace", "why": "No edge-case Hermit arguments are required"},
+          {"backend": "dbi", "why": "No edge-case Hermit arguments are required"},
+          {"backend": "kvm", "why": "No edge-case Hermit arguments are required"},
+          {"backend": "sabre", "why": "No edge-case Hermit arguments are required"},
+          {"backend": "liteinst", "why": "No edge-case Hermit arguments are required"}
+        ]}
+      ],
+      "occasional": false
+    },
+    {
+      "id": "applications/kvm-shell-environment",
+      "category": "applications",
+      "description": "KVM executes a shell workload with a deterministic environment",
+      "lane": "privileged",
+      "program": {"kind": "shell", "path": "tests/e2e/applications/kvm-shell-environment.sh", "prepare-args": ["--prepare"], "run-args": ["--run"]},
+      "requires": ["linux", "x86_64", "kvm"],
+      "timeout-seconds": 60,
+      "observation": {"status": true, "stdout": true, "stderr": false, "artifacts": []},
+      "modes": [
+        {"mode": "naked", "ci": false, "backends-enabled": [], "backends-disabled": [{"backend": "native", "why": "This is a privileged KVM backend integration test"}]},
+        {"mode": "verify", "ci": true, "backends-enabled": ["kvm"], "backends-disabled": [
+          {"backend": "ptrace", "why": "This test specifically asserts the KVM execution path"},
+          {"backend": "dbi", "why": "This test specifically asserts the KVM execution path"},
+          {"backend": "sabre", "why": "This test specifically asserts the KVM execution path"},
+          {"backend": "liteinst", "why": "This test specifically asserts the KVM execution path"}
+        ]},
+        {"mode": "replay", "ci": false, "backends-enabled": [], "backends-disabled": [
+          {"backend": "ptrace", "why": "This is a KVM integration test"},
+          {"backend": "dbi", "why": "Record/replay is unsupported by DBI"},
+          {"backend": "kvm", "why": "Record/replay is unsupported by KVM"},
+          {"backend": "sabre", "why": "Record/replay is unsupported by SaBRe"},
+          {"backend": "liteinst", "why": "Record/replay is unsupported by LiteInst"}
+        ]},
+        {"mode": "chaos", "ci": false, "backends-enabled": [], "backends-disabled": [
+          {"backend": "ptrace", "why": "The workload is single-threaded"},
+          {"backend": "dbi", "why": "Chaos scheduling is unsupported by DBI"},
+          {"backend": "kvm", "why": "Chaos scheduling is unsupported by KVM"},
+          {"backend": "sabre", "why": "Chaos scheduling is unsupported by SaBRe"},
+          {"backend": "liteinst", "why": "Chaos scheduling is unsupported by LiteInst"}
+        ]},
+        {"mode": "custom", "ci": false, "backends-enabled": [], "backends-disabled": [
+          {"backend": "ptrace", "why": "No edge-case Hermit arguments are required"},
+          {"backend": "dbi", "why": "No edge-case Hermit arguments are required"},
+          {"backend": "kvm", "why": "No edge-case Hermit arguments are required"},
+          {"backend": "sabre", "why": "No edge-case Hermit arguments are required"},
+          {"backend": "liteinst", "why": "No edge-case Hermit arguments are required"}
+        ]}
+      ],
+      "occasional": false
+    }
+  ]
+}

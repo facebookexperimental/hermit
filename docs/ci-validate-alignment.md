@@ -13,7 +13,7 @@ Hermit CI is partitioned by host capability, not by test duration:
 | Lane | Workflow and runner | Local command | Capability contract |
 | --- | --- | --- | --- |
 | Portable | `ci-portable.yml`, `ubuntu-latest` | `./validate.sh portable-only --no-label-pr` | No PMU counters, CPUID faulting, or KVM |
-| Privileged | `ci-privileged.yml`, `[Linux, X64, hermit, pmu]` | `ci/run-dag.sh privileged -j 2` | PMU overflow delivery, CPUID faulting, and read/write `/dev/kvm` |
+| Privileged | `ci-privileged.yml`, `[Linux, X64, hermit, pmu]` | `./validate.sh --privileged-only --no-label-pr` | PMU overflow delivery, CPUID faulting, and read/write `/dev/kvm` |
 
 The portable workflow is the required broad product gate. The privileged
 workflow is a focused capability sentinel and must finish in less than five
@@ -22,8 +22,8 @@ do not belong in the scarce privileged lane.
 
 ## Multi-mode E2E harness
 
-`ci/test_harness.sh` discovers executable tests only at
-`tests/e2e/<category>/*.sh`. The closed category set is:
+`ci/test_harness.sh` discovers tests from the schema-v2 bucket files under
+`ci/manifests/`. The current category set is:
 
 - `system-utils`
 - `data-handling`
@@ -31,19 +31,23 @@ do not belong in the scarce privileged lane.
 - `language-runtimes`
 - `applications`
 
-Each test embeds strict JSON metadata that declares its lane, modes, backend
-allowlists, observation tuple, timeout, and explicit reasons for every disabled
-mode. `ci/test_harness.sh validate` fails on an unannotated test, an invalid
-backend claim, or a replay backend other than ptrace.
+Test programs contain no policy annotations. Each central entry declares its
+program path, lane, observation tuple, timeout, and all five modes. Mode is the
+outer list; each mode partitions its complete backend set between
+`backends-enabled` and `backends-disabled`, with a reason for every disabled
+backend. `ci/test_harness.sh validate` fails on an invalid partition, stale
+inventory, unclassified file under `tests/`, or replay backend other than
+ptrace.
 
 The modes have distinct contracts:
 
 | Mode | Contract |
 | --- | --- |
-| `naked` | Run without Hermit and require the declared nondeterminism to appear |
+| `naked` | Explicit meta-CI only: run three to five times without Hermit and require declared nondeterminism |
 | `verify` | Run every allowlisted backend with `--strict --verify` |
 | `replay` | Run ptrace `record start --strict --verify` in an isolated recording directory |
 | `chaos` | Require cross-seed diversity and exact within-seed reproduction |
+| `custom` | Run Hermit with manifest-declared edge-case arguments |
 
 Portable Hermit cells add `--no-virtualize-cpuid` and
 `--max-timeslice=disabled`. Every result records the source SHA and dirty bit,
@@ -70,18 +74,22 @@ documentation, and unit-test nodes retain their existing dependencies.
 - PMU overflow/skid validation; and
 - the KVM E2E shell/environment sentinel.
 
-Use `ci/run-dag.sh portable ascii` or `ci/run-dag.sh privileged ascii` to audit
-the dependency layers without running tests.
+Both `validate.sh` and GitHub Actions execute these exact DAG files. Use
+`ci/run-dag.sh portable ascii` or `ci/run-dag.sh privileged ascii` to audit the
+dependency layers without running tests. `ci/test_harness.sh audit-ci` hashes
+the ordered step IDs and commands and verifies both callers still delegate to
+the shared plans.
 
 ## Reconciliation checklist
 
 When adding or changing an E2E test:
 
-1. Put the workload in exactly one `tests/e2e/<category>/` shell file.
-2. Declare all four modes as enabled or explicitly disabled.
+1. Put the workload in a focused shell, C, or Rust source file.
+2. Add it to exactly one bucket manifest and declare all five modes.
 3. Add only locally proven backend combinations to an allowlist.
 4. Run `ci/test_harness.sh validate` and inspect `plan --format json`.
 5. Run the affected mode/backend cells and retain their JSONL/JUnit results.
-6. Update the owning DAG only when a category or capability dependency changes.
-7. Never replace a semantic workload with `--help`, `--version`, or a no-op
+6. Update `inventory/test-files.json` with its disposition and runner.
+7. Update the owning DAG only when a category or capability dependency changes.
+8. Never replace a semantic workload with `--help`, `--version`, or a no-op
    launcher probe.

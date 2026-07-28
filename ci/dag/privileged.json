@@ -47,8 +47,8 @@
       "desc": "Privileged KVM shell, environment, and Python example verification",
       "cmd": "./ci/test_harness.sh run --lane privileged --category applications --results target/e2e/privileged/applications/results.jsonl --junit target/e2e/privileged/applications/junit.xml",
       "deps": ["build.privileged_tests", "e2e.metadata"],
-      "timeout": 60,
-      "hint": {"resources": {"kvm": 1}, "est_duration_s": 15,
+      "timeout": 180,
+      "hint": {"resources": {"kvm": 1}, "est_duration_s": 60,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
     },

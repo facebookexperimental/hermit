@@ -7,11 +7,10 @@
 #
 # run-dag.sh — run a Hermit CI validation lane as a safe-ci-dag-runner DAG.
 #
-# This entrypoint maps the hand-rolled serial/parallel gate structure in
-# validate.sh onto the safe-ci-dag-runner scheduler, so each gate runs as an
-# independently boxed node with explicit dependencies and resource limits (see
-# ci/dag/README.md). The portable GitHub Actions lane uses this path directly;
-# validate.sh remains the source of truth for the individual gate commands.
+# This entrypoint is the shared local/GitHub execution path for the centralized
+# portable and privileged CI plans. Each gate is an independently boxed node
+# with explicit dependencies and resource limits (see ci/dag/README.md).
+# validate.sh and GitHub Actions both consume these exact DAG files.
 #
 # Usage:
 #   ci/run-dag.sh <lane> [runner-args...]

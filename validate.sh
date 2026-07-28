@@ -2851,56 +2851,18 @@ function run_hermit_targets_serial {
     cargo "${cargo_args[@]}" -- --test-threads=1
 }
 
+function run_ci_manifest_lane {
+    local lane=$1
+    local timeout_seconds=${2:-7200}
+    local jobs=${CI_DAG_JOBS:-2}
+
+    run_check "Centralized test manifest and inventory" ./ci/test_harness.sh validate
+    run_check_with_timeout "$timeout_seconds" "$lane CI DAG manifest" \
+        ./ci/run-dag.sh "$lane" -j "$jobs" -v
+}
+
 function run_portable_only_suite {
-    run_check "Detcore backend-abstraction check" \
-        ./scripts/check-detcore-backend-abstraction.sh
-    run_check "cargo-nextest available" ensure_cargo_nextest
-    run_check "Build workspace" cargo build --workspace
-    run_check "Multi-mode portable E2E categories" \
-        ./ci/test_harness.sh run --lane portable
-    run_check "Application end-to-end strict verification" \
-        ./tests/e2e/lib/applications/run_all.sh
-
-    start_check "Test workspace documentation" cargo test --workspace --doc
-    start_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
-    start_check "Rustfmt" cargo fmt --all -- --check
-    start_check "Documentation" cargo doc --workspace --no-deps
-
-    run_check "Test regular workspace crates" "${NEXTEST_RUN[@]}" --workspace --exclude detcore --exclude detcore-liteinst --exclude hermit --exclude hermetic_infra_hermit_flaky-tests
-    # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#707): The guest harnesses deliberately exit nonzero
-    # for some native schedules. Compile them here; Hermit's deterministic and
-    # chaos-mode integration targets below exercise their runtime behavior.
-    run_check "Compile flaky guest test harnesses" \
-        cargo test -p hermetic_infra_hermit_flaky-tests --no-run
-    # AUTONOMOUS-BOT-IMPLEMENTED
-    # TODO-HUMAN-REVIEW(#736): Review serialization for guest-executing Hermit library tests.
-    run_check "Test Hermit unit and binary targets" cargo test -p hermit --lib --bins -- --test-threads=1
-    run_check "Test Detcore unit and binary targets" cargo test -p detcore --lib --bins
-    run_check "Test Detcore non-CPUID miscellaneous cases" cargo test -p detcore --test tests_misc -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --skip ordinary_clone_child_starts_before_parent_resumes --skip ordinary_clone_parent_mode_can_resume_before_child --skip network_syscalls_are_deterministic_across_five_runs --test-threads=1
-    run_check "Test Detcore non-PMU parallel cases" cargo test -p detcore --test tests_parallelism -- --skip detcore --test-threads=4
-
-    run_check "Build LiteInst runtime for portable integration targets" cargo build -p detcore-liteinst -p hermit
-    run_check "Portable Hermit integration targets" run_hermit_targets_serial chaos_sched_yield_progress chaos_stress_pmu_detection clock_determinism clock_discipline_determinism epoll_determinism file_nr_determinism fp_reduction_determinism futex2_refusal hashseed_determinism inode_nr_determinism mmap_determinism pidfd_creation process_isolation_refusals procfs_determinism python_stdlib self_schedstat_determinism signal_determinism socket_ioctl_timestamp_determinism socket_timestamp_determinism softnet_stat_determinism sockstat_determinism
-    run_check "Portable arbitrary-binary cases" cargo test -p hermit --test arbitrary_binaries -- --skip record_replay_stable_arbitrary_binaries --test-threads=1
-    # Keep backend lifecycle cases that require fork or clone out of this broad
-    # CLI batch. The dedicated gate below blocks on LiteInst's supported
-    # direct-ELF Detcore envelope, including Python entropy virtualization.
-    run_check "Portable CLI cases" cargo test -p hermit --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbi_strict_returns_with_blocked_stdin_source --skip run_dbi_verifies_pipe_backpressure --skip run_dbi_keeps_diagnostics_out_of_guest_stderr --skip run_dbi_recovers_after_failed_exec --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --test-threads=1
-    run_check "Portable LiteInst strict compatibility" \
-        cargo test -p hermit --test liteinst_advanced -- --test-threads=1
-    run_check "Portable Hermit mode cases" cargo test -p hermit --test hermit_modes -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify --test-threads=1
-    run_check "Portable application strict verification" cargo test -p hermit --test app_strict_verify -- --ignored --skip java_ --skip javac_ --test-threads=1
-    run_check "Portable command strict verification" cargo test -p hermit --test command_strict_verify -- --ignored --test-threads=1
-    run_check "Portable ignored syscall regressions" cargo test -p hermit --test epoll_determinism --test rcx_canonicalization -- --ignored --test-threads=1
-    run_check "rr suite source contract" cargo test -p hermit --test rr_suite rr_scratch_directories_are_fresh_and_cleaned -- --exact
-    run_check "Build release Hermit for DBI parity" cargo build --release -p hermit
-    run_check "DynamoRIO DBI backend parity" python3 tests/backend-parity/run_matrix.py --hermit target/release/hermit --backend dbi --require-backend
-    run_check "Portable working-envelope levels" run_portable_envelope_levels
-
-    run_check_with_timeout 1200 "Strict compatibility envelope" run_strict_compatibility_envelope
-
-    wait_for_background_checks
+    run_ci_manifest_lane portable "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}"
     print_summary
     ((failures == 0))
 }
@@ -2982,71 +2944,7 @@ function run_calibrated_analyze_tests {
 }
 
 function run_privileged_validation {
-    local leveldb_install="$ROOT_DIR/target/hermit-leveldb-ci"
-    local leveldb_build="$ROOT_DIR/target/hermit-leveldb-build-ci"
-
-    run_check "Build workspace" cargo build --workspace
-    run_check "Build release Hermit for record/replay compatibility" cargo build --release -p hermit
-    run_check "CPUID host feature probe" cargo test -p detcore --test tests_misc has_rdrand_without_detcore -- --exact
-    run_check "CPUID RDRAND/RDSEED masking" cargo test -p detcore --test tests_misc rdrand_rdseed_is_masked -- --exact
-    # Keep PMU tracees in separate harness processes. On the persistent runner,
-    # a leaked tracee can otherwise hold an entire family gate open for an hour.
-    run_exact_detcore_cases "PMU timing" tests_time 120 \
-        max_timeslice_preempts_cpu_bound_code_without_rcb_logical_time \
-        rdtsc_deltas \
-        target_timeslice_yields_at_syscall_boundaries_without_pmu \
-        tod_clock_getres \
-        tod_clock_getres_2 \
-        tod_clock_gettime \
-        tod_from_epoch \
-        tod_gettimeofday \
-        tod_gettimeofday_delta::bottom_detcore \
-        tod_gettimeofday_delta::default_detcore \
-        tod_gettimeofday_delta::middle_detcore \
-        tod_gettimeofday_delta::top_detcore \
-        tod_is_stable \
-        tod_time
-    run_exact_detcore_cases "PMU parallel futex" tests_parallelism 300 \
-        futex_wait_parent::bottom_detcore \
-        futex_wait_parent::default_detcore \
-        futex_wait_parent::middle_detcore
-    run_exact_detcore_cases "PMU parallel memory-and-print" tests_parallelism 600 \
-        mem_print_race::bottom_detcore \
-        mem_print_race::default_detcore \
-        mem_print_race::middle_detcore \
-        mem_print_race::top_detcore
-
-    run_check "KVM CLI cases" cargo test -p hermit --test cli run_kvm_ -- --test-threads=1
-    run_check "KVM global-position CLI case" cargo test -p hermit --test cli backend_accepted_in_global_position -- --exact --test-threads=1
-    run_check "Hardware Hermit integration targets" run_hermit_targets_serial arch_prctl compression madvise ppoll_simulation redis_strict sqlite_veryquick syscall_file_io syscall_file_metadata syscall_quick_wins thread_scheduling_fairness thread_sync_determinism writev_determinism
-    run_check "Stable record/replay integration tests" cargo test -p hermit --test record_replay -- --skip record_replay_matrix --test-threads=1
-    run_check "Arbitrary-binary record/replay case" cargo test -p hermit --test arbitrary_binaries record_replay_stable_arbitrary_binaries -- --exact --test-threads=1
-    run_check "Random-source strict verification" cargo test -p hermit --test random_determinism random_sources_are_deterministic_under_strict_verify -- --exact --ignored --test-threads=1
-    run_check "PMU analyze scenarios (calibrated skid)" \
-        run_calibrated_analyze_tests -- --ignored --test-threads=1
-    run_check "Runtime entropy scenarios" cargo test -p hermit --test language_runtime_determinism -- --ignored --test-threads=1
-    run_check "PMU Python stdlib scenarios" cargo test -p hermit --test python_stdlib -- --ignored --test-threads=1
-    run_check "Frontier application benchmarks" cargo test -p hermit --test frontier_app_benchmarks -- --ignored --test-threads=1
-    run_check "PMU stress search and replay" cargo test -p hermit --test stress_suite slow_cas_search_and_replay -- --exact --ignored --test-threads=1
-
-    run_check "Build pinned LevelDB integration fixture" ./hermit-cli/tests/prepare_leveldb.sh "$leveldb_install" "$leveldb_build"
-    run_check "Focused LevelDB strict determinism" env HERMIT_LEVELDB_BUILD_DIR="$leveldb_build" cargo test -p hermit --test leveldb focused_leveldb_tests_are_deterministic_under_strict -- --exact --test-threads=1
-    run_check "LevelDB env_posix strict determinism" env HERMIT_LEVELDB_BUILD_DIR="$leveldb_build" cargo test -p hermit --test leveldb leveldb_env_posix_is_deterministic_under_strict -- --exact --ignored --test-threads=1
-    run_check "Extended Redis strict determinism" cargo test -p hermit --test redis_strict -- --ignored --test-threads=1
-
-    if [[ -f "$ROOT_DIR/third-party/rr/src/test/util.h" ]]; then
-        run_check "PMU rr syscall suite" cargo test -p hermit --test rr_suite -- --ignored --skip rr_ppoll --skip rr_rlimit --skip rr_sched_yield_to_lower_priority --test-threads=1
-    else
-        failures=$((failures + 1))
-        checks=$((checks + 1))
-        echo "FAIL: PMU rr syscall suite requires initialized third-party/rr"
-    fi
-
-    run_check "Record/replay working-envelope level" run_privileged_envelope_record_replay
-    run_check "Record/replay compatibility baseline" run_rr_compatibility_envelope
-    run_check "Debugger integration tests" ./tests/debugger/run_debugger_tests.sh
-    run_check "Ptrace backend parity" python3 tests/backend-parity/run_matrix.py --backend ptrace
-
+    run_ci_manifest_lane privileged "${CI_PRIVILEGED_DAG_TIMEOUT_SECONDS:-7200}"
     print_summary
     ((failures == 0))
 }
@@ -3064,52 +2962,8 @@ function run_quick_suite {
 }
 
 function run_full_suite {
-    run_check "cargo-nextest available" ensure_cargo_nextest
-    run_quick_suite
-    run_check "Build release Hermit and LiteInst runtime" cargo build --release -p hermit -p detcore-liteinst
-
-    # Cargo supports concurrent commands in one target directory. Run checks that
-    # do not execute Hermit guests alongside the ordered runtime and PMU gates.
-    start_check "Test workspace documentation" cargo test --workspace --doc
-    start_check "Clippy" cargo clippy --workspace --all-targets -- -D warnings
-    start_check "Rustfmt" cargo fmt --all -- --check
-    start_check "Copyright headers (fbsource lint)" check_copyright_headers
-    start_check "Documentation" cargo doc --workspace --no-deps
-
-    if ! run_strict_compatibility_envelope; then
-        printf "❌ Strict compatibility envelope regressed; failing validation (matches the now-blocking CI gate).\n"
-        failures=$((failures + 1))
-    fi
-    run_check "Record/replay compatibility baseline ($RR_COMPAT_EXPECTED programs)" \
-        run_rr_compatibility_envelope
-    # Nextest runs most package unit and Cargo integration targets in parallel.
-    # Detcore's PMU tests depend on same-binary coordination; nextest would launch
-    # them as separate processes. Keep detcore and rustdoc tests as Cargo phases.
-    run_check "Test workspace and integrations" \
-        "${NEXTEST_RUN[@]}" --workspace --exclude detcore \
-        --exclude hermetic_infra_hermit_flaky-tests
-    run_check "Test detcore package" cargo test -p detcore
-    run_check "Fast concurrency stress suite" \
-        "${NEXTEST_RUN[@]}" -p hermit --test stress_suite \
-        --run-ignored only -E 'test(=fast_chaos_matrix)'
-    # rr's syscall edge-case programs (third-party/rr submodule) run under Hermit.
-    if [[ -f "$ROOT_DIR/third-party/rr/src/test/util.h" ]]; then
-        run_check "rr syscall suite" \
-            cargo test -p hermit --test rr_suite -- --ignored
-    else
-        echo "SKIP: rr syscall suite (run 'git submodule update --init third-party/rr' to enable)"
-    fi
-    # `hermit analyze` root-cause search over chaotic schedules (Buck analyze_* targets).
-    # The Cargo target covers the same hello_race and racewrite fixtures as
-    # hermit_analyze_e2e.sh, including their source-line assertions.
-    run_check "Hermit analyze scenarios (calibrated skid)" \
-        run_calibrated_analyze_tests -- --ignored --test-threads=1
-
-    run_full_backend_gates
-    wait_for_background_checks
-
-    # Measure and report the working-envelope vector (informational; does not gate).
-    run_envelope
+    run_ci_manifest_lane portable "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}"
+    run_ci_manifest_lane privileged "${CI_PRIVILEGED_DAG_TIMEOUT_SECONDS:-7200}"
 }
 
 function run_portable_slow_strict_diagnostics {
