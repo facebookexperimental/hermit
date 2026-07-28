@@ -28,12 +28,22 @@ static void on_sigchld(int signal_number) {
   ++sigchld_count;
 }
 
-int main(void) {
-  struct sigaction action = {0};
-  action.sa_handler = on_sigchld;
-  sigemptyset(&action.sa_mask);
-  if (sigaction(SIGCHLD, &action, NULL) != 0)
-    fail("sigaction");
+int main(int argc, char **argv) {
+  int require_sigchld = 1;
+  if (argc == 2 && strcmp(argv[1], "--accounting-only") == 0) {
+    require_sigchld = 0;
+  } else if (argc != 1) {
+    fprintf(stderr, "usage: %s [--accounting-only]\n", argv[0]);
+    return 64;
+  }
+
+  if (require_sigchld) {
+    struct sigaction action = {0};
+    action.sa_handler = on_sigchld;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGCHLD, &action, NULL) != 0)
+      fail("sigaction");
+  }
 
   pid_t first = fork();
   if (first < 0)
@@ -69,13 +79,17 @@ int main(void) {
     return 5;
   // AUTONOMOUS-BOT-IMPLEMENTED
   // TODO-HUMAN-REVIEW(#878): Confirm the portable coalesced-SIGCHLD contract.
-  if (sigchld_count < 1 || sigchld_count > 2)
+  if (require_sigchld && (sigchld_count < 1 || sigchld_count > 2))
     return 6;
   if (waitpid(first, NULL, WNOHANG) != -1 || errno != ECHILD)
     return 7;
   if (waitpid(second, NULL, WNOHANG) != -1 || errno != ECHILD)
     return 8;
 
-  printf("wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n");
+  if (require_sigchld) {
+    puts("wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero");
+  } else {
+    puts("wait4=7 waitid=9 reaped=2 cpu=zero");
+  }
   return 0;
 }

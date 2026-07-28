@@ -226,6 +226,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             0,
             b"threads=4 total=10\n",
         ),
+        "process_wait_accounting": (
+            [str(fixtures.binary("process_wait_lifecycle")), "--accounting-only"],
+            0,
+            b"wait4=7 waitid=9 reaped=2 cpu=zero\n",
+        ),
         "process_wait_lifecycle": (
             [str(fixtures.binary("process_wait_lifecycle"))],
             0,
