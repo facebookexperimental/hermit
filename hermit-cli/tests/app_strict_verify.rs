@@ -391,6 +391,22 @@ fn run_once_under_strict(program: &Path, args: &[&str]) -> Output {
     run_hermit_command(command)
 }
 
+// --- L2: installed application runtimes and databases are deterministic ---
+
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + Python 3"]
+fn python_arithmetic_is_deterministic_under_strict_verify() {
+    let python = required_app("python3", &["/usr/local/bin/python3", "/usr/bin/python3"]);
+    assert_l2_under_strict_verify(&python, &["-c", "print(sum(range(1000)))"]);
+}
+
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + sqlite3"]
+fn sqlite_query_is_deterministic_under_strict_verify() {
+    let sqlite = required_app("sqlite3", &["/usr/bin/sqlite3", "/usr/local/bin/sqlite3"]);
+    assert_l2_under_strict_verify(&sqlite, &[":memory:", "SELECT 1+1"]);
+}
+
 // --- L2: compiled managed-runtime programs are bitwise deterministic ---
 
 #[test]
