@@ -14,13 +14,20 @@ timeout, build flags, observation policy, and exclusion reasons belong here.
 `ci/test_harness.sh` loads them through the structured Rust parser in
 `ci/manifest-plan`.
 
-The manifests are split into five workload buckets so CI can shard them:
+The 13 manifests separate calibrated blocking cells from discoverable migration
+inventory. CI currently shards the five calibrated workload buckets:
 
 - `system-utils.toml`
 - `data-handling.toml`
 - `determinism-stress.toml`
 - `language-runtimes.toml`
 - `applications.toml`
+
+Eight additional `*-c.toml`/`c-programs.toml` buckets make 180 more C guests
+centrally discoverable. Their ptrace verify cells are enabled for explicit
+mode selection but set `ci = false` until their standalone build and output
+contracts are calibrated. They still declare all five modes and every backend
+exclusion, so inventory does not silently imply support.
 
 ## Schema contract
 
@@ -61,13 +68,18 @@ The mode contracts are:
 
 `naked` must set `ci = false`; it runs only when explicitly selected. A mode
 with no enabled backend remains visible with `ci = false` and a reason for
-every disabled backend. Regular CI executes only cells with `ci = true`.
+every disabled backend. Regular CI executes only cells with `ci = true`;
+selecting a mode explicitly also exposes enabled manual cells:
+
+```sh
+./ci/test_harness.sh run --mode verify --test c-programs/add-key-enosys
+```
 
 ## Inventory and validation
 
-`inventory/test-files.json` classifies every file below `tests/` with a
-disposition, owning runner, and per-file justification. The audit compares the
-inventory byte-for-byte with filesystem discovery, then confirms that every
+`inventory/test-files.json` classifies every regular file and symlink below
+`tests/` with a disposition, owning runner, and per-file justification. The
+audit compares the inventory byte-for-byte with filesystem discovery, then confirms that every
 manifest program is classified as `manifest-test`. Tests retained under Cargo,
 Buck, integration, QEMU, or suite drivers explain the build flags, arguments,
 expected results, hardware, or shared setup that their owner supplies.

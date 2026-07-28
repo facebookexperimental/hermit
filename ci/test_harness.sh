@@ -154,23 +154,27 @@ function audit_inventory {
     scratch=$(mktemp -d)
     expected="$scratch/expected"
     actual="$scratch/actual"
-    find "$ROOT_DIR/tests" -type f -printf 'tests/%P\n' | LC_ALL=C sort >"$expected"
+    find "$ROOT_DIR/tests" \( -type f -o -type l \) -printf 'tests/%P\n' | LC_ALL=C sort >"$expected"
     jq -r '.files[].path' "$INVENTORY" | LC_ALL=C sort >"$actual"
     if ! diff -u "$expected" "$actual"; then
         rm -rf "$scratch"
         die "test inventory is stale; every file in tests/ must have an explicit disposition"
     fi
-    rm -rf "$scratch"
 
-    local test id path disposition
+    local manifest_programs="$scratch/manifest-programs"
+    local inventory_manifest_tests="$scratch/inventory-manifest-tests"
+    local test
     for test in "${TESTS[@]}"; do
-        id=${ID_BY_TEST[$test]}
         [[ $test != direct:* ]] || continue
-        path=${test#"$ROOT_DIR/"}
-        disposition=$(jq -r --arg path "$path" '.files[] | select(.path == $path) | .disposition' "$INVENTORY")
-        [[ $disposition == manifest-test ]] ||
-            die "central manifest program $id must be disposition=manifest-test in inventory: $path"
-    done
+        printf '%s\n' "${test#"$ROOT_DIR/"}"
+    done | LC_ALL=C sort >"$manifest_programs"
+    jq -r '.files[] | select(.disposition == "manifest-test") | .path' "$INVENTORY" |
+        LC_ALL=C sort >"$inventory_manifest_tests"
+    if ! diff -u "$manifest_programs" "$inventory_manifest_tests"; then
+        rm -rf "$scratch"
+        die "manifest programs and disposition=manifest-test inventory entries differ"
+    fi
+    rm -rf "$scratch"
 
     jq '{files:(.files|length),by_disposition:(.files|group_by(.disposition)|map({key:.[0].disposition,value:length})|from_entries)}' \
         "$INVENTORY"
@@ -242,85 +246,70 @@ function parse_options {
     [[ $FORMAT == text || $FORMAT == json ]] || die "invalid format: $FORMAT"
 }
 
-function test_selected {
-    local metadata=$1
-    local id category lane occasional
-    id=$(jq -r .id <<<"$metadata")
-    category=$(jq -r .category <<<"$metadata")
-    lane=$(jq -r .lane <<<"$metadata")
-    occasional=$(jq -r '.occasional // false' <<<"$metadata")
-
-    [[ -z $TEST_FILTER || $id == "$TEST_FILTER" ]] || return 1
-    [[ -z $CATEGORY_FILTER || $category == "$CATEGORY_FILTER" ]] || return 1
-    [[ -z $LANE_FILTER || $lane == "$LANE_FILTER" ]] || return 1
-    ((INCLUDE_OCCASIONAL == 1)) || [[ $occasional == false ]] || return 1
-}
-
 function emit_required_plan {
-    local test metadata id category lane mode backend
+    local test
     for test in "${TESTS[@]}"; do
-        metadata=$(metadata_json "$test")
-        test_selected "$metadata" || continue
-        id=$(jq -r .id <<<"$metadata")
-        category=$(jq -r .category <<<"$metadata")
-        lane=$(jq -r .lane <<<"$metadata")
-        for mode in "${MODES[@]}"; do
-            jq -e --arg mode "$mode" '.modes | has($mode)' >/dev/null <<<"$metadata" || continue
-            [[ -z $MODE_FILTER || $mode == "$MODE_FILTER" ]] || continue
-            if [[ -z $MODE_FILTER ]]; then
-                jq -e --arg mode "$mode" '.modes[$mode].ci == true' >/dev/null <<<"$metadata" || continue
-            fi
-            if [[ $mode == naked ]]; then
-                [[ -z $BACKEND_FILTER ]] || continue
-                jq -e '.modes.naked.backends | index("native") != null' >/dev/null <<<"$metadata" || continue
-                jq -cn --arg test "$id" --arg category "$category" --arg lane "$lane" --arg mode "$mode" \
-                    '{test:$test,category:$category,lane:$lane,mode:$mode,backend:null}'
-            else
-                while IFS= read -r backend; do
-                    [[ -z $BACKEND_FILTER || $backend == "$BACKEND_FILTER" ]] || continue
-                    jq -cn --arg test "$id" --arg category "$category" --arg lane "$lane" \
-                        --arg mode "$mode" --arg backend "$backend" \
-                        '{test:$test,category:$category,lane:$lane,mode:$mode,backend:$backend}'
-                done < <(jq -r --arg mode "$mode" '.modes[$mode].backends[]' <<<"$metadata")
-            fi
-        done
-    done
+        metadata_json "$test"
+    done | jq -c \
+        --arg lane_filter "$LANE_FILTER" \
+        --arg mode_filter "$MODE_FILTER" \
+        --arg backend_filter "$BACKEND_FILTER" \
+        --arg category_filter "$CATEGORY_FILTER" \
+        --arg test_filter "$TEST_FILTER" \
+        --argjson include_occasional "$INCLUDE_OCCASIONAL" '
+        select($lane_filter == "" or .lane == $lane_filter)
+        | select($category_filter == "" or .category == $category_filter)
+        | select($test_filter == "" or .id == $test_filter)
+        | select($include_occasional == 1 or (.occasional // false) == false)
+        | . as $test
+        | .modes | to_entries[]
+        | select($mode_filter == "" or .key == $mode_filter)
+        | select($mode_filter != "" or .value.ci == true)
+        | . as $mode
+        | if .key == "naked" then
+            select($backend_filter == "")
+            | select(.value.backends | index("native") != null)
+            | {test:$test.id,category:$test.category,lane:$test.lane,mode:$mode.key,backend:null}
+          else
+            .value.backends[] as $backend
+            | select($backend_filter == "" or $backend == $backend_filter)
+            | {test:$test.id,category:$test.category,lane:$test.lane,mode:$mode.key,backend:$backend}
+          end
+    '
 }
 
 function emit_gap_plan {
-    local test metadata id category lane mode backend why
+    local test
     for test in "${TESTS[@]}"; do
-        metadata=$(metadata_json "$test")
-        test_selected "$metadata" || continue
-        id=$(jq -r .id <<<"$metadata")
-        category=$(jq -r .category <<<"$metadata")
-        lane=$(jq -r .lane <<<"$metadata")
-        for mode in "${MODES[@]}"; do
-            jq -e --arg mode "$mode" '.modes | has($mode)' >/dev/null <<<"$metadata" || continue
-            [[ -z $MODE_FILTER || $mode == "$MODE_FILTER" ]] || continue
-            if [[ $mode == naked ]]; then
-                [[ -z $BACKEND_FILTER ]] || continue
-                jq -e '.modes.naked.backends | index("native") != null' >/dev/null <<<"$metadata" && continue
-                why=$(jq -r '.modes.naked.disabled.native' <<<"$metadata")
-                jq -cn --arg test "$id" --arg category "$category" --arg lane "$lane" \
-                    --arg mode "$mode" --arg backend native --arg why "$why" \
-                    '{test:$test,category:$category,lane:$lane,mode:$mode,backend:$backend,
-                      classification:"disabled",why:$why}'
-                continue
-            fi
-            for backend in "${BACKENDS[@]}"; do
-                [[ -z $BACKEND_FILTER || $backend == "$BACKEND_FILTER" ]] || continue
-                jq -e --arg mode "$mode" --arg backend "$backend" \
-                    '.modes[$mode].backends | index($backend) != null' >/dev/null <<<"$metadata" && continue
-                why=$(jq -r --arg mode "$mode" --arg backend "$backend" \
-                    '.modes[$mode].disabled[$backend]' <<<"$metadata")
-                jq -cn --arg test "$id" --arg category "$category" --arg lane "$lane" \
-                    --arg mode "$mode" --arg backend "$backend" --arg why "$why" \
-                    '{test:$test,category:$category,lane:$lane,mode:$mode,backend:$backend,
-                      classification:"disabled",why:$why}'
-            done
-        done
-    done
+        metadata_json "$test"
+    done | jq -c \
+        --arg lane_filter "$LANE_FILTER" \
+        --arg mode_filter "$MODE_FILTER" \
+        --arg backend_filter "$BACKEND_FILTER" \
+        --arg category_filter "$CATEGORY_FILTER" \
+        --arg test_filter "$TEST_FILTER" \
+        --argjson include_occasional "$INCLUDE_OCCASIONAL" '
+        select($lane_filter == "" or .lane == $lane_filter)
+        | select($category_filter == "" or .category == $category_filter)
+        | select($test_filter == "" or .id == $test_filter)
+        | select($include_occasional == 1 or (.occasional // false) == false)
+        | . as $test
+        | .modes | to_entries[]
+        | select($mode_filter == "" or .key == $mode_filter)
+        | . as $mode
+        | if .key == "naked" then
+            select($backend_filter == "")
+            | .value.disabled.native as $why
+            | select($why != null)
+            | {test:$test.id,category:$test.category,lane:$test.lane,mode:$mode.key,
+               backend:"native",classification:"disabled",why:$why}
+          else
+            .value.disabled | to_entries[]
+            | select($backend_filter == "" or .key == $backend_filter)
+            | {test:$test.id,category:$test.category,lane:$test.lane,mode:$mode.key,
+               backend:.key,classification:"disabled",why:.value}
+          end
+    '
 }
 
 function print_plan {

@@ -23,13 +23,18 @@ do not belong in the scarce privileged lane.
 ## Multi-mode E2E harness
 
 `ci/test_harness.sh` discovers tests from the schema-v2 TOML bucket files under
-`tests/e2e/manifests/`. The current category set is:
+`tests/e2e/manifests/`. The CI-enabled category set is:
 
 - `system-utils`
 - `data-handling`
 - `determinism-stress`
 - `language-runtimes`
 - `applications`
+
+Eight additional C-corpus buckets are centrally discoverable with `ci=false`
+until each direct guest's standalone build and output contract is calibrated.
+They participate in schema, inventory, and disabled-backend audits without
+silently expanding the blocking CI denominator.
 
 Test programs contain no policy annotations. Each central entry declares its
 program path, lane, observation tuple, timeout, and all five modes. Mode is the

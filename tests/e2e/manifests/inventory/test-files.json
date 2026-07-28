@@ -15,9 +15,9 @@
     },
     {
       "path": "tests/backend-parity/fixtures/cpuid_probe.c",
-      "disposition": "guest-fixture",
-      "runner": "tests/backend-parity/run_matrix.py",
-      "why": "Backend-parity guest compiled and parameterized by the matrix driver"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/backend-parity/fixtures/input.txt",
@@ -27,15 +27,15 @@
     },
     {
       "path": "tests/backend-parity/fixtures/pid_probe.c",
-      "disposition": "guest-fixture",
-      "runner": "tests/backend-parity/run_matrix.py",
-      "why": "Backend-parity guest compiled and parameterized by the matrix driver"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/backend-parity/fixtures/pthread_lifecycle.c",
-      "disposition": "guest-fixture",
-      "runner": "tests/backend-parity/run_matrix.py",
-      "why": "Backend-parity guest compiled and parameterized by the matrix driver"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/backend-parity/matrix.tsv",
@@ -57,57 +57,57 @@
     },
     {
       "path": "tests/bin/posix_timer_test.c",
-      "disposition": "buck-fixture",
-      "runner": "Meta Buck test targets",
-      "why": "Buck-owned guest fixture retained for internal integration coverage; no standalone public harness contract exists"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/bin-c.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/bin/robust_futex_test.c",
-      "disposition": "buck-fixture",
-      "runner": "Meta Buck test targets",
-      "why": "Buck-owned guest fixture retained for internal integration coverage; no standalone public harness contract exists"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/bin-c.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/acct_refusal_probe.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/add_key_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/adjtimex_deterministic.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/arch_prctl_determinism.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/bpf_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/cachestat_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/clock_adjtime_deterministic.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/clock_determinism.c",
@@ -117,129 +117,129 @@
     },
     {
       "path": "tests/c/clone.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/copy_file_range_refusal_probe.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/dbi_copied_tiocgpgrp.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/dbi_exec_failure.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/dbi_execveat_unsupported.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/dbi_mmap_exec.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/dbi_pid_virtualization.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/dbi_prlimit_self.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/dbi_self_sigqueue.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/dbi_unsupported_syscall.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/dbi_wait_lifecycle.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/epoll_determinism.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/fp_reduction_nondeterminism.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/futex_requeue_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/futex_waitv_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/futex_wake_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/getCpu.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/get_robust_list_child.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/get_robust_list_self.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/get_robust_list_thread.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/getitimer_determinism_probe.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/getpid.c",
@@ -249,189 +249,189 @@
     },
     {
       "path": "tests/c/getsockopt_null.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/hello_alarm.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/hello_signals.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/io_uring_fallback.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/io_uring_ring_determinism.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/ioctl_fioclex.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/ioctl_siocethtool.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/ipc_determinism.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/just_spin.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/kcmp_eperm.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/keyctl_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/keyctl_passthrough.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/listmount_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/liteinst_advanced.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/lsm_get_self_attr_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/lsm_list_modules_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/lsm_set_self_attr_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/madvise_determinism.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/map_shadow_stack_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/memfd_secret_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/meminfo_available_deterministic.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/meminfo_cached_deterministic.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/meminfo_free_deterministic.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/memoryPress.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/mmap_determinism.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/mmap_stress_determinism.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/name_to_handle_at_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/name_to_handle_directory_eopnotsupp.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/name_to_handle_empty_path_eopnotsupp.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/name_to_handle_regular_eopnotsupp.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/nanosleep-par.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/netlink_autobind_common.h",
@@ -441,21 +441,21 @@
     },
     {
       "path": "tests/c/netlink_autobind_generic.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/netlink_autobind_route.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/netlink_autobind_usersock.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/netns_cookie_common.h",
@@ -465,261 +465,261 @@
     },
     {
       "path": "tests/c/netns_cookie_tcp4.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/netns_cookie_tcp6.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/netns_cookie_udp4.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/perf_event_hardware_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/perf_event_open_eperm.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/perf_event_software_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/perf_event_watchpoint_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/periodic_setitimer_delivery.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/pidfd_open_self.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/pidfd_poll_self.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/pidfd_waitid_child.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/ppoll_readv.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/ppoll_simulation.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/prctl_dumpable.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/print_memaddrs.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/printf_with_threads.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/proc_fd_link_aliases.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/proc_fdinfo.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/proc_locks.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/process_mrelease_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/process_vm_readv_refusal_probe.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/process_vm_writev_refusal_probe.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/procfs_positioned_probe.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/prodcons_determinism.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/pselect6_simulation.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/ptrace_attach_eperm.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/ptrace_eperm.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/ptrace_seize_eperm.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/ptrace_traceme_eperm.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/pty_nr_count.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/random_sources.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/rcx_canonicalization.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/record_replay_fd_close.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/record_replay_file_state.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/record_replay_lseek_seek_cur.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/record_replay_setsockopt.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/recvmsg_scm_rights_mmap.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/remap_file_pages_anonymous_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/remap_file_pages_memfd_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/remap_file_pages_tmpfile_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/request_key_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/resource_determinism.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/sched_setattr_batch.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/sched_setattr_common.h",
@@ -729,117 +729,117 @@
     },
     {
       "path": "tests/c/sched_setattr_idle.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/sched_setattr_other.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/sched_yield_progress.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/scheduler_policy_queries.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/setitimer_determinism.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/sigmask_preemption.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/signal_determinism.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/sigpipe_siginfo.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/sigtimedwait-no-timeout.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/sigtimedwait-timeout-0s.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/sigtimedwait-timeout-1s.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/simple/hello_nostdlib.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/simple/nanosleep-threads-nocrash.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/simple/nanosleep-threads-simple.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/simple/pread64_nostdlib.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/simple/racewrite_nostdlib.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/so_incoming_cpu_tcp4.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/so_incoming_cpu_tcp6.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/so_incoming_cpu_udp4.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/socket_cookie_common.h",
@@ -849,165 +849,165 @@
     },
     {
       "path": "tests/c/socket_cookie_tcp.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/socket_cookie_udp.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/socket_cookie_unix.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/socket_ioctl_timestamp.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/socket_timestamp_edge_cases.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/socket_timestamp_timespec.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/socket_timestamp_timeval.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/splice_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/statmount_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/syscall_file_io.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/syscall_file_metadata.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/syscall_quick_wins.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/sysfs_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/sysinfo.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/sysinfo_uptime.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/syslog_deterministic.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/sysv_sem_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/sysv_shm_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/tcp_info_accept4.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/tcp_info_accept6.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/tcp_info_client4.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/tee_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/threadExhaustion.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/thread_self_procfs_handoff.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/thread_sync_determinism.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/timer_create_determinism.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/uname.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/unix_autobind_common.h",
@@ -1017,27 +1017,27 @@
     },
     {
       "path": "tests/c/unix_autobind_dgram.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/unix_autobind_seqpacket.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/unix_autobind_stream.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/ustat_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/util/assert.h",
@@ -1046,22 +1046,28 @@
       "why": "Non-executable fixture, configuration, lockfile, or documentation consumed by tests"
     },
     {
+      "path": "tests/c/vforkExec.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Symlinked Reverie C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI pending standalone calibration"
+    },
+    {
       "path": "tests/c/vmsplice_enosys.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/wait_on_child.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/c/writev_determinism.c",
-      "disposition": "cargo-fixture",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "C guest compiled with case-specific flags and asserted by a Rust integration driver; direct execution would omit required arguments and expected-result policy"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/chaos/cas_sequence.rs",
@@ -1083,9 +1089,9 @@
     },
     {
       "path": "tests/chaos/lock_granularity.c",
-      "disposition": "cargo-binary",
-      "runner": "tests/Cargo.toml and hermit-cli integration targets",
-      "why": "Cargo guest binary selected by Hermit mode, stress, or record/replay integration tests"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/chaos-c.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/chaos/nanosleep-threads-nocrash-rust.rs",
@@ -1131,9 +1137,9 @@
     },
     {
       "path": "tests/debugger/guests/debuggee.c",
-      "disposition": "guest-fixture",
-      "runner": "tests/debugger/run_debugger_tests.sh",
-      "why": "Debugger guest source or documentation consumed by the debugger integration driver"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/debugger-c.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/debugger/harness.py",
@@ -1203,45 +1209,45 @@
     },
     {
       "path": "tests/e2e/determinism-stress/fork_tree.c",
-      "disposition": "guest-fixture",
-      "runner": "tests/e2e category driver",
-      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/e2e/determinism-stress/guests/lock_free.c",
-      "disposition": "guest-fixture",
-      "runner": "tests/e2e category driver",
-      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/e2e/determinism-stress/guests/pid_tid.c",
-      "disposition": "guest-fixture",
-      "runner": "tests/e2e category driver",
-      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/e2e/determinism-stress/guests/signal_order.c",
-      "disposition": "guest-fixture",
-      "runner": "tests/e2e category driver",
-      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/e2e/determinism-stress/mmap_fork_shared.c",
-      "disposition": "guest-fixture",
-      "runner": "tests/e2e category driver",
-      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/e2e/determinism-stress/pipe_chain.c",
-      "disposition": "guest-fixture",
-      "runner": "tests/e2e category driver",
-      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/e2e/determinism-stress/pipe_prefill.c",
-      "disposition": "guest-fixture",
-      "runner": "tests/e2e category driver",
-      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/e2e/determinism-stress/process-chains.sh",
@@ -1263,15 +1269,15 @@
     },
     {
       "path": "tests/e2e/determinism-stress/thread_contention.c",
-      "disposition": "guest-fixture",
-      "runner": "tests/e2e category driver",
-      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/e2e/determinism-stress/thread_stress.c",
-      "disposition": "guest-fixture",
-      "runner": "tests/e2e category driver",
-      "why": "Guest source or runtime payload consumed by an E2E shell driver; assertions and Hermit mode selection live in that driver"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/e2e/language-runtimes/RuntimeProbe.java",
@@ -1532,10 +1538,46 @@
       "why": "Central application test entries, modes, lanes, observations, and backend exclusion reasons"
     },
     {
+      "path": "tests/e2e/manifests/backend-parity-c.toml",
+      "disposition": "manifest-policy",
+      "runner": "ci/test_harness.sh via ci/manifest-plan",
+      "why": "C guest inventory for backend-parity fixtures; every entry has complete five-mode backend accounting and remains manual pending calibration"
+    },
+    {
+      "path": "tests/e2e/manifests/bin-c.toml",
+      "disposition": "manifest-policy",
+      "runner": "ci/test_harness.sh via ci/manifest-plan",
+      "why": "C guest inventory for tests/bin; every entry has complete five-mode backend accounting and remains manual pending calibration"
+    },
+    {
+      "path": "tests/e2e/manifests/c-programs.toml",
+      "disposition": "manifest-policy",
+      "runner": "ci/test_harness.sh via ci/manifest-plan",
+      "why": "C guest inventory for tests/c; every entry has complete five-mode backend accounting and remains manual pending calibration"
+    },
+    {
+      "path": "tests/e2e/manifests/chaos-c.toml",
+      "disposition": "manifest-policy",
+      "runner": "ci/test_harness.sh via ci/manifest-plan",
+      "why": "C guest inventory for tests/chaos; every entry has complete five-mode backend accounting and remains manual pending calibration"
+    },
+    {
       "path": "tests/e2e/manifests/data-handling.toml",
       "disposition": "manifest-policy",
       "runner": "ci/test_harness.sh via ci/manifest-plan",
       "why": "Central data-handling test entries, modes, lanes, observations, and backend exclusion reasons"
+    },
+    {
+      "path": "tests/e2e/manifests/debugger-c.toml",
+      "disposition": "manifest-policy",
+      "runner": "ci/test_harness.sh via ci/manifest-plan",
+      "why": "C guest inventory for debugger fixtures; every entry has complete five-mode backend accounting and remains manual pending calibration"
+    },
+    {
+      "path": "tests/e2e/manifests/determinism-stress-c.toml",
+      "disposition": "manifest-policy",
+      "runner": "ci/test_harness.sh via ci/manifest-plan",
+      "why": "C guest inventory for stress fixtures; every entry has complete five-mode backend accounting and remains manual pending calibration"
     },
     {
       "path": "tests/e2e/manifests/determinism-stress.toml",
@@ -1556,10 +1598,22 @@
       "why": "Central language-runtime test entries, modes, lanes, observations, and backend exclusion reasons"
     },
     {
+      "path": "tests/e2e/manifests/shared-futex-c.toml",
+      "disposition": "manifest-policy",
+      "runner": "ci/test_harness.sh via ci/manifest-plan",
+      "why": "C guest inventory for shared-futex fixtures; every entry has complete five-mode backend accounting and remains manual pending calibration"
+    },
+    {
       "path": "tests/e2e/manifests/system-utils.toml",
       "disposition": "manifest-policy",
       "runner": "ci/test_harness.sh via ci/manifest-plan",
       "why": "Central system-utility test entries, modes, lanes, observations, and backend exclusion reasons"
+    },
+    {
+      "path": "tests/e2e/manifests/util-c.toml",
+      "disposition": "manifest-policy",
+      "runner": "ci/test_harness.sh via ci/manifest-plan",
+      "why": "C guest inventory for utility probes; every entry has complete five-mode backend accounting and remains manual pending calibration"
     },
     {
       "path": "tests/e2e/system-utils/README.md",
@@ -1608,6 +1662,18 @@
       "disposition": "guest-fixture",
       "runner": "hermit-cli integration targets",
       "why": "Interpreted guest payload invoked by a Rust integration test"
+    },
+    {
+      "path": "tests/python/non_strict/rand.py",
+      "disposition": "guest-fixture",
+      "runner": "hermit-cli integration targets",
+      "why": "Symlink to the random Python example; the owning Rust integration test supplies interpreter selection, Hermit arguments, and assertions"
+    },
+    {
+      "path": "tests/python/non_strict/timed_progress_bar.py",
+      "disposition": "guest-fixture",
+      "runner": "hermit-cli integration targets",
+      "why": "Symlink to the timed-progress Python example; the owning Rust integration test supplies interpreter selection, Hermit arguments, and assertions"
     },
     {
       "path": "tests/qemu-boot/smoke_test.sh",
@@ -1899,27 +1965,39 @@
     },
     {
       "path": "tests/shared-futex-verify/qemu_exec_init.c",
-      "disposition": "guest-fixture",
-      "runner": "tests/qemu-boot/*.sh",
-      "why": "Freestanding initramfs guest source compiled by the QEMU boot drivers; it has no standalone host execution contract"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/shared-futex-c.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/shared-futex-verify/qemu_hello.c",
-      "disposition": "guest-fixture",
-      "runner": "tests/qemu-boot/*.sh",
-      "why": "Freestanding initramfs guest source compiled by the QEMU boot drivers; it has no standalone host execution contract"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/shared-futex-c.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/shared-futex-verify/qemu_init.c",
-      "disposition": "guest-fixture",
-      "runner": "tests/qemu-boot/*.sh",
-      "why": "Freestanding initramfs guest source compiled by the QEMU boot drivers; it has no standalone host execution contract"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/shared-futex-c.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/shared-futex-verify/qemu_net_init.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/shared-futex-c.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "path": "tests/shell/date.sh",
       "disposition": "guest-fixture",
-      "runner": "tests/qemu-boot/*.sh",
-      "why": "Freestanding initramfs guest source compiled by the QEMU boot drivers; it has no standalone host execution contract"
+      "runner": "hermit-cli integration targets",
+      "why": "Symlink to the date shell example; the owning Rust integration test supplies Hermit mode and expected-output policy"
+    },
+    {
+      "path": "tests/shell/devrand.sh",
+      "disposition": "guest-fixture",
+      "runner": "hermit-cli integration targets",
+      "why": "Symlink to the random-device shell example; the owning Rust integration test supplies Hermit mode and expected-output policy"
     },
     {
       "path": "tests/shell/non_strict/curl.sh",
@@ -1938,6 +2016,12 @@
       "disposition": "guest-fixture",
       "runner": "hermit-cli integration targets",
       "why": "Interpreted guest payload invoked by a Rust integration test"
+    },
+    {
+      "path": "tests/shell/race.sh",
+      "disposition": "guest-fixture",
+      "runner": "hermit-cli integration targets",
+      "why": "Symlink to the race shell example; the owning Rust integration test supplies scheduler arguments and expected-result policy"
     },
     {
       "path": "tests/shell/taskset.sh",
@@ -2103,9 +2187,9 @@
     },
     {
       "path": "tests/util/pmu_skid.c",
-      "disposition": "integration-helper",
-      "runner": "validate.sh or hermit-cli integration targets",
-      "why": "Shared probe or orchestration helper; its caller supplies hardware checks, arguments, and assertions"
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/util-c.toml (explicit mode selection; ci=false)",
+      "why": "Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "path": "tests/util/simplest_server.py",
