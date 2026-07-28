@@ -1389,7 +1389,13 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     let getrandom_prng = getrandom_probe
         .filter(|probe| probe.writable < probe.requested)
         .map(|probe| (probe, thread.state.prng.clone()));
-    let mut outcome = reverie_dbi::run_tool_syscall(
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1057): Review production fault-safe DBI backtraces.
+    // Preserve DynamoRIO's fault containment when Detcore asks DbiGuest for a
+    // backtrace. Dropping this callback makes the adapter fall back to direct
+    // self-process reads, which cannot distinguish a guest fault from a client
+    // fault as reliably as dr_safe_read.
+    let mut outcome = reverie_dbi::run_tool_syscall_with_memory_reader(
         tool,
         context as usize,
         det_tid,
@@ -1402,6 +1408,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         invoke_syscall,
         read_registers,
         write_registers,
+        read_memory,
     );
     if let Some((probe, original_prng)) = getrandom_prng {
         // The shortened safe write must consume exactly the stream portion that the shared
