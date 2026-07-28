@@ -22,6 +22,11 @@ use std::time::Duration;
 use std::time::Instant;
 
 static LITEINST_ADVANCED_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static LITEINST_COMPAT_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+
+const COMPAT_FIXTURE_CONTENT: &[u8] = b"liteinst compatibility fixture\n";
+const COMPAT_FIXTURE_SHA256: &str =
+    "e5c4447a0a9f796a0b72bb47875e9879aa7722c74e601385e74058f029ae60cd";
 
 fn advanced_guest() -> &'static Path {
     LITEINST_ADVANCED_GUEST.get_or_init(|| {
@@ -48,10 +53,20 @@ fn advanced_guest() -> &'static Path {
     })
 }
 
+fn compatibility_fixture() -> &'static Path {
+    LITEINST_COMPAT_FIXTURE.get_or_init(|| {
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-advanced");
+        fs::create_dir_all(&build_root).expect("failed to create LiteInst fixture directory");
+        let fixture = build_root.join("compatibility-fixture.txt");
+        fs::write(&fixture, COMPAT_FIXTURE_CONTENT).expect("failed to write LiteInst fixture");
+        fixture
+    })
+}
+
 fn run_liteinst(program: &Path, args: &[&str], verify: bool) -> Output {
     liteinst_runtime::ensure_liteinst_runtime();
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command.args(["run", "--backend", "liteinst", "--strict"]);
+    command.args(["--log=info", "run", "--backend", "liteinst", "--strict"]);
     if verify {
         command.arg("--verify");
     }
@@ -64,6 +79,11 @@ fn assert_strict_verify_without_rcb_preemption(
     args: &[&str],
     expected_stdout: &[u8],
 ) {
+    let output = strict_verify_without_rcb_preemption(program, args);
+    assert_eq!(output.stdout, expected_stdout);
+}
+
+fn strict_verify_without_rcb_preemption(program: &Path, args: &[&str]) -> Output {
     let output = run_liteinst(program, args, true);
     assert!(
         output.status.success(),
@@ -72,7 +92,6 @@ fn assert_strict_verify_without_rcb_preemption(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    assert_eq!(output.stdout, expected_stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("liteinst backend] Detcore Tool active"),
@@ -90,6 +109,7 @@ fn assert_strict_verify_without_rcb_preemption(
         stderr.contains("LiteInst (reverie-liteinst LiteinstGuest<Detcore>)"),
         "{stderr}"
     );
+    output
 }
 
 #[test]
@@ -106,6 +126,88 @@ fn liteinst_detcore_strict_verify_micro_suite() {
         Path::new("/bin/cat"),
         &[readme.to_str().unwrap()],
         &expected,
+    );
+}
+
+#[test]
+fn liteinst_strict_verify_identity_utilities() {
+    assert_strict_verify_without_rcb_preemption(Path::new("/usr/bin/uname"), &["-s"], b"Linux\n");
+    assert_strict_verify_without_rcb_preemption(Path::new("/usr/bin/id"), &["-u"], b"0\n");
+    assert_strict_verify_without_rcb_preemption(Path::new("/usr/bin/whoami"), &[], b"root\n");
+}
+
+#[test]
+fn liteinst_strict_verify_file_and_text_utilities() {
+    let fixture = compatibility_fixture();
+    let fixture = fixture.to_str().expect("fixture path should be UTF-8");
+
+    assert_strict_verify_without_rcb_preemption(
+        Path::new("/usr/bin/printf"),
+        &["liteinst-printf-ok\n"],
+        b"liteinst-printf-ok\n",
+    );
+    assert_strict_verify_without_rcb_preemption(
+        Path::new("/usr/bin/grep"),
+        &["^liteinst", fixture],
+        COMPAT_FIXTURE_CONTENT,
+    );
+    assert_strict_verify_without_rcb_preemption(
+        Path::new("/usr/bin/head"),
+        &["-n", "1", fixture],
+        COMPAT_FIXTURE_CONTENT,
+    );
+
+    let expected_wc = format!("{} {fixture}\n", COMPAT_FIXTURE_CONTENT.len());
+    assert_strict_verify_without_rcb_preemption(
+        Path::new("/usr/bin/wc"),
+        &["-c", fixture],
+        expected_wc.as_bytes(),
+    );
+    let expected_sha256 = format!("{COMPAT_FIXTURE_SHA256}  {fixture}\n");
+    assert_strict_verify_without_rcb_preemption(
+        Path::new("/usr/bin/sha256sum"),
+        &[fixture],
+        expected_sha256.as_bytes(),
+    );
+    assert_strict_verify_without_rcb_preemption(
+        Path::new("/usr/bin/stat"),
+        &["-c", "%s", fixture],
+        format!("{}\n", COMPAT_FIXTURE_CONTENT.len()).as_bytes(),
+    );
+}
+
+#[test]
+fn liteinst_strict_verify_shell_and_entropy_consumer() {
+    assert_strict_verify_without_rcb_preemption(
+        Path::new("/bin/sh"),
+        &["-c", "printf 'liteinst-shell-ok\\n'"],
+        b"liteinst-shell-ok\n",
+    );
+    assert_strict_verify_without_rcb_preemption(
+        Path::new("/usr/bin/hexdump"),
+        &["/dev/urandom", "--length", "16"],
+        b"0000000 eca2 407d f242 5603 1acd e9e2 5f75 d684\n0000010\n",
+    );
+}
+
+#[test]
+fn liteinst_strict_verify_python_entropy() {
+    let output = strict_verify_without_rcb_preemption(
+        Path::new("/usr/bin/python3"),
+        &[
+            "-c",
+            "import os; print(os.getpid(), len(os.urandom(8)), os.urandom(8).hex())",
+        ],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("Python output should be UTF-8");
+    let fields = stdout.split_whitespace().collect::<Vec<_>>();
+    assert_eq!(fields.len(), 3, "stdout={stdout:?}");
+    assert_eq!(fields[0], "3", "stdout={stdout:?}");
+    assert_eq!(fields[1], "8", "stdout={stdout:?}");
+    assert_eq!(fields[2].len(), 16, "stdout={stdout:?}");
+    assert!(
+        fields[2].bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "stdout={stdout:?}"
     );
 }
 

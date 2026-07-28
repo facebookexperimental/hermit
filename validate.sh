@@ -2824,14 +2824,12 @@ function run_portable_only_suite {
     run_check "Build LiteInst runtime for portable integration targets" cargo build -p detcore-liteinst -p hermit
     run_check "Portable Hermit integration targets" run_hermit_targets_serial chaos_sched_yield_progress chaos_stress_pmu_detection clock_determinism clock_discipline_determinism epoll_determinism file_nr_determinism fp_reduction_determinism futex2_refusal hashseed_determinism inode_nr_determinism mmap_determinism pidfd_creation process_isolation_refusals procfs_determinism python_stdlib self_schedstat_determinism signal_determinism socket_ioctl_timestamp_determinism socket_timestamp_determinism softnet_stat_determinism sockstat_determinism
     run_check "Portable arbitrary-binary cases" cargo test -p hermit --test arbitrary_binaries -- --skip record_replay_stable_arbitrary_binaries --test-threads=1
-    # The LiteInst preload backend intentionally runs without Detcore
-    # determinization, so its --verify shape comparison observes python3
-    # interpreter-startup syscall reordering (mmap vs newfstatat at event ~94)
-    # nondeterministically. Route the whole python3 --verify LiteInst class to a
-    # bounded, observable portable diagnostic instead of the blocking gate; the
-    # non-python3 LiteInst cases (/bin/echo, /bin/sh, /bin/cat, workdir, stdin,
-    # exit/signal, orphan reaping) stay blocking here.
+    # Keep backend lifecycle cases that require fork or clone out of this broad
+    # CLI batch. The dedicated gate below blocks on LiteInst's supported
+    # direct-ELF Detcore envelope, including Python entropy virtualization.
     run_check "Portable CLI cases" cargo test -p hermit --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbi_strict_returns_with_blocked_stdin_source --skip run_dbi_verifies_pipe_backpressure --skip run_dbi_keeps_diagnostics_out_of_guest_stderr --skip run_dbi_recovers_after_failed_exec --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --test-threads=1
+    run_check "Portable LiteInst strict compatibility" \
+        cargo test -p hermit --test liteinst_advanced -- --test-threads=1
     run_check "Portable Hermit mode cases" cargo test -p hermit --test hermit_modes -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify --test-threads=1
     run_check "Portable application strict verification" cargo test -p hermit --test app_strict_verify -- --ignored --skip java_ --skip javac_ --test-threads=1
     run_check "Portable command strict verification" cargo test -p hermit --test command_strict_verify -- --ignored --test-threads=1

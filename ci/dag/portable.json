@@ -230,6 +230,16 @@
                "classification": "latency-bound"}
     },
     {
+      "group": "test", "job": "liteinst_strict",
+      "desc": "Portable LiteInst strict compatibility",
+      "cmd": "cargo test -p hermit --test liteinst_advanced -- --test-threads=1",
+      "deps": ["build.workspace"],
+      "timeout": 300,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 30,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
       "group": "test", "job": "hermit_modes",
       "desc": "Portable Hermit mode cases (skips default_ and chaos_buck_)",
       "cmd": "cargo test -p hermit --test hermit_modes -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify --test-threads=1",
