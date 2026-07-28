@@ -16,9 +16,12 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use detcore::Detcore;
 use reverie_memory::LocalMemory;
+use reverie_memory::MemoryAccess;
 use reverie_sabre as sabre;
 use reverie_sabre::RemoteReverieAdapter;
 use reverie_syscalls::Errno;
@@ -80,6 +83,14 @@ fn require_virtual_rdtsc(result: Result<u64, Errno>) -> u64 {
     result.expect("SaBRe RDTSC virtualization failed")
 }
 
+fn is_post_load_bootstrap_random(syscall: &Syscall) -> bool {
+    matches!(
+        syscall,
+        Syscall::Getrandom(call)
+            if call.buflen() == 32 && call.flags() == libc::GRND_NONBLOCK as usize
+    )
+}
+
 /// Returns the Detcore SaBRe plugin built beside the running Hermit binary.
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-738): Review the Hermit-to-SaBRe plugin artifact boundary.
@@ -110,6 +121,10 @@ pub fn runtime_library_path() -> io::Result<PathBuf> {
 
 struct Plugin {
     adapter: RemoteReverieAdapter<Detcore>,
+    // The SaBRe-injected runtime requests its hash seed on the first rewritten
+    // syscall after post-load. Keep that tool-private draw out of Detcore's
+    // guest-visible random stream.
+    post_load_syscall_pending: AtomicBool,
 }
 
 impl Plugin {
@@ -119,7 +134,31 @@ impl Plugin {
         let adapter = RemoteReverieAdapter::connect(socket)
             .expect("failed to connect Detcore SaBRe plugin to coordinator");
 
-        Self { adapter }
+        Self {
+            adapter,
+            post_load_syscall_pending: AtomicBool::new(false),
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review SaBRe bootstrap-random isolation.
+    fn handle_post_load_syscall(&self, syscall: &Syscall) -> Option<Result<usize, Errno>> {
+        if !self.post_load_syscall_pending.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+
+        if !is_post_load_bootstrap_random(syscall) {
+            return None;
+        }
+
+        let Syscall::Getrandom(call) = syscall else {
+            unreachable!("bootstrap-random classifier accepted a non-getrandom syscall")
+        };
+        let buffer = call.buf().ok_or(Errno::EFAULT);
+        Some(buffer.and_then(|buffer| {
+            let mut memory = LocalMemory::new();
+            memory.write_exact(buffer, &[0; 32]).map(|()| 32)
+        }))
     }
 
     fn handle_vdso(&self, sysno: Sysno, args: SyscallArgs) -> i32 {
@@ -142,6 +181,9 @@ impl reverie_sabre::Tool for Plugin {
     }
 
     fn syscall(&self, syscall: Syscall, _memory: &LocalMemory) -> Result<usize, Errno> {
+        if let Some(result) = self.handle_post_load_syscall(&syscall) {
+            return result;
+        }
         self.adapter.handle_syscall(syscall)
     }
 
@@ -201,6 +243,12 @@ impl reverie_sabre::Tool for Plugin {
         self.adapter.handle_thread_start(thread_id);
     }
 
+    fn on_post_load(&self) {
+        self.adapter.handle_post_exec();
+        self.post_load_syscall_pending
+            .store(true, Ordering::Release);
+    }
+
     fn on_thread_exit(&self, thread_id: u32) {
         self.adapter.handle_thread_exit(thread_id);
     }
@@ -252,6 +300,31 @@ mod tests {
     #[test]
     fn virtual_rdtsc_returns_coordinator_value() {
         assert_eq!(require_virtual_rdtsc(Ok(42)), 42);
+    }
+
+    #[test]
+    fn recognizes_only_sabre_post_load_bootstrap_random_shape() {
+        let buffer = 0x1234;
+        let syscall = |length, flags| {
+            Syscall::from_raw(
+                Sysno::getrandom,
+                SyscallArgs::new(buffer, length, flags, 0, 0, 0),
+            )
+        };
+
+        assert!(is_post_load_bootstrap_random(&syscall(
+            32,
+            libc::GRND_NONBLOCK as usize
+        )));
+        assert!(!is_post_load_bootstrap_random(&syscall(
+            31,
+            libc::GRND_NONBLOCK as usize
+        )));
+        assert!(!is_post_load_bootstrap_random(&syscall(32, 0)));
+        assert!(!is_post_load_bootstrap_random(&Syscall::from_raw(
+            Sysno::getpid,
+            SyscallArgs::new(0, 0, 0, 0, 0, 0),
+        )));
     }
 
     #[test]
