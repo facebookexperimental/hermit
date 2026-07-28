@@ -1081,6 +1081,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 ThreadState {
                     dettid,
                     detpid: None, // Initialized later.
+                    open_file_creator: None,
                     mm_id: MmId::for_clone(
                         pts.1.mm_id,
                         dettid,

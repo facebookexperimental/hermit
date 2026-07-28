@@ -36,6 +36,7 @@ use std::task::Poll;
 use std::task::Waker;
 
 use detcore::Config;
+use detcore::DetTid;
 use detcore::Detcore;
 use detcore::GlobalState;
 use detcore::UnsupportedSyscallError;
@@ -1321,7 +1322,10 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             let message = b"detcore-dbi: constructing Detcore thread state\n";
             unsafe { emit(message.as_ptr(), message.len()) };
         }
-        let state = tool.init_thread_state(Tid::from_raw(tid.into()), None);
+        let mut state = tool.init_thread_state(Tid::from_raw(tid.into()), None);
+        if scratch.virtual_tid > 0 {
+            state.set_open_file_creator(DetTid::from_raw(scratch.virtual_tid));
+        }
         if first_event {
             let message = b"detcore-dbi: Detcore thread state constructed\n";
             unsafe { emit(message.as_ptr(), message.len()) };

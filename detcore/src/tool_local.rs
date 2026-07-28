@@ -1051,6 +1051,12 @@ pub struct ThreadState<T> {
     /// The deterministic process ID of the this thread.
     pub detpid: Option<DetTid>,
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1063): Review backend-supplied open-file creator identity.
+    /// Stable identity used when allocating deterministic open-file descriptions.
+    #[serde(default)]
+    pub(crate) open_file_creator: Option<DetTid>,
+
     /// Linux memory address space shared by tasks created with `CLONE_VM`.
     pub mm_id: MmId,
 
@@ -1330,6 +1336,7 @@ impl<T> ThreadState<T> {
         ThreadState {
             dettid: pid,
             detpid: None, // Initialized later.
+            open_file_creator: None,
             mm_id: MmId::initial(pid),
             memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),
             pedigree: Pedigree::new(), // Root thread.
@@ -1461,7 +1468,20 @@ impl<T> ThreadState<T> {
         ty: FdType,
         stat: Option<DetStat>,
     ) -> Result<(), Errno> {
-        self.metadata().add_fd(self.dettid, fd, flags, ty, stat)
+        self.metadata().add_fd(
+            self.open_file_creator.unwrap_or(self.dettid),
+            fd,
+            flags,
+            ty,
+            stat,
+        )
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1063): Review backend-supplied open-file creator identity.
+    /// Overrides the task identity embedded in subsequently allocated open-file descriptions.
+    pub fn set_open_file_creator(&mut self, creator: DetTid) {
+        self.open_file_creator = Some(creator);
     }
 
     /// Get a mutable reference of `DetFd` from a raw file descriptor, and
@@ -1738,6 +1758,17 @@ mod timeslice_tests {
 
         assert!(!state.recover_process_mm_id(detpid));
         assert_eq!(state.mm_id, inherited_mm);
+    }
+
+    #[test]
+    fn backend_can_override_open_file_creator_identity() {
+        let host_tid = DetTid::from_raw(10_003);
+        let virtual_tid = DetTid::from_raw(3);
+        let mut state = ThreadState::new(host_tid, &Config::default(), ());
+
+        assert_eq!(state.open_file_creator, None);
+        state.set_open_file_creator(virtual_tid);
+        assert_eq!(state.open_file_creator, Some(virtual_tid));
     }
 
     fn cpu_snapshot(
