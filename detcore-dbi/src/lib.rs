@@ -57,6 +57,12 @@ use reverie_dbi::MemoryReader;
 use reverie_dbi::RegisterReader;
 use reverie_dbi::RegisterWriter;
 use reverie_dbi::SyscallInvoker;
+use tracing::Event;
+use tracing::Metadata;
+use tracing::Subscriber;
+use tracing::field::Field;
+use tracing::field::Visit;
+use tracing::span;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -74,6 +80,94 @@ type DetcoreThreadState = <Detcore as Tool>::ThreadState;
 type Emitter = reverie_dbi::RuntimeEmitter;
 type Idler = reverie_dbi::RuntimeIdler;
 
+static DBI_TRACING_ACTIVE: AtomicBool = AtomicBool::new(false);
+static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
+
+struct DbiSubscriber {
+    emit: Emitter,
+    level: DbiLogLevel,
+}
+
+impl Subscriber for DbiSubscriber {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        self.level.enables(metadata.level())
+    }
+
+    fn new_span(&self, _span: &span::Attributes<'_>) -> span::Id {
+        span::Id::from_u64(NEXT_SPAN_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+    fn event(&self, event: &Event<'_>) {
+        let metadata = event.metadata();
+        let mut visitor = DbiEventVisitor::default();
+        event.record(&mut visitor);
+        let line = format!(
+            "{} {}: {}\n",
+            metadata.level(),
+            metadata.target(),
+            visitor.fields
+        );
+        unsafe { (self.emit)(line.as_ptr(), line.len()) };
+    }
+
+    fn enter(&self, _span: &span::Id) {}
+
+    fn exit(&self, _span: &span::Id) {}
+}
+
+#[derive(Default)]
+struct DbiEventVisitor {
+    fields: String,
+}
+
+impl DbiEventVisitor {
+    fn push(&mut self, field: &Field, value: String) {
+        if !self.fields.is_empty() {
+            self.fields.push(' ');
+        }
+        if field.name() != "message" {
+            self.fields.push_str(field.name());
+            self.fields.push('=');
+        }
+        self.fields.push_str(&value);
+    }
+}
+
+impl Visit for DbiEventVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.push(field, format!("{value:?}"));
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.push(field, value.to_owned());
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DbiLogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl DbiLogLevel {
+    fn enables(self, level: &tracing::Level) -> bool {
+        match self {
+            Self::Error => *level == tracing::Level::ERROR,
+            Self::Warn => matches!(*level, tracing::Level::ERROR | tracing::Level::WARN),
+            Self::Info => !matches!(*level, tracing::Level::DEBUG | tracing::Level::TRACE),
+            Self::Debug => *level != tracing::Level::TRACE,
+            Self::Trace => true,
+        }
+    }
+}
+
 fn emit_marker(emit: Emitter, message: &'static [u8]) {
     unsafe { emit(message.as_ptr(), message.len()) };
 }
@@ -86,6 +180,35 @@ fn info_logging_enabled() -> bool {
             .as_str(),
         "info" | "debug" | "trace"
     )
+}
+
+fn dbi_log_level() -> Option<DbiLogLevel> {
+    match std::env::var("HERMIT_LOG")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "error" => Some(DbiLogLevel::Error),
+        "warn" => Some(DbiLogLevel::Warn),
+        "info" => Some(DbiLogLevel::Info),
+        "debug" => Some(DbiLogLevel::Debug),
+        "trace" => Some(DbiLogLevel::Trace),
+        _ => None,
+    }
+}
+
+fn init_dbi_tracing(emit: Emitter) -> bool {
+    if DBI_TRACING_ACTIVE.load(Ordering::Acquire) {
+        return true;
+    }
+    let Some(level) = dbi_log_level() else {
+        return false;
+    };
+    if tracing::subscriber::set_global_default(DbiSubscriber { emit, level }).is_err() {
+        return false;
+    }
+    DBI_TRACING_ACTIVE.store(true, Ordering::Release);
+    true
 }
 
 /// Environment variable through which `hermit run --backend dbi` hands the
@@ -595,6 +718,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
     RUNTIME_PAUSE_REQUESTED.store(false, Ordering::Release);
     RUNTIME_PAUSED.store(false, Ordering::Release);
     emit_marker(emit, b"detcore-dbi: background client thread entered\n");
+    let tracing_active = init_dbi_tracing(emit);
     let runtime = {
         let mut slot = RUNTIME.write().expect("Detcore DBI runtime lock poisoned");
         if slot.is_none() {
@@ -656,7 +780,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
     };
     emit_marker(emit, b"detcore-dbi: background scheduler ready\n");
     READY_IMAGE.store(image_generation, Ordering::SeqCst);
-    let log_scheduler = info_logging_enabled();
+    let log_scheduler = info_logging_enabled() && !tracing_active;
     let observer = Arc::new(move |event: &'static str| {
         if log_scheduler {
             let line = format!("INFO detcore::scheduler: {event}\n");

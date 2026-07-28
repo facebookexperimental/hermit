@@ -543,6 +543,7 @@ dependencies = [
  "reverie",
  "reverie-dbi",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]

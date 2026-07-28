@@ -630,6 +630,28 @@ fn run_dbi_keeps_diagnostics_out_of_guest_stderr() {
     );
 }
 
+#[test]
+fn run_dbi_forwards_detcore_info_logs() {
+    let args = [
+        "--log",
+        "INFO",
+        "run",
+        "--backend",
+        "dbi",
+        "--strict",
+        "--",
+        "/bin/true",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("INFO detcore") && stderr.contains("DETLOG [syscall]"),
+        "DBI did not forward the Detcore INFO syscall stream:\n{stderr}",
+    );
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#543): validate the explicit application-mmap DBI regression.
 #[test]
