@@ -229,6 +229,11 @@ fn ensure_keys(value: &Value, allowed: &[&str], location: &str) {
     }
 }
 
+fn is_file_or_symlink(path: &Path) -> bool {
+    path.is_file()
+        || std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_and_expand(
     test: &Value,
@@ -295,6 +300,7 @@ fn validate_and_expand(
 
     let program = test.get("program").and_then(Value::as_str);
     let direct = test.get("direct").and_then(Value::as_str);
+    let mut program_path = None;
     match (program, direct) {
         (Some(_), Some(_)) => die(format!("{id}: set only one of `program`/`direct`")),
         (None, None) => die(format!("{id}: must set `program` or `direct`")),
@@ -311,9 +317,11 @@ fn validate_and_expand(
                     "{id}: program must be a repo-relative path below tests/: {program}"
                 ));
             }
-            if !repo_root.join(program).is_file() {
+            let path = repo_root.join(program);
+            if !is_file_or_symlink(&path) {
                 die(format!("{id}: program path does not exist: {program}"));
             }
+            program_path = Some(path);
             if !seen_programs.insert(program.to_string()) {
                 die(format!(
                     "program appears in multiple manifest tests: {program}"
@@ -361,8 +369,17 @@ fn validate_and_expand(
         ));
     }
 
+    let row_start = rows.len();
     for mode in MODES {
         validate_mode(&id, bucket, lane, mode, modes.get(mode).unwrap(), rows);
+    }
+    if rows[row_start..].iter().any(|row| row.ci)
+        && program_path.as_ref().is_some_and(|path| !path.is_file())
+    {
+        die(format!(
+            "{id}: CI-enabled program symlink target is unavailable: {}",
+            program.unwrap()
+        ));
     }
 }
 
@@ -656,5 +673,22 @@ liteinst = "unsupported"
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].backend, "ptrace");
         assert!(rows[0].ci);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recognizes_broken_symlink_as_manual_program_entry() {
+        use std::os::unix::fs::symlink;
+
+        let directory = std::env::temp_dir().join(format!(
+            "hermit-manifest-plan-symlink-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("create test directory");
+        let link = directory.join("external.c");
+        symlink("missing-external-target.c", &link).expect("create broken symlink");
+        assert!(is_file_or_symlink(&link));
+        assert!(!link.is_file());
+        std::fs::remove_dir_all(directory).expect("remove test directory");
     }
 }
