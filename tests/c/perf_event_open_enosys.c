@@ -29,8 +29,8 @@ int main(void) {
 
   errno = 0;
   long result = syscall(SYS_perf_event_open, &attr, 0, -1, -1, 0);
-  if (result == -1 && errno == EPERM) {
-    puts("perf_event_open deterministically refused");
+  if (result == -1 && errno == ENOSYS) {
+    puts("perf_event_open deterministically unavailable");
     return 0;
   }
 
@@ -38,7 +38,7 @@ int main(void) {
     close((int)result);
   }
   fprintf(stderr,
-          "perf_event_open: expected EPERM, got result=%ld errno=%d\n",
+          "perf_event_open: expected ENOSYS, got result=%ld errno=%d\n",
           result, errno);
   return 1;
 }

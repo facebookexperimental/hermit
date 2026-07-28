@@ -33,15 +33,15 @@ int main(void) {
   errno = 0;
   long result = syscall(SYS_name_to_handle_at, AT_FDCWD, "/", handle,
                         &mount_id, 0U);
-  if (result != -1 || errno != ENOSYS) {
+  if (result != -1 || errno != EOPNOTSUPP) {
     fprintf(stderr,
             "name_to_handle_at returned %ld with errno %d (%s), expected "
-            "ENOSYS\n",
+            "EOPNOTSUPP\n",
             result, errno, strerror(errno));
     free(handle);
     return 1;
   }
   free(handle);
-  puts("name_to_handle_at deterministically unavailable");
+  puts("name_to_handle_at deterministically refused");
   return 0;
 }

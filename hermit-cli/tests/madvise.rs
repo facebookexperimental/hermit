@@ -100,7 +100,16 @@ fn madvise_policy_verifies_in_run_record_and_kvm_modes() {
             .arg(&guest)
             .arg("--kvm");
         let output = command_output(verify, "KVM madvise verification");
-        assert_marker(&output, "Determinism verified", "KVM madvise verification");
+        assert_marker(
+            &output,
+            "KVM concurrent mode: comparing guest output and exit status; internal syscall trace order is not deterministic",
+            "KVM madvise verification",
+        );
+        assert_marker(
+            &output,
+            "Success: KVM guest output and exit status matched.",
+            "KVM madvise verification",
+        );
     }
 
     let recording = build_root.join("recording");

@@ -45,12 +45,12 @@ fn host_security_identity_probes_fall_back_deterministically() {
         ),
         (
             "name_to_handle_at",
-            repository.join("tests/c/name_to_handle_at_enosys.c"),
+            repository.join("tests/c/name_to_handle_at_eopnotsupp.c"),
         ),
     ];
 
     for (syscall, source) in cases {
-        let guest = build_root.join(format!("{syscall}_enosys"));
+        let guest = build_root.join(format!("{syscall}_refusal"));
         let mut compile = Command::new("cc");
         compile
             .args(["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror"])

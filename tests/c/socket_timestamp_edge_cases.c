@@ -80,7 +80,7 @@ int main(void) {
   int32_t timestamp_prefix;
   memcpy(&timestamp_prefix, CMSG_DATA(truncated_header),
          sizeof(timestamp_prefix));
-  if (timestamp_prefix < 1600000000 || timestamp_prefix >= 1704067200) {
+  if (timestamp_prefix != 1767225600) {
     fprintf(stderr,
             "truncated timestamp prefix escaped the fixed logical epoch: %d\n",
             timestamp_prefix);

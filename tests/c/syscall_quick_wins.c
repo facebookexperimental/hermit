@@ -113,8 +113,8 @@ int main(void) {
   struct seccomp_notif_sizes sizes;
   errno = 0;
   if (syscall(SYS_seccomp, SECCOMP_GET_NOTIF_SIZES, 0, &sizes) != -1 ||
-      errno != ENOSYS) {
-    fputs("seccomp capability probe did not return ENOSYS\n", stderr);
+      errno != EOPNOTSUPP) {
+    fputs("seccomp capability probe did not return EOPNOTSUPP\n", stderr);
     return 1;
   }
 

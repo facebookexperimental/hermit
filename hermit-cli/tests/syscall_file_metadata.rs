@@ -113,7 +113,6 @@ fn deterministic_file_metadata_syscalls_verify() {
             "--backend=ptrace",
             "--strict",
             "--verify",
-            "--passthru-opt",
             "--panic-on-unsupported-syscalls",
             "--base-env=minimal",
             "--tmp",

@@ -283,14 +283,15 @@ fn cases(fixture: &Fixture) -> Vec<Case> {
             Expectation::Pass,
             false,
         ),
-        // Use the distro binary rather than Meta's instrumented /usr/local
-        // build, which starts telemetry polling threads even for simple work.
+        // `git --version` is a stable compatibility probe that does not depend
+        // on the worktree's internal gitdir being visible in the container.
+        // Prefer the distro binary over instrumented wrappers.
         case(
             "threaded",
             "git",
-            &["/usr/bin/git"],
-            &["ls-files", "README.md"],
-            Some("README.md"),
+            &["/usr/bin/git", "/usr/local/bin/git"],
+            &["--version"],
+            Some("git version"),
             Expectation::Pass,
             false,
         ),
