@@ -207,7 +207,7 @@ pub struct Config {
     pub chaos_target_races: bool,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-1069)
+    // TODO-HUMAN-REVIEW(PR-1149)
     /// RR-style stable per-thread slowdown factors. When set (with `--chaos`),
     /// each thread is assigned a slowdown factor that is CONSTANT for the whole
     /// run — some threads are consistently slower, some faster — rather than
@@ -223,7 +223,7 @@ pub struct Config {
     pub chaos_per_thread_slowdown: bool,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-1069)
+    // TODO-HUMAN-REVIEW(PR-1149)
     /// Maximum ratio between the slowest and fastest per-thread slowdown factor
     /// for `--chaos-per-thread-slowdown`. Each thread's factor is drawn
     /// log-uniformly from `[1/R, R]` where `R` is this value, so a thread's mean
@@ -506,7 +506,7 @@ impl Config {
         assert!(self.sched_sticky_random_param >= 0.0);
         assert!(self.sched_sticky_random_param <= 1.0);
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-1069)
+        // TODO-HUMAN-REVIEW(PR-1149)
         assert!(
             self.chaos_slowdown_max_factor.is_finite() && self.chaos_slowdown_max_factor >= 1.0,
             "chaos_slowdown_max_factor must be finite and >= 1.0, got {}",
@@ -667,7 +667,7 @@ impl fmt::Display for Config {
             write!(f, " --chaos-target-races")?;
         }
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-1069)
+        // TODO-HUMAN-REVIEW(PR-1149)
         if self.chaos_per_thread_slowdown {
             write!(f, " --chaos-per-thread-slowdown")?;
             write!(
@@ -1105,7 +1105,7 @@ mod tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-1069)
+    // TODO-HUMAN-REVIEW(PR-1149)
     #[test]
     fn chaos_per_thread_slowdown_is_opt_in_and_round_trips() {
         // Off by default; the factor default is present but inert.
@@ -1137,7 +1137,7 @@ mod tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-1069)
+    // TODO-HUMAN-REVIEW(PR-1149)
     #[test]
     #[should_panic(expected = "chaos_slowdown_max_factor must be finite and >= 1.0")]
     fn validate_rejects_chaos_slowdown_max_factor_below_one() {

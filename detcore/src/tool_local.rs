@@ -1291,7 +1291,7 @@ fn from_atflags(flags: AtFlags) -> OFlag {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-1069)
+// TODO-HUMAN-REVIEW(PR-1149)
 /// RR-style stable per-thread slowdown factor for chaos scheduling.
 ///
 /// Returns the multiplier applied to a thread's *mean* chaos timeslice length.
@@ -1761,7 +1761,7 @@ impl<T> ThreadState<T> {
                 let nanos_per_rcb = NANOS_PER_RCB * cfg.clock_multiplier.unwrap_or(1.0);
                 let mut target_timeout_rcbs = u64::from(timeout_ns) as f64 / nanos_per_rcb;
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-1069)
+                // TODO-HUMAN-REVIEW(PR-1149)
                 // RR-style stable per-thread slowdown: scale the MEAN chaos
                 // timeslice length by a factor that is constant for this thread
                 // over the whole run (a slower thread gets longer slices, so it
@@ -1961,7 +1961,7 @@ mod timeslice_tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-1069)
+    // TODO-HUMAN-REVIEW(PR-1149)
     #[test]
     fn chaos_per_thread_slowdown_factor_is_stable_and_deterministic() {
         let seed = 0xdead_beef_u64;
@@ -1982,7 +1982,7 @@ mod timeslice_tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-1069)
+    // TODO-HUMAN-REVIEW(PR-1149)
     #[test]
     fn chaos_per_thread_slowdown_factor_varies_across_threads_and_seeds() {
         let max_factor = 10.0;
@@ -2006,7 +2006,7 @@ mod timeslice_tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-1069)
+    // TODO-HUMAN-REVIEW(PR-1149)
     #[test]
     fn chaos_per_thread_slowdown_factor_disabled_when_max_factor_at_most_one() {
         // max_factor <= 1.0 disables the spread: every thread is nominal (1.0).
