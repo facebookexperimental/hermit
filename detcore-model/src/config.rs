@@ -108,6 +108,13 @@ pub struct Config {
     #[clap(skip)]
     pub backend_requires_thread_directed_process_signals: bool,
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review backend-owned capability-control prctls.
+    /// The execution backend virtualizes capability bounding-set and ambient-capability state.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_virtualizes_capability_prctls: bool,
+
     /// Epoch of the logical time.
     ///
     /// This is the datetime from which all time and date modtimes begin and
@@ -1013,6 +1020,7 @@ mod tests {
         assert!(!config.backend_serializes_fork_children);
         assert!(config.backend_dispatches_thread_tools);
         assert!(!config.backend_requires_thread_directed_process_signals);
+        assert!(!config.backend_virtualizes_capability_prctls);
     }
 
     #[test]

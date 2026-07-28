@@ -124,6 +124,12 @@ fn is_supported_prctl_option(option: libc::c_int) -> bool {
     )
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-PENDING): Review KVM capability-control prctl forwarding.
+fn is_backend_virtualized_capability_prctl(option: libc::c_int) -> bool {
+    matches!(option, libc::PR_CAPBSET_DROP | libc::PR_CAP_AMBIENT)
+}
+
 /// Is `which` one of the Linux `PRIO_*` target selectors for get/setpriority?
 fn is_valid_prio_which(which: i32) -> bool {
     which == libc::PRIO_PROCESS as i32
@@ -360,6 +366,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         match call.option() {
             // The capability bounding set is fixed by the container launch policy.
             libc::PR_CAPBSET_READ => Ok(self.record_or_replay(guest, call).await?),
+            option
+                if guest.config().backend_virtualizes_capability_prctls
+                    && is_backend_virtualized_capability_prctl(option) =>
+            {
+                self.passthrough(guest, call.into()).await
+            }
             option if is_supported_prctl_option(option) => {
                 self.passthrough(guest, call.into()).await
             }
@@ -764,6 +776,16 @@ mod tests {
         }
 
         assert!(!is_supported_prctl_option(libc::PR_SET_NO_NEW_PRIVS));
+    }
+
+    #[test]
+    fn backend_virtualized_prctl_support_is_capability_scoped() {
+        for option in [libc::PR_CAPBSET_DROP, libc::PR_CAP_AMBIENT] {
+            assert!(is_backend_virtualized_capability_prctl(option));
+        }
+        for option in [libc::PR_SET_KEEPCAPS, libc::PR_SET_SECUREBITS] {
+            assert!(!is_backend_virtualized_capability_prctl(option));
+        }
     }
 
     #[test]

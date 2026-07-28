@@ -1071,6 +1071,36 @@ fn run_kvm_resolves_bare_program_from_guest_path() {
 }
 
 #[test]
+fn run_kvm_setpriv_capability_wrapper_is_deterministic() {
+    if !Path::new("/dev/kvm").exists()
+        || !Path::new("/usr/bin/setpriv").exists()
+        || !Path::new("/bin/date").exists()
+    {
+        return;
+    }
+
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--base-env=minimal",
+        "--",
+        "/usr/bin/setpriv",
+        "--bounding-set=-sys_time",
+        "/bin/date",
+        "-u",
+        "+%s",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "1767225600\n");
+    assert!(stderr(&output).contains("Success: KVM guest output and exit status matched."));
+}
+
+#[test]
 fn run_kvm_propagates_explicit_environment() {
     if !Path::new("/dev/kvm").exists() {
         return;
