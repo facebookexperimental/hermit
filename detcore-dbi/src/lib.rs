@@ -1137,9 +1137,10 @@ pub unsafe extern "C" fn reverie_dbi_runtime_exec_failed(_scratch: *mut c_void, 
 /// A copied pre-exec child runs natively on the DynamoRIO client stack with no
 /// Detcore tool, so every syscall it makes bypasses `handle_syscall_event`.
 /// Returning 0 lets the syscall run natively; returning 1 fail-closes by
-/// aborting the runtime tree. There is no errno-injection channel in this ABI,
-/// so a fixed-ENOSYS/EPERM syscall cannot be emulated here — the only way to
-/// avoid leaking host state is to refuse the whole child.
+/// aborting the runtime tree. A negative return value injects that deterministic
+/// errno without executing the syscall. Syscalls that need guest-memory access
+/// still have to fail closed because this ABI exposes arguments but no memory
+/// reader or writer.
 ///
 /// The gate covers the classic Unsupported set plus the broader fixed-error
 /// boundary. Unconditional deterministic refusals fail closed in every mode;
@@ -1147,22 +1148,50 @@ pub unsafe extern "C" fn reverie_dbi_runtime_exec_failed(_scratch: *mut c_void, 
 /// execution (`rseq`, zero-copy pipes, keyrings) retain native non-strict
 /// behavior. Before PR-978 both groups could execute natively in a copied child
 /// despite the root Detcore policy.
+///
+/// # Safety
+///
+/// `args` must be null or point to the DBI client's live six-element syscall
+/// argument array for the duration of this call.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1061): Review copied-child ioctl errno emulation.
 #[unsafe(no_mangle)]
-pub extern "C" fn reverie_dbi_runtime_copied_syscall(sysnum: i64) -> i32 {
+pub unsafe extern "C" fn reverie_dbi_runtime_copied_syscall(sysnum: i64, args: *const u64) -> i32 {
     let sysno = Sysno::from(sysnum as i32);
     let strict = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+    // Bash probes the foreground process group in a copied child before
+    // running a background shell function. Hermit's captured stderr is not a
+    // terminal, so the instrumented root observes ENOTTY for the same request.
+    // Emulate that result instead of either exposing a host terminal's process
+    // group or aborting an otherwise deterministic child.
+    //
+    // Every other ioctl remains fail-closed: copied children still cannot enter
+    // the Rust Detcore Tool, and the ABI has no guest-memory channel for safely
+    // handling socket timestamps or arbitrary device operations.
+    if sysno == Sysno::ioctl && strict {
+        let request = if args.is_null() {
+            None
+        } else {
+            // SAFETY: Reverie's DBI client passes its live six-element syscall
+            // argument array for the duration of this callback.
+            Some(unsafe { args.add(1).read() })
+        };
+        if request == Some(libc::TIOCGPGRP) {
+            return -libc::ENOTTY;
+        }
+        return 1;
+    }
     // TODO-HUMAN-REVIEW(PR-981): Copied DBI children cannot enter the Rust
-    // Detcore Tool, and this callback receives no syscall arguments with which
-    // to distinguish timestamp ioctls or timestamp-enabled receive buffers.
-    // Strict mode therefore fails closed for the three syscall classes that can
-    // expose native socket timestamps. Non-strict mode retains native behavior.
+    // Detcore Tool. Strict mode therefore fails closed for receive syscalls that
+    // can expose native socket timestamps. Non-strict mode retains native
+    // behavior.
     // TODO-HUMAN-REVIEW(PR-972): readlink identity canonicalization also requires
     // Detcore mediation. This ABI has neither syscall arguments nor a memory
     // writer, so a copied child must fail closed rather than expose native
     // pipe/socket inode identities.
     if matches!(
         sysno,
-        Sysno::ioctl | Sysno::recvmsg | Sysno::recvmmsg | Sysno::readlink | Sysno::readlinkat
+        Sysno::recvmsg | Sysno::recvmmsg | Sysno::readlink | Sysno::readlinkat
     ) && strict
     {
         return 1;
@@ -1570,6 +1599,16 @@ mod tests {
 
     static COPIED_CHILD_POLICY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    fn copied_child_action(sysnum: i64) -> i32 {
+        copied_child_action_with_args(sysnum, [0; 6])
+    }
+
+    fn copied_child_action_with_args(sysnum: i64, args: [u64; 6]) -> i32 {
+        // SAFETY: The callback reads the argument array only for the duration
+        // of this call.
+        unsafe { reverie_dbi_runtime_copied_syscall(sysnum, args.as_ptr()) }
+    }
+
     #[test]
     fn native_client_links_only_the_dedicated_dbi_runtime() {
         let executable = std::path::Path::new("/workspace/target/debug/hermit");
@@ -1622,18 +1661,18 @@ mod tests {
         // upcalls. `1` tells the native client to exit the isolated runtime
         // tree (fail closed), matching the pre-848 Unsupported behavior.
         COPIED_PANIC_ON_UNSUPPORTED.store(true, Ordering::Release);
-        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_keyctl), 1);
-        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_add_key), 1);
-        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_request_key), 1);
+        assert_eq!(copied_child_action(libc::SYS_keyctl), 1);
+        assert_eq!(copied_child_action(libc::SYS_add_key), 1);
+        assert_eq!(copied_child_action(libc::SYS_request_key), 1);
         // A supported syscall still runs natively even under strict mode.
-        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_getpid), 0);
+        assert_eq!(copied_child_action(libc::SYS_getpid), 0);
 
         // Non-strict: keyring syscalls fall through to native pass-through,
         // matching the root process's non-strict keyring behavior.
         COPIED_PANIC_ON_UNSUPPORTED.store(false, Ordering::Release);
-        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_keyctl), 0);
-        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_add_key), 0);
-        assert_eq!(reverie_dbi_runtime_copied_syscall(libc::SYS_request_key), 0);
+        assert_eq!(copied_child_action(libc::SYS_keyctl), 0);
+        assert_eq!(copied_child_action(libc::SYS_add_key), 0);
+        assert_eq!(copied_child_action(libc::SYS_request_key), 0);
 
         COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
     }
@@ -1816,14 +1855,34 @@ mod tests {
             libc::SYS_readlinkat,
         ] {
             assert_eq!(
-                reverie_dbi_runtime_copied_syscall(sysnum),
+                copied_child_action(sysnum),
                 1,
                 "strict copied child must refuse syscall {sysnum}"
             );
         }
+        let mut ioctl_args = [0; 6];
+        ioctl_args[1] = libc::TIOCGPGRP;
+        assert_eq!(
+            copied_child_action_with_args(libc::SYS_ioctl, ioctl_args),
+            -libc::ENOTTY,
+            "TIOCGPGRP must receive the deterministic non-terminal result"
+        );
+        ioctl_args[1] = 0x8906; // SIOCGSTAMP_OLD
+        assert_eq!(
+            copied_child_action_with_args(libc::SYS_ioctl, ioctl_args),
+            1,
+            "socket timestamp ioctls must remain fail-closed"
+        );
+        // SAFETY: A null argument vector is an explicit fail-closed ABI test;
+        // the callback checks it before dereferencing.
+        assert_eq!(
+            unsafe { reverie_dbi_runtime_copied_syscall(libc::SYS_ioctl, std::ptr::null()) },
+            1,
+            "missing ioctl arguments must fail closed"
+        );
         for sysnum in [libc::SYS_read, libc::SYS_write, libc::SYS_getpid] {
             assert_eq!(
-                reverie_dbi_runtime_copied_syscall(sysnum),
+                copied_child_action(sysnum),
                 0,
                 "strict copied child must allow ordinary syscall {sysnum}"
             );
@@ -1844,7 +1903,7 @@ mod tests {
             libc::SYS_readlinkat,
         ] {
             assert_eq!(
-                reverie_dbi_runtime_copied_syscall(sysnum),
+                copied_child_action(sysnum),
                 0,
                 "non-strict copied child must allow syscall {sysnum}"
             );
@@ -1855,7 +1914,7 @@ mod tests {
             libc::SYS_io_uring_setup,
         ] {
             assert_eq!(
-                reverie_dbi_runtime_copied_syscall(sysnum),
+                copied_child_action(sysnum),
                 1,
                 "unconditional refusal must fail closed for syscall {sysnum}"
             );
