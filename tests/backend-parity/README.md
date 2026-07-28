@@ -10,11 +10,11 @@ A `gap` must have a concrete implementation reason.
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
 | ptrace | 22/22 | 100% |
-| DBI | 21/22 | 95% |
+| DBI | 22/22 | 100% |
 | KVM | 20/22 | 91% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 21/22 number above is deliberately
+measures the backend's own Reverie suite. The 22/22 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
@@ -32,10 +32,11 @@ deterministic `ENOSYS` refusal for `MADV_DONTNEED`. The memory-layout rows check
 that `sbrk`/`brk` growth, ordered one-, two-, and three-page private anonymous
 mappings, and a written two-page shared anonymous mapping produce the same
 address sequences across repeated runs of each backend; they deliberately
-permit different backend-local layouts. Portable
-pthread startup can still stall during native startup and remains the sole DBI
-gap; child-thread random sources remain covered by that lifecycle gap rather
-than the random-source pair.
+permit different backend-local layouts. Portable pthread startup now completes
+reliably through DynamoRIO and is enforced under strict mode alongside the
+other DBI contracts. The random-source row continues to use root-only mode so
+it measures the cross-backend root stream independently of the dedicated
+pthread lifecycle contract.
 
 The file-mutation row creates, writes, attempts allocation, truncates, renames,
 links, reads, and removes temporary files without exposing backend-specific metadata.
@@ -84,7 +85,7 @@ because KVM child processes do not run through per-child Detcore callbacks.
 | `heap_growth` | pass | pass | pass |
 | `anonymous_mmap_layout` | pass | pass | pass |
 | `shared_anonymous_mmap` | pass | pass | pass |
-| `pthread_lifecycle` | pass | gap | pass |
+| `pthread_lifecycle` | pass | pass | pass |
 | `process_wait_lifecycle` | pass | pass | gap |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
@@ -94,12 +95,16 @@ because KVM child processes do not run through per-child Detcore callbacks.
 The authoritative reasons live in `matrix.tsv`, next to the status they
 justify. The runner executes each passing pair three times and checks exit
 status, stdout, and (for determinism cases) byte-identical repeated output.
+Passing `--strict` adds `hermit run --strict` to every probe; the hosted DBI
+gate uses this mode.
 The DBI random-source contract also compares the root thread's post-fault
 random stream byte-for-byte with a ptrace reference run. It deliberately uses
-the fixture's root-only mode because portable DBI pthread startup remains a
-separate declared gap.
-These repeat-run results are compatibility evidence, not an L1/L2 assurance
-level: the runner disables timeslicing and does not pass `--strict --verify`.
+the fixture's root-only mode to keep that comparison independent of the
+pthread lifecycle row.
+Without `--strict`, repeat-run results are compatibility evidence rather than
+an assurance level. With `--strict`, they are L1 strict-mode evidence backed by
+three byte-identical runs. The runner disables PMU timeslicing for portability
+and does not pass `--verify`.
 
 Hermit's KVM root process enters the shared tool through
 `run_static_elf_with_tool::<Detcore>`, but child process and thread syscalls
@@ -128,7 +133,7 @@ Run DBI with the pinned DynamoRIO runtime and client built by Cargo:
 ```bash
 cargo build --release -p hermit
 python3 tests/backend-parity/run_matrix.py \
-    --hermit target/release/hermit --backend dbi --require-backend
+    --hermit target/release/hermit --backend dbi --strict --require-backend
 ```
 
 Run KVM on a host with read-write `/dev/kvm` access:

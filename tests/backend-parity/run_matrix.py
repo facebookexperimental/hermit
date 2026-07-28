@@ -246,11 +246,15 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
         raise MatrixError(f"matrix has no implementation for {name}") from error
 
 
-def backend_block(backend: str, hermit: Path) -> str | None:
+def backend_block(backend: str, hermit: Path, strict: bool) -> str | None:
     if backend == "dbi":
+        smoke_command = [str(hermit), "run", "--backend", "dbi"]
+        if strict:
+            smoke_command.append("--strict")
+        smoke_command.extend(["--", "/bin/true"])
         try:
             smoke = subprocess.run(
-                [str(hermit), "run", "--backend", "dbi", "--", "/bin/true"],
+                smoke_command,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 timeout=30,
@@ -269,11 +273,13 @@ def backend_block(backend: str, hermit: Path) -> str | None:
 
 
 def hermit_command(
-    hermit: Path, backend: str, guest: list[str], name: str
+    hermit: Path, backend: str, guest: list[str], name: str, strict: bool
 ) -> list[str]:
     command = [str(hermit), "run"]
     if backend != "ptrace":
         command.extend(["--backend", backend])
+    if strict:
+        command.append("--strict")
     command.extend(
         [
             "--base-env=minimal",
@@ -370,7 +376,7 @@ def root_random_output(stdout: bytes) -> bytes:
 
 
 def run_case(
-    hermit: Path, backend: str, name: str, fixtures: Fixtures
+    hermit: Path, backend: str, name: str, fixtures: Fixtures, strict: bool
 ) -> tuple[str, str, float]:
     guest, expected_status, expected_stdout = case_command(name, fixtures)
     if backend == "dbi" and name == "random_sources":
@@ -381,7 +387,9 @@ def run_case(
     started = time.monotonic()
     ptrace_random: bytes | None = None
     if backend == "dbi" and name == "random_sources":
-        reference = run_with_timeout(hermit_command(hermit, "ptrace", guest, name))
+        reference = run_with_timeout(
+            hermit_command(hermit, "ptrace", guest, name, strict)
+        )
         if reference is None:
             return "FAIL", "ptrace reference timed out", time.monotonic() - started
         if reference.returncode != expected_status:
@@ -393,7 +401,7 @@ def run_case(
             )
         ptrace_random = root_random_output(reference.stdout)
     for iteration in range(RUNS):
-        command = hermit_command(hermit, backend, guest, name)
+        command = hermit_command(hermit, backend, guest, name, strict)
         result = run_with_timeout(command)
         if result is None:
             return "FAIL", f"run {iteration + 1} timed out", time.monotonic() - started
@@ -508,6 +516,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="fail instead of reporting BLOCKED when a selected backend is unavailable",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="run every guest with hermit run --strict",
+    )
     return parser.parse_args()
 
 
@@ -531,7 +544,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="hermit-backend-parity-") as tempdir:
         fixtures = Fixtures(Path(tempdir))
         for backend in backends:
-            block = backend_block(backend, hermit)
+            block = backend_block(backend, hermit, args.strict)
             if block:
                 print(f"BLOCKED {backend}: {block}")
                 if args.require_backend:
@@ -556,7 +569,9 @@ def main() -> int:
                     )
                     continue
 
-                status, detail, duration = run_case(hermit, backend, name, fixtures)
+                status, detail, duration = run_case(
+                    hermit, backend, name, fixtures, args.strict
+                )
                 if expectation == "gap" and status == "PASS":
                     status = "XPASS"
                     detail = "candidate for promotion from gap to pass"
