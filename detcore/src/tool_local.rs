@@ -1043,6 +1043,36 @@ impl ProcessCpuTime {
     }
 }
 
+/// Guest-visible wall-clock calibration shared by every thread in a process.
+///
+/// Detcore's raw logical clock includes backend-specific implementation work
+/// (for example, ptrace RCBs versus DBI's syscall-only fallback). Calibrating
+/// the first observation after exec keeps that startup work out of the clock
+/// exposed to the new executable while preserving subsequent logical deltas.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct GuestClock {
+    origin: Option<LogicalTime>,
+    elapsed: LogicalTime,
+}
+
+impl GuestClock {
+    fn observe(&mut self, raw: LogicalTime, epoch: LogicalTime) -> LogicalTime {
+        let origin = *self.origin.get_or_insert(raw);
+        let candidate = if raw >= origin {
+            raw - origin
+        } else {
+            LogicalTime::ZERO
+        };
+        self.elapsed = self.elapsed.max(candidate);
+        epoch + self.elapsed
+    }
+
+    fn reset(&mut self) {
+        self.origin = None;
+        self.elapsed = LogicalTime::ZERO;
+    }
+}
+
 /// The Detcore per-thread state.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ThreadState<T> {
@@ -1109,6 +1139,10 @@ pub struct ThreadState<T> {
 
     /// Logical CPU accounting shared by all threads in this process.
     pub(crate) process_cpu_time: Arc<Mutex<ProcessCpuTime>>,
+
+    /// Wall-clock calibration shared by all threads in this process.
+    #[serde(default)]
+    pub(crate) guest_clock: Arc<Mutex<GuestClock>>,
 
     /// Parent process accounting notified when this process leader exits.
     pub(crate) parent_process_cpu_time: Option<Arc<Mutex<ProcessCpuTime>>>,
@@ -1226,6 +1260,20 @@ fn from_atflags(flags: AtFlags) -> OFlag {
 }
 
 impl<T> ThreadState<T> {
+    pub(crate) fn observe_guest_clock(&self, raw: LogicalTime, epoch: LogicalTime) -> LogicalTime {
+        self.guest_clock
+            .lock()
+            .expect("guest clock mutex poisoned")
+            .observe(raw, epoch)
+    }
+
+    pub(crate) fn reset_guest_clock(&self) {
+        self.guest_clock
+            .lock()
+            .expect("guest clock mutex poisoned")
+            .reset();
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1060): Review backend-stable child RNG reseeding.
     /// Replaces the host-TID-derived child streams with a backend-provided,
@@ -1346,6 +1394,7 @@ impl<T> ThreadState<T> {
             posix_timers: Arc::new(Mutex::new(PosixTimers::default())),
             resource_limits: Arc::new(Mutex::new(ResourceLimits::default())),
             process_cpu_time: Arc::new(Mutex::new(ProcessCpuTime::default())),
+            guest_clock: Arc::new(Mutex::new(GuestClock::default())),
             parent_process_cpu_time: None,
             last_accounted_user_time,
             last_accounted_system_time,
@@ -1736,6 +1785,44 @@ mod timeslice_tests {
     use std::num::NonZeroU64;
 
     use super::*;
+
+    #[test]
+    fn guest_clock_rebases_backend_startup_work_and_preserves_deltas() {
+        let epoch = LogicalTime::from_secs(1_000);
+        let mut ptrace = GuestClock::default();
+        let mut dbi = GuestClock::default();
+
+        assert_eq!(
+            ptrace.observe(epoch + Duration::from_nanos(41_000_000), epoch),
+            epoch
+        );
+        assert_eq!(
+            dbi.observe(epoch + Duration::from_nanos(822_000_000), epoch),
+            epoch
+        );
+        assert_eq!(
+            ptrace.observe(epoch + Duration::from_nanos(41_025_000), epoch),
+            epoch + Duration::from_nanos(25_000)
+        );
+        assert_eq!(
+            dbi.observe(epoch + Duration::from_nanos(822_025_000), epoch),
+            epoch + Duration::from_nanos(25_000)
+        );
+    }
+
+    #[test]
+    fn guest_clock_reset_starts_a_new_executable_at_epoch() {
+        let epoch = LogicalTime::from_secs(1_000);
+        let mut clock = GuestClock::default();
+        assert_eq!(clock.observe(epoch + Duration::from_secs(1), epoch), epoch);
+        assert_eq!(
+            clock.observe(epoch + Duration::from_secs(2), epoch),
+            epoch + Duration::from_secs(1)
+        );
+
+        clock.reset();
+        assert_eq!(clock.observe(epoch + Duration::from_secs(9), epoch), epoch);
+    }
 
     #[test]
     fn unparented_thread_recovers_process_memory_identity() {

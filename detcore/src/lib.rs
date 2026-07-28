@@ -1142,6 +1142,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     } else {
                         Arc::new(Mutex::new(ProcessCpuTime::default()))
                     },
+                    guest_clock: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                        Arc::clone(&pts.1.guest_clock)
+                    } else {
+                        Arc::new(Mutex::new(
+                            pts.1
+                                .guest_clock
+                                .lock()
+                                .expect("guest clock mutex poisoned")
+                                .clone(),
+                        ))
+                    },
                     parent_process_cpu_time: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
                         pts.1.parent_process_cpu_time.clone()
                     } else {
@@ -1238,6 +1249,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         guest.thread_state_mut().past_global_first_execve = true;
+        guest.thread_state().reset_guest_clock();
         tool_global::mark_past_first_execve(guest).await;
         self.pre_handler_hook(guest, false).await;
 
