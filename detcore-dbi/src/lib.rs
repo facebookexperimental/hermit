@@ -345,7 +345,7 @@ struct Runtime {
     config: Config,
     global: GlobalState,
     tool: OnceLock<Detcore>,
-    next_child_ordinal: AtomicI32,
+    next_child_ordinal: AtomicU64,
 }
 
 struct ThreadRuntime {
@@ -357,7 +357,7 @@ struct ThreadRuntime {
 
 struct PendingThreadParent {
     parent_tid: Tid,
-    child_tid: Tid,
+    rng_entropy: u128,
     state: DetcoreThreadState,
 }
 
@@ -405,20 +405,19 @@ fn current_runtime() -> Arc<Runtime> {
     )
 }
 
-// Linux host PIDs cannot exceed 1 << 22. Keep synthetic DetTids in a disjoint
-// range while leaving room for stable per-process child namespaces.
-const DBI_THREAD_TID_BASE: i32 = 1 << 28;
-const DBI_THREAD_CHILD_STRIDE: i32 = 1 << 11;
-
-// TODO-HUMAN-REVIEW(PR-1052): Review the DBI DetTid namespace for native child threads.
-fn dbi_child_det_tid(virtual_pid: i32, child_ordinal: i32) -> Option<Tid> {
-    if virtual_pid <= 0 || child_ordinal <= 0 || child_ordinal >= DBI_THREAD_CHILD_STRIDE {
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1060): Review the stable DBI child RNG identity encoding.
+fn dbi_child_rng_entropy(virtual_pid: i32, child_ordinal: u64) -> Option<u128> {
+    if virtual_pid <= 0 || child_ordinal == 0 {
         return None;
     }
-    DBI_THREAD_TID_BASE
-        .checked_add(virtual_pid.checked_mul(DBI_THREAD_CHILD_STRIDE)?)
-        .and_then(|base| base.checked_add(child_ordinal))
-        .map(Tid::from_raw)
+    Some(((virtual_pid as u32 as u128) << 64) | u128::from(child_ordinal))
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1060): Review preservation of physical DBI child TIDs.
+fn dbi_scheduler_tid(host_tid: i32) -> Option<Tid> {
+    (host_tid > 0).then(|| Tid::from_raw(host_tid))
 }
 
 fn update_memory_hash(sysnum: i64, args: &[u64], read_memory: MemoryReader) {
@@ -823,7 +822,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
                 config,
                 global,
                 tool: OnceLock::new(),
-                next_child_ordinal: AtomicI32::new(1),
+                next_child_ordinal: AtomicU64::new(1),
             }));
         }
         Arc::clone(slot.as_ref().expect("Detcore DBI runtime was initialized"))
@@ -878,7 +877,7 @@ pub extern "C" fn reverie_dbi_runtime_ready(image_generation: u64) -> i32 {
 /// DynamoRIO `context`, and callback pointers valid for this application.
 // TODO-HUMAN-REVIEW(PR-743): Review the native thread initialization ABI and state handoff.
 // TODO-HUMAN-REVIEW(PR-874): Review compatibility with Reverie's expanded DBI callback ABI.
-// TODO-HUMAN-REVIEW(PR-1052): Review preservation of stable DBI thread identity.
+// TODO-HUMAN-REVIEW(PR-1060): Review separation of host thread identity from stable RNG entropy.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
@@ -935,18 +934,21 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
         };
         Some(parent)
     };
-    let det_tid = parent
-        .as_ref()
-        .map(|parent| parent.child_tid)
-        .unwrap_or_else(|| Tid::from_raw(host_tid));
+    let Some(det_tid) = dbi_scheduler_tid(host_tid) else {
+        return -1;
+    };
     let parent_ref = parent
         .as_ref()
         .map(|parent| (parent.parent_tid, &parent.state));
     let det_pid = Pid::from_raw(det_tid.into());
     let host_pid = Pid::from_raw(host_pid);
+    let mut state = tool.init_thread_state(det_tid, parent_ref);
+    if let Some(parent) = &parent {
+        state.reseed_child_rngs(&parent.state, parent.rng_entropy);
+    }
     let mut thread = Box::new(ThreadRuntime {
         tid: det_pid,
-        state: tool.init_thread_state(det_tid, parent_ref),
+        state,
         initialized: false,
         post_exec_pending: host_tid == pid,
     });
@@ -980,7 +982,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
 /// live DynamoRIO context, and callback pointers must remain valid.
 // TODO-HUMAN-REVIEW(PR-743): Review parent-side native child registration.
 // TODO-HUMAN-REVIEW(PR-874): Review register-writer propagation to child registration.
-// TODO-HUMAN-REVIEW(PR-1052): Review deterministic child DetTid allocation.
+// TODO-HUMAN-REVIEW(PR-1060): Review deterministic child RNG identity allocation.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
@@ -1012,7 +1014,11 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
     parent.state.clone_flags = Some(flags);
     let parent_snapshot = parent.state.clone();
     let child_ordinal = runtime.next_child_ordinal.fetch_add(1, Ordering::SeqCst);
-    let Some(child_det_tid) = dbi_child_det_tid(virtual_pid, child_ordinal) else {
+    let Some(rng_entropy) = dbi_child_rng_entropy(virtual_pid, child_ordinal) else {
+        parent.state.clone_flags = None;
+        return -1;
+    };
+    let Some(child_scheduler_tid) = dbi_scheduler_tid(child_tid) else {
         parent.state.clone_flags = None;
         return -1;
     };
@@ -1023,7 +1029,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
             child_tid,
             PendingThreadParent {
                 parent_tid: Tid::from_raw(parent.tid.into()),
-                child_tid: child_det_tid,
+                rng_entropy,
                 state: parent_snapshot,
             },
         )
@@ -1049,7 +1055,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
         );
         run_ready(tool.register_external_child(
             &mut guest,
-            child_det_tid,
+            child_scheduler_tid,
             child_tid_addr as usize,
             flags,
         ));
@@ -1201,7 +1207,7 @@ unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut 
 #[unsafe(no_mangle)]
 // TODO-HUMAN-REVIEW(PR-587): Confirm native process dispatch pauses only exec.
 // TODO-HUMAN-REVIEW(PR-874): Review deferred-syscall and register-writer ABI compatibility.
-// TODO-HUMAN-REVIEW(PR-1052): Review mapped child DetTid syscall dispatch.
+// TODO-HUMAN-REVIEW(PR-1060): Review host child DetTid syscall dispatch.
 pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     context: *mut c_void,
     scratch: *mut c_void,
@@ -1483,23 +1489,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn child_dettid_namespace_is_stable_and_partitioned() {
-        let first: i32 = dbi_child_det_tid(3, 1).unwrap().into();
-        let second: i32 = dbi_child_det_tid(3, 2).unwrap().into();
-        let next_process: i32 = dbi_child_det_tid(4, 1).unwrap().into();
+    fn child_rng_entropy_is_stable_and_partitioned() {
+        let first = dbi_child_rng_entropy(3, 1).unwrap();
+        let second = dbi_child_rng_entropy(3, 2).unwrap();
+        let next_process = dbi_child_rng_entropy(4, 1).unwrap();
 
-        assert_eq!(first, DBI_THREAD_TID_BASE + 3 * DBI_THREAD_CHILD_STRIDE + 1);
+        assert_eq!(first, (3_u128 << 64) | 1);
         assert_ne!(first, second);
         assert_ne!(first, next_process);
-        assert!(first > (1 << 22));
     }
 
     #[test]
-    fn child_dettid_namespace_rejects_invalid_or_overflowing_ids() {
-        assert_eq!(dbi_child_det_tid(0, 1), None);
-        assert_eq!(dbi_child_det_tid(3, 0), None);
-        assert_eq!(dbi_child_det_tid(3, DBI_THREAD_CHILD_STRIDE), None);
-        assert_eq!(dbi_child_det_tid(i32::MAX, 1), None);
+    fn child_rng_entropy_has_no_small_thread_lifetime_limit() {
+        assert_eq!(dbi_child_rng_entropy(0, 1), None);
+        assert_eq!(dbi_child_rng_entropy(3, 0), None);
+        assert!(dbi_child_rng_entropy(3, 2_048).is_some());
+        assert!(dbi_child_rng_entropy(3, u64::MAX).is_some());
+        assert!(dbi_child_rng_entropy(i32::MAX, 1).is_some());
+    }
+
+    #[test]
+    fn child_scheduler_identity_remains_the_host_tid() {
+        let host_tid = 42_001;
+        let scheduler_tid: i32 = dbi_scheduler_tid(host_tid).unwrap().into();
+        assert_eq!(scheduler_tid, host_tid);
+        assert_eq!(dbi_scheduler_tid(0), None);
+        assert_eq!(dbi_scheduler_tid(-1), None);
     }
 
     #[test]

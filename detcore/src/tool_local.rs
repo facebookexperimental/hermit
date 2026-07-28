@@ -1221,6 +1221,15 @@ fn from_atflags(flags: AtFlags) -> OFlag {
 
 impl<T> ThreadState<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1060): Review backend-stable child RNG reseeding.
+    /// Replaces the host-TID-derived child streams with a backend-provided,
+    /// deterministic identity before the thread enters its start hook.
+    pub fn reseed_child_rngs(&mut self, parent: &Self, entropy: u128) {
+        self.prng = thread_rng_from_parent_entropy("USER RAND", &parent.prng, entropy);
+        self.chaos_prng = thread_rng_from_parent_entropy("CHAOSRAND", &parent.chaos_prng, entropy);
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-845): Review SaBRe orphan-thread memory identity recovery.
     /// Repair a thread state that a remote backend had to initialize without
     /// access to its parent's state.
@@ -1910,6 +1919,17 @@ mod timeslice_tests {
         let odd_values: [u64; 4] = std::array::from_fn(|_| odd.next_u64());
         assert_ne!(even_values, odd_values);
     }
+
+    #[test]
+    fn child_rng_uses_high_entropy_bits() {
+        let parent = Pcg64Mcg::seed_from_u64(0);
+        let mut low = thread_rng_from_parent_entropy("test", &parent, 1);
+        let mut high = thread_rng_from_parent_entropy("test", &parent, (1_u128 << 64) | 1);
+
+        let low_values: [u64; 4] = std::array::from_fn(|_| low.next_u64());
+        let high_values: [u64; 4] = std::array::from_fn(|_| high.next_u64());
+        assert_ne!(low_values, high_values);
+    }
 }
 
 /// Generate a new thread-local PRNG from the parent's PRNG state, mixing in the
@@ -1917,21 +1937,36 @@ mod timeslice_tests {
 /// threads get distinct PRNG states.
 // TODO-HUMAN-REVIEW(PR-1052): Review collision-free child-thread PRNG seeding.
 pub fn thread_rng_from_parent(msg: &str, parent: &Pcg64Mcg, child: DetTid) -> Pcg64Mcg {
+    thread_rng_from_parent_entropy_labeled(msg, parent, child.as_raw() as u32 as u128, "tid")
+}
+
+fn thread_rng_from_parent_entropy(msg: &str, parent: &Pcg64Mcg, entropy: u128) -> Pcg64Mcg {
+    thread_rng_from_parent_entropy_labeled(msg, parent, entropy, "entropy")
+}
+
+fn thread_rng_from_parent_entropy_labeled(
+    msg: &str,
+    parent: &Pcg64Mcg,
+    entropy: u128,
+    identity_kind: &str,
+) -> Pcg64Mcg {
     // Perform the default SeedableRng::from_seed procedure
     let mut seed = <Pcg64Mcg as SeedableRng>::Seed::default();
     // Generate a seed from the parent:
     parent.clone().fill_bytes(seed.as_mut());
     detlog!("RNG {} Generated new seed {:?}", msg, seed);
     // Pcg64Mcg forces its internal state odd, so seed bit zero carries no
-    // entropy. Mix the full thread ID into later bytes to preserve every bit.
-    let entropy = child.as_raw().to_le_bytes();
-    for (seed_byte, entropy_byte) in seed[4..8].iter_mut().zip(entropy) {
+    // entropy. DBI uses 96 bits for a stable process/thread sequence; mix those
+    // bytes after the forced bit while retaining the existing DetTid layout.
+    let entropy_bytes = entropy.to_le_bytes();
+    for (seed_byte, entropy_byte) in seed[4..].iter_mut().zip(entropy_bytes) {
         *seed_byte ^= entropy_byte;
     }
     detlog!(
-        "RNG {} seeding child tid {}: {:?} from parent {:?}",
+        "RNG {} seeding child {} {}: {:?} from parent {:?}",
         msg,
-        child,
+        identity_kind,
+        entropy,
         seed,
         parent
     );
