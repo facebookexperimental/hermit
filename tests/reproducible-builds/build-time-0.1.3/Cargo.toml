@@ -1,0 +1,11 @@
+[package]
+name = "hermit-repro-build-time"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+build-time = "=0.1.3"
+
+# Keep this fixture independent of Hermit's generated workspace manifest.
+[workspace]
