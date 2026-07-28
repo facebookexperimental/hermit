@@ -66,6 +66,8 @@ jobs:
         '
 
     - uses: actions/checkout@v4
+    - name: Trust self-hosted checkout path
+      run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
     - name: Initialize DAG runner
       run: timeout --foreground --kill-after=10s 60s git submodule update --init agent-utils
     - name: Require hardware capabilities
