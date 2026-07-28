@@ -184,6 +184,11 @@ elif ((PRIVILEGED_ONLY == 1)); then
     # The PMU memory-race fixtures perform tens of millions of instrumented
     # atomic operations. They need a longer per-family budget than portable CI.
     default_gate_timeout_seconds=3600
+elif ((SABRE_COMPAT_ONLY == 1)); then
+    # The focused SaBRe profile measures 198 programs and is documented as a
+    # 10-20 minute gate. Preserve headroom without bypassing the caller's
+    # VALIDATE_GATE_TIMEOUT_SECONDS override.
+    default_gate_timeout_seconds=1800
 fi
 GATE_TIMEOUT_SECONDS=${VALIDATE_GATE_TIMEOUT_SECONDS:-$default_gate_timeout_seconds}
 TIMEOUT_KILL_GRACE_SECONDS=${VALIDATE_TIMEOUT_KILL_GRACE_SECONDS:-5}
@@ -2458,6 +2463,13 @@ function run_strict_compatibility_envelope {
 
 function run_sabre_compatibility_envelope {
     local status=0
+
+    if ! "$ROOT_DIR/tests/compat/prepare_real_compat_fixtures.sh" \
+        "$REAL_COMPAT_FIXTURES" >>"$LOG_FILE" 2>&1; then
+        printf "❌ Unable to prepare functional compatibility fixtures (log: %s)\n" \
+            "$LOG_FILE"
+        return 1
+    fi
 
     COMPATIBILITY_MODE=sabre
     run_compatibility_corpus || status=$?
