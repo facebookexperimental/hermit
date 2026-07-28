@@ -47,6 +47,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::anyhow;
 use clap::ValueEnum;
@@ -1004,6 +1005,7 @@ async fn run_kvm(
     print_summary_to_json_file: &Option<PathBuf>,
     capture_output: bool,
 ) -> Result<Output, Error> {
+    let dispatch_started = Instant::now();
     let stdin = reserved_kvm_stdin()?;
     let requested_cwd = command
         .get_current_dir()
@@ -1068,6 +1070,7 @@ async fn run_kvm(
     let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
     let envp = envp.iter().map(String::as_str).collect::<Vec<_>>();
 
+    let setup_started = Instant::now();
     config.cpuid_virtualized_by_backend = true;
     config.backend_supports_madvise = false;
     // KVM does not enter Hermit's UTS namespace, so Detcore must provide the
@@ -1084,13 +1087,30 @@ async fn run_kvm(
         .set_random_seed(random_seed)
         .map_err(|error| anyhow!("failed to configure KVM guest random seed: {error}"))?;
 
+    let execution_started = Instant::now();
     let (global_state, code, stdout, stderr) = backend
         .run_static_elf_with_tool::<Detcore>(config, capture_output)
         .await
         .map_err(|error| anyhow!("KVM guest execution failed: {error}"))?;
+    let cleanup_started = Instant::now();
     global_state
         .clean_up(print_summary, print_summary_to_json_file)
         .await;
+    let teardown_started = Instant::now();
+    // Drop explicitly so the host's KVM VM teardown cost remains observable.
+    drop(backend);
+    let teardown_finished = Instant::now();
+
+    tracing::info!(
+        target: "hermit::kvm",
+        prepare_us = setup_started.duration_since(dispatch_started).as_micros() as u64,
+        setup_us = execution_started.duration_since(setup_started).as_micros() as u64,
+        execution_us = cleanup_started.duration_since(execution_started).as_micros() as u64,
+        cleanup_us = teardown_started.duration_since(cleanup_started).as_micros() as u64,
+        teardown_us = teardown_finished.duration_since(teardown_started).as_micros() as u64,
+        lifecycle_us = teardown_finished.duration_since(dispatch_started).as_micros() as u64,
+        "reverie-kvm lifecycle phase timings",
+    );
 
     if !capture_output {
         std::io::stdout().write_all(&stdout)?;
