@@ -15,6 +15,7 @@ qemu_bin=${QEMU_BIN:-}
 output_dir=${OUTPUT_DIR:-$repo_root/target/qemu-busybox}
 timeout_seconds=${DEMO_TIMEOUT_SECONDS:-300}
 verify=${VERIFY:-0}
+skid_margin=${SKID_MARGIN:-}
 
 if [[ -z $qemu_bin ]]; then
   qemu_bin=$(command -v qemu-system-x86_64 || true)
@@ -29,6 +30,8 @@ fi
 [[ $timeout_seconds =~ ^[1-9][0-9]*$ ]] || fail \
   "DEMO_TIMEOUT_SECONDS must be a positive integer"
 [[ $verify == 0 || $verify == 1 ]] || fail "VERIFY must be 0 or 1"
+[[ -z $skid_margin || $skid_margin =~ ^[1-9][0-9]*$ ]] || fail \
+  "SKID_MARGIN must be empty or a positive integer"
 
 for command in grep sha256sum tee timeout; do
   command -v "$command" >/dev/null || fail "$command is required"
@@ -54,6 +57,9 @@ guest_command=(
 )
 
 hermit_args=(--log info --log-file "$info_log" run --strict)
+if [[ -n $skid_margin ]]; then
+  hermit_args+=(--skid-margin="$skid_margin")
+fi
 if [[ $verify == 1 ]]; then
   hermit_args+=(--verify)
 fi
@@ -61,6 +67,7 @@ hermit_args+=(--)
 
 printf 'backend=ptrace level=%s log=info relaxations=none\n' \
   "$([[ $verify == 1 ]] && printf L2 || printf L1)"
+printf 'pmu_skid_margin=%s\n' "${skid_margin:-auto}"
 printf 'hermit=%s\nqemu=%s\nkernel=%s\ninitramfs=%s\nconsole=%s\ninfo=%s\nstderr=%s\n' \
   "$hermit_bin" "$qemu_bin" "$kernel_image" "$initramfs_image" \
   "$console_log" "$info_log" "$stderr_log"

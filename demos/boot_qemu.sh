@@ -27,6 +27,8 @@ fi
 exec "$qemu_bin" \
   -nodefaults \
   -nic none \
+  -machine q35 \
+  -cpu max \
   -m 256M \
   -accel 'tcg,thread=single' \
   -smp 1 \

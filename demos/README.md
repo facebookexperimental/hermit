@@ -50,6 +50,23 @@ threads execute under the strict ptrace scheduler. Hermit captures guest output
 internally in this mode so it can compare both executions; the verification
 summary is saved as `hermit-stderr.log` instead of replaying the serial console.
 
+The ptrace PMU skid margin is processor-specific. If Reverie reports that its
+perf counter exceeded the single-step target, measure the host and pass the
+reported recommendation explicitly:
+
+```bash
+cc -O2 -Wall -Wextra -Werror -std=gnu11 \
+  tests/util/pmu_skid.c -o /tmp/pmu-skid-test
+/tmp/pmu-skid-test --iterations 1000
+KERNEL_IMAGE=/path/to/bzImage VERIFY=1 SKID_MARGIN=66276 \
+  DEMO_TIMEOUT_SECONDS=1000 ./demos/05-qemu-busybox.sh
+```
+
+`SKID_MARGIN` forwards to Hermit's `--skid-margin`; it schedules the PMU
+overflow earlier and can add single-stepping overhead, but does not disable a
+determinism feature. Use the value measured on the host rather than copying the
+example blindly.
+
 ### Inputs and dependencies
 
 - x86-64 Linux with `qemu-system-x86_64`
@@ -58,11 +75,11 @@ summary is saved as `hermit-stderr.log` instead of replaying the serial console.
 - `cpio`, `file`, `find`, `gzip`, `install`, `sha256sum`, `sort`, `stat`,
   `tee`, `timeout`, `touch`, and `wc`
 
-The runner pins QEMU to one TCG vCPU and an instruction-derived clock, disables
-default devices and networking, and uses a VM-clock RTC. The initramfs builder
-fixes archive order, ownership, mtimes, cpio inode metadata, and the gzip
-header. A changing kernel, QEMU binary, BusyBox binary, host filesystem, or
-command line is a different experiment.
+The runner pins QEMU to the `q35` machine, `max` CPU, one TCG vCPU, and an
+instruction-derived clock. It disables default devices and networking and uses
+a VM-clock RTC. The initramfs builder fixes archive order, ownership, mtimes,
+cpio inode metadata, and the gzip header. A changing kernel, QEMU binary,
+BusyBox binary, host filesystem, or command line is a different experiment.
 
 ### Current boundary
 
@@ -89,11 +106,20 @@ and initramfs SHA-256
 `5515b4bced678c4d22ff54dafd1676f06b8e254f1656d2994018df24aa1e9698`.
 The guest reached `HERMIT-QEMU-BUSYBOX-PASS`, printed pi as `3.1415926532`,
 and powered down. With `boot_qemu.sh` as the guest entry point, Hermit scheduled
-six shell/QEMU threads for 32,161 turns over 146.181220200 virtual seconds. The
+six shell/QEMU threads for 38,088 turns over 181.740147850 virtual seconds. The
 documented `cargo run` form and the higher-level runner both produced console
-SHA-256 `0afde4df0d92cee9b5c331498fc4571fd8b53ef91f6fa34142fd8c7db5e1971a`.
+SHA-256 `f9a42014fac177223f08d5e722a8c6d88ae3b79eb0f1fab95bbdcb15487fbab3`.
+Pinning `q35` and `max` produced no QEMU stderr warnings.
 
-An L2 `VERIFY=1` run then completed both boots with the same inputs. Each
-normalized log contained 533,731 messages, including 375,853 DETLOG and
-scheduler COMMIT messages. Hermit reported no substantive differences and
-printed `Success: deterministic. Determinism verified.`
+On the measured AMD EPYC 9D85 host, the repository PMU benchmark observed a
+33,138-RCB maximum skid over 1,000 samples and recommended a 66,276-RCB margin.
+Current Reverie's 1,000-RCB processor default panicked during L2 Run 1. The
+measured override passed the prior failure point, but Run 1 had not completed
+after nine minutes and was stopped; current-main L2 verification therefore
+remains blocked on practical PMU calibration.
+
+Before the Reverie PMU-default update, an L2 `VERIFY=1` run completed both q35
+boots with the same inputs. Each normalized log contained 759,956 messages,
+including 548,255 DETLOG and scheduler COMMIT messages. Hermit reported no
+substantive differences and printed `Success: deterministic. Determinism
+verified.`
