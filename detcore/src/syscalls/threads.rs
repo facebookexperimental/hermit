@@ -269,6 +269,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         let flags = clone_family.flags(&guest.memory());
         let ctid = clone_family.child_tid(&guest.memory());
         let is_vfork = flags.contains(CloneFlags::CLONE_VFORK);
+        let parent_blocks_for_child = is_vfork
+            || (self.cfg.backend_serializes_fork_children
+                && !flags.contains(CloneFlags::CLONE_THREAD));
+        let backend_uninstrumented_thread =
+            flags.contains(CloneFlags::CLONE_THREAD) && !self.cfg.backend_dispatches_thread_tools;
 
         let ts = guest.thread_state_mut();
         assert_eq!(ts.clone_flags, None);
@@ -276,7 +281,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         ts.clone_flags = Some(flags);
 
         let parent_dettid = ts.dettid;
-        let child_priority_entropy = if is_vfork
+        let child_priority_entropy = if parent_blocks_for_child
             && self.cfg.chaos
             && self.cfg.replay_preemptions_from.is_none()
             && self.cfg.replay_schedule_from.is_none()
@@ -286,7 +291,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
-        if is_vfork {
+        if parent_blocks_for_child {
             ts.pending_vfork = Some(PendingVfork {
                 parent_dettid,
                 parent_detpid: ts.detpid.expect("detpid unset"),
@@ -297,27 +302,39 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         trace!("[detcore, dtid {}] parent invoking clone.", parent_dettid);
-        let vfork_op_id =
+        let blocking_child_op_id =
             ExternalOpId::new(parent_dettid, guest.thread_state().stats.syscall_count);
 
-        // The kernel blocks a CLONE_VFORK parent until its child execs or exits.
-        // Remove it from Detcore's run queue before entering that blocking call.
-        if is_vfork && self.cfg.sequentialize_threads {
+        // A CLONE_VFORK parent and a backend-serialized fork parent cannot
+        // resume until the child exits. Relinquish the parent's scheduler turn
+        // before entering either blocking operation.
+        if parent_blocks_for_child && self.cfg.sequentialize_threads {
             let mut resources = Resources::new(parent_dettid);
-            resources.insert(ResourceID::BlockingVfork(vfork_op_id), Permission::RW);
-            resources.fyi("clone_vfork");
+            resources.insert(
+                ResourceID::BlockingVfork(blocking_child_op_id),
+                Permission::RW,
+            );
+            resources.fyi(if is_vfork {
+                "clone_vfork"
+            } else {
+                "clone_serialized_child"
+            });
             resource_request(guest, resources).await;
         }
 
         let maybe_res = guest.inject(Syscall::from(clone_family)).await;
 
-        if is_vfork && self.cfg.sequentialize_threads {
+        if parent_blocks_for_child && self.cfg.sequentialize_threads {
             let mut resources = Resources::new(parent_dettid);
             resources.insert(
-                ResourceID::BlockedExternalContinue(vfork_op_id),
+                ResourceID::BlockedExternalContinue(blocking_child_op_id),
                 Permission::RW,
             );
-            resources.fyi("clone_vfork");
+            resources.fyi(if is_vfork {
+                "clone_vfork"
+            } else {
+                "clone_serialized_child"
+            });
             resource_request(guest, resources).await;
         }
 
@@ -329,7 +346,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         // Match ordinary clone: the parent consumes the priority entropy after
         // the child has inherited the parent state.
-        if is_vfork
+        if parent_blocks_for_child
             && self.cfg.chaos
             && self.cfg.replay_preemptions_from.is_none()
             && self.cfg.replay_schedule_from.is_none()
@@ -346,7 +363,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             child_dettid
         );
 
-        if !is_vfork {
+        if !parent_blocks_for_child && !backend_uninstrumented_thread {
             create_child_thread(guest, child_dettid, ctid, Some(flags)).await;
         }
 

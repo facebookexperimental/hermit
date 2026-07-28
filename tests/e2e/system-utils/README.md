@@ -37,12 +37,13 @@ claim that different backends expose byte-identical hardware descriptions.
 | `uname.sh` | pass | pass | |
 | `id.sh` | pass | pass | |
 | `groups.sh` | pass | pass | |
-| `proc.sh` | pass | gap | shell procfs probe stalls |
+| `proc.sh` | pass | pass | |
 | `du.sh` | pass | pass | |
 | `df.sh` | pass | pass | |
 
 Native observations are diagnostic. `/proc/uptime` is required to change
 between two uncontained probes, directly demonstrating the host nondeterminism
-that Hermit replaces with the canonical `120.00 0.00` value. Other utilities
+that Hermit replaces with a backend-local deterministic value: `120.00 0.00`
+through ptrace and `0.00 0.00` through the KVM personality. Other utilities
 report a native-output digest because identity, hardware topology, and
 filesystem geometry are host-specific even when stable during one short run.

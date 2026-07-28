@@ -88,6 +88,18 @@ pub struct Config {
     #[clap(skip)]
     pub cancel_killed_thread_rpcs: bool,
 
+    // TODO-HUMAN-REVIEW(PR-1013): Review backend child process execution ordering.
+    /// The execution backend completes forked process children before returning to the parent.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_serializes_fork_children: bool,
+
+    // TODO-HUMAN-REVIEW(PR-1013): Review backend thread callback coverage.
+    /// The execution backend dispatches cloned thread syscalls through this tool.
+    #[serde(default = "default_true")]
+    #[clap(skip = true)]
+    pub backend_dispatches_thread_tools: bool,
+
     /// Epoch of the logical time.
     ///
     /// This is the datetime from which all time and date modtimes begin and
@@ -985,6 +997,13 @@ mod tests {
         assert_eq!(DEFAULT_EPOCH_STR, "2026-01-01T00:00:00Z");
         let epoch = DEFAULT_EPOCH_STR.parse::<DateTime<Utc>>().unwrap();
         assert_eq!(epoch.timestamp(), 1_767_225_600);
+    }
+
+    #[test]
+    fn default_backend_capabilities_match_instrumented_backends() {
+        let config = Config::default();
+        assert!(!config.backend_serializes_fork_children);
+        assert!(config.backend_dispatches_thread_tools);
     }
 
     #[test]

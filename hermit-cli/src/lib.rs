@@ -1152,6 +1152,8 @@ fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig 
     config.detect_host_clock_futex_timeouts = backend == Backend::Sabre;
     config.syscall_clobbers_virtualized_by_backend = backend == Backend::Sabre;
     config.cancel_killed_thread_rpcs = backend == Backend::Sabre;
+    config.backend_serializes_fork_children = backend == Backend::Kvm;
+    config.backend_dispatches_thread_tools = backend != Backend::Kvm;
     config
 }
 
@@ -1608,12 +1610,24 @@ mod tests {
         assert!(sabre.detect_host_clock_futex_timeouts);
         assert!(sabre.syscall_clobbers_virtualized_by_backend);
         assert!(sabre.cancel_killed_thread_rpcs);
+        assert!(!sabre.backend_serializes_fork_children);
+        assert!(sabre.backend_dispatches_thread_tools);
         let ptrace = prepare_backend_config(config, Backend::Ptrace);
         assert!(!ptrace.discover_live_file_metadata);
         assert!(!ptrace.use_thread_local_clock_reads);
         assert!(!ptrace.detect_host_clock_futex_timeouts);
         assert!(!ptrace.syscall_clobbers_virtualized_by_backend);
         assert!(!ptrace.cancel_killed_thread_rpcs);
+        assert!(!ptrace.backend_serializes_fork_children);
+        assert!(ptrace.backend_dispatches_thread_tools);
+    }
+
+    #[test]
+    fn kvm_backend_config_marks_serialized_fork_children() {
+        let config = super::DetConfig::default();
+        let kvm = prepare_backend_config(config, Backend::Kvm);
+        assert!(kvm.backend_serializes_fork_children);
+        assert!(!kvm.backend_dispatches_thread_tools);
     }
 
     #[test]

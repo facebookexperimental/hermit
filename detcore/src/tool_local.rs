@@ -1079,8 +1079,9 @@ pub struct ThreadState<T> {
     /// Stated differently, this is just for message-passing communication.
     pub clone_flags: Option<CloneFlags>,
 
-    /// Registration metadata for a vfork child. The child consumes this in
-    /// `handle_thread_start`; the parent clears its copy when vfork returns.
+    /// Registration metadata for a child whose parent cannot resume until the
+    /// backend finishes the child. The child consumes this in
+    /// `handle_thread_start`; the parent clears its copy when injection returns.
     pub pending_vfork: Option<PendingVfork>,
 
     /// Shared file metadata among all threads in the same process.

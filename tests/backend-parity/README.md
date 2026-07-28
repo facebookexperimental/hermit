@@ -11,7 +11,7 @@ A `gap` must have a concrete implementation reason.
 | --- | ---: | ---: |
 | ptrace | 22/22 | 100% |
 | DBI | 21/22 | 95% |
-| KVM | 19/22 | 86% |
+| KVM | 20/22 | 91% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
 measures the backend's own Reverie suite. The 21/22 number above is deliberately
@@ -53,16 +53,16 @@ deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
-nineteen pairs, including its bounded cooperative pthread lifecycle, executable
-memory, deterministic memory-advice policy, clock, PID, and synthetic CPUID
-probes, plus file mutation, listmount refusal, process-memory read/write refusal,
-io_uring refusal with epoll fallback, repeatable heap growth, and private/shared
-anonymous mapping layouts. Its remaining gaps are file metadata, because its
-personality does not implement extended-attribute syscalls; the threaded
-random-source fixture, where child-thread syscalls bypass per-child Detcore
-callbacks and the KVM personality repeats fixed random streams across workers;
-and process wait accounting, because KVM child processes do not run through
-per-child Detcore callbacks.
+twenty pairs, including its bounded cooperative pthread lifecycle, executable
+memory, deterministic memory-advice policy, clock, PID, synthetic CPUID, and
+threaded random-source probes, plus file mutation, listmount refusal,
+process-memory read/write refusal, io_uring refusal with epoll fallback,
+repeatable heap growth, and private/shared anonymous mapping layouts. KVM
+thread syscalls bypass per-child Detcore callbacks, but the shared personality
+still provides distinct worker samples and byte-identical output across strict
+verification runs. Its remaining gaps are file metadata, because its personality
+does not implement extended-attribute syscalls, and process wait accounting,
+because KVM child processes do not run through per-child Detcore callbacks.
 
 ## Matrix
 
@@ -88,7 +88,7 @@ per-child Detcore callbacks.
 | `process_wait_lifecycle` | pass | pass | gap |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
-| `random_sources` | pass | pass | gap |
+| `random_sources` | pass | pass | pass |
 | `virtual_pid` | pass | pass | pass |
 
 The authoritative reasons live in `matrix.tsv`, next to the status they

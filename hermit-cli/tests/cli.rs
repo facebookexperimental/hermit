@@ -815,6 +815,43 @@ fn run_kvm_executes_dynamic_guest() {
 }
 
 #[test]
+fn run_kvm_awk_mincore_probe_terminates() {
+    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/awk").exists() {
+        return;
+    }
+
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--verify",
+        "--",
+        "/usr/bin/awk",
+        "BEGIN { print 42 }",
+    ];
+    let output = Command::new("timeout")
+        .args(["--kill-after", "2s", "20s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(args)
+        .output()
+        .expect("failed to run the KVM awk mincore regression");
+
+    assert_ne!(
+        output.status.code(),
+        Some(124),
+        "KVM awk mincore probe hung"
+    );
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "42\n");
+    assert!(
+        stderr(&output).contains("Success: KVM guest output and exit status matched."),
+        "KVM determinism confirmation missing:\n{}",
+        stderr(&output),
+    );
+}
+
+#[test]
 fn run_kvm_resolves_bare_program_from_guest_path() {
     if !Path::new("/dev/kvm").exists() {
         return;
@@ -886,7 +923,7 @@ fn run_kvm_bash_process_substitution_is_deterministic() {
 
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "paste-ok\n");
-    assert!(stderr(&output).contains("Determinism verified"));
+    assert!(stderr(&output).contains("Success: KVM guest output and exit status matched."));
 }
 
 #[test]
@@ -942,7 +979,7 @@ fn run_kvm_cpuid_policy_is_deterministic() {
         stdout(&output),
         "CPUID-SUCCESS vendor=GenuineIntel signature=00000663\n"
     );
-    assert!(stderr(&output).contains("Determinism verified"));
+    assert!(stderr(&output).contains("Success: KVM guest output and exit status matched."));
 }
 
 #[test]
@@ -1122,7 +1159,7 @@ fn run_kvm_verify_f_getfl_with_isolated_standard_input() {
 
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "fcntl-verify-ok\n");
-    assert!(stderr(&output).contains("Determinism verified"));
+    assert!(stderr(&output).contains("Success: KVM guest output and exit status matched."));
 }
 
 #[test]

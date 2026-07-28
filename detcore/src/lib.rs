@@ -1198,7 +1198,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
         assert_eq!(new_dettid, guest.thread_state().dettid);
 
-        if guest.is_root_thread() {
+        if let Some(vfork) = guest.thread_state_mut().pending_vfork.take() {
+            create_vfork_child_thread(guest, new_dettid, vfork).await;
+        } else if guest.is_root_thread() {
             // There is no fork event to catch for the root thread.
             debug!(
                 "[detcore, dtid {}] root thread start, scheduling.. full config:\n {:?}",
@@ -1206,8 +1208,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 guest.config()
             );
             create_child_thread(guest, new_dettid, 0, None).await;
-        } else if let Some(vfork) = guest.thread_state_mut().pending_vfork.take() {
-            create_vfork_child_thread(guest, new_dettid, vfork).await;
         }
 
         // Except for the root task, let's block until it's our turn to go:

@@ -207,11 +207,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// under the KVM backend on a code path the ptrace backend does not take, so
     /// leaving it unsupported aborts the guest under `--strict`.
     ///
-    /// Report every page in the requested range as resident. The residency
-    /// vector is only ever an advisory hint, so a constant answer preserves
-    /// correctness for well-behaved callers while being bitwise-identical across
-    /// runs. This matches the in-process KVM guest executor, which also reports
-    /// full residency.
+    /// Inject the call first so the backend preserves Linux pointer and mapping
+    /// validation, then report every mapped page as resident. The residency
+    /// vector is only an advisory hint, so replacing those nondeterministic bits
+    /// with a constant answer remains bitwise-identical across runs.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#775): Review deterministic mincore residency emulation.
     pub async fn handle_mincore<G: Guest<Self>>(
@@ -232,6 +231,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         start.checked_add(len).ok_or(Errno::EINVAL)?;
         let page_count = len.div_ceil(PAGE_SIZE);
         let vec = call.vec().ok_or(Errno::EFAULT)?;
+        guest.inject(syscalls::Syscall::from(call)).await?;
         let residency = vec![1u8; page_count];
         guest.memory().write_exact(vec, &residency)?;
         Ok(0)
