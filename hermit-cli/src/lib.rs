@@ -1074,11 +1074,15 @@ async fn run_kvm(
     // same synthetic identity that the namespace-backed ptrace path exposes.
     // TODO-HUMAN-REVIEW(PR-998): Review KVM UTS namespace parity.
     config.has_uts_namespace = false;
+    let random_seed = config.rng_seed();
     let mut backend = reverie_kvm::KvmBackend::new_with_stdin(KVM_GUEST_MEMORY_BYTES, stdin)
         .map_err(|error| anyhow!("failed to initialize reverie-kvm: {error}"))?;
     backend
         .install_static_elf_with_context(&image, &argv, &envp, &cwd)
         .map_err(|error| anyhow!("failed to load KVM guest executable {program:?}: {error}"))?;
+    backend
+        .set_random_seed(random_seed)
+        .map_err(|error| anyhow!("failed to configure KVM guest random seed: {error}"))?;
 
     let (global_state, code, stdout, stderr) = backend
         .run_static_elf_with_tool::<Detcore>(config, capture_output)

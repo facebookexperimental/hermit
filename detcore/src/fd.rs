@@ -114,6 +114,11 @@ struct OpenFileDescription {
     ///
     /// This should always be `Some` for regular files, as we eagerly populate it.
     stat: Option<DetStat>,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review canonical random-device cursor sharing.
+    /// Cursor into Hermit's backend-independent random-device byte stream.
+    #[serde(default)]
+    random_device_offset: u64,
     /// resource
     resource: Option<ResourceID>,
     /// Deterministic snapshot state for selected procfs files.
@@ -162,6 +167,7 @@ impl DetFd {
                 inode: None,
                 dirty: false,
                 stat: None,
+                random_device_offset: 0,
                 resource: None,
                 procfs: None,
                 socket_receive_timestamp: None,
@@ -278,6 +284,23 @@ impl DetFd {
     /// Resource attached to the open file description.
     pub fn resource(&self) -> Option<ResourceID> {
         self.description().resource.clone()
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review canonical random-device cursor sharing.
+    /// Return the cursor shared by aliases of this random-device open file.
+    pub(crate) fn random_device_offset(&self) -> u64 {
+        self.description().random_device_offset
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review canonical random-device cursor sharing.
+    /// Advance the cursor shared by aliases of this random-device open file.
+    pub(crate) fn advance_random_device_offset(&self, count: usize) {
+        let mut description = self.description();
+        description.random_device_offset = description
+            .random_device_offset
+            .saturating_add(count as u64);
     }
 
     /// Path used to open this file description, when it was observable.
@@ -531,6 +554,17 @@ mod tests {
             original.take_procfs(128).unwrap(),
             b"0\t0\t9223372036854775807\n"
         );
+    }
+
+    #[test]
+    fn random_device_offsets_are_shared_by_dup_aliases() {
+        let owner = DetTid::from_raw(10);
+        let original = DetFd::new(3, OFlag::empty(), FdType::Rng, OpenFileId::new(owner, 0));
+        let duplicate = original.clone().with_fd(4);
+
+        assert_eq!(original.random_device_offset(), 0);
+        duplicate.advance_random_device_offset(50);
+        assert_eq!(original.random_device_offset(), 50);
     }
 
     #[test]

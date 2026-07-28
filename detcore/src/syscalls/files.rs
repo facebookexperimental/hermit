@@ -447,9 +447,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(bytes.len() as i64);
         }
 
-        let (fd_type, resource) = guest
-            .thread_state_mut()
-            .with_detfd(call.fd(), |detfd| (detfd.ty(), detfd.resource()))?;
+        let (fd_type, resource, random_device_offset) =
+            guest.thread_state_mut().with_detfd(call.fd(), |detfd| {
+                (detfd.ty(), detfd.resource(), detfd.random_device_offset())
+            })?;
 
         if let Some(resource) = resource {
             let request = guest.thread_state().mk_request(resource, Permission::R);
@@ -460,7 +461,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             FdType::Rng => {
                 trace!("Read call RNG fd {}, simulating...", call.fd());
                 let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
-                let n = self.fill_random_bytes(guest, remote_buf, call.len(), "/dev/[u]random")?;
+                let n = self.fill_random_device_bytes(
+                    guest,
+                    remote_buf,
+                    call.len(),
+                    random_device_offset,
+                )?;
+                guest.thread_state().with_detfd(call.fd(), |detfd| {
+                    detfd.advance_random_device_offset(n);
+                })?;
                 return Ok(n as i64);
             }
             FdType::Regular => {
@@ -542,7 +551,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             FdType::Rng => (|| -> Result<i64, Error> {
                 trace!("Pread64 call RNG fd {}, simulating...", call.fd());
                 let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
-                let n = self.fill_random_bytes(guest, remote_buf, call.len(), "/dev/[u]random")?;
+                let n =
+                    self.fill_random_device_bytes(guest, remote_buf, call.len(), offset as u64)?;
                 Ok(n as i64)
             })(),
             FdType::Regular if guest.config().deterministic_io => {

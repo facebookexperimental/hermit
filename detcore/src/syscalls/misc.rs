@@ -195,6 +195,8 @@ fn validate_getrandom_flags(flags: usize) -> Result<(), Errno> {
 }
 
 const RANDOM_FILL_CHUNK_BYTES: usize = 4096;
+const RANDOM_DEVICE_BYTE_STRIDE: u8 = 73;
+const RANDOM_DEVICE_FIRST_BYTE: u8 = 41;
 // Linux's import_ubuf clamps getrandom requests to MAX_RW_COUNT on x86_64.
 const GETRANDOM_MAX_BYTES: usize = (i32::MAX as usize) & !4095;
 
@@ -230,6 +232,16 @@ fn write_random_chunk(
         Ok(second) => Ok(first + second),
         Err(_) => Ok(first),
     }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review the backend-independent random-device stream.
+fn canonical_random_device_byte(seed: u64, index: u64) -> u8 {
+    let seed_byte = seed.rotate_right(((index % 8) * 8) as u32) as u8;
+    (index as u8)
+        .wrapping_mul(RANDOM_DEVICE_BYTE_STRIDE)
+        .wrapping_add(RANDOM_DEVICE_FIRST_BYTE)
+        ^ seed_byte
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -482,6 +494,76 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(written)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review the backend-independent random-device stream.
+    /// Fill guest memory from the canonical stream used by every backend's
+    /// `/dev/random` and `/dev/urandom` virtualization.
+    pub(super) fn fill_random_device_bytes<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        remote_buf: AddrMut<u8>,
+        len: usize,
+        stream_offset: u64,
+    ) -> Result<usize, Error> {
+        let seed = guest.config().rng_seed();
+        let mut local_words = [0_u64; RANDOM_FILL_CHUNK_BYTES / std::mem::size_of::<u64>()];
+        let mut hasher = DefaultHasher::new();
+        let mut written = 0;
+
+        while written < len {
+            let remote_chunk = match remote_buf
+                .as_raw()
+                .checked_add(written)
+                .and_then(AddrMut::<u8>::from_raw)
+            {
+                Some(address) => address,
+                None if written == 0 => return Err(Errno::EFAULT.into()),
+                None => break,
+            };
+            let chunk_len = (len - written).min(RANDOM_FILL_CHUNK_BYTES);
+            let local_buf = unsafe {
+                std::slice::from_raw_parts_mut(local_words.as_mut_ptr().cast::<u8>(), chunk_len)
+            };
+            for (index, byte) in local_buf.iter_mut().enumerate() {
+                *byte = canonical_random_device_byte(
+                    seed,
+                    stream_offset
+                        .saturating_add(written as u64)
+                        .saturating_add(index as u64),
+                );
+            }
+            let n = match write_random_chunk(guest.memory(), remote_chunk, local_buf) {
+                Ok(n) => n,
+                Err(_) if written > 0 => break,
+                Err(error) => return Err(error.into()),
+            };
+            if n == 0 {
+                if written == 0 {
+                    return Err(Errno::EFAULT.into());
+                }
+                break;
+            }
+            if cfg!(debug_assertions) {
+                Hash::hash_slice(&local_buf[..n], &mut hasher);
+            }
+            written += n;
+            if n < chunk_len {
+                break;
+            }
+        }
+
+        if cfg!(debug_assertions) {
+            detlog!(
+                "[dtid {}] USER RAND [/dev/[u]random] Filled guest memory with {} canonical random bytes at offset {}, hash of bytes: {}",
+                guest.thread_state().dettid,
+                written,
+                stream_offset,
+                hasher.finish()
+            );
+        }
+        Ok(written)
+    }
+
     /// uname syscall
     pub async fn handle_uname<G: Guest<Self>>(
         &self,
@@ -717,6 +799,24 @@ mod tests {
     fn getrandom_caps_requests_at_linux_max_rw_count() {
         assert_eq!(getrandom_request_len(16), 16);
         assert_eq!(getrandom_request_len(usize::MAX), GETRANDOM_MAX_BYTES);
+    }
+
+    #[test]
+    fn canonical_random_device_stream_matches_kvm_root_contract() {
+        let first: Vec<_> = (0..8)
+            .map(|index| canonical_random_device_byte(0, index))
+            .collect();
+        assert_eq!(first, [41, 114, 187, 4, 77, 150, 223, 40]);
+
+        let continued: Vec<_> = (8..16)
+            .map(|index| canonical_random_device_byte(0, index))
+            .collect();
+        assert_eq!(continued, [113, 186, 3, 76, 149, 222, 39, 112]);
+
+        let seeded: Vec<_> = (0..16)
+            .map(|index| canonical_random_device_byte(17, index))
+            .collect();
+        assert_ne!(seeded, [first, continued].concat());
     }
 
     #[test]
