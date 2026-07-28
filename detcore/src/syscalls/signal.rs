@@ -240,6 +240,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         })
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1046): Review retrying interrupted signal-mask injections.
     /// rt_sigprocmask
     pub async fn handle_rt_sigprocmask<G: Guest<Self>>(
         &self,
@@ -247,7 +249,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::RtSigprocmask,
     ) -> Result<i64, Error> {
         if call.how() != libc::SIG_BLOCK && call.how() != libc::SIG_SETMASK {
-            Ok(guest.inject(call).await?)
+            Ok(guest.inject_with_retry(call).await?)
         } else if let Some(set) = call.set() {
             let memory = guest.memory();
             let mut stack = guest.stack().await;
@@ -260,11 +262,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .with_set(Some(new_set))
                 .with_oldset(call.oldset())
                 .with_sigsetsize(call.sigsetsize());
-            // Using inject (intead of tail_inject) here so that
-            // post_handler_hook can be called.
-            Ok(guest.inject(modified_call).await?)
+            // Keep returning to the handler so post_handler_hook can run, but
+            // do not expose a tracer preemption as ERESTARTSYS to the guest.
+            Ok(guest.inject_with_retry(modified_call).await?)
         } else {
-            Ok(guest.inject(call).await?)
+            Ok(guest.inject_with_retry(call).await?)
         }
     }
 
