@@ -15,19 +15,21 @@ timeout, build flags, observation policy, and exclusion reasons belong here.
 `ci/manifest-plan`.
 
 The 13 manifests separate calibrated blocking cells from discoverable migration
-inventory. CI currently shards the five calibrated workload buckets:
+inventory. CI currently shards six calibrated workload buckets:
 
 - `system-utils.toml`
 - `data-handling.toml`
 - `determinism-stress.toml`
 - `language-runtimes.toml`
 - `applications.toml`
+- `c-programs.toml` (eight calibrated Buck-derived C probes)
 
 Eight additional `*-c.toml`/`c-programs.toml` buckets make 180 more C guests
-centrally discoverable. Their ptrace verify cells are enabled for explicit
-mode selection but set `ci = false` until their standalone build and output
-contracts are calibrated. They still declare all five modes and every backend
-exclusion, so inventory does not silently imply support.
+centrally discoverable. Eight `c-programs.toml` entries have calibrated
+standalone build and output contracts and run in blocking CI; the remaining
+172 C guests keep `ci = false` until they are calibrated. Every entry still
+declares all five modes and every backend exclusion, so inventory does not
+silently imply support.
 
 ## Schema contract
 

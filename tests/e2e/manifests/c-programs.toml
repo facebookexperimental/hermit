@@ -74,7 +74,7 @@ program = "tests/c/add_key_enosys.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
+ci = true
 backends_enabled = ["ptrace", "dbi"]
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
@@ -291,7 +291,7 @@ program = "tests/c/cachestat_enosys.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
+ci = true
 backends_enabled = ["ptrace", "dbi"]
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
@@ -1183,7 +1183,7 @@ program = "tests/c/futex_waitv_enosys.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
+ci = true
 backends_enabled = ["ptrace", "dbi"]
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
@@ -1404,7 +1404,7 @@ program = "tests/c/get_robust_list_self.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
+ci = true
 backends_enabled = ["ptrace", "dbi"]
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
@@ -1855,7 +1855,7 @@ program = "tests/c/ioctl_fioclex.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
+ci = true
 backends_enabled = ["ptrace", "dbi"]
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
@@ -2083,7 +2083,7 @@ program = "tests/c/kcmp_eperm.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
+ci = true
 backends_enabled = ["ptrace", "dbi"]
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
@@ -2137,7 +2137,7 @@ program = "tests/c/keyctl_enosys.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
+ci = true
 backends_enabled = ["ptrace", "dbi"]
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
@@ -2246,7 +2246,7 @@ program = "tests/c/listmount_enosys.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
+ci = true
 backends_enabled = ["ptrace", "dbi"]
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"

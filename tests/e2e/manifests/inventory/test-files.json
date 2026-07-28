@@ -76,8 +76,8 @@
     {
       "path": "tests/c/add_key_enosys.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/add_key_enosys.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI)",
+      "why": "tests/c/add_key_enosys.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and DBI and runs in blocking GitHub CI"
     },
     {
       "path": "tests/c/adjtimex_deterministic.c",
@@ -100,8 +100,8 @@
     {
       "path": "tests/c/cachestat_enosys.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/cachestat_enosys.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI)",
+      "why": "tests/c/cachestat_enosys.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and DBI and runs in blocking GitHub CI"
     },
     {
       "path": "tests/c/clock_adjtime_deterministic.c",
@@ -202,8 +202,8 @@
     {
       "path": "tests/c/futex_waitv_enosys.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/futex_waitv_enosys.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI)",
+      "why": "tests/c/futex_waitv_enosys.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and DBI and runs in blocking GitHub CI"
     },
     {
       "path": "tests/c/futex_wake_enosys.c",
@@ -226,8 +226,8 @@
     {
       "path": "tests/c/get_robust_list_self.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/get_robust_list_self.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI)",
+      "why": "tests/c/get_robust_list_self.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and DBI and runs in blocking GitHub CI"
     },
     {
       "path": "tests/c/get_robust_list_thread.c",
@@ -280,8 +280,8 @@
     {
       "path": "tests/c/ioctl_fioclex.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/ioctl_fioclex.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI)",
+      "why": "tests/c/ioctl_fioclex.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and DBI and runs in blocking GitHub CI"
     },
     {
       "path": "tests/c/ioctl_siocethtool.c",
@@ -304,14 +304,14 @@
     {
       "path": "tests/c/kcmp_eperm.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/kcmp_eperm.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI)",
+      "why": "tests/c/kcmp_eperm.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and DBI and runs in blocking GitHub CI"
     },
     {
       "path": "tests/c/keyctl_enosys.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/keyctl_enosys.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI)",
+      "why": "tests/c/keyctl_enosys.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and DBI and runs in blocking GitHub CI"
     },
     {
       "path": "tests/c/keyctl_passthrough.c",
@@ -322,8 +322,8 @@
     {
       "path": "tests/c/listmount_enosys.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/listmount_enosys.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI)",
+      "why": "tests/c/listmount_enosys.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and DBI and runs in blocking GitHub CI"
     },
     {
       "path": "tests/c/liteinst_advanced.c",

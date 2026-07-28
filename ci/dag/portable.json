@@ -97,6 +97,16 @@
                "classification": "latency-bound"}
     },
     {
+      "group": "e2e", "job": "c_programs",
+      "desc": "Portable Buck-derived C guest verification",
+      "cmd": "./ci/test_harness.sh run --lane portable --category c-programs --results target/e2e/portable/c-programs/results.jsonl --junit target/e2e/portable/c-programs/junit.xml",
+      "deps": ["build.dbi_release", "e2e.metadata"],
+      "timeout": 600,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 60,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
       "group": "test", "job": "applications_e2e",
       "desc": "Run application end-to-end strict verification",
       "cmd": "./tests/e2e/lib/applications/run_all.sh",
