@@ -345,6 +345,7 @@ struct Runtime {
     config: Config,
     global: GlobalState,
     tool: OnceLock<Detcore>,
+    next_child_ordinal: AtomicI32,
 }
 
 struct ThreadRuntime {
@@ -352,6 +353,12 @@ struct ThreadRuntime {
     state: DetcoreThreadState,
     initialized: bool,
     post_exec_pending: bool,
+}
+
+struct PendingThreadParent {
+    parent_tid: Tid,
+    child_tid: Tid,
+    state: DetcoreThreadState,
 }
 
 // TODO-HUMAN-REVIEW(PR-743): Review the scratch ABI shared with DynamoRIO.
@@ -374,7 +381,7 @@ struct NativeThreadScratch {
 }
 
 static RUNTIME: LazyLock<RwLock<Option<Arc<Runtime>>>> = LazyLock::new(|| RwLock::new(None));
-static PENDING_THREAD_PARENTS: LazyLock<Mutex<HashMap<i32, (Tid, DetcoreThreadState)>>> =
+static PENDING_THREAD_PARENTS: LazyLock<Mutex<HashMap<i32, PendingThreadParent>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static READY_IMAGE: AtomicU64 = AtomicU64::new(0);
@@ -396,6 +403,22 @@ fn current_runtime() -> Arc<Runtime> {
             .as_ref()
             .expect("Detcore DBI runtime was not initialized"),
     )
+}
+
+// Linux host PIDs cannot exceed 1 << 22. Keep synthetic DetTids in a disjoint
+// range while leaving room for stable per-process child namespaces.
+const DBI_THREAD_TID_BASE: i32 = 1 << 28;
+const DBI_THREAD_CHILD_STRIDE: i32 = 1 << 11;
+
+// TODO-HUMAN-REVIEW(PR-1052): Review the DBI DetTid namespace for native child threads.
+fn dbi_child_det_tid(virtual_pid: i32, child_ordinal: i32) -> Option<Tid> {
+    if virtual_pid <= 0 || child_ordinal <= 0 || child_ordinal >= DBI_THREAD_CHILD_STRIDE {
+        return None;
+    }
+    DBI_THREAD_TID_BASE
+        .checked_add(virtual_pid.checked_mul(DBI_THREAD_CHILD_STRIDE)?)
+        .and_then(|base| base.checked_add(child_ordinal))
+        .map(Tid::from_raw)
 }
 
 fn update_memory_hash(sysnum: i64, args: &[u64], read_memory: MemoryReader) {
@@ -800,6 +823,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
                 config,
                 global,
                 tool: OnceLock::new(),
+                next_child_ordinal: AtomicI32::new(1),
             }));
         }
         Arc::clone(slot.as_ref().expect("Detcore DBI runtime was initialized"))
@@ -854,6 +878,7 @@ pub extern "C" fn reverie_dbi_runtime_ready(image_generation: u64) -> i32 {
 /// DynamoRIO `context`, and callback pointers valid for this application.
 // TODO-HUMAN-REVIEW(PR-743): Review the native thread initialization ABI and state handoff.
 // TODO-HUMAN-REVIEW(PR-874): Review compatibility with Reverie's expanded DBI callback ABI.
+// TODO-HUMAN-REVIEW(PR-1052): Review preservation of stable DBI thread identity.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
@@ -868,61 +893,68 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
     read_registers: RegisterReader,
     write_registers: RegisterWriter,
 ) -> i32 {
-    unsafe {
-        scratch
-            .cast::<NativeThreadScratch>()
-            .write(NativeThreadScratch {
-                branches: branch_count,
-                observed_syscalls: 0,
-                rewritten_syscalls: 0,
-                runtime_state: std::ptr::null_mut(),
-                pending_thread_clone: 0,
-                thread_clone_flags: 0,
-                thread_clone_ctid: 0,
-                pending_thread_start: 0,
-                virtual_pid: 0,
-                virtual_ppid: 0,
-                virtual_tid: 0,
-                pending_virtual_child: 0,
-                pending_clone_flags: 0,
-            });
-    }
     if defer_runtime != 0 {
+        unsafe {
+            scratch
+                .cast::<NativeThreadScratch>()
+                .write(NativeThreadScratch {
+                    branches: branch_count,
+                    observed_syscalls: 0,
+                    rewritten_syscalls: 0,
+                    runtime_state: std::ptr::null_mut(),
+                    pending_thread_clone: 0,
+                    thread_clone_flags: 0,
+                    thread_clone_ctid: 0,
+                    pending_thread_start: 0,
+                    virtual_pid: 0,
+                    virtual_ppid: 0,
+                    virtual_tid: 0,
+                    pending_virtual_child: 0,
+                    pending_clone_flags: 0,
+                });
+        }
         return 0;
     }
+    let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
 
+    let host_tid = tid;
+    let host_pid = pid;
     let runtime = current_runtime();
     let tool = runtime
         .tool
-        .get_or_init(|| Detcore::new(Pid::from_raw(pid), &runtime.config));
-    let parent = if tid == pid {
+        .get_or_init(|| Detcore::new(Pid::from_raw(host_pid), &runtime.config));
+    let parent = if host_tid == host_pid {
         None
     } else {
         let parent = PENDING_THREAD_PARENTS
             .lock()
             .expect("pending DBI thread parent lock poisoned")
-            .remove(&tid);
+            .remove(&host_tid);
         let Some(parent) = parent else {
             return 1;
         };
         Some(parent)
     };
+    let det_tid = parent
+        .as_ref()
+        .map(|parent| parent.child_tid)
+        .unwrap_or_else(|| Tid::from_raw(host_tid));
     let parent_ref = parent
         .as_ref()
-        .map(|(parent_tid, state)| (*parent_tid, state));
-    let tid = Pid::from_raw(tid);
-    let pid = Pid::from_raw(pid);
+        .map(|parent| (parent.parent_tid, &parent.state));
+    let det_pid = Pid::from_raw(det_tid.into());
+    let host_pid = Pid::from_raw(host_pid);
     let mut thread = Box::new(ThreadRuntime {
-        tid,
-        state: tool.init_thread_state(Tid::from_raw(tid.into()), parent_ref),
+        tid: det_pid,
+        state: tool.init_thread_state(det_tid, parent_ref),
         initialized: false,
-        post_exec_pending: tid == pid,
+        post_exec_pending: host_tid == pid,
     });
     if reverie_dbi::run_tool_thread_start(
         tool,
         context as usize,
-        tid,
-        pid,
+        det_pid,
+        host_pid,
         branch_count,
         &mut thread.state,
         &runtime.global,
@@ -936,9 +968,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
         return -1;
     }
     thread.initialized = true;
-    unsafe {
-        (*scratch.cast::<NativeThreadScratch>()).runtime_state = Box::into_raw(thread);
-    }
+    scratch.runtime_state = Box::into_raw(thread);
     0
 }
 
@@ -950,12 +980,13 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
 /// live DynamoRIO context, and callback pointers must remain valid.
 // TODO-HUMAN-REVIEW(PR-743): Review parent-side native child registration.
 // TODO-HUMAN-REVIEW(PR-874): Review register-writer propagation to child registration.
+// TODO-HUMAN-REVIEW(PR-1052): Review deterministic child DetTid allocation.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
     scratch: *mut c_void,
     context: *mut c_void,
-    parent_tid: i32,
+    _parent_tid: i32,
     pid: i32,
     branch_count: u64,
     child_tid: i32,
@@ -975,14 +1006,27 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
         .tool
         .get()
         .expect("Detcore DBI tool was initialized");
+    let virtual_pid = scratch.virtual_pid;
     let parent = unsafe { &mut *scratch.runtime_state };
     let flags = CloneFlags::from_bits_truncate(flags);
     parent.state.clone_flags = Some(flags);
     let parent_snapshot = parent.state.clone();
+    let child_ordinal = runtime.next_child_ordinal.fetch_add(1, Ordering::SeqCst);
+    let Some(child_det_tid) = dbi_child_det_tid(virtual_pid, child_ordinal) else {
+        parent.state.clone_flags = None;
+        return -1;
+    };
     if PENDING_THREAD_PARENTS
         .lock()
         .expect("pending DBI thread parent lock poisoned")
-        .insert(child_tid, (Tid::from_raw(parent_tid), parent_snapshot))
+        .insert(
+            child_tid,
+            PendingThreadParent {
+                parent_tid: Tid::from_raw(parent.tid.into()),
+                child_tid: child_det_tid,
+                state: parent_snapshot,
+            },
+        )
         .is_some()
     {
         parent.state.clone_flags = None;
@@ -1005,7 +1049,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
         );
         run_ready(tool.register_external_child(
             &mut guest,
-            Tid::from_raw(child_tid),
+            child_det_tid,
             child_tid_addr as usize,
             flags,
         ));
@@ -1157,6 +1201,7 @@ unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut 
 #[unsafe(no_mangle)]
 // TODO-HUMAN-REVIEW(PR-587): Confirm native process dispatch pauses only exec.
 // TODO-HUMAN-REVIEW(PR-874): Review deferred-syscall and register-writer ABI compatibility.
+// TODO-HUMAN-REVIEW(PR-1052): Review mapped child DetTid syscall dispatch.
 pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     context: *mut c_void,
     scratch: *mut c_void,
@@ -1244,11 +1289,11 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
     update_memory_hash(sysnum, raw_args, read_memory);
     let runtime = current_runtime();
-    let tool = runtime
-        .tool
-        .get_or_init(|| Detcore::new(Pid::from_raw(pid), &runtime.config));
     let tid = Pid::from_raw(tid);
     let pid = Pid::from_raw(pid);
+    let tool = runtime
+        .tool
+        .get_or_init(|| Detcore::new(pid, &runtime.config));
     let syscall = Syscall::from_raw(
         Sysno::from(sysnum as i32),
         SyscallArgs::new(
@@ -1283,6 +1328,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         }));
     }
     let thread = unsafe { &mut *scratch.runtime_state };
+    let det_tid = thread.tid;
     if !thread.initialized {
         if first_event {
             let message = b"detcore-dbi: running Detcore thread-start hook\n";
@@ -1291,7 +1337,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         if let Err(error) = reverie_dbi::run_tool_thread_start(
             tool,
             context as usize,
-            tid,
+            det_tid,
             pid,
             branches,
             &mut thread.state,
@@ -1315,7 +1361,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         if let Err(errno) = reverie_dbi::run_tool_post_exec(
             tool,
             context as usize,
-            tid,
+            det_tid,
             pid,
             branches,
             &mut thread.state,
@@ -1346,7 +1392,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     let mut outcome = reverie_dbi::run_tool_syscall(
         tool,
         context as usize,
-        tid,
+        det_tid,
         pid,
         branches,
         &mut thread.state,
@@ -1428,6 +1474,26 @@ pub unsafe extern "C" fn reverie_dbi_runtime_totals(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_dettid_namespace_is_stable_and_partitioned() {
+        let first: i32 = dbi_child_det_tid(3, 1).unwrap().into();
+        let second: i32 = dbi_child_det_tid(3, 2).unwrap().into();
+        let next_process: i32 = dbi_child_det_tid(4, 1).unwrap().into();
+
+        assert_eq!(first, DBI_THREAD_TID_BASE + 3 * DBI_THREAD_CHILD_STRIDE + 1);
+        assert_ne!(first, second);
+        assert_ne!(first, next_process);
+        assert!(first > (1 << 22));
+    }
+
+    #[test]
+    fn child_dettid_namespace_rejects_invalid_or_overflowing_ids() {
+        assert_eq!(dbi_child_det_tid(0, 1), None);
+        assert_eq!(dbi_child_det_tid(3, 0), None);
+        assert_eq!(dbi_child_det_tid(3, DBI_THREAD_CHILD_STRIDE), None);
+        assert_eq!(dbi_child_det_tid(i32::MAX, 1), None);
+    }
 
     #[test]
     fn queued_self_signals_use_host_identities() {

@@ -893,6 +893,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Handle a guest-internal poll call that can be fully determinized.
+    // TODO-HUMAN-REVIEW(PR-1052): Review scheduler fairness for zero-timeout poll.
     pub async fn handle_internal_poll<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -900,6 +901,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let timeout_millis = call.timeout();
         if timeout_millis == 0 {
+            // A nonblocking poll can still be the synchronization point in a
+            // userspace polling loop. Yield once before probing so backends
+            // without PMU preemption cannot let that loop starve its producer.
+            resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
             Ok(guest.inject(call).await?) // Already non-blocking.
         } else {
             let maybe_timeout_ns = millis_duration_to_absolute_timeout(guest, timeout_millis).await;
