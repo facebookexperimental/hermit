@@ -277,6 +277,32 @@ fn requires_native_lifecycle(sysnum: i64) -> bool {
     }
 }
 
+// TODO-HUMAN-REVIEW(PR-1038): Review DBI self-target queued-signal identity translation.
+fn translate_self_queued_signal_targets(
+    sysnum: i64,
+    args: &mut [u64; 6],
+    virtual_pid: i32,
+    virtual_tid: i32,
+    host_pid: i32,
+    host_tid: i32,
+) {
+    if virtual_pid <= 0 || virtual_tid <= 0 || host_pid <= 0 || host_tid <= 0 {
+        return;
+    }
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    if sysnum == libc::SYS_rt_tgsigqueueinfo
+        && args[0] as i32 == virtual_pid
+        && args[1] as i32 == virtual_tid
+    {
+        args[0] = host_pid as u32 as u64;
+        args[1] = host_tid as u32 as u64;
+    }
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    if sysnum == libc::SYS_rt_sigqueueinfo && args[0] as i32 == virtual_pid {
+        args[0] = host_pid as u32 as u64;
+    }
+}
+
 fn run_cooperative<F: Future<Output = ()>>(future: F, idle: Idler) {
     let mut future = pin!(future);
     let waker = Waker::noop();
@@ -1156,6 +1182,15 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     }
     let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
     let mut dispatch_args: [u64; 6] = raw_args.try_into().expect("six syscall arguments");
+    let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
+    translate_self_queued_signal_targets(
+        sysnum,
+        &mut dispatch_args,
+        scratch.virtual_pid,
+        scratch.virtual_tid,
+        pid,
+        tid,
+    );
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-849): Review fault-safe DBI getrandom writes.
     // Probe with deterministic zeros through process_vm_writev, then let Detcore overwrite
@@ -1230,7 +1265,6 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         let message = b"detcore-dbi: initializing Detcore thread state\n";
         unsafe { emit(message.as_ptr(), message.len()) };
     }
-    let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
     if scratch.runtime_state.is_null() {
         if first_event {
             let message = b"detcore-dbi: constructing Detcore thread state\n";
@@ -1394,6 +1428,53 @@ pub unsafe extern "C" fn reverie_dbi_runtime_totals(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_self_signals_use_host_identities() {
+        let mut targeted = [3, 4, libc::SIGUSR1 as u64, 0, 0, 0];
+        translate_self_queued_signal_targets(
+            libc::SYS_rt_tgsigqueueinfo,
+            &mut targeted,
+            3,
+            4,
+            10_003,
+            10_004,
+        );
+        assert_eq!(targeted[..2], [10_003, 10_004]);
+
+        let mut process = [3, libc::SIGUSR1 as u64, 0, 0, 0, 0];
+        translate_self_queued_signal_targets(
+            libc::SYS_rt_sigqueueinfo,
+            &mut process,
+            3,
+            4,
+            10_003,
+            10_004,
+        );
+        assert_eq!(process[0], 10_003);
+
+        let mut other = [5, 6, libc::SIGUSR1 as u64, 0, 0, 0];
+        translate_self_queued_signal_targets(
+            libc::SYS_rt_tgsigqueueinfo,
+            &mut other,
+            3,
+            4,
+            10_003,
+            10_004,
+        );
+        assert_eq!(other[..2], [5, 6]);
+
+        let mut process_group = [0, libc::SIGUSR1 as u64, 0, 0, 0, 0];
+        translate_self_queued_signal_targets(
+            libc::SYS_rt_sigqueueinfo,
+            &mut process_group,
+            0,
+            0,
+            10_003,
+            10_004,
+        );
+        assert_eq!(process_group[0], 0);
+    }
 
     static COPIED_CHILD_POLICY_TEST_LOCK: Mutex<()> = Mutex::new(());
 

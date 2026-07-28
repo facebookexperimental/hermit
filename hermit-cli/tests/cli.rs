@@ -27,6 +27,7 @@ static DBI_EXECVEAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBI_PID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBI_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBI_UNSUPPORTED_SYSCALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DBI_SELF_SIGQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 fn hermit(args: &[&str]) -> Output {
@@ -202,6 +203,33 @@ fn dbi_unsupported_syscall_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "DBI unsupported-syscall guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+// TODO-HUMAN-REVIEW(PR-1038): Review the DBI self-signal fixture build.
+fn dbi_self_sigqueue_guest() -> &'static Path {
+    DBI_SELF_SIGQUEUE_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbi-self-sigqueue");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create DBI self-sigqueue guest directory");
+        let guest = build_root.join("dbi_self_sigqueue");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/dbi_self_sigqueue.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile DBI self-sigqueue guest");
+        assert!(
+            output.status.success(),
+            "DBI self-sigqueue guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -649,6 +677,32 @@ fn run_dbi_forwards_detcore_info_logs() {
     assert!(
         stderr.contains("INFO detcore") && stderr.contains("DETLOG [syscall]"),
         "DBI did not forward the Detcore INFO syscall stream:\n{stderr}",
+    );
+}
+
+// TODO-HUMAN-REVIEW(PR-1038): Review DBI queued self-signal verification.
+#[test]
+fn run_dbi_verifies_queued_self_signals() {
+    let program = dbi_self_sigqueue_guest()
+        .to_str()
+        .expect("DBI self-sigqueue guest path should be UTF-8");
+    let args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--strict",
+        "--verify",
+        "--",
+        program,
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "dbi-self-sigqueue-ok\n");
+    assert!(
+        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
+        "DBI determinism confirmation missing:\n{}",
+        stderr(&output),
     );
 }
 
