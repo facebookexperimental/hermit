@@ -10,11 +10,11 @@ A `gap` must have a concrete implementation reason.
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
 | ptrace | 22/22 | 100% |
-| DBI | 22/22 | 100% |
+| DBI | 21/22 | 95% |
 | KVM | 20/22 | 91% |
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 22/22 number above is deliberately
+measures the backend's own Reverie suite. The 21/22 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
@@ -32,11 +32,11 @@ deterministic `ENOSYS` refusal for `MADV_DONTNEED`. The memory-layout rows check
 that `sbrk`/`brk` growth, ordered one-, two-, and three-page private anonymous
 mappings, and a written two-page shared anonymous mapping produce the same
 address sequences across repeated runs of each backend; they deliberately
-permit different backend-local layouts. Portable pthread startup now completes
-reliably through DynamoRIO and is enforced under strict mode alongside the
-other DBI contracts. The random-source row continues to use root-only mode so
-it measures the cross-backend root stream independently of the dedicated
-pthread lifecycle contract.
+permit different backend-local layouts. Portable pthread startup still exits
+or stalls intermittently during DynamoRIO startup, so it remains an explicit
+gap rather than making the strict CI gate flaky. The random-source row continues
+to use root-only mode so it measures the cross-backend root stream independently
+of the pthread lifecycle gap.
 
 The file-mutation row creates, writes, attempts allocation, truncates, renames,
 links, reads, and removes temporary files without exposing backend-specific metadata.
@@ -85,7 +85,7 @@ because KVM child processes do not run through per-child Detcore callbacks.
 | `heap_growth` | pass | pass | pass |
 | `anonymous_mmap_layout` | pass | pass | pass |
 | `shared_anonymous_mmap` | pass | pass | pass |
-| `pthread_lifecycle` | pass | pass | pass |
+| `pthread_lifecycle` | pass | gap | pass |
 | `process_wait_lifecycle` | pass | pass | gap |
 | `cpuid_policy` | pass | pass | pass |
 | `virtual_clock` | pass | pass | pass |
