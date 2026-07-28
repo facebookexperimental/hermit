@@ -94,8 +94,8 @@ enabled. Therefore:
    Counts may only move from failure/ignored to pass unless expansion is
    deliberately approved.
 
-The self-hosted CI job runs the ratchet after the regular Hermit integration
-suite when mount namespaces are available.
+Portable CI runs the ratchet after the regular Hermit integration suite when
+mount namespaces are available.
 
 ## Current Limitation
 

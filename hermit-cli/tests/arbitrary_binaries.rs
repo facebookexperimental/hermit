@@ -52,15 +52,6 @@ fn executable(candidates: &[&str]) -> Option<PathBuf> {
     })
 }
 
-fn rustup_tool(name: &str) -> Option<PathBuf> {
-    let output = Command::new("rustup").args(["which", name]).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
-    executable(&[path.to_str()?])
-}
-
 fn tool(
     name: &'static str,
     candidates: &[&str],
@@ -76,7 +67,7 @@ fn tool(
 }
 
 fn available_tools(allowed: &[&str]) -> Vec<Tool> {
-    let mut tools = [
+    [
         tool(
             "static_busybox",
             &["/usr/sbin/busybox", "/usr/bin/busybox", "/bin/busybox"],
@@ -86,8 +77,8 @@ fn available_tools(allowed: &[&str]) -> Vec<Tool> {
         tool(
             "dynamic_ls",
             &["/usr/bin/ls", "/bin/ls"],
-            &["--version"],
-            "ls",
+            &["-d", "/bin"],
+            "/bin",
         ),
         tool(
             "shell",
@@ -108,47 +99,34 @@ fn available_tools(allowed: &[&str]) -> Vec<Tool> {
             "node-ok",
         ),
         tool(
-            "java",
-            &["/usr/bin/java", "/usr/local/bin/java"],
-            &["-version"],
-            "version",
-        ),
-        tool(
             "go",
             &["/usr/bin/go", "/usr/local/bin/go"],
-            &["version"],
-            "go version",
+            &["env", "GOARCH"],
+            "amd64",
         ),
         tool(
             "curl",
             &["/usr/bin/curl", "/usr/local/bin/curl"],
-            &["--version"],
-            "curl",
-        ),
-        tool(
-            "wget",
-            &["/usr/bin/wget", "/usr/local/bin/wget"],
-            &["--version"],
-            "Wget",
+            &["--silent", "--show-error", "file:///etc/os-release"],
+            "NAME=",
         ),
         tool(
             "git",
             &["/usr/bin/git", "/bin/git"],
-            &["--version"],
-            "git version",
+            &["check-ref-format", "--normalize", "refs//heads//hermit-e2e"],
+            "refs/heads/hermit-e2e",
         ),
-        tool("gcc", &["/usr/bin/gcc", "/bin/gcc"], &["--version"], "gcc"),
         tool(
-            "make",
-            &["/usr/bin/make", "/bin/make"],
-            &["--version"],
-            "Make",
+            "gcc",
+            &["/usr/bin/gcc", "/bin/gcc"],
+            &["-print-file-name=libgcc.a"],
+            "libgcc.a",
         ),
         tool(
             "cmake",
             &["/usr/bin/cmake", "/usr/local/bin/cmake"],
-            &["--version"],
-            "cmake version",
+            &["-E", "echo", "cmake-ok"],
+            "cmake-ok",
         ),
         tool(
             "sqlite",
@@ -163,19 +141,7 @@ fn available_tools(allowed: &[&str]) -> Vec<Tool> {
     .into_iter()
     .flatten()
     .filter(|tool| allowed.contains(&tool.name))
-    .collect::<Vec<_>>();
-
-    if allowed.contains(&"cargo")
-        && let Some(path) = rustup_tool("cargo")
-    {
-        tools.push(Tool {
-            name: "cargo",
-            path,
-            args: &["--version"],
-            marker: "cargo",
-        });
-    }
-    tools
+    .collect()
 }
 
 fn bounded_command(program: &Path, timeout: Duration) -> Command {

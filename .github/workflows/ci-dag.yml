@@ -1,8 +1,8 @@
 name: CI (DAG runner, manual)
 
-# Manual entrypoint for comparing or debugging the hosted and hardware DAGs.
-# The required GitHub-hosted lane uses the same hosted DAG directly from
-# ci-hosted.yml; this workflow adds no per-PR load.
+# Manual entrypoint for comparing or debugging the portable and privileged DAGs.
+# The required GitHub-managed portable lane uses the same portable DAG directly from
+# ci-portable.yml; this workflow adds no per-PR load.
 on:
   workflow_dispatch:
     inputs:
@@ -10,8 +10,8 @@ on:
         description: Which validation lane to run as a DAG
         required: true
         type: choice
-        default: hosted
-        options: [hosted, hardware]
+        default: portable
+        options: [portable, privileged]
       max_mem:
         description: RAM budget for memory-aware -j (e.g. 32G); blank = one CPU per job
         required: false
@@ -27,9 +27,9 @@ env:
   STRICT_COMPAT_HERMIT_BIN: ${{ github.workspace }}/target/debug/hermit
 
 jobs:
-  dag-hosted:
-    name: DAG lane (GitHub-hosted)
-    if: ${{ inputs.lane == 'hosted' }}
+  dag-portable:
+    name: DAG lane (GitHub-managed portable)
+    if: ${{ inputs.lane == 'portable' }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -42,7 +42,7 @@ jobs:
           cache: false
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: hosted-validation
+          shared-key: portable-validation
           cache-on-failure: true
       - name: Dependencies
         run: |
@@ -60,13 +60,13 @@ jobs:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
       - name: Rust components
         run: rustup component add clippy rustfmt
-      - name: Run hosted lane as a DAG
-        run: ci/run-dag.sh hosted ${{ inputs.max_mem != '' && format('--max-mem {0}', inputs.max_mem) || '' }} -v
+      - name: Run portable lane as a DAG
+        run: ci/run-dag.sh portable ${{ inputs.max_mem != '' && format('--max-mem {0}', inputs.max_mem) || '' }} -v
 
-  dag-hardware:
-    name: DAG lane (self-hosted)
-    if: ${{ inputs.lane == 'hardware' && github.repository == 'rrnewton/hermit' }}
-    runs-on: [self-hosted, Linux, X64, hermit, pmu, pmu-serial]
+  dag-privileged:
+    name: DAG lane (privileged)
+    if: ${{ inputs.lane == 'privileged' && github.repository == 'rrnewton/hermit' }}
+    runs-on: [Linux, X64, hermit, pmu, pmu-serial]
     timeout-minutes: 240
     env:
       DETCORE_TEST_RUST_LOG: "off"
@@ -84,7 +84,7 @@ jobs:
           go-version: stable
           cache: false
       # PMU access is a single serialized host resource; hold the same lock the
-      # validate.sh self-hosted lane uses. The DAG's own {"pmu": 1} cap keeps
+      # validate.sh privileged lane uses. The DAG's own {"pmu": 1} cap keeps
       # gates one-at-a-time within this run.
-      - name: Run hardware lane as a DAG
-        run: flock /tmp/hermit-self-hosted-pmu.lock ci/run-dag.sh hardware -j 2 -v
+      - name: Run privileged lane as a DAG
+        run: flock /tmp/hermit-privileged-pmu.lock ci/run-dag.sh privileged -j 2 -v

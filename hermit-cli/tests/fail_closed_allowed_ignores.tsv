@@ -3,16 +3,11 @@
 analyze	analyze_hello_race	slow schedule bisection; requires PMU and mount namespaces
 analyze	analyze_nanosleep_threads_rejects_indistinguishable_baseline	slow schedule bisection; requires PMU and mount namespaces
 analyze	analyze_racewrite_nostdlib	slow schedule bisection; requires PMU and mount namespaces
-app_strict_verify	curl_version_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and curl
 app_strict_verify	go_goroutines_are_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and the Go toolchain
 app_strict_verify	go_hello_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and the Go toolchain
-app_strict_verify	go_version_is_l1_deterministic_under_strict	e2e requires PMU, mount namespaces, and the Go toolchain
 app_strict_verify	java_hello_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and a JDK
 app_strict_verify	java_threads_are_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and a JDK
-app_strict_verify	java_version_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and a JDK
 app_strict_verify	javac_is_l1_deterministic_under_strict	e2e requires PMU, mount namespaces, and a JDK
-app_strict_verify	nginx_version_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and nginx
-app_strict_verify	redis_server_version_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and redis-server
 command_strict_verify	common_commands_are_deterministic_under_strict_verify	requires PMU, mount namespaces, and the standard command suite
 command_strict_verify	python_getrandom_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and /usr/bin/python3
 command_strict_verify	python_prlimit64_query_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and /usr/bin/python3

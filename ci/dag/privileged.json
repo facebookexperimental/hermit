@@ -1,0 +1,56 @@
+{
+  "resource_caps": {"pmu": 1, "kvm": 1},
+  "mem_cap_factor": 1.25,
+  "mem_cap_floor_bytes": 8589934592,
+  "outer_mem_safety_factor": 1.0,
+  "default_step_timeout": 120,
+  "steps": [
+    {
+      "group": "build", "job": "privileged_tests",
+      "desc": "Build Hermit and the focused test binaries used by the privileged lane",
+      "cmd": "cargo build -p hermit --bin hermit && cargo test -p detcore --test tests_misc --no-run",
+      "timeout": 210,
+      "hint": {"est_duration_s": 150, "rss_baseline_bytes": 5368709120,
+               "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
+    },
+    {
+      "group": "cpuid", "job": "faulting",
+      "desc": "CPUID-faulting smoke: Detcore masks host RDRAND/RDSEED feature bits",
+      "cmd": "timeout 30 cargo test -p detcore --test tests_misc rdrand_rdseed_is_masked -- --exact",
+      "deps": ["build.privileged_tests"],
+      "timeout": 40,
+      "hint": {"est_duration_s": 15,
+               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "classification": "cpu-bound"}
+    },
+    {
+      "group": "pmu", "job": "preemption",
+      "desc": "PMU smoke: retired-conditional-branch overflow delivery and skid measurement",
+      "cmd": "cc -O2 -Wall -Wextra -Werror tests/util/pmu_skid.c -o target/ci-pmu-skid && timeout 20 target/ci-pmu-skid --iterations 16 --period 100000",
+      "deps": ["build.privileged_tests"],
+      "timeout": 30,
+      "hint": {"resources": {"pmu": 1}, "est_duration_s": 5,
+               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "classification": "cpu-bound"}
+    },
+    {
+      "group": "e2e", "job": "metadata",
+      "desc": "Validate multi-mode E2E metadata and required-cell plan",
+      "cmd": "./ci/test_harness.sh validate",
+      "timeout": 60,
+      "hint": {"est_duration_s": 5,
+               "rss_baseline_bytes": 268435456, "hard_mem_max_bytes": 1073741824,
+               "classification": "light"}
+    },
+    {
+      "group": "e2e", "job": "applications",
+      "desc": "Privileged KVM shell and environment verification",
+      "cmd": "./ci/test_harness.sh run --lane privileged --category applications --results target/e2e/privileged/applications/results.jsonl --junit target/e2e/privileged/applications/junit.xml",
+      "deps": ["build.privileged_tests", "e2e.metadata"],
+      "timeout": 60,
+      "hint": {"resources": {"kvm": 1}, "est_duration_s": 15,
+               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "classification": "latency-bound"}
+    }
+  ]
+}

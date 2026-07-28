@@ -61,8 +61,8 @@ Override the binary with `HERMIT_BIN=/path/to/hermit`.
    GDB (`--gdbex`). An external-LLDB-vs-replay test needs a future
    `hermit replay --gdbserver` (serve-and-wait) flag.
 
-## CI
+## Validation
 
-Wired into the self-hosted `hardware` job in
-`.github/workflows/ci-selfhosted.yml` (the runner with PMU + user namespaces where Hermit integration tests already run),
-gated on mount/user-namespace availability.
+The debugger suite is intentionally outside the sub-five-minute privileged CI
+sentinel. Run it in explicit full or scheduled validation on a host with the
+required mount/user namespaces and debugger tools.

@@ -7,7 +7,7 @@ on:
   merge_group:
     types: [checks_requested]
   workflow_run:
-    workflows: ["CI (GitHub-hosted)"]
+    workflows: ["CI (GitHub-managed portable)"]
     types: [completed]
   workflow_dispatch:
     inputs:
@@ -19,14 +19,14 @@ on:
         type: string
 
 # This lightweight required check accepts an exact PR head after the repository
-# GitHub-hosted CI workflow succeeds or after a fully green local validate.sh
-# run applies the locally-validated label. Self-hosted CI is an independent
+# GitHub-managed portable CI workflow succeeds or after a fully green local validate.sh
+# run applies the locally-validated label. Privileged CI is an independent
 # bonus signal. Merge-group checks inspect their constituent PR heads instead of
 # trusting the synthetic queue commit.
 #
 # The gate is fork-only because facebookexperimental/hermit has no access to the
-# fork self-hosted runners and fork pull requests receive a read-only token in
-# that repository. Upstream relies on the GitHub-hosted Rust job instead.
+# fork privileged runners and fork pull requests receive a read-only token in
+# that repository. Upstream relies on the GitHub-managed portable Rust job instead.
 permissions:
   actions: read
   contents: read
@@ -201,7 +201,7 @@ jobs:
             fi
 
             runs="$(
-              gh api "repos/${REPO}/actions/workflows/ci-hosted.yml/runs?head_sha=${head_sha}&per_page=100"
+              gh api "repos/${REPO}/actions/workflows/ci-portable.yml/runs?head_sha=${head_sha}&per_page=100"
             )"
             run="$(jq --arg sha "$head_sha" '
               [.workflow_runs[] | select(.head_sha == $sha)]
@@ -213,9 +213,9 @@ jobs:
             url="$(jq -r '.html_url // ""' <<< "$run")"
 
             if [ "$status:$conclusion" = completed:success ]; then
-              echo "GitHub-hosted CI passed for PR #${pr_number} at $head_sha: $url"
+              echo "GitHub-managed portable CI passed for PR #${pr_number} at $head_sha: $url"
             else
-              echo "::error::GitHub-hosted CI for PR #${pr_number} at $head_sha is $status/${conclusion:-none}: ${url:-no run URL}."
+              echo "::error::GitHub-managed portable CI for PR #${pr_number} at $head_sha is $status/${conclusion:-none}: ${url:-no run URL}."
               failed=1
             fi
           done < <(jq -r '

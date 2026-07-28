@@ -64,7 +64,7 @@ Before landing a key change:
 - `locally-validated` — the legitimate substitute for green CI when the CI lane
   cannot go green for environmental reasons: run the checks the PR can affect
   locally, prove any residual failure is baseline/environmental, then label +
-  merge on real GitHub-hosted green where possible (avoid `--admin` over red CI).
+  merge on real GitHub-managed portable green where possible (avoid `--admin` over red CI).
 
 ## 3. Code markers
 
@@ -84,12 +84,12 @@ novel), not blanketed across untouched code.
 Once a key change survives adversarial review and CI is green, **land it** —
 squash-merge to `main`. Do not wait for a human.
 
-- Merge gate = **GitHub-hosted "Regular tests" green**. The self-hosted
+- Merge gate = **GitHub-managed portable "Regular tests" green**. The privileged
   "Host-dependent tests" lane is environmental and non-required (`main` is
-  unprotected); a red self-hosted lane does not block landing.
-- Prefer merging on real GitHub-hosted green. When using `--admin`, it should
-  only be bypassing the known-environmental self-hosted lane, not a genuine
-  red on GitHub-hosted or on a meaningful check.
+  unprotected); a red privileged lane does not block landing.
+- Prefer merging on real GitHub-managed portable green. When using `--admin`, it should
+  only be bypassing the known-environmental privileged lane, not a genuine
+  red on GitHub-managed portable or on a meaningful check.
 - After landing, rebase dependent PRs onto the new `main` (see the PR DAG
   section of [human-review-first](../human-review-first/SKILL.md)).
 

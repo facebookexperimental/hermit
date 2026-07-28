@@ -2,7 +2,7 @@
 # Columns: target<TAB>test<TAB>class<TAB>first observed blocker
 # Removing a row enables that test in the ratchet; adding a row requires debt review.
 fp_reduction_determinism	strict_parallel_fp_reduction_is_bit_identical	host-pmu-bug	CI runner AMD errata AmdSpecLockMapShouldBeDisabled causes strict-mode SIGSEGV
-hashseed_determinism	python_set_order_nondeterministic_natively_deterministic_under_hermit	host-pmu-bug	CI-runner SIGSEGV in reverie clone_with_stack::callback under --strict; not reproducible locally (passes on devserver kernel 6.17, standalone x15, and under CI-like unshare namespaces); same self-hosted-runner class as AmdSpecLockMapShouldBeDisabled above
-hermit_modes	default_cargo_futex_and_print	runner-scheduler-hang	self-hosted runner blocked in futex guest for over 18 minutes; exact local fail-closed test passes in 5.74s
+hashseed_determinism	python_set_order_nondeterministic_natively_deterministic_under_hermit	host-pmu-bug	CI-runner SIGSEGV in reverie clone_with_stack::callback under --strict; not reproducible locally (passes on devserver kernel 6.17, standalone x15, and under CI-like unshare namespaces); same privileged-runner class as AmdSpecLockMapShouldBeDisabled above
+hermit_modes	default_cargo_futex_and_print	runner-scheduler-hang	privileged runner blocked in futex guest for over 18 minutes; exact local fail-closed test passes in 5.74s
 signal_determinism	blocking_sigsuspend_releases_the_scheduler	scheduler-hang	rt_sigsuspend does not wake under fail-closed mode
 sqlite_veryquick	sqlite_fast_subset_is_deterministic_under_strict_hermit	unsupported-syscall	Fchown

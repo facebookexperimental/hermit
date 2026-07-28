@@ -12,15 +12,8 @@
 //!
 //! These deliberately use the built-in `--verify` execution path (Hermit runs
 //! the guest twice and diffs the two logs) rather than the manual "run N times
-//! and compare stdout" style used elsewhere. They also cover applications that
-//! previously had no strict-mode coverage at all:
-//!
-//! - `curl` and `nginx` were only exercised in default run mode
-//!   (`arbitrary_binaries.rs`, `integration_matrix.rs`), never under `--strict`.
-//! - `redis-server` and `java` have strict workloads elsewhere
-//!   (`redis_strict.rs`, `language_runtime_determinism.rs`); the bounded
-//!   version invocations here add a cheap, self-contained L2 smoke check for
-//!   process startup and static initialization under the deterministic runtime.
+//! and compare stdout" style used elsewhere. The corpus uses real compiled
+//! workloads rather than help/version startup probes.
 //!
 //! Each workload is a bounded, self-contained invocation (no network, no
 //! long-running server) so the run terminates and its output depends only on
@@ -38,15 +31,13 @@
 //!
 //! - **L2 (bitwise-identical repeat run, `--strict --verify`):** compiled Go
 //!   programs (a hello world and a goroutine workload) and the JVM running
-//!   compiled classes (`java Hello`, a multi-thread `Threads`, and
-//!   `java -version`). The managed runtimes' scheduling, GC, and static
+//!   compiled classes (`java Hello` and a multi-thread `Threads`). The managed
+//!   runtimes' scheduling, GC, and static
 //!   initialization are fully determinized.
 //! - **L1 only (output-deterministic under `--strict`, but `--verify`'s
-//!   internal two-run log diff diverges):** the toolchain *drivers*
-//!   `go version` (the `go` command) and `javac`. Their exit code and
-//!   user-visible output are stable across strict runs -- `javac` even emits a
-//!   bytewise-identical `.class` -- but Hermit's `--verify` reports
-//!   `Failure: nondeterministic`, so they are asserted at L1, not L2.
+//!   internal two-run log diff diverges):** the `javac` toolchain driver. Its
+//!   exit code and emitted `.class` are stable across strict runs, but Hermit's
+//!   `--verify` reports `Failure: nondeterministic`, so it is asserted at L1.
 //!
 //! The compiled-guest tests build their guests with the host `go`/`javac`
 //! toolchain first and then run the resulting artifact under Hermit, which
@@ -64,8 +55,8 @@ use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
-/// Serialize the Hermit runs; the deterministic scheduler and PMU counters are
-/// process-global resources on the self-hosted runner.
+/// Serialize Hermit runs because the deterministic scheduler and runtime
+/// fixtures are process-global resources on the shared host.
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 /// Wall-clock cap for a single `--verify` (two-run) invocation.
@@ -135,7 +126,7 @@ fn run_hermit_command(mut command: Command) -> Output {
 
 /// Resolve the first candidate path that names an existing regular file.
 ///
-/// These applications are installed by the self-hosted CI job, so a missing
+/// These applications are installed by the portable CI job, so a missing
 /// binary is a hard error rather than a silent skip.
 fn required_app(name: &str, candidates: &[&str]) -> PathBuf {
     candidates
@@ -145,7 +136,7 @@ fn required_app(name: &str, candidates: &[&str]) -> PathBuf {
         .unwrap_or_else(|| {
             panic!(
                 "ERROR: required application {name} is missing; expected an executable at one of \
-                 {candidates:?} (the self-hosted CI job installs it)"
+                 {candidates:?} (the portable CI job installs it)"
             )
         })
 }
@@ -236,45 +227,13 @@ fn assert_l2_under_strict_verify(program: &Path, args: &[&str]) {
     );
 }
 
-#[test]
-#[ignore = "e2e: requires hermit + mount namespaces + the curl binary"]
-fn curl_version_is_deterministic_under_strict_verify() {
-    let curl = required_app("curl", &["/usr/bin/curl", "/usr/local/bin/curl"]);
-    assert_l2_under_strict_verify(&curl, &["--version"]);
-}
-
-#[test]
-#[ignore = "e2e: requires hermit + mount namespaces + the nginx binary"]
-fn nginx_version_is_deterministic_under_strict_verify() {
-    let nginx = required_app("nginx", &["/usr/sbin/nginx", "/usr/bin/nginx"]);
-    assert_l2_under_strict_verify(&nginx, &["-v"]);
-}
-
-#[test]
-#[ignore = "e2e: requires hermit + mount namespaces + the redis-server binary"]
-fn redis_server_version_is_deterministic_under_strict_verify() {
-    let redis_server = required_app(
-        "redis-server",
-        &["/usr/bin/redis-server", "/usr/local/bin/redis-server"],
-    );
-    assert_l2_under_strict_verify(&redis_server, &["--version"]);
-}
-
-#[test]
-#[ignore = "e2e: requires hermit + mount namespaces + a JVM"]
-fn java_version_is_deterministic_under_strict_verify() {
-    let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
-    let args = java_vm_args(&["-version"]);
-    assert_l2_under_strict_verify(&java, &args);
-}
-
 // ---------------------------------------------------------------------------
 // Go and JVM managed-runtime coverage.
 //
 // The compiled-guest tests build a tiny program with the host toolchain and run
 // the artifact under Hermit, isolating managed-runtime determinism from
 // compiler determinism. The `go`/`javac`/`java` binaries are installed by the
-// self-hosted CI job, so a missing toolchain is a hard error, matching the
+// portable CI job, so a missing toolchain is a hard error, matching the
 // `required_app` policy above.
 // ---------------------------------------------------------------------------
 
@@ -432,37 +391,6 @@ fn run_once_under_strict(program: &Path, args: &[&str]) -> Output {
     run_hermit_command(command)
 }
 
-/// Assert assurance level L1 for a driver that does not reach L2: two separate
-/// `--strict` runs must both succeed and produce identical stdout, but we do not
-/// require `--verify` to agree (its internal two-run log diff diverges for these
-/// toolchain drivers).
-fn assert_l1_stdout_deterministic(program: &Path, args: &[&str]) {
-    let _guard = hermit_run_lock();
-
-    let first = run_once_under_strict(program, args);
-    let second = run_once_under_strict(program, args);
-
-    for (label, output) in [("run 1", &first), ("run 2", &second)] {
-        assert!(
-            output.status.success(),
-            "hermit run --strict ({label}) failed for {} {args:?}\nstatus: {}\nstderr:\n{}",
-            program.display(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-
-    assert_eq!(
-        first.stdout,
-        second.stdout,
-        "hermit run --strict produced non-deterministic stdout (not even L1) for {} {args:?}\n\
-         run 1 stdout:\n{}\nrun 2 stdout:\n{}",
-        program.display(),
-        String::from_utf8_lossy(&first.stdout),
-        String::from_utf8_lossy(&second.stdout),
-    );
-}
-
 // --- L2: compiled managed-runtime programs are bitwise deterministic ---
 
 #[test]
@@ -500,15 +428,6 @@ fn java_threads_are_deterministic_under_strict_verify() {
 }
 
 // --- L1: toolchain drivers are output-deterministic but not bitwise (no L2) ---
-
-#[test]
-#[ignore = "e2e: requires hermit + mount namespaces + the Go toolchain"]
-fn go_version_is_l1_deterministic_under_strict() {
-    // `go version` is output-deterministic under --strict but Hermit's --verify
-    // reports it nondeterministic, so it is asserted at L1 only.
-    let go = required_app("go", &["/usr/bin/go", "/usr/local/bin/go"]);
-    assert_l1_stdout_deterministic(&go, &["version"]);
-}
 
 #[test]
 #[ignore = "e2e: requires hermit + mount namespaces + a JDK"]

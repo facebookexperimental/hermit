@@ -284,13 +284,13 @@ fn cases(fixture: &Fixture) -> Vec<Case> {
             false,
         ),
         // Use the distro binary rather than Meta's instrumented /usr/local
-        // build, which starts telemetry polling threads even for --version.
+        // build, which starts telemetry polling threads even for simple work.
         case(
             "threaded",
             "git",
             &["/usr/bin/git"],
-            &["--version"],
-            Some("git version"),
+            &["ls-files", "README.md"],
+            Some("README.md"),
             Expectation::Pass,
             false,
         ),

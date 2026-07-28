@@ -10,20 +10,20 @@
 # This entrypoint maps the hand-rolled serial/parallel gate structure in
 # validate.sh onto the safe-ci-dag-runner scheduler, so each gate runs as an
 # independently boxed node with explicit dependencies and resource limits (see
-# ci/dag/README.md). The hosted GitHub Actions lane uses this path directly;
+# ci/dag/README.md). The portable GitHub Actions lane uses this path directly;
 # validate.sh remains the source of truth for the individual gate commands.
 #
 # Usage:
 #   ci/run-dag.sh <lane> [runner-args...]
-#     <lane>            hosted | hardware  (selects ci/dag/<lane>.json)
+#     <lane>            portable | privileged  (selects ci/dag/<lane>.json)
 #     runner-args       forwarded verbatim to `safe-ci-dag-runner run`
 #                       (e.g. -j 8, --max-mem 32G, --perf-dir ./perf, --cgroups,
 #                        -k/--keep-going, -v, -q)
 #
 # Examples:
-#   ci/run-dag.sh hosted --max-mem 32G
-#   ci/run-dag.sh hardware -j 1 --perf-dir ./perf
-#   ci/run-dag.sh hosted ascii     # any non-`run` verb also works: ci/run-dag.sh hosted <verb>
+#   ci/run-dag.sh portable --max-mem 32G
+#   ci/run-dag.sh privileged -j 1 --perf-dir ./perf
+#   ci/run-dag.sh portable ascii   # any non-`run` verb also works
 #
 # Environment:
 #   SAFE_CI_DAG_RUNNER   override the runner executable to use.
@@ -34,7 +34,7 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR" || exit 2
 
 if (($# < 1)); then
-    echo "usage: ci/run-dag.sh <hosted|hardware> [runner-args...]" >&2
+    echo "usage: ci/run-dag.sh <portable|privileged> [runner-args...]" >&2
     exit 2
 fi
 
@@ -44,7 +44,7 @@ shift
 dag="$ROOT_DIR/ci/dag/${lane}.json"
 if [[ ! -f $dag ]]; then
     echo "run-dag.sh: unknown lane '$lane' (no such file: $dag)" >&2
-    echo "            known lanes: hosted, hardware" >&2
+    echo "            known lanes: portable, privileged" >&2
     exit 2
 fi
 

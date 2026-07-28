@@ -47,7 +47,7 @@ jobs:
           cache: false
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: hosted-validation
+          shared-key: portable-validation
           cache-on-failure: true
       - name: Dependencies
         run: |
@@ -65,8 +65,8 @@ jobs:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
       - name: Rust components
         run: rustup component add clippy rustfmt
-      - name: GitHub-hosted test lane
-        run: ./validate.sh --hosted-only --no-label-pr
+      - name: GitHub-managed portable test lane
+        run: ./validate.sh --portable-only --no-label-pr
       - name: Upload nextest JUnit report
         if: always()
         uses: actions/upload-artifact@v4
@@ -77,7 +77,7 @@ jobs:
           retention-days: 14
 
   full:
-    name: Hardware validation (merge gate)
+    name: Privileged validation (merge gate)
     if: >-
       ${{
         github.repository == 'rrnewton/hermit' &&
@@ -86,7 +86,7 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.level == 'full')
         )
       }}
-    runs-on: [self-hosted, Linux, X64, hermit, pmu, pmu-serial]
+    runs-on: [Linux, X64, hermit, pmu, pmu-serial]
     timeout-minutes: 360
     env:
       DETCORE_TEST_RUST_LOG: "off"
@@ -117,7 +117,7 @@ jobs:
             echo "::error::Unsupported package manager"
             exit 1
           fi
-      - name: Hardware and runtime preflight
+      - name: Privileged capability and runtime preflight
         run: |
           test -r /proc/sys/kernel/perf_event_paranoid
           test -r /dev/kvm -a -w /dev/kvm
@@ -125,14 +125,14 @@ jobs:
           command -v go ruby node javac java ocamlopt python3 redis-server redis-cli sqlite3 gdb lldb
           python3 -c 'import test.support'
           unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
-      - name: Self-hosted PMU and CPUID test DAG
-        run: env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner flock /tmp/hermit-self-hosted-pmu.lock ci/run-dag.sh hardware -j 2 --perf-dir "$RUNNER_TEMP/hermit-hardware-dag-perf" -v
-      - name: Upload hardware DAG performance report
+      - name: Privileged PMU and CPUID test DAG
+        run: env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner flock /tmp/hermit-privileged-pmu.lock ci/run-dag.sh privileged -j 2 --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
+      - name: Upload privileged DAG performance report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: validation-levels-hardware-dag-perf
-          path: ${{ runner.temp }}/hermit-hardware-dag-perf
+          name: validation-levels-privileged-dag-perf
+          path: ${{ runner.temp }}/hermit-privileged-dag-perf
           if-no-files-found: warn
           retention-days: 14
       - name: Upload working-envelope JSON
@@ -154,7 +154,7 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.level == 'super')
         )
       }}
-    runs-on: [self-hosted, Linux, X64, hermit, pmu, pmu-serial]
+    runs-on: [Linux, X64, hermit, pmu, pmu-serial]
     timeout-minutes: 360
     env:
       DETCORE_TEST_RUST_LOG: "off"
@@ -188,5 +188,5 @@ jobs:
           command -v flock
           command -v java javac
           unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
-      - name: Repeated and long-form hardware validation
-        run: flock /tmp/hermit-self-hosted-pmu.lock ./validate.sh super --no-label-pr
+      - name: Repeated and long-form privileged validation
+        run: flock /tmp/hermit-privileged-pmu.lock ./validate.sh super --no-label-pr

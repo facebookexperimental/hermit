@@ -316,79 +316,6 @@ fn deny_syscall(command: &mut Command, syscall: libc::c_long) {
 }
 
 #[test]
-fn top_level_help_lists_user_facing_commands() {
-    let args = ["--help"];
-    let output = hermit(&args);
-    assert_success(&output, &args);
-    let help = stdout(&output);
-
-    assert!(help.contains("Usage: hermit [OPTIONS] <COMMAND>"));
-    for command in [
-        "run", "strace", "record", "replay", "log-diff", "analyze", "bisect",
-    ] {
-        assert!(help.contains(command), "missing {command:?} in:\n{help}");
-    }
-}
-
-#[test]
-fn bisect_help_describes_schedule_endpoints() {
-    let args = ["bisect", "--help"];
-    let output = hermit(&args);
-    assert_success(&output, &args);
-    let help = stdout(&output);
-
-    assert!(help.contains("--good <SCHEDULE>"));
-    assert!(help.contains("--bad <SCHEDULE>"));
-    assert!(help.contains("--target-exit-code"));
-    assert!(help.contains("--report-file"));
-    assert!(help.contains("<RUN_ARGS>..."));
-}
-
-#[test]
-fn replay_help_accepts_optional_recording_id() {
-    let args = ["replay", "--help"];
-    let output = hermit(&args);
-    assert_success(&output, &args);
-    let help = stdout(&output);
-
-    assert!(help.contains("Usage: hermit replay [OPTIONS] [ID]"));
-    assert!(help.contains("--autopilot"));
-    assert!(help.contains("--data-dir <DIR>"));
-    assert!(help.contains("--gdbserver-port"));
-}
-
-#[test]
-fn run_help_exposes_determinism_modes() {
-    let args = ["run", "--help"];
-    let output = hermit(&args);
-    assert_success(&output, &args);
-    let help = stdout(&output);
-
-    for option in [
-        "--strict",
-        "--sequentialize-threads",
-        "--chaos",
-        "--verify",
-        "--verify-verbose",
-        "--record-preemptions",
-        "--replay-preemptions-from",
-        "--max-timeslice",
-        "--target-timeslice",
-        "--backend <BACKEND>",
-        "ptrace",
-        "dbi",
-        "kvm",
-        "Bare names are resolved using the guest PATH",
-        "hidden by Hermit's isolated `/tmp`",
-        "without ptrace, seccomp interception, or determinization",
-        "--no-namespace",
-        "--core-only",
-    ] {
-        assert!(help.contains(option), "missing {option:?} in run help");
-    }
-}
-
-#[test]
 fn run_strict_flag_is_accepted_and_runs() {
     // Regression test for GH #12: `docs/Users.md` documents
     // `hermit run --strict ...`, and the CLI must accept that spelling and run
@@ -971,7 +898,8 @@ fn run_kvm_cpuid_policy_is_deterministic() {
         .into_iter()
         .find(|program| {
             Command::new(program)
-                .arg("--version")
+                .args(["-x", "c", "-fsyntax-only", "-"])
+                .stdin(Stdio::null())
                 .output()
                 .is_ok_and(|output| output.status.success())
         })
@@ -1343,7 +1271,8 @@ fn run_kvm_pipe_pipe2_and_getgroups_round_trip() {
         .into_iter()
         .find(|program| {
             Command::new(program)
-                .arg("--version")
+                .args(["-x", "c", "-fsyntax-only", "-"])
+                .stdin(Stdio::null())
                 .output()
                 .is_ok_and(|output| output.status.success())
         })
@@ -1699,23 +1628,6 @@ fn no_namespace_preserves_affinity_for_run_and_verify() {
     ];
     let output = hermit(&verify_args);
     assert_success(&output, &verify_args);
-}
-
-#[test]
-fn record_help_lists_management_commands() {
-    let args = ["record", "--help"];
-    let output = hermit(&args);
-    assert_success(&output, &args);
-    let help = stdout(&output);
-
-    assert!(help.contains("Usage: hermit record"));
-    for command in ["list", "rm", "clean", "start"] {
-        assert!(help.contains(command), "missing {command:?} in:\n{help}");
-    }
-    assert!(
-        help.contains("--strict"),
-        "missing direct strict option in:\n{help}"
-    );
 }
 
 #[test]

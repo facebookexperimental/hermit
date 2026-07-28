@@ -15,7 +15,7 @@ conditional test execution; if those are wanted, track them in a separate
 implementation issue and link it here.
 
 > The headline rule: **not every x86-64 Linux machine can run every Hermit
-> test.** A green `cargo test --workspace` on a hosted VM demonstrates the
+> test.** A green `cargo test --workspace` on a portable VM demonstrates the
 > environment-independent subset only, not the PMU- and namespace-dependent
 > integration matrix.
 
@@ -27,7 +27,7 @@ it runs `full` for backward compatibility.
 | Level | Typical estimate | Coverage |
 | --- | --- | --- |
 | `quick` | About 3 minutes | Builds the workspace, runs Detcore's core unit tests, and exercises ptrace run, repeat-output, verify, record, and replay smoke tests. It does not execute DBI or KVM or build the optimized binary. |
-| `hosted-only` | About 8 minutes | Mirrors the portable GitHub-hosted `regular` job: build, portable workspace tests, Hermit and Detcore library/binary tests, docs, Clippy, and rustfmt. It does not require PMU or guest namespaces. |
+| `portable-only` | About 8 minutes | Mirrors the portable GitHub-managed portable `regular` job: build, portable workspace tests, Hermit and Detcore library/binary tests, docs, Clippy, and rustfmt. It does not require PMU or guest namespaces. |
 | `full` (default) | About 20-70 minutes | Runs everything in `quick`, the pre-existing workspace, compatibility, record/replay, stress, rr, analyze, documentation, formatting, and lint gates, then runs the KVM and DBI parity ratchets when those backends are available. The R/R matrix stops after its first canary failure instead of repeating a known-broken setup 128 times. |
 | `super` | About 30-90 minutes | Builds Hermit and repeats each bounded determinism probe 20 times by default. It reports `passed/total` for every probe and fails if any iteration fails. Available KVM and DBI verify probes join the ptrace strict-verify, pipeline, and record/replay probes. |
 
@@ -36,12 +36,12 @@ useful in scripts and make the intended capability tier explicit:
 
 ```sh
 ./validate.sh --quick
-./validate.sh --hosted
-VALIDATE_LEVEL=hosted-only ./validate.sh
+./validate.sh --portable
+VALIDATE_LEVEL=portable-only ./validate.sh
 ```
 
-`--quick` is an alias for `quick`; `--hosted` and `--hosted-only` are aliases
-for `hosted-only`. The script prints the selected profile and its estimate
+`--quick` is an alias for `quick`; `--portable` and `--portable-only` are aliases
+for `portable-only`. The script prints the selected profile and its estimate
 before starting any gate. Treat estimates as planning guidance: a cold Cargo
 cache and host contention can increase elapsed time.
 
@@ -92,10 +92,10 @@ namespaces (see the [CI tiers](#ci-tiers-what-runs-where) below).
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | **Bare metal (supported CPU)** | ✅ | ✅ (if recognized) | ✅ | ✅ (if `perf_event_paranoid` permits) | usually ✅ | ✅ | Full suite can pass, including PMU + namespace integration tests |
 | **Bare metal (newer/unrecognized CPU)** | ✅ | ❌ maybe | ✅ | ✅ | ✅ | ✅ | Timer/perf layer may reject the model → PMU tests fail; file a CPU-support bug (see below) |
-| **Hosted VM (typical cloud)** | ✅ | varies | ❌ usually | n/a | ❌ often | often ✅ | Env-independent subset passes; PMU and CPUID/RDRAND tests fail or skip |
-| **Self-hosted VM with virtualized PMU** | ✅ | ✅ | ✅ (if configured) | ✅ | varies | ✅ | Approaches bare metal; validate PMU tests explicitly before trusting them |
+| **Portable VM (typical cloud)** | ✅ | varies | ❌ usually | n/a | ❌ often | often ✅ | Env-independent subset passes; PMU and CPUID/RDRAND tests fail or skip |
+| **Privileged VM with virtualized PMU** | ✅ | ✅ | ✅ (if configured) | ✅ | varies | ✅ | Approaches bare metal; validate PMU tests explicitly before trusting them |
 | **Container (shares host CPU)** | ✅ | inherits host | inherits host, but | ❌ often restricted | inherits host | ❌ often blocked | CPU/PMU capabilities come from the host, but perf perms and namespaces are commonly restricted independently |
-| **WSL** | ✅ | varies | ❌ usually | n/a | varies | varies | Treat like a hosted VM; PMU-dependent tests are not expected to pass |
+| **WSL** | ✅ | varies | ❌ usually | n/a | varies | varies | Treat like a portable VM; PMU-dependent tests are not expected to pass |
 
 Notes:
 
@@ -109,10 +109,10 @@ Notes:
 
 ## CI tiers: what runs where
 
-CI (`.github/workflows/ci.yml`) is the reference for which tests are expected in
-ordinary GitHub Actions versus a specialized runner. There are two jobs:
+The portable and privileged workflows are the reference for which tests run on
+ordinary GitHub Actions versus a capability-bearing runner:
 
-### `regular` — GitHub-hosted (`ubuntu-latest`)
+### `regular` — GitHub-managed portable (`ubuntu-latest`)
 
 Runs on every push and pull request. Covers the **environment-independent
 subset**:
@@ -124,31 +124,16 @@ subset**:
 - `cargo test -p detcore --lib --bins`
 - doc tests (`cargo test --workspace --doc`), `cargo doc`, Clippy, rustfmt
 
-GitHub-hosted runners have **no usable PMU and no CPUID faulting**, so the
+GitHub-managed portable runners have **no usable PMU and no CPUID faulting**, so the
 detcore and hermit integration suites are deliberately excluded here.
 
-### `hardware` — self-hosted (`[self-hosted, Linux, X64, hermit, pmu]`)
+### `privileged` — capability runner (`[Linux, X64, hermit, pmu]`)
 
 Runs on push, and on pull requests only from the trusted `rrnewton` account.
-Requires a bare-metal-class host with PMU access. Covers:
-
-- **CPUID/RDRAND/RDSEED:** `tests_misc has_rdrand_without_detcore`,
-  `tests_misc rdrand_rdseed_is_masked`
-- **PMU timing/parallelism:** `tests_time --ignored`,
-  `tests_parallelism futex_wait_parent --ignored`,
-  `tests_parallelism 'mem_race::' --ignored`,
-  `tests_parallelism 'mem_print_race::' --ignored`
-- **Namespace-gated Hermit integration** (only if a mount-namespace probe
-  succeeds): `arbitrary_binaries`, `cli`, `clock_determinism`,
-  `epoll_determinism`, `mmap_determinism`, `procfs_determinism`,
-  `signal_determinism`, `record_replay_matrix`, `strict_mode_matrix`, the
-  fail-closed ratchet (`scripts/test-fail-closed.sh`), the working-envelope gate
-  (`validate.sh --envelope-compare`), and the debugger integration tests
-- **Backend parity ratchet:** always for `ptrace`; `kvm` only when `/dev/kvm` is
-  readable+writable; `dbi` only when the DynamoRIO environment is configured
-
-If the mount-namespace probe fails, the job falls back to
-`cargo test -p hermit --lib --bins` only.
+Requires PMU access, CPUID faulting, and read/write `/dev/kvm`. It is a focused
+sub-five-minute sentinel: one CPUID test, one direct PMU overflow/skid probe,
+and one KVM multi-mode E2E cell. Broad product and stress coverage remains in
+portable or scheduled validation.
 
 ## Hardware-sensitive Cargo tests
 
@@ -159,7 +144,7 @@ root.
 | --- | --- | --- | --- |
 | `has_rdrand_without_detcore` | `detcore/tests/misc/mod.rs` | Host RDRAND | Probes host features; returns early if RDRAND absent |
 | `rdrand_rdseed_is_masked` | `detcore/tests/misc/mod.rs` | RDRAND/RDSEED **and** CPUID faulting | Runs without PMU (`det_test_fn_without_pmu`); skips if faulting unsupported |
-| `getrandom_intercepted` | `detcore/tests/misc/mod.rs` | None (PMU-free) | Uses `ret_without_perf!`; currently scheduled in self-hosted hardware CI |
+| `getrandom_intercepted` | `detcore/tests/misc/mod.rs` | None (PMU-free) | Uses `ret_without_perf!`; belongs in portable validation |
 | `tests_time` (`--ignored`) | `detcore/tests/time.rs` | PMU (RCB counters) | |
 | `tests_parallelism` `futex_wait_parent`, `mem_race::`, `mem_print_race::` (`--ignored`) | `detcore/tests/parallelism*` | PMU (RCB counters) | |
 | chaos schedule-bisection tests (`--ignored`) | `hermit-cli/tests/analyze.rs` | PMU **and** mount/user namespaces | `#[ignore]`: "requires PMU branch counters and working mount namespaces" |
@@ -170,8 +155,8 @@ root.
 | `python_stdlib` | `hermit-cli/tests/python_stdlib.rs` | System CPython 3 + full `Lib/test` | |
 | `redis_strict`, `sqlite_veryquick` | `hermit-cli/tests/` | Network/build to fetch+build pinned Redis/SQLite | Slow; `#[ignore]` by default |
 
-`#[ignore]` tests are excluded from a plain `cargo test`; the `hardware` CI job
-opts into them with `-- --ignored`. Running them locally requires the matching
+`#[ignore]` tests are excluded from a plain `cargo test`. Scheduled or explicit
+local validation may opt into them; running them requires the matching
 capability, not just removing `--ignored`.
 
 ## Expected failure signatures
@@ -261,7 +246,7 @@ the failure; remove hostnames and any internal identifiers before sharing.
 1. **Reproduce** with the diagnostic block above.
 2. **Classify** the failure using the signatures:
    - PMU/perf or namespace signature → **adjust the environment** (grant perf
-     access, enable namespaces, or use a self-hosted/bare-metal runner). Not a
+     access, enable namespaces, or use a privileged/bare-metal runner). Not a
      bug.
    - VM/container without PMU or CPUID faulting → **expected limitation**. Run
      the environment-independent subset only, or move to a capable host.
@@ -299,7 +284,7 @@ When filing an environment-related bug, include:
     host kernel because Hermit virtualizes `uname -r`
   - [#6](https://github.com/rrnewton/hermit/issues/6) — virtualized host time
     corrupts QEMU guest clock calibration
-  - [#94](https://github.com/rrnewton/hermit/issues/94) — self-hosted CI stays
+  - [#94](https://github.com/rrnewton/hermit/issues/94) — privileged CI stays
     red after mount fix (statfs replay)
 - **This issue:** [#11](https://github.com/rrnewton/hermit/issues/11).
 - [docs/ERROR_CATALOG.md](ERROR_CATALOG.md) — exact error text → cause → fix.

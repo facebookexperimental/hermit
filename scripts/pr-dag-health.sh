@@ -17,8 +17,8 @@
 #   2. Builds the dependency DAG from branch stacking: PR X depends on PR Y when
 #      X's base branch is Y's head branch.
 #   3. Checks per-PR health: can it merge onto its base (no conflicts), and is
-#      the meaningful CI job ("Regular tests (GitHub-hosted)") green. The
-#      hardware-gated "PMU and CPUID tests (self-hosted)" job is reported
+#      the meaningful CI job ("Regular tests (GitHub-managed portable)") green. The
+#      "Privileged capability and E2E tests" job is reported
 #      separately because it is not a landing gate.
 #   4. Ranks review priority: "Review PR #X -> releases N PRs from floating to
 #      landed", where N is the size of X's dependent subtree.
@@ -89,9 +89,9 @@ def red: ["FAILURE","TIMED_OUT","CANCELLED","ERROR","ACTION_REQUIRED","STARTUP_F
 def ci_of($rollup):
   ($rollup // []) as $r
   | { checks: ($r|length),
-      regular: (($r | map(select((.name // .context)=="Regular tests (GitHub-hosted)")) | .[0]) as $x
+      regular: (($r | map(select((.name // .context)=="Regular tests (GitHub-managed portable)")) | .[0]) as $x
                 | if $x==null then "NONE" else ($x|result) end),
-      hostdep: (($r | map(select((.name // .context)=="PMU and CPUID tests (self-hosted)")) | .[0]) as $x
+      hostdep: (($r | map(select((.name // .context)=="Privileged capability and E2E tests")) | .[0]) as $x
                 | if $x==null then "NONE" else ($x|result) end) }
   | . as $o
   | $o + { overall:
@@ -183,7 +183,7 @@ fi
 # ---------------------------------------------------------------------------
 MAIN_SHA="$(gh_ api "repos/$REPO/commits/$MAIN_BRANCH" --jq '.sha' 2>/dev/null | cut -c1-12)"
 MAIN_CI="$(gh_ api "repos/$REPO/commits/$MAIN_BRANCH/check-runs" \
-    --jq '[.check_runs[] | select(.name=="Regular tests (GitHub-hosted)")] | (.[0].conclusion // "none")' 2>/dev/null)"
+    --jq '[.check_runs[] | select(.name=="Regular tests (GitHub-managed portable)")] | (.[0].conclusion // "none")' 2>/dev/null)"
 [ -n "$MAIN_SHA" ] || MAIN_SHA="unknown"
 [ -n "$MAIN_CI" ]  || MAIN_CI="unknown"
 

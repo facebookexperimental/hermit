@@ -152,7 +152,7 @@ The row counts were measured directly from each merged version of `run_strict_co
 
 | Blocker | Current state | Evidence | Exit criterion |
 | --- | --- | --- | --- |
-| Python/vfork scheduling | [Hermit PR #239](https://github.com/rrnewton/hermit/pull/239) is open, non-draft, `human-review`, and `locally-validated`; no review has been submitted. Hosted CI passed; self-hosted failed because zlib development files were absent. | The exact Meta Python probe on `2df293b` did not reach L2. The PR candidate passed 20/20 L2 repetitions with an empty read-only bind over `/var/run/nscd`; bare-host execution still diverged on live NSCD readiness. Backend ptrace, INFO log, relaxations none. | Human approval and merge; rerun the exact current-main Python probe both with controlled NSCD state and on the bare host, reporting external-state dependence separately. |
+| Python/vfork scheduling | [Hermit PR #239](https://github.com/rrnewton/hermit/pull/239) is open, non-draft, `human-review`, and `locally-validated`; no review has been submitted. Portable CI passed; privileged failed because zlib development files were absent. | The exact Meta Python probe on `2df293b` did not reach L2. The PR candidate passed 20/20 L2 repetitions with an empty read-only bind over `/var/run/nscd`; bare-host execution still diverged on live NSCD readiness. Backend ptrace, INFO log, relaxations none. | Human approval and merge; rerun the exact current-main Python probe both with controlled NSCD state and on the bare host, reporting external-state dependence separately. |
 | DBI fork/process tree | [Reverie issue #31](https://github.com/rrnewton/reverie/issues/31) is open. It is an issue, not a PR. | `ppid()` remains `None`; correct clone/fork ancestry needs native DynamoRIO client tracking. The same issue also tracks precise timers and continuous clock reads. DBI matrix has 17 Run1 timeouts concentrated in pipelines and exec-oriented programs. | Implement native process-tree/lifecycle support and dispatch; rerun the current 61-row corpus under DBI L2. |
 | KVM fork/clone | [Reverie issue #55](https://github.com/rrnewton/reverie/issues/55) is open. It is an issue, not a PR. | 19/26 KVM failures are direct `clone`/fork `ENOSYS`. Correct support needs child registers/address space, inherited descriptors, PID/TID identity, Detcore lifecycle callbacks, and deterministic scheduling. | Both issue reproductions and the 19 affected matrix rows pass KVM L2, with descriptor cleanup regressions. |
 | R/R descriptor state | [Hermit PR #240](https://github.com/rrnewton/hermit/pull/240) is open, draft, and `human-review`; [issue #536](https://github.com/rrnewton/hermit/issues/536) tracks the `EpollWait` EOF hang. | 14 stdout-routing mismatches, five fd-number/order desyncs, and two toolchain replay timeouts. | Land the close fix after review, implement a real replay descriptor table for dup/open/fcntl/write routing, repair epoll lifecycle, then rerun 57 and 61 rows. |
@@ -160,7 +160,7 @@ The row counts were measured directly from each merged version of `run_strict_co
 ## Recommended next steps
 
 1. **Normalize the denominator.** After the current fixes land, rerun DBI, KVM, and R/R against the same 61 commands now on `main`; do not compare 20/38, 31/57, and 36/57 as if they measured identical coverage.
-2. **Review and land PR #239.** It has the strongest immediate user impact and already has hosted CI plus 20/20 isolated Python evidence. Preserve the NSCD caveat in the landing report.
+2. **Review and land PR #239.** It has the strongest immediate user impact and already has portable CI plus 20/20 isolated Python evidence. Preserve the NSCD caveat in the landing report.
 3. **Review PR #240, then finish R/R fd tracking.** The existing close fix addresses one concrete cause, but numeric stdout injection and the descriptor table remain broader than `close(2)`.
 4. **Implement KVM issue #55 before secondary loader work.** Fork/clone alone accounts for 19 of 26 KVM failures; then address `execve`, shebang loading, ELF layout, and filesystem metadata.
 5. **Implement DBI native process lifecycle from issue #31.** Add clone/fork ancestry and lifecycle callbacks before interpreting pipeline timeouts as individual syscall bugs.
@@ -194,7 +194,7 @@ GitHub query: `merged:>=2026-07-24`, captured at 2026-07-24T09:18:27Z. Total: **
 | [#545](https://github.com/rrnewton/hermit/pull/545) | 05:46:50 | Harden deterministic getrandom handling |
 | [#546](https://github.com/rrnewton/hermit/pull/546) | 05:50:54 | Determinize scheduler affinity masks |
 | [#543](https://github.com/rrnewton/hermit/pull/543) | 05:58:13 | Bump Reverie for DBI application syscall fix |
-| [#541](https://github.com/rrnewton/hermit/pull/541) | 06:04:18 | Install zlib headers in self-hosted CI |
+| [#541](https://github.com/rrnewton/hermit/pull/541) | 06:04:18 | Install zlib headers in privileged CI |
 | [#547](https://github.com/rrnewton/hermit/pull/547) | 06:30:00 | Determinize writev syscall handling |
 | [#329](https://github.com/rrnewton/hermit/pull/329) | 06:33:54 | Document strict QEMU boot syscall analysis |
 | [#544](https://github.com/rrnewton/hermit/pull/544) | 06:39:35 | Restore KVM pipe and supplementary-group syscalls |

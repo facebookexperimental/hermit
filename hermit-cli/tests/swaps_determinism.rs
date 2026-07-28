@@ -90,7 +90,7 @@ fn swaps_consumers_are_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();
     assert!(
         Path::new(PROC_SWAPS).is_file(),
-        "{PROC_SWAPS} is required for the hosted regression"
+        "{PROC_SWAPS} is required for the portable regression"
     );
 
     let cases = [

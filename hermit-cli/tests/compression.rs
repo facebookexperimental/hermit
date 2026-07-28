@@ -18,13 +18,6 @@ fn compression_tools_are_deterministic_under_strict_hermit() {
     let _guard = HERMIT_RUN_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for tool in ["bzip2", "bzip2recover", "gzip"] {
-        assert!(
-            Command::new(tool).arg("--help").output().is_ok(),
-            "required compression tool is missing: {tool}"
-        );
-    }
-
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository root");

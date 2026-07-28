@@ -36,12 +36,12 @@ DEFAULT_REPOS = ("rrnewton/hermit", "rrnewton/reverie")
 DEFAULT_WARN_THRESHOLD = 10
 DEFAULT_MAIN_LIMIT = 10
 HUMAN_REVIEW_LABEL = "human-review"
-REGULAR_HOSTED_CHECK = "Regular tests (GitHub-hosted)"
+REGULAR_PORTABLE_CHECK = "Regular tests (GitHub-managed portable)"
 REQUIRED_CHECKS = {
-    "rrnewton/hermit": (REGULAR_HOSTED_CHECK,),
+    "rrnewton/hermit": (REGULAR_PORTABLE_CHECK,),
     "rrnewton/reverie": (
-        REGULAR_HOSTED_CHECK,
-        "Host-dependent tests (self-hosted)",
+        REGULAR_PORTABLE_CHECK,
+        "Host-dependent tests (privileged)",
     ),
 }
 
@@ -98,13 +98,13 @@ def classify_ci_rollup(repo: str, checks: object) -> str:
 
     GitHub retains older reruns and auxiliary checks in ``statusCheckRollup``.
     In particular, Hermit's merge gate intentionally starts red and refires
-    after hosted CI completes. Those historical placeholders must not turn a
-    hosted-green pull request red in this operational report.
+    after portable CI completes. Those historical placeholders must not turn a
+    portable-green pull request red in this operational report.
     """
     if not isinstance(checks, list) or not checks:
         return "none"
 
-    required = REQUIRED_CHECKS.get(repo, (REGULAR_HOSTED_CHECK,))
+    required = REQUIRED_CHECKS.get(repo, (REGULAR_PORTABLE_CHECK,))
     latest: dict[str, tuple[tuple[int, str, int], dict[object, object]]] = {}
     for index, check in enumerate(checks):
         if not isinstance(check, dict):

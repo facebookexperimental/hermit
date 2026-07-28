@@ -84,7 +84,7 @@ impl Replay {
 
         // bind mount fbcode otherwise many program can fail to execve due to missing
         // shared libraries. This path only exists on Meta hosts; skip it elsewhere
-        // (e.g. generic self-hosted CI runners) where the missing source would make
+        // (e.g. generic external CI runners) where the missing source would make
         // mount(2) fail with ENOENT.
         //
         // The bind-mount target directory is created here, in the parent process,

@@ -90,7 +90,7 @@ fn uevent_seqnum_consumers_are_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();
     assert!(
         Path::new(UEVENT_SEQNUM).is_file(),
-        "{UEVENT_SEQNUM} is required for the hosted regression"
+        "{UEVENT_SEQNUM} is required for the portable regression"
     );
 
     let cases = [

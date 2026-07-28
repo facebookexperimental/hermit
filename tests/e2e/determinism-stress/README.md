@@ -16,8 +16,8 @@ Build Hermit once, then run a category or the complete matrix:
 
 ```bash
 cargo build --release -p hermit --bin hermit
-tests/e2e/determinism-stress/random.sh
-tests/e2e/determinism-stress/run.sh
+tests/e2e/lib/determinism-stress/random.sh
+tests/e2e/lib/determinism-stress/run.sh
 ```
 
 `DETERMINISM_STRESS_REPETITIONS=20` repeats every internal two-run comparison

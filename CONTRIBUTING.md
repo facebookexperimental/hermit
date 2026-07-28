@@ -29,24 +29,23 @@ entry point is:
 ./validate.sh
 ```
 
-`validate.sh` is the local mirror of the GitHub Actions workflows
-(`.github/workflows/ci-hosted.yml` and
-`.github/workflows/ci-selfhosted.yml`): it runs the same build, lint,
-format, doc, and
-test matrix, in the same modes, so a green local run predicts a green CI run.
+`validate.sh portable-only` is the local mirror of the required
+`.github/workflows/ci-portable.yml` workflow: it runs the same build, lint,
+format, documentation, and test matrix. The focused privileged capability
+contract is reproduced with `ci/run-dag.sh privileged -j 2`.
 The exact step-by-step mapping between the two — and any sanctioned
 host-capability differences — is documented in
 [`docs/ci-validate-alignment.md`](docs/ci-validate-alignment.md). Do not add a
 test to only one side: a test that gates CI must be reproducible with
 `validate.sh`, and vice versa.
 
-For a predictable portable iteration loop that mirrors GitHub-hosted CI, run:
+For a predictable portable iteration loop that mirrors GitHub-managed portable CI, run:
 
 ```bash
-VALIDATE_LEVEL=hosted-only ./validate.sh
+VALIDATE_LEVEL=portable-only ./validate.sh
 ```
 
-`./validate.sh --hosted` is equivalent, while `./validate.sh --quick` selects
+`./validate.sh --portable` is equivalent, while `./validate.sh --quick` selects
 the smaller ptrace smoke suite. These modes provide fast feedback; use `full`
 for the complete hardware-dependent local gate when the host supports it.
 

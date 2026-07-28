@@ -14,12 +14,12 @@ HERMIT_E9PATCH_BACKEND=/path/to/e9patch \
 ./validate.sh --e9patch-compat-only
 ```
 
-The mode runs the same 156 installed-program probes used by the existing
-compatibility matrix, followed by 56 additional probes when their programs are
-installed. Every available probe uses `hermit run --backend e9patch --strict
---verify`, so a pass is L2. Missing extended programs skip; an installed program
-that fails or lacks a backend diagnostic fails the gate. Missing e9patch
-artifacts fail before either matrix.
+The mode runs the 155 semantic installed-program probes in the compatibility
+matrix. Every available probe uses `hermit run --backend e9patch --strict
+--verify`, so a pass is L2. A program that fails or lacks a backend diagnostic
+fails the gate. Missing e9patch artifacts fail before the matrix starts. The
+former 56-row optional banner matrix was retired because `--help`, `--version`,
+and no-argument invocations did not exercise meaningful program behavior.
 
 For identity-dependent core rows (`whoami`, `groups`, `pinky`, `logname`,
 `tar`, and `chown`), the harness bind-mounts a files-only `nsswitch.conf`.
@@ -27,7 +27,7 @@ This keeps asynchronous host identity daemons out of the two-run comparison
 without changing the commands under test. The fixture is a stable filesystem
 input, not a determinism relaxation.
 
-## 2026-07-25 core result
+## 2026-07-25 historical core result
 
 Environment: x86_64 CentOS Stream 9; e9patch backend; default log level;
 relaxations: none.
@@ -54,7 +54,10 @@ now keeps the two counts separate and still rejects any partial recovered-site
 rewrite. A cache-miss `cargo --version` run and cache-hit `rustc --version` run
 both passed at L2.
 
-## 2026-07-25 extended result
+## 2026-07-25 retired extended result
+
+This result records the former optional matrix for historical comparison. The
+current gate does not run these banner-oriented probes.
 
 All 56 extended programs were installed on the measurement host.
 
@@ -120,8 +123,8 @@ cache-miss budget.
 
 ## Current limits and intentional failures
 
-- The matrix uses bounded command, version, and small functional probes. It does
-  not establish L2 for every workload those programs can execute.
+- The matrix uses bounded semantic workloads. It does not establish L2 for
+  every workload those programs can execute.
 - Only the main executable is preprocessed. Shared objects, the vDSO, JIT code,
   and child executables remain on the ptrace correctness path.
 - Empty trampolines preserve the original instructions. Raw `RDRAND`, `RDSEED`,

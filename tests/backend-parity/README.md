@@ -32,7 +32,7 @@ deterministic `ENOSYS` refusal for `MADV_DONTNEED`. The memory-layout rows check
 that `sbrk`/`brk` growth, ordered one-, two-, and three-page private anonymous
 mappings, and a written two-page shared anonymous mapping produce the same
 address sequences across repeated runs of each backend; they deliberately
-permit different backend-local layouts. Hosted
+permit different backend-local layouts. Portable
 pthread startup can still stall during native startup and remains the sole DBI
 gap; child-thread random sources remain covered by that lifecycle gap rather
 than the random-source pair.
@@ -96,7 +96,7 @@ justify. The runner executes each passing pair three times and checks exit
 status, stdout, and (for determinism cases) byte-identical repeated output.
 The DBI random-source contract also compares the root thread's post-fault
 random stream byte-for-byte with a ptrace reference run. It deliberately uses
-the fixture's root-only mode because hosted DBI pthread startup remains a
+the fixture's root-only mode because portable DBI pthread startup remains a
 separate declared gap.
 These repeat-run results are compatibility evidence, not an L1/L2 assurance
 level: the runner disables timeslicing and does not pass `--strict --verify`.

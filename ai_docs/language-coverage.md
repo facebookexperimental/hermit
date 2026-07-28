@@ -89,7 +89,7 @@ All entries use the repository nightly Rust toolchain above.
 | --- | --- | --- |
 | Workspace unit/doc tests | `common/digest`, `common/edit-distance`, `common/test-allocator`, `detcore-model`, `detcore`, `hermit`, `hermit-verify` | Active. |
 | Detcore integration | `tests_misc`, `tests_parallelism`, `tests_time` | Active; some cases are ignored for PMU/hardware requirements. |
-| Hermit CLI integration | `arbitrary_binaries`, `cli`, `clock_determinism`, `epoll_determinism`, `hermit_modes`, `ipc_determinism`, `mmap_determinism`, `procfs_determinism`, `random_determinism`, `record_replay`, `signal_determinism`, `stress_suite`, `thread_sync_determinism` | Active on capable/self-hosted hosts. |
+| Hermit CLI integration | `arbitrary_binaries`, `cli`, `clock_determinism`, `epoll_determinism`, `hermit_modes`, `ipc_determinism`, `mmap_determinism`, `procfs_determinism`, `random_determinism`, `record_replay`, `signal_determinism`, `stress_suite`, `thread_sync_determinism` | Active on capable/privileged hosts. |
 | Runtime matrix | `language_runtime_determinism` with six tests | New, explicit `--ignored` matrix because external toolchains are required. |
 | Hermit Verify integration | `hermit-verify/tests/cli.rs` | Active. |
 | Cargo guest package | 32 `[[bin]]` targets in `tests/Cargo.toml` | Built as guests; not each one is an end-to-end Cargo test. |
@@ -114,7 +114,7 @@ not pin GCC.
 | --- | --- | --- |
 | `tests/c` | 31 guests | A broad subset is compiled by Hermit integration tests; the rest are legacy/manual guests. |
 | Dedicated determinism guests | `clock_determinism`, `epoll_determinism`, `ipc_determinism`, `mmap_determinism`, `random_sources`, `signal_determinism`, `thread_sync_determinism` | Active Hermit integration coverage. |
-| Mode/record-replay guests | `getpid`, `uname`, `sysinfo`, `wait_on_child`, `nanosleep-par`, plus 15 compatibility guests selected by `hermit_modes` | Active on capable/self-hosted hosts. |
+| Mode/record-replay guests | `getpid`, `uname`, `sysinfo`, `wait_on_child`, `nanosleep-par`, plus 15 compatibility guests selected by `hermit_modes` | Active on capable/privileged hosts. |
 | Minimal guests | `hello_nostdlib`, `nanosleep-threads-nocrash`, `nanosleep-threads-simple`, `racewrite_nostdlib` | Manual/analyze/stress use. |
 | Legacy lit C | `hello_world_c`, `networking`, `rt_sigaction`, `rt_sigprocmask` | Buck/lit coverage; partially ported through `hermit_modes`. |
 | Chaos C | `lock_granularity`, `order_violation` | Guest sources, not standalone Cargo integration targets. |

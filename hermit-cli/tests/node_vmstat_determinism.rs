@@ -90,7 +90,7 @@ fn node_vmstat_consumers_are_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();
     assert!(
         Path::new(NODE_VMSTAT).is_file(),
-        "{NODE_VMSTAT} is required for the hosted regression"
+        "{NODE_VMSTAT} is required for the portable regression"
     );
 
     let cases = [

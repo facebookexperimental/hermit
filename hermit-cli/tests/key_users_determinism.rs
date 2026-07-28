@@ -58,7 +58,7 @@ impl KeyChurn {
         };
         if key < 0 {
             eprintln!(
-                "skipping /proc/key-users hosted regression: add_key failed: {}",
+                "skipping /proc/key-users portable regression: add_key failed: {}",
                 std::io::Error::last_os_error()
             );
             return None;
@@ -202,7 +202,7 @@ fn key_user_consumers_are_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();
     assert!(
         Path::new(PROC_KEY_USERS).is_file(),
-        "{PROC_KEY_USERS} is required for the hosted regression"
+        "{PROC_KEY_USERS} is required for the portable regression"
     );
     let Some(churn) = KeyChurn::start() else {
         return;

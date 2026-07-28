@@ -8,117 +8,80 @@ LICENSE file in the root directory of this source tree.
 
 # CI and validate.sh alignment
 
-The Rust workflow and local validation use the same capability selectors:
+Hermit CI is partitioned by host capability, not by test duration:
 
-| Lane | Runner | Command | Capability contract |
+| Lane | Workflow and runner | Local command | Capability contract |
 | --- | --- | --- | --- |
-| Portable | GitHub-hosted Ubuntu | `./validate.sh --hosted-only --no-label-pr` | No PMU counters, ptrace CPUID faulting, or KVM required |
-| Hardware | self-hosted `[Linux, X64, hermit, pmu, pmu-serial]` | `./validate.sh --hardware-only --no-label-pr` | PMU, CPUID, KVM, or another host capability is part of the test |
+| Portable | `ci-portable.yml`, `ubuntu-latest` | `./validate.sh portable-only --no-label-pr` | No PMU counters, CPUID faulting, or KVM |
+| Privileged | `ci-privileged.yml`, `[Linux, X64, hermit, pmu]` | `ci/run-dag.sh privileged -j 2` | PMU overflow delivery, CPUID faulting, and read/write `/dev/kvm` |
 
-The default `./validate.sh` remains the developer superset. The focused modes
-exist so either CI subset can be reproduced independently. The tiered workflow
-maps `quick` to portable, `full` to per-PR hardware, and long database and
-PMU chaos stress to the weekly self-hosted `super` profile.
+The portable workflow is the required broad product gate. The privileged
+workflow is a focused capability sentinel and must finish in less than five
+minutes. Long PMU stress, debugger, language-runtime, and application matrices
+do not belong in the scarce privileged lane.
 
-## Portable lane
+## Multi-mode E2E harness
 
-The hosted job enables user and mount namespaces before starting Hermit. This
-is a privilege prerequisite, not a PMU or CPUID dependency. Guest tests in this
-lane either need no hardware event handling or explicitly pass:
+`ci/test_harness.sh` discovers executable tests only at
+`tests/e2e/<category>/*.sh`. The closed category set is:
 
-```text
---max-timeslice=disabled --no-virtualize-cpuid
-```
+- `system-utils`
+- `data-handling`
+- `determinism-stress`
+- `language-runtimes`
+- `applications`
 
-The selector covers exactly 476 of the 889 Cargo-discovered cases:
+Each test embeds strict JSON metadata that declares its lane, modes, backend
+allowlists, observation tuple, timeout, and explicit reasons for every disabled
+mode. `ci/test_harness.sh validate` fails on an unannotated test, an invalid
+backend claim, or a replay backend other than ptrace.
 
-| Group | Cases | Selector |
-| --- | ---: | --- |
-| Workspace unit, bin, and doc baseline | 329 | Existing regular-job selection |
-| Detcore misc without CPUID probes | 22 | `tests_misc`, excluding two RDRAND/CPUID cases and three bounded diagnostics |
-| Detcore parallel without RCB scheduling | 5 | Raw/noop cases, excluding generated `detcore` variants |
-| Flaky guest crate contract | 1 | The crate's standalone Cargo test |
-| Portable Hermit integration cases | 119 | Non-KVM CLI, non-python3-verify LiteInst, strict/verify modes, clock-discipline, futex2, pidfd creation, and process-isolation refusals, non-JVM apps, commands, time, memory, procfs, signals, Python, and rr source contract |
+The modes have distinct contracts:
 
-The same lane enforces the 12 portable L1-L4 working-envelope cells and runs
-the 195-row strict compatibility corpus with the debug Hermit binary and PMU/CPUID disabled.
-The corpus is blocking except for seven bounded diagnostics observed on a
-GitHub-hosted runner with PMU disabled: Rust, Java/Javac, Node.js, the two zstd
-rows, and `top` process-table variance.
+| Mode | Contract |
+| --- | --- |
+| `naked` | Run without Hermit and require the declared nondeterminism to appear |
+| `verify` | Run every allowlisted backend with `--strict --verify` |
+| `replay` | Run ptrace `record start --strict --verify` in an isolated recording directory |
+| `chaos` | Require cross-seed diversity and exact within-seed reproduction |
 
-The lane also requires all six DynamoRIO DBI parity scenarios currently
-marked `pass`. Cargo builds the pinned DynamoRIO runtime and native client;
-external `DYNAMORIO_HOME`, `HERMIT_DRRUN`, and `HERMIT_DBI_CLIENT` variables are
-not part of the CI contract.
+Portable Hermit cells add `--no-virtualize-cpuid` and
+`--max-timeslice=disabled`. Every result records the source SHA and dirty bit,
+test and binary hashes, effective arguments, relaxations, lane, mode, backend,
+duration, and outcome. JSONL, JUnit XML, and a denominator-aware summary are
+stored below `target/e2e/` and uploaded by both workflows.
 
-## Hardware lane
+Each cell receives repo-local `HOME`, `XDG_CONFIG_HOME`, fixtures, captures,
+and recording directories. Hermit guests use the isolated `/tmp/hermit-e2e`
+logical work path so built-in verification cannot leak run-one mutations into
+run two. The checked-in XDG seed is under `tests/e2e/xdg-config/`; developer
+configuration is never read.
 
-The remaining 413 Cargo cases are outside the blocking hosted subset. The
-per-PR hardware lane executes 320 blocking cases, 18 cases run as bounded
-nonblocking diagnostics (eleven hosted and seven hardware), the weekly `super`
-tier executes 69 long or relaxed cases, and five existing gaps remain explicit:
+## DAG wiring
 
-| Group | Cases | Routing | Hardware reason |
-| --- | ---: | --- | --- |
-| Detcore CPUID/RDRAND probes | 2 | Per-PR | Host feature probe and deterministic masking |
-| Detcore time tests | 14 | Per-PR | Nonzero RCB preemption configuration |
-| Detcore parallel variants | 11 | Per-PR | Deterministic RCB preemption assertions |
-| KVM CLI cases | 17 | Per-PR | Read/write `/dev/kvm` is required |
-| DBI pipe backpressure | 1 | Per-PR diagnostic | Bounded known DBI hang from PR #598 |
-| Portable runtime diagnostics | 6 | Hosted per-PR diagnostic | Threaded Java/Node matrix, four python3 `--verify` LiteInst shape-ordering cases, and chaos hello-race gaps |
-| Portable no-PMU diagnostics | 5 | Hosted per-PR diagnostic | Post-fork, network, IPC, and random-source stalls |
-| Pselect signal interruption | 1 | Per-PR diagnostic | Virtual timeout currently wins the delayed-signal race |
-| Buck chaos variants | 8 | Weekly | Explicit one-million-RCB time slice |
-| Relaxed default-mode cases | 55 | 53 weekly, 2 known ignored gaps | Non-sequentialized relaxed execution can block without hardware scheduling |
-| Portable chaos/stress cases | 5 | Weekly | Seed searches exceed hosted per-gate budgets |
-| Runtime, database, scheduling, and syscall targets | 54 | 53 per-PR blocking, 1 per-PR diagnostic | Default PMU/CPUID or record/replay configuration; includes the relocated five-run thread-sync determinism target and the pidfd_open record/replay witness |
-| Ignored runtime/database/analyze tiers | 19 | 12 per-PR, 3 weekly, 4 JVM diagnostics | Default PMU/CPUID configuration |
-| Slow CAS stress | 1 | Per-PR | PMU preemption search and replay |
-| rr syscall corpus | 213 | 210 per-PR, 3 known gaps | Explicit 80-million-RCB time slice |
+`ci/dag/portable.json` has one metadata node and one resource-serialized E2E
+node per category. Those nodes depend on `build.workspace`; other build, lint,
+documentation, and unit-test nodes retain their existing dependencies.
 
-The Detcore time and parallel commands intentionally do not pass `--ignored`.
-Those targets contain no ignored tests; the former workflow selected zero
-cases. Each of the 25 PMU cases runs as an exact, single-threaded Cargo test so
-a leaked tracee cannot hold a whole family harness open. Timing cases have a
-two-minute limit, futex cases five minutes, and the CPU-heavy memory cases 15
-minutes each. A family stops after its first failure, while a green run still
-executes every enumerated case.
+`ci/dag/privileged.json` contains only:
 
-The per-PR hardware lane runs LevelDB's bounded `env_posix_test`. The eight
-Buck chaos cases, PMU-skid-sensitive `analyze_hello_race`, full randomized
-LevelDB suite, SQLite veryquick suite, 53 relaxed default-mode cases, and five
-portable chaos/stress cases remain in the weekly `super` profile because they
-cannot fit the per-PR hosted budget. The two intentionally ignored default-mode
-known hangs remain explicit gaps.
+- the focused Hermit and Detcore build;
+- CPUID-faulting validation;
+- PMU overflow/skid validation; and
+- the KVM E2E shell/environment sentinel.
 
-The rr gate excludes `rr_ppoll` (unsupported `ppoll` operation), `rr_rlimit`
-(host policy rejects `setrlimit`), and `rr_sched_yield_to_lower_priority` (priority scheduling gap).
+Use `ci/run-dag.sh portable ascii` or `ci/run-dag.sh privileged ascii` to audit
+the dependency layers without running tests.
 
-The stable record/replay integration cases remain blocking. The intermittently
-flaky `record_replay_matrix`, four JVM cases, the DBI pipe-backpressure case,
-the pselect signal-interruption case, and the eleven hosted diagnostics
-still execute on every pull request as bounded nonblocking diagnostics tracked
-by PRs #678, #657, #598, #673, and #712.
+## Reconciliation checklist
 
-The hardware lane also gates the three record/replay working-envelope cells,
-the 128-row R/R compatibility corpus, debugger
-integration, and ptrace backend parity. Missing rr sources, namespaces, PMU,
-CPUID, KVM, or runtime prerequisites fail the lane instead of silently reducing
-coverage.
+When adding or changing an E2E test:
 
-## Workflow prerequisites
-
-The hosted job installs the Unix commands, language tools, app binaries,
-cargo-nextest, rustfmt, and Clippy used by its selected tests. The self-hosted
-job initializes the rr submodule and preflights PMU, KVM, namespaces, runtime
-tools, databases, and debuggers before starting the hardware selector. Hardware
-and weekly-super jobs require the dedicated `pmu-serial` runner label so PMU
-tests cannot overlap unrelated work on the two general self-hosted runners.
-
-When adding a test:
-
-1. Identify whether it asserts PMU/RCB, CPUID, KVM, or another host capability.
-2. Put it in exactly one validation tier.
-3. If it is portable, make the disabling flags explicit in its command helper.
-4. Run both focused modes on a capable host and the default full validation.
-5. Update the case totals in this document.
+1. Put the workload in exactly one `tests/e2e/<category>/` shell file.
+2. Declare all four modes as enabled or explicitly disabled.
+3. Add only locally proven backend combinations to an allowlist.
+4. Run `ci/test_harness.sh validate` and inspect `plan --format json`.
+5. Run the affected mode/backend cells and retain their JSONL/JUnit results.
+6. Update the owning DAG only when a category or capability dependency changes.
+7. Never replace a semantic workload with `--help`, `--version`, or a no-op
+   launcher probe.

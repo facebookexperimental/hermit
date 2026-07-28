@@ -7,27 +7,27 @@ with explicit dependencies and resource limits, so the scheduler can run
 independent gates concurrently. On hosts with delegated cgroup v2 support, it
 can also box each node for memory limits and full process-subtree teardown.
 
-- [`hosted.json`](hosted.json) — mirrors `validate.sh`'s **`--hosted-only`**
-  lane (`run_hosted_only_suite`), the GitHub-hosted `regular` job in
-  [`.github/workflows/ci-hosted.yml`](../../.github/workflows/ci-hosted.yml).
+- [`portable.json`](portable.json) — mirrors `validate.sh`'s **`--portable-only`**
+  lane (`run_portable_only_suite`), the GitHub-managed portable `regular` job in
+  [`.github/workflows/ci-portable.yml`](../../.github/workflows/ci-portable.yml).
   No PMU / CPUID interception required.
-- [`hardware.json`](hardware.json) — mirrors `validate.sh`'s **`--hardware-only`**
-  lane (`run_hardware_validation`), the self-hosted `hardware` job in
-  [`.github/workflows/ci-selfhosted.yml`](../../.github/workflows/ci-selfhosted.yml).
+- [`privileged.json`](privileged.json) — implements the focused capability
+  contract for the privileged job in
+  [`.github/workflows/ci-privileged.yml`](../../.github/workflows/ci-privileged.yml).
   Requires PMU + `/dev/kvm`.
 
 Run a lane with the wrapper:
 
 ```sh
-ci/run-dag.sh hosted   --max-mem 32G          # memory-aware -j
-ci/run-dag.sh hardware -j 2                    # PMU lane, one gate at a time
-ci/run-dag.sh hosted   ascii                   # visualize instead of run
+ci/run-dag.sh portable   --max-mem 32G          # memory-aware -j
+ci/run-dag.sh privileged -j 2                    # PMU lane, one gate at a time
+ci/run-dag.sh portable   ascii                   # visualize instead of run
 ```
 
 ## Status: active validation lanes
 
-`hosted.json` drives the required `Regular tests (GitHub-hosted)` job, and
-`hardware.json` drives both self-hosted PMU entrypoints. Existing job names,
+`portable.json` drives the required `Regular tests (GitHub-managed portable)` job, and
+`privileged.json` drives both privileged PMU entrypoints. Existing job names,
 the merge-gate contract, and the outer PMU `flock` stay unchanged; only the
 internal scheduler changes. `validate.sh` remains the source of truth for
 individual gate commands.
@@ -38,14 +38,14 @@ three nonblocking post-DAG diagnostics run in the scheduled `super` tier so a
 known host-sensitive hang cannot consume the required serialized lane.
 
 The `Validation Levels` workflow no longer launches a second copy of
-`--hosted-only` for every pull request. Its quick lane remains available by
-manual dispatch, while merge-group hardware and scheduled super validation are
+`--portable-only` for every pull request. Its quick lane remains available by
+manual dispatch, while merge-group privileged and scheduled super validation are
 unchanged. The manual [`ci-dag.yml`](../../.github/workflows/ci-dag.yml)
 workflow runs either DAG on demand.
 
 ### Runner dependency
 
-This change pins `rrnewton/agent-utils` at v0.2.0 as an HTTPS submodule. Hosted
+This change pins `rrnewton/agent-utils` at v0.2.0 as an HTTPS submodule. Portable
 CI initializes only `agent-utils` instead of all submodules, then executes the
 dependency-free Python runner so per-node performance CSVs are available
 without an install step. `ci/run-dag.sh` also accepts
@@ -55,15 +55,15 @@ without an install step. `ci/run-dag.sh` also accepts
 
 A successful PR run on 2026-07-26 provided the baseline:
 
-- The blocking hosted validation took 14 minutes after setup.
+- The blocking portable validation took 14 minutes after setup.
 - Eight nonblocking diagnostics then ran serially for another 20 minutes,
   extending the required workflow from useful signal at minute 17 to completion
   at minute 37.
-- `Validation Levels` independently repeated the same 14-minute hosted suite,
-  consuming another GitHub-hosted runner.
+- `Validation Levels` independently repeated the same 14-minute portable suite,
+  consuming another GitHub-managed portable runner.
 
 The diagnostics now run in the scheduled `super` tier. The required lane uses a 14 GiB memory budget, which the current model
-maps to `-j 2` on the 16 GiB hosted runner. Compile, lint, documentation, unit,
+maps to `-j 2` on the 16 GiB portable runner. Compile, lint, documentation, unit,
 and contract nodes may overlap when dependencies allow, while Hermit guest
 executions retain the
 `hermit_guest: 1` exclusion. Per-node performance reports are uploaded from
@@ -90,15 +90,15 @@ moving parts:
 
 - **Composite envelope gates reuse `validate.sh`'s own standalone entrypoints**
   so there is one source of truth: `test.strict_compat` runs
-  `./validate.sh --hosted-strict-compat-only`, and (hardware) `rr.compat_baseline`
-  runs `./validate.sh --rr-compat-only`. The hardware flag builds release;
-  hosted strict compatibility reuses `STRICT_COMPAT_HERMIT_BIN` from the
+  `./validate.sh --portable-strict-compat-only`, and (privileged) `rr.compat_baseline`
+  runs `./validate.sh --rr-compat-only`. The privileged selector builds release;
+  portable strict compatibility reuses `STRICT_COMPAT_HERMIT_BIN` from the
   preceding workspace build. Without that override, the strict flag builds
   release as before.
 - **The DBI stderr-isolation CLI case is a separate 120-second node** so a
   backend hang fails quickly without consuming the aggregate CLI budget. The
   aggregate node skips that case, so the test set remains unchanged.
-- **Hosted strict compatibility starts after every non-guest Cargo node** so
+- **Portable strict compatibility starts after every non-guest Cargo node** so
   its `shell-build` run1/run2 comparison cannot observe concurrent target or
   cache mutation. Those short nodes still run in parallel before the barrier.
 - **Hermit integration targets use one Cargo invocation** with repeated
@@ -106,9 +106,9 @@ moving parts:
   plans and links the selected targets together, then executes their separate
   test binaries serially. The `pmu.*` exact-case gates retain their `for` loops
   and per-case `timeout`s to preserve fail-fast hardware isolation.
-- **The hosted `envelope_levels` gate is inlined** (L1–L4 over the three
+- **The portable `envelope_levels` gate is inlined** (L1–L4 over the three
   `ENVELOPE_PROBES`: `true`, `echo`, `date`) because it has no standalone
-  `validate.sh` flag. It mirrors `run_hosted_envelope_levels` in `validate.sh`.
+  `validate.sh` flag. It mirrors `run_portable_envelope_levels` in `validate.sh`.
   If `ENVELOPE_PROBES` changes in `validate.sh`, update this node.
 
 ## Resource model (outer + inner limits)
@@ -117,13 +117,13 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
 
 **Outer** — how many gates may co-run:
 
-- `resource_caps` gates *scarce* resources. `hosted.json` sets
+- `resource_caps` gates *scarce* resources. `portable.json` sets
   `{"hermit_guest": 1}`; every gate that executes Hermit on guest programs
   carries `resources: {"hermit_guest": 1}`, so they run **one at a time**
   (they share the working filesystem, are mutually nondeterministic, and on a
   PMU host contend for the counter). Non-guest gates — `build`, `clippy`,
   `rustfmt`, doctests, `rustdoc`, nextest of non-Hermit crates — carry no
-  scarce resource and parallelize freely. `hardware.json` uses `{"pmu": 1}`
+  scarce resource and parallelize freely. `privileged.json` uses `{"pmu": 1}`
   the same way; the PMU is genuinely exclusive, so that lane is essentially
   serial after the initial builds.
 - `--max-mem SPEC` (or `-j N`) bounds total concurrency. With `--max-mem`, the
@@ -144,7 +144,7 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
 > **The `rss_baseline_bytes` / `hard_mem_max_bytes` / `est_duration_s` values
 > are hand-estimated, not measured.** They are safe starting points for
 > `--max-mem` sizing and inner caps, not benchmarks. Refine them from a real
-> run's `--perf-dir` CSVs (`ci/run-dag.sh hosted --perf-dir ./perf`) before
+> run's `--perf-dir` CSVs (`ci/run-dag.sh portable --perf-dir ./perf`) before
 > relying on tight memory budgets.
 
 ## Conservatism and how to relax it

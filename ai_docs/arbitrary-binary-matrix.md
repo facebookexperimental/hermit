@@ -4,9 +4,9 @@ Last tested: 2026-07-21
 
 This report measures how unmodified host binaries behave under Hermit. It
 separates a cheap launch/version matrix from functional workloads that exercise
-subprocesses, files, sockets, and threads. The launch matrix is also represented
-by a public Cargo integration test so regressions in the passing subset are
-caught on the self-hosted CI runner.
+subprocesses, files, sockets, and threads. The semantic run matrix is also
+represented by a public Cargo integration test so regressions in the passing
+subset are caught in portable CI.
 
 ## Test environment
 
@@ -115,6 +115,9 @@ The tested base does not contain the open `CLONE_VFORK` implementation in [PR #2
 - `run_arbitrary_binary_matrix` discovers installed tools and runs static and dynamic ELF, shell, Python, Node, Java, Go, curl, wget, Git, GCC, Make, CMake, SQLite, and a direct Cargo binary. Missing optional packages are skipped; `ls` and `sh` are required baselines.
 - `record_replay_stable_arbitrary_binaries` runs `record start --verify` for the locally proven subset: BusyBox, `ls`, `sh`, system Python, curl, wget, system Git, GCC, Make, and direct Cargo.
 
-The existing self-hosted CI job runs `cargo test -p hermit`, so Cargo discovers these integration tests without a workflow change. On this host the run test covered 15 installed categories in 1.9 seconds, and the stable record/replay test covered 10 categories in 16.4 seconds.
+Portable CI runs the curated semantic command matrix. The stable record/replay
+matrix remains part of explicit full or scheduled validation. On the measured
+host, the original run test covered 15 installed categories in 1.9 seconds and
+the stable record/replay test covered 10 categories in 16.4 seconds.
 
 Keep failing cases out of the green CI matrix until their linked issues are fixed. When a fix lands, move the smallest corresponding probe into the stable record/replay set and retain the functional workload as regression coverage.

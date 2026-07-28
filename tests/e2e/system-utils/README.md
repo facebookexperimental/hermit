@@ -9,13 +9,13 @@ Build a release binary and run the ptrace suite:
 
 ```shell
 cargo build --release -p hermit
-tests/e2e/system-utils/run.sh target/release/hermit ptrace
+tests/e2e/lib/system-utils/run.sh target/release/hermit ptrace
 ```
 
 Run the currently supported KVM subset on a host with `/dev/kvm` access:
 
 ```shell
-tests/e2e/system-utils/run.sh target/release/hermit kvm
+tests/e2e/lib/system-utils/run.sh target/release/hermit kvm
 ```
 
 Individual scripts accept the same optional `HERMIT_BIN BACKEND` arguments.

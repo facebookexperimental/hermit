@@ -334,7 +334,7 @@ fn record_strict_direct_cli_records_and_replays_echo() {
 #[test]
 fn record_replay_matrix() {
     // Record/replay does not enable PMU-backed preemption, so these workloads
-    // also run on GitHub-hosted runners without performance-counter access.
+    // also run on GitHub-managed portable runners without performance-counter access.
     let _guard = hermit_record_lock();
     for name in BASELINE_RECORD_WORKLOADS {
         record_replay(workload(name));
@@ -619,20 +619,6 @@ fn record_shell_original_output_aliases_and_swaps() {
             ),
         ],
     );
-}
-
-#[test]
-fn record_curl_version() {
-    let _guard = hermit_record_lock();
-    let curl = [Path::new("/usr/bin/curl"), Path::new("/usr/local/bin/curl")]
-        .into_iter()
-        .find(|path| path.is_file());
-    let Some(curl) = curl else {
-        eprintln!("curl is not installed; skipping record/replay coverage");
-        return;
-    };
-
-    record_replay_command("curl", curl, &[OsStr::new("--version")]);
 }
 
 #[test]

@@ -7,7 +7,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Report the health of a repository's registered self-hosted GitHub runners.
+//! Report the health of a repository's registered privileged GitHub runners.
 //!
 //! Run locally through the forward proxy:
 //!
@@ -34,7 +34,7 @@ const DEFAULT_REPOSITORY: &str = "rrnewton/hermit";
 const DEFAULT_OFFLINE_THRESHOLD_SECONDS: u64 = 60 * 60;
 const DEFAULT_RUN_SCAN_LIMIT: usize = 20;
 const DEFAULT_STATE_FILE: &str = "target/runner-health/state.tsv";
-const DEFAULT_WORKFLOWS: &[&str] = &["ci-selfhosted.yml", "validation-levels.yml", "ci-dag.yml"];
+const DEFAULT_WORKFLOWS: &[&str] = &["ci-privileged.yml", "validation-levels.yml", "ci-dag.yml"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Runner {
@@ -93,8 +93,8 @@ Options:\n\
   --run-scan-limit N                Completed runs scanned per workflow (default: 20)\n\
   --state-file PATH                 Persistent state file\n\
                                       (default: target/runner-health/state.tsv)\n\
-  --workflow FILE_OR_ID             Self-hosted workflow to scan; repeatable\n\
-                                      (defaults: ci-selfhosted.yml, validation-levels.yml, ci-dag.yml)\n\
+  --workflow FILE_OR_ID             Privileged workflow to scan; repeatable\n\
+                                      (defaults: ci-privileged.yml, validation-levels.yml, ci-dag.yml)\n\
   -h, --help                        Show this help\n\
 \n\
 Exit status: 0 healthy/grace period, 1 health alert, 2 operational error."
@@ -439,7 +439,7 @@ fn annotation(kind: &str, message: &str) {
             .replace('%', "%25")
             .replace('\r', "%0D")
             .replace('\n', "%0A");
-        println!("::{kind} title=Self-hosted runner health::{escaped}");
+        println!("::{kind} title=Privileged runner health::{escaped}");
     }
 }
 
@@ -460,10 +460,10 @@ fn run(options: Options) -> Result<bool, String> {
     )?)?;
     if runners.is_empty() {
         println!(
-            "Self-hosted runner health: {}\nregistered: 0\nALERT: no self-hosted runners are registered",
+            "Privileged runner health: {}\nregistered: 0\nALERT: no privileged runners are registered",
             options.repository
         );
-        annotation("error", "no self-hosted runners are registered");
+        annotation("error", "no privileged runners are registered");
         return Ok(true);
     }
 
@@ -529,7 +529,7 @@ fn run(options: Options) -> Result<bool, String> {
         }
     }
 
-    println!("Self-hosted runner health: {}", options.repository);
+    println!("Privileged runner health: {}", options.repository);
     println!("registered: {}", runners.len());
     println!(
         "offline alert threshold: {}",
@@ -537,7 +537,7 @@ fn run(options: Options) -> Result<bool, String> {
     );
     if let Some(run) = runs.iter().find(|run| run.conclusion == "success") {
         println!(
-            "last successful workflow run (may not use a self-hosted runner): {} | {} | {}",
+            "last successful workflow run (may not use a privileged runner): {} | {} | {}",
             run.updated_at, run.name, run.html_url
         );
     } else {

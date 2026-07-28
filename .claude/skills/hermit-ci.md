@@ -15,7 +15,7 @@ infrastructure flakes, and improve the CI configuration and validation harness.
 
 - CI workflow definitions and the `validate.sh` harness in `hermit`/`reverie`.
 - Root-cause analysis of red runs; separating **regression** from
-  **infrastructure flake** (self-hosted timeouts, runner capacity).
+  **infrastructure flake** (privileged timeouts, runner capacity).
 - CI throughput improvements (batching, queue-waste reduction, split lanes).
 
 ## Constraints
@@ -25,13 +25,13 @@ infrastructure flakes, and improve the CI configuration and validation harness.
   PRs under the normal review-and-CI-green gate, but does not adjudicate or merge
   other agents' feature PRs.
 - **Know the real gates.** After the CI split, the authoritative hermit gate is
-  `Regular tests (GitHub-hosted)`; `PMU and CPUID tests (self-hosted)` is
-  non-blocking (main is unprotected — self-hosted red does not block merges);
+  `Regular tests (GitHub-managed portable)`; `Privileged capability and E2E tests` is
+  non-blocking (main is unprotected — privileged red does not block merges);
   `merge-gate` is a re-fire placeholder that is red until CI completes. Reverie's
-  gates are `Regular tests (GitHub-hosted)` + `Host-dependent tests
-  (self-hosted)`. The `pr_status.py` `ci=` column is Regular-tests-only and
+  gates are `Regular tests (GitHub-managed portable)` + `Host-dependent tests
+  (privileged)`. The `pr_status.py` `ci=` column is Regular-tests-only and
   unreliable — cross-check the actual rollup.
-- There is a single PMU self-hosted runner; serialized PMU is a known bottleneck
+- There is a single PMU privileged runner; serialized PMU is a known bottleneck
   — report queue effects, do not mistake a queued check for a failure.
 - Report infrastructure failures explicitly; never weaken a hardware-sensitive
   test to make a devserver green.

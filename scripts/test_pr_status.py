@@ -19,7 +19,7 @@ class ClassifyCiRollupTest(unittest.TestCase):
     def test_failure_conclusion_is_red(self) -> None:
         checks = [
             {
-                "name": pr_status.REGULAR_HOSTED_CHECK,
+                "name": pr_status.REGULAR_PORTABLE_CHECK,
                 "conclusion": "FAILURE",
                 "status": "COMPLETED",
             },
@@ -31,7 +31,7 @@ class ClassifyCiRollupTest(unittest.TestCase):
     def test_incomplete_status_is_pending(self) -> None:
         checks = [
             {
-                "name": pr_status.REGULAR_HOSTED_CHECK,
+                "name": pr_status.REGULAR_PORTABLE_CHECK,
                 "conclusion": "",
                 "status": "IN_PROGRESS",
             }
@@ -43,7 +43,7 @@ class ClassifyCiRollupTest(unittest.TestCase):
     def test_all_success_is_green(self) -> None:
         checks = [
             {
-                "name": pr_status.REGULAR_HOSTED_CHECK,
+                "name": pr_status.REGULAR_PORTABLE_CHECK,
                 "conclusion": "SUCCESS",
                 "status": "COMPLETED",
             }
@@ -61,7 +61,7 @@ class ClassifyCiRollupTest(unittest.TestCase):
                 "startedAt": "2026-07-26T12:00:00Z",
             },
             {
-                "name": pr_status.REGULAR_HOSTED_CHECK,
+                "name": pr_status.REGULAR_PORTABLE_CHECK,
                 "conclusion": "SUCCESS",
                 "status": "COMPLETED",
                 "startedAt": "2026-07-26T12:01:00Z",
@@ -74,13 +74,13 @@ class ClassifyCiRollupTest(unittest.TestCase):
     def test_latest_authoritative_rerun_wins(self) -> None:
         checks = [
             {
-                "name": pr_status.REGULAR_HOSTED_CHECK,
+                "name": pr_status.REGULAR_PORTABLE_CHECK,
                 "conclusion": "FAILURE",
                 "status": "COMPLETED",
                 "startedAt": "2026-07-26T12:00:00Z",
             },
             {
-                "name": pr_status.REGULAR_HOSTED_CHECK,
+                "name": pr_status.REGULAR_PORTABLE_CHECK,
                 "conclusion": "SUCCESS",
                 "status": "COMPLETED",
                 "startedAt": "2026-07-26T12:05:00Z",
@@ -93,14 +93,14 @@ class ClassifyCiRollupTest(unittest.TestCase):
     def test_newer_queued_run_wins_over_older_success(self) -> None:
         checks = [
             {
-                "name": pr_status.REGULAR_HOSTED_CHECK,
+                "name": pr_status.REGULAR_PORTABLE_CHECK,
                 "conclusion": "SUCCESS",
                 "status": "COMPLETED",
                 "startedAt": "2026-07-26T12:00:00Z",
                 "detailsUrl": "https://github.com/o/r/actions/runs/10/job/1",
             },
             {
-                "name": pr_status.REGULAR_HOSTED_CHECK,
+                "name": pr_status.REGULAR_PORTABLE_CHECK,
                 "conclusion": "",
                 "status": "QUEUED",
                 "startedAt": "0001-01-01T00:00:00Z",
@@ -111,15 +111,15 @@ class ClassifyCiRollupTest(unittest.TestCase):
             pr_status.classify_ci_rollup("rrnewton/hermit", checks), "pending"
         )
 
-    def test_hermit_self_hosted_failure_is_nonblocking(self) -> None:
+    def test_hermit_privileged_failure_is_nonblocking(self) -> None:
         checks = [
             {
-                "name": pr_status.REGULAR_HOSTED_CHECK,
+                "name": pr_status.REGULAR_PORTABLE_CHECK,
                 "conclusion": "SUCCESS",
                 "status": "COMPLETED",
             },
             {
-                "name": "PMU and CPUID tests (self-hosted)",
+                "name": "Privileged capability and E2E tests",
                 "conclusion": "FAILURE",
                 "status": "COMPLETED",
             },
@@ -128,30 +128,30 @@ class ClassifyCiRollupTest(unittest.TestCase):
             pr_status.classify_ci_rollup("rrnewton/hermit", checks), "green"
         )
 
-    def test_reverie_requires_hosted_and_host_dependent_checks(self) -> None:
-        hosted = {
-            "name": pr_status.REGULAR_HOSTED_CHECK,
+    def test_reverie_requires_portable_and_host_dependent_checks(self) -> None:
+        portable = {
+            "name": pr_status.REGULAR_PORTABLE_CHECK,
             "conclusion": "SUCCESS",
             "status": "COMPLETED",
         }
         host_dependent = {
-            "name": "Host-dependent tests (self-hosted)",
+            "name": "Host-dependent tests (privileged)",
             "conclusion": "SUCCESS",
             "status": "COMPLETED",
         }
         self.assertEqual(
-            pr_status.classify_ci_rollup("rrnewton/reverie", [hosted]), "pending"
+            pr_status.classify_ci_rollup("rrnewton/reverie", [portable]), "pending"
         )
         self.assertEqual(
             pr_status.classify_ci_rollup(
-                "rrnewton/reverie", [hosted, host_dependent]
+                "rrnewton/reverie", [portable, host_dependent]
             ),
             "green",
         )
 
         failed = {**host_dependent, "conclusion": "FAILURE"}
         self.assertEqual(
-            pr_status.classify_ci_rollup("rrnewton/reverie", [hosted, failed]),
+            pr_status.classify_ci_rollup("rrnewton/reverie", [portable, failed]),
             "red",
         )
 
@@ -258,7 +258,7 @@ class ParseWorkflowRunTest(unittest.TestCase):
             "rrnewton/hermit",
             {
                 "headSha": "6cd2b1d4716d165fed5c46bbeadeceebde7c9754",
-                "workflowName": "CI (GitHub-hosted)",
+                "workflowName": "CI (GitHub-managed portable)",
                 "name": "commit message title",
                 "conclusion": "failure",
                 "status": "completed",
@@ -266,7 +266,7 @@ class ParseWorkflowRunTest(unittest.TestCase):
             },
         )
         self.assertEqual(run.head_sha, "6cd2b1d4")
-        self.assertEqual(run.workflow_name, "CI (GitHub-hosted)")
+        self.assertEqual(run.workflow_name, "CI (GitHub-managed portable)")
         self.assertEqual(run.state, "fail")
         self.assertEqual(run.created_at_display, "2026-07-27 18:03")
 
@@ -301,8 +301,8 @@ class RenderMainCiTest(unittest.TestCase):
 
     def test_counts_ordering_and_failure_highlight(self) -> None:
         runs = [
-            self._run("aaaaaaaa", "CI (GitHub-hosted)", "success", "2026-07-27T10:00:00Z"),
-            self._run("bbbbbbbb", "CI (GitHub-hosted)", "failure", "2026-07-27T12:00:00Z"),
+            self._run("aaaaaaaa", "CI (GitHub-managed portable)", "success", "2026-07-27T10:00:00Z"),
+            self._run("bbbbbbbb", "CI (GitHub-managed portable)", "failure", "2026-07-27T12:00:00Z"),
             self._run("cccccccc", "Docs", "", "2026-07-27T13:00:00Z"),
         ]
         report = pr_status.render_main_ci(runs, "rrnewton/hermit", 10)
@@ -316,7 +316,7 @@ class RenderMainCiTest(unittest.TestCase):
         self.assertIn("FAILURES (1)", report)
         self.assertIn("FAIL", report)
         # The failing commit is called out in the FAILURES block with its reason.
-        self.assertIn("bbbbbbbb CI (GitHub-hosted) (failure)", report)
+        self.assertIn("bbbbbbbb CI (GitHub-managed portable) (failure)", report)
 
     def test_no_failures_omits_failure_block(self) -> None:
         runs = [self._run("aaaaaaaa", "Docs", "success", "2026-07-27T10:00:00Z")]

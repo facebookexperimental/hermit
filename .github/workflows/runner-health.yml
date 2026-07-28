@@ -1,4 +1,4 @@
-name: Self-hosted runner health
+name: Privileged runner health
 
 on:
   schedule:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: self-hosted-runner-health
+  group: privileged-runner-health
   cancel-in-progress: true
 
 permissions:

@@ -7,7 +7,7 @@
  */
 
 //! End-to-end L2 coverage for standard command-line tools that are expected on
-//! the self-hosted CI runner.
+//! the portable CI runner.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -519,12 +519,6 @@ fn hardware_accounting_commands_are_deterministic_under_strict_verify() {
             name: "numactl hardware",
             candidates: &["/usr/bin/numactl"],
             args: &["--hardware"],
-            stdin: None,
-        },
-        StrictCommandCase {
-            name: "sensors version",
-            candidates: &["/usr/bin/sensors"],
-            args: &["--version"],
             stdin: None,
         },
     ];

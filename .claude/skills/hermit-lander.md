@@ -32,8 +32,8 @@ integration starts clean.
 - **Never push directly to `main`; never force-push a shared branch or `main`.**
   Land via `gh pr merge --squash --admin` only when the authoritative gate is
   green at the exact PR head.
-- **Know the real gates.** Hermit: `Regular tests (GitHub-hosted)` (authoritative
-  after the CI split); `PMU and CPUID (self-hosted)` non-blocking (main
+- **Know the real gates.** Hermit: `Regular tests (GitHub-managed portable)` (authoritative
+  after the CI split); `Privileged capability and E2E tests` non-blocking (main
   unprotected); `merge-gate` is a re-fire placeholder. Reverie: `Regular tests`
   + `Host-dependent tests` both SUCCESS. `human-review` label and draft status
   are NOT blockers. Never land on `mergeStateStatus=UNKNOWN` (re-poll) or
