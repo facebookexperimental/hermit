@@ -1421,6 +1421,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let fd = call.fd();
         let (cloexec, nonblocking) = match call.request() {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-1142): Review deterministic SIOCETHTOOL rejection.
+            // Ethernet link state belongs to the host network namespace and can change between
+            // runs. Match record/replay's established policy instead of exposing that state.
+            syscalls::ioctl::Request::SIOCETHTOOL(_) => return Err(Errno::ENODEV.into()),
             syscalls::ioctl::Request::FIOCLEX => (Some(true), None),
             syscalls::ioctl::Request::FIONCLEX => (Some(false), None),
             syscalls::ioctl::Request::FIONBIO(value) => {
