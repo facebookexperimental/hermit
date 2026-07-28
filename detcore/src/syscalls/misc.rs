@@ -235,7 +235,7 @@ fn write_random_chunk(
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-TBD): Review the backend-independent random-device stream.
+// TODO-HUMAN-REVIEW(PR-1096): Review the backend-independent random-device stream.
 fn canonical_random_device_byte(seed: u64, index: u64) -> u8 {
     let seed_byte = seed.rotate_right(((index % 8) * 8) as u32) as u8;
     (index as u8)
@@ -495,7 +495,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review the backend-independent random-device stream.
+    // TODO-HUMAN-REVIEW(PR-1096): Review the backend-independent random-device stream.
     /// Fill guest memory from the canonical stream used by every backend's
     /// `/dev/random` and `/dev/urandom` virtualization.
     pub(super) fn fill_random_device_bytes<G: Guest<Self>>(

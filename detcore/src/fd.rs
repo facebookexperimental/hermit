@@ -115,7 +115,7 @@ struct OpenFileDescription {
     /// This should always be `Some` for regular files, as we eagerly populate it.
     stat: Option<DetStat>,
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review canonical random-device cursor sharing.
+    // TODO-HUMAN-REVIEW(PR-1096): Review canonical random-device cursor sharing.
     /// Cursor into Hermit's backend-independent random-device byte stream.
     #[serde(default)]
     random_device_offset: u64,
@@ -287,14 +287,14 @@ impl DetFd {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review canonical random-device cursor sharing.
+    // TODO-HUMAN-REVIEW(PR-1096): Review canonical random-device cursor sharing.
     /// Return the cursor shared by aliases of this random-device open file.
     pub(crate) fn random_device_offset(&self) -> u64 {
         self.description().random_device_offset
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-TBD): Review canonical random-device cursor sharing.
+    // TODO-HUMAN-REVIEW(PR-1096): Review canonical random-device cursor sharing.
     /// Advance the cursor shared by aliases of this random-device open file.
     pub(crate) fn advance_random_device_offset(&self, count: usize) {
         let mut description = self.description();
