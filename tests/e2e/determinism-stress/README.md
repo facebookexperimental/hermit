@@ -39,6 +39,8 @@ KEEP_DETERMINISM_STRESS_ARTIFACTS=1 retain logs under target/
 | `examples.sh` | Every executable/program file in `examples/`; the manifest fails closed when a new example appears. |
 | `random.sh` | `getrandom`, `/dev/random`, `/dev/urandom`, glibc/Python PRNGs, `secrets`, and `SystemRandom`. |
 | `thread-racing.sh` | Barriers, mutex/condvar contention, rwlocks, semaphores, cancellation, TLS across fork, and C11 lock-free CAS/fetch-add contention. |
+| `thread-contention.sh` | Mutex acquisition traces, multi-fd `poll`/`epoll` delivery, a causally chained SIGUSR1/SIGUSR2/SIGALRM sequence, and process-shared synchronization over anonymous `MAP_SHARED` after `fork`. |
+| `process-chains.sh` | A 13-process two-generation fork tree with deterministic exit propagation and a five-stage C pipe transform chain. |
 | `time-clock.sh` | `gettimeofday`, realtime/monotonic/process/thread/boottime `clock_gettime`, `clock_nanosleep`, and formatted timestamps. |
 | `pid-tid.sh` | Virtual PID, PPID, and TID values across pthreads and fork/wait. |
 | `signals.sh` | Pending/delivered signal order, masks, alternate stacks, reentrancy, and interrupted/restarted blocking syscalls. |
