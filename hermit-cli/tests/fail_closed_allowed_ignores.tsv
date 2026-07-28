@@ -17,6 +17,9 @@ command_strict_verify	common_commands_are_deterministic_under_strict_verify	requ
 command_strict_verify	python_getrandom_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and /usr/bin/python3
 command_strict_verify	python_prlimit64_query_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and /usr/bin/python3
 epoll_determinism	notification_control_syscalls_reach_strict_verify_l2	e2e requires PMU and mount namespaces
+frontier_app_benchmarks	http_server_is_nondeterministic_natively_and_l2_under_hermit	requires PMU, mount namespaces, and Python 3
+frontier_app_benchmarks	redis_commands_are_nondeterministic_natively_and_l2_under_hermit	requires PMU, mount namespaces, redis-server, and redis-cli
+frontier_app_benchmarks	sqlite_transaction_is_nondeterministic_natively_and_l2_under_hermit	requires PMU, mount namespaces, and sqlite3
 hermit_modes	chaos_buck_clone	requires PMU branch counters and working mount namespaces
 hermit_modes	chaos_buck_getpid	requires PMU branch counters and working mount namespaces
 hermit_modes	chaos_buck_hello_alarm	requires PMU branch counters and working mount namespaces

@@ -4019,6 +4019,7 @@ function run_hardware_validation {
     run_check "PMU analyze scenarios" cargo test -p hermit --test analyze -- --ignored --skip analyze_hello_race --test-threads=1
     run_check "Runtime entropy scenarios" cargo test -p hermit --test language_runtime_determinism -- --ignored --test-threads=1
     run_check "PMU Python stdlib scenarios" cargo test -p hermit --test python_stdlib -- --ignored --test-threads=1
+    run_check "Frontier application benchmarks" cargo test -p hermit --test frontier_app_benchmarks -- --ignored --test-threads=1
     run_check "PMU stress search and replay" cargo test -p hermit --test stress_suite slow_cas_search_and_replay -- --exact --ignored --test-threads=1
 
     run_check "Build pinned LevelDB integration fixture" ./hermit-cli/tests/prepare_leveldb.sh "$leveldb_install" "$leveldb_build"
