@@ -44,7 +44,7 @@
     },
     {
       "group": "e2e", "job": "applications",
-      "desc": "Privileged KVM shell and environment verification",
+      "desc": "Privileged KVM shell, environment, and Python example verification",
       "cmd": "./ci/test_harness.sh run --lane privileged --category applications --results target/e2e/privileged/applications/results.jsonl --junit target/e2e/privileged/applications/junit.xml",
       "deps": ["build.privileged_tests", "e2e.metadata"],
       "timeout": 60,
