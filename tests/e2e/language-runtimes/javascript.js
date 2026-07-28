@@ -11,7 +11,9 @@
 
 const crypto = require("crypto");
 const fs = require("fs");
+const fsPromises = require("fs/promises");
 const os = require("os");
+const path = require("path");
 const {Worker, isMainThread, workerData} = require("worker_threads");
 
 const THREADS = 4;
@@ -97,7 +99,65 @@ if (!isMainThread) {
     console.log(`THREAD workers=${THREADS} counter=${state[COUNTER]} schedule_sha256=${digest}`);
   }
 
-  function systemProbe() {
+  async function applicationProbe() {
+    const workspace = await fsPromises.mkdtemp(path.join(os.tmpdir(), "hermit-node-deep-"));
+    try {
+      const dataPath = path.join(workspace, "payload.json");
+      const journalPath = path.join(workspace, "journal.txt");
+      const payload = {
+        name: "hermit-node-deep-app",
+        version: 1,
+        values: Array.from({length: 32}, (_, index) => ({
+          id: index,
+          square: index * index,
+          parity: index % 2 === 0 ? "even" : "odd",
+        })),
+        nested: {alpha: [1, 2, 3], beta: {stable: "yes"}},
+      };
+      const encoded = `${JSON.stringify(payload, null, 2)}\n`;
+
+      await fsPromises.writeFile(dataPath, encoded, "utf8");
+      const [decodedText, stat] = await Promise.all([
+        fsPromises.readFile(dataPath, "utf8"),
+        fsPromises.stat(dataPath),
+      ]);
+      const decoded = JSON.parse(decodedText);
+      if (JSON.stringify(decoded) !== JSON.stringify(payload)) {
+        throw new Error("JSON round trip changed the payload");
+      }
+
+      const events = ["sync:start"];
+      await new Promise((resolve, reject) => {
+        let remaining = 4;
+        const complete = (event) => {
+          events.push(event);
+          remaining -= 1;
+          if (remaining === 0) {
+            resolve();
+          }
+        };
+
+        Promise.resolve().then(() => complete("microtask"), reject);
+        setImmediate(() => complete("immediate"));
+        setTimeout(() => complete("timer:0"), 0);
+        setTimeout(() => complete("timer:5"), 5);
+      });
+
+      await fsPromises.writeFile(journalPath, `${events.join("\n")}\n`, "utf8");
+      const journal = await fsPromises.readFile(journalPath, "utf8");
+      return {
+        bytes: stat.size,
+        digest: crypto.createHash("sha256").update(decodedText).digest("hex"),
+        events: journal.trim().split("\n"),
+        itemCount: decoded.values.length,
+        squareSum: decoded.values.reduce((sum, item) => sum + item.square, 0),
+      };
+    } finally {
+      await fsPromises.rm(workspace, {recursive: true, force: true});
+    }
+  }
+
+  function systemProbe(application) {
     const sentinel = process.env.HERMIT_RUNTIME_SENTINEL;
     const status = Object.fromEntries(
       fs.readFileSync("/proc/self/status", "utf8")
@@ -108,7 +168,9 @@ if (!isMainThread) {
     const procHostname = fs.readFileSync("/proc/sys/kernel/hostname", "utf8").trim();
     console.log(
       `SYSTEM uname=${os.type()}/${os.arch()}/${os.hostname()} ` +
-      `env=${sentinel} proc=${status.Name}/${status.Threads}/${procHostname}`,
+      `env=${sentinel} proc=${status.Name}/${status.Threads}/${procHostname} ` +
+      `app=${application.bytes}/${application.digest}/${application.events.join(",")}/` +
+      `${application.itemCount}/${application.squareSum}`,
     );
   }
 
@@ -116,7 +178,8 @@ if (!isMainThread) {
     randomProbe();
     timeProbe();
     await threadProbe();
-    systemProbe();
+    const application = await applicationProbe();
+    systemProbe(application);
   }
 
   main().catch((error) => {
