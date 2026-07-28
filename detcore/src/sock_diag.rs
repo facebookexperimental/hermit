@@ -232,18 +232,19 @@ mod tests {
         buf.extend_from_slice(&0u32.to_ne_bytes()); // nlmsg_seq
         buf.extend_from_slice(&0u32.to_ne_bytes()); // nlmsg_pid
         buf.extend_from_slice(body);
-        while buf.len() % NLMSG_ALIGNTO != 0 {
+        while !buf.len().is_multiple_of(NLMSG_ALIGNTO) {
             buf.push(0);
         }
     }
 
     /// A `unix_diag_msg` (16 bytes) followed by a `UNIX_DIAG_PEER` attribute.
     fn unix_diag_body(ino: u32, peer_ino: u32) -> Vec<u8> {
-        let mut body = Vec::new();
-        body.push(libc::AF_UNIX as u8); // udiag_family
-        body.push(0); // udiag_type
-        body.push(1); // udiag_state
-        body.push(0); // pad
+        let mut body = vec![
+            libc::AF_UNIX as u8, // udiag_family
+            0,                   // udiag_type
+            1,                   // udiag_state
+            0,                   // pad
+        ];
         body.extend_from_slice(&ino.to_ne_bytes()); // udiag_ino
         body.extend_from_slice(&[0u8; 8]); // udiag_cookie[2]
         assert_eq!(body.len(), UNIX_DIAG_MSG_LEN);
@@ -257,11 +258,12 @@ mod tests {
 
     /// A `netlink_diag_msg` with `ndiag_ino` at offset 16.
     fn netlink_diag_body(ino: u32) -> Vec<u8> {
-        let mut body = Vec::new();
-        body.push(libc::AF_NETLINK as u8); // ndiag_family
-        body.push(0); // ndiag_type
-        body.push(0); // ndiag_protocol
-        body.push(1); // ndiag_state
+        let mut body = vec![
+            libc::AF_NETLINK as u8, // ndiag_family
+            0,                      // ndiag_type
+            0,                      // ndiag_protocol
+            1,                      // ndiag_state
+        ];
         body.extend_from_slice(&0x4000_0000u32.to_ne_bytes()); // ndiag_portid
         body.extend_from_slice(&0u32.to_ne_bytes()); // ndiag_dst_portid
         body.extend_from_slice(&0u32.to_ne_bytes()); // ndiag_dst_group
