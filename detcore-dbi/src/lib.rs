@@ -279,7 +279,8 @@ fn requires_native_lifecycle(sysnum: i64) -> bool {
 }
 
 // TODO-HUMAN-REVIEW(PR-1038): Review DBI self-target queued-signal identity translation.
-fn translate_self_queued_signal_targets(
+// TODO-HUMAN-REVIEW(PR-1065): Review DBI self-target prlimit64 translation.
+fn translate_self_identity_targets(
     sysnum: i64,
     args: &mut [u64; 6],
     virtual_pid: i32,
@@ -287,7 +288,14 @@ fn translate_self_queued_signal_targets(
     host_pid: i32,
     host_tid: i32,
 ) {
-    if virtual_pid <= 0 || virtual_tid <= 0 || host_pid <= 0 || host_tid <= 0 {
+    if virtual_pid <= 0 || host_pid <= 0 {
+        return;
+    }
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    if sysnum == libc::SYS_prlimit64 && args[0] as i32 == virtual_pid {
+        args[0] = host_pid as u32 as u64;
+    }
+    if virtual_tid <= 0 || host_tid <= 0 {
         return;
     }
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -448,6 +456,20 @@ fn update_memory_hash(sysnum: i64, args: &[u64], read_memory: MemoryReader) {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     MEMORY_HASH.fetch_add(hash, Ordering::SeqCst);
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1065): Review fault-safe DBI prlimit64 input validation.
+fn prlimit_new_limit_is_readable(
+    sysnum: i64,
+    args: &[u64],
+    mut read: impl FnMut(usize, &mut [u8]) -> bool,
+) -> bool {
+    if sysnum != libc::SYS_prlimit64 || args[2] == 0 {
+        return true;
+    }
+    let mut limit = [0_u8; std::mem::size_of::<libc::rlimit64>()];
+    read(args[2] as usize, &mut limit)
 }
 
 fn getrandom_flags_are_valid(flags: u64) -> bool {
@@ -1264,7 +1286,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
     let mut dispatch_args: [u64; 6] = raw_args.try_into().expect("six syscall arguments");
     let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
-    translate_self_queued_signal_targets(
+    translate_self_identity_targets(
         sysnum,
         &mut dispatch_args,
         scratch.virtual_pid,
@@ -1272,6 +1294,15 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         pid,
         tid,
     );
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1065): Review fault-safe DBI prlimit64 input validation.
+    if !prlimit_new_limit_is_readable(sysnum, raw_args, |address, bytes| unsafe {
+        read_memory(address, bytes.as_mut_ptr(), bytes.len()) != 0
+    }) {
+        unsafe { result.write(-(Errno::EFAULT.into_raw() as i64)) };
+        TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+        return 1;
+    }
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-849): Review fault-safe DBI getrandom writes.
     // Probe with deterministic zeros through process_vm_writev, then let Detcore overwrite
@@ -1551,9 +1582,9 @@ mod tests {
     }
 
     #[test]
-    fn queued_self_signals_use_host_identities() {
+    fn self_identity_syscalls_use_host_identities() {
         let mut targeted = [3, 4, libc::SIGUSR1 as u64, 0, 0, 0];
-        translate_self_queued_signal_targets(
+        translate_self_identity_targets(
             libc::SYS_rt_tgsigqueueinfo,
             &mut targeted,
             3,
@@ -1564,7 +1595,7 @@ mod tests {
         assert_eq!(targeted[..2], [10_003, 10_004]);
 
         let mut process = [3, libc::SIGUSR1 as u64, 0, 0, 0, 0];
-        translate_self_queued_signal_targets(
+        translate_self_identity_targets(
             libc::SYS_rt_sigqueueinfo,
             &mut process,
             3,
@@ -1575,7 +1606,7 @@ mod tests {
         assert_eq!(process[0], 10_003);
 
         let mut other = [5, 6, libc::SIGUSR1 as u64, 0, 0, 0];
-        translate_self_queued_signal_targets(
+        translate_self_identity_targets(
             libc::SYS_rt_tgsigqueueinfo,
             &mut other,
             3,
@@ -1586,7 +1617,7 @@ mod tests {
         assert_eq!(other[..2], [5, 6]);
 
         let mut process_group = [0, libc::SIGUSR1 as u64, 0, 0, 0, 0];
-        translate_self_queued_signal_targets(
+        translate_self_identity_targets(
             libc::SYS_rt_sigqueueinfo,
             &mut process_group,
             0,
@@ -1595,6 +1626,64 @@ mod tests {
             10_004,
         );
         assert_eq!(process_group[0], 0);
+
+        let mut prlimit = [3, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
+        translate_self_identity_targets(libc::SYS_prlimit64, &mut prlimit, 3, 4, 10_003, 10_004);
+        assert_eq!(prlimit[0], 10_003);
+
+        let mut prlimit_without_tid = [3, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
+        translate_self_identity_targets(
+            libc::SYS_prlimit64,
+            &mut prlimit_without_tid,
+            3,
+            0,
+            10_003,
+            0,
+        );
+        assert_eq!(prlimit_without_tid[0], 10_003);
+
+        let mut current = [0, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
+        translate_self_identity_targets(libc::SYS_prlimit64, &mut current, 3, 4, 10_003, 10_004);
+        assert_eq!(current[0], 0);
+
+        let mut other_process = [5, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
+        translate_self_identity_targets(
+            libc::SYS_prlimit64,
+            &mut other_process,
+            3,
+            4,
+            10_003,
+            10_004,
+        );
+        assert_eq!(other_process[0], 5);
+    }
+
+    #[test]
+    fn prlimit_input_preflight_rejects_unreadable_non_null_limits() {
+        let null_limit = [0, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
+        assert!(prlimit_new_limit_is_readable(
+            libc::SYS_prlimit64,
+            &null_limit,
+            |_, _| false,
+        ));
+
+        let limit = [0, libc::RLIMIT_NOFILE as u64, 1, 0, 0, 0];
+        assert!(!prlimit_new_limit_is_readable(
+            libc::SYS_prlimit64,
+            &limit,
+            |_, _| false,
+        ));
+        assert!(prlimit_new_limit_is_readable(
+            libc::SYS_prlimit64,
+            &limit,
+            |address, bytes| address == 1 && bytes.len() == std::mem::size_of::<libc::rlimit64>(),
+        ));
+
+        assert!(prlimit_new_limit_is_readable(
+            libc::SYS_getrlimit,
+            &limit,
+            |_, _| false,
+        ));
     }
 
     static COPIED_CHILD_POLICY_TEST_LOCK: Mutex<()> = Mutex::new(());
