@@ -1251,6 +1251,11 @@ async fn run_kvm(
     let random_seed = config.rng_seed();
     let mut backend = reverie_kvm::KvmBackend::new_with_stdin(KVM_GUEST_MEMORY_BYTES, stdin)
         .map_err(|error| anyhow!("failed to initialize reverie-kvm: {error}"))?;
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-TBD): Review KVM's canonical Detcore root identity.
+    backend
+        .set_root_pid(detcore::ROOT_DETPID.as_raw())
+        .map_err(|error| anyhow!("failed to configure KVM root PID: {error}"))?;
     backend
         .install_static_elf_with_context(&image, &argv, &envp, &cwd)
         .map_err(|error| anyhow!("failed to load KVM guest executable {program:?}: {error}"))?;

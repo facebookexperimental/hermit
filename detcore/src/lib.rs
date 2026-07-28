@@ -75,6 +75,9 @@ pub use config::BlockingMode;
 pub use config::Config;
 pub use config::RunsPostFork;
 pub use config::SchedHeuristic;
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-TBD): Review the public canonical Detcore root identity.
+pub use consts::ROOT_DETPID;
 use rand::RngExt as _;
 use raw_cpuid::CpuIdResult;
 use raw_cpuid::cpuid;
