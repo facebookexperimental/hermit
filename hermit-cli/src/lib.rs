@@ -1274,7 +1274,8 @@ fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig 
     config.detect_host_clock_futex_timeouts = backend == Backend::Sabre;
     config.syscall_clobbers_virtualized_by_backend = backend == Backend::Sabre;
     config.cancel_killed_thread_rpcs = backend == Backend::Sabre;
-    config.backend_serializes_fork_children = backend == Backend::Kvm;
+    // TODO-HUMAN-REVIEW(PR-PENDING): Review concurrent KVM process-child scheduling.
+    config.backend_serializes_fork_children = false;
     config.backend_dispatches_thread_tools = backend != Backend::Kvm;
     config.backend_requires_thread_directed_process_signals = backend == Backend::Dbi;
     config.backend_virtualizes_capability_prctls = backend == Backend::Kvm;
@@ -1793,10 +1794,10 @@ mod tests {
     }
 
     #[test]
-    fn kvm_backend_config_marks_serialized_fork_children() {
+    fn kvm_backend_config_marks_concurrent_process_children() {
         let config = super::DetConfig::default();
         let kvm = prepare_backend_config(config, Backend::Kvm);
-        assert!(kvm.backend_serializes_fork_children);
+        assert!(!kvm.backend_serializes_fork_children);
         assert!(!kvm.backend_dispatches_thread_tools);
         assert!(!kvm.backend_requires_thread_directed_process_signals);
         assert!(kvm.backend_virtualizes_capability_prctls);
