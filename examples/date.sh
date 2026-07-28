@@ -6,4 +6,4 @@
 # LICENSE file in the root directory of this source tree.
 
 # Print exact time with nanoseconds so it is always different in consecutive calls:
-exec /usr/bin/date +'%Y-%M-%d_%R:%S_%N'
+exec /usr/bin/date +'%Y-%m-%d_%H:%M:%S_%N'
