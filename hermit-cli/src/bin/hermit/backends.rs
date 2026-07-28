@@ -422,9 +422,10 @@ pub fn run_dbi(
     let second_summary = detcore_summary(&second)?;
 
     if first.stdout != second.stdout {
-        return Err(Error::msg(
-            "DBI verification failed: guest stdout differed between runs",
-        ));
+        return Err(Error::msg(dbi_stdout_mismatch(
+            &first.stdout,
+            &second.stdout,
+        )));
     }
     if !first_summary.same_observable_behavior(&second_summary) {
         return Err(Error::msg(format!(
@@ -446,6 +447,36 @@ pub fn run_dbi(
     eprintln!(":: DBI path confirmed: DynamoRIO client reported tool=Detcore");
     eprintln!(":: Success: deterministic. Determinism verified.");
     Ok(ExitStatus::Exited(0))
+}
+
+fn dbi_stdout_mismatch(first: &[u8], second: &[u8]) -> String {
+    const CONTEXT_BEFORE: usize = 40;
+    const CONTEXT_AFTER: usize = 120;
+
+    let offset = first
+        .iter()
+        .zip(second)
+        .position(|(left, right)| left != right)
+        .unwrap_or_else(|| first.len().min(second.len()));
+    let start = offset.saturating_sub(CONTEXT_BEFORE);
+    let first_end = first.len().min(offset.saturating_add(CONTEXT_AFTER));
+    let second_end = second.len().min(offset.saturating_add(CONTEXT_AFTER));
+
+    format!(
+        concat!(
+            "DBI verification failed: guest stdout differed at byte {offset} ",
+            "(run1_len={}, run2_len={}); run1[{start}..{first_end}]={:?}; ",
+            "run2[{start}..{second_end}]={:?}"
+        ),
+        first.len(),
+        second.len(),
+        String::from_utf8_lossy(&first[start..first_end]),
+        String::from_utf8_lossy(&second[start..second_end]),
+        offset = offset,
+        start = start,
+        first_end = first_end,
+        second_end = second_end,
+    )
 }
 
 fn run_once<R: Read + Send + 'static>(
@@ -696,6 +727,28 @@ mod tests {
         let mut actual = dbi_summary(100);
         actual.memory_hash = "0000000000000000".to_owned();
         assert!(!expected.same_observable_behavior(&actual));
+    }
+
+    #[test]
+    fn dbi_stdout_mismatch_reports_offset_lengths_and_bounded_context() {
+        let first = [vec![b'a'; 80], b"left-tail".to_vec()].concat();
+        let second = [vec![b'a'; 80], b"right-tail-extra".to_vec()].concat();
+
+        let detail = dbi_stdout_mismatch(&first, &second);
+
+        assert!(detail.contains("differed at byte 80"), "{detail}");
+        assert!(detail.contains("run1_len=89, run2_len=96"), "{detail}");
+        assert!(detail.contains("run1[40..89]"), "{detail}");
+        assert!(detail.contains("left-tail"), "{detail}");
+        assert!(detail.contains("right-tail-extra"), "{detail}");
+    }
+
+    #[test]
+    fn dbi_stdout_mismatch_reports_prefix_length_difference() {
+        let detail = dbi_stdout_mismatch(b"same", b"same suffix");
+
+        assert!(detail.contains("differed at byte 4"), "{detail}");
+        assert!(detail.contains("run1_len=4, run2_len=11"), "{detail}");
     }
 
     #[test]
