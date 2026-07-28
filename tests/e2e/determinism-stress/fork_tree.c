@@ -8,6 +8,7 @@
 
 #define _GNU_SOURCE
 
+#include <stdbool.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,13 +31,16 @@ static void fail(const char *operation) {
   exit(EXIT_FAILURE);
 }
 
-static int run_syscalls(void) {
+static int run_syscalls(bool allow_namespace_init_parent) {
   for (unsigned round = 0; round < SYSCALL_ROUNDS; ++round) {
     const long pid = syscall(SYS_getpid);
     const long parent = syscall(SYS_getppid);
     const long tid = syscall(SYS_gettid);
     const long uid = syscall(SYS_getuid);
-    if (pid <= 0 || parent <= 0 || tid != pid || uid < 0) {
+    // Linux reports PPID 0 for PID 1 in a PID namespace. Child processes must
+    // still identify a positive parent inside the namespace.
+    if (pid <= 0 || parent < 0 || (!allow_namespace_init_parent && parent == 0) ||
+        tid != pid || uid < 0) {
       return -1;
     }
   }
@@ -68,12 +72,12 @@ static void run_child(unsigned child_index) {
           GRANDCHILD_EXIT_BASE + child_index * GRANDCHILDREN_PER_CHILD +
           grandchild_index;
       const int failure_code = 240 + (int)grandchild_index;
-      _exit(run_syscalls() == 0 ? exit_code : failure_code);
+      _exit(run_syscalls(false) == 0 ? exit_code : failure_code);
     }
     grandchildren[grandchild_index] = grandchild;
   }
 
-  if (run_syscalls() != 0) {
+  if (run_syscalls(false) != 0) {
     _exit(210 + child_index);
   }
   for (unsigned grandchild_index = 0;
@@ -103,7 +107,7 @@ int main(void) {
     children[child_index] = child;
   }
 
-  if (run_syscalls() != 0) {
+  if (run_syscalls(true) != 0) {
     fputs("parent syscall invariant failed\n", stderr);
     return EXIT_FAILURE;
   }
