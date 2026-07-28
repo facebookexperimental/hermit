@@ -19,10 +19,10 @@
 //! long-running server) so the run terminates and its output depends only on
 //! the guest, which is what lets `--verify` reach L2.
 //!
-//! # Managed runtimes: Go and the JVM
+//! # Managed runtimes and interpreters
 //!
-//! This file also covers the Go runtime and the JVM. The results below were
-//! measured with the ptrace backend, `--log=info`, and relaxations
+//! This file also covers CPython, Lua, the Go runtime, and the JVM. The results
+//! below were measured with the ptrace backend, `--log=info`, and relaxations
 //! `--no-virtualize-cpuid --max-timeslice=disabled` (which keep strict
 //! determinism; they only accommodate hosts without CPUID/PMU interception),
 //! using Go 1.26.4 (Red Hat 1.26.4-1.el9) and OpenJDK 1.8.0_492.
@@ -419,6 +419,26 @@ fn python_arithmetic_is_deterministic_under_strict_verify() {
 fn sqlite_query_is_deterministic_under_strict_verify() {
     let sqlite = required_app("sqlite3", &["/usr/bin/sqlite3", "/usr/local/bin/sqlite3"]);
     assert_l2_under_strict_verify(&sqlite, &[":memory:", "SELECT 1+1"]);
+}
+
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + the CPython runtime"]
+fn python_is_deterministic_under_strict_verify() {
+    let python = required_app("python3", &["/usr/bin/python3", "/bin/python3"]);
+    assert_l2_under_strict_verify(
+        &python,
+        &[
+            "-c",
+            "import sys; print(sys.version); print(sum(range(10000)))",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + the Lua runtime"]
+fn lua_is_deterministic_under_strict_verify() {
+    let lua = required_app("lua", &["/usr/bin/lua", "/bin/lua"]);
+    assert_l2_under_strict_verify(&lua, &["-e", "print(1+1)"]);
 }
 
 // --- L2: compiled managed-runtime programs are bitwise deterministic ---
