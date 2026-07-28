@@ -1352,6 +1352,12 @@
       "why": "tests/e2e/lib/applications/run_all.sh is owned by ci/dag/portable.json test.applications_e2e: The `run_all.sh` executable is the applications suite aggregator: it enumerates multiple sibling scenarios, supplies their shared lifecycle, and combines their assertions. It remains a suite driver because flattening it into one program cell would hide its internal test denominator and multi-program setup."
     },
     {
+      "path": "tests/e2e/lib/applications/sqlite_deep.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib/applications/run_all.sh",
+      "why": "tests/e2e/lib/applications/sqlite_deep.sh is owned by tests/e2e/lib/applications/run_all.sh: The `sqlite_deep` scenario is one named case inside the applications aggregate suite, driven by run_all.sh with suite-owned lifecycle. It builds a deeper multi-table relational SQLite database and folds its determinism assertions into the suite's combined pass/fail contract, so scheduling the helper on its own would duplicate that setup and fracture the contract."
+    },
+    {
       "path": "tests/e2e/lib/applications/sqlite_on_disk.sh",
       "disposition": "suite-helper",
       "runner": "tests/e2e/lib/applications/run_all.sh",
