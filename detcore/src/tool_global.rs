@@ -328,7 +328,9 @@ impl GlobalState {
         let range = Self::read_port_range();
 
         let unsupported_syscall_report_fd = cfg.unsupported_syscall_report_fd.and_then(|fd| {
-            let duplicate = unsafe { libc::dup(fd) };
+            // This writer is internal controller state. In an in-process DBI
+            // runtime it must not leak into the next guest image across exec.
+            let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
             if duplicate == -1 {
                 warn!(
                     "failed to duplicate unsupported-syscall report fd {fd}: {}",
@@ -2176,6 +2178,9 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+    use std::os::fd::OwnedFd;
     use std::time::Duration;
 
     use super::FutexAction;
@@ -2190,6 +2195,33 @@ mod tests {
     use crate::types::DetTid;
     use crate::types::FutexID;
     use crate::types::MmId;
+
+    #[test]
+    fn unsupported_syscall_report_duplicate_is_close_on_exec() {
+        let mut descriptors = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // SAFETY: pipe2 initialized both descriptors and transfers ownership.
+        let _reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+        let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+        let config = Config {
+            unsupported_syscall_report_fd: Some(writer.as_raw_fd()),
+            ..Config::default()
+        };
+
+        let state = GlobalState::initialize(&config, false);
+        let duplicate = state
+            .unsupported_syscall_report_fd
+            .as_ref()
+            .expect("report writer should be duplicated")
+            .lock()
+            .unwrap();
+        let flags = unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags, -1);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+    }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping test.
