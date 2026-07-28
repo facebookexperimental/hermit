@@ -1346,6 +1346,12 @@
       "why": "tests/e2e/lib/applications/http_server.sh is owned by tests/e2e/lib/applications/run_all.sh: The `http_server` scenario is one named case inside the applications aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
     },
     {
+      "path": "tests/e2e/lib/applications/redis_deep.sh",
+      "disposition": "suite-helper",
+      "runner": "tests/e2e/lib/applications/run_all.sh",
+      "why": "tests/e2e/lib/applications/redis_deep.sh is owned by tests/e2e/lib/applications/run_all.sh: The `redis_deep` scenario is one named case inside the applications aggregate suite, driven by run_all.sh with suite-owned lifecycle. It runs a full redis-server plus redis-cli session over a private unix socket and folds its determinism assertions into the suite's combined pass/fail contract, so scheduling the helper on its own would duplicate that setup and fracture the contract."
+    },
+    {
       "path": "tests/e2e/lib/applications/run_all.sh",
       "disposition": "special-driver",
       "runner": "ci/dag/portable.json test.applications_e2e",

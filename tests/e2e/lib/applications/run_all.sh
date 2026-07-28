@@ -10,7 +10,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 readonly SCRIPT_DIR
 
-for test_script in sqlite_on_disk.sh sqlite_deep.sh http_server.sh build_tools.sh; do
+for test_script in sqlite_on_disk.sh sqlite_deep.sh redis_deep.sh http_server.sh build_tools.sh; do
     printf '==> %s\n' "$test_script"
     "$SCRIPT_DIR/$test_script"
 done
