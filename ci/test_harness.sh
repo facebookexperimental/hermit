@@ -25,6 +25,9 @@ fi
 readonly ROOT_DIR TEST_ROOT MANIFEST_ROOT INVENTORY EXPECTED_PLAN HERMIT_BIN RESULT_ROOT RUN_ID SOURCE_TREE_SHA SOURCE_TREE_DIRTY
 readonly -a MODES=(verify chaos replay naked custom)
 readonly -a BACKENDS=(ptrace dbi kvm sabre liteinst)
+readonly -a LANES=(portable privileged)
+DAG_DIR="$ROOT_DIR/ci/dag"
+readonly DAG_DIR
 
 function usage {
     cat <<'USAGE'
@@ -311,6 +314,79 @@ function audit_ci_correspondence {
           e2e_cells:$e2e_cells,portable_fingerprint:$portable_fingerprint,
           privileged_fingerprint:$privileged_fingerprint,
           correspondence:"validated exact workflow and validate.sh entrypoints plus both DAG fingerprints"}'
+}
+
+# Enforce that the committed CI DAG stays in correspondence with the e2e test
+# plan. `ci/run-dag.sh` executes ci/dag/<lane>.json VERBATIM, so a node that is
+# deleted, renamed, or divorced from the plan silently changes what CI runs.
+# This check reads the COMMITTED DAG (not a freshly re-rendered copy) and fails
+# closed on any drift, so removing a node from portable.json makes `validate`
+# exit non-zero. Two invariants are enforced per lane:
+#   1. Referential integrity: every `deps` entry names a node that exists in the
+#      same file (removing any depended-upon node leaves a dangling edge).
+#   2. e2e <-> plan correspondence: the set of e2e run-nodes equals, exactly,
+#      the (lane, category) cells the harness plans from the e2e metadata, and
+#      the `e2e.metadata` gate node is present (removing a leaf e2e node, or
+#      adding one for a category with no tests, is a mismatch).
+function validate_dag_correspondence {
+    local lane dag
+    for lane in "${LANES[@]}"; do
+        dag="$DAG_DIR/$lane.json"
+        [[ -f $dag ]] || die "missing committed DAG: ci/dag/$lane.json"
+        jq -e . >/dev/null <"$dag" || die "invalid DAG JSON: ci/dag/$lane.json"
+
+        # --- (1) Referential integrity of the committed DAG. ---
+        local node_ids dup dep_id
+        node_ids=$(jq -r '.steps[] | .group + "." + .job' "$dag" | LC_ALL=C sort)
+        dup=$(printf '%s\n' "$node_ids" | uniq -d)
+        [[ -z $dup ]] || die "ci/dag/$lane.json: duplicate node id(s): $(echo $dup)"
+        while IFS= read -r dep_id; do
+            [[ -z $dep_id ]] && continue
+            printf '%s\n' "$node_ids" | grep -Fxq -- "$dep_id" ||
+                die "ci/dag/$lane.json: dependency '$dep_id' names no node (node removed or renamed?)"
+        done < <(jq -r '.steps[] | (.deps // [])[]' "$dag" | LC_ALL=C sort -u)
+
+        # --- (2) e2e run-nodes must correspond to the planned cells. ---
+        # The e2e.metadata gate node (which runs this very `validate`) must exist.
+        jq -e '[.steps[]
+                | select(.group == "e2e" and .job == "metadata"
+                         and (.cmd | test("test_harness\\.sh validate")))]
+               | length == 1' >/dev/null <"$dag" ||
+            die "ci/dag/$lane.json: missing e2e.metadata node running 'test_harness.sh validate'"
+
+        # Every e2e run-node must target this lane.
+        local wrong_lane
+        wrong_lane=$(jq -r --arg lane "$lane" '
+            .steps[] | select(.group == "e2e")
+            | select(.cmd | test("--category "))
+            | (.cmd | capture("--lane (?<l>\\S+) --category (?<c>\\S+)"))
+            | select(.l != $lane) | .l + ":" + .c' "$dag")
+        [[ -z $wrong_lane ]] ||
+            die "ci/dag/$lane.json: e2e run-node targets wrong lane: $(echo $wrong_lane)"
+
+        local expected actual
+        expected=$(emit_required_plan | jq -r --arg lane "$lane" \
+            'select(.lane == $lane) | .category' | LC_ALL=C sort -u)
+        actual=$(jq -r '
+            .steps[] | select(.group == "e2e")
+            | select(.cmd | test("--category "))
+            | (.cmd | capture("--category (?<c>\\S+)")) | .c' "$dag" |
+            LC_ALL=C sort -u)
+
+        if [[ $expected != "$actual" ]]; then
+            {
+                echo "ci/dag/$lane.json: e2e DAG nodes do not correspond to the $lane test plan."
+                echo "  planned categories : $(echo $expected)"
+                echo "  DAG run-node cats  : $(echo $actual)"
+                comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") |
+                    sed 's/^/  MISSING from DAG (node deleted or renamed?): /'
+                comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") |
+                    sed 's/^/  EXTRA in DAG (no such planned test category): /'
+            } >&2
+            die "DAG/plan correspondence mismatch for lane $lane"
+        fi
+    done
+    echo "PASS: committed CI DAG (ci/dag/${LANES[0]}.json, ci/dag/${LANES[1]}.json) corresponds to the e2e plan with no dangling deps"
 }
 
 LANE_FILTER=
@@ -845,6 +921,7 @@ case "$subcommand" in
         audit_ci_correspondence
         echo "PASS: ${#TESTS[@]} E2E tests have valid syntax and centralized schema-v2 manifests"
         emit_required_plan | jq -s '{tests:(map(.test)|unique|length),required_cells:length,by_mode:(group_by(.mode)|map({key:.[0].mode,value:length})|from_entries)}'
+        validate_dag_correspondence
         ;;
     plan)
         print_plan required
