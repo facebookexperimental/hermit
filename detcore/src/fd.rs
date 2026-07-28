@@ -441,10 +441,10 @@ mod tests {
     }
 
     #[test]
-    fn clearing_logical_nonblocking_preserves_physical() {
-        // Models a FIONBIO(0) clear on an fd that Detcore forced physically
-        // nonblocking for the scheduler: the guest-visible flag clears, but the
-        // physical (scheduler) state must survive.
+    fn toggling_logical_nonblocking_preserves_physical() {
+        // Models FIONBIO on an fd that Detcore forced physically nonblocking for
+        // the scheduler: the guest-visible flag changes, but the physical state
+        // must survive.
         let owner = DetTid::from_raw(10);
         let fd = DetFd::new(3, OFlag::empty(), FdType::Socket, OpenFileId::new(owner, 0));
         fd.set_physically_nonblocking();
@@ -460,6 +460,13 @@ mod tests {
         assert!(
             fd.physically_nonblocking(),
             "the scheduler's physical nonblocking state must be preserved"
+        );
+
+        fd.set_logical_nonblocking(true);
+        assert!(fd.is_nonblocking());
+        assert!(
+            fd.physically_nonblocking(),
+            "setting the logical flag must not discard physical tracking"
         );
 
         // The both-flags setter still tracks physical alongside logical.

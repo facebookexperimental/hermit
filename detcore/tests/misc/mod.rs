@@ -684,6 +684,31 @@ fn dup_shares_status_flags_but_not_cloexec() {
 }
 
 #[test]
+fn fcntl_advisory_set_lock_succeeds() {
+    det_test_fn_sequential_without_pmu(|| {
+        let path = b"/tmp/detcore-fcntl-lock\0";
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr().cast(),
+                libc::O_CREAT | libc::O_CLOEXEC | libc::O_RDWR | libc::O_TRUNC,
+                0o600,
+            )
+        };
+        assert!(fd >= 0);
+
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = libc::F_WRLCK as libc::c_short;
+        lock.l_whence = libc::SEEK_SET as libc::c_short;
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETLK, &lock) }, 0);
+
+        lock.l_type = libc::F_UNLCK as libc::c_short;
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETLK, &lock) }, 0);
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+        assert_eq!(unsafe { libc::unlink(path.as_ptr().cast()) }, 0);
+    });
+}
+
+#[test]
 fn bound_port_survives_closing_dup_alias() {
     det_test_fn_sequential_without_pmu(|| {
         fn bind_loopback_ephemeral(fd: libc::c_int) -> libc::c_int {
