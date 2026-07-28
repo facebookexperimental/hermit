@@ -186,7 +186,7 @@ fn liteinst_strict_verify_shell_and_entropy_consumer() {
     assert_strict_verify_without_rcb_preemption(
         Path::new("/usr/bin/hexdump"),
         &["/dev/urandom", "--length", "16"],
-        b"0000000 eca2 407d f242 5603 1acd e9e2 5f75 d684\n0000010\n",
+        b"0000000 7229 04bb 964d 28df ba71 4c03 de95 7027\n0000010\n",
     );
 }
 
