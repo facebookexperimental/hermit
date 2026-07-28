@@ -15,3 +15,6 @@ envelope.json
 *.orig
 **/__pycache__/
 **/.mypy_cache/
+
+# Regenerated human-readable commands from tests/e2e/manifests/*.toml.
+/ignored/e2e-commands/
