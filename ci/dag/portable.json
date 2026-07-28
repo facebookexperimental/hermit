@@ -14,6 +14,14 @@
                "hard_mem_max_bytes": 1073741824, "classification": "light"}
     },
     {
+      "group": "check", "job": "portability_paths",
+      "desc": "Reject developer-specific paths in build/run files",
+      "cmd": "./scripts/check-portable-paths.sh",
+      "timeout": 60,
+      "hint": {"est_duration_s": 2, "rss_baseline_bytes": 67108864,
+               "hard_mem_max_bytes": 536870912, "classification": "light"}
+    },
+    {
       "group": "setup", "job": "nextest",
       "desc": "cargo-nextest available",
       "cmd": "cargo nextest show-config version >/dev/null 2>&1 || if command -v with-proxy >/dev/null 2>&1; then with-proxy cargo install cargo-nextest --locked --version 0.9.100; else cargo install cargo-nextest --locked --version 0.9.100; fi",
