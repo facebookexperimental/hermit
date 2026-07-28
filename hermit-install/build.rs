@@ -8,6 +8,9 @@
 
 use std::env;
 use std::fs;
+use std::hash::DefaultHasher;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::io;
 use std::os::unix::fs::symlink;
 use std::path::Path;
@@ -110,7 +113,12 @@ fn ensure_submodule(repository: &Path, name: &str, relative: &str, marker: &str)
 
 fn build_sabre(repository: &Path, build_root: &Path, resources: &Path) {
     let source = ensure_submodule(repository, "SaBRe", "third-party/sabre", "CMakeLists.txt");
-    let build = build_root.join("sabre");
+    // CMake records the absolute source directory in CMakeCache.txt. Cargo
+    // checks each pinned Reverie revision out under a different path, so a
+    // stable build directory becomes invalid as soon as the pin advances.
+    let mut source_hash = DefaultHasher::new();
+    source.hash(&mut source_hash);
+    let build = build_root.join(format!("sabre-{:016x}", source_hash.finish()));
     run(
         Command::new("cmake")
             .arg("-S")

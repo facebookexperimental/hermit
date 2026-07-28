@@ -1483,12 +1483,14 @@ impl RunOpts {
             | Backend::Kvm
             | Backend::E9patch => {}
             Backend::Dbi => {
+                let environment = self.guest_command()?.get_captured_envs();
                 return super::backends::run_dbi(
                     &self.program,
                     &self.args,
                     self.verify,
                     global.log,
                     &self.effective_det_config(),
+                    environment,
                 );
             }
         }

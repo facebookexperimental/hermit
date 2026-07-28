@@ -405,6 +405,38 @@ fn run_dbi_executes_integrated_backend() {
 }
 
 #[test]
+fn run_dbi_uses_the_requested_guest_environment() {
+    let args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--strict",
+        "--base-env=empty",
+        "--env=DBI_GUEST_ONLY=present",
+        "--",
+        "/usr/bin/env",
+    ];
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .env("DBI_HOST_ONLY", "must-not-leak")
+        .args(args)
+        .output()
+        .expect("failed to run DBI environment regression");
+
+    assert_success(&output, &args);
+    let stdout = stdout(&output);
+    assert!(
+        stdout.lines().any(|line| line == "DBI_GUEST_ONLY=present"),
+        "DBI guest environment omitted the requested value:\n{stdout}",
+    );
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| line.starts_with("DBI_HOST_ONLY=")),
+        "DBI guest inherited a host-only value:\n{stdout}",
+    );
+}
+
+#[test]
 fn run_dbi_verifies_simple_env_shebang() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create DBI env-shebang test directory");

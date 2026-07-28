@@ -18,6 +18,7 @@
 //! plugin. This module retains the separate
 //! `hermit --backend sabre strace` diagnostic path.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsStr;
@@ -123,6 +124,18 @@ fn prepare_dbi_guest_command(
         program: interpreter,
         args: resolved_args,
     }
+}
+
+fn apply_exact_environment(command: &mut StdCommand, environment: &BTreeMap<OsString, OsString>) {
+    // DbiRunner reconstructs its launcher command from Command::get_envs(),
+    // which cannot expose env_clear(). Make removals explicit so --base-env
+    // does not accidentally inherit the Hermit launcher's environment.
+    for (key, _) in env::vars_os() {
+        if !environment.contains_key(&key) {
+            command.env_remove(key);
+        }
+    }
+    command.envs(environment);
 }
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review inherited DBI policy descriptors and bounded reports.
@@ -304,12 +317,13 @@ impl<R: Read, W: Write> Read for TeeReader<R, W> {
 /// When `verify` is true, the guest is executed twice. Both runs must succeed,
 /// produce byte-identical stdout, report `tool=Detcore`, and produce the same
 /// observed guest-memory hash from the native DBI runtime.
-pub fn run_dbi(
+pub(super) fn run_dbi(
     program: &Path,
     args: &[String],
     verify: bool,
     log: Option<LevelFilter>,
     config: &Config,
+    mut environment: BTreeMap<OsString, OsString>,
 ) -> Result<ExitStatus, Error> {
     // The DBI backend drives a single Detcore external scheduler, so it cannot
     // honor a request to relax thread sequentialization. Fail loudly rather
@@ -357,12 +371,17 @@ pub fn run_dbi(
     );
 
     let _unsupported_report = DbiUnsupportedSyscallReport::new()?;
-    let prepared = prepare_dbi_guest_command(program, args, env::var_os("PATH").as_deref());
+    let prepared = prepare_dbi_guest_command(
+        program,
+        args,
+        environment.get(OsStr::new("PATH")).map(OsString::as_os_str),
+    );
     let mut guest = StdCommand::new(&prepared.program);
     if let Some(level) = log {
-        guest.env("HERMIT_LOG", level.to_string());
+        environment.insert("HERMIT_LOG".into(), level.to_string().into());
     }
-    guest.env(detcore_dbi::DETCONFIG_ENV, &config_json);
+    environment.insert(detcore_dbi::DETCONFIG_ENV.into(), config_json.into());
+    apply_exact_environment(&mut guest, &environment);
     guest.args(&prepared.args);
 
     if !verify {
