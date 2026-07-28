@@ -2866,6 +2866,62 @@ function run_exact_detcore_cases {
     done
 }
 
+# Calibrate the host's retired-conditional-branch overflow skid before running
+# schedule bisection. Short idle-host probes understate the tail observed while
+# analyze repeatedly starts tracees. A 10,000-RCB guard was still exceeded by
+# a 10,366-RCB tail on the self-hosted EPYC runner, so retain a 20,000-RCB
+# floor and increase it if calibration measures a larger recommendation.
+function run_calibrated_analyze_tests {
+    local analyze_iterations=${ANALYZE_SKID_CALIBRATION_ITERATIONS:-64}
+    local analyze_period=${ANALYZE_SKID_CALIBRATION_PERIOD:-1000000}
+    local analyze_minimum_margin=${ANALYZE_SKID_MINIMUM_MARGIN:-20000}
+    local analyze_calibration_timeout=${ANALYZE_SKID_CALIBRATION_TIMEOUT:-30}
+    local calibration_binary="$ROOT_DIR/target/ci-pmu-skid"
+    local output
+    local recommended
+    local margin
+
+    for value_name in \
+        analyze_iterations analyze_period analyze_minimum_margin analyze_calibration_timeout; do
+        local value=${!value_name}
+        if [[ ! $value =~ ^[1-9][0-9]*$ ]]; then
+            printf "Analyze PMU calibration error: %s must be a positive integer, got %q\n" \
+                "$value_name" "$value" >&2
+            return 2
+        fi
+    done
+
+    mkdir -p "$(dirname "$calibration_binary")"
+    if ! cc -O2 -Wall -Wextra -Werror -std=gnu11 \
+        "$ROOT_DIR/tests/util/pmu_skid.c" -o "$calibration_binary"; then
+        echo "Analyze PMU calibration error: failed to build tests/util/pmu_skid.c" >&2
+        return 1
+    fi
+    local status=0
+    output=$(timeout "$analyze_calibration_timeout" "$calibration_binary" \
+        --iterations "$analyze_iterations" --period "$analyze_period" 2>&1) || status=$?
+    if ((status != 0)); then
+        printf "Analyze PMU calibration failed (exit %s):\n%s\n" "$status" "$output" >&2
+        return "$status"
+    fi
+    printf "%s\n" "$output"
+
+    recommended=$(sed -n 's/^Recommended margin: \([0-9][0-9]*\) RCB.*/\1/p' <<<"$output")
+    if [[ ! $recommended =~ ^[1-9][0-9]*$ ]]; then
+        echo "Analyze PMU calibration error: output omitted a valid recommended margin" >&2
+        return 1
+    fi
+    margin=$recommended
+    if ((margin < analyze_minimum_margin)); then
+        margin=$analyze_minimum_margin
+    fi
+    printf "Analyze PMU skid margin: calibrated=%s RCB, conservative floor=%s RCB, using=%s RCB\n" \
+        "$recommended" "$analyze_minimum_margin" "$margin"
+
+    HERMIT_ANALYZE_SKID_MARGIN=$margin \
+        cargo test -p hermit --test analyze "$@"
+}
+
 function run_privileged_validation {
     local leveldb_install="$ROOT_DIR/target/hermit-leveldb-ci"
     local leveldb_build="$ROOT_DIR/target/hermit-leveldb-build-ci"
@@ -2907,7 +2963,8 @@ function run_privileged_validation {
     run_check "Stable record/replay integration tests" cargo test -p hermit --test record_replay -- --skip record_replay_matrix --test-threads=1
     run_check "Arbitrary-binary record/replay case" cargo test -p hermit --test arbitrary_binaries record_replay_stable_arbitrary_binaries -- --exact --test-threads=1
     run_check "Random-source strict verification" cargo test -p hermit --test random_determinism random_sources_are_deterministic_under_strict_verify -- --exact --ignored --test-threads=1
-    run_check "PMU analyze scenarios" cargo test -p hermit --test analyze -- --ignored --skip analyze_hello_race --test-threads=1
+    run_check "PMU analyze scenarios (calibrated skid)" \
+        run_calibrated_analyze_tests -- --ignored --test-threads=1
     run_check "Runtime entropy scenarios" cargo test -p hermit --test language_runtime_determinism -- --ignored --test-threads=1
     run_check "PMU Python stdlib scenarios" cargo test -p hermit --test python_stdlib -- --ignored --test-threads=1
     run_check "Frontier application benchmarks" cargo test -p hermit --test frontier_app_benchmarks -- --ignored --test-threads=1
@@ -2984,10 +3041,10 @@ function run_full_suite {
         echo "SKIP: rr syscall suite (run 'git submodule update --init third-party/rr' to enable)"
     fi
     # `hermit analyze` root-cause search over chaotic schedules (Buck analyze_* targets).
-    run_check "Hermit analyze scenarios" \
-        cargo test -p hermit --test analyze -- --ignored
-    run_check "Schedule search E2E (requires PMU)" \
-        ./tests/util/hermit_analyze_e2e.sh
+    # The Cargo target covers the same hello_race and racewrite fixtures as
+    # hermit_analyze_e2e.sh, including their source-line assertions.
+    run_check "Hermit analyze scenarios (calibrated skid)" \
+        run_calibrated_analyze_tests -- --ignored --test-threads=1
 
     run_full_backend_gates
     wait_for_background_checks
@@ -3107,7 +3164,8 @@ function run_super_suite {
     run_check "Weekly portable chaos cases" cargo test -p hermit --test stress_suite -- --skip slow_cas_search_and_replay --test-threads=1
     run_check "Weekly ignored portable chaos cases" cargo test -p hermit --test stress_suite -- --ignored --skip slow_cas_search_and_replay --test-threads=1
     run_check "PMU Buck chaos cases" cargo test -p hermit --test hermit_modes chaos_buck_ -- --ignored --test-threads=1
-    run_check "PMU analyze hello-race stress" cargo test -p hermit --test analyze analyze_hello_race -- --exact --ignored --test-threads=1
+    run_check "PMU analyze hello-race stress (calibrated skid)" \
+        run_calibrated_analyze_tests analyze_hello_race -- --exact --ignored --test-threads=1
     run_check "Build pinned LevelDB super fixture" ./hermit-cli/tests/prepare_leveldb.sh "$leveldb_install" "$leveldb_build"
     run_check "Full LevelDB strict determinism" env HERMIT_LEVELDB_BUILD_DIR="$leveldb_build" cargo test -p hermit --test leveldb full_leveldb_suite_is_deterministic_under_strict -- --exact --ignored --test-threads=1
     run_check "SQLite veryquick strict determinism" cargo test -p hermit --test sqlite_veryquick sqlite_veryquick_is_deterministic_under_strict_hermit -- --exact --ignored --test-threads=1

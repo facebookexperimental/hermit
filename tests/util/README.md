@@ -23,3 +23,12 @@ period. Raw PMU access must be permitted by the host kernel.
 The reported margin is twice the largest observed skid, with a minimum of 100
 RCBs. It is an empirical starting point rather than a hardware guarantee; run
 the tool repeatedly under representative host load before changing a margin.
+
+`validate.sh` runs this calibration before every PMU-dependent analyze test and
+passes the result through `HERMIT_ANALYZE_SKID_MARGIN`. Analyze uses the larger
+of the calibrated recommendation and a conservative 20,000-RCB floor, because
+short idle-host probes did not capture a 10,366-RCB tail observed while
+schedule search repeatedly started tracees. `ANALYZE_SKID_CALIBRATION_ITERATIONS`,
+`ANALYZE_SKID_CALIBRATION_PERIOD`, `ANALYZE_SKID_CALIBRATION_TIMEOUT`, and
+`ANALYZE_SKID_MINIMUM_MARGIN` allow CI experiments to tune the calibration;
+each override must be a positive integer.

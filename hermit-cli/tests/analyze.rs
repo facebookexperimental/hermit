@@ -34,6 +34,7 @@ use std::sync::OnceLock;
 
 static ANALYZE_LOCK: Mutex<()> = Mutex::new(());
 static WORKLOADS: OnceLock<AnalyzeWorkloads> = OnceLock::new();
+const ANALYZE_SKID_MARGIN_ENV: &str = "HERMIT_ANALYZE_SKID_MARGIN";
 
 /// Guest binaries whose races `hermit analyze` is expected to pinpoint.
 ///
@@ -66,6 +67,24 @@ fn analyze_lock() -> MutexGuard<'static, ()> {
     ANALYZE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn add_calibrated_skid_margin(command: &mut Command, label: &str) {
+    let Some(value) = std::env::var_os(ANALYZE_SKID_MARGIN_ENV) else {
+        return;
+    };
+    let value = value.to_string_lossy();
+    let margin = value.parse::<u64>().unwrap_or_else(|error| {
+        panic!(
+            "{label}: {ANALYZE_SKID_MARGIN_ENV} must be a positive integer, got {value:?}: {error}"
+        )
+    });
+    assert!(
+        margin > 0,
+        "{label}: {ANALYZE_SKID_MARGIN_ENV} must be greater than zero"
+    );
+    eprintln!("{label}: using calibrated PMU skid margin {margin} RCB");
+    command.arg(format!("--run-arg=--skid-margin={margin}"));
 }
 
 fn repository() -> &'static Path {
@@ -149,6 +168,7 @@ fn run_analyze(label: &str, guest: &Path, analyze_opts: &[&str], expected_output
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command.arg("analyze");
     command.args(analyze_opts);
+    add_calibrated_skid_margin(&mut command, label);
     command
         .arg(format!("--report-file={}", report_file.display()))
         .args(["--analyze-seed=0", "--search", "--"])
@@ -185,6 +205,7 @@ fn run_analyze_expect_baseline_collision(label: &str, guest: &Path, analyze_opts
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command.arg("analyze");
     command.args(analyze_opts);
+    add_calibrated_skid_margin(&mut command, label);
     command
         .arg(format!("--report-file={}", report_file.display()))
         .args(["--analyze-seed=0", "--search", "--"])
@@ -218,7 +239,7 @@ fn analyze_hello_race() {
         "analyze hello_race",
         &workloads().hello_race,
         &["--run-arg=--base-env=host"],
-        "",
+        "flaky-tests/hello_race.rs:37",
     );
 }
 
