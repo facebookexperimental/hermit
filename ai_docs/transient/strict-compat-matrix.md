@@ -39,9 +39,9 @@ batches 1 through 12. It reports the commands recorded in TaskGraph by
 | 8 | Text processing | 12 | 0 | 0 |
 | 9 | Math and file inspection | 11 | 0 | 0 |
 | 10 | Process and system utilities | 5 | 8 | 0 |
-| 11 | Real applications | 8 | 3 | 0 |
+| 11 | Real applications | 9 | 2 | 0 |
 | 12 | Signals and edge cases | 11 | 0 | 0 |
-| **Total** | | **108** | **20** | **2** |
+| **Total** | | **109** | **19** | **2** |
 
 ## Core utilities
 
@@ -205,7 +205,7 @@ batches 1 through 12. It reports the commands recorded in TaskGraph by
 
 | # | Program | Command | Result | Batch | Notes |
 |---:|---|---|---|---:|---|
-| 109 | Git init/add/status | `/bin/sh -c 'rm -rf /tmp/hermit-git-test && /usr/local/bin/git init /tmp/hermit-git-test && cd /tmp/hermit-git-test && /usr/local/bin/git add . && /usr/local/bin/git status'` | FAIL | 11 | Killed with exit 137 in run 1 after producing multi-gigabyte logs. |
+| 109 | Git init/add/commit/log | `env REAL_COMPAT_FIXTURES=/tmp/hermit-real-compat-fixtures bash tests/compat/real_compat_workload.sh git` | PASS L2 | 11 | Retested 2026-07-28 with ptrace, `--strict --verify`, INFO logging, and no relaxations: 34,710/34,710 messages and no substantive differences. The workload selects `/usr/local/bin/git.meta.real` on Meta hosts because `/usr/local/bin/git` is a telemetry wrapper, then falls back to `/usr/bin/git` elsewhere. |
 | 110 | Git log | `/usr/local/bin/git log --oneline -5` | FAIL | 11 | A 15-second outer timeout expired in run 1 with exit 124; never reached L2. |
 | 111 | Git diff | `/usr/local/bin/git diff --stat 'HEAD~1'` | FAIL | 11 | A 15-second outer timeout expired in run 1 with exit 124; never reached L2. |
 | 112 | curl | `/usr/bin/curl --version` | PASS L2 | 11 | 2419/2419 messages. |
