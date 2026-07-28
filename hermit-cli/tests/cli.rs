@@ -376,6 +376,39 @@ fn run_dbi_executes_integrated_backend() {
     assert_success(&output, &args);
 }
 
+#[test]
+fn run_dbi_verifies_simple_env_shebang() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create DBI env-shebang test directory");
+    let script = directory.path().join("env-echo");
+    fs::write(&script, b"#!/usr/bin/env echo\n")
+        .expect("failed to write DBI env-shebang test script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+        .expect("failed to mark DBI env-shebang test script executable");
+    let program = script
+        .to_str()
+        .expect("DBI env-shebang test path should be UTF-8");
+    let args = [
+        "run",
+        "--backend",
+        "dbi",
+        "--strict",
+        "--verify",
+        "--",
+        program,
+    ];
+
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), format!("{}\n", script.display()));
+    assert!(
+        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
+        "DBI determinism confirmation missing:\n{}",
+        stderr(&output),
+    );
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review ptrace verification warning delivery.
 #[test]

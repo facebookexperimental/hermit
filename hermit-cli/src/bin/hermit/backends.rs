@@ -19,6 +19,8 @@
 //! `hermit --backend sabre strace` diagnostic path.
 
 use std::collections::BTreeSet;
+use std::env;
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
 use std::io::IsTerminal as _;
@@ -30,6 +32,7 @@ use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command as StdCommand;
 use std::process::Output;
 
@@ -56,6 +59,69 @@ impl DbiSummary {
             && self.rewritten == other.rewritten
             && self.stdin_reads == other.stdin_reads
             && self.memory_hash == other.memory_hash
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DbiGuestCommand {
+    program: PathBuf,
+    args: Vec<OsString>,
+}
+
+fn executable_on_path(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
+    env::split_paths(path)
+        .map(|directory| directory.join(program))
+        .find(|candidate| {
+            candidate.metadata().is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+}
+
+/// Resolve the simple `#!/usr/bin/env PROGRAM` form before DynamoRIO starts.
+///
+/// DynamoRIO follows an absolute exec target correctly, but its copied exec path
+/// can wait indefinitely when `env` later resolves a bare target through PATH.
+/// Keep `env` in the process chain and replace only its single plain program
+/// token with the equivalent absolute PATH match. More complex `env` forms are
+/// left unchanged for the normal launcher rather than partially interpreting
+/// options or assignments here.
+fn prepare_dbi_guest_command(
+    program: &Path,
+    args: &[String],
+    path: Option<&OsStr>,
+) -> DbiGuestCommand {
+    let unchanged = || DbiGuestCommand {
+        program: program.to_path_buf(),
+        args: args.iter().map(OsString::from).collect(),
+    };
+    let Some(shebang) = hermit::Shebang::new(program) else {
+        return unchanged();
+    };
+    let (interpreter, interpreter_args) = shebang.into_parts();
+    if interpreter.file_name() != Some(OsStr::new("env")) || interpreter_args.len() != 1 {
+        return unchanged();
+    }
+
+    let target = &interpreter_args[0];
+    let target_bytes = std::os::unix::ffi::OsStrExt::as_bytes(target.as_os_str());
+    if target_bytes.starts_with(b"-")
+        || target_bytes.contains(&b'=')
+        || target_bytes.contains(&b'/')
+    {
+        return unchanged();
+    }
+    let Some(target) = path.and_then(|path| executable_on_path(target, path)) else {
+        return unchanged();
+    };
+
+    let mut resolved_args = Vec::with_capacity(args.len() + 2);
+    resolved_args.push(target.into_os_string());
+    resolved_args.push(program.as_os_str().to_owned());
+    resolved_args.extend(args.iter().map(OsString::from));
+    DbiGuestCommand {
+        program: interpreter,
+        args: resolved_args,
     }
 }
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -291,12 +357,13 @@ pub fn run_dbi(
     );
 
     let _unsupported_report = DbiUnsupportedSyscallReport::new()?;
-    let mut guest = StdCommand::new(program);
+    let prepared = prepare_dbi_guest_command(program, args, env::var_os("PATH").as_deref());
+    let mut guest = StdCommand::new(&prepared.program);
     if let Some(level) = log {
         guest.env("HERMIT_LOG", level.to_string());
     }
     guest.env(detcore_dbi::DETCONFIG_ENV, &config_json);
-    guest.args(args);
+    guest.args(&prepared.args);
 
     if !verify {
         if stdin_is_terminal {
@@ -588,6 +655,13 @@ pub fn run_sabre_strace(program: &Path, args: &[String]) -> Result<ExitStatus, E
 mod tests {
     use super::*;
 
+    fn write_executable(path: &Path, contents: &[u8]) {
+        fs::write(path, contents).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
     fn dbi_summary(branches: u64) -> DbiSummary {
         DbiSummary {
             branches,
@@ -622,6 +696,42 @@ mod tests {
         let mut actual = dbi_summary(100);
         actual.memory_hash = "0000000000000000".to_owned();
         assert!(!expected.same_observable_behavior(&actual));
+    }
+
+    #[test]
+    fn dbi_resolves_simple_env_shebang_target_to_absolute_path() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let python = bin.join("python3");
+        write_executable(&python, b"\x7fELFplaceholder");
+        let script = root.path().join("guest.py");
+        write_executable(&script, b"#!/usr/bin/env python3\n");
+
+        let prepared =
+            prepare_dbi_guest_command(&script, &["argument".to_owned()], Some(bin.as_os_str()));
+
+        assert_eq!(prepared.program, Path::new("/usr/bin/env"));
+        assert_eq!(
+            prepared.args,
+            [
+                python.into_os_string(),
+                script.into_os_string(),
+                OsString::from("argument"),
+            ]
+        );
+    }
+
+    #[test]
+    fn dbi_leaves_complex_env_shebang_for_launcher() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("guest.py");
+        write_executable(&script, b"#!/usr/bin/env -S python3 -u\n");
+
+        let prepared = prepare_dbi_guest_command(&script, &[], Some(OsStr::new("/usr/bin")));
+
+        assert_eq!(prepared.program, script);
+        assert!(prepared.args.is_empty());
     }
 
     #[test]
