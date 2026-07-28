@@ -194,6 +194,15 @@ mod tests {
         let ivar = Ivar::new();
         assert_eq!(ivar.to_string(), "<ivar NoWaiter>");
 
+        let mut waiting = ivar.clone();
+        let waker = futures::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut waiting).poll(&mut context),
+            Poll::Pending
+        ));
+        assert_eq!(ivar.to_string(), "<ivar HasWaiter>");
+
         ivar.put(7);
         assert_eq!(ivar.to_string(), "<ivar 7>");
     }
