@@ -33,7 +33,10 @@ mod script;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -146,6 +149,101 @@ fn reserved_kvm_stdin() -> Result<Option<fs::File>, Error> {
         Some(KvmStdinReservation::Open(file)) => Ok(Some(file.try_clone()?)),
         Some(KvmStdinReservation::Closed) => Ok(None),
         None => unreachable!("stdin reservation was initialized above"),
+    }
+}
+
+/// A replayable snapshot of the guest's stdin for the output-capturing backends.
+///
+/// `hermit run --verify` executes the guest twice and compares the two runs. The
+/// output-capturing backends historically fed the guest `Stdio::null()`, so any
+/// data piped into hermit (`echo prog | hermit run --strict --verify -- ...`)
+/// was silently dropped. Both runs then saw identical *empty* input and hermit
+/// reported a false "deterministic" success even though the guest never received
+/// its input. `Seekable` holds a rewindable file so both runs receive the exact
+/// same bytes; `None` means stdin should be `/dev/null` (nothing to replay, or a
+/// terminal that cannot be replayed identically to two runs).
+enum StdinSnapshot {
+    Seekable(fs::File),
+    None,
+}
+
+static OUTPUT_STDIN_SNAPSHOT: Mutex<Option<StdinSnapshot>> = Mutex::new(None);
+
+/// Records a rewindable snapshot of the process stdin so the output-capturing
+/// backends can replay identical input to each run of `hermit run --verify`.
+///
+/// `stdin` is the descriptor captured before Rust startup could reuse a closed
+/// fd 0 (see the binary's `startup_stdin`). A regular-file redirect is already
+/// seekable and is kept as-is; a pipe/fifo/socket is drained once into a
+/// seekable temporary file so it can be re-read; a terminal (or absent stdin)
+/// is treated as `/dev/null` because a live terminal cannot be replayed
+/// identically to two runs.
+pub fn reserve_output_stdin_snapshot(stdin: Option<fs::File>) -> io::Result<()> {
+    let snapshot = match stdin {
+        None => StdinSnapshot::None,
+        Some(mut file) => {
+            // SAFETY: as_raw_fd borrows the descriptor without taking ownership.
+            let is_tty = unsafe { libc::isatty(file.as_raw_fd()) } == 1;
+            if is_tty {
+                StdinSnapshot::None
+            } else if file.stream_position().is_ok() {
+                // Already seekable (e.g. `< file`): rewind before each run.
+                StdinSnapshot::Seekable(file)
+            } else {
+                // Non-seekable (pipe/fifo/socket): buffer once into a seekable
+                // temporary file so both --verify runs receive identical input.
+                let mut buffered = tempfile::tempfile()?;
+                io::copy(&mut file, &mut buffered)?;
+                buffered.seek(SeekFrom::Start(0))?;
+                StdinSnapshot::Seekable(buffered)
+            }
+        }
+    };
+    let mut reservation = OUTPUT_STDIN_SNAPSHOT
+        .lock()
+        .map_err(|_| io::Error::other("output stdin snapshot lock is poisoned"))?;
+    if reservation.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "output stdin snapshot is already reserved",
+        ));
+    }
+    *reservation = Some(snapshot);
+    Ok(())
+}
+
+/// Returns a rewound descriptor for the reserved stdin snapshot, if any.
+///
+/// Each call rewinds the snapshot and hands back a fresh descriptor, so
+/// repeated `--verify` runs read identical input from the start. Returns `None`
+/// when no snapshot was reserved or the reserved stdin is a terminal/absent
+/// (nothing to replay). Runs are sequential (each executes in its own forked
+/// container child), so resetting the shared open file description's offset here
+/// is safe.
+fn output_backend_stdin_file() -> Result<Option<fs::File>, Error> {
+    let mut reservation = OUTPUT_STDIN_SNAPSHOT
+        .lock()
+        .map_err(|_| io::Error::other("output stdin snapshot lock is poisoned"))?;
+    match reservation.as_mut() {
+        Some(StdinSnapshot::Seekable(file)) => {
+            file.seek(SeekFrom::Start(0))?;
+            Ok(Some(file.try_clone()?))
+        }
+        Some(StdinSnapshot::None) | None => Ok(None),
+    }
+}
+
+/// Returns the stdin to hand a guest run in an output-capturing backend.
+///
+/// When [`reserve_output_stdin_snapshot`] has stored a replayable snapshot the
+/// file is rewound and a fresh descriptor handed to the guest, so each
+/// `--verify` run reads identical input. Otherwise (no snapshot reserved, or a
+/// terminal/absent stdin) the guest gets `/dev/null`, matching the previous
+/// behavior for callers that do not reserve a snapshot.
+fn output_backend_stdin() -> Result<Stdio, Error> {
+    match output_backend_stdin_file()? {
+        Some(file) => Ok(Stdio::from(file)),
+        None => Ok(Stdio::null()),
     }
 }
 
@@ -1287,7 +1385,7 @@ async fn run_with_output_backend_inner(
         return run_dbi(command, config, print_summary, true).await;
     }
     if backend == Backend::Sabre {
-        command.stdin(Stdio::null());
+        command.stdin(output_backend_stdin()?);
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         return run_sabre(
@@ -1300,7 +1398,7 @@ async fn run_with_output_backend_inner(
         .await;
     }
     if backend == Backend::Liteinst {
-        command.stdin(Stdio::null());
+        command.stdin(output_backend_stdin()?);
         let preload = liteinst_runtime_library_path()?;
         let (output, mut global_state) =
             reverie_liteinst::LiteinstBackend::run_with_output_and_preload::<Detcore>(
@@ -1323,7 +1421,7 @@ async fn run_with_output_backend_inner(
     }
     ensure_backend_dispatch(backend)?;
 
-    command.stdin(Stdio::null());
+    command.stdin(output_backend_stdin()?);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     let mut builder = reverie_ptrace::TracerBuilder::<Detcore>::new(command).config(config.clone());
@@ -1565,7 +1663,9 @@ mod tests {
     use super::kvm_device_unavailable_reason;
     use super::liteinst_requires_forced_shutdown;
     use super::liteinst_runtime_unavailable_reason;
+    use super::output_backend_stdin_file;
     use super::prepare_backend_config;
+    use super::reserve_output_stdin_snapshot;
     use super::resolve_kvm_shebang;
     use super::resolve_sabre_binary_from;
     use super::sabre_program_needs_neutral_name;
@@ -1574,6 +1674,46 @@ mod tests {
     use super::stage_sabre_program_in;
     use super::stop_sabre_rpc_server;
     use super::wait_for_sabre_rpc_disconnects;
+
+    /// Regression test for the `hermit run --verify` empty-stdin bug: a pipe
+    /// (non-seekable) fed to hermit must be buffered and replayed *identically*
+    /// to every run of `--verify`. Before the fix the output-capturing backend
+    /// used `Stdio::null()`, so piped input was silently dropped and both runs
+    /// saw empty input (a false "deterministic" pass, e.g. `gcc -x c -`
+    /// compiling nothing). This asserts the reserved snapshot replays the exact
+    /// bytes twice.
+    #[test]
+    fn output_stdin_snapshot_replays_pipe_to_repeated_runs() {
+        use std::io::Read;
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+
+        // A pipe is non-seekable, exercising the buffer-into-tempfile path that
+        // matches the real `echo prog | hermit run --verify` scenario.
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: pipe(2) just returned two fresh owned descriptors.
+        let read_end = unsafe { fs::File::from_raw_fd(fds[0]) };
+        let mut write_end = unsafe { fs::File::from_raw_fd(fds[1]) };
+
+        let payload = b"int main(){return 0;}\n";
+        write_end.write_all(payload).unwrap();
+        // Close the write end so draining the pipe hits EOF.
+        drop(write_end);
+
+        reserve_output_stdin_snapshot(Some(read_end)).unwrap();
+
+        // Two successive runs (as `--verify` performs) must each read the full
+        // payload from the start.
+        for run in 0..2 {
+            let mut file = output_backend_stdin_file()
+                .unwrap()
+                .unwrap_or_else(|| panic!("run {run}: expected a replayable stdin snapshot"));
+            let mut got = Vec::new();
+            file.read_to_end(&mut got).unwrap();
+            assert_eq!(got, payload, "run {run} stdin replay mismatch");
+        }
+    }
 
     #[test]
     fn liteinst_reserved_failures_require_scheduler_cancellation() {

@@ -1436,6 +1436,13 @@ impl RunOpts {
         }
         if self.selected_backend() == Backend::Kvm {
             hermit::reserve_kvm_stdin(super::startup_stdin()?)?;
+        } else if self.verify {
+            // `--verify` runs the guest twice through the output-capturing
+            // backend, which otherwise feeds the guest an empty stdin. Snapshot
+            // the real stdin now so both runs replay identical input; without
+            // this, piped input (e.g. `echo prog | hermit run --verify -- gcc
+            // -x c -`) is dropped and hermit reports a false deterministic pass.
+            hermit::reserve_output_stdin_snapshot(super::startup_stdin()?)?;
         }
 
         // TODO(T124429978): temporarily disabling this because it inexplicably clobbers our
