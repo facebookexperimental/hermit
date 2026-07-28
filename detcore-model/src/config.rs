@@ -100,6 +100,14 @@ pub struct Config {
     #[clap(skip = true)]
     pub backend_dispatches_thread_tools: bool,
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1058): Review process-signal identity translation.
+    /// The backend cannot execute process-directed signal syscalls using Detcore's guest PID and
+    /// therefore requires Detcore to translate an unambiguous process target to a specific thread.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_requires_thread_directed_process_signals: bool,
+
     /// Epoch of the logical time.
     ///
     /// This is the datetime from which all time and date modtimes begin and
@@ -1004,6 +1012,7 @@ mod tests {
         let config = Config::default();
         assert!(!config.backend_serializes_fork_children);
         assert!(config.backend_dispatches_thread_tools);
+        assert!(!config.backend_requires_thread_directed_process_signals);
     }
 
     #[test]

@@ -1154,6 +1154,7 @@ fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig 
     config.cancel_killed_thread_rpcs = backend == Backend::Sabre;
     config.backend_serializes_fork_children = backend == Backend::Kvm;
     config.backend_dispatches_thread_tools = backend != Backend::Kvm;
+    config.backend_requires_thread_directed_process_signals = backend == Backend::Dbi;
     config
 }
 
@@ -1612,6 +1613,7 @@ mod tests {
         assert!(sabre.cancel_killed_thread_rpcs);
         assert!(!sabre.backend_serializes_fork_children);
         assert!(sabre.backend_dispatches_thread_tools);
+        assert!(!sabre.backend_requires_thread_directed_process_signals);
         let ptrace = prepare_backend_config(config, Backend::Ptrace);
         assert!(!ptrace.discover_live_file_metadata);
         assert!(!ptrace.use_thread_local_clock_reads);
@@ -1620,6 +1622,7 @@ mod tests {
         assert!(!ptrace.cancel_killed_thread_rpcs);
         assert!(!ptrace.backend_serializes_fork_children);
         assert!(ptrace.backend_dispatches_thread_tools);
+        assert!(!ptrace.backend_requires_thread_directed_process_signals);
     }
 
     #[test]
@@ -1628,6 +1631,13 @@ mod tests {
         let kvm = prepare_backend_config(config, Backend::Kvm);
         assert!(kvm.backend_serializes_fork_children);
         assert!(!kvm.backend_dispatches_thread_tools);
+        assert!(!kvm.backend_requires_thread_directed_process_signals);
+    }
+
+    #[test]
+    fn dbi_backend_config_translates_process_signals_to_host_threads() {
+        let config = prepare_backend_config(super::DetConfig::default(), Backend::Dbi);
+        assert!(config.backend_requires_thread_directed_process_signals);
     }
 
     #[test]

@@ -299,10 +299,13 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
+    // TODO-HUMAN-REVIEW(PR-1058): Review process-pending signal preservation.
     /// Resolve signal-zero existence checks in the fixed PID namespace, then route an
-    /// unambiguous positive-PID process signal to its sole live thread. Multithreaded
-    /// process-directed delivery, process-group delivery, and broadcast delivery are
-    /// refused until Detcore models eligible signal masks.
+    /// unambiguous positive-PID process signal through the backend. Backends that can execute
+    /// with guest PIDs preserve process-directed delivery; DBI translates it to the sole live
+    /// thread because its native process uses a host PID. Multithreaded process-directed
+    /// delivery, process-group delivery, and broadcast delivery are refused until Detcore models
+    /// eligible signal masks.
     pub async fn handle_kill<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -322,6 +325,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let targets = resolve_kill_targets(guest, DetPid::from_raw(tgid)).await;
         let tid = deterministic_kill_target(&targets, call.sig())?;
+        if !guest
+            .config()
+            .backend_requires_thread_directed_process_signals
+        {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
         let targeted = syscalls::Tgkill::new()
             .with_tgid(tgid)
             .with_tid(tid.as_raw())
@@ -371,12 +380,11 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#812)
-    /// Queue a process-directed signal with an accompanying `siginfo_t`. Mirrors
-    /// `handle_kill`: a signal-zero existence check forwards unchanged, and an
-    /// unambiguous positive-PID target is routed to its sole live thread via
-    /// `rt_tgsigqueueinfo`, preserving the guest siginfo pointer. Ambiguous
-    /// multithreaded process-directed delivery is refused until Detcore models
-    /// eligible signal masks.
+    // TODO-HUMAN-REVIEW(PR-1058): Review queued process-signal preservation.
+    /// Queue a process-directed signal with an accompanying `siginfo_t`. Mirrors `handle_kill`:
+    /// preserve process-directed delivery when the backend accepts guest PIDs, otherwise route an
+    /// unambiguous positive-PID target to its sole live thread via `rt_tgsigqueueinfo`. Ambiguous
+    /// multithreaded process-directed delivery is refused until Detcore models eligible masks.
     pub async fn handle_rt_sigqueueinfo<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -396,6 +404,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let targets = resolve_kill_targets(guest, DetPid::from_raw(tgid)).await;
         let tid = deterministic_kill_target(&targets, call.sig())?;
+        if !guest
+            .config()
+            .backend_requires_thread_directed_process_signals
+        {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
         let targeted = syscalls::RtTgsigqueueinfo::new()
             .with_tgid(tgid)
             .with_tid(tid.as_raw())
