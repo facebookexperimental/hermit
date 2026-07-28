@@ -560,7 +560,11 @@ fn detcore_summary(output: &Output) -> Result<DbiSummary, Error> {
     let stdin_reads = field("stdin_reads=")?
         .parse::<u64>()
         .map_err(|_| Error::msg("DBI verification failed: invalid stdin read count"))?;
-    if branches == 0 || syscalls == 0 || rewritten == 0 || rewritten > syscalls {
+    // A guest can reach the native callback without asking Detcore to suppress
+    // a syscall. For example, a raw program whose only syscall is the native
+    // lifecycle `exit` reports `rewritten=0`. The callback is still healthy as
+    // long as it observed work and did not report more rewrites than syscalls.
+    if branches == 0 || syscalls == 0 || rewritten > syscalls {
         return Err(Error::msg(
             "DBI verification failed: native callback counters are inconsistent",
         ));
@@ -703,6 +707,8 @@ pub fn run_sabre_strace(program: &Path, args: &[String]) -> Result<ExitStatus, E
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::process::ExitStatusExt as _;
+
     use super::*;
 
     fn write_executable(path: &Path, contents: &[u8]) {
@@ -746,6 +752,44 @@ mod tests {
         let mut actual = dbi_summary(100);
         actual.memory_hash = "0000000000000000".to_owned();
         assert!(!expected.same_observable_behavior(&actual));
+    }
+
+    fn dbi_output(summary: &str) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: summary.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn dbi_summary_accepts_a_callback_without_rewritten_syscalls() {
+        let output = dbi_output(
+            "reverie-dbi: tool=Detcore branches=18 syscalls=1 rewritten=0 \
+             stdin_reads=0 memory_hash=cbf29ce484222325\n",
+        );
+
+        let summary = detcore_summary(&output).unwrap();
+
+        assert_eq!(summary.syscalls, 1);
+        assert_eq!(summary.rewritten, 0);
+    }
+
+    #[test]
+    fn dbi_summary_rejects_more_rewrites_than_syscalls() {
+        let output = dbi_output(
+            "reverie-dbi: tool=Detcore branches=18 syscalls=1 rewritten=2 \
+             stdin_reads=0 memory_hash=cbf29ce484222325\n",
+        );
+
+        let error = detcore_summary(&output).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("native callback counters are inconsistent"),
+            "{error}"
+        );
     }
 
     #[test]
