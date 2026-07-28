@@ -84,7 +84,7 @@ fn deterministic_kill_target(targets: &[DetTid], sig: libc::c_int) -> Result<Det
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-PENDING): Review unmaskable process-group SIGKILL forwarding.
+// TODO-HUMAN-REVIEW(PR-1119): Review unmaskable process-group SIGKILL forwarding.
 fn can_forward_process_group_signal(
     pid: libc::pid_t,
     sig: libc::c_int,
@@ -310,7 +310,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     // TODO-HUMAN-REVIEW(PR-1058): Review process-pending signal preservation.
-    // TODO-HUMAN-REVIEW(PR-PENDING): Review unmaskable process-group SIGKILL forwarding.
+    // TODO-HUMAN-REVIEW(PR-1119): Review unmaskable process-group SIGKILL forwarding.
     /// Resolve signal-zero existence checks in the fixed PID namespace, then route an
     /// unambiguous positive-PID process signal through the backend. Backends that can execute
     /// with guest PIDs preserve process-directed delivery; DBI translates it to the sole live
