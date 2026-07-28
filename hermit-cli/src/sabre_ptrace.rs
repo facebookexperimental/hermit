@@ -48,12 +48,12 @@ pub struct Output {
 
 #[derive(Default)]
 struct TraceeState {
-    pending_syscall: Option<PendingSyscall>,
+    pending_patch: Option<PendingPatch>,
 }
 
-enum PendingSyscall {
-    Patch { site: usize, syscall: u64 },
-    Refusal { syscall: u64, errno: i32 },
+struct PendingPatch {
+    site: usize,
+    syscall: u64,
 }
 
 struct Supervisor {
@@ -64,19 +64,12 @@ struct Supervisor {
     sabre: PathBuf,
     plugin: PathBuf,
     readiness: Arc<AtomicBool>,
-    strict: bool,
     ready_observed: bool,
     patched_sites: HashSet<(Pid, usize)>,
 }
 
 impl Supervisor {
-    fn new(
-        root: Pid,
-        sabre: PathBuf,
-        plugin: PathBuf,
-        readiness: Arc<AtomicBool>,
-        strict: bool,
-    ) -> Self {
+    fn new(root: Pid, sabre: PathBuf, plugin: PathBuf, readiness: Arc<AtomicBool>) -> Self {
         Self {
             root,
             tracees: HashSet::from([root]),
@@ -84,7 +77,6 @@ impl Supervisor {
             mapping_cache: HashMap::new(),
             sabre,
             readiness,
-            strict,
             plugin,
             ready_observed: false,
             patched_sites: HashSet::new(),
@@ -204,54 +196,28 @@ impl Supervisor {
                         "child syscall entry",
                     );
                 }
-                if bytes == SYSCALL_INSN && fallback_ready {
+                if bytes == SYSCALL_INSN && fallback_ready && !self.is_trusted_mapping(pid, site)? {
+                    write_two_bytes(pid, site, SABRE_SYSCALL_MARKER)?;
                     let syscall = regs.orig_rax;
-                    if !self.is_trusted_mapping(pid, site)? {
-                        write_two_bytes(pid, site, SABRE_SYSCALL_MARKER)?;
-                        regs.orig_rax = u64::MAX;
-                        ptrace::setregs(pid, regs)?;
-                        self.states.entry(pid).or_default().pending_syscall =
-                            Some(PendingSyscall::Patch { site, syscall });
-                        self.patched_sites.insert((pid, site));
-                        tracing::debug!(
-                            target: "hermit::sabre::fallback",
-                            tid = pid.as_raw(),
-                            address = site,
-                            "redirecting raw syscall instruction through the SaBRe handler",
-                        );
-                    // AUTONOMOUS-BOT-IMPLEMENTED
-                    // TODO-HUMAN-REVIEW(PR-1142): Review trusted-site ENOSYS enforcement.
-                    } else if let Some(errno) = trusted_enosys_refusal_errno(syscall, self.strict)
-                        && !self.caller_is_runtime_owned(pid, regs.rsp)?
-                    {
-                        regs.orig_rax = u64::MAX;
-                        ptrace::setregs(pid, regs)?;
-                        self.states.entry(pid).or_default().pending_syscall =
-                            Some(PendingSyscall::Refusal { syscall, errno });
-                        tracing::debug!(
-                            target: "hermit::sabre::fallback",
-                            tid = pid.as_raw(),
-                            syscall,
-                            errno,
-                            "enforcing deterministic refusal at trusted raw syscall site",
-                        );
-                    }
+                    regs.orig_rax = u64::MAX;
+                    ptrace::setregs(pid, regs)?;
+                    self.states.entry(pid).or_default().pending_patch =
+                        Some(PendingPatch { site, syscall });
+                    self.patched_sites.insert((pid, site));
+                    tracing::debug!(
+                        target: "hermit::sabre::fallback",
+                        tid = pid.as_raw(),
+                        address = site,
+                        "redirecting raw syscall instruction through the SaBRe handler",
+                    );
                 }
             }
             libc::PTRACE_SYSCALL_INFO_EXIT => {
-                if let Some(pending) = self.states.entry(pid).or_default().pending_syscall.take() {
+                if let Some(pending) = self.states.entry(pid).or_default().pending_patch.take() {
                     let mut regs = ptrace::getregs(pid)?;
-                    match pending {
-                        PendingSyscall::Patch { site, syscall } => {
-                            regs.rax = syscall;
-                            regs.orig_rax = syscall;
-                            regs.rip = site as u64;
-                        }
-                        PendingSyscall::Refusal { syscall, errno } => {
-                            regs.rax = (-(errno as i64)) as u64;
-                            regs.orig_rax = syscall;
-                        }
-                    }
+                    regs.rax = pending.syscall;
+                    regs.orig_rax = pending.syscall;
+                    regs.rip = pending.site as u64;
                     ptrace::setregs(pid, regs)?;
                 }
             }
@@ -305,31 +271,11 @@ impl Supervisor {
         Ok(trusted)
     }
 
-    fn caller_is_runtime_owned(&self, pid: Pid, stack_pointer: u64) -> Result<bool, Error> {
-        let return_address = ptrace::read(pid, stack_pointer as ptrace::AddressType)? as usize;
-        let maps = fs::read_to_string(format!("/proc/{}/maps", pid.as_raw()))?;
-        Ok(mapping_path(&maps, return_address)
-            .is_some_and(|path| mapping_is_runtime_owned(path, &self.sabre, &self.plugin)))
-    }
-
     fn remove_tracee(&mut self, pid: Pid) {
         self.tracees.remove(&pid);
         self.states.remove(&pid);
         self.mapping_cache
             .retain(|(cached_pid, _), _| *cached_pid != pid);
-    }
-}
-
-// The in-guest runtime itself uses process_vm_* through libc. Keep trusted-site
-// handling to feature-absence ENOSYS families; broader fixed-error enforcement
-// needs stronger caller attribution than a shared libc syscall site provides.
-fn trusted_enosys_refusal_errno(raw_syscall: u64, strict: bool) -> Option<i32> {
-    let sysno = usize::try_from(raw_syscall)
-        .ok()
-        .and_then(reverie::syscalls::Sysno::new)?;
-    match detcore::deterministic_refusal_errno(sysno, strict) {
-        Some(reverie::syscalls::Errno::ENOSYS) => Some(reverie::syscalls::Errno::ENOSYS.into_raw()),
-        _ => None,
     }
 }
 
@@ -379,16 +325,14 @@ fn mapping_is_trusted(path: &str, sabre: &Path, plugin: &Path) -> bool {
         return true;
     }
     let path = Path::new(path.strip_suffix(" (deleted)").unwrap_or(path));
-    mapping_is_runtime_owned(path.to_string_lossy().as_ref(), sabre, plugin)
+    path == sabre
+        || path == plugin
+        || same_file_name(path, sabre)
+        || same_file_name(path, plugin)
         // SaBRe owns its loader and shared-library rewriting. Patching a raw
         // libc site while the in-guest tool is active would recurse into the
         // tool's own RPC transport through SaBRe's guest-only UD marker ABI.
         || path.file_name().is_some_and(|name| name.to_string_lossy().contains(".so"))
-}
-
-fn mapping_is_runtime_owned(path: &str, sabre: &Path, plugin: &Path) -> bool {
-    let path = Path::new(path.strip_suffix(" (deleted)").unwrap_or(path));
-    path == sabre || path == plugin || same_file_name(path, sabre) || same_file_name(path, plugin)
 }
 
 fn same_file_name(left: &Path, right: &Path) -> bool {
@@ -446,11 +390,10 @@ pub async fn run(
     sabre: PathBuf,
     plugin: PathBuf,
     readiness: Arc<AtomicBool>,
-    strict: bool,
     capture_output: bool,
 ) -> Result<Output, Error> {
     tokio::task::spawn_blocking(move || {
-        run_blocking(command, sabre, plugin, readiness, strict, capture_output)
+        run_blocking(command, sabre, plugin, readiness, capture_output)
     })
     .await
     .context("SaBRe ptrace supervisor task panicked")?
@@ -461,7 +404,6 @@ fn run_blocking(
     sabre: PathBuf,
     plugin: PathBuf,
     readiness: Arc<AtomicBool>,
-    strict: bool,
     capture_output: bool,
 ) -> Result<Output, Error> {
     if capture_output {
@@ -495,7 +437,7 @@ fn run_blocking(
 
     let stdout_thread = std::thread::spawn(move || read_pipe(stdout));
     let stderr_thread = std::thread::spawn(move || read_pipe(stderr));
-    let supervised = Supervisor::new(root, sabre, plugin, readiness, strict).run();
+    let supervised = Supervisor::new(root, sabre, plugin, readiness).run();
     if supervised.is_err() {
         let _ = nix::sys::signal::kill(root, Signal::SIGKILL);
     }
@@ -551,60 +493,5 @@ mod tests {
         assert!(mapping_is_trusted("/usr/lib/libc.so.6", sabre, plugin));
         assert!(!mapping_is_trusted("/usr/bin/echo", sabre, plugin));
         assert!(!mapping_is_trusted("", sabre, plugin));
-    }
-
-    #[test]
-    fn runtime_ownership_excludes_guest_and_libc_callers() {
-        let sabre = Path::new("/opt/sabre/bin/sabre");
-        let plugin = Path::new("/opt/hermit/libdetcore_sabre.so");
-        assert!(mapping_is_runtime_owned(
-            "/opt/hermit/libdetcore_sabre.so",
-            sabre,
-            plugin
-        ));
-        assert!(mapping_is_runtime_owned(
-            "/tmp/libdetcore_sabre.so (deleted)",
-            sabre,
-            plugin
-        ));
-        assert!(mapping_is_runtime_owned(
-            "/opt/sabre/bin/sabre",
-            sabre,
-            plugin
-        ));
-        assert!(!mapping_is_runtime_owned(
-            "/usr/lib/libc.so.6",
-            sabre,
-            plugin
-        ));
-        assert!(!mapping_is_runtime_owned("/usr/bin/guest", sabre, plugin));
-    }
-
-    #[test]
-    fn trusted_raw_sites_use_detcore_fixed_refusals() {
-        for sysno in [
-            reverie::syscalls::Sysno::add_key,
-            reverie::syscalls::Sysno::cachestat,
-            reverie::syscalls::Sysno::futex_waitv,
-            reverie::syscalls::Sysno::keyctl,
-            reverie::syscalls::Sysno::listmount,
-        ] {
-            assert_eq!(
-                trusted_enosys_refusal_errno(sysno.id() as u64, true),
-                Some(reverie::syscalls::Errno::ENOSYS.into_raw())
-            );
-        }
-        assert_eq!(
-            trusted_enosys_refusal_errno(reverie::syscalls::Sysno::add_key.id() as u64, false),
-            None
-        );
-        assert_eq!(
-            trusted_enosys_refusal_errno(reverie::syscalls::Sysno::read.id() as u64, true),
-            None
-        );
-        assert_eq!(
-            trusted_enosys_refusal_errno(reverie::syscalls::Sysno::mount.id() as u64, true),
-            None
-        );
     }
 }

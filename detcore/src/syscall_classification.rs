@@ -6,7 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use reverie::syscalls::Errno;
 use reverie::syscalls::Sysno;
 
 const EXPECTED_X86_64_SYSNO_COUNT: usize = 373;
@@ -1251,30 +1250,6 @@ pub(crate) const fn is_deterministically_refused_syscall(sysno: Sysno) -> bool {
         )
 }
 
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-1142): Review the fixed-error policy shared with backend fallbacks.
-/// Returns the fixed errno for a syscall that Detcore refuses without consulting the host.
-pub(crate) const fn deterministic_refusal_errno(sysno: Sysno, strict: bool) -> Option<Errno> {
-    if is_strict_only_deterministic_refusal_syscall(sysno) && !strict {
-        return None;
-    }
-    if !is_deterministically_refused_syscall(sysno) {
-        return None;
-    }
-    if is_privileged_admin_refused_syscall(sysno)
-        || is_mount_ns_admin_refused_syscall(sysno)
-        || is_process_isolation_refused_syscall(sysno)
-        || is_privileged_observation_refused_syscall(sysno)
-        || matches!(sysno, Sysno::clock_settime)
-    {
-        Some(Errno::EPERM)
-    } else if matches!(sysno, Sysno::name_to_handle_at) {
-        Some(Errno::EOPNOTSUPP)
-    } else {
-        Some(Errno::ENOSYS)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2149,31 +2124,5 @@ mod tests {
         for sysno in [Sysno::openat2, Sysno::perf_event_open, Sysno::clock_settime] {
             assert!(!is_strict_only_deterministic_refusal_syscall(sysno));
         }
-    }
-
-    #[test]
-    fn deterministic_refusal_errno_matches_dispatch_policy() {
-        for sysno in [
-            Sysno::add_key,
-            Sysno::cachestat,
-            Sysno::futex_waitv,
-            Sysno::keyctl,
-            Sysno::listmount,
-        ] {
-            assert_eq!(
-                deterministic_refusal_errno(sysno, true),
-                Some(Errno::ENOSYS)
-            );
-        }
-        assert_eq!(
-            deterministic_refusal_errno(Sysno::mount, true),
-            Some(Errno::EPERM)
-        );
-        assert_eq!(
-            deterministic_refusal_errno(Sysno::name_to_handle_at, true),
-            Some(Errno::EOPNOTSUPP)
-        );
-        assert_eq!(deterministic_refusal_errno(Sysno::add_key, false), None);
-        assert_eq!(deterministic_refusal_errno(Sysno::read, true), None);
     }
 }

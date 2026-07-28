@@ -695,26 +695,9 @@ fn stage_sabre_program_in(
 
 // TODO-HUMAN-REVIEW(PR-738): Review controller/plugin artifact separation.
 fn sabre_runtime_library_path() -> io::Result<PathBuf> {
-    if let Some(path) = hermit_resources::resource("libdetcore_sabre.so")?
-        && path.is_file()
-    {
-        return Ok(path);
-    }
-
     let executable = std::env::current_exe()?;
-    let directory = executable.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "Hermit executable has no parent directory",
-        )
-    })?;
-    [
-        directory.join("libdetcore_sabre.so"),
-        directory.join("deps/libdetcore_sabre.so"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
-    .ok_or_else(|| {
+    let packaged = hermit_resources::resource("libdetcore_sabre.so")?;
+    resolve_sabre_runtime_library_from(&executable, packaged.as_deref()).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             format!(
@@ -722,6 +705,25 @@ fn sabre_runtime_library_path() -> io::Result<PathBuf> {
                 executable.display()
             ),
         )
+    })
+}
+
+// TODO-HUMAN-REVIEW(PR-1142): Prefer the plugin built in the running binary's profile.
+fn resolve_sabre_runtime_library_from(
+    executable: &Path,
+    packaged: Option<&Path>,
+) -> Option<PathBuf> {
+    let directory = executable.parent()?;
+    [
+        directory.join("libdetcore_sabre.so"),
+        directory.join("deps/libdetcore_sabre.so"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .or_else(|| {
+        packaged
+            .filter(|path| path.is_file())
+            .map(Path::to_path_buf)
     })
 }
 
@@ -883,7 +885,6 @@ async fn run_sabre(
         PathBuf::from(&sabre),
         plugin.clone(),
         fallback_ready,
-        config.panic_on_unsupported_syscalls,
         capture_output,
     )
     .await
@@ -1695,6 +1696,7 @@ mod tests {
     use super::reserve_output_stdin_snapshot;
     use super::resolve_kvm_shebang;
     use super::resolve_sabre_binary_from;
+    use super::resolve_sabre_runtime_library_from;
     use super::sabre_program_needs_neutral_name;
     use super::sabre_runtime_unavailable_reason;
     use super::shutdown_sabre_rpc;
@@ -2053,6 +2055,31 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("is not an executable file"));
+    }
+
+    #[test]
+    fn sabre_plugin_resolver_prefers_the_running_profile_over_install_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("target/debug/hermit");
+        let adjacent = temp.path().join("target/debug/libdetcore_sabre.so");
+        let packaged = temp
+            .path()
+            .join("target/install_pkg/rsrcs/libdetcore_sabre.so");
+        fs::create_dir_all(adjacent.parent().unwrap()).unwrap();
+        fs::create_dir_all(packaged.parent().unwrap()).unwrap();
+        fs::write(&adjacent, b"debug plugin").unwrap();
+        fs::write(&packaged, b"stale release plugin").unwrap();
+
+        assert_eq!(
+            resolve_sabre_runtime_library_from(&executable, Some(&packaged)),
+            Some(adjacent.clone())
+        );
+
+        fs::remove_file(&adjacent).unwrap();
+        assert_eq!(
+            resolve_sabre_runtime_library_from(&executable, Some(&packaged)),
+            Some(packaged)
+        );
     }
 
     #[test]
