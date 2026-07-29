@@ -55,6 +55,7 @@ use reverie::syscalls::Sysno;
 use reverie_dbi::DbiGuest;
 use reverie_dbi::DbiSyscallOutcome;
 use reverie_dbi::MemoryReader;
+use reverie_dbi::MemoryWriter;
 use reverie_dbi::RegisterReader;
 use reverie_dbi::RegisterWriter;
 use reverie_dbi::SyscallInvoker;
@@ -546,56 +547,6 @@ impl GetrandomProbe {
         let failed_chunk = self.writable / RANDOM_FILL_CHUNK_BYTES;
         ((failed_chunk + 1) * RANDOM_FILL_CHUNK_BYTES).min(self.requested)
     }
-}
-
-fn write_process_memory(
-    pid: i32,
-    remote_address: usize,
-    bytes: &[u8],
-    mut invoke: impl FnMut(&[u64; 6]) -> i64,
-) -> Result<usize, Errno> {
-    let page_size = 4096;
-    let mut written = 0;
-    while written < bytes.len() {
-        let Some(remote) = remote_address.checked_add(written) else {
-            return Ok(written);
-        };
-        let segment_len = (page_size - remote % page_size).min(bytes.len() - written);
-        let local_iov = libc::iovec {
-            iov_base: bytes[written..].as_ptr().cast_mut().cast(),
-            iov_len: segment_len,
-        };
-        let remote_iov = libc::iovec {
-            iov_base: remote as *mut c_void,
-            iov_len: segment_len,
-        };
-        let process_vm_writev_args = [
-            pid as u64,
-            (&raw const local_iov) as u64,
-            1,
-            (&raw const remote_iov) as u64,
-            1,
-            0,
-        ];
-        let result = loop {
-            let result = invoke(&process_vm_writev_args);
-            if result != -(Errno::EINTR.into_raw() as i64) {
-                break result;
-            }
-        };
-        if result == -(Errno::EFAULT.into_raw() as i64) {
-            return Ok(written);
-        }
-        if result < 0 {
-            return Err(Errno::EIO);
-        }
-        let count = (result as usize).min(segment_len);
-        if count == 0 {
-            return Ok(written);
-        }
-        written += count;
-    }
-    Ok(written)
 }
 
 fn getrandom_writable_prefix(
@@ -1311,6 +1262,7 @@ unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut 
 // TODO-HUMAN-REVIEW(PR-587): Confirm native process dispatch pauses only exec.
 // TODO-HUMAN-REVIEW(PR-874): Review deferred-syscall and register-writer ABI compatibility.
 // TODO-HUMAN-REVIEW(PR-1060): Review host child DetTid syscall dispatch.
+// TODO-HUMAN-REVIEW(PR-1118): Review fault-safe DBI getrandom memory writes.
 pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     context: *mut c_void,
     scratch: *mut c_void,
@@ -1327,6 +1279,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     read_registers: RegisterReader,
     write_registers: RegisterWriter,
     read_memory: MemoryReader,
+    write_memory: MemoryWriter,
     emit: unsafe extern "C" fn(*const u8, usize),
 ) -> i32 {
     let first_event = TOTAL_SYSCALLS.fetch_add(1, Ordering::Relaxed) == 0;
@@ -1363,17 +1316,11 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     }
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-849): Review fault-safe DBI getrandom writes.
-    // Probe with deterministic zeros through process_vm_writev, then let Detcore overwrite
-    // the entire writable prefix before the application resumes.
+    // Probe with deterministic zeros through DynamoRIO's fault-safe writer, then let Detcore
+    // overwrite the entire writable prefix before the application resumes.
     let getrandom_probe = if sysnum == libc::SYS_getrandom {
-        match getrandom_writable_prefix(raw_args, |remote, bytes| {
-            write_process_memory(pid, remote, bytes, |process_vm_writev_args| unsafe {
-                invoke_syscall(
-                    context as usize,
-                    libc::SYS_process_vm_writev,
-                    process_vm_writev_args.as_ptr(),
-                )
-            })
+        match getrandom_writable_prefix(raw_args, |remote, bytes| unsafe {
+            Ok(write_memory(remote, bytes.as_ptr(), bytes.len()))
         }) {
             Some(Ok(probe)) => {
                 dispatch_args[1] = probe.writable as u64;
@@ -1928,26 +1875,6 @@ mod tests {
             None
         );
         assert!(!invoked);
-    }
-
-    #[test]
-    fn process_memory_writer_retries_interrupts_and_stops_at_faults() {
-        let mut calls = 0;
-        let written = write_process_memory(7, 0x1ff8, &[0_u8; 16], |args| {
-            assert_eq!(args[0], 7);
-            assert_eq!(args[2], 1);
-            assert_eq!(args[4], 1);
-            calls += 1;
-            match calls {
-                1 => -(Errno::EINTR.into_raw() as i64),
-                2 => 8,
-                3 => -(Errno::EFAULT.into_raw() as i64),
-                _ => unreachable!(),
-            }
-        })
-        .unwrap();
-        assert_eq!(written, 8);
-        assert_eq!(calls, 3);
     }
 
     #[test]
