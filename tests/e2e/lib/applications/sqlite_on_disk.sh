@@ -10,22 +10,53 @@ export LC_ALL=C
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export TZ=UTC
 
-readonly EXPECTED_ROWS_SHA256=3500e4318c539abc8887178622adfaa8746704ed40b3ada35d29ec5d78d5c247
+readonly EXPECTED_ROWS_SHA256=b44b616cd6823208d1f28a458acea5ff742e1b030adf03b6b80e0cdaa01c2ede
 
 function run_sqlite_workload {
     local work_dir=$1
-    local database rows metadata rows_hash metadata_hash integrity
+    local database rows metadata plan rows_hash metadata_hash integrity
 
     database="$work_dir/application.db"
     rows="$work_dir/rows.txt"
     metadata="$work_dir/metadata.txt"
+    plan="$work_dir/plan.txt"
     rm -rf -- "$work_dir"
     mkdir -p -- "$work_dir"
 
     sqlite3 -batch "$database" >/dev/null <<'SQL'
 PRAGMA journal_mode=DELETE;
-CREATE TABLE records (id INTEGER PRIMARY KEY, label TEXT NOT NULL, value INTEGER NOT NULL);
-INSERT INTO records VALUES (1, 'alpha', 11), (2, 'beta', 29), (3, 'gamma', 47);
+PRAGMA synchronous=FULL;
+PRAGMA mmap_size=1048576;
+
+CREATE TABLE records(
+  id INTEGER PRIMARY KEY,
+  category TEXT NOT NULL,
+  value INTEGER NOT NULL,
+  note TEXT NOT NULL
+);
+
+-- Keep this fixture small while exercising a committed multi-row transaction.
+BEGIN IMMEDIATE;
+WITH RECURSIVE sequence(id) AS (
+  VALUES(1) UNION ALL SELECT id + 1 FROM sequence WHERE id < 48
+)
+INSERT INTO records(id, category, value, note)
+SELECT id,
+       CASE id % 3 WHEN 0 THEN 'alpha' WHEN 1 THEN 'beta' ELSE 'gamma' END,
+       id * 7,
+       printf('row-%02d', id)
+FROM sequence;
+UPDATE records SET value = value + 5 WHERE id % 10 = 0;
+COMMIT;
+
+CREATE INDEX idx_records_category_value ON records(category, value);
+
+-- Exercise rollback and journal cleanup without changing the expected rows.
+BEGIN;
+INSERT INTO records VALUES(999, 'rolled-back', 999, 'must-not-persist');
+DELETE FROM records WHERE id <= 3;
+ROLLBACK;
+
 CREATE TABLE run_metadata (observed_at TEXT NOT NULL, nonce TEXT NOT NULL);
 INSERT INTO run_metadata
 VALUES (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), lower(hex(randomblob(16))));
@@ -35,8 +66,22 @@ SQL
     integrity=$(sqlite3 -batch -noheader "$database" 'PRAGMA integrity_check;')
     [[ $integrity == ok ]]
 
-    sqlite3 -batch -noheader -separator '|' "$database" \
-        'SELECT id, label, value FROM records ORDER BY id;' >"$rows"
+    sqlite3 -batch -noheader "$database" >"$plan" <<'SQL'
+EXPLAIN QUERY PLAN
+SELECT id, value FROM records INDEXED BY idx_records_category_value
+WHERE category = 'alpha' AND value >= 70 ORDER BY value;
+SQL
+    grep -Fq 'USING COVERING INDEX idx_records_category_value' "$plan"
+
+    sqlite3 -batch -noheader -separator '|' "$database" >"$rows" <<'SQL'
+PRAGMA mmap_size=1048576;
+SELECT category, COUNT(*), SUM(value), MIN(value), MAX(value)
+FROM records GROUP BY category ORDER BY category;
+SELECT id, category, value
+FROM records INDEXED BY idx_records_category_value
+WHERE category = 'alpha' AND value >= 70 ORDER BY value, id LIMIT 8;
+SELECT COUNT(*) FROM records WHERE category = 'rolled-back';
+SQL
     sqlite3 -batch -noheader -separator '|' "$database" \
         'SELECT observed_at, nonce FROM run_metadata;' >"$metadata"
 
