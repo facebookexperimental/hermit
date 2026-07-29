@@ -56,18 +56,25 @@ pub use detcore::Config as DetConfig;
 pub use detcore::Detcore;
 pub use detcore::RecordOrReplay;
 #[doc(hidden)]
+#[cfg(feature = "dbi")]
 pub use detcore_dbi::reverie_dbi_runtime_background_init;
 #[doc(hidden)]
+#[cfg(feature = "dbi")]
 pub use detcore_dbi::reverie_dbi_runtime_name;
 #[doc(hidden)]
+#[cfg(feature = "dbi")]
 pub use detcore_dbi::reverie_dbi_runtime_pre_syscall;
 #[doc(hidden)]
+#[cfg(feature = "dbi")]
 pub use detcore_dbi::reverie_dbi_runtime_ready;
 #[doc(hidden)]
+#[cfg(feature = "dbi")]
 pub use detcore_dbi::reverie_dbi_runtime_thread_exit;
 #[doc(hidden)]
+#[cfg(feature = "dbi")]
 pub use detcore_dbi::reverie_dbi_runtime_thread_init;
 #[doc(hidden)]
+#[cfg(feature = "dbi")]
 pub use detcore_dbi::reverie_dbi_runtime_totals;
 pub use error::Context;
 pub use error::Error;
@@ -358,12 +365,14 @@ fn validate_tracing_environment() -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(feature = "dbi")]
 fn is_dynamorio_sdk(path: &Path) -> bool {
     path.join("include/dr_api.h").is_file()
         || path.join("DynamoRIOConfig.cmake").is_file()
         || path.join("cmake/DynamoRIOConfig.cmake").is_file()
 }
 
+#[cfg(feature = "dbi")]
 fn dynamorio_sdk_available() -> bool {
     if hermit_resources::resource("dynamorio/bin64/drrun")
         .is_ok_and(|path| path.is_some_and(|path| path.is_file()))
@@ -387,6 +396,7 @@ fn dynamorio_sdk_available() -> bool {
         .any(|path| is_dynamorio_sdk(&path))
 }
 
+#[cfg(feature = "dbi")]
 fn dbi_runtime_unavailable_reason() -> Option<String> {
     detcore_dbi::runtime_library_path().err().map(|error| {
         format!(
@@ -537,11 +547,7 @@ impl Backend {
             Self::Ptrace => validate_tracing_environment()
                 .err()
                 .map(|error| error.to_string()),
-            Self::Dbi if !dynamorio_sdk_available() => Some(
-                "the DynamoRIO runtime was not found; build target/install_pkg, set HERMIT_INSTALL_DIR, or set DYNAMORIO_HOME/DynamoRIO_DIR to a valid SDK"
-                    .to_owned(),
-            ),
-            Self::Dbi => dbi_runtime_unavailable_reason(),
+            Self::Dbi => dbi_unavailable_reason(),
             Self::Liteinst => liteinst_runtime_unavailable_reason(),
             // TODO-HUMAN-REVIEW(#589): Review SaBRe backend availability reporting.
             Self::Sabre => sabre_runtime_unavailable_reason(),
@@ -552,6 +558,23 @@ impl Backend {
                 .or_else(e9patch::unavailable_reason),
         }
     }
+}
+
+#[cfg(feature = "dbi")]
+fn dbi_unavailable_reason() -> Option<String> {
+    if !dynamorio_sdk_available() {
+        return Some(
+            "the DynamoRIO runtime was not found; build target/install_pkg, set HERMIT_INSTALL_DIR, or set DYNAMORIO_HOME/DynamoRIO_DIR to a valid SDK"
+                .to_owned(),
+        );
+    }
+    dbi_runtime_unavailable_reason()
+}
+
+#[cfg(not(feature = "dbi"))]
+// TODO-HUMAN-REVIEW(PR-1150): Review the default-on DBI compile-time feature boundary.
+fn dbi_unavailable_reason() -> Option<String> {
+    Some("DBI support was not included in this build".to_owned())
 }
 
 const SABRE_BINARY_ENV: &str = "HERMIT_SABRE_BINARY";
@@ -1125,6 +1148,7 @@ async fn run_kvm(
 }
 
 // TODO-HUMAN-REVIEW(PR-743): Review bounded relaunch before DBI guest execution.
+#[cfg(feature = "dbi")]
 fn dbi_client_thread_start_failed(status: &std::process::ExitStatus) -> bool {
     status.code() == Some(reverie_dbi::CLIENT_THREAD_START_FAILURE_EXIT_CODE)
 }
@@ -1132,6 +1156,7 @@ fn dbi_client_thread_start_failed(status: &std::process::ExitStatus) -> bool {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-737): Review public DBI dispatch and child environment ownership.
 /// Dispatch a command onto the Detcore-linked reverie-dbi runtime.
+#[cfg(feature = "dbi")]
 async fn run_dbi(
     command: Command,
     config: DetConfig,
@@ -1310,7 +1335,15 @@ async fn run_with_backend_inner(
         .status);
     }
     if backend == Backend::Dbi {
-        return Ok(run_dbi(command, config, print_summary, false).await?.status);
+        #[cfg(feature = "dbi")]
+        {
+            return Ok(run_dbi(command, config, print_summary, false).await?.status);
+        }
+        #[cfg(not(feature = "dbi"))]
+        {
+            backend.ensure_available()?;
+            unreachable!("DBI availability must fail when the feature is disabled");
+        }
     }
     if backend == Backend::Sabre {
         return Ok(run_sabre(
@@ -1408,7 +1441,15 @@ async fn run_with_output_backend_inner(
         .await;
     }
     if backend == Backend::Dbi {
-        return run_dbi(command, config, print_summary, true).await;
+        #[cfg(feature = "dbi")]
+        {
+            return run_dbi(command, config, print_summary, true).await;
+        }
+        #[cfg(not(feature = "dbi"))]
+        {
+            backend.ensure_available()?;
+            unreachable!("DBI availability must fail when the feature is disabled");
+        }
     }
     if backend == Backend::Sabre {
         command.stdin(output_backend_stdin()?);
@@ -1682,12 +1723,16 @@ mod tests {
     use super::Backend;
     use super::ExitStatus;
     use super::SABRE_RPC_SOCKET_ENV;
+    #[cfg(feature = "dbi")]
     use super::dbi_runtime_unavailable_reason;
+    #[cfg(feature = "dbi")]
     use super::dynamorio_sdk_available;
     use super::ensure_backend_dispatch;
+    #[cfg(feature = "dbi")]
     use super::is_dynamorio_sdk;
     use super::kvm_device_unavailable_reason;
     use super::liteinst_requires_forced_shutdown;
+    #[cfg(feature = "dbi")]
     use super::liteinst_runtime_unavailable_reason;
     use super::output_backend_stdin_file;
     use super::prepare_backend_config;
@@ -1695,6 +1740,7 @@ mod tests {
     use super::resolve_kvm_shebang;
     use super::resolve_sabre_binary_from;
     use super::sabre_program_needs_neutral_name;
+    #[cfg(feature = "dbi")]
     use super::sabre_runtime_unavailable_reason;
     use super::shutdown_sabre_rpc;
     use super::stage_sabre_program_in;
@@ -1840,6 +1886,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn default_and_available_backends_reflect_host_probes() {
         assert_eq!(Backend::default(), Backend::Ptrace);
         let available = Backend::available().collect::<Vec<_>>();
@@ -1870,6 +1917,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn dependency_probes_require_usable_paths() {
         let temp = tempfile::tempdir().unwrap();
         assert!(!is_dynamorio_sdk(temp.path()));
@@ -2055,6 +2103,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn optional_backends_report_accurate_availability() {
         match Backend::Dbi.ensure_available() {
             Ok(()) => assert!(
@@ -2101,6 +2150,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn dbi_retries_only_the_pre_guest_bootstrap_failure() {
         use std::os::unix::process::ExitStatusExt as _;
 
@@ -2114,6 +2164,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn dbi_public_dispatch_requires_sequentialized_threads() {
         let command = super::Command::new("/bin/true");
         let config = super::DetConfig {
@@ -2132,6 +2183,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn dbi_public_dispatch_runs_echo_through_detcore() {
         use clap::Parser;
 
@@ -2159,6 +2211,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn dbi_public_status_dispatch_runs_true_through_detcore() {
         use clap::Parser;
 

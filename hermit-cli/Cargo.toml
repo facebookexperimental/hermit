@@ -10,13 +10,17 @@ license = "BSD-3-Clause"
 [lib]
 crate-type = ["rlib", "cdylib"]
 
+[features]
+default = ["dbi"]
+dbi = ["dep:detcore-dbi", "dep:reverie-dbi"]
+
 [dependencies]
 anyhow = "1.0.103"
 bincode = { version = "2", features = ["serde"] }
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 colored = "2.1.0"
 detcore = { version = "0.0.0", path = "../detcore" }
-detcore-dbi = { version = "0.0.0", path = "../detcore-dbi" }
+detcore-dbi = { version = "0.0.0", path = "../detcore-dbi", optional = true }
 diff = "0.1.13"
 digest = { version = "0.0.0", path = "../common/digest" }
 dirs = "6.0"
@@ -35,7 +39,7 @@ regex = "1.13.1"
 # Reverie is pinned to a specific commit for reproducibility. Keep this rev in
 # sync across all crates and bump it via docs/updating-reverie.md.
 reverie = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "7424ea5878baebad1c14caf8ea3cd21069823518" }
-reverie-dbi = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "7424ea5878baebad1c14caf8ea3cd21069823518", default-features = false }
+reverie-dbi = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "7424ea5878baebad1c14caf8ea3cd21069823518", default-features = false, optional = true }
 reverie-kvm = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "7424ea5878baebad1c14caf8ea3cd21069823518" }
 reverie-ptrace = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "7424ea5878baebad1c14caf8ea3cd21069823518" }
 reverie-liteinst = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "7424ea5878baebad1c14caf8ea3cd21069823518", default-features = false }

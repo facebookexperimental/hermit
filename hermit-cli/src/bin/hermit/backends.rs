@@ -19,31 +19,45 @@
 //! `hermit --backend sabre strace` diagnostic path.
 
 use std::collections::BTreeMap;
+#[cfg(feature = "dbi")]
 use std::collections::BTreeSet;
+#[cfg(feature = "dbi")]
 use std::env;
+#[cfg(feature = "dbi")]
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
+#[cfg(feature = "dbi")]
 use std::io::IsTerminal as _;
+#[cfg(feature = "dbi")]
 use std::io::Read;
+#[cfg(feature = "dbi")]
 use std::io::Seek as _;
+#[cfg(feature = "dbi")]
 use std::io::SeekFrom;
+#[cfg(feature = "dbi")]
 use std::io::Write;
+#[cfg(feature = "dbi")]
 use std::os::fd::AsRawFd;
+#[cfg(feature = "dbi")]
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+#[cfg(feature = "dbi")]
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
+#[cfg(feature = "dbi")]
 use std::process::Output;
 
 use detcore::Config;
 use hermit::Error;
 use hermit::ExitStatus;
+#[cfg(feature = "dbi")]
 use reverie_dbi::DbiRunner;
 use tracing::metadata::LevelFilter;
 
 #[derive(Debug)]
+#[cfg(feature = "dbi")]
 struct DbiSummary {
     branches: u64,
     syscalls: u64,
@@ -52,6 +66,7 @@ struct DbiSummary {
     memory_hash: String,
 }
 
+#[cfg(feature = "dbi")]
 impl DbiSummary {
     fn same_observable_behavior(&self, other: &Self) -> bool {
         // `branches` is the count at the last intercepted syscall, not an execution digest.
@@ -64,11 +79,13 @@ impl DbiSummary {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+#[cfg(feature = "dbi")]
 struct DbiGuestCommand {
     program: PathBuf,
     args: Vec<OsString>,
 }
 
+#[cfg(feature = "dbi")]
 fn executable_on_path(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
     env::split_paths(path)
         .map(|directory| directory.join(program))
@@ -87,6 +104,7 @@ fn executable_on_path(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
 /// token with the equivalent absolute PATH match. More complex `env` forms are
 /// left unchanged for the normal launcher rather than partially interpreting
 /// options or assignments here.
+#[cfg(feature = "dbi")]
 fn prepare_dbi_guest_command(
     program: &Path,
     args: &[String],
@@ -126,6 +144,7 @@ fn prepare_dbi_guest_command(
     }
 }
 
+#[cfg(feature = "dbi")]
 fn apply_exact_environment(command: &mut StdCommand, environment: &BTreeMap<OsString, OsString>) {
     // DbiRunner reconstructs its launcher command from Command::get_envs(),
     // which cannot expose env_clear(). Make removals explicit so --base-env
@@ -139,12 +158,14 @@ fn apply_exact_environment(command: &mut StdCommand, environment: &BTreeMap<OsSt
 }
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review inherited DBI policy descriptors and bounded reports.
+#[cfg(feature = "dbi")]
 struct InstalledFd {
     target: i32,
     backup: Option<i32>,
     original_flags: Option<i32>,
 }
 
+#[cfg(feature = "dbi")]
 impl InstalledFd {
     fn install(source: i32, target: i32) -> std::io::Result<Self> {
         // Keep the backup above the reserved transport descriptor so installing the target
@@ -194,6 +215,7 @@ impl InstalledFd {
     }
 }
 
+#[cfg(feature = "dbi")]
 impl Drop for InstalledFd {
     fn drop(&mut self) {
         if let Some(backup) = self.backup {
@@ -208,12 +230,14 @@ impl Drop for InstalledFd {
     }
 }
 
+#[cfg(feature = "dbi")]
 struct DbiUnsupportedSyscallReport {
     reader: std::fs::File,
     _writer: std::fs::File,
     _report_fd: InstalledFd,
 }
 
+#[cfg(feature = "dbi")]
 impl DbiUnsupportedSyscallReport {
     fn new() -> std::io::Result<Self> {
         let mut descriptors = [-1; 2];
@@ -286,6 +310,7 @@ impl DbiUnsupportedSyscallReport {
     }
 }
 
+#[cfg(feature = "dbi")]
 impl Drop for DbiUnsupportedSyscallReport {
     fn drop(&mut self) {
         if let Err(error) = self.emit() {
@@ -294,11 +319,13 @@ impl Drop for DbiUnsupportedSyscallReport {
     }
 }
 
+#[cfg(feature = "dbi")]
 struct TeeReader<R, W> {
     input: R,
     replay: W,
 }
 
+#[cfg(feature = "dbi")]
 impl<R: Read, W: Write> Read for TeeReader<R, W> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         let read = self.input.read(buffer)?;
@@ -317,6 +344,7 @@ impl<R: Read, W: Write> Read for TeeReader<R, W> {
 /// When `verify` is true, the guest is executed twice. Both runs must succeed,
 /// produce byte-identical stdout, report `tool=Detcore`, and produce the same
 /// observed guest-memory hash from the native DBI runtime.
+#[cfg(feature = "dbi")]
 pub(super) fn run_dbi(
     program: &Path,
     args: &[String],
@@ -468,6 +496,19 @@ pub(super) fn run_dbi(
     Ok(ExitStatus::Exited(0))
 }
 
+#[cfg(not(feature = "dbi"))]
+pub(super) fn run_dbi(
+    _program: &Path,
+    _args: &[String],
+    _verify: bool,
+    _log: Option<LevelFilter>,
+    _config: &Config,
+    _environment: BTreeMap<OsString, OsString>,
+) -> Result<ExitStatus, Error> {
+    Err(Error::msg("DBI support was not included in this build"))
+}
+
+#[cfg(feature = "dbi")]
 fn dbi_stdout_mismatch(first: &[u8], second: &[u8]) -> String {
     const CONTEXT_BEFORE: usize = 40;
     const CONTEXT_AFTER: usize = 120;
@@ -498,6 +539,7 @@ fn dbi_stdout_mismatch(first: &[u8], second: &[u8]) -> String {
     )
 }
 
+#[cfg(feature = "dbi")]
 fn run_once<R: Read + Send + 'static>(
     runner: &DbiRunner,
     guest: &StdCommand,
@@ -509,6 +551,7 @@ fn run_once<R: Read + Send + 'static>(
         .map_err(|error| launch_error(drrun, error))
 }
 
+#[cfg(feature = "dbi")]
 fn run_once_with_terminal_input(
     runner: &DbiRunner,
     guest: &StdCommand,
@@ -519,6 +562,7 @@ fn run_once_with_terminal_input(
         .map_err(|error| launch_error(drrun, error))
 }
 
+#[cfg(feature = "dbi")]
 fn launch_error(drrun: &Path, error: std::io::Error) -> Error {
     Error::msg(format!(
         "failed to launch drrun ({}): {error}",
@@ -526,10 +570,12 @@ fn launch_error(drrun: &Path, error: std::io::Error) -> Error {
     ))
 }
 
+#[cfg(feature = "dbi")]
 fn process_status(status: std::process::ExitStatus) -> ExitStatus {
     ExitStatus::Exited(status.code().unwrap_or(1))
 }
 
+#[cfg(feature = "dbi")]
 fn detcore_summary(output: &Output) -> Result<DbiSummary, Error> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let summary = stderr
@@ -585,12 +631,14 @@ fn detcore_summary(output: &Output) -> Result<DbiSummary, Error> {
     })
 }
 
+#[cfg(feature = "dbi")]
 fn write_output(output: &Output) -> Result<(), Error> {
     std::io::stdout().write_all(&output.stdout)?;
     std::io::stderr().write_all(&output.stderr)?;
     Ok(())
 }
 
+#[cfg(feature = "dbi")]
 fn output_status(output: &Output) -> ExitStatus {
     ExitStatus::Exited(output.status.code().unwrap_or(1))
 }
@@ -707,10 +755,12 @@ pub fn run_sabre_strace(program: &Path, args: &[String]) -> Result<ExitStatus, E
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "dbi")]
     use std::os::unix::process::ExitStatusExt as _;
 
     use super::*;
 
+    #[cfg(feature = "dbi")]
     fn write_executable(path: &Path, contents: &[u8]) {
         fs::write(path, contents).unwrap();
         let mut permissions = fs::metadata(path).unwrap().permissions();
@@ -718,6 +768,7 @@ mod tests {
         fs::set_permissions(path, permissions).unwrap();
     }
 
+    #[cfg(feature = "dbi")]
     fn dbi_summary(branches: u64) -> DbiSummary {
         DbiSummary {
             branches,
@@ -729,11 +780,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn dbi_summary_treats_last_syscall_branch_count_as_telemetry() {
         assert!(dbi_summary(563_145).same_observable_behavior(&dbi_summary(563_103)));
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn dbi_summary_compares_observable_counters_and_hash() {
         let expected = dbi_summary(100);
 
@@ -754,6 +807,7 @@ mod tests {
         assert!(!expected.same_observable_behavior(&actual));
     }
 
+    #[cfg(feature = "dbi")]
     fn dbi_output(summary: &str) -> Output {
         Output {
             status: std::process::ExitStatus::from_raw(0),
@@ -763,6 +817,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn dbi_summary_accepts_a_callback_without_rewritten_syscalls() {
         let output = dbi_output(
             "reverie-dbi: tool=Detcore branches=18 syscalls=1 rewritten=0 \
@@ -776,6 +831,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn dbi_summary_rejects_more_rewrites_than_syscalls() {
         let output = dbi_output(
             "reverie-dbi: tool=Detcore branches=18 syscalls=1 rewritten=2 \
@@ -793,6 +849,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn dbi_stdout_mismatch_reports_offset_lengths_and_bounded_context() {
         let first = [vec![b'a'; 80], b"left-tail".to_vec()].concat();
         let second = [vec![b'a'; 80], b"right-tail-extra".to_vec()].concat();
@@ -807,6 +864,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn dbi_stdout_mismatch_reports_prefix_length_difference() {
         let detail = dbi_stdout_mismatch(b"same", b"same suffix");
 
@@ -815,6 +873,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn dbi_resolves_simple_env_shebang_target_to_absolute_path() {
         let root = tempfile::tempdir().unwrap();
         let bin = root.path().join("bin");
@@ -839,6 +898,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn dbi_leaves_complex_env_shebang_for_launcher() {
         let root = tempfile::tempdir().unwrap();
         let script = root.path().join("guest.py");
