@@ -147,10 +147,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         open_file_id: OpenFileId,
     ) -> Option<u16> {
-        let mytime = guest.thread_state().thread_logical_time.clone();
-        let response = guest
-            .send_rpc((mytime, GlobalRequest::ReleasePort(open_file_id)))
-            .await;
+        let response = send_and_update_time(guest, GlobalRequest::ReleasePort(open_file_id)).await;
         match response.1 {
             GlobalResponse::ReleasePort(port) => port,
             other => panic!("unexpected release-port response: {other:?}"),
@@ -163,10 +160,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         open_file_id: OpenFileId,
         port: u16,
     ) {
-        let mytime = guest.thread_state().thread_logical_time.clone();
-        let response = guest
-            .send_rpc((mytime, GlobalRequest::AddUsedPort(port, open_file_id)))
-            .await;
+        let response =
+            send_and_update_time(guest, GlobalRequest::AddUsedPort(port, open_file_id)).await;
         match response.1 {
             GlobalResponse::AddUsedPort => {}
             other => panic!("unexpected restore-port response: {other:?}"),
@@ -2002,10 +1997,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if sockaddr_family == libc::AF_UNIX as u16
             && call.addrlen() == std::mem::offset_of!(libc::sockaddr_un, sun_path) as i32
         {
-            let mytime = guest.thread_state().thread_logical_time.clone();
-            let resp = guest
-                .send_rpc((mytime, GlobalRequest::RequestPort(open_file_id)))
-                .await;
+            let resp = send_and_update_time(guest, GlobalRequest::RequestPort(open_file_id)).await;
             let port = match resp.1 {
                 GlobalResponse::RequestPort(port) => port,
                 GlobalResponse::PortFull => {
@@ -2033,10 +2025,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .memory()
                 .read_value(addr.cast::<libc::sockaddr_nl>())?;
             if sockaddr_nl.nl_pid == 0 {
-                let mytime = guest.thread_state().thread_logical_time.clone();
-                let resp = guest
-                    .send_rpc((mytime, GlobalRequest::RequestPort(open_file_id)))
-                    .await;
+                let resp =
+                    send_and_update_time(guest, GlobalRequest::RequestPort(open_file_id)).await;
                 match resp.1 {
                     GlobalResponse::RequestPort(port) => {
                         sockaddr_nl.nl_pid = DETERMINISTIC_NETLINK_PORT_ID_BASE | u32::from(port);
@@ -2070,11 +2060,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                         ipaddr, port
                     );
                 }
-                let mytime = guest.thread_state().thread_logical_time.clone();
                 // Send RPC to make sure already used ports are not used.
-                let resp = guest
-                    .send_rpc((mytime, GlobalRequest::AddUsedPort(port, open_file_id)))
-                    .await;
+                let resp =
+                    send_and_update_time(guest, GlobalRequest::AddUsedPort(port, open_file_id))
+                        .await;
                 match resp.1 {
                     GlobalResponse::AddUsedPort => {
                         trace!("Added to used port {}", port);
@@ -2082,11 +2071,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     _ => unreachable!(),
                 }
             } else {
-                let mytime = guest.thread_state().thread_logical_time.clone();
                 // Request a determinzed port
-                let resp = guest
-                    .send_rpc((mytime, GlobalRequest::RequestPort(open_file_id)))
-                    .await;
+                let resp =
+                    send_and_update_time(guest, GlobalRequest::RequestPort(open_file_id)).await;
                 match resp.1 {
                     GlobalResponse::RequestPort(port_assigned) => {
                         sockaddr_in.sin_port = port_assigned.to_be();
@@ -2114,10 +2101,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                         ipaddr, port
                     );
                 }
-                let mytime = guest.thread_state().thread_logical_time.clone();
-                let resp = guest
-                    .send_rpc((mytime, GlobalRequest::AddUsedPort(port, open_file_id)))
-                    .await;
+                let resp =
+                    send_and_update_time(guest, GlobalRequest::AddUsedPort(port, open_file_id))
+                        .await;
                 match resp.1 {
                     GlobalResponse::AddUsedPort => {
                         trace!("Added to used port {}", port);
@@ -2125,10 +2111,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     _ => unreachable!(),
                 }
             } else {
-                let mytime = guest.thread_state().thread_logical_time.clone();
-                let resp = guest
-                    .send_rpc((mytime, GlobalRequest::RequestPort(open_file_id)))
-                    .await;
+                let resp =
+                    send_and_update_time(guest, GlobalRequest::RequestPort(open_file_id)).await;
                 match resp.1 {
                     GlobalResponse::RequestPort(port_assigned) => {
                         sockfaddr_in.sin6_port = port_assigned.to_be();

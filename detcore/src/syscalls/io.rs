@@ -348,17 +348,22 @@ fn sanitize_ppoll_signal_mask(mask: u64) -> u64 {
 
 impl<T: RecordOrReplay> Detcore<T> {
     /// poll syscall (MAYHANG)
+    // TODO-HUMAN-REVIEW(PR-1023): Review zero-timeout poll scheduling across backends.
     pub async fn handle_poll<G: Guest<Self>>(
         &self,
         guest: &mut G,
 
         call: syscalls::Poll,
     ) -> Result<i64, Error> {
-        if self.cfg.recordreplay_modes && call.timeout() == 0 {
+        if self.cfg.sequentialize_threads && call.timeout() == 0 {
             // This cannot block, but still yield a scheduler turn so a polling thread cannot
             // monopolize the guest between preemptions.
             resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
-            Ok(self.record_or_replay(guest, call).await?)
+            if self.cfg.recordreplay_modes {
+                Ok(self.record_or_replay(guest, call).await?)
+            } else {
+                Ok(guest.inject(call).await?)
+            }
         } else if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
             // In replay mode, we cannot assume the existence of FILES during replay.
             // Thus we must record the poll and replay it from the trace.

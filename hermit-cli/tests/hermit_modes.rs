@@ -8,14 +8,18 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
+use std::time::Duration;
+use std::time::Instant;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 static WORKLOADS: OnceLock<Workloads> = OnceLock::new();
@@ -32,6 +36,7 @@ struct Workloads {
     default_only: Vec<Workload>,
     hello_race: Workload,
     resource_determinism: Workload,
+    sabre_exit_group_parked: Workload,
 }
 
 #[derive(Clone, Copy)]
@@ -314,11 +319,21 @@ fn workloads() -> &'static Workloads {
             &hello_race.path,
         );
 
+        let sabre_exit_group_parked = workload(
+            "sabre_exit_group_parked",
+            build_root.join("sabre_exit_group_parked"),
+        );
+        compile_c(
+            &repository.join("tests/c/sabre_exit_group_parked.c"),
+            &sabre_exit_group_parked.path,
+        );
+
         Workloads {
             stable,
             default_only,
             hello_race,
             resource_determinism,
+            sabre_exit_group_parked,
         }
     })
 }
@@ -505,6 +520,68 @@ fn run_default_workload(name: &str) {
         .find(|workload| workload.name == name)
         .unwrap_or_else(|| panic!("unknown default-mode workload: {name}"));
     hermit_run(RunMode::Default, workload);
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1023): Review the SaBRe exit-group teardown regression.
+fn run_sabre_exit_group_parked() {
+    let hermit_binary = Path::new(env!("CARGO_BIN_EXE_hermit"));
+    let executable_dir = hermit_binary.parent().unwrap();
+    let target_dir = executable_dir.parent().unwrap();
+    let loader = std::env::var_os("HERMIT_SABRE_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| target_dir.join("sabre/sabre"));
+    let plugin = executable_dir.join("libdetcore_sabre.so");
+    if !loader.is_file() || !plugin.is_file() {
+        return;
+    }
+
+    let _guard = hermit_run_lock();
+    let workload = &workloads().sabre_exit_group_parked;
+    let mut command = Command::new(hermit_binary);
+    command
+        .env("HERMIT_SABRE_BINARY", &loader)
+        .args(["run", "--backend", "sabre", "--strict", "--verify", "--"])
+        .arg(&workload.path)
+        .args(workload.args)
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let rendered = format!("{command:?}");
+    let started = Instant::now();
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to start SaBRe regression: {rendered}: {error}"));
+    let timed_out = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break false,
+            Ok(None) if started.elapsed() >= Duration::from_secs(30) => {
+                let process_group = -(child.id() as libc::pid_t);
+                unsafe {
+                    libc::kill(process_group, libc::SIGKILL);
+                }
+                break true;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => panic!("failed to poll SaBRe regression: {rendered}: {error}"),
+        }
+    };
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|error| panic!("failed to collect SaBRe regression: {rendered}: {error}"));
+    assert!(
+        !timed_out && output.status.success(),
+        "SaBRe regression failed: {rendered}\nstatus: {}\ntimed out: {timed_out}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn sabre_exit_group_cancels_parked_futex_thread() {
+    run_sabre_exit_group_parked();
 }
 
 macro_rules! default_workload_tests {

@@ -13,6 +13,7 @@ pub mod runqueue;
 pub mod timed_waiters;
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -279,6 +280,14 @@ pub struct Scheduler {
 
     /// Whether exit-group teardown must explicitly cancel parked backend RPCs.
     cancel_killed_thread_rpcs: bool,
+
+    /// Raw TIDs removed by logical teardown. Tombstones are permanent for the life of this
+    /// scheduler: accepting Linux TID reuse would let delayed backend RPCs bind to a new thread.
+    logically_killed_threads: BTreeSet<DetTid>,
+
+    /// Tombstoned SaBRe threads whose final asynchronous deregistration statistics were merged.
+    /// Logical exit-group teardown and physical exit cleanup are distinct events.
+    deregistration_accounted: BTreeSet<DetTid>,
 
     /// Ac table of "locks held": which action is using which resources.
     /// A given resource can be held by at most one action at a given time.
@@ -903,6 +912,8 @@ impl Scheduler {
             vfork_barriers: Default::default(),
             cleared_child_tids: Default::default(),
             cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
+            logically_killed_threads: Default::default(),
+            deregistration_accounted: Default::default(),
             resources: Default::default(),
             started_up: Default::default(),
             thread_tree: Default::default(),
@@ -1086,6 +1097,9 @@ impl Scheduler {
     /// This is IDEMPOTENT, and it may indeed be called twice, both to proactively remove a thread,
     /// and then reactively in response to an exit hook.
     pub fn logically_kill_thread(&mut self, dtid: &DetTid, detpid: &DetPid, mm: MmId) {
+        if self.cancel_killed_thread_rpcs {
+            self.logically_killed_threads.insert(*dtid);
+        }
         // Remove from runnable queue:
         let _ = self.run_queue.remove_tid(*dtid);
         // Remove from all non-runnable pools:
@@ -1133,6 +1147,17 @@ impl Scheduler {
         if !live_process_thread {
             self.blocked.timed_waiters.remove_process_timers(*detpid);
         }
+    }
+
+    // TODO-HUMAN-REVIEW(PR-1023): Review fail-closed SaBRe thread tombstones.
+    pub(crate) fn thread_is_logically_killed(&self, dettid: DetTid) -> bool {
+        self.cancel_killed_thread_rpcs && self.logically_killed_threads.contains(&dettid)
+    }
+
+    /// Mark a physical exit cleanup as accounted. Non-cancelling backends preserve their existing
+    /// behavior; SaBRe teardown may deliver the cleanup after an earlier logical tombstone.
+    pub(crate) fn note_deregistration_accounted(&mut self, dettid: DetTid) -> bool {
+        !self.cancel_killed_thread_rpcs || self.deregistration_accounted.insert(dettid)
     }
 
     /// Remove entries from everywhere that non-runnable threads lurk.

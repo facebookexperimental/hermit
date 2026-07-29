@@ -716,6 +716,12 @@
       "why": "tests/c/resource_determinism.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "path": "tests/c/sabre_exit_group_parked.c",
+      "disposition": "guest-fixture",
+      "runner": "hermit-cli/tests/hermit_modes.rs",
+      "why": "tests/c/sabre_exit_group_parked.c is owned by hermit-cli/tests/hermit_modes.rs: The Rust integration test compiles this SaBRe-only lifecycle guest, supplies the reviewed loader, enforces strict verification, and owns bounded process-group cleanup; a generic manifest cell cannot express that backend-specific setup and timeout contract."
+    },
+    {
       "path": "tests/c/sched_setattr_batch.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
