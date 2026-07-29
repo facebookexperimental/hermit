@@ -90,6 +90,22 @@ every required run so estimates can be replaced with measurements.
 
 Each node's tag is `group.job` (e.g. `build.workspace`, `lint.clippy`).
 
+### Manifest bucket fan-out
+
+The centralized manifests use an explicit build barrier before execution:
+
+1. `e2e.metadata` validates schema, inventory, and CI correspondence.
+2. `build.manifest_guests` prepares every `ci=true` program once.
+3. One `e2e.manifest_<bucket>` node per TOML bucket runs with `--prebuilt`.
+
+Every run node carries a structured `manifest` selector as well as its command.
+`ci/test_harness.sh audit-ci` derives the expected bucket set from the TOMLs,
+requires the command to be the canonical rendering of that selector, and
+compares the aggregate selected cells with `ci/expected-e2e-plan.json`. Buckets
+whose entries are still manual execute as explicit empty nodes; `--allow-empty`
+cannot hide a blocking cell because the aggregate comparison is independent of
+runtime output.
+
 ### Command fidelity
 
 Node `cmd`s are the **verbatim** commands `validate.sh` runs, with three
@@ -125,15 +141,15 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
 
 **Outer** — how many gates may co-run:
 
-- `resource_caps` gates *scarce* resources. `portable.json` sets
-  `{"hermit_guest": 1}`; every gate that executes Hermit on guest programs
-  carries `resources: {"hermit_guest": 1}`, so they run **one at a time**
+- `resource_caps` gates *scarce* resources. `portable.json` keeps
+  `{"hermit_guest": 1}` for legacy guest gates, so they run **one at a time**
   (they share the working filesystem, are mutually nondeterministic, and on a
-  PMU host contend for the counter). Non-guest gates — `build`, `clippy`,
-  `rustfmt`, doctests, `rustdoc`, nextest of non-Hermit crates — carry no
-  scarce resource and parallelize freely. `privileged.json` uses `{"pmu": 1}`
-  the same way; the PMU is genuinely exclusive, so that lane is essentially
-  serial after the initial builds.
+  PMU host contend for the counter). Manifest buckets use disjoint cell trees
+  and portable timing relaxations, so they use a separate
+  `{"manifest_guest": 4}` pool after the shared build barrier. Non-guest gates
+  carry no scarce resource and parallelize freely. `privileged.json` uses
+  `{"pmu": 1}` the same way; the PMU is genuinely exclusive, so that lane is
+  essentially serial after the initial builds.
 - `--max-mem SPEC` (or `-j N`) bounds total concurrency. With `--max-mem`, the
   runner picks the largest `-j` whose modeled worst-case footprint (summed
   `rss_baseline_bytes` of a schedulable set) fits the budget.

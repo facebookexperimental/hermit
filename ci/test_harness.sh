@@ -16,13 +16,15 @@ HERMIT_BIN=${HERMIT_BIN:-$ROOT_DIR/target/debug/hermit}
 RESULT_ROOT=${E2E_RESULT_ROOT:-$ROOT_DIR/target/e2e}
 RUN_ID=${E2E_RUN_ID:-"local-$(date +%s)-$$"}
 SOURCE_TREE_SHA=$(git -C "$ROOT_DIR" rev-parse HEAD)
+BUILD_ROOT=${E2E_BUILD_ROOT:-$RESULT_ROOT/build/$SOURCE_TREE_SHA}
+DAG_ROOT=${E2E_DAG_ROOT:-$ROOT_DIR/ci/dag}
 if [[ -n $(git -C "$ROOT_DIR" status --porcelain --untracked-files=no) ]]; then
     SOURCE_TREE_DIRTY=true
 else
     SOURCE_TREE_DIRTY=false
 fi
 
-readonly ROOT_DIR TEST_ROOT MANIFEST_ROOT INVENTORY EXPECTED_PLAN HERMIT_BIN RESULT_ROOT RUN_ID SOURCE_TREE_SHA SOURCE_TREE_DIRTY
+readonly ROOT_DIR TEST_ROOT MANIFEST_ROOT INVENTORY EXPECTED_PLAN HERMIT_BIN RESULT_ROOT RUN_ID SOURCE_TREE_SHA SOURCE_TREE_DIRTY BUILD_ROOT DAG_ROOT
 readonly -a MODES=(verify chaos replay naked custom)
 readonly -a BACKENDS=(ptrace dbi kvm sabre liteinst)
 readonly -a LANES=(portable privileged)
@@ -34,6 +36,7 @@ function usage {
 Usage:
   ci/test_harness.sh validate
   ci/test_harness.sh plan [--lane portable|privileged] [--format text|json]
+  ci/test_harness.sh build [filters]
   ci/test_harness.sh run [filters] [--results PATH] [--junit PATH]
   ci/test_harness.sh audit-gaps [--lane portable|privileged] [--format text|json]
   ci/test_harness.sh audit-inventory
@@ -45,6 +48,9 @@ Filters:
   --backend BACKEND       ptrace, dbi, kvm, sabre, or liteinst
   --category CATEGORY     manifest category
   --test ID               exact category/test ID
+  --ci-only               select only cells explicitly marked ci=true
+  --prebuilt              require artifacts produced by the build command
+  --allow-empty           permit an empty selection (DAG bucket nodes only)
   --include-occasional    include tests marked occasional
   --include-manual        include a ci=false cell; requires exact --test and --mode
 
@@ -239,15 +245,22 @@ function dag_critical_path_seconds {
     ' "$dag"
 }
 
+function emit_manifest_buckets {
+    local test
+    for test in "${TESTS[@]}"; do
+        metadata_json "$test" | jq -c '{lane,category}'
+    done | jq -sS 'unique | sort_by(.lane,.category)'
+}
+
 function audit_ci_correspondence {
     local lane dag
     for lane in portable privileged; do
-        dag="$ROOT_DIR/ci/dag/$lane.json"
+        dag="$DAG_ROOT/$lane.json"
         jq -e '
             .steps | type == "array" and length > 0
             and (map(.group + "." + .job) | unique | length) == length
             and all(.[]; (.cmd | type == "string" and length > 0))
-        ' "$dag" >/dev/null || die "invalid or duplicate CI DAG steps: ci/dag/$lane.json"
+        ' "$dag" >/dev/null || die "invalid or duplicate CI DAG steps: ${dag#"$ROOT_DIR/"}"
     done
 
     # These are literal workflow/validate expressions, not local expansions.
@@ -277,7 +290,7 @@ function audit_ci_correspondence {
         die "validate.sh run_ci_manifest_lane must execute exactly one audited DAG"
 
     local privileged_critical_path
-    privileged_critical_path=$(dag_critical_path_seconds "$ROOT_DIR/ci/dag/privileged.json")
+    privileged_critical_path=$(dag_critical_path_seconds "$DAG_ROOT/privileged.json")
     [[ $privileged_critical_path =~ ^[0-9]+$ ]] ||
         die "privileged DAG critical path is not an integer: $privileged_critical_path"
     ((privileged_critical_path <= 270)) ||
@@ -286,36 +299,90 @@ function audit_ci_correspondence {
     [[ -f $EXPECTED_PLAN ]] || die "missing E2E denominator ratchet: ${EXPECTED_PLAN#"$ROOT_DIR/"}"
     jq -e '.schema == 1 and (.cells | type == "array" and length > 0)' "$EXPECTED_PLAN" >/dev/null ||
         die "invalid E2E denominator ratchet"
-    local scratch current_plan expected_plan
+    local scratch current_plan expected_plan all_buckets
     scratch=$(mktemp -d)
     current_plan="$scratch/current-plan.json"
     expected_plan="$scratch/expected-plan.json"
+    all_buckets="$scratch/manifest-buckets.json"
     emit_required_plan | jq -sS 'sort_by(.category,.test,.mode,.backend)' >"$current_plan"
     jq -S '.cells | sort_by(.category,.test,.mode,.backend)' "$EXPECTED_PLAN" >"$expected_plan"
     if ! diff -u "$expected_plan" "$current_plan"; then
         rm -rf "$scratch"
         die "required E2E plan changed; update ci/expected-e2e-plan.json in the same review"
     fi
+    emit_manifest_buckets >"$all_buckets"
+
+    local selectors expected_buckets dag_buckets selected_cells lane_cells
+    for lane in portable privileged; do
+        dag="$DAG_ROOT/$lane.json"
+        jq -e --arg lane "$lane" '
+            def expected_command($m):
+                "./ci/test_harness.sh run --lane \($m.lane) --category \($m.category) --ci-only --allow-empty --prebuilt --results target/e2e/\($m.lane)/\($m.category)/results.jsonl --junit target/e2e/\($m.lane)/\($m.category)/junit.xml";
+            ([.steps[] | select(.cmd | startswith("./ci/test_harness.sh run "))] | all(has("manifest")))
+            and ([.steps[] | select(has("manifest"))] | all(
+                . as $step
+                | ($step.manifest | (keys | sort) == ["category","lane"] and .lane == $lane and (.category | length > 0))
+                and ($step.cmd == expected_command($step.manifest))
+                and ($step.deps | index("e2e.metadata") != null)
+                and ($step.deps | index("build.manifest_guests") != null)))
+            and ([.steps[] | select(has("manifest")) | .manifest.category] | unique | length)
+                == ([.steps[] | select(has("manifest"))] | length)
+            and ([.steps[] | select(.group == "build" and .job == "manifest_guests"
+                    and .cmd == ("./ci/test_harness.sh build --lane " + $lane + " --ci-only"))] | length) == 1
+        ' "$dag" >/dev/null || {
+            rm -rf "$scratch"
+            die "$lane DAG manifest nodes do not match the fail-closed build/run contract"
+        }
+
+        selectors="$scratch/$lane-selectors.json"
+        expected_buckets="$scratch/$lane-expected-buckets.json"
+        dag_buckets="$scratch/$lane-dag-buckets.json"
+        selected_cells="$scratch/$lane-selected-cells.json"
+        lane_cells="$scratch/$lane-cells.json"
+        jq -S '[.steps[] | select(has("manifest")) | .manifest] | sort_by(.lane,.category)' \
+            "$dag" >"$selectors"
+        jq -S --arg lane "$lane" '[.[] | select(.lane == $lane)]' \
+            "$all_buckets" >"$expected_buckets"
+        cp "$selectors" "$dag_buckets"
+        if ! diff -u "$expected_buckets" "$dag_buckets"; then
+            rm -rf "$scratch"
+            die "$lane DAG must contain exactly one run node per manifest bucket"
+        fi
+
+        jq -S --arg lane "$lane" --slurpfile selectors "$selectors" '
+            [.[] as $cell
+             | select($cell.lane == $lane)
+             | select(any($selectors[0][]; .category == $cell.category))
+             | $cell]
+            | sort_by(.category,.test,.mode,.backend)
+        ' "$current_plan" >"$selected_cells"
+        jq -S --arg lane "$lane" '[.[] | select(.lane == $lane)]
+            | sort_by(.category,.test,.mode,.backend)' "$current_plan" >"$lane_cells"
+        if ! diff -u "$lane_cells" "$selected_cells"; then
+            rm -rf "$scratch"
+            die "$lane DAG manifest nodes do not select the exact ratcheted cells"
+        fi
+    done
 
     local portable_fingerprint privileged_fingerprint e2e_cells
     portable_fingerprint=$(jq -Sc '.steps | map({id:(.group + "." + .job),cmd})' \
-        "$ROOT_DIR/ci/dag/portable.json" | sha256sum | cut -d' ' -f1)
+        "$DAG_ROOT/portable.json" | sha256sum | cut -d' ' -f1)
     privileged_fingerprint=$(jq -Sc '.steps | map({id:(.group + "." + .job),cmd})' \
-        "$ROOT_DIR/ci/dag/privileged.json" | sha256sum | cut -d' ' -f1)
+        "$DAG_ROOT/privileged.json" | sha256sum | cut -d' ' -f1)
     e2e_cells=$(jq length "$current_plan")
     rm -rf "$scratch"
     jq -n \
         --arg portable_fingerprint "$portable_fingerprint" \
         --arg privileged_fingerprint "$privileged_fingerprint" \
-        --argjson portable_steps "$(jq '.steps | length' "$ROOT_DIR/ci/dag/portable.json")" \
-        --argjson privileged_steps "$(jq '.steps | length' "$ROOT_DIR/ci/dag/privileged.json")" \
+        --argjson portable_steps "$(jq '.steps | length' "$DAG_ROOT/portable.json")" \
+        --argjson privileged_steps "$(jq '.steps | length' "$DAG_ROOT/privileged.json")" \
         --argjson privileged_critical_path_seconds "$privileged_critical_path" \
         --argjson e2e_cells "$e2e_cells" \
         '{portable_steps:$portable_steps,privileged_steps:$privileged_steps,
           privileged_critical_path_seconds:$privileged_critical_path_seconds,
           e2e_cells:$e2e_cells,portable_fingerprint:$portable_fingerprint,
           privileged_fingerprint:$privileged_fingerprint,
-          correspondence:"validated exact workflow and validate.sh entrypoints plus both DAG fingerprints"}'
+          correspondence:"validated exact workflow/validate entrypoints, one DAG node per manifest bucket, and exact aggregate cells"}'
 }
 
 # Enforce that the committed CI DAG stays in correspondence with the e2e test
@@ -341,7 +408,7 @@ function validate_dag_correspondence {
         local node_ids dup dep_id
         node_ids=$(jq -r '.steps[] | .group + "." + .job' "$dag" | LC_ALL=C sort)
         dup=$(printf '%s\n' "$node_ids" | uniq -d)
-        [[ -z $dup ]] || die "ci/dag/$lane.json: duplicate node id(s): $(echo $dup)"
+        [[ -z $dup ]] || die "ci/dag/$lane.json: duplicate node id(s): $dup"
         while IFS= read -r dep_id; do
             [[ -z $dep_id ]] && continue
             printf '%s\n' "$node_ids" | grep -Fxq -- "$dep_id" ||
@@ -364,11 +431,11 @@ function validate_dag_correspondence {
             | (.cmd | capture("--lane (?<l>\\S+) --category (?<c>\\S+)"))
             | select(.l != $lane) | .l + ":" + .c' "$dag")
         [[ -z $wrong_lane ]] ||
-            die "ci/dag/$lane.json: e2e run-node targets wrong lane: $(echo $wrong_lane)"
+            die "ci/dag/$lane.json: e2e run-node targets wrong lane: $wrong_lane"
 
         local expected actual
-        expected=$(emit_required_plan | jq -r --arg lane "$lane" \
-            'select(.lane == $lane) | .category' | LC_ALL=C sort -u)
+        expected=$(emit_manifest_buckets | jq -r --arg lane "$lane" \
+            '.[] | select(.lane == $lane) | .category' | LC_ALL=C sort -u)
         actual=$(jq -r '
             .steps[] | select(.group == "e2e")
             | select(.cmd | test("--category "))
@@ -377,18 +444,18 @@ function validate_dag_correspondence {
 
         if [[ $expected != "$actual" ]]; then
             {
-                echo "ci/dag/$lane.json: e2e DAG nodes do not correspond to the $lane test plan."
-                echo "  planned categories : $(echo $expected)"
-                echo "  DAG run-node cats  : $(echo $actual)"
+                echo "ci/dag/$lane.json: e2e DAG nodes do not correspond to the $lane manifest buckets."
+                echo "  manifest categories: $expected"
+                echo "  DAG run-node cats  : $actual"
                 comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") |
                     sed 's/^/  MISSING from DAG (node deleted or renamed?): /'
                 comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") |
-                    sed 's/^/  EXTRA in DAG (no such planned test category): /'
+                    sed 's/^/  EXTRA in DAG (no such manifest bucket): /'
             } >&2
-            die "DAG/plan correspondence mismatch for lane $lane"
+            die "DAG/manifest-bucket correspondence mismatch for lane $lane"
         fi
     done
-    echo "PASS: committed CI DAG (ci/dag/${LANES[0]}.json, ci/dag/${LANES[1]}.json) corresponds to the e2e plan with no dangling deps"
+    echo "PASS: committed CI DAG (ci/dag/${LANES[0]}.json, ci/dag/${LANES[1]}.json) corresponds to the manifest buckets with no dangling deps"
 }
 
 LANE_FILTER=
@@ -401,6 +468,9 @@ RESULTS=
 JUNIT=
 INCLUDE_OCCASIONAL=0
 INCLUDE_MANUAL=0
+CI_ONLY=0
+PREBUILT=0
+ALLOW_EMPTY=0
 
 function parse_options {
     while (($#)); do
@@ -410,6 +480,9 @@ function parse_options {
             --backend) BACKEND_FILTER=${2:?missing backend}; shift 2 ;;
             --category) CATEGORY_FILTER=${2:?missing category}; shift 2 ;;
             --test) TEST_FILTER=${2:?missing test id}; shift 2 ;;
+            --ci-only) CI_ONLY=1; shift ;;
+            --prebuilt) PREBUILT=1; shift ;;
+            --allow-empty) ALLOW_EMPTY=1; shift ;;
             --format) FORMAT=${2:?missing format}; shift 2 ;;
             --results) RESULTS=${2:?missing result path}; shift 2 ;;
             --junit) JUNIT=${2:?missing JUnit path}; shift 2 ;;
@@ -423,6 +496,9 @@ function parse_options {
     [[ -z $LANE_FILTER ]] || contains "$LANE_FILTER" portable privileged || die "invalid lane: $LANE_FILTER"
     [[ -z $MODE_FILTER ]] || contains "$MODE_FILTER" "${MODES[@]}" || die "invalid mode: $MODE_FILTER"
     [[ -z $BACKEND_FILTER ]] || contains "$BACKEND_FILTER" "${BACKENDS[@]}" || die "invalid backend: $BACKEND_FILTER"
+    if ((ALLOW_EMPTY == 1)) && { ((CI_ONLY == 0)) || [[ -z $CATEGORY_FILTER ]]; }; then
+        die "--allow-empty requires --ci-only and an explicit --category"
+    fi
     [[ $FORMAT == text || $FORMAT == json ]] || die "invalid format: $FORMAT"
     if ((INCLUDE_MANUAL)); then
         [[ -n $TEST_FILTER && -n $MODE_FILTER ]] ||
@@ -441,6 +517,7 @@ function emit_required_plan {
         --arg category_filter "$CATEGORY_FILTER" \
         --arg test_filter "$TEST_FILTER" \
         --argjson include_manual "$INCLUDE_MANUAL" \
+        --argjson ci_only "$CI_ONLY" \
         --argjson include_occasional "$INCLUDE_OCCASIONAL" '
         select($lane_filter == "" or .lane == $lane_filter)
         | select($category_filter == "" or .category == $category_filter)
@@ -450,6 +527,7 @@ function emit_required_plan {
         | .modes | to_entries[]
         | select($mode_filter == "" or .key == $mode_filter)
         | select(.value.ci == true or $mode_filter == "naked" or $include_manual == 1)
+        | select($ci_only == 0 or .value.ci == true)
         | . as $mode
         | if .key == "naked" then
             select($backend_filter == "")
@@ -575,9 +653,19 @@ function prepare_test {
         E2E_TMPDIR="$cell_dir/tmp"
         E2E_FIXTURE_DIR="$cell_dir/fixtures"
     )
-    local metadata kind
+    local metadata kind id prebuilt_fixtures
     metadata=$(metadata_json "$test")
     kind=$(jq -r .program_kind <<<"$metadata")
+    id=$(jq -r .id <<<"$metadata")
+    if ((PREBUILT == 1)) && [[ $kind != direct ]]; then
+        prebuilt_fixtures="$BUILD_ROOT/${id//\//-}/fixtures"
+        [[ -d $prebuilt_fixtures ]] || {
+            echo "prebuilt fixture is missing for $id: $prebuilt_fixtures" >&2
+            return 1
+        }
+        cp -a "$prebuilt_fixtures/." "$cell_dir/fixtures/"
+        return 0
+    fi
     local -a prepare_args=() compile_args=()
     if [[ $kind == c ]]; then
         mapfile -t compile_args < <(jq -r '.compile_args[]' <<<"$metadata")
@@ -907,6 +995,31 @@ function write_junit {
     } >"$JUNIT"
 }
 
+function build_required {
+    local planned test_id test build_dir metadata timeout_seconds kind failures=0 selected=0
+    planned=$(emit_required_plan)
+    while IFS= read -r test_id; do
+        [[ -n $test_id ]] || continue
+        selected=$((selected + 1))
+        test=${TEST_BY_ID[$test_id]}
+        build_dir="$BUILD_ROOT/${test_id//\//-}"
+        rm -rf "$build_dir"
+        prepare_cell_dirs "$build_dir"
+        metadata=$(metadata_json "$test")
+        timeout_seconds=$(jq -r .timeout_seconds <<<"$metadata")
+        kind=$(jq -r .program_kind <<<"$metadata")
+        if prepare_test "$test" "$build_dir" "$timeout_seconds"; then
+            printf 'BUILT %-11s %s\n' "$kind" "$test_id"
+        else
+            failures=$((failures + 1))
+        fi
+    done < <(jq -r '.test' <<<"$planned" | LC_ALL=C sort -u)
+
+    ((selected > 0)) || ((ALLOW_EMPTY == 1)) || die "filters selected no required test cells"
+    echo "Build root: $BUILD_ROOT"
+    ((failures == 0))
+}
+
 function run_required {
     RESULTS=${RESULTS:-$RESULT_ROOT/$RUN_ID/results.jsonl}
     JUNIT=${JUNIT:-$RESULT_ROOT/$RUN_ID/junit.xml}
@@ -923,7 +1036,7 @@ function run_required {
         run_cell "$test" "$metadata" "$mode" "$backend" || failures=$((failures + 1))
     done < <(jq -r '[.test,.mode,(.backend // "")] | @tsv' <<<"$planned")
 
-    ((selected > 0)) || die "filters selected no required test cells"
+    ((selected > 0)) || ((ALLOW_EMPTY == 1)) || die "filters selected no required test cells"
     write_junit
     jq -s '{schema:1,tests:(map(.test)|unique|length),cells:length,
         passed:(map(select(.outcome=="PASS"))|length),
@@ -953,6 +1066,10 @@ case "$subcommand" in
         ;;
     plan)
         print_plan required
+        ;;
+    build)
+        ((PREBUILT == 0)) || die "build does not accept --prebuilt"
+        build_required
         ;;
     run)
         [[ -x $HERMIT_BIN || $MODE_FILTER == naked ]] || die "Hermit binary is not executable: $HERMIT_BIN"

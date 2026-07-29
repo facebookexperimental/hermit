@@ -2953,7 +2953,7 @@ function run_quick_suite {
     run_check "Build workspace" cargo build --workspace
     run_check "Portable E2E metadata" ./ci/test_harness.sh validate
     run_check "Portable ptrace E2E verification" \
-        ./ci/test_harness.sh run --lane portable --mode verify --backend ptrace
+        ./ci/test_harness.sh run --lane portable --mode verify --backend ptrace --ci-only
     run_check "Detcore core unit tests" cargo test -p detcore --lib
     run_check "Hermit run smoke test" hermit_run_smoke
     run_check "Hermit output determinism" hermit_determinism_check

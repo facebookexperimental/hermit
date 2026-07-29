@@ -43,12 +43,34 @@
                "classification": "light"}
     },
     {
-      "group": "e2e", "job": "applications",
-      "desc": "Privileged KVM shell, environment, and Python example verification",
-      "cmd": "./ci/test_harness.sh run --lane privileged --category applications --results target/e2e/privileged/applications/results.jsonl --junit target/e2e/privileged/applications/junit.xml",
-      "deps": ["build.privileged_tests", "e2e.metadata"],
+      "group": "build", "job": "manifest_guests",
+      "desc": "Prepare every CI-enabled privileged manifest guest",
+      "cmd": "./ci/test_harness.sh build --lane privileged --ci-only",
+      "deps": ["e2e.metadata"],
+      "timeout": 90,
+      "hint": {"est_duration_s": 75,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "cpu-bound"}
+    },
+    {
+      "group": "e2e", "job": "manifest_applications",
+      "desc": "Privileged manifest bucket: applications",
+      "manifest": {"lane": "privileged", "category": "applications"},
+      "cmd": "./ci/test_harness.sh run --lane privileged --category applications --ci-only --allow-empty --prebuilt --results target/e2e/privileged/applications/results.jsonl --junit target/e2e/privileged/applications/junit.xml",
+      "deps": ["build.privileged_tests", "build.manifest_guests", "e2e.metadata"],
       "timeout": 120,
       "hint": {"resources": {"kvm": 1}, "est_duration_s": 90,
+               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "e2e", "job": "manifest_backend_parity_c",
+      "desc": "Privileged manifest bucket: backend-parity-c",
+      "manifest": {"lane": "privileged", "category": "backend-parity-c"},
+      "cmd": "./ci/test_harness.sh run --lane privileged --category backend-parity-c --ci-only --allow-empty --prebuilt --results target/e2e/privileged/backend-parity-c/results.jsonl --junit target/e2e/privileged/backend-parity-c/junit.xml",
+      "deps": ["build.privileged_tests", "build.manifest_guests", "e2e.metadata"],
+      "timeout": 120,
+      "hint": {"resources": {"kvm": 1}, "est_duration_s": 5,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
     }
