@@ -44,6 +44,7 @@ use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::resources::SABRE_INTERNAL_PIPE_IO_FYI;
 use crate::scheduler::runqueue::LAST_PRIORITY;
 use crate::stat::*;
 use crate::tool_global::*;
@@ -57,6 +58,18 @@ fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
 }
 
 const UNIX_AUTOBIND_NAME_LEN: usize = 6;
+
+fn should_tag_sabre_internal_pipe_io(
+    discovers_live_metadata: bool,
+    fd_type: FdType,
+    physically_nonblocking: bool,
+    logically_nonblocking: bool,
+) -> bool {
+    discovers_live_metadata
+        && fd_type == FdType::Pipe
+        && physically_nonblocking
+        && !logically_nonblocking
+}
 
 fn unix_autobind_addrlen() -> i32 {
     (std::mem::offset_of!(libc::sockaddr_un, sun_path) + UNIX_AUTOBIND_NAME_LEN) as i32
@@ -442,13 +455,32 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(bytes.len() as i64);
         }
 
-        let (fd_type, resource, random_device_offset) =
-            guest.thread_state_mut().with_detfd(call.fd(), |detfd| {
-                (detfd.ty(), detfd.resource(), detfd.random_device_offset())
-            })?;
+        let (
+            fd_type,
+            physically_nonblocking,
+            logically_nonblocking,
+            resource,
+            random_device_offset,
+        ) = guest.thread_state_mut().with_detfd(call.fd(), |detfd| {
+            (
+                detfd.ty(),
+                detfd.physically_nonblocking(),
+                detfd.is_nonblocking(),
+                detfd.resource(),
+                detfd.random_device_offset(),
+            )
+        })?;
 
         if let Some(resource) = resource {
-            let request = guest.thread_state().mk_request(resource, Permission::R);
+            let mut request = guest.thread_state().mk_request(resource, Permission::R);
+            if should_tag_sabre_internal_pipe_io(
+                guest.config().discover_live_file_metadata,
+                fd_type,
+                physically_nonblocking,
+                logically_nonblocking,
+            ) {
+                request.fyi(SABRE_INTERNAL_PIPE_IO_FYI);
+            }
             resource_request(guest, request).await;
         }
 
@@ -792,11 +824,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         mut call: syscalls::Write,
     ) -> Result<i64, Error> {
-        let (fd_type, physically_nonblocking, resource, raw_ino) =
+        let (fd_type, physically_nonblocking, logically_nonblocking, resource, raw_ino) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (
                     detfd.ty(),
                     detfd.physically_nonblocking(),
+                    detfd.is_nonblocking(),
                     detfd.resource(),
                     detfd.stat().map(|x| x.inode),
                 )
@@ -809,7 +842,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         if let Some(resource) = resource {
-            let request = guest.thread_state().mk_request(resource, Permission::W);
+            let mut request = guest.thread_state().mk_request(resource, Permission::W);
+            if should_tag_sabre_internal_pipe_io(
+                guest.config().discover_live_file_metadata,
+                fd_type,
+                physically_nonblocking,
+                logically_nonblocking,
+            ) {
+                request.fyi(SABRE_INTERNAL_PIPE_IO_FYI);
+            }
             resource_request(guest, request).await;
         }
 
@@ -970,7 +1011,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             })?;
 
         if let Some(resource) = resource {
-            let request = guest.thread_state().mk_request(resource, Permission::W);
+            let mut request = guest.thread_state().mk_request(resource, Permission::W);
+            if should_tag_sabre_internal_pipe_io(
+                guest.config().discover_live_file_metadata,
+                fd_type,
+                physically_nonblocking,
+                logically_nonblocking,
+            ) {
+                request.fyi(SABRE_INTERNAL_PIPE_IO_FYI);
+            }
             resource_request(guest, request).await;
         }
 
@@ -1015,13 +1064,26 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::ENOSYS.into());
         }
 
-        let (fd_type, physically_nonblocking, resource) =
+        let (fd_type, physically_nonblocking, logically_nonblocking, resource) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
-                (detfd.ty(), detfd.physically_nonblocking(), detfd.resource())
+                (
+                    detfd.ty(),
+                    detfd.physically_nonblocking(),
+                    detfd.is_nonblocking(),
+                    detfd.resource(),
+                )
             })?;
 
         if let Some(resource) = resource {
-            let request = guest.thread_state().mk_request(resource, Permission::R);
+            let mut request = guest.thread_state().mk_request(resource, Permission::R);
+            if should_tag_sabre_internal_pipe_io(
+                guest.config().discover_live_file_metadata,
+                fd_type,
+                physically_nonblocking,
+                logically_nonblocking,
+            ) {
+                request.fyi(SABRE_INTERNAL_PIPE_IO_FYI);
+            }
             resource_request(guest, request).await;
         }
 
@@ -2450,8 +2512,10 @@ mod test {
 
     use super::UNIX_AUTOBIND_NAME_LEN;
     use super::canonicalize_tcp_info;
+    use super::should_tag_sabre_internal_pipe_io;
     use super::unix_autobind_address;
     use super::unix_autobind_addrlen;
+    use crate::fd::FdType;
 
     /// This is an assumption we're making about flags.  Probably these flags can never be
     /// changed, but let's check just in case.
@@ -2459,6 +2523,40 @@ mod test {
     fn linux_flags_assumptions() {
         assert_eq!(libc::SOCK_NONBLOCK, OFlag::O_NONBLOCK.bits());
         assert_eq!(libc::SOCK_CLOEXEC, OFlag::O_CLOEXEC.bits());
+    }
+
+    #[test]
+    fn sabre_pipe_marker_requires_nonblockize_retry_semantics() {
+        assert!(should_tag_sabre_internal_pipe_io(
+            true,
+            FdType::Pipe,
+            true,
+            false
+        ));
+        assert!(!should_tag_sabre_internal_pipe_io(
+            true,
+            FdType::Pipe,
+            true,
+            true
+        ));
+        assert!(!should_tag_sabre_internal_pipe_io(
+            true,
+            FdType::Pipe,
+            false,
+            false
+        ));
+        assert!(!should_tag_sabre_internal_pipe_io(
+            false,
+            FdType::Pipe,
+            true,
+            false
+        ));
+        assert!(!should_tag_sabre_internal_pipe_io(
+            true,
+            FdType::Regular,
+            true,
+            false
+        ));
     }
 
     #[test]

@@ -254,12 +254,16 @@ fn is_detlog(line: &str) -> bool {
 /// comparison consistent and focused on guest-observable events (the actual syscall
 /// results, still compared via their DETLOG entries).
 ///
-/// The scheduler additionally suppresses the per-retry "advance global time for scheduler
-/// turn" DETLOG line for these turns at the source (see `Scheduler::bump_global_time`), so
-/// the two mechanisms together make the deterministic comparison insensitive to how many
-/// times a would-block syscall was retried.
+/// SaBRe's inherited stdio pipes emit an outer device-resource turn before the inner polling
+/// turn. The scheduler tags that outer turn with `[sabre-internal-pipe-io]`; it is the same
+/// host-timing-sensitive operation and is normalized here as well. The scheduler additionally
+/// suppresses the per-retry "advance global time for scheduler turn" DETLOG line for both kinds
+/// of turns at the source (see `Scheduler::bump_global_time`), so the two mechanisms together
+/// make the deterministic comparison insensitive to how many times a would-block syscall was
+/// retried.
 fn is_internal_io_poll_commit(line: &str) -> bool {
-    is_commit(line) && line.contains("{InternalIOPolling: ")
+    is_commit(line)
+        && (line.contains("{InternalIOPolling: ") || line.contains(" [sabre-internal-pipe-io]"))
 }
 
 /// The scheduler's per-turn `committed_time` advance bookkeeping. `committed_time` tracks
@@ -960,6 +964,29 @@ mod test {
                     "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Path(\"/proc/5/fd/3\"): R}, on previously committed 2s"
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn test_filter_deterministic_drops_sabre_internal_pipe_resource_turn() {
+        let opts = super::LogDiffOpts::default();
+        let v = opts.filter_deterministic(&[
+            (
+                0,
+                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 17, dettid 5 using resources {Device(ContainerStdout): W}, on previously committed 1s [sabre-internal-pipe-io]",
+            ),
+            (
+                1,
+                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Device(ContainerStdout): W}, on previously committed 2s",
+            ),
+        ]);
+
+        assert_eq!(
+            v,
+            vec![(
+                1,
+                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Device(ContainerStdout): W}, on previously committed 2s"
+            )]
         );
     }
 

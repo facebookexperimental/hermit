@@ -64,6 +64,7 @@ use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::resources::SABRE_INTERNAL_PIPE_IO_FYI;
 use crate::scheduler::replayer::StopReason;
 use crate::scheduler::replayer::events_consistent;
 use crate::scheduler::replayer::events_match;
@@ -2275,6 +2276,13 @@ impl Scheduler {
         Self::is_x_turn(rsrcs, &ResourceID::InternalIOPolling)
     }
 
+    /// SaBRe discovers an inherited stdio pipe as a device resource before the inner
+    /// `InternalIOPolling` request. Both turns belong to one host-timing-sensitive pipe
+    /// operation, so their logical-time logging must use the same retry normalization.
+    fn is_sabre_internal_pipe_io_turn(&self, rsrcs: &Resources) -> bool {
+        rsrcs.fyi == SABRE_INTERNAL_PIPE_IO_FYI
+    }
+
     fn is_x_turn(rsrcs: &Resources, x: &ResourceID) -> bool {
         if rsrcs.resources.contains_key(x) {
             if rsrcs.resources.len() > 1 {
@@ -2308,7 +2316,9 @@ impl Scheduler {
         // between runs, but those are numerically normalized before comparison.
         let last_turn_was_polling = last_turn
             .as_ref()
-            .map(Self::is_polling_turn)
+            .map(|resources| {
+                Self::is_polling_turn(resources) || self.is_sabre_internal_pipe_io_turn(resources)
+            })
             .unwrap_or(false);
 
         // At this moment, when threads are parked, we know that the global_time is
@@ -2399,9 +2409,18 @@ impl Scheduler {
                 assert_eq!(resp, &nxt.resp);
                 // N.B.: these prints themselves should be deterministic between
                 // runs.  They are part of the "detlog".
+                let sabre_internal_pipe_io = self.is_sabre_internal_pipe_io_turn(rsrcs);
                 info!(
-                    "[sched-step5] >>>>>>>\n\n COMMIT turn {}, dettid {} using resources {:?}, on previously committed {}",
-                    self.turn, next_dtid, rsrcs.resources, self.committed_time
+                    "[sched-step5] >>>>>>>\n\n COMMIT turn {}, dettid {} using resources {:?}, on previously committed {}{}",
+                    self.turn,
+                    next_dtid,
+                    rsrcs.resources,
+                    self.committed_time,
+                    if sabre_internal_pipe_io {
+                        " [sabre-internal-pipe-io]"
+                    } else {
+                        ""
+                    }
                 );
                 self.unblock_guest(next_dtid, resp);
                 Ok(())

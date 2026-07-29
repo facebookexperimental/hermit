@@ -24,6 +24,12 @@ use crate::types::MmId;
 use crate::types::RcbTimeMultiplier;
 use crate::types::SigWrapper;
 
+/// Identifies the outer resource turn for a physically nonblocking, guest-internal pipe
+/// operation. SaBRe reports these inherited stdio pipes as device resources before Detcore's
+/// `InternalIOPolling` turn, so the scheduler tags the outer turn for the same retry-count
+/// normalization as the polling turn itself.
+pub(crate) const SABRE_INTERNAL_PIPE_IO_FYI: &str = "sabre-internal-pipe-io";
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1151)
 /// An exact slowdown-factor transition recorded at a scheduler commit boundary.

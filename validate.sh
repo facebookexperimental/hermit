@@ -318,7 +318,8 @@ readonly STRICT_COMPAT_TOTAL=191
 # either fails the parse-time size check or masks real divergences.
 readonly RR_COMPAT_EXPECTED=139
 # Require the established SaBRe compatibility floor across the full measured corpus.
-# This is a compatibility floor, not a Detcore determinism claim.
+# Explicit must-pass rows below ratchet fixed programs without allowing host-sensitive
+# rows to make the aggregate floor alternate between green and red.
 readonly SABRE_COMPAT_EXPECTED=200
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(PR-1154): Review synchronization of the measured SaBRe corpus size.
@@ -1639,6 +1640,7 @@ function run_compatibility_corpus {
     local known_flaky=0
     local unavailable=0
     local total=0
+    local sabre_flex_passed=0
     PORTABLE_STRICT_DIAGNOSTIC_FAILURE_COUNT=0
 
     if [[ $COMPATIBILITY_MODE == rr ]]; then
@@ -2245,9 +2247,15 @@ function run_compatibility_corpus {
         strict_compatibility_probe cscope bash -c \
             'set -euo pipefail; d=$(mktemp -d); trap '\''rm -rf "$d"'\'' EXIT; printf "int compat_add(int a, int b) { return a + b; }\nint main(void) { return compat_add(20, 22) != 42; }\n" >"$d/fixture.c"; printf "fixture.c\n" >"$d/cscope.files"; (cd "$d" && /usr/bin/cscope -bq -i cscope.files); output=$(cd "$d" && /usr/bin/cscope -dL -1 compat_add); [[ $output == *"fixture.c compat_add 1"* ]]; printf "cscope:compat_add-found\n"' \
             && passed=$((passed + 1)) || failed=$((failed + 1))
-        strict_compatibility_probe flex bash -c \
-            'set -euo pipefail; d=$(mktemp -d); trap '\''rm -rf "$d"'\'' EXIT; printf "%s\n" "%option prefix=\"compat\" noyywrap" "%%" "[0-9]+ return 1;" ".      ;" "%%" >"$d/scanner.l"; /usr/bin/flex -o "$d/scanner.c" "$d/scanner.l"; grep -q compatlex "$d/scanner.c"; printf "flex:compat-scanner-generated\n"' \
-            && passed=$((passed + 1)) || failed=$((failed + 1))
+        if strict_compatibility_probe flex bash -c \
+            'set -euo pipefail; d=$(mktemp -d); trap '\''rm -rf "$d"'\'' EXIT; printf "%s\n" "%option prefix=\"compat\" noyywrap" "%%" "[0-9]+ return 1;" ".      ;" "%%" >"$d/scanner.l"; /usr/bin/flex -o "$d/scanner.c" "$d/scanner.l"; grep -q compatlex "$d/scanner.c"; printf "flex:compat-scanner-generated\n"'; then
+            passed=$((passed + 1))
+            if [[ $COMPATIBILITY_MODE == sabre ]]; then
+                sabre_flex_passed=1
+            fi
+        else
+            failed=$((failed + 1))
+        fi
         strict_compatibility_probe msgfmt bash -c \
             'set -euo pipefail; d=$(mktemp -d); trap '\''rm -rf "$d"'\'' EXIT; printf "%s\n" "msgid \"\"" "msgstr \"Content-Type: text/plain; charset=UTF-8\\n\"" "" "msgid \"hello\"" "msgstr \"Hermit\"" >"$d/messages.po"; /usr/bin/msgfmt -o "$d/messages.mo" "$d/messages.po"; test -s "$d/messages.mo"; printf "msgfmt:catalog-compiled\n"' \
             && passed=$((passed + 1)) || failed=$((failed + 1))
@@ -2380,6 +2388,10 @@ function run_compatibility_corpus {
         if ((total != SABRE_COMPAT_TOTAL)); then
             printf "❌ SaBRe compatibility corpus selected %s rows; expected %s\n" \
                 "$total" "$SABRE_COMPAT_TOTAL"
+            return 1
+        fi
+        if ((sabre_flex_passed != 1)); then
+            printf "❌ SaBRe compatibility required row flex regressed\n"
             return 1
         fi
         if ((passed < SABRE_COMPAT_EXPECTED)); then
