@@ -21,7 +21,21 @@ use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 use crate::types::MmId;
+use crate::types::RcbTimeMultiplier;
 use crate::types::SigWrapper;
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-PENDING)
+/// An exact slowdown-factor transition recorded at a scheduler commit boundary.
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
+pub struct ChaosEpochTransition {
+    /// Per-thread absolute logical time at which the new epoch begins.
+    pub logical_time: LogicalTime,
+    /// Deterministic epoch number.
+    pub epoch: u64,
+    /// Exact fixed-point factor used for virtual-time progression.
+    pub factor: RcbTimeMultiplier,
+}
 
 /// Identity of one syscall executing outside Hermit's serialized guest turns.
 #[derive(
@@ -243,7 +257,9 @@ pub enum ResourceID {
     /// No guarantees are made about how it will be used.
     ///
     /// Also includes the local time at which the guest observed the preemption point.
-    PriorityChangePoint(u64, LogicalTime),
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING)
+    PriorityChangePoint(u64, LogicalTime, Option<ChaosEpochTransition>),
 
     /// A physical signal has been received by the thread, request to continue delivering it and
     /// invoking the signal handler as the next thing to run.

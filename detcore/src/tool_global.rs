@@ -58,6 +58,7 @@ use crate::ivar::Ivar;
 use crate::preemptions::PreemptionReader;
 use crate::preemptions::ThreadHistory;
 use crate::record_or_replay::RecordOrReplay;
+use crate::resources::ChaosEpochTransition;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
@@ -649,10 +650,17 @@ impl GlobalTool for GlobalState {
             GlobalRequest::StartNewThread(dettid, detpid) => {
                 R::StartNewThread(self.recv_start_new_thread(from, dettid, detpid).await)
             }
-            GlobalRequest::DeregisterThread(dettid, detpid, mm, timeslice_stats) => {
+            GlobalRequest::DeregisterThread(dettid, detpid, mm, timeslice_stats, chaos_epoch) => {
                 R::DeregisterThread(
-                    self.recv_deregister_thread(from, dettid, detpid, mm, timeslice_stats)
-                        .await,
+                    self.recv_deregister_thread(
+                        from,
+                        dettid,
+                        detpid,
+                        mm,
+                        timeslice_stats,
+                        chaos_epoch,
+                    )
+                    .await,
                 )
             }
             GlobalRequest::FutexAction(dettid, action, futexid, init_read, mask) => R::FutexAction(
@@ -1082,10 +1090,16 @@ impl GlobalState {
         detpid: DetPid,
         mm: MmId,
         timeslice_stats: TimesliceStats,
+        chaos_epoch: Option<ChaosEpochTransition>,
     ) {
         // Invariant: will only be called when sequentialize-threads is on.
         assert!(self.cfg.sequentialize_threads);
         let mut sched = self.sched.lock().unwrap();
+        if let Some(transition) = chaos_epoch
+            && let Some(writer) = &mut sched.preemption_writer
+        {
+            writer.insert_chaos_epoch(dettid, transition);
+        }
         sched.record_timeslice_stats(dettid, timeslice_stats);
         sched.logically_kill_thread(&dettid, &detpid, mm);
         drop(sched);
@@ -1424,7 +1438,17 @@ pub enum GlobalRequest {
     /// Remove thread from scheduler data structure, guaranteeing it will consume no
     /// further turns. Carries the exiting thread's completed-timeslice distribution
     /// so the scheduler can aggregate it into the final run report.
-    DeregisterThread(DetTid, DetPid, MmId, TimesliceStats),
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING)
+    /// Deregister a thread, flushing an epoch transition that did not reach a
+    /// later priority-change commit before the thread exited.
+    DeregisterThread(
+        DetTid,
+        DetPid,
+        MmId,
+        TimesliceStats,
+        Option<ChaosEpochTransition>,
+    ),
 
     /// Notify scheduler before/after futex action.
     /// The last two arguments are the initial contents of the memory word, and the mask.
@@ -1801,18 +1825,26 @@ pub async fn create_vfork_child_thread<G, T>(
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-PENDING)
+/// State published when a thread leaves the deterministic scheduler.
+pub(crate) struct ThreadDeregistration {
+    pub(crate) dettid: DetTid,
+    pub(crate) detpid: DetPid,
+    pub(crate) mm: MmId,
+    pub(crate) timeslice_stats: TimesliceStats,
+    pub(crate) chaos_epoch: Option<ChaosEpochTransition>,
+}
+
 /// Remove the thread from the scheduler.
 ///
 /// Nonblocking: the future may return immediately, not guaranteeing the changes to the
 /// scheduler have been completed.
-pub async fn deregister_thread<R>(
-    dettid: DetTid,
+pub(crate) async fn deregister_thread<R>(
     threads_time: DetTime,
     cfg: &Config,
     reverie: &R,
-    detpid: DetPid,
-    mm: MmId,
-    timeslice_stats: TimesliceStats,
+    thread: ThreadDeregistration,
 ) where
     // Note, this is called from a context where we DON'T have a full, operable `Guest`.
     R: GlobalRPC<GlobalState>,
@@ -1822,7 +1854,13 @@ pub async fn deregister_thread<R>(
         let resp = reverie
             .send_rpc((
                 threads_time,
-                GlobalRequest::DeregisterThread(dettid, detpid, mm, timeslice_stats),
+                GlobalRequest::DeregisterThread(
+                    thread.dettid,
+                    thread.detpid,
+                    thread.mm,
+                    thread.timeslice_stats,
+                    thread.chaos_epoch,
+                ),
             ))
             .await;
         // We can't update the thread time here.  But it's dead anyway!

@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use tracing::trace;
 
+use crate::resources::ChaosEpochTransition;
 use crate::scheduler::Priority;
 use crate::scheduler::runqueue::DEFAULT_PRIORITY;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
@@ -70,6 +71,7 @@ impl PreemptionRecord {
     pub fn strip_contents(mut self) -> Self {
         for history in self.per_thread.values_mut() {
             history.prio_changes = Vec::new();
+            history.chaos_epochs = Vec::new();
             history.final_prio = 1000;
         }
         self.global = Vec::new();
@@ -132,6 +134,7 @@ impl PreemptionRecord {
                 ThreadHistory {
                     final_prio: DEFAULT_PRIORITY,
                     prio_changes: Vec::new(),
+                    chaos_epochs: Vec::new(),
                 }
             } else {
                 // We could insist on this invariant, but it's a little more flexible not to:
@@ -155,6 +158,7 @@ impl PreemptionRecord {
                 ThreadHistory {
                     final_prio,
                     prio_changes,
+                    chaos_epochs: Vec::new(),
                 }
             };
             bt2.insert(*tid, th);
@@ -219,6 +223,30 @@ impl PreemptionRecord {
                     time_last = Some(*ns);
                 }
             }
+            let mut transition_last = None;
+            let mut epoch_last = None;
+            for transition in &history.chaos_epochs {
+                if transition.factor.as_f64() <= 0.0 {
+                    return Err(format!(
+                        "chaos epoch factor for thread {} must be positive",
+                        tid
+                    ));
+                }
+                if transition_last.is_some_and(|last| transition.logical_time <= last) {
+                    return Err(format!(
+                        "chaos epoch transition times failed to increase for thread {}",
+                        tid
+                    ));
+                }
+                if epoch_last.is_some_and(|last| transition.epoch <= last) {
+                    return Err(format!(
+                        "chaos epoch numbers failed to increase for thread {}",
+                        tid
+                    ));
+                }
+                transition_last = Some(transition.logical_time);
+                epoch_last = Some(transition.epoch);
+            }
         }
         Ok(())
     }
@@ -249,7 +277,10 @@ impl PreemptionRecord {
         // One more pass to remove anything that just has default priority its whole lifetime.
         let mut finalmap = BTreeMap::new();
         for (tid, history) in clone.per_thread.into_iter() {
-            if history.final_prio != DEFAULT_PRIORITY || !history.prio_changes.is_empty() {
+            if history.final_prio != DEFAULT_PRIORITY
+                || !history.prio_changes.is_empty()
+                || !history.chaos_epochs.is_empty()
+            {
                 assert!(finalmap.insert(tid, history).is_none());
             }
         }
@@ -320,6 +351,15 @@ pub struct ThreadHistory {
     /// private, and thus you must go through the iterator, as this will change in the
     /// future.
     prio_changes: Vec<(LogicalTime, Priority)>,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING)
+    /// Exact per-thread slowdown transitions. Empty artifacts from older Hermit
+    /// versions remain wire-compatible when read through Serde's default.
+    // `ThreadHistory` also crosses Reverie's non-self-describing bincode RPC,
+    // so this field must never be skipped when it is empty.
+    #[serde(default)]
+    chaos_epochs: Vec<ChaosEpochTransition>,
 }
 
 impl ThreadHistory {
@@ -328,6 +368,7 @@ impl ThreadHistory {
         ThreadHistory {
             final_prio: DEFAULT_PRIORITY,
             prio_changes: Vec::new(),
+            chaos_epochs: Vec::new(),
         }
     }
 
@@ -337,7 +378,14 @@ impl ThreadHistory {
         ThreadHistoryIterator {
             full_history: self,
             ix: 0,
+            chaos_epoch_ix: 0,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_chaos_epochs(mut self, chaos_epochs: Vec<ChaosEpochTransition>) -> Self {
+        self.chaos_epochs = chaos_epochs;
+        self
     }
 
     /// Flatten the time series into a uniform representation.
@@ -382,6 +430,10 @@ pub struct ThreadHistoryIterator {
     full_history: ThreadHistory,
     /// Index that tracks our position.
     ix: usize,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING)
+    #[serde(default)]
+    chaos_epoch_ix: usize,
 }
 
 impl ThreadHistoryIterator {
@@ -393,6 +445,29 @@ impl ThreadHistoryIterator {
     /// Return the priority of the last slice after the last preemption.
     pub fn final_priority(&self) -> Priority {
         self.full_history.final_prio
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING)
+    /// Consume recorded epoch transitions up to `current_time`, returning a
+    /// transition only when the active recorded factor changed.
+    pub fn advance_chaos_epoch(
+        &mut self,
+        current_time: LogicalTime,
+    ) -> Option<ChaosEpochTransition> {
+        let mut changed = None;
+        while let Some(transition) = self.full_history.chaos_epochs.get(self.chaos_epoch_ix)
+            && transition.logical_time <= current_time
+        {
+            changed = Some(*transition);
+            self.chaos_epoch_ix += 1;
+        }
+        changed
+    }
+
+    /// Whether this artifact carries recorded slowdown epochs.
+    pub fn has_chaos_epochs(&self) -> bool {
+        !self.full_history.chaos_epochs.is_empty()
     }
 }
 
@@ -418,6 +493,52 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::types::RcbTimeMultiplier;
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING)
+    #[test]
+    fn chaos_epoch_transitions_round_trip_and_replay_exact_factors() {
+        let tid = DetTid::from_raw(2);
+        let first = ChaosEpochTransition {
+            logical_time: LogicalTime::from_nanos(100),
+            epoch: 0,
+            factor: RcbTimeMultiplier::from_f64(2.5),
+        };
+        let second = ChaosEpochTransition {
+            logical_time: LogicalTime::from_nanos(500),
+            epoch: 1,
+            factor: RcbTimeMultiplier::from_f64(0.75),
+        };
+
+        let mut writer = PreemptionWriter::new(None);
+        writer.register_thread(tid, DEFAULT_PRIORITY);
+        writer.insert_chaos_epoch(tid, first);
+        writer.insert_chaos_epoch(tid, second);
+        let encoded = writer.into_string();
+        assert!(encoded.contains("chaos_epochs"));
+
+        let decoded: PreemptionRecord = serde_json::from_str(&encoded).unwrap();
+        decoded.validate().unwrap();
+        let mut history = decoded.extract_all().remove(&tid).unwrap().into_iter();
+        assert_eq!(
+            history.advance_chaos_epoch(LogicalTime::from_nanos(99)),
+            None
+        );
+        assert_eq!(
+            history.advance_chaos_epoch(LogicalTime::from_nanos(100)),
+            Some(first)
+        );
+        assert_eq!(
+            history.advance_chaos_epoch(LogicalTime::from_nanos(499)),
+            None
+        );
+        assert_eq!(
+            history.advance_chaos_epoch(LogicalTime::from_nanos(500)),
+            Some(second)
+        );
+        assert_eq!(history.advance_chaos_epoch(LogicalTime::MAX), None);
+    }
 
     #[test]
     fn print_preemptionrecord() {
@@ -680,7 +801,7 @@ impl PreemptionWriter {
     pub fn len(&self) -> usize {
         let mut count = 0;
         for v in self.inner.per_thread.values() {
-            count += v.prio_changes.len();
+            count += v.prio_changes.len() + v.chaos_epochs.len();
         }
         count
     }
@@ -695,6 +816,7 @@ impl PreemptionWriter {
                 ThreadHistory {
                     final_prio: prio,
                     prio_changes: Vec::new(),
+                    chaos_epochs: Vec::new(),
                 },
             )
             .is_some()
@@ -731,6 +853,23 @@ impl PreemptionWriter {
         }
         history.prio_changes.push((time, prior_prio));
         history.final_prio = next_prio;
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING)
+    /// Record a deterministic slowdown epoch transition for replay.
+    pub fn insert_chaos_epoch(&mut self, tid: DetTid, transition: ChaosEpochTransition) {
+        let history = self.inner.per_thread.get_mut(&tid).unwrap_or_else(|| {
+            panic!(
+                "PreemptionRecord: Cannot insert a chaos epoch before registering thread {}",
+                tid
+            )
+        });
+        if let Some(last) = history.chaos_epochs.last() {
+            assert!(transition.logical_time > last.logical_time);
+            assert!(transition.epoch > last.epoch);
+        }
+        history.chaos_epochs.push(transition);
     }
 
     /// Add a SchedEvent to the global log of thread behavior.

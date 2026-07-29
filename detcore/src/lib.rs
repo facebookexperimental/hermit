@@ -106,6 +106,7 @@ pub use scheduler::runqueue::DEFAULT_PRIORITY;
 pub use scheduler::runqueue::FIRST_PRIORITY;
 pub use scheduler::runqueue::LAST_PRIORITY;
 pub use tool_global::GlobalState;
+use tool_global::ThreadDeregistration;
 use tool_global::create_child_thread;
 use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
@@ -372,7 +373,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             assert!(thread_state.committed_clock_value <= clock_value);
             let delta_rcbs: u64 = clock_value - thread_state.committed_clock_value;
             if self.cfg.use_rcb_time() {
-                thread_state.thread_logical_time.add_rcbs(delta_rcbs);
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-PENDING)
+                if thread_state.chaos_slowdown_active {
+                    let factor = thread_state.rcb_time_multiplier();
+                    thread_state
+                        .thread_logical_time
+                        .add_rcbs_with_multiplier(delta_rcbs, factor);
+                } else {
+                    thread_state.thread_logical_time.add_rcbs(delta_rcbs);
+                }
             }
             thread_state.account_process_cpu_time();
             thread_state.committed_clock_value = clock_value;
@@ -524,7 +534,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(mut max_timeslice_end) = guest.thread_state().max_timeslice_end {
             assert!(guest.config().max_timeslice.is_some());
             // TODO: get rid of fractional NANOS_PER_RCB so it's clear that this does not lose precision:
-            let clock_multiplier = guest.config().clock_multiplier.unwrap_or(1.0);
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-PENDING)
+            let clock_multiplier = guest.config().clock_multiplier.unwrap_or(1.0)
+                * guest.thread_state().rcb_time_multiplier().as_f64();
             let epsilon = Duration::from_nanos((NANOS_PER_RCB * clock_multiplier).ceil() as u64);
 
             if current_time + epsilon > max_timeslice_end {
@@ -1175,6 +1188,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     committed_clock_value: 0,
 
                     end_of_timeslice: None,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(PR-PENDING)
+                    chaos_epoch: tool_local::chaos_epoch_sentinel(),
+                    chaos_slowdown_factor: RcbTimeMultiplier::ONE,
+                    chaos_slowdown_active: false,
+                    pending_chaos_epoch: None,
                     max_timeslice_end: None,
                     last_rcb_timer: None,
                     last_rcb_timer_is_max: false,
@@ -2163,14 +2182,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             thread_state.account_process_cpu_time();
         }
         let mm_id = thread_state.mm_id;
+        let pending_chaos_epoch = thread_state.take_pending_chaos_epoch();
         deregister_thread(
-            dettid,
             thread_state.thread_logical_time.clone(),
             &self.cfg,
             global_state,
-            detpid,
-            mm_id,
-            thread_state.stats.timeslice_stats,
+            ThreadDeregistration {
+                dettid,
+                detpid,
+                mm: mm_id,
+                timeslice_stats: thread_state.stats.timeslice_stats,
+                chaos_epoch: pending_chaos_epoch,
+            },
         )
         .await;
 

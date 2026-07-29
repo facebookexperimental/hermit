@@ -38,6 +38,59 @@ pub const NANOS_PER_SYSCALL: f64 = 10000.0;
 /// Virtual nanoseconds elapsed per Retired Conditional Branch.
 pub const NANOS_PER_RCB: f64 = 10.0;
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-PENDING)
+/// Fixed-point scale used for deterministic per-thread RCB time multipliers.
+/// Q32 keeps accumulation independent of how a backend batches RCB updates.
+const RCB_TIME_MULTIPLIER_SCALE: u64 = 1_u64 << 32;
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-PENDING)
+/// A positive Q32 multiplier for converting RCB progress into virtual time.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    Ord,
+    PartialOrd,
+    Eq,
+    PartialEq,
+    Hash
+)]
+pub struct RcbTimeMultiplier(u64);
+
+impl RcbTimeMultiplier {
+    /// The identity multiplier.
+    pub const ONE: Self = Self(RCB_TIME_MULTIPLIER_SCALE);
+
+    /// Largest representable multiplier.
+    pub const MAX: f64 = u64::MAX as f64 / RCB_TIME_MULTIPLIER_SCALE as f64;
+
+    /// Quantize a finite positive multiplier to deterministic Q32 units.
+    pub fn from_f64(value: f64) -> Self {
+        assert!(value.is_finite() && value > 0.0 && value <= Self::MAX);
+        let scaled = (value * RCB_TIME_MULTIPLIER_SCALE as f64).round() as u64;
+        Self(scaled.max(1))
+    }
+
+    /// Convert the fixed-point value back to a floating-point multiplier.
+    pub fn as_f64(self) -> f64 {
+        self.0 as f64 / RCB_TIME_MULTIPLIER_SCALE as f64
+    }
+
+    fn units(self) -> u64 {
+        self.0
+    }
+}
+
+impl Default for RcbTimeMultiplier {
+    fn default() -> Self {
+        Self::ONE
+    }
+}
+
 /// Virtual nanoseconds elapsed per nondeterministic instruction other than system calls.
 pub const NANOS_PER_NONDET_INSTR: f64 = 25.0;
 
@@ -359,6 +412,16 @@ pub struct DetTime {
     /// Technically, that these are RCBs is an implementation detail of reverie.
     rcbs: u64,
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING)
+    /// RCB progress weighted by per-thread virtual-time multipliers, in Q32 RCB units.
+    /// `None` preserves the uniform interpretation of older serialized values.
+    // This field participates in Reverie's non-self-describing bincode RPC.
+    // Never skip it during serialization: doing so would shift the following
+    // `GlobalRequest` bytes and corrupt the tuple on decode.
+    #[serde(default)]
+    weighted_rcbs: Option<u128>,
+
     /// Number of nondeterministic instructions (rdtsc, cpuid)
     nondet_instrs: u64,
 
@@ -380,6 +443,7 @@ impl Default for DetTime {
             syscalls: 0,
             syscall_nanos: Some(0),
             rcbs: 0,
+            weighted_rcbs: None,
             nondet_instrs: 0,
             extra_nanos: 0,
             starting_micros: 0,
@@ -418,6 +482,7 @@ impl From<&DateTime<Utc>> for DetTime {
             syscalls: 0,
             syscall_nanos: Some(0),
             rcbs: 0,
+            weighted_rcbs: None,
             nondet_instrs: 0,
             extra_nanos: 0,
             starting_micros: micros_from_utc(dt),
@@ -464,6 +529,7 @@ impl DetTime {
             syscalls: 0,
             syscall_nanos: Some(0),
             rcbs: 0,
+            weighted_rcbs: None,
             nondet_instrs: 0,
             extra_nanos: 0,
             starting_micros: 0,
@@ -502,6 +568,23 @@ impl DetTime {
 
     /// Update internal counts using the reverie clock value.
     pub fn add_rcbs(&mut self, count: u64) {
+        if let Some(weighted_rcbs) = &mut self.weighted_rcbs {
+            *weighted_rcbs += u128::from(count) * u128::from(RCB_TIME_MULTIPLIER_SCALE);
+        }
+        self.rcbs += count;
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING)
+    /// Add RCB progress using a deterministic per-thread virtual-time multiplier.
+    ///
+    /// The Q32 accumulator makes the result independent of whether a backend reports
+    /// the same RCB total in one update or several smaller updates.
+    pub fn add_rcbs_with_multiplier(&mut self, count: u64, factor: RcbTimeMultiplier) {
+        let weighted_rcbs = self
+            .weighted_rcbs
+            .get_or_insert_with(|| u128::from(self.rcbs) * u128::from(RCB_TIME_MULTIPLIER_SCALE));
+        *weighted_rcbs += u128::from(count) * u128::from(factor.units());
         self.rcbs += count;
     }
 
@@ -524,11 +607,15 @@ impl DetTime {
         let syscall_nanos = self
             .syscall_nanos
             .unwrap_or((self.syscalls as f64 * NANOS_PER_SYSCALL) as u64);
+        let rcb_nanos = self.weighted_rcbs.map_or_else(
+            || self.rcbs as f64 * NANOS_PER_RCB,
+            |weighted| weighted as f64 * NANOS_PER_RCB / RCB_TIME_MULTIPLIER_SCALE as f64,
+        );
         LogicalTime(
             (self.starting_micros * 1000)
                 + self.extra_nanos
                 + ((syscall_nanos as f64 * self.multiplier) as u64)
-                + ((self.rcbs as f64 * NANOS_PER_RCB * self.multiplier) as u64)
+                + ((rcb_nanos * self.multiplier) as u64)
                 + ((self.nondet_instrs as f64 * NANOS_PER_NONDET_INSTR * self.multiplier) as u64),
         )
     }
@@ -542,10 +629,13 @@ impl DetTime {
     // TODO-HUMAN-REVIEW(#797): Review logical user/system CPU-time projections.
     /// Guest-execution time that corresponds to user-space instructions.
     pub fn user_cpu_time(&self) -> LogicalDuration {
+        let rcb_nanos = self.weighted_rcbs.map_or_else(
+            || self.rcbs as f64 * NANOS_PER_RCB,
+            |weighted| weighted as f64 * NANOS_PER_RCB / RCB_TIME_MULTIPLIER_SCALE as f64,
+        );
         LogicalTime(
-            (((self.rcbs as f64 * NANOS_PER_RCB)
-                + (self.nondet_instrs as f64 * NANOS_PER_NONDET_INSTR))
-                * self.multiplier) as u64,
+            ((rcb_nanos + (self.nondet_instrs as f64 * NANOS_PER_NONDET_INSTR)) * self.multiplier)
+                as u64,
         )
     }
 
@@ -572,6 +662,43 @@ impl DetTime {
     /// Project deterministic time duration from imaginary starting point of deterministic time creation
     pub fn as_duration(&self) -> std::time::Duration {
         std::time::Duration::from_nanos(self.as_nanos().0 - self.starting_micros * 1000)
+    }
+}
+
+#[cfg(test)]
+mod rcb_multiplier_tests {
+    use super::*;
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING)
+    #[test]
+    fn weighted_rcb_time_is_batching_independent() {
+        let factor = RcbTimeMultiplier::from_f64(2.5);
+        let mut one_batch = DetTime::zero();
+        one_batch.add_rcbs_with_multiplier(10, factor);
+
+        let mut split_batches = DetTime::zero();
+        split_batches.add_rcbs_with_multiplier(4, factor);
+        split_batches.add_rcbs_with_multiplier(6, factor);
+
+        assert_eq!(one_batch.rcbs(), 10);
+        assert_eq!(split_batches.rcbs(), 10);
+        assert_eq!(one_batch.as_nanos(), LogicalTime::from_nanos(250));
+        assert_eq!(one_batch.as_nanos(), split_batches.as_nanos());
+        assert_eq!(one_batch.user_cpu_time(), split_batches.user_cpu_time());
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING)
+    #[test]
+    fn uniform_rcbs_after_weighted_rcbs_keep_continuity() {
+        let mut time = DetTime::zero();
+        time.add_rcbs_with_multiplier(10, RcbTimeMultiplier::from_f64(0.5));
+        assert_eq!(time.as_nanos(), LogicalTime::from_nanos(50));
+
+        time.add_rcbs(5);
+        assert_eq!(time.rcbs(), 15);
+        assert_eq!(time.as_nanos(), LogicalTime::from_nanos(100));
     }
 }
 

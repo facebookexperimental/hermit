@@ -24,6 +24,7 @@ use serde::Serialize;
 use crate::pid::DetTid;
 use crate::schedule::SigWrapper;
 use crate::time::NANOS_PER_RCB;
+use crate::time::RcbTimeMultiplier;
 
 const fn default_true() -> bool {
     true
@@ -208,29 +209,37 @@ pub struct Config {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1149)
-    /// RR-style stable per-thread slowdown factors. When set (with `--chaos`),
-    /// each thread is assigned a slowdown factor that is CONSTANT for the whole
-    /// run — some threads are consistently slower, some faster — rather than
-    /// redrawing a fresh scheduling priority every timeslice (which averages out
-    /// over a long run by the law of large numbers). The factor scales the mean
-    /// chaos timeslice length only (an out-of-band scheduling budget); it does
-    /// NOT scale guest-visible virtual time, so determinism is preserved and the
-    /// mode is `--strict`-safe. The factor is a pure, replayable function of the
-    /// scheduler seed and the thread's deterministic id, so a fixed seed
-    /// reproduces the same per-thread factors. Mirrors rr's `--nested` /
-    /// chaos-mode per-task priority idea.
+    // TODO-HUMAN-REVIEW(PR-PENDING)
+    /// Reproducible per-thread slowdown factors for chaos mode. A factor greater
+    /// than one makes each RCB consume proportionally more virtual time, while a
+    /// factor below one makes it consume less. Thus scheduling deadlines and the
+    /// guest-visible virtual clock describe the same slowed execution rather than
+    /// applying an out-of-band scheduling bias. The factor is a pure function of
+    /// scheduler seed, stable deterministic thread id, and chaos epoch. A fixed
+    /// seed therefore reproduces both timing and interleavings.
     #[clap(long)]
     pub chaos_per_thread_slowdown: bool,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1149)
+    // TODO-HUMAN-REVIEW(PR-PENDING)
     /// Maximum ratio between the slowest and fastest per-thread slowdown factor
     /// for `--chaos-per-thread-slowdown`. Each thread's factor is drawn
-    /// log-uniformly from `[1/R, R]` where `R` is this value, so a thread's mean
-    /// timeslice can be up to `R`x longer or `1/R`x shorter than nominal. Must be
-    /// `>= 1.0`; `1.0` disables the spread (all threads nominal). Default 10.0.
+    /// log-uniformly from `[1/R, R]` where `R` is this value. Must fit the Q32
+    /// virtual-time representation and be `>= 1.0`; `1.0` disables the spread.
     #[clap(long, default_value = "10.0", value_name = "double")]
     pub chaos_slowdown_max_factor: f64,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING)
+    /// Length of a deterministic slowdown epoch in elapsed per-thread logical
+    /// nanoseconds. At the first scheduler commit at or after each boundary the
+    /// factor is redrawn as `factor(seed, stable_dettid, epoch)`. This is never
+    /// wall time. `0` means one epoch for the entire run, making constant slowdown
+    /// the single-epoch special case. Recorded preemption artifacts carry exact
+    /// epoch transitions and factors for replay. Inert without chaos slowdown.
+    #[clap(long, default_value = "0", value_name = "nanos")]
+    pub chaos_epoch_length_ns: u64,
 
     /// Record the timing of preemption events for future replay or experimentation.
     /// This is only useful in chaos modes.
@@ -497,7 +506,12 @@ fn try_parse_memory(from_str: &str) -> anyhow::Result<u64> {
 impl Config {
     /// Smallest PMU-backed maximum representable by one RCB at this clock multiplier.
     pub fn minimum_max_timeslice_nanos(&self) -> u64 {
-        let multiplier = self.clock_multiplier.unwrap_or(1.0);
+        let slowdown = if self.chaos && self.chaos_per_thread_slowdown {
+            self.chaos_slowdown_max_factor
+        } else {
+            1.0
+        };
+        let multiplier = self.clock_multiplier.unwrap_or(1.0) * slowdown;
         ((NANOS_PER_RCB * multiplier).ceil() as u64).max(NANOS_PER_RCB as u64)
     }
 
@@ -508,8 +522,11 @@ impl Config {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-1149)
         assert!(
-            self.chaos_slowdown_max_factor.is_finite() && self.chaos_slowdown_max_factor >= 1.0,
-            "chaos_slowdown_max_factor must be finite and >= 1.0, got {}",
+            self.chaos_slowdown_max_factor.is_finite()
+                && self.chaos_slowdown_max_factor >= 1.0
+                && self.chaos_slowdown_max_factor <= RcbTimeMultiplier::MAX,
+            "chaos_slowdown_max_factor must be finite and in [1.0, {}], got {}",
+            RcbTimeMultiplier::MAX,
             self.chaos_slowdown_max_factor
         );
         if let Some(multiplier) = self.clock_multiplier {
@@ -675,6 +692,11 @@ impl fmt::Display for Config {
                 " --chaos-slowdown-max-factor={}",
                 self.chaos_slowdown_max_factor
             )?;
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-PENDING)
+            if self.chaos_epoch_length_ns > 0 {
+                write!(f, " --chaos-epoch-length-ns={}", self.chaos_epoch_length_ns)?;
+            }
         }
         if let Some(m) = self.clock_multiplier {
             write!(f, " --clock-multiplier={}", m)?;
@@ -1137,9 +1159,41 @@ mod tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING)
+    #[test]
+    fn chaos_epoch_length_is_opt_in_and_round_trips() {
+        // Off by default (single stable factor == plain per-thread-slowdown).
+        let dflt = Config::default();
+        assert_eq!(dflt.chaos_epoch_length_ns, 0);
+        assert!(!dflt.to_string().contains("--chaos-epoch-length-ns"));
+
+        // Epochs are only emitted alongside per-thread-slowdown.
+        let config = Config::parse_from([
+            "detcore",
+            "--chaos",
+            "--chaos-per-thread-slowdown",
+            "--chaos-epoch-length-ns=100000",
+        ]);
+        assert_eq!(config.chaos_epoch_length_ns, 100000);
+
+        let rendered = config.to_string();
+        assert!(rendered.contains(" --chaos-epoch-length-ns=100000"));
+        let reparsed = Config::parse_from(
+            std::iter::once("detcore".to_string())
+                .chain(rendered.split_whitespace().map(String::from)),
+        );
+        assert_eq!(reparsed.chaos_epoch_length_ns, 100000);
+
+        // Without per-thread-slowdown the epoch flag is inert and not rendered.
+        let no_slowdown = Config::parse_from(["detcore", "--chaos", "--chaos-epoch-length-ns=100"]);
+        assert_eq!(no_slowdown.chaos_epoch_length_ns, 100);
+        assert!(!no_slowdown.to_string().contains("--chaos-epoch-length-ns"));
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1149)
     #[test]
-    #[should_panic(expected = "chaos_slowdown_max_factor must be finite and >= 1.0")]
+    #[should_panic(expected = "chaos_slowdown_max_factor must be finite and in")]
     fn validate_rejects_chaos_slowdown_max_factor_below_one() {
         let mut config = Config {
             chaos_slowdown_max_factor: 0.5,
@@ -1185,6 +1239,33 @@ mod tests {
         let mut config = Config {
             max_timeslice: NonZeroU64::new(10),
             clock_multiplier: Some(2.0),
+            ..Default::default()
+        };
+        config.validate();
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING)
+    #[test]
+    #[should_panic(expected = "max_timeslice must be at least one RCB")]
+    fn validate_scales_one_rcb_minimum_with_chaos_slowdown() {
+        let mut config = Config {
+            chaos: true,
+            chaos_per_thread_slowdown: true,
+            chaos_slowdown_max_factor: 4.0,
+            max_timeslice: NonZeroU64::new(39),
+            ..Default::default()
+        };
+        config.validate();
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-PENDING)
+    #[test]
+    #[should_panic(expected = "chaos_slowdown_max_factor must be finite and in")]
+    fn validate_rejects_unrepresentable_chaos_slowdown_factor() {
+        let mut config = Config {
+            chaos_slowdown_max_factor: RcbTimeMultiplier::MAX * 2.0,
             ..Default::default()
         };
         config.validate();

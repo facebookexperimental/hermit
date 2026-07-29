@@ -1984,6 +1984,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let resource = ResourceID::PriorityChangePoint(
                 LAST_PRIORITY,
                 guest.thread_state().thread_logical_time.as_nanos(),
+                None,
             );
             let req = guest.thread_state().mk_request(resource, Permission::W);
             resource_request(guest, req).await;
