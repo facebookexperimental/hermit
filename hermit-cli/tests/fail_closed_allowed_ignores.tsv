@@ -8,16 +8,18 @@ app_strict_verify	go_hello_is_deterministic_under_strict_verify	e2e requires PMU
 app_strict_verify	java_hello_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and a JDK
 app_strict_verify	java_threads_are_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and a JDK
 app_strict_verify	javac_is_l1_deterministic_under_strict	e2e requires PMU, mount namespaces, and a JDK
-app_strict_verify	python_arithmetic_is_deterministic_under_strict_verify	e2e requires mount namespaces and Python 3
-app_strict_verify	sqlite_query_is_deterministic_under_strict_verify	e2e requires mount namespaces and sqlite3
 app_strict_verify	lua_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and the Lua runtime
+app_strict_verify	python_arithmetic_is_deterministic_under_strict_verify	e2e requires mount namespaces and Python 3
 app_strict_verify	python_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and the CPython runtime
+app_strict_verify	sqlite_query_is_deterministic_under_strict_verify	e2e requires mount namespaces and sqlite3
 command_strict_verify	common_commands_are_deterministic_under_strict_verify	requires PMU, mount namespaces, and the standard command suite
 command_strict_verify	python_getrandom_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and /usr/bin/python3
 command_strict_verify	python_prlimit64_query_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and /usr/bin/python3
 epoll_determinism	notification_control_syscalls_reach_strict_verify_l2	e2e requires PMU and mount namespaces
 frontier_app_benchmarks	http_server_is_nondeterministic_natively_and_l2_under_hermit	requires PMU, mount namespaces, and Python 3
+frontier_app_benchmarks	http_server_session_is_nondeterministic_natively_and_l2_under_hermit	occasional long-lived HTTP server/client session; requires namespaces, curl, and Python 3
 frontier_app_benchmarks	redis_commands_are_nondeterministic_natively_and_l2_under_hermit	requires PMU, mount namespaces, redis-server, and redis-cli
+frontier_app_benchmarks	redis_deep_session_is_nondeterministic_natively_and_l2_under_hermit	occasional full Redis session is too slow for every-commit CI; requires namespaces, redis-server, and redis-cli
 frontier_app_benchmarks	sqlite_transaction_is_nondeterministic_natively_and_l2_under_hermit	requires PMU, mount namespaces, and sqlite3
 hermit_modes	chaos_buck_clone	requires PMU branch counters and working mount namespaces
 hermit_modes	chaos_buck_getpid	requires PMU branch counters and working mount namespaces

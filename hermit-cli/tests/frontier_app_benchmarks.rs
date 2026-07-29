@@ -172,6 +172,33 @@ fn render_output(output: &Output) -> String {
     )
 }
 
+fn assert_occasional_application_script(script_name: &str, success_marker: &str) {
+    let _guard = HERMIT_RUN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let script = repository()
+        .join("tests/e2e/lib/applications")
+        .join(script_name);
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after", KILL_AFTER, "240s"])
+        .arg(&script)
+        .env("HERMIT_BIN", env!("CARGO_BIN_EXE_hermit"))
+        .env("HERMIT_APPLICATION_TIMEOUT", HERMIT_TIMEOUT);
+
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains(success_marker),
+        "occasional application script did not reach L2 under strict Hermit\n\
+         command: {rendered}\n{}",
+        render_output(&output),
+    );
+}
+
 fn unused_loopback_port() -> u16 {
     TcpListener::bind(("127.0.0.1", 0))
         .expect("failed to reserve a loopback port")
@@ -226,6 +253,12 @@ fn redis_commands_are_nondeterministic_natively_and_l2_under_hermit() {
 }
 
 #[test]
+#[ignore = "occasional validation: full Redis server/client session is too slow for every commit"]
+fn redis_deep_session_is_nondeterministic_natively_and_l2_under_hermit() {
+    assert_occasional_application_script("redis_deep.sh", "redis-deep:verified");
+}
+
+#[test]
 #[ignore = "requires PMU, mount namespaces, and Python 3"]
 fn http_server_is_nondeterministic_natively_and_l2_under_hermit() {
     let script = repository().join("hermit-cli/tests/fixtures/frontier-apps/http_server.py");
@@ -240,4 +273,10 @@ fn http_server_is_nondeterministic_natively_and_l2_under_hermit() {
 
     workload.assert_native_nondeterminism();
     workload.assert_l2_under_strict_hermit();
+}
+
+#[test]
+#[ignore = "occasional validation: long-lived HTTP server/client session"]
+fn http_server_session_is_nondeterministic_natively_and_l2_under_hermit() {
+    assert_occasional_application_script("http_server.sh", "http-server:verified");
 }

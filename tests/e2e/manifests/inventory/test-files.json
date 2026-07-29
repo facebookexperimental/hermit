@@ -1348,14 +1348,14 @@
     {
       "path": "tests/e2e/lib/applications/http_server.sh",
       "disposition": "suite-helper",
-      "runner": "tests/e2e/lib/applications/run_all.sh",
-      "why": "tests/e2e/lib/applications/http_server.sh is owned by tests/e2e/lib/applications/run_all.sh: The `http_server` scenario is one named case inside the applications aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+      "runner": "hermit-cli/tests/frontier_app_benchmarks.rs ignored http_server_session_is_nondeterministic_natively_and_l2_under_hermit",
+      "why": "tests/e2e/lib/applications/http_server.sh is owned by hermit-cli/tests/frontier_app_benchmarks.rs ignored http_server_session_is_nondeterministic_natively_and_l2_under_hermit: The long-lived Python server plus curl client remains an explicit occasional L2 check, preserving its process-lifecycle coverage without allowing a server-child starvation defect to consume every-commit CI's full application timeout."
     },
     {
       "path": "tests/e2e/lib/applications/redis_deep.sh",
       "disposition": "suite-helper",
-      "runner": "tests/e2e/lib/applications/run_all.sh",
-      "why": "tests/e2e/lib/applications/redis_deep.sh is owned by tests/e2e/lib/applications/run_all.sh: The `redis_deep` scenario is one named case inside the applications aggregate suite, driven by run_all.sh with suite-owned lifecycle. It runs a full redis-server plus redis-cli session over a private unix socket and folds its determinism assertions into the suite's combined pass/fail contract, so scheduling the helper on its own would duplicate that setup and fracture the contract."
+      "runner": "hermit-cli/tests/frontier_app_benchmarks.rs ignored redis_deep_session_is_nondeterministic_natively_and_l2_under_hermit",
+      "why": "tests/e2e/lib/applications/redis_deep.sh is owned by hermit-cli/tests/frontier_app_benchmarks.rs ignored redis_deep_session_is_nondeterministic_natively_and_l2_under_hermit: The full redis-server plus redis-cli session takes about one minute even when healthy, so the ignored Rust wrapper keeps it available as explicit occasional L2 validation without adding a long-lived server workload to every-commit portable CI."
     },
     {
       "path": "tests/e2e/lib/applications/run_all.sh",
