@@ -906,17 +906,23 @@ async fn run_sabre(
         PathBuf::from(&sabre),
         plugin.clone(),
         fallback_ready,
+        global.clone(),
         capture_output,
     )
     .await
     {
         Ok(supervised) => supervised,
         Err(error) => {
+            global.release_all_physical_process_exits();
             global.force_shutdown_with_error();
             let _ = shutdown_sabre_rpc(server_task, &global, SABRE_RPC_DISCONNECT_TIMEOUT).await;
             return Err(error);
         }
     };
+    // The supervisor returns only after every tracee reached a final kernel wait status. Release
+    // the root process's barrier (and any intentionally unreaped child barriers) before scheduler
+    // shutdown; no guest thread remains that could race timer fast-forward here.
+    global.release_all_physical_process_exits();
     let requires_forced_shutdown = !supervised.status.success();
     if requires_forced_shutdown {
         global.force_shutdown_with_error();
@@ -1299,6 +1305,7 @@ fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig 
     config.detect_host_clock_futex_timeouts = backend == Backend::Sabre;
     config.syscall_clobbers_virtualized_by_backend = backend == Backend::Sabre;
     config.cancel_killed_thread_rpcs = backend == Backend::Sabre;
+    config.backend_reports_physical_process_exits = backend == Backend::Sabre;
     // TODO-HUMAN-REVIEW(PR-1122): Review concurrent KVM process-child scheduling.
     config.backend_serializes_fork_children = false;
     config.backend_dispatches_thread_tools = backend != Backend::Kvm;
@@ -1823,6 +1830,7 @@ mod tests {
         assert!(sabre.detect_host_clock_futex_timeouts);
         assert!(sabre.syscall_clobbers_virtualized_by_backend);
         assert!(sabre.cancel_killed_thread_rpcs);
+        assert!(sabre.backend_reports_physical_process_exits);
         assert!(!sabre.backend_serializes_fork_children);
         assert!(sabre.backend_dispatches_thread_tools);
         assert!(!sabre.backend_requires_thread_directed_process_signals);
@@ -1833,6 +1841,7 @@ mod tests {
         assert!(!ptrace.detect_host_clock_futex_timeouts);
         assert!(!ptrace.syscall_clobbers_virtualized_by_backend);
         assert!(!ptrace.cancel_killed_thread_rpcs);
+        assert!(!ptrace.backend_reports_physical_process_exits);
         assert!(!ptrace.backend_serializes_fork_children);
         assert!(ptrace.backend_dispatches_thread_tools);
         assert!(!ptrace.backend_requires_thread_directed_process_signals);

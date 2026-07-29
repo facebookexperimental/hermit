@@ -56,6 +56,17 @@ struct PendingPatch {
     syscall: u64,
 }
 
+fn final_physical_exit(status: &WaitStatus) -> Option<(Pid, ExitStatus)> {
+    match *status {
+        WaitStatus::Exited(pid, code) => Some((pid, ExitStatus::from_raw(code << 8))),
+        WaitStatus::Signaled(pid, signal, core_dumped) => {
+            let raw = signal as i32 | if core_dumped { 0x80 } else { 0 };
+            Some((pid, ExitStatus::from_raw(raw)))
+        }
+        _ => None,
+    }
+}
+
 struct Supervisor {
     root: Pid,
     tracees: HashSet<Pid>,
@@ -66,10 +77,17 @@ struct Supervisor {
     readiness: Arc<AtomicBool>,
     ready_observed: bool,
     patched_sites: HashSet<(Pid, usize)>,
+    physical_exit_observer: Arc<detcore::GlobalState>,
 }
 
 impl Supervisor {
-    fn new(root: Pid, sabre: PathBuf, plugin: PathBuf, readiness: Arc<AtomicBool>) -> Self {
+    fn new(
+        root: Pid,
+        sabre: PathBuf,
+        plugin: PathBuf,
+        readiness: Arc<AtomicBool>,
+        physical_exit_observer: Arc<detcore::GlobalState>,
+    ) -> Self {
         Self {
             root,
             tracees: HashSet::from([root]),
@@ -80,6 +98,7 @@ impl Supervisor {
             plugin,
             ready_observed: false,
             patched_sites: HashSet::new(),
+            physical_exit_observer,
         }
     }
 
@@ -110,6 +129,15 @@ impl Supervisor {
                 ?status,
                 "received ptrace wait status",
             );
+            if let Some((pid, exit_status)) = final_physical_exit(&status) {
+                self.remove_tracee(pid);
+                self.physical_exit_observer
+                    .complete_physical_process_exit(pid.as_raw());
+                if pid == self.root {
+                    root_status = Some(exit_status);
+                }
+                continue;
+            }
             match status {
                 WaitStatus::PtraceSyscall(pid) => self.handle_syscall_stop(pid)?,
                 WaitStatus::PtraceEvent(pid, _, event) => self.handle_ptrace_event(pid, event)?,
@@ -133,19 +161,7 @@ impl Supervisor {
                         self.resume(pid, Some(signal))?;
                     }
                 }
-                WaitStatus::Exited(pid, code) => {
-                    self.remove_tracee(pid);
-                    if pid == self.root {
-                        root_status = Some(ExitStatus::from_raw(code << 8));
-                    }
-                }
-                WaitStatus::Signaled(pid, signal, core_dumped) => {
-                    self.remove_tracee(pid);
-                    if pid == self.root {
-                        let raw = signal as i32 | if core_dumped { 0x80 } else { 0 };
-                        root_status = Some(ExitStatus::from_raw(raw));
-                    }
-                }
+                WaitStatus::Exited(..) | WaitStatus::Signaled(..) => unreachable!(),
                 WaitStatus::Continued(_) | WaitStatus::StillAlive => {}
             }
         }
@@ -390,10 +406,18 @@ pub async fn run(
     sabre: PathBuf,
     plugin: PathBuf,
     readiness: Arc<AtomicBool>,
+    physical_exit_observer: Arc<detcore::GlobalState>,
     capture_output: bool,
 ) -> Result<Output, Error> {
     tokio::task::spawn_blocking(move || {
-        run_blocking(command, sabre, plugin, readiness, capture_output)
+        run_blocking(
+            command,
+            sabre,
+            plugin,
+            readiness,
+            physical_exit_observer,
+            capture_output,
+        )
     })
     .await
     .context("SaBRe ptrace supervisor task panicked")?
@@ -404,6 +428,7 @@ fn run_blocking(
     sabre: PathBuf,
     plugin: PathBuf,
     readiness: Arc<AtomicBool>,
+    physical_exit_observer: Arc<detcore::GlobalState>,
     capture_output: bool,
 ) -> Result<Output, Error> {
     if capture_output {
@@ -437,7 +462,7 @@ fn run_blocking(
 
     let stdout_thread = std::thread::spawn(move || read_pipe(stdout));
     let stderr_thread = std::thread::spawn(move || read_pipe(stderr));
-    let supervised = Supervisor::new(root, sabre, plugin, readiness).run();
+    let supervised = Supervisor::new(root, sabre, plugin, readiness, physical_exit_observer).run();
     if supervised.is_err() {
         let _ = nix::sys::signal::kill(root, Signal::SIGKILL);
     }
@@ -467,6 +492,31 @@ fn read_pipe<R: Read>(pipe: Option<R>) -> Result<Vec<u8>, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acknowledges_only_final_physical_exit_statuses() {
+        let child = Pid::from_raw(17);
+        let parent = Pid::from_raw(11);
+
+        assert_eq!(
+            final_physical_exit(&WaitStatus::Exited(child, 0)).map(|(pid, _)| pid),
+            Some(child)
+        );
+        assert_eq!(
+            final_physical_exit(&WaitStatus::Signaled(child, Signal::SIGKILL, false))
+                .map(|(pid, _)| pid),
+            Some(child)
+        );
+        assert!(
+            final_physical_exit(&WaitStatus::PtraceEvent(
+                child,
+                Signal::SIGTRAP,
+                libc::PTRACE_EVENT_EXIT,
+            ))
+            .is_none()
+        );
+        assert!(final_physical_exit(&WaitStatus::Stopped(parent, Signal::SIGCHLD)).is_none());
+    }
 
     #[test]
     fn finds_mapping_path() {

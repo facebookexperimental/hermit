@@ -389,6 +389,39 @@ impl GlobalState {
         sched_loop_external(self.sched.clone(), self.global_time.clone(), observer).await;
     }
 
+    /// Reports that a backend supervisor received a process's final kernel exit status.
+    ///
+    /// This only records a barrier observation when the backend advertises physical-exit
+    /// reporting; it is therefore a no-op for ptrace, DBI, KVM, and LiteInst execution. The
+    /// exact process's barrier is released at this physical-waitability boundary.
+    pub fn complete_physical_process_exit(&self, raw_pid: i32) {
+        let detpid = DetPid::from_raw(raw_pid);
+        if self
+            .sched
+            .lock()
+            .unwrap()
+            .complete_physical_process_exit(detpid)
+        {
+            trace!(
+                "[detcore, dpid {}] backend completed final physical process exit",
+                detpid
+            );
+        }
+    }
+
+    /// Releases all physical-process-exit barriers after a backend supervisor has drained every
+    /// tracee and no guest thread can race another lifecycle event.
+    pub fn release_all_physical_process_exits(&self) {
+        let released = self
+            .sched
+            .lock()
+            .unwrap()
+            .release_all_physical_process_exits();
+        if released != 0 {
+            trace!("released {released} final physical process-exit barrier(s)");
+        }
+    }
+
     /// Unrecoverable fatal erorr. Bring things to a close cleanly, but as quickly as
     /// possible.
     pub fn force_shutdown_with_error(&self) {

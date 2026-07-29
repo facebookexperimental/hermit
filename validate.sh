@@ -319,7 +319,7 @@ readonly STRICT_COMPAT_TOTAL=191
 readonly RR_COMPAT_EXPECTED=139
 # Require the established SaBRe compatibility floor across the full measured corpus.
 # This is a compatibility floor, not a Detcore determinism claim.
-readonly SABRE_COMPAT_EXPECTED=199
+readonly SABRE_COMPAT_EXPECTED=200
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(PR-1154): Review synchronization of the measured SaBRe corpus size.
 readonly SABRE_COMPAT_TOTAL=212
@@ -334,7 +334,6 @@ E9PATCH_COMPAT_NO_DIAGNOSTIC=0
 # Tracked compatibility gaps that are intentionally excluded from the
 # executable corpus. They remain in the canonical denominator and table.
 declare -Ar COMPAT_SUMMARY_KNOWN_FAILURES=(
-    [timeout]="parent waits indefinitely in rt_sigsuspend for the delayed child"
     # Explicit --strict now fail-closes on unsupported syscalls (PR #644). These
     # programs each require a syscall Detcore does not yet determinize, so they
     # correctly abort under fail-closed --strict; they only passed the envelope

@@ -89,6 +89,12 @@ pub struct Config {
     #[clap(skip)]
     pub cancel_killed_thread_rpcs: bool,
 
+    /// The execution backend reports final physical process exits after logical tool cleanup, so
+    /// Detcore can prevent virtual timers from overtaking kernel child-exit publication.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_reports_physical_process_exits: bool,
+
     // TODO-HUMAN-REVIEW(PR-1013): Review backend child process execution ordering.
     /// The execution backend completes forked process children before returning to the parent.
     #[serde(default)]
@@ -1082,6 +1088,7 @@ mod tests {
     #[test]
     fn default_backend_capabilities_match_instrumented_backends() {
         let config = Config::default();
+        assert!(!config.backend_reports_physical_process_exits);
         assert!(!config.backend_serializes_fork_children);
         assert!(config.backend_dispatches_thread_tools);
         assert!(!config.backend_requires_thread_directed_process_signals);

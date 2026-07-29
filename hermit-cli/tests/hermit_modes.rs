@@ -615,6 +615,48 @@ fn sabre_exec_pipeline_preserves_blocking_pipe_semantics() {
     );
 }
 
+#[test]
+fn sabre_timeout_observes_child_exit_before_virtual_alarm() {
+    run_bounded_sabre_strict_verify(
+        Path::new("/usr/bin/timeout"),
+        &["1", "/usr/bin/true"],
+        "SaBRe timeout physical-exit regression",
+    );
+}
+
+#[test]
+fn sabre_root_exit_with_orphan_child_is_bounded() {
+    run_bounded_sabre_strict_verify(
+        Path::new("/usr/bin/bash"),
+        &["-c", "/usr/bin/sleep 0.01 & exit 0"],
+        "SaBRe root exit with orphan child regression",
+    );
+}
+
+#[test]
+fn sabre_ignored_sigchld_does_not_block_parent_timer() {
+    run_bounded_sabre_strict_verify(
+        Path::new("/usr/bin/bash"),
+        &[
+            "-c",
+            "trap \"\" CHLD; /usr/bin/true & /usr/bin/sleep 0.01; exit 0",
+        ],
+        "SaBRe ignored SIGCHLD timer regression",
+    );
+}
+
+#[test]
+fn sabre_ignored_blocked_sigchld_external_wait_does_not_block_alarm() {
+    run_bounded_sabre_strict_verify(
+        Path::new("/usr/bin/python3"),
+        &[
+            "-c",
+            "import ctypes, os, signal, time; signal.signal(signal.SIGCHLD, signal.SIG_IGN); signal.signal(signal.SIGALRM, lambda s,f: None); libc=ctypes.CDLL(None, use_errno=True); Mask=ctypes.c_ulong*16; mask=Mask(); assert libc.sigemptyset(ctypes.byref(mask)) == 0; assert libc.sigaddset(ctypes.byref(mask), signal.SIGCHLD) == 0; pid=os.fork(); (time.sleep(0.005), os._exit(0)) if pid == 0 else None; signal.alarm(1); rc=libc.sigsuspend(ctypes.byref(mask)); print('done', rc, ctypes.get_errno())",
+        ],
+        "SaBRe ignored and blocked SIGCHLD external-wait alarm regression",
+    );
+}
+
 macro_rules! default_workload_tests {
     ($($test_name:ident => $workload_name:literal),+ $(,)?) => {
         $(
