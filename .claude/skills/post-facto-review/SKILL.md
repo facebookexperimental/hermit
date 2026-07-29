@@ -36,52 +36,69 @@ difference from human-review-first is *ordering*: the human's review happens
 after landing, and mistakes are corrected by follow-up commits rather than by
 blocking the queue.
 
-## 1. Key changes still get adversarial review (multiple rounds)
+## 1. Exact human-review trigger set
 
-The "key change" definition is identical to
-[human-review-first](../human-review-first/SKILL.md): new syscalls, major Reverie API
-changes (small additive extensions are OK), scheduler/determinism-model changes,
-record/replay format changes.
+Apply `post-facto-human-review` if and only if the PR contains at least one of
+these four triggers:
 
-Before landing a key change:
-- Spawn independent reviewer agents whose job is to **refute** the change, over
-  **multiple rounds** — author fixes, reviewers re-attack — until it survives.
-- Cover correctness, determinism (preserve L1/L2/L3 per AGENTS.md), the
-  reverie/detcore boundary, and security.
-- Ground every claim in evidence (exact command + observed output), per
-  AGENTS.md "Precise Communication". No vague "works"/"looks good".
+1. **New syscall support.** Verify `AUTONOMOUS-BOT-IMPLEMENTED` at the new
+   dispatch/classification entry and `TODO-HUMAN-REVIEW(PR-id)` at the
+   implementation or determinization block.
+2. **A Reverie API or core-abstraction change**, including the `Tool`, `Guest`,
+   `Backend`, or syscall-interception model.
+3. **A new determinization strategy**, rather than an implementation of an
+   already established strategy.
+4. **A core DetCore scheduling change**: anything that affects how programs are
+   scheduled, especially race-search behavior. This trigger is always labeled.
+   [Hermit PR #1151](https://github.com/rrnewton/hermit/pull/1151), which moved
+   slowdown into virtual-time/epoch scheduling, is the canonical good example
+   of both this trigger and the determinism rationale reviewers need.
 
-## 2. Labels
+Routine backend-parity work toward the golden ptrace reference does **not**
+trigger human review merely because it changes a non-ptrace backend. Label it
+only when it also meets one of the four triggers above; "backend parity change"
+is not a valid rationale by itself.
 
-- `human-review` — marks a PR the human still wants to look at post-facto.
-  Under post-facto mode, human-review PRs are STILL LANDED — they also receive
-  the `post-facto-review` label so the human can find and review them after
-  landing. human-review is informational, NOT a landing blocker.
-- `post-facto-review` — marks a PR that landed autonomously and is awaiting the
-  human's after-the-fact review.
-- **Never apply `human-approved`.** That label means a human actually approved,
-  and only a human may apply it. A bot claiming approval is a defect.
-- `locally-validated` — the legitimate substitute for green CI when the CI lane
-  cannot go green for environmental reasons: run the checks the PR can affect
-  locally, prove any residual failure is baseline/environmental, then label +
-  merge on real GitHub-managed portable green where possible (avoid `--admin` over red CI).
+Before landing a triggered change, use independent reviewers whose job is to
+refute the change over repeated author-fix/reviewer-recheck rounds. Cover
+correctness, determinism, the Reverie/Detcore boundary, and security, and bind
+evidence to exact commands and SHAs.
 
-## 3. Code markers
+## 2. Mandatory PR description sections
 
-Autonomously-landed code carries in-source breadcrumbs so a human reviewing
-post-facto can find exactly what a bot wrote and what still needs eyes:
+Every PR description must contain:
 
-- `// AUTONOMOUS-BOT-IMPLEMENTED` — this code was written and landed by a bot
-  without prior human review.
-- `// TODO-HUMAN-REVIEW(PR-id)` — a specific spot the human should scrutinize;
-  include the PR number, e.g. `// TODO-HUMAN-REVIEW(#206)`.
+- **Summary**.
+- **Determinism** — mandatory for every PR; explain why the change is
+  deterministic and give the logic or informal proof, not only test results.
+- **Validation** — exact commands, outcomes, limitations, and relaxations.
+- **Relationship to gVisor** — required for KVM changes; state the comparison
+  or explain why none applies.
+- **Human Review Required** — mandatory when `post-facto-human-review` is
+  applied. Name the specific numbered trigger(s); vague prose such as "backend
+  change" is insufficient.
 
-Keep markers at the smallest meaningful scope (the function/block that is
-novel), not blanketed across untouched code.
+PR #1151 is the canonical good example for trigger 4: its slowdown model is
+explained as weighted virtual-time progression with deterministic epochs and
+replay evidence, rather than asserted from passing tests alone. New PRs must
+use the section names above and identify trigger 4 explicitly.
+
+## 3. Labels and new-syscall code markers
+
+- `post-facto-human-review` is the single routing label for a PR awaiting the
+  human's after-the-fact review. Apply it only for the four triggers above.
+- Never apply `pre-land-human-review`, and never alter `human-approved`.
+- The obsolete `human-review` and `post-facto-review` labels must not be used.
+
+New syscall support authored by a bot must carry both narrowly scoped audit
+tags: `// AUTONOMOUS-BOT-IMPLEMENTED` at its new dispatch/classification entry
+and `// TODO-HUMAN-REVIEW(PR-id)` at its implementation or determinization
+block. These are not blanket markers for API changes, backend work, or routine
+parity fixes.
 
 ## 4. Land immediately after review + CI green
 
-Once a key change survives adversarial review and CI is green, **land it** —
+Once a triggered change survives adversarial review and CI is green, **land it** —
 squash-merge to `main`. Do not wait for a human.
 
 - Merge gate = **GitHub-managed portable "Regular tests" green**. The privileged
@@ -90,6 +107,9 @@ squash-merge to `main`. Do not wait for a human.
 - Prefer merging on real GitHub-managed portable green. When using `--admin`, it should
   only be bypassing the known-environmental privileged lane, not a genuine
   red on GitHub-managed portable or on a meaningful check.
+- When one of the four triggers applies, add `post-facto-human-review` and
+  verify that **Human Review Required** names the specific trigger before
+  landing. Do not label routine backend-parity work.
 - After landing, rebase dependent PRs onto the new `main` (see the PR DAG
   section of [human-review-first](../human-review-first/SKILL.md)).
 
