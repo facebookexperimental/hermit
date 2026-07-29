@@ -374,7 +374,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let delta_rcbs: u64 = clock_value - thread_state.committed_clock_value;
             if self.cfg.use_rcb_time() {
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-PENDING)
+                // TODO-HUMAN-REVIEW(PR-1151)
                 if thread_state.chaos_slowdown_active {
                     let factor = thread_state.rcb_time_multiplier();
                     thread_state
@@ -535,7 +535,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             assert!(guest.config().max_timeslice.is_some());
             // TODO: get rid of fractional NANOS_PER_RCB so it's clear that this does not lose precision:
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-PENDING)
+            // TODO-HUMAN-REVIEW(PR-1151)
             let clock_multiplier = guest.config().clock_multiplier.unwrap_or(1.0)
                 * guest.thread_state().rcb_time_multiplier().as_f64();
             let epsilon = Duration::from_nanos((NANOS_PER_RCB * clock_multiplier).ceil() as u64);
@@ -1189,7 +1189,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                     end_of_timeslice: None,
                     // AUTONOMOUS-BOT-IMPLEMENTED
-                    // TODO-HUMAN-REVIEW(PR-PENDING)
+                    // TODO-HUMAN-REVIEW(PR-1151)
                     chaos_epoch: tool_local::chaos_epoch_sentinel(),
                     chaos_slowdown_factor: RcbTimeMultiplier::ONE,
                     chaos_slowdown_active: false,

@@ -25,7 +25,7 @@ use crate::types::RcbTimeMultiplier;
 use crate::types::SigWrapper;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-PENDING)
+// TODO-HUMAN-REVIEW(PR-1151)
 /// An exact slowdown-factor transition recorded at a scheduler commit boundary.
 #[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
 pub struct ChaosEpochTransition {
@@ -258,7 +258,7 @@ pub enum ResourceID {
     ///
     /// Also includes the local time at which the guest observed the preemption point.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     PriorityChangePoint(u64, LogicalTime, Option<ChaosEpochTransition>),
 
     /// A physical signal has been received by the thread, request to continue delivering it and

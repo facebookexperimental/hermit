@@ -209,7 +209,7 @@ pub struct Config {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1149)
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     /// Reproducible per-thread slowdown factors for chaos mode. A factor greater
     /// than one makes each RCB consume proportionally more virtual time, while a
     /// factor below one makes it consume less. Thus scheduling deadlines and the
@@ -222,7 +222,7 @@ pub struct Config {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1149)
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     /// Maximum ratio between the slowest and fastest per-thread slowdown factor
     /// for `--chaos-per-thread-slowdown`. Each thread's factor is drawn
     /// log-uniformly from `[1/R, R]` where `R` is this value. Must fit the Q32
@@ -231,7 +231,7 @@ pub struct Config {
     pub chaos_slowdown_max_factor: f64,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     /// Length of a deterministic slowdown epoch in elapsed per-thread logical
     /// nanoseconds. At the first scheduler commit at or after each boundary the
     /// factor is redrawn as `factor(seed, stable_dettid, epoch)`. This is never
@@ -693,7 +693,7 @@ impl fmt::Display for Config {
                 self.chaos_slowdown_max_factor
             )?;
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-PENDING)
+            // TODO-HUMAN-REVIEW(PR-1151)
             if self.chaos_epoch_length_ns > 0 {
                 write!(f, " --chaos-epoch-length-ns={}", self.chaos_epoch_length_ns)?;
             }
@@ -1159,7 +1159,7 @@ mod tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
     fn chaos_epoch_length_is_opt_in_and_round_trips() {
         // Off by default (single stable factor == plain per-thread-slowdown).
@@ -1245,7 +1245,7 @@ mod tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
     #[should_panic(expected = "max_timeslice must be at least one RCB")]
     fn validate_scales_one_rcb_minimum_with_chaos_slowdown() {
@@ -1260,7 +1260,7 @@ mod tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
     #[should_panic(expected = "chaos_slowdown_max_factor must be finite and in")]
     fn validate_rejects_unrepresentable_chaos_slowdown_factor() {

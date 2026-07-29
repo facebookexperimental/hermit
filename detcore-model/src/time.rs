@@ -39,13 +39,13 @@ pub const NANOS_PER_SYSCALL: f64 = 10000.0;
 pub const NANOS_PER_RCB: f64 = 10.0;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-PENDING)
+// TODO-HUMAN-REVIEW(PR-1151)
 /// Fixed-point scale used for deterministic per-thread RCB time multipliers.
 /// Q32 keeps accumulation independent of how a backend batches RCB updates.
 const RCB_TIME_MULTIPLIER_SCALE: u64 = 1_u64 << 32;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-PENDING)
+// TODO-HUMAN-REVIEW(PR-1151)
 /// A positive Q32 multiplier for converting RCB progress into virtual time.
 #[derive(
     Debug,
@@ -413,7 +413,7 @@ pub struct DetTime {
     rcbs: u64,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     /// RCB progress weighted by per-thread virtual-time multipliers, in Q32 RCB units.
     /// `None` preserves the uniform interpretation of older serialized values.
     // This field participates in Reverie's non-self-describing bincode RPC.
@@ -575,7 +575,7 @@ impl DetTime {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     /// Add RCB progress using a deterministic per-thread virtual-time multiplier.
     ///
     /// The Q32 accumulator makes the result independent of whether a backend reports
@@ -670,7 +670,7 @@ mod rcb_multiplier_tests {
     use super::*;
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
     fn weighted_rcb_time_is_batching_independent() {
         let factor = RcbTimeMultiplier::from_f64(2.5);
@@ -689,7 +689,7 @@ mod rcb_multiplier_tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
     fn uniform_rcbs_after_weighted_rcbs_keep_continuity() {
         let mut time = DetTime::zero();

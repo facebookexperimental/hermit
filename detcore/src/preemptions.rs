@@ -353,7 +353,7 @@ pub struct ThreadHistory {
     prio_changes: Vec<(LogicalTime, Priority)>,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     /// Exact per-thread slowdown transitions. Empty artifacts from older Hermit
     /// versions remain wire-compatible when read through Serde's default.
     // `ThreadHistory` also crosses Reverie's non-self-describing bincode RPC,
@@ -431,7 +431,7 @@ pub struct ThreadHistoryIterator {
     /// Index that tracks our position.
     ix: usize,
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     #[serde(default)]
     chaos_epoch_ix: usize,
 }
@@ -448,7 +448,7 @@ impl ThreadHistoryIterator {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     /// Consume recorded epoch transitions up to `current_time`, returning a
     /// transition only when the active recorded factor changed.
     pub fn advance_chaos_epoch(
@@ -496,7 +496,7 @@ mod tests {
     use crate::types::RcbTimeMultiplier;
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
     fn chaos_epoch_transitions_round_trip_and_replay_exact_factors() {
         let tid = DetTid::from_raw(2);
@@ -856,7 +856,7 @@ impl PreemptionWriter {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     /// Record a deterministic slowdown epoch transition for replay.
     pub fn insert_chaos_epoch(&mut self, tid: DetTid, transition: ChaosEpochTransition) {
         let history = self.inner.per_thread.get_mut(&tid).unwrap_or_else(|| {

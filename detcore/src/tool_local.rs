@@ -1209,7 +1209,7 @@ pub struct ThreadState<T> {
     pub end_of_timeslice: Option<LogicalTime>,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     /// Deterministic chaos epoch this thread was in at its last `next_timeslice`.
     /// Used only to detect epoch transitions for `CHAOSEPOCH` logging; the epoch
     /// itself is recomputed each slice from `thread_logical_time`. Sentinel
@@ -1218,19 +1218,19 @@ pub struct ThreadState<T> {
     pub chaos_epoch: u64,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     /// Exact multiplier currently used to convert this thread's RCBs to virtual time.
     #[serde(default)]
     pub chaos_slowdown_factor: RcbTimeMultiplier,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     /// True when live chaos configuration or a replay artifact supplies the factor.
     #[serde(default)]
     pub chaos_slowdown_active: bool,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     /// Transition waiting to be committed into the preemption artifact.
     #[serde(default)]
     pub pending_chaos_epoch: Option<ChaosEpochTransition>,
@@ -1290,7 +1290,7 @@ impl<T> Default for ThreadState<T> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-PENDING)
+// TODO-HUMAN-REVIEW(PR-1151)
 /// Sentinel for `ThreadState::chaos_epoch` before the first `next_timeslice`.
 /// `u64::MAX` can never equal a real epoch (`current_ns / N`), so the first
 /// chaos slice always emits its `CHAOSEPOCH` transition.
@@ -1352,7 +1352,7 @@ fn from_atflags(flags: AtFlags) -> OFlag {
 /// `max_factor <= 1.0` disables the spread and returns `1.0` (nominal) for
 /// every thread; callers validate `max_factor >= 1.0`.
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-PENDING)
+// TODO-HUMAN-REVIEW(PR-1151)
 /// `epoch` selects a deterministic chaos EPOCH: the factor is redrawn per
 /// (thread, epoch) so a thread's bias changes in deterministic phases across a
 /// long run instead of staying fixed. `epoch == 0` reproduces the epoch-less
@@ -1374,7 +1374,7 @@ pub(crate) fn chaos_per_thread_slowdown_factor(
     // stream distinct from other sched_seed-derived streams.
     const SLOWDOWN_SALT: u64 = 0x736c_6f77_646f_776e; // "slowdown"
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     // Fold the epoch into the mix with its own golden-ratio multiplier. At
     // `epoch == 0` this term is 0, leaving `mixed` identical to the epoch-less
     // factor; each successive epoch decorrelates the draw deterministically.
@@ -1539,10 +1539,10 @@ impl<T> ThreadState<T> {
             committed_clock_value: 0,
             end_of_timeslice: None, // Temporary/bogus.
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-PENDING)
+            // TODO-HUMAN-REVIEW(PR-1151)
             chaos_epoch: chaos_epoch_sentinel(),
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-PENDING)
+            // TODO-HUMAN-REVIEW(PR-1151)
             chaos_slowdown_factor: RcbTimeMultiplier::ONE,
             chaos_slowdown_active: false,
             pending_chaos_epoch: None,
@@ -1728,7 +1728,7 @@ impl<T> ThreadState<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     /// Current RCB virtual-time multiplier, including recorded replay state.
     pub(crate) fn rcb_time_multiplier(&self) -> RcbTimeMultiplier {
         if self.chaos_slowdown_active {
@@ -1739,13 +1739,13 @@ impl<T> ThreadState<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     pub(crate) fn take_pending_chaos_epoch(&mut self) -> Option<ChaosEpochTransition> {
         self.pending_chaos_epoch.take()
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     fn install_chaos_epoch(&mut self, transition: ChaosEpochTransition, record: bool) {
         self.chaos_epoch = transition.epoch;
         self.chaos_slowdown_factor = transition.factor;
@@ -1775,7 +1775,7 @@ impl<T> ThreadState<T> {
             let current_ns = self.thread_logical_time.as_nanos();
 
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-PENDING)
+            // TODO-HUMAN-REVIEW(PR-1151)
             // Redraw only at scheduler commit boundaries, keyed to elapsed
             // deterministic logical time. Replay artifacts take precedence and
             // restore the exact recorded Q32 factor even without ambient flags.
@@ -1902,7 +1902,7 @@ impl<T> ThreadState<T> {
                 }
             } else {
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-PENDING)
+                // TODO-HUMAN-REVIEW(PR-1151)
                 // The slowdown changes RCB-to-virtual-time progression. Converting
                 // the sampled virtual duration back to RCBs with the SAME factor
                 // keeps the deadline and guest-visible clock internally consistent.
@@ -2170,7 +2170,7 @@ mod timeslice_tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
     fn chaos_epoch_zero_reproduces_epochless_factor() {
         // Enabling epochs must never perturb the FIRST epoch: epoch 0 has to
@@ -2203,7 +2203,7 @@ mod timeslice_tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
     fn chaos_epoch_factor_varies_deterministically_across_epochs() {
         let max_factor = 10.0;
@@ -2293,7 +2293,7 @@ mod timeslice_tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
     fn constant_slowdown_is_the_single_epoch_case() {
         let config = Config {
@@ -2320,7 +2320,7 @@ mod timeslice_tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
     fn epoch_redraw_uses_elapsed_logical_time_at_commit_boundaries() {
         let config = Config {
@@ -2359,7 +2359,7 @@ mod timeslice_tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
     fn replay_installs_recorded_epoch_without_ambient_chaos_flags() {
         let config = Config {

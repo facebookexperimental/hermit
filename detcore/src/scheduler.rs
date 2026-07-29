@@ -2026,7 +2026,7 @@ impl Scheduler {
         new_priority: Priority,
         guest_time: LogicalTime,
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-PENDING)
+        // TODO-HUMAN-REVIEW(PR-1151)
         chaos_epoch: Option<crate::resources::ChaosEpochTransition>,
     ) -> Result<(), SkipTurn> {
         assert!(runqueue::is_ordinary_priority(new_priority));

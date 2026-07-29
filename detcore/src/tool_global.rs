@@ -1439,7 +1439,7 @@ pub enum GlobalRequest {
     /// further turns. Carries the exiting thread's completed-timeslice distribution
     /// so the scheduler can aggregate it into the final run report.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-PENDING)
+    // TODO-HUMAN-REVIEW(PR-1151)
     /// Deregister a thread, flushing an epoch transition that did not reach a
     /// later priority-change commit before the thread exited.
     DeregisterThread(
@@ -1826,7 +1826,7 @@ pub async fn create_vfork_child_thread<G, T>(
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-PENDING)
+// TODO-HUMAN-REVIEW(PR-1151)
 /// State published when a thread leaves the deterministic scheduler.
 pub(crate) struct ThreadDeregistration {
     pub(crate) dettid: DetTid,
