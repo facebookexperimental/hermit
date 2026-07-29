@@ -10,6 +10,7 @@
 //! the Detcore tool.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -79,6 +80,7 @@ use crate::scheduler::runqueue::is_ordinary_priority;
 use crate::scheduler::sched_loop;
 use crate::scheduler::sched_loop_external;
 use crate::tool_local::Detcore;
+use crate::tool_local::ExecFdBlockingOverrides;
 use crate::types::*;
 
 async fn yield_once() {
@@ -270,6 +272,11 @@ pub struct GlobalState {
     // False initially after fork, and true when we begin executing the guest binary.
     past_first_execve: AtomicBool,
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
+    /// Logically blocking descriptors awaiting restoration after a SaBRe exec reload.
+    pending_exec_fd_blocking: Mutex<BTreeMap<DetTid, ExecFdBlockingOverrides>>,
+
     sched_handle: Option<tokio::task::JoinHandle<()>>,
 
     /// Global time is a *volatile* vector clock of individual thread progress. Each
@@ -354,6 +361,7 @@ impl GlobalState {
             port_end_range: AtomicU16::new(range[1]),
             open_file_to_port: Mutex::new(HashMap::new()),
             past_first_execve: AtomicBool::new(false),
+            pending_exec_fd_blocking: Mutex::new(BTreeMap::new()),
             inodes: Arc::new(Mutex::new(InodePool::new())),
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping state.
@@ -631,9 +639,32 @@ impl GlobalTool for GlobalState {
                 }
                 R::ReportUnsupportedSyscall(())
             }
+            GlobalRequest::PrepareExecFdBlocking(overrides) => {
+                trace!(
+                    "[detcore, dtid {}] preparing logically blocking descriptors for exec: {:?}",
+                    dtid, overrides,
+                );
+                let mut pending = self.pending_exec_fd_blocking.lock().unwrap();
+                if overrides.is_empty() {
+                    pending.remove(&dtid);
+                } else {
+                    pending.insert(dtid, overrides);
+                }
+                R::PrepareExecFdBlocking(())
+            }
             GlobalRequest::MarkPastFirstExecve => {
                 self.past_first_execve.store(true, SeqCst);
-                R::MarkPastFirstExecve(())
+                let overrides = self
+                    .pending_exec_fd_blocking
+                    .lock()
+                    .unwrap()
+                    .remove(&dtid)
+                    .unwrap_or_default();
+                trace!(
+                    "[detcore, dtid {}] restoring logically blocking descriptors after exec: {:?}",
+                    dtid, overrides,
+                );
+                R::MarkPastFirstExecve(overrides)
             }
             // Requested by the parent thread:
             GlobalRequest::CreateChildThread(dettid, parent_detpid, ctid, flags, priority) => {
@@ -1203,6 +1234,10 @@ impl GlobalState {
             timeslice_stats,
             chaos_epochs,
         } = deregistration;
+        self.pending_exec_fd_blocking
+            .lock()
+            .unwrap()
+            .remove(&dettid);
         // Invariant: will only be called when sequentialize-threads is on.
         assert!(self.cfg.sequentialize_threads);
         let mut sched = self.sched.lock().unwrap();
@@ -1571,6 +1606,12 @@ pub enum GlobalRequest {
     /// Add a syscall to the run-wide unsupported-use summary.
     ReportUnsupportedSyscall(String),
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
+    /// Save logically blocking descriptors before a backend reloads its tool across exec.
+    /// An empty set clears a failed exec attempt.
+    PrepareExecFdBlocking(ExecFdBlockingOverrides),
+
     /// Mark the initial image transition complete for backends that begin post-exec.
     MarkPastFirstExecve,
 
@@ -1674,7 +1715,8 @@ pub enum GlobalResponse {
     ReleaseAllResources(()),
     // TODO-HUMAN-REVIEW(PR-643): Review this new Detcore global RPC response.
     ReportUnsupportedSyscall(()),
-    MarkPastFirstExecve(()),
+    PrepareExecFdBlocking(()),
+    MarkPastFirstExecve(ExecFdBlockingOverrides),
     CreateChildThread(()),
     /// Includes optional preemption points for the new thread.
     StartNewThread(Option<ThreadHistory>),
@@ -1725,13 +1767,36 @@ pub fn format_unsupported_syscall_warning(syscalls: &BTreeSet<String>) -> Option
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
+pub async fn set_pending_exec_fd_blocking<G, T>(guest: &mut G, overrides: ExecFdBlockingOverrides)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::PrepareExecFdBlocking(overrides)).await;
+    assert_eq!(response, GlobalResponse::PrepareExecFdBlocking(()));
+}
+
 pub async fn mark_past_first_execve<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
     let (_, response) = send_and_update_time(guest, GlobalRequest::MarkPastFirstExecve).await;
-    assert_eq!(response, GlobalResponse::MarkPastFirstExecve(()));
+    let overrides = match response {
+        GlobalResponse::MarkPastFirstExecve(overrides) => overrides,
+        _ => unreachable!(),
+    };
+    if !overrides.is_empty() {
+        let dettid = guest.thread_state().dettid;
+        let metadata = Arc::clone(&guest.thread_state().file_metadata);
+        metadata
+            .lock()
+            .unwrap()
+            .apply_exec_blocking_overrides(dettid, overrides);
+    }
 }
 
 // TODO-HUMAN-REVIEW(PR-643): Review the guest-to-global unsupported-syscall report path.

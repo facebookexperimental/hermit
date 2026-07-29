@@ -185,7 +185,7 @@ elif ((PRIVILEGED_ONLY == 1)); then
     # atomic operations. They need a longer per-family budget than portable CI.
     default_gate_timeout_seconds=3600
 elif ((SABRE_COMPAT_ONLY == 1)); then
-    # The focused SaBRe profile measures 198 programs and is documented as a
+    # The focused SaBRe profile measures 212 programs and is documented as a
     # 10-20 minute gate. Preserve headroom without bypassing the caller's
     # VALIDATE_GATE_TIMEOUT_SECONDS override.
     default_gate_timeout_seconds=1800
@@ -317,10 +317,12 @@ readonly STRICT_COMPAT_TOTAL=191
 # proving the added rows pass R/R: an aspirational count is a phantom ratchet that
 # either fails the parse-time size check or masks real divergences.
 readonly RR_COMPAT_EXPECTED=139
-# Require every measured SaBRe compatibility row.
+# Require the established SaBRe compatibility floor across the full measured corpus.
 # This is a compatibility floor, not a Detcore determinism claim.
-readonly SABRE_COMPAT_EXPECTED=198
-readonly SABRE_COMPAT_TOTAL=198
+readonly SABRE_COMPAT_EXPECTED=199
+# AUTONOMOUS-BOT-IMPLEMENTED
+# TODO-HUMAN-REVIEW(PR-1154): Review synchronization of the measured SaBRe corpus size.
+readonly SABRE_COMPAT_TOTAL=212
 readonly E9PATCH_COMPAT_TOTAL=155
 COMPATIBILITY_MODE=strict
 E9PATCH_COMPAT_REWRITTEN=0

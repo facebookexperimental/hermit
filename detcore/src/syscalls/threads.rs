@@ -47,6 +47,7 @@ use crate::tool_global::ResumeStatus;
 use crate::tool_global::create_child_thread;
 use crate::tool_global::futex_action;
 use crate::tool_global::resource_request;
+use crate::tool_global::set_pending_exec_fd_blocking;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
 use crate::tool_local::PendingVfork;
@@ -655,13 +656,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 thread_state.mm_id,
             )
         };
-        let (new_metadata, closed_open_files) = {
+        let (new_metadata, closed_open_files, exec_fd_blocking) = {
             let metadata = old_metadata.lock().unwrap();
+            let new_metadata = metadata.for_exec(dettid);
             (
-                metadata.for_exec(dettid),
+                new_metadata.clone(),
                 metadata.open_files_closed_on_exec(table_is_shared),
+                new_metadata.exec_blocking_overrides(),
             )
         };
+        let preserve_exec_fd_status = guest.thread_state().discover_live_file_metadata;
 
         {
             let thread_state = guest.thread_state_mut();
@@ -677,8 +681,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
 
+        if preserve_exec_fd_status {
+            set_pending_exec_fd_blocking(guest, exec_fd_blocking).await;
+        }
+
         // execve(2) doesn't return upon success.
         let errno = self.record_or_replay(guest, call).await.unwrap_err();
+
+        if preserve_exec_fd_status {
+            set_pending_exec_fd_blocking(guest, Default::default()).await;
+        }
 
         for (open_file_id, port) in released_ports {
             self.restore_port_for_open_file(guest, open_file_id, port)

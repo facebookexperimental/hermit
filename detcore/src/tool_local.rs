@@ -85,6 +85,12 @@ pub struct FileMetadata {
     pub(crate) file_handles: HashMap<RawFd, DetFd>,
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1154): Review SaBRe exec descriptor-status handoff state.
+/// Descriptor numbers that Detcore keeps physically nonblocking while presenting them as
+/// blocking to the guest. SaBRe carries this narrow status set across an exec plugin reload.
+pub type ExecFdBlockingOverrides = BTreeSet<RawFd>;
+
 /// A single POSIX per-process interval timer created by `timer_create(2)`.
 ///
 /// Detcore records arming against virtual time and schedules supported
@@ -343,6 +349,44 @@ impl FileMetadata {
                 .iter()
                 .filter_map(|(&fd, detfd)| (!detfd.is_cloexec()).then_some((fd, detfd.clone())))
                 .collect(),
+        }
+    }
+
+    pub(crate) fn exec_blocking_overrides(&self) -> ExecFdBlockingOverrides {
+        self.file_handles
+            .iter()
+            .filter_map(|(&fd, detfd)| {
+                (!detfd.is_cloexec() && detfd.physically_nonblocking() && !detfd.is_nonblocking())
+                    .then_some(fd)
+            })
+            .collect()
+    }
+
+    pub(crate) fn apply_exec_blocking_overrides(
+        &mut self,
+        owner: DetTid,
+        overrides: ExecFdBlockingOverrides,
+    ) {
+        for fd in overrides {
+            tracing::trace!(
+                "[detcore, dtid {}] restoring descriptor {} as logically blocking after exec",
+                owner,
+                fd,
+            );
+            match self.discover_fd_from_current_process(owner, fd) {
+                Ok(()) => {
+                    self.with_detfd(fd, |detfd| detfd.set_logical_nonblocking(false))
+                        .expect("a just-discovered descriptor must remain registered");
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "[detcore, dtid {}] unable to restore inherited descriptor {} after exec: {}",
+                        owner,
+                        fd,
+                        error,
+                    );
+                }
+            }
         }
     }
 
@@ -732,6 +776,42 @@ mod file_metadata_tests {
             .expect("discovered pipe should be tracked");
 
         assert_eq!(flags, (true, true));
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    #[test]
+    fn exec_handoff_restores_scheduler_pipe_as_logically_blocking() {
+        let owner = DetTid::from_raw(9);
+        let mut fds = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK) },
+            0
+        );
+        let mut before_exec = FileMetadata::new(owner);
+        before_exec
+            .add_fd(owner, fds[0], OFlag::empty(), FdType::Pipe, None)
+            .expect("scheduler pipe should be registered");
+        before_exec
+            .with_detfd(fds[0], |detfd| detfd.set_physically_nonblocking())
+            .expect("scheduler pipe should remain registered");
+
+        let overrides = before_exec.exec_blocking_overrides();
+        assert_eq!(overrides, BTreeSet::from([fds[0]]));
+
+        let mut after_exec = FileMetadata::new(owner);
+        after_exec.apply_exec_blocking_overrides(owner, overrides);
+        assert_eq!(
+            after_exec
+                .with_detfd(fds[0], |detfd| {
+                    (detfd.is_nonblocking(), detfd.physically_nonblocking())
+                })
+                .expect("inherited pipe should be rediscovered"),
+            (false, true)
+        );
+
         unsafe {
             libc::close(fds[0]);
             libc::close(fds[1]);

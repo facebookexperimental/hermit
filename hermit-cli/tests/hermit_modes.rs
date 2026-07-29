@@ -524,26 +524,38 @@ fn run_default_workload(name: &str) {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1023): Review the SaBRe exit-group teardown regression.
-fn run_sabre_exit_group_parked() {
+fn run_bounded_sabre_strict_verify(program: &Path, args: &[&str], label: &str) {
     let hermit_binary = Path::new(env!("CARGO_BIN_EXE_hermit"));
     let executable_dir = hermit_binary.parent().unwrap();
     let target_dir = executable_dir.parent().unwrap();
-    let loader = std::env::var_os("HERMIT_SABRE_BINARY")
-        .map(PathBuf::from)
+    let configured_loader = std::env::var_os("HERMIT_SABRE_BINARY").map(PathBuf::from);
+    let loader = configured_loader
+        .clone()
         .unwrap_or_else(|| target_dir.join("sabre/sabre"));
     let plugin = executable_dir.join("libdetcore_sabre.so");
     if !loader.is_file() || !plugin.is_file() {
+        if configured_loader.is_some() {
+            panic!(
+                "configured SaBRe regression artifacts are unavailable: loader={}, plugin={}",
+                loader.display(),
+                plugin.display(),
+            );
+        }
+        eprintln!(
+            "skipping {label}: SaBRe regression artifacts are unavailable: loader={}, plugin={}",
+            loader.display(),
+            plugin.display(),
+        );
         return;
     }
 
     let _guard = hermit_run_lock();
-    let workload = &workloads().sabre_exit_group_parked;
     let mut command = Command::new(hermit_binary);
     command
         .env("HERMIT_SABRE_BINARY", &loader)
         .args(["run", "--backend", "sabre", "--strict", "--verify", "--"])
-        .arg(&workload.path)
-        .args(workload.args)
+        .arg(program)
+        .args(args)
         .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -552,7 +564,7 @@ fn run_sabre_exit_group_parked() {
     let started = Instant::now();
     let mut child = command
         .spawn()
-        .unwrap_or_else(|error| panic!("failed to start SaBRe regression: {rendered}: {error}"));
+        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
     let timed_out = loop {
         match child.try_wait() {
             Ok(Some(_)) => break false,
@@ -564,15 +576,15 @@ fn run_sabre_exit_group_parked() {
                 break true;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(error) => panic!("failed to poll SaBRe regression: {rendered}: {error}"),
+            Err(error) => panic!("failed to poll {label}: {rendered}: {error}"),
         }
     };
     let output = child
         .wait_with_output()
-        .unwrap_or_else(|error| panic!("failed to collect SaBRe regression: {rendered}: {error}"));
+        .unwrap_or_else(|error| panic!("failed to collect {label}: {rendered}: {error}"));
     assert!(
         !timed_out && output.status.success(),
-        "SaBRe regression failed: {rendered}\nstatus: {}\ntimed out: {timed_out}\nstdout:\n{}\nstderr:\n{}",
+        "{label} failed: {rendered}\nstatus: {}\ntimed out: {timed_out}\nstdout:\n{}\nstderr:\n{}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
@@ -581,7 +593,26 @@ fn run_sabre_exit_group_parked() {
 
 #[test]
 fn sabre_exit_group_cancels_parked_futex_thread() {
-    run_sabre_exit_group_parked();
+    let workload = &workloads().sabre_exit_group_parked;
+    run_bounded_sabre_strict_verify(
+        &workload.path,
+        workload.args,
+        "SaBRe exit-group teardown regression",
+    );
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe fork/exec pipe-state regression.
+#[test]
+fn sabre_exec_pipeline_preserves_blocking_pipe_semantics() {
+    run_bounded_sabre_strict_verify(
+        Path::new("/usr/bin/bash"),
+        &[
+            "-c",
+            "set -euo pipefail; paste -d: <(printf 'alpha\\nbeta\\n') <(printf '1\\n2\\n') | diff -u <(printf 'alpha:1\\nbeta:2\\n') -; printf 'paste-ok\\n'",
+        ],
+        "SaBRe exec pipe-metadata regression",
+    );
 }
 
 macro_rules! default_workload_tests {
