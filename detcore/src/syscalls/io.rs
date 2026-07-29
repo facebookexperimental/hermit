@@ -415,22 +415,36 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         // Linux wraps pselect6's temporary mask in { pointer, size }. Glibc supplies
-        // the wrapper even when the inner pointer is null. A real mask needs atomic
-        // kernel ownership across the wait, so keep it on the external-blocking path.
-        if let Some(argument) = call.sigmask() {
+        // the wrapper even when the inner pointer is null. A real mask must stay in
+        // effect for the whole wait so an unblocked signal (make's jobserver unblocks
+        // SIGCHLD) can interrupt it. Previously that forced the external-blocking path,
+        // whose completion timing is host-decided and is a source of `make -jN`
+        // execution-log divergence. With SIGCHLD admission now deterministic (scheduler
+        // `sigchld_deferred`/`sigchld_ready`), honor the mask on each deterministic poll
+        // probe instead: a pending unblocked signal is observed at a scheduler-decided
+        // probe point rather than at host signal-arrival time.
+        let sigmask = if let Some(argument) = call.sigmask() {
             let argument: Pselect6SigmaskArg = guest.memory().read_value(argument.cast())?;
             if argument.sigmask != 0 {
-                return self
-                    .record_or_replay_blocking(guest, Syscall::Pselect6(call))
-                    .await;
+                if argument.sigsetsize != KERNEL_SIGSET_SIZE {
+                    return Err(Errno::EINVAL.into());
+                }
+                let mask_addr = AddrMut::<u64>::from_raw(argument.sigmask).ok_or(Errno::EFAULT)?;
+                let mask: u64 = guest.memory().read_value(mask_addr.cast())?;
+                Some(sanitize_ppoll_signal_mask(mask))
+            } else {
+                None
             }
-        }
-        // The null inner mask was snapshotted above. Do not let later guest mutations of
-        // the outer wrapper change the meaning of a retry probe.
+        } else {
+            None
+        };
+        // The inner mask was snapshotted above. Do not let later guest mutations of the
+        // outer wrapper change the meaning of a retry probe.
         let call = call.with_sigmask(None);
         let timeout = raw_timeout.map(ppoll_timeout_duration).transpose()?;
 
-        self.handle_internal_pselect6(guest, call, timeout).await
+        self.handle_internal_pselect6(guest, call, timeout, sigmask)
+            .await
     }
 
     async fn handle_internal_pselect6<G: Guest<Self>>(
@@ -438,6 +452,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Pselect6,
         timeout: Option<Duration>,
+        sigmask: Option<u64>,
     ) -> Result<i64, Error> {
         let len = pselect6_fd_set_len(call.nfds())?;
         let deadline = match timeout {
@@ -476,12 +491,26 @@ impl<T: RecordOrReplay> Detcore<T> {
                 tv_nsec: 0,
             })
             .cast::<libc::timeval>();
+        // Carry the temporary signal mask on every zero-timeout probe so the kernel
+        // applies it atomically: a pending, mask-unblocked signal makes the probe return
+        // EINTR at a deterministic scheduler point. The probe's wrapper points at scratch
+        // memory the guard keeps alive across each injection.
+        let probe_sigmask = sigmask.map(|mask| {
+            let sigset = stack.push(mask);
+            stack
+                .push(Pselect6SigmaskArg {
+                    sigmask: sigset.as_raw(),
+                    sigsetsize: KERNEL_SIGSET_SIZE,
+                })
+                .cast()
+        });
         let _guard = stack.commit()?;
         let probe = call
             .with_readfds(readfds)
             .with_writefds(writefds)
             .with_exceptfds(exceptfds)
-            .with_timeout(Some(probe_timeout));
+            .with_timeout(Some(probe_timeout))
+            .with_sigmask(probe_sigmask);
 
         let mut resources = Resources::new(guest.thread_state().dettid);
         resources.insert(ResourceID::InternalIOPolling, Permission::W);

@@ -239,6 +239,17 @@ impl RunQueue {
         Some(k.priority)
     }
 
+    /// True if any thread other than `exclude` is runnable at ordinary
+    /// (non-poller) priority. This is the "deterministic work still runnable"
+    /// test used to decide whether an asynchronous signal delivery must defer to
+    /// guest work that was already scheduled. Read-only, so it is safe to call
+    /// while a tentative_pop selection is in progress.
+    pub fn has_runnable_besides(&self, exclude: DetTid) -> bool {
+        self.queue
+            .iter()
+            .any(|(k, v)| v.tid != exclude && k.priority < LAST_PRIORITY)
+    }
+
     /// Push a thread to the back of the specified priority. Return the
     /// resulting overall position in the queue.
     ///

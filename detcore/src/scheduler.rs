@@ -206,6 +206,27 @@ pub struct BlockedPool {
     /// waiting for permission to resume.  The request will stay empty while the thread is
     /// doing the blocking action.  This is different than the normal relationship
     pub external_io_blockers: BTreeMap<DetTid, ExternalOpId>,
+
+    /// Parents parked awaiting deterministic delivery of a host-async `SIGCHLD`.
+    ///
+    /// When a guest child process exits, the kernel raises `SIGCHLD` on the
+    /// parent at a moment decided purely by host timing. If the resulting
+    /// `InboundSignal` turn is committed as soon as it arrives, its position
+    /// races whatever guest work was already runnable -- classically a `make -jN`
+    /// jobserver `pselect6` continuation -- and `--strict --verify` diverges.
+    ///
+    /// Instead the parent is parked here, out of the run queue, and re-admitted
+    /// by `step2e_process_signal_deferred` only once no ordinary (non-poller)
+    /// guest work remains: the same deterministic-work-first policy that governs
+    /// `external_io_blockers`. The physical signal has already been delivered by
+    /// the kernel, so the handler's `wait4`/`waitpid` still reaps a real host
+    /// zombie and no synthetic signal is ever generated.
+    pub sigchld_deferred: BTreeSet<DetTid>,
+
+    /// Deferred `SIGCHLD` parents that `step2e_process_signal_deferred` has
+    /// re-admitted to the run queue. Their `InboundSignal` turn must now be
+    /// granted rather than deferred again on the turn the scheduler selects them.
+    pub sigchld_ready: BTreeSet<DetTid>,
 }
 
 impl BlockedPool {
@@ -214,6 +235,7 @@ impl BlockedPool {
         self.no_futex_waiters()
             && self.timed_waiters.is_empty()
             && self.external_io_blockers.is_empty()
+            && self.sigchld_deferred.is_empty()
     }
 
     /// True if there are no runnable threads, and the only blocked ones are externally-blocked.
@@ -1209,6 +1231,8 @@ impl Scheduler {
         self.blocked.timed_waiters.remove(*dtid);
         let _ = self.blocked.external_io_blockers.remove(dtid);
         self.blocked.timed_out_futex_waiters.remove(dtid);
+        self.blocked.sigchld_deferred.remove(dtid);
+        self.blocked.sigchld_ready.remove(dtid);
         let _ = self.remove_futex_waiter(dtid);
     }
 
@@ -1390,8 +1414,37 @@ impl Scheduler {
         self.step2a_wait_for_vfork_barrier()?;
         self.step2b_process_timed(); // May populate run_queue.
         self.step2c_process_io_blockers()?;
+        self.step2e_process_signal_deferred(); // May populate run_queue.
         self.step2d_handle_empty_queue(global_time)?;
         Ok(())
+    }
+
+    /// Re-admit parents whose host-async `SIGCHLD` was parked in
+    /// `blocked.sigchld_deferred` (see `block_for_one_resource`). Uses the same
+    /// deterministic-work-first gate as `step2c_process_io_blockers`: a deferred
+    /// signal is delivered only once the run queue holds no ordinary (non-poller)
+    /// guest work, so its commit order is fixed by the scheduler rather than by
+    /// host signal-arrival timing. Runs after external-IO harvesting so a ready
+    /// IO continuation is always ordered ahead of a deferred signal.
+    fn step2e_process_signal_deferred(&mut self) {
+        if self.blocked.sigchld_deferred.is_empty() {
+            return;
+        }
+        let only_pollers = match self.run_queue.first_priority() {
+            Some(fp) => fp >= LAST_PRIORITY,
+            None => true,
+        };
+        if !self.run_queue.is_empty() && !only_pollers {
+            return;
+        }
+        // BTreeSet drains in sorted DetTid order, giving a canonical admission
+        // order when several parents are owed a signal at the same quiescence.
+        let ready = std::mem::take(&mut self.blocked.sigchld_deferred);
+        for dtid in ready {
+            info!("[step2] Re-admit deferred SIGCHLD for dtid {:?}", dtid);
+            self.blocked.sigchld_ready.insert(dtid);
+            self.run_queue.push_eager_io_repoll(dtid);
+        }
     }
 
     /// Keep scheduling inside an active vfork until the parent can continue.
@@ -2069,7 +2122,33 @@ impl Scheduler {
             ResourceID::FutexWait => Ok(()),
             ResourceID::TraceReplay => Ok(()),
             ResourceID::SchedYield => Ok(()),
-            ResourceID::InboundSignal(_) => Ok(()),
+
+            // A host-async SIGCHLD (a guest child process exited) is delivered to
+            // the parent at a moment decided by host timing. Committing that turn
+            // immediately makes the signal race whatever guest work was already
+            // runnable (e.g. a `make -jN` jobserver `pselect6` continuation),
+            // which diverges under `--strict --verify`. Defer it deterministic-
+            // work-first: park the parent out of the run queue and let
+            // `step2e_process_signal_deferred` re-admit it once no ordinary guest
+            // work remains, mirroring the `external_io_blockers` policy. Signals
+            // that the scheduler itself synthesizes deterministically (timers via
+            // `fire_alarm`) are never SIGCHLD and are unaffected.
+            ResourceID::InboundSignal(SigWrapper(sig)) => {
+                // `sigchld_ready` marks a parent step2e has already re-admitted;
+                // grant it now rather than deferring it a second time.
+                let already_readmitted = self.blocked.sigchld_ready.remove(&dettid);
+                if *sig == Signal::SIGCHLD
+                    && !already_readmitted
+                    && self.run_queue.has_runnable_besides(dettid)
+                {
+                    self.run_queue.undo_tentative_pop(); // Begun in step3.
+                    assert!(self.run_queue.remove_tid(dettid));
+                    self.blocked.sigchld_deferred.insert(dettid);
+                    Err(SkipTurn)
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 
