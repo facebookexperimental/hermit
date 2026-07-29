@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Hermetic Infra: tools for reproducible Linux execution.">
+  <title>Hermetic Infra: tools for reproducible Linux execution</title>
+  <link rel="stylesheet" href="site.css">
+</head>
+<body>
+  <header class="site-header">
+    <a class="wordmark" href="#top" aria-label="Hermetic Infra home">
+      <span class="wordmark-icon" aria-hidden="true">H//I</span>
+      <span>Hermetic Infra</span>
+    </a>
+    <nav aria-label="Main navigation">
+      <a href="#tools">Tools</a>
+      <a href="#compatibility">Compatibility</a>
+      <a href="#frontier">What works</a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">Open infrastructure for controlled execution</p>
+        <h1>Tools for reproducible<br><em>Linux execution.</em></h1>
+        <p class="lede">
+          Hermetic Infra combines deterministic container technology, a typed
+          instrumentation API, and lightweight binary patching. Control time,
+          randomness, and scheduling&mdash;then inspect what actually happened.
+        </p>
+        <div class="actions">
+          <a class="button primary" href="https://github.com/rrnewton/hermit">Explore Hermit</a>
+          <a class="button secondary" href="hermit/index.html">Read the Rust API</a>
+        </div>
+      </div>
+      <div class="hero-visual" aria-label="Reproducible execution diagram">
+        <div class="orbit orbit-outer"><span>observe</span></div>
+        <div class="orbit orbit-middle"><span>schedule</span></div>
+        <div class="orbit orbit-inner"><span>intercept</span></div>
+        <div class="core"><strong>Linux</strong><small>same input<br>same evolution</small></div>
+      </div>
+    </section>
+
+    <section class="score-strip" aria-label="Current compatibility highlights">
+      <div><strong>191/191</strong><span>ptrace strict L2 corpus</span></div>
+      <div><strong>70/89</strong><span>DBI-native Reverie tests</span></div>
+      <div><strong>22/23</strong><span>DBI at ptrace parity</span></div>
+      <div><strong>22/23</strong><span>KVM at ptrace parity</span></div>
+    </section>
+
+    <section id="tools" class="section tools">
+      <div class="section-heading">
+        <p class="eyebrow">The toolchain</p>
+        <h2>Three layers, one boundary.</h2>
+        <p>Use the complete stack or take the layer that fits your system.</p>
+      </div>
+      <div class="card-grid">
+        <article class="tool-card accent-coral">
+          <p class="card-index">01 / execute</p>
+          <h3>Hermit</h3>
+          <p>
+            Deterministic container technology for unmodified x86-64 Linux
+            programs. Hermit controls scheduling, time, random data, CPUID,
+            and selected filesystem observations.
+          </p>
+          <div class="card-links">
+            <a href="https://github.com/rrnewton/hermit">Source <span aria-hidden="true">&nearr;</span></a>
+            <a href="hermit/index.html">API docs <span aria-hidden="true">&rarr;</span></a>
+          </div>
+        </article>
+
+        <article class="tool-card accent-blue">
+          <p class="card-index">02 / instrument</p>
+          <h3>Reverie</h3>
+          <p>
+            A type-safe Rust instrumentation API for Linux. Tools subscribe to
+            typed syscall and processor events, then inspect, modify, suppress,
+            or inject operations across a guest process tree.
+          </p>
+          <div class="card-links">
+            <a href="https://github.com/rrnewton/reverie">Source and guide <span aria-hidden="true">&nearr;</span></a>
+          </div>
+        </article>
+
+        <article class="tool-card accent-gold">
+          <p class="card-index">03 / patch</p>
+          <h3>LiteInst</h3>
+          <p>
+            Online x86-64 instrumentation built around instruction punning.
+            The original C++ system established the technique; LiteInst2 is a
+            policy-free Rust port of its patching core.
+          </p>
+          <div class="card-links stacked">
+            <a href="https://github.com/iu-parfunc/liteinst">Original LiteInst <span aria-hidden="true">&nearr;</span></a>
+            <a href="https://github.com/rrnewton/liteinst2">LiteInst2 Rust port <span aria-hidden="true">&nearr;</span></a>
+            <a href="https://doi.org/10.1145/2908080.2908084">PLDI '16 &mdash; Living on the edge <span aria-hidden="true">&nearr;</span></a>
+            <a href="https://doi.org/10.1145/3062341.3062344">PLDI '17 &mdash; Instruction punning <span aria-hidden="true">&nearr;</span></a>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section id="compatibility" class="section compatibility">
+      <div class="section-heading split-heading">
+        <div>
+          <p class="eyebrow">Measured, not implied</p>
+          <h2>Compatibility envelope</h2>
+        </div>
+        <p>
+          Backend-local repeatability and ptrace parity answer different
+          questions. These checked-in ratchets keep them separate.
+        </p>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">Backend</th>
+              <th scope="col">Backend-local / compatibility</th>
+              <th scope="col">Ptrace-parity contracts</th>
+              <th scope="col">Proven maturity</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th scope="row">ptrace <span class="tag reference">reference</span></th>
+              <td><strong>191/191</strong> strict L2; <strong>139</strong> record/replay</td>
+              <td><strong>23/23</strong> contracts</td>
+              <td><strong>B2.1</strong></td>
+            </tr>
+            <tr>
+              <th scope="row">DBI</th>
+              <td><strong>70/89</strong> Reverie-native tests</td>
+              <td><strong>22/23</strong> contracts</td>
+              <td><strong>B2</strong></td>
+            </tr>
+            <tr>
+              <th scope="row">KVM</th>
+              <td><span class="todo">TODO: publish native-suite denominator</span></td>
+              <td><strong>22/23</strong> contracts</td>
+              <td><strong>B2</strong></td>
+            </tr>
+            <tr>
+              <th scope="row">SaBRe</th>
+              <td><strong>198/198</strong> compatibility rows</td>
+              <td><span class="todo">TODO: add to 23-pair matrix</span></td>
+              <td><strong>B2</strong></td>
+            </tr>
+            <tr>
+              <th scope="row">LiteInst</th>
+              <td><span class="todo">TODO: publish native-suite denominator</span></td>
+              <td><span class="todo">TODO: add to 23-pair matrix</span></td>
+              <td><span class="todo">TODO: not assigned in current snapshot</span></td>
+            </tr>
+            <tr>
+              <th scope="row">e9patch</th>
+              <td><strong>155</strong> classified rows; <span class="todo">pass count TODO</span></td>
+              <td><span class="todo">TODO: add to 23-pair matrix</span></td>
+              <td><span class="todo">TODO: not assigned in current snapshot</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="evidence-links">
+        <span>Sources:</span>
+        <a href="https://github.com/rrnewton/hermit/blob/main/validate.sh">compatibility ratchets</a>
+        <a href="https://github.com/rrnewton/hermit/tree/main/tests/backend-parity">parity matrix</a>
+        <a href="https://github.com/rrnewton/hermit/issues/1087">maturity definitions and evidence snapshot</a>
+      </div>
+
+      <div class="maturity-grid" aria-label="Backend maturity levels B1 through B4">
+        <div><strong>B1</strong><span>intercepts a documented syscall subset</span></div>
+        <div><strong>B2</strong><span>Detcore drives a real strict, verified workload</span></div>
+        <div><strong>B3</strong><span>&ge;50% of the full frozen ptrace corpus, after B2.4</span></div>
+        <div><strong>B4</strong><span>100% parity across every supported backend</span></div>
+      </div>
+      <p class="boundary-note">
+        The maturity model is cumulative. The current evidence snapshot proves
+        no B3 or B4 backend; small parity matrices are diagnostics, not a
+        substitute for the full frozen corpus.
+      </p>
+    </section>
+
+    <section id="frontier" class="section frontier">
+      <div class="section-heading">
+        <p class="eyebrow">What works now</p>
+        <h2>From a process to a kernel.</h2>
+        <p>Frontier demonstrations extend the same control loop to systems workloads.</p>
+      </div>
+      <div class="frontier-grid">
+        <a class="frontier-card" href="https://github.com/rrnewton/dev-hermit/blob/main/demos/WALKTHROUGH.md#demo-5-boot-once-and-store-the-linux-snapshot">
+          <span class="frontier-number">05</span>
+          <h3>Boot Linux under QEMU</h3>
+          <p>Boot once under Hermit and save a reusable live snapshot with deterministic instruction-derived time.</p>
+          <span class="text-link">Open the walkthrough &nearr;</span>
+        </a>
+        <a class="frontier-card" href="https://github.com/rrnewton/dev-hermit/tree/main/experiments/btrfs_userspace_archeology_demo08_20260728">
+          <span class="frontier-number">btrfs</span>
+          <h3>Exercise filesystem logic</h3>
+          <p>Reproduce a historical btrfs-progs userspace bug with pinned buggy/fixed revisions and byte-stable transcripts.</p>
+          <span class="text-link">Inspect the experiment &nearr;</span>
+        </a>
+        <a class="frontier-card" href="https://github.com/rrnewton/dev-hermit/blob/main/demos/WALKTHROUGH.md#demo-7-read-advance-and-read-again">
+          <span class="frontier-number">07</span>
+          <h3>Read the kernel with drgn</h3>
+          <p>Read a stopped guest task list, advance by a fixed budget, read again, and reproduce the same state diff.</p>
+          <span class="text-link">Open the walkthrough &nearr;</span>
+        </a>
+      </div>
+      <p class="boundary-note wide">
+        Boundary: these are named, reproducible demonstrations&mdash;not a claim
+        that every Linux kernel, device model, filesystem race, or arbitrary
+        binary is already supported. Each linked artifact records its own
+        prerequisites and oracle.
+      </p>
+    </section>
+  </main>
+
+  <footer>
+    <div>
+      <strong>Hermetic Infra</strong>
+      <span>An initial project sketch for reproducible Linux execution.</span>
+    </div>
+    <a href="https://github.com/rrnewton/hermit/tree/main/docs/site">View this page's source &nearr;</a>
+  </footer>
+</body>
+</html>
