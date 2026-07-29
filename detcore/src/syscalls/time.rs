@@ -164,8 +164,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Resources {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-1151)
-        let epoch = guest.thread_state_mut().take_pending_chaos_epoch();
-        let resource = ResourceID::PriorityChangePoint(new_priority, change_time, epoch);
+        let epochs = guest.thread_state_mut().take_pending_chaos_epochs();
+        let rcbs = guest.thread_state().committed_clock_value;
+        let resource = ResourceID::PriorityChangePoint(new_priority, change_time, rcbs, epochs);
         guest.thread_state().mk_request(resource, Permission::W)
     }
 

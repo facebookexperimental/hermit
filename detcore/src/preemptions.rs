@@ -71,6 +71,7 @@ impl PreemptionRecord {
     pub fn strip_contents(mut self) -> Self {
         for history in self.per_thread.values_mut() {
             history.prio_changes = Vec::new();
+            history.preemption_rcbs = Vec::new();
             history.chaos_epochs = Vec::new();
             history.final_prio = 1000;
         }
@@ -134,6 +135,7 @@ impl PreemptionRecord {
                 ThreadHistory {
                     final_prio: DEFAULT_PRIORITY,
                     prio_changes: Vec::new(),
+                    preemption_rcbs: Vec::new(),
                     chaos_epochs: Vec::new(),
                 }
             } else {
@@ -158,6 +160,7 @@ impl PreemptionRecord {
                 ThreadHistory {
                     final_prio,
                     prio_changes,
+                    preemption_rcbs: Vec::new(),
                     chaos_epochs: Vec::new(),
                 }
             };
@@ -222,6 +225,26 @@ impl PreemptionRecord {
                     }
                     time_last = Some(*ns);
                 }
+            }
+            if !history.preemption_rcbs.is_empty()
+                && history.preemption_rcbs.len() != history.prio_changes.len()
+            {
+                return Err(format!(
+                    "thread {} has {} preemption times but {} RCB targets",
+                    tid,
+                    history.prio_changes.len(),
+                    history.preemption_rcbs.len()
+                ));
+            }
+            if history
+                .preemption_rcbs
+                .windows(2)
+                .any(|pair| pair[1] < pair[0])
+            {
+                return Err(format!(
+                    "preemption RCB targets failed to increase for thread {}",
+                    tid
+                ));
             }
             let mut transition_last = None;
             let mut epoch_last = None;
@@ -321,6 +344,9 @@ impl PreemptionRecord {
                 // There were prio changes for at least one of the threads, remove that
                 // preemption as the one to drop
                 let removed_prio = thread_history.prio_changes.pop().unwrap().1;
+                if !thread_history.preemption_rcbs.is_empty() {
+                    thread_history.preemption_rcbs.pop();
+                }
                 thread_history.final_prio = removed_prio;
             } else {
                 // There were no prio changes for any threads, so just remove the last
@@ -354,6 +380,14 @@ pub struct ThreadHistory {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
+    /// Exact per-thread PMU RCB target for each matching priority change. Empty
+    /// in older JSON artifacts, which fall back to logical-time replay.
+    // `ThreadHistory` crosses a non-self-describing bincode RPC; never skip it.
+    #[serde(default)]
+    preemption_rcbs: Vec<u64>,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
     /// Exact per-thread slowdown transitions. Empty artifacts from older Hermit
     /// versions remain wire-compatible when read through Serde's default.
     // `ThreadHistory` also crosses Reverie's non-self-describing bincode RPC,
@@ -368,6 +402,7 @@ impl ThreadHistory {
         ThreadHistory {
             final_prio: DEFAULT_PRIORITY,
             prio_changes: Vec::new(),
+            preemption_rcbs: Vec::new(),
             chaos_epochs: Vec::new(),
         }
     }
@@ -385,6 +420,18 @@ impl ThreadHistory {
     #[cfg(test)]
     pub(crate) fn with_chaos_epochs(mut self, chaos_epochs: Vec<ChaosEpochTransition>) -> Self {
         self.chaos_epochs = chaos_epochs;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_prio_changes(mut self, prio_changes: Vec<(LogicalTime, Priority)>) -> Self {
+        self.prio_changes = prio_changes;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_preemption_rcbs(mut self, preemption_rcbs: Vec<u64>) -> Self {
+        self.preemption_rcbs = preemption_rcbs;
         self
     }
 
@@ -469,6 +516,21 @@ impl ThreadHistoryIterator {
     pub fn has_chaos_epochs(&self) -> bool {
         !self.full_history.chaos_epochs.is_empty()
     }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    /// Return the next recorded logical boundary and its exact RCB target when
+    /// the artifact was produced by a version that records one.
+    pub fn next_with_rcbs(&mut self) -> Option<(LogicalTime, Priority, Option<u64>)> {
+        let ix = self.ix;
+        self.next().map(|(time, priority)| {
+            (
+                time,
+                priority,
+                self.full_history.preemption_rcbs.get(ix).copied(),
+            )
+        })
+    }
 }
 
 impl Iterator for ThreadHistoryIterator {
@@ -550,12 +612,12 @@ mod tests {
         pw.register_thread(tid1, 1000);
         pw.register_thread(tid2, 1000);
 
-        pw.insert_reprioritization(tid1, LogicalTime::from_nanos(3), 1000, 3);
-        pw.insert_reprioritization(tid1, LogicalTime::from_nanos(30), 3, 30);
-        pw.insert_reprioritization(tid1, LogicalTime::from_nanos(300), 30, 300);
-        pw.insert_reprioritization(tid2, LogicalTime::from_nanos(2), 1000, 2);
-        pw.insert_reprioritization(tid2, LogicalTime::from_nanos(20), 2, 20);
-        pw.insert_reprioritization(tid2, LogicalTime::from_nanos(200), 20, 200);
+        pw.insert_reprioritization(tid1, LogicalTime::from_nanos(3), 3, 1000, 3);
+        pw.insert_reprioritization(tid1, LogicalTime::from_nanos(30), 30, 3, 30);
+        pw.insert_reprioritization(tid1, LogicalTime::from_nanos(300), 300, 30, 300);
+        pw.insert_reprioritization(tid2, LogicalTime::from_nanos(2), 2, 1000, 2);
+        pw.insert_reprioritization(tid2, LogicalTime::from_nanos(20), 20, 2, 20);
+        pw.insert_reprioritization(tid2, LogicalTime::from_nanos(200), 200, 20, 200);
 
         // First, round trip through a pretty-printed string
         // ------------------------------------------------
@@ -573,6 +635,16 @@ mod tests {
         let th2 = reader.extract_thread_record(&tid2).unwrap();
         assert_eq!(th1.final_prio, 300);
         assert_eq!(th2.final_prio, 200);
+
+        let mut exact = th1.clone().into_iter();
+        assert_eq!(
+            exact.next_with_rcbs(),
+            Some((LogicalTime::from_nanos(3), 1000, Some(3)))
+        );
+        assert_eq!(
+            exact.next_with_rcbs(),
+            Some((LogicalTime::from_nanos(30), 3, Some(30)))
+        );
 
         let it1 = th1.into_iter();
         let it2 = th2.into_iter();
@@ -816,6 +888,7 @@ impl PreemptionWriter {
                 ThreadHistory {
                     final_prio: prio,
                     prio_changes: Vec::new(),
+                    preemption_rcbs: Vec::new(),
                     chaos_epochs: Vec::new(),
                 },
             )
@@ -837,6 +910,7 @@ impl PreemptionWriter {
         &mut self,
         tid: DetTid,
         time: LogicalTime,
+        rcbs: u64,
         prior_prio: Priority,
         next_prio: Priority,
     ) {
@@ -852,6 +926,7 @@ impl PreemptionWriter {
             assert!(&time > last);
         }
         history.prio_changes.push((time, prior_prio));
+        history.preemption_rcbs.push(rcbs);
         history.final_prio = next_prio;
     }
 

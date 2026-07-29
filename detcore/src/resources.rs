@@ -259,7 +259,7 @@ pub enum ResourceID {
     /// Also includes the local time at which the guest observed the preemption point.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
-    PriorityChangePoint(u64, LogicalTime, Option<ChaosEpochTransition>),
+    PriorityChangePoint(u64, LogicalTime, u64, Vec<ChaosEpochTransition>),
 
     /// A physical signal has been received by the thread, request to continue delivering it and
     /// invoking the signal handler as the next thing to run.

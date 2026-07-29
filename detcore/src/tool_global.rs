@@ -1090,15 +1090,15 @@ impl GlobalState {
         detpid: DetPid,
         mm: MmId,
         timeslice_stats: TimesliceStats,
-        chaos_epoch: Option<ChaosEpochTransition>,
+        chaos_epochs: Vec<ChaosEpochTransition>,
     ) {
         // Invariant: will only be called when sequentialize-threads is on.
         assert!(self.cfg.sequentialize_threads);
         let mut sched = self.sched.lock().unwrap();
-        if let Some(transition) = chaos_epoch
-            && let Some(writer) = &mut sched.preemption_writer
-        {
-            writer.insert_chaos_epoch(dettid, transition);
+        if let Some(writer) = &mut sched.preemption_writer {
+            for transition in chaos_epochs {
+                writer.insert_chaos_epoch(dettid, transition);
+            }
         }
         sched.record_timeslice_stats(dettid, timeslice_stats);
         sched.logically_kill_thread(&dettid, &detpid, mm);
@@ -1447,7 +1447,7 @@ pub enum GlobalRequest {
         DetPid,
         MmId,
         TimesliceStats,
-        Option<ChaosEpochTransition>,
+        Vec<ChaosEpochTransition>,
     ),
 
     /// Notify scheduler before/after futex action.
@@ -1833,7 +1833,7 @@ pub(crate) struct ThreadDeregistration {
     pub(crate) detpid: DetPid,
     pub(crate) mm: MmId,
     pub(crate) timeslice_stats: TimesliceStats,
-    pub(crate) chaos_epoch: Option<ChaosEpochTransition>,
+    pub(crate) chaos_epochs: Vec<ChaosEpochTransition>,
 }
 
 /// Remove the thread from the scheduler.
@@ -1859,7 +1859,7 @@ pub(crate) async fn deregister_thread<R>(
                     thread.detpid,
                     thread.mm,
                     thread.timeslice_stats,
-                    thread.chaos_epoch,
+                    thread.chaos_epochs,
                 ),
             ))
             .await;

@@ -1064,7 +1064,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             let resource = ResourceID::PriorityChangePoint(
                 FIRST_PRIORITY,
                 guest.thread_state().thread_logical_time.as_nanos(),
-                None,
+                guest.thread_state().committed_clock_value,
+                Vec::new(),
             );
             let req = guest.thread_state().mk_request(resource, Permission::W);
             resource_request(guest, req).await;

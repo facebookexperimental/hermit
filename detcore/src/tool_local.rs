@@ -1210,6 +1210,13 @@ pub struct ThreadState<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
+    /// Exact per-thread PMU RCB target for the active preemption-replay slice.
+    /// `None` selects the legacy logical-time deadline path.
+    #[serde(default)]
+    pub replay_rcb_end: Option<u64>,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
     /// Deterministic chaos epoch this thread was in at its last `next_timeslice`.
     /// Used only to detect epoch transitions for `CHAOSEPOCH` logging; the epoch
     /// itself is recomputed each slice from `thread_logical_time`. Sentinel
@@ -1231,9 +1238,9 @@ pub struct ThreadState<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
-    /// Transition waiting to be committed into the preemption artifact.
+    /// Transitions waiting to be committed into the preemption artifact.
     #[serde(default)]
-    pub pending_chaos_epoch: Option<ChaosEpochTransition>,
+    pub pending_chaos_epochs: Vec<ChaosEpochTransition>,
 
     /// Absolute deadline enforced by the PMU-backed `--max-timeslice` timer. This is separate from
     /// `end_of_timeslice` so syscall-heavy workloads can use a shorter, cheap target deadline.
@@ -1273,6 +1280,7 @@ impl<T> std::fmt::Debug for ThreadState<T> {
             .field("thread_logical_time", &self.thread_logical_time)
             .field("committed_clock_value", &self.committed_clock_value)
             .field("end_of_timeslice", &self.end_of_timeslice)
+            .field("replay_rcb_end", &self.replay_rcb_end)
             .field("chaos_epoch", &self.chaos_epoch)
             .field("chaos_slowdown_factor", &self.chaos_slowdown_factor)
             .field("chaos_slowdown_active", &self.chaos_slowdown_active)
@@ -1538,6 +1546,7 @@ impl<T> ThreadState<T> {
             thread_logical_time,
             committed_clock_value: 0,
             end_of_timeslice: None, // Temporary/bogus.
+            replay_rcb_end: None,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-1151)
             chaos_epoch: chaos_epoch_sentinel(),
@@ -1545,7 +1554,7 @@ impl<T> ThreadState<T> {
             // TODO-HUMAN-REVIEW(PR-1151)
             chaos_slowdown_factor: RcbTimeMultiplier::ONE,
             chaos_slowdown_active: false,
-            pending_chaos_epoch: None,
+            pending_chaos_epochs: Vec::new(),
             max_timeslice_end: None,
             last_rcb_timer: None,
             last_rcb_timer_is_max: false,
@@ -1722,6 +1731,9 @@ impl<T> ThreadState<T> {
 
     /// Whether this thread has consumed its current logical timeslice.
     pub(crate) fn timeslice_expired(&self) -> bool {
+        if let Some(replay_rcb_end) = self.replay_rcb_end {
+            return self.committed_clock_value >= replay_rcb_end;
+        }
         let current_time = self.thread_logical_time.as_nanos();
         self.end_of_timeslice
             .is_some_and(|end_of_timeslice| current_time >= end_of_timeslice)
@@ -1740,8 +1752,8 @@ impl<T> ThreadState<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
-    pub(crate) fn take_pending_chaos_epoch(&mut self) -> Option<ChaosEpochTransition> {
-        self.pending_chaos_epoch.take()
+    pub(crate) fn take_pending_chaos_epochs(&mut self) -> Vec<ChaosEpochTransition> {
+        std::mem::take(&mut self.pending_chaos_epochs)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1750,7 +1762,9 @@ impl<T> ThreadState<T> {
         self.chaos_epoch = transition.epoch;
         self.chaos_slowdown_factor = transition.factor;
         self.chaos_slowdown_active = true;
-        self.pending_chaos_epoch = record.then_some(transition);
+        if record {
+            self.pending_chaos_epochs.push(transition);
+        }
         detlog!(
             "[dtid {}] CHAOSEPOCH => epoch = {}, factor = {}, logical_time = {}",
             self.dettid,
@@ -1784,10 +1798,17 @@ impl<T> ThreadState<T> {
                 .as_ref()
                 .is_some_and(ThreadHistoryIterator::has_chaos_epochs);
             if replay_has_epochs {
+                // Precise PMU replay deliberately checks in up to one RCB
+                // before the recorded logical boundary. The new slice still
+                // begins at that recorded boundary, so install its factor
+                // against the prior slice's exact target rather than the
+                // slightly-early observed clock. Otherwise a short epoch can
+                // be skipped and the following RCBs receive the wrong weight.
+                let transition_time = self.end_of_timeslice.unwrap_or(current_ns);
                 let transition = self
                     .preemption_points
                     .as_mut()
-                    .and_then(|history| history.advance_chaos_epoch(current_ns));
+                    .and_then(|history| history.advance_chaos_epoch(transition_time));
                 if let Some(transition) = transition {
                     self.install_chaos_epoch(transition, false);
                 }
@@ -1818,10 +1839,11 @@ impl<T> ThreadState<T> {
             } else {
                 self.chaos_slowdown_factor = RcbTimeMultiplier::ONE;
                 self.chaos_slowdown_active = false;
-                self.pending_chaos_epoch = None;
+                self.pending_chaos_epochs.clear();
             }
 
             let mut result = None;
+            self.replay_rcb_end = None;
             let replay_controls_deadline =
                 self.preemption_points.is_some() || cfg.replay_schedule_from.is_some();
 
@@ -1829,7 +1851,7 @@ impl<T> ThreadState<T> {
             if let Some(thi) = &mut self.preemption_points {
                 if self.stats.last_recorded_slice.is_none() {
                     // We have not tapped out the recording yet.
-                    if let Some((end_time, prio)) = thi.next() {
+                    if let Some((end_time, prio, replay_rcb_end)) = thi.next_with_rcbs() {
                         debug!(
                             "[dtid {}] next timeslice (T{}), set by recording to {:?} (current {}), priority {}",
                             self.dettid,
@@ -1838,13 +1860,25 @@ impl<T> ThreadState<T> {
                             current_ns,
                             prio
                         );
-                        if end_time <= current_ns {
+                        let current_rcbs = self.committed_clock_value;
+                        if let Some(target_rcbs) = replay_rcb_end
+                            && target_rcbs < current_rcbs
+                        {
+                            panic!(
+                                "Cannot set RCB end of timeslice to {} for thread {}, when current RCB count is already {}.",
+                                target_rcbs, self.dettid, current_rcbs
+                            )
+                        }
+                        let exact_deadline_is_now =
+                            replay_rcb_end.is_some_and(|target| target == current_rcbs);
+                        if end_time <= current_ns && !exact_deadline_is_now {
                             panic!(
                                 "Cannot set end of timeslice to {} for thread {}, when current thread logical time is already {}.",
                                 end_time, self.dettid, current_ns
                             )
                         }
                         self.end_of_timeslice = Some(end_time);
+                        self.replay_rcb_end = replay_rcb_end;
                         result = Some(prio);
                     } else {
                         let max = LogicalTime::MAX;
@@ -1983,6 +2017,7 @@ impl<T> ThreadState<T> {
             result
         } else {
             self.end_of_timeslice = None;
+            self.replay_rcb_end = None;
             self.max_timeslice_end = None;
             self.last_rcb_timer = None;
             self.last_rcb_timer_is_max = false;
@@ -2025,6 +2060,7 @@ mod timeslice_tests {
     use std::num::NonZeroU64;
 
     use super::*;
+    use crate::DEFAULT_PRIORITY;
     use crate::preemptions::ThreadHistory;
 
     #[test]
@@ -2306,7 +2342,7 @@ mod timeslice_tests {
         };
         let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
         state.next_timeslice(&config);
-        let first = state.take_pending_chaos_epoch().unwrap();
+        let first = state.take_pending_chaos_epochs().pop().unwrap();
         assert_eq!(first.epoch, 0);
         assert_eq!(state.chaos_epoch, 0);
 
@@ -2316,7 +2352,7 @@ mod timeslice_tests {
         state.next_timeslice(&config);
         assert_eq!(state.chaos_epoch, 0);
         assert_eq!(state.chaos_slowdown_factor, first.factor);
-        assert_eq!(state.take_pending_chaos_epoch(), None);
+        assert!(state.take_pending_chaos_epochs().is_empty());
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2334,7 +2370,7 @@ mod timeslice_tests {
         let tid = DetPid::from_raw(5);
         let mut state = ThreadState::new(tid, &config, ());
         state.next_timeslice(&config);
-        let first = state.take_pending_chaos_epoch().unwrap();
+        let first = state.pending_chaos_epochs[0];
 
         state
             .thread_logical_time
@@ -2344,7 +2380,10 @@ mod timeslice_tests {
         assert!(expected_epoch > 0);
 
         state.next_timeslice(&config);
-        let redraw = state.take_pending_chaos_epoch().unwrap();
+        let transitions = state.take_pending_chaos_epochs();
+        assert_eq!(transitions.len(), 2);
+        assert_eq!(transitions[0], first);
+        let redraw = transitions[1];
         assert_eq!(redraw.epoch, expected_epoch);
         assert_eq!(
             redraw.factor,
@@ -2384,7 +2423,94 @@ mod timeslice_tests {
         assert!(state.chaos_slowdown_active);
         assert_eq!(state.chaos_epoch, transition.epoch);
         assert_eq!(state.chaos_slowdown_factor, transition.factor);
-        assert_eq!(state.take_pending_chaos_epoch(), None);
+        assert!(state.take_pending_chaos_epochs().is_empty());
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    #[test]
+    fn replay_installs_boundary_epoch_when_pmu_checks_in_early() {
+        let config = Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+        let now = state.thread_logical_time.as_nanos();
+        let first = ChaosEpochTransition {
+            logical_time: now,
+            epoch: 0,
+            factor: RcbTimeMultiplier::from_f64(2.0),
+        };
+        let second = ChaosEpochTransition {
+            logical_time: now + Duration::from_nanos(100),
+            epoch: 1,
+            factor: RcbTimeMultiplier::from_f64(3.0),
+        };
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![
+                (now + Duration::from_nanos(100), DEFAULT_PRIORITY),
+                (now + Duration::from_nanos(200), DEFAULT_PRIORITY),
+            ])
+            .with_preemption_rcbs(vec![4, 8])
+            .with_chaos_epochs(vec![first, second]);
+        state.preemption_points = Some(history.into_iter());
+
+        state.next_timeslice(&config);
+        assert_eq!(state.chaos_slowdown_factor, first.factor);
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(now + Duration::from_nanos(100))
+        );
+
+        // Four 2x RCBs advance to 80ns: within one RCB of the exact 100ns
+        // boundary, matching the early check-in path in post_handler_hook.
+        state
+            .thread_logical_time
+            .add_rcbs_with_multiplier(4, first.factor);
+        state.committed_clock_value = 4;
+        assert!(state.timeslice_expired());
+        state.next_timeslice(&config);
+
+        assert_eq!(
+            state.thread_logical_time.as_nanos(),
+            now + Duration::from_nanos(80)
+        );
+        assert_eq!(state.chaos_epoch, second.epoch);
+        assert_eq!(state.chaos_slowdown_factor, second.factor);
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(now + Duration::from_nanos(200))
+        );
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1151)
+    #[test]
+    fn replay_preserves_adjacent_zero_rcb_slices() {
+        let config = Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+        let now = state.thread_logical_time.as_nanos();
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![
+                (now + Duration::from_nanos(70), DEFAULT_PRIORITY),
+                (now + Duration::from_nanos(80), DEFAULT_PRIORITY),
+            ])
+            .with_preemption_rcbs(vec![4, 4]);
+        state.preemption_points = Some(history.into_iter());
+
+        state.next_timeslice(&config);
+        state.thread_logical_time.add_rcbs(4);
+        state.committed_clock_value = 4;
+        assert!(state.timeslice_expired());
+
+        state.next_timeslice(&config);
+        assert_eq!(state.replay_rcb_end, Some(4));
+        assert!(state.timeslice_expired());
     }
 
     #[test]
