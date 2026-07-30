@@ -19,6 +19,7 @@ mod error;
 mod event;
 mod event_stream;
 mod fd;
+pub mod happens_before;
 mod id;
 pub mod instruction_map;
 mod interp;
