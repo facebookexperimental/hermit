@@ -462,8 +462,13 @@ EOF
             printf '%s\n' 'all: result.txt' 'result.txt: input.txt'
             printf '\t@printf "make:42\\n" > result.txt\n'
         } >"$WORK_DIR/Makefile"
-        make --no-print-directory -s -C "$WORK_DIR"
-        make --no-print-directory -q -C "$WORK_DIR"
+        # These freshly-created inputs intentionally precede the missing
+        # target. Treat them as old after that first build so GNU make does not
+        # emit a host-timing-sensitive clock-skew diagnostic.
+        make --no-print-directory -s -C "$WORK_DIR" \
+            --old-file=Makefile --old-file=input.txt
+        make --no-print-directory -q -C "$WORK_DIR" \
+            --old-file=Makefile --old-file=input.txt --old-file=result.txt
         IFS= read -r result <"$WORK_DIR/result.txt"
         test "$result" = 'make:42'
         printf '%s\n' "$result"
