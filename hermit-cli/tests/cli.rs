@@ -525,19 +525,26 @@ fn run_dbi_verifies_simple_env_shebang() {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review ptrace verification warning delivery.
+// After pidfd_send_signal/pidfd_getfd were determinized, restart_syscall is the
+// lone remaining Unsupported syscall. Under ptrace it is consumed by reverie's
+// syscall-restart machinery before Detcore classification, so it never surfaces
+// as a guest aggregate "used but not yet supported" warning. The ptrace verify
+// path therefore emits zero such warnings for this fixture; the DBI backend
+// (which routes it through Detcore classification) still aggregates it, covered
+// by run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them.
 #[test]
-fn run_ptrace_verify_reemits_unsupported_syscall_warning() {
+fn run_ptrace_verify_emits_no_unsupported_syscall_warning() {
     let program = dbi_unsupported_syscall_guest()
         .to_str()
         .expect("unsupported-syscall guest path should be UTF-8");
     let args = ["--log", "info", "run", "--verify", "--", program];
     let output = hermit(&args);
     assert_success(&output, &args);
-    let warning = "syscalls pidfd_getfd used but not yet supported";
+    let warning = "used but not yet supported";
     assert_eq!(
         stderr(&output).matches(warning).count(),
-        1,
-        "verify did not re-emit exactly one aggregate warning:\n{}",
+        0,
+        "ptrace verify unexpectedly emitted an unsupported-syscall warning:\n{}",
         stderr(&output)
     );
 }
@@ -554,7 +561,7 @@ fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
     assert_success(&normal, &normal_args);
     assert_eq!(stdout(&normal), "dbi-unsupported-ok\n");
     let normal_stderr = stderr(&normal);
-    let warning = "syscalls pidfd_getfd used but not yet supported";
+    let warning = "syscalls restart_syscall used but not yet supported";
     assert_eq!(
         normal_stderr.matches(warning).count(),
         1,
@@ -601,7 +608,7 @@ fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         stderr(&strict)
     );
     assert!(
-        stderr(&strict).contains("unsupported syscall: pidfd_getfd"),
+        stderr(&strict).contains("unsupported syscall: restart_syscall"),
         "strict DBI failure omitted unsupported syscall:\n{}",
         stderr(&strict)
     );

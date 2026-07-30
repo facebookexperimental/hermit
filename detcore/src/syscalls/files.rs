@@ -2370,6 +2370,87 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(fd as i64)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1175): pidfd_send_signal(2) determinization.
+    /// Deliver a signal to the process referred to by a pidfd.
+    ///
+    /// `pidfd_send_signal(pidfd, sig, info, flags)` names its target by an open
+    /// kernel descriptor rather than a numeric PID. Unlike `kill(2)`, there is
+    /// therefore no host-PID/virtual-PID ambiguity for Detcore to resolve: the
+    /// pidfd was bound to one specific process at `pidfd_open` time. Signal
+    /// generation runs inside this thread's serialized scheduler turn, exactly
+    /// like `tgkill`/`tkill`/`rt_tgsigqueueinfo` (which also just forward through
+    /// record/replay), so forwarding the kernel call is deterministic by
+    /// construction. This handler adds deterministic argument validation ahead of
+    /// the forward: a descriptor that Detcore does not model as a pidfd fails
+    /// closed with `EBADF`, and the flags field the current kernel reserves is
+    /// required to be zero (`EINVAL` otherwise), so the guest-visible errno is
+    /// fixed and host-independent.
+    ///
+    /// `call` is the raw `Syscall::Other`; `pidfd`/`flags` are pre-extracted from
+    /// its arguments by the dispatcher.
+    pub async fn handle_pidfd_send_signal<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        pidfd: RawFd,
+        flags: u32,
+    ) -> Result<i64, Error> {
+        // The kernel currently reserves `flags`; a nonzero value is EINVAL.
+        if flags != 0 {
+            return Err(Errno::EINVAL.into());
+        }
+        // Fail closed unless Detcore models this descriptor as a pidfd. This also
+        // yields a deterministic EBADF for an unknown/closed descriptor.
+        let is_pidfd = guest
+            .thread_state()
+            .with_detfd(pidfd, |detfd| matches!(detfd.ty(), FdType::Pidfd))?;
+        if !is_pidfd {
+            return Err(Errno::EBADF.into());
+        }
+        Ok(self.record_or_replay(guest, call).await?)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1175): pidfd_getfd(2) determinization and the
+    // FdType of the duplicated descriptor.
+    /// Duplicate a descriptor from the process referred to by a pidfd.
+    ///
+    /// `pidfd_getfd(pidfd, targetfd, flags)` returns a fresh descriptor in the
+    /// caller that aliases `targetfd` in the target process. The source pidfd
+    /// names one specific process fixed at `pidfd_open` time, the returned
+    /// descriptor number is chosen through record/replay (so it is stable across
+    /// runs), and the operation executes inside this thread's serialized turn, so
+    /// the result is deterministic. Detcore fails closed with `EBADF` unless it
+    /// models the descriptor as a pidfd, and requires the kernel-reserved `flags`
+    /// to be zero (`EINVAL` otherwise). The duplicated descriptor is registered so
+    /// later `close`/`fcntl`/`dup` see it; Detcore cannot cheaply learn the source
+    /// descriptor's kind, so it is modeled as a regular, close-on-exec fd. This is
+    /// sufficient for descriptor lifecycle tracking; see the review tag above for
+    /// the type-inference limitation.
+    pub async fn handle_pidfd_getfd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        pidfd: RawFd,
+        flags: u32,
+    ) -> Result<i64, Error> {
+        if flags != 0 {
+            return Err(Errno::EINVAL.into());
+        }
+        let is_pidfd = guest
+            .thread_state()
+            .with_detfd(pidfd, |detfd| matches!(detfd.ty(), FdType::Pidfd))?;
+        if !is_pidfd {
+            return Err(Errno::EBADF.into());
+        }
+        let fd = self.record_or_replay(guest, call).await? as RawFd;
+        // pidfd_getfd always sets FD_CLOEXEC on the returned descriptor.
+        self.add_fd(guest, fd, OFlag::O_CLOEXEC, FdType::Regular)
+            .await?;
+        Ok(fd as i64)
+    }
+
     /// userfaultfd system call.
     pub async fn handle_userfaultfd<G: Guest<Self>>(
         &self,

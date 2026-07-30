@@ -18,12 +18,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-// pidfd_getfd remains Unsupported and exercises the aggregate warning. The
-// process-local get_robust_list query is a reviewed passthrough and ensures the
-// fixture also covers a classified call before returning. The invalid pidfd
-// probe and robust-list head are stable across repeat runs.
+// restart_syscall is the lone remaining Unsupported syscall and exercises the
+// aggregate warning. Invoked directly with no pending restart block, the kernel
+// deterministically returns -EINTR, so the probe is stable across repeat runs.
+// The process-local get_robust_list query is a reviewed passthrough and ensures
+// the fixture also covers a classified call before returning.
 static int call_unsupported(void) {
-  (void)syscall(SYS_pidfd_getfd, -1, 0, 0);
+  (void)syscall(SYS_restart_syscall);
   void *robust_head = NULL;
   size_t robust_len = 0;
   if (syscall(SYS_get_robust_list, 0, &robust_head, &robust_len) < 0) {

@@ -550,6 +550,16 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // registers the result as FdType::Pidfd before later fd operations.
         | Sysno::pidfd_open
         // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1175): pidfd_send_signal/pidfd_getfd operate on
+        // a pidfd that names one specific process fixed at pidfd_open time, so
+        // there is no numeric-PID ambiguity to resolve. Delivery/duplication runs
+        // inside the serialized scheduler turn (like tgkill), and the handlers add
+        // deterministic argument validation (EBADF for a non-pidfd descriptor,
+        // EINVAL for the kernel-reserved nonzero flags) before forwarding. Untyped
+        // (Syscall::Other) in the pinned Reverie, so dispatch on the Sysno.
+        | Sysno::pidfd_send_signal
+        | Sysno::pidfd_getfd
+        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#877): Canonicalize fresh kernel namespace inode
         // identities while preserving ordinary symlink behavior and errors.
         | Sysno::readlink
@@ -781,9 +791,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // --panic-on-unsupported-syscalls stops at the first use.
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed unsupported classifications.
-        Sysno::pidfd_getfd
-        | Sysno::pidfd_send_signal
-        | Sysno::restart_syscall
+        Sysno::restart_syscall
         => SyscallClassification::Unsupported,
         // ===== END UNSUPPORTED SYSCALLS =====
 
@@ -1266,7 +1274,10 @@ mod tests {
             }
         }
 
-        assert_eq!(counts, [281, 89, 3]);
+        // pidfd_send_signal and pidfd_getfd moved from Unsupported to Determinized
+        // (see handle_pidfd_send_signal / handle_pidfd_getfd), leaving only
+        // restart_syscall Unsupported.
+        assert_eq!(counts, [283, 89, 1]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1560,13 +1571,16 @@ mod tests {
     }
 
     #[test]
-    fn pidfd_open_is_determinized_while_cross_process_operations_remain_unsupported() {
-        assert_eq!(
-            classify_syscall(Sysno::pidfd_open),
-            SyscallClassification::Determinized
-        );
-        for sysno in [Sysno::pidfd_getfd, Sysno::pidfd_send_signal] {
-            assert_eq!(classify_syscall(sysno), SyscallClassification::Unsupported);
+    fn pidfd_family_is_determinized() {
+        // pidfd_send_signal and pidfd_getfd are now determinized alongside
+        // pidfd_open: the pidfd names a fixed process (no numeric-PID ambiguity),
+        // so the signal/getfd forward through the serialized turn deterministically.
+        for sysno in [
+            Sysno::pidfd_open,
+            Sysno::pidfd_getfd,
+            Sysno::pidfd_send_signal,
+        ] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }
     }
 
