@@ -87,7 +87,8 @@ use the section names above and identify trigger 4 explicitly.
 
 - `post-facto-human-review` is the single routing label for a PR awaiting the
   human's after-the-fact review. Apply it only for the four triggers above.
-- Never apply `pre-land-human-review`, and never alter `human-approved`.
+- Apply `pre-land-human-review` only when the owner explicitly requests it;
+  never infer or auto-apply it. Never alter `human-approved`.
 - The obsolete `human-review` and `post-facto-review` labels must not be used.
 
 New syscall support authored by a bot must carry both narrowly scoped audit
@@ -119,6 +120,18 @@ The human reviews landed changes after the fact (aided by the labels and code
 markers above). Corrections are made by **follow-up commits/PRs**, not by
 reverting the queue — fix forward. If a human review finds a real defect, open a
 fix PR that removes the relevant `// TODO-HUMAN-REVIEW` marker once addressed.
+
+## CONFIRM BEFORE CLOSING
+
+For a **KEY API / core-abstraction change** to the Reverie `Tool`, `Guest`,
+`Backend`, or interception model, loudly report the change and its implications
+to the owner. Do not close the corresponding task until the owner has discussed
+the API change.
+
+This is a task-closure gate, not an automatic pre-land gate: the post-facto
+landing default still applies after adversarial review and authoritative CI are
+green. Apply `pre-land-human-review` only on the owner's explicit request;
+never infer or auto-apply it from the nature of the change.
 
 ## Deactivation
 
