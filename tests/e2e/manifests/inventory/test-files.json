@@ -332,6 +332,18 @@
       "why": "tests/c/liteinst_advanced.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "path": "tests/c/liteinst_host_activation.c",
+      "disposition": "guest-fixture",
+      "runner": "hermit-cli/tests/liteinst_host_activation.rs",
+      "why": "tests/c/liteinst_host_activation.c is owned by hermit-cli/tests/liteinst_host_activation.rs: The Rust integration test compiles this activation-aware guest and asserts host-selected LiteInst registration and hook counters; it remains a guest fixture because a generic E2E manifest cannot build the selected runtime or verify controller-owned activation provenance."
+    },
+    {
+      "path": "tests/c/liteinst_inert_runtime.c",
+      "disposition": "guest-fixture",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/liteinst_inert_runtime.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this export-shaped but constructor-free DSO, selects the LiteInst backend, injects it as the runtime override, and asserts rejection before any activation claim; it remains a guest fixture because a generic manifest cannot express that build, injection, and fail-closed diagnostic contract."
+    },
+    {
       "path": "tests/c/lsm_get_self_attr_enosys.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",

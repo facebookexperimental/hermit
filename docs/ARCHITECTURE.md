@@ -63,12 +63,13 @@ operations. Detcore supplies the policy — what is emulated, transformed,
 ordered, recorded, or replayed. Keeping that seam clean is what makes more than
 one backend conceivable without rewriting the deterministic core.
 
-Four backend mechanisms sit at different points on the speed/completeness/
+Five backend mechanisms sit at different points on the speed/completeness/
 determinism curve:
 
 | Backend | Mechanism | Status | Trade-off |
 | --- | --- | --- | --- |
 | **ptrace** | seccomp-BPF `SECCOMP_RET_TRACE` + `PTRACE`, out-of-process tracer | Production; the only in-tree backend (`reverie-ptrace`) | Complete and strongly deterministic; per-event context-switch cost |
+| **LiteInst + ptrace** | Online hot-site patching with a ptrace-owned Tool and in-guest patch/helper DSO | Experimental hybrid | Keeps ptrace lifecycle/PMU correctness while replacing eligible repeated syscall traps; dynamic single-process/single-thread scope |
 | **DBI** (SaBRe / DynamoRIO style) | In-process binary rewriting / function hooking of syscall sites | Experimental / research | Low overhead; today it is a syscall-boundary interceptor, **not** a deterministic backend |
 | **KVM / SVM** | Run the guest inside a hardware VM and trap via VM-exits | Exploratory | Can trap instructions ptrace cannot (see CPUID below); heaviest isolation and integration cost |
 | **e9patch + ptrace** | Cached offline main-ELF rewriting followed by the ptrace Detcore runtime | Experimental hybrid | Exact coverage of e9tool-recovered candidate sites; raw random/TSX instructions remain unsupported even when mapped |
@@ -78,6 +79,15 @@ stops to an out-of-process tracer that holds all Detcore state. This is the
 backend the rest of this document describes. It is complete (it sees every
 subscribed event from every thread) and integrates with the PMU for RCB-based
 preemption, at the cost of a context switch per intercepted event.
+
+**LiteInst host hybrid.** Ptrace owns the sole Detcore Tool and GlobalTool from
+the initial exec, including PMU scheduling and CPUID/RDTSC handling. A preload
+DSO contains only LiteInst patch/helper state. The first eligible syscall site
+is validated by the tracer and may be patched; later invocations enter the
+trampoline but preserve the same ptrace-owned lifecycle. The current scope is
+dynamically linked, single-process, and single-threaded. Fork/thread creation
+fails closed, and exec remains unsupported until the replacement image can
+rebootstrap and revalidate the runtime.
 
 **e9patch hybrid.** The `e9patch` backend loads the cached instruction map for
 the main executable and invokes `e9tool -O0` with an exact file-offset matcher.

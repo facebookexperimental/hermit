@@ -104,30 +104,36 @@ For backwards compatibility, `run` still accepts `--backend` after the
 subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
 
 Backend selection fails closed. Hermit never substitutes ptrace after an
-explicit backend request. LiteInst is an experimental in-process Detcore
-backend for dynamically linked Linux x86-64 guests:
+explicit backend request. LiteInst is an experimental ptrace-hosted hybrid for
+dynamically linked Linux x86-64 guests:
 
 ```bash
-cargo build -p hermit --bin hermit
-cargo build -p detcore-liteinst --lib
-hermit run --backend=liteinst --strict --verify -- /bin/echo hello
+./scripts/stage-liteinst-runtime.sh dev \
+  "$PWD/target/debug/libreverie_liteinst.so" \
+  "$PWD/target/liteinst-runtime-build"
+cargo build --locked -p hermit --bin hermit
+./target/debug/hermit run --backend=liteinst --strict --verify -- /bin/echo hello
 ```
 
-The Hermit-owned preload DSO installs `Detcore` as a generic Reverie `Tool`.
-The first invocation of a syscall site arrives through seccomp `SIGSYS`, where
-LiteInst installs an instruction-punning hook. Later invocations enter the
-LiteInst trampoline and `LiteinstGuest<Detcore>`; global Detcore state remains
-in the coordinator and is reached over the Reverie RPC transport.
+The ptrace host owns the sole generic Reverie `Detcore` Tool and GlobalTool.
+The standalone manifest enables and statically verifies the preload constructor;
+Hermit rejects non-runtime or constructor-free overrides before activation.
+The resulting Reverie preload DSO initializes only the LiteInst patch/helper
+side; it never installs another Tool in the guest. The host observes the first
+invocation of each eligible syscall site and installs an instruction-punning
+hook. Later invocations enter the LiteInst trampoline and return to the same
+ptrace-owned Detcore lifecycle.
 
 `--verify` runs the normal Detcore comparison over captured status, output,
 and deterministic scheduler logs, so a successful result is an L2 claim.
 Current support is limited to single-threaded, single-process guests. Thread
 clone, `fork`, and `vfork` fail closed with `EOPNOTSUPP`; `exec` is also
-unsupported because the inherited seccomp filter would outlive the preload
-runtime. RCB preemption and CPUID/RDTSC interception are not implemented.
+unsupported because runtime rebootstrap after image replacement is not yet
+implemented. RCB preemption and CPUID/RDTSC interception use the ptrace host
+and retain its PMU and CPU capability requirements.
 The default Hermit namespace path is supported; `--no-namespace` remains an
-explicit option for trusted guests. The in-process preload is experimental and
-continues to receive compatibility and lifecycle improvements.
+explicit option for trusted guests. The in-guest patch runtime is experimental
+and continues to receive compatibility and lifecycle improvements.
 The release installation package supplies the DynamoRIO, SaBRe, LiteInst, and
 e9patch runtime artifacts. KVM requires read-write `/dev/kvm` access plus its
 guest-kernel Linux ABI.

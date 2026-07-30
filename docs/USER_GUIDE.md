@@ -160,11 +160,25 @@ subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
 
 Hermit detects whether the requested backend is integrated and available on
 the current host. It does not silently fall back to a different backend.
-LiteInst requires `libdetcore_liteinst.so` beside the Hermit executable. That
-DSO installs `Detcore` over `LiteinstGuest`; a coordinator-side
-`LiteinstBackend` owns global state and transports tool RPC over a Unix socket.
-The first syscall at each site traps through seccomp `SIGSYS`; subsequent calls
-use the installed LiteInst trampoline.
+LiteInst requires `libreverie_liteinst.so` beside the Hermit executable. That
+DSO initializes only the in-guest patch/helper runtime. The ptrace host owns the
+sole `Detcore` Tool and GlobalTool from the initial exec; it observes the first
+syscall at each site and installs a LiteInst trampoline for later invocations.
+There is no second in-guest Detcore instance or coordinator RPC Tool.
+
+Build and stage the constructor-enabled runtime with its locked standalone
+manifest before building Hermit:
+
+```bash
+./scripts/stage-liteinst-runtime.sh dev \
+  "$PWD/target/debug/libreverie_liteinst.so" \
+  "$PWD/target/liteinst-runtime-build"
+cargo build --locked -p hermit --bin hermit
+```
+
+Hermit verifies the DSO architecture, required exports, and preload constructor
+before activation; an arbitrary shared object or constructor-free runtime is
+rejected rather than silently falling back.
 
 LiteInst uses the normal Hermit run and verification paths. A successful
 `--strict --verify` run compares captured status/output and Detcore scheduler
@@ -172,13 +186,15 @@ logs and is therefore an L2 result. Verification currently supplies
 `/dev/null` as guest stdin. The supported execution scope is dynamically
 linked, single-threaded, single-process Linux x86-64 guests. Thread clone,
 `fork`, and `vfork` fail closed with `EOPNOTSUPP`, and `exec` remains
-unsupported. RCB timer delivery and CPUID/RDTSC interception are not yet
-implemented.
+unsupported because the patch runtime is not yet re-bootstrapped and
+revalidated after image replacement. PMU/RCB timer delivery, CPUID, RDTSC, and
+RDTSCP use the ptrace host path and therefore have the same host capability
+requirements as the normal ptrace backend.
 
 The default namespace, mount, and network setup is shared with Hermit's other
 backends; `--no-namespace` remains available for trusted guests. The preload
 runtime reserves `SIGSYS` in kernel-visible signal masks. This experimental
-in-process path is not a security boundary for intentionally hostile code.
+patch-helper path is not a security boundary for intentionally hostile code.
 The release installation package provides the DynamoRIO, SaBRe, LiteInst, and
 e9patch runtime artifacts. KVM requires read-write `/dev/kvm` access plus a
 guest-kernel ABI.

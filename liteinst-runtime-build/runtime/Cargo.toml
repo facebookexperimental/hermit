@@ -1,0 +1,8 @@
+[package]
+name = "hermit-liteinst-runtime-artifact"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+reverie-liteinst = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "4cee948e35ae5561f44f21be3a6e1bbc653058c0", default-features = false, features = ["preload-constructor"] }

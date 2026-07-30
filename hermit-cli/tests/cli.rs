@@ -29,6 +29,7 @@ static DBI_PRLIMIT_SELF_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBI_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBI_UNSUPPORTED_SYSCALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBI_SELF_SIGQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 fn hermit(args: &[&str]) -> Output {
@@ -55,6 +56,31 @@ fn hermit_with_stdin(args: &[&str], input: &[u8]) -> Output {
     child
         .wait_with_output()
         .unwrap_or_else(|error| panic!("failed to wait for hermit with {args:?}: {error}"))
+}
+
+fn liteinst_inert_runtime() -> &'static Path {
+    LITEINST_INERT_RUNTIME.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-inert-runtime");
+        fs::create_dir_all(&build_root).expect("failed to create inert runtime directory");
+        let runtime = build_root.join("libreverie_liteinst_inert.so");
+        let output = Command::new("cc")
+            .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/liteinst_inert_runtime.c"))
+            .arg("-o")
+            .arg(&runtime)
+            .output()
+            .expect("failed to compile inert LiteInst runtime fixture");
+        assert!(
+            output.status.success(),
+            "inert LiteInst fixture compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        runtime
+    })
 }
 
 fn dbi_mmap_guest() -> &'static Path {
@@ -678,7 +704,9 @@ fn run_liteinst_verifies_detcore_backend() {
     assert_eq!(stdout(&output), "liteinst-cli-ok\n");
     let stderr = stderr(&output);
     assert!(
-        stderr.contains("liteinst backend] Detcore Tool active"),
+        stderr.contains(
+            "liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
+        ),
         "{stderr}"
     );
     assert!(
@@ -686,9 +714,58 @@ fn run_liteinst_verifies_detcore_backend() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("LiteInst (reverie-liteinst LiteinstGuest<Detcore>)"),
+        stderr.contains(
+            "LiteInst host hybrid (reverie-liteinst patch runtime + ptrace Detcore Tool)"
+        ),
         "{stderr}"
     );
+}
+
+#[test]
+fn run_liteinst_rejects_a_non_runtime_override_before_activation_claim() {
+    let args = [
+        "run",
+        "--backend",
+        "liteinst",
+        "--strict",
+        "--",
+        "/bin/true",
+    ];
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .env("HERMIT_LITEINST_RUNTIME", "/bin/true")
+        .args(args)
+        .output()
+        .expect("failed to run Hermit with a false LiteInst runtime");
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = stderr(&output);
+    assert!(stderr.contains("missing required export"), "{stderr}");
+    assert!(!stderr.contains("activation verified"), "{stderr}");
+    assert!(!stderr.contains("Success: deterministic"), "{stderr}");
+}
+
+#[test]
+fn run_liteinst_rejects_an_inert_dso_before_activation_claim() {
+    let args = [
+        "run",
+        "--backend",
+        "liteinst",
+        "--strict",
+        "--",
+        "/bin/true",
+    ];
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .env("HERMIT_LITEINST_RUNTIME", liteinst_inert_runtime())
+        .args(args)
+        .output()
+        .expect("failed to run Hermit with an inert LiteInst runtime");
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("does not register reverie_liteinst_initialize as a preload constructor"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("activation verified"), "{stderr}");
+    assert!(!stderr.contains("Success: deterministic"), "{stderr}");
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED

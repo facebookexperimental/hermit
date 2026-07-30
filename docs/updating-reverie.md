@@ -15,10 +15,11 @@ build. As of this writing the deps are:
 - `hermit-cli/Cargo.toml`
 - `detcore/Cargo.toml`
 - `detcore-dbi/Cargo.toml`
-- `detcore-liteinst/Cargo.toml`
 - `detcore-model/Cargo.toml` — `reverie-syscalls`
 - `detcore-sabre/Cargo.toml`
 - `detcore/tests/testutils/Cargo.toml`
+- `hermit-install/Cargo.toml`
+- `liteinst-runtime-build/Cargo.toml` — isolated constructor-runtime build
 
 ## How to bump
 
@@ -41,6 +42,7 @@ build. As of this writing the deps are:
 
    ```bash
    with-proxy cargo update -p reverie   # refresh the lock for the new rev
+   with-proxy cargo update --manifest-path liteinst-runtime-build/Cargo.toml
    with-proxy cargo build --workspace
    ```
 
@@ -49,8 +51,9 @@ build. As of this writing the deps are:
 
 ## Notes
 
-- `Cargo.lock` is tracked. Commit its updated Reverie source entries with every
-  pin change.
+- `Cargo.lock` and `liteinst-runtime-build/Cargo.lock` are tracked. The runtime
+  builder is an isolated workspace, so update and commit both lockfiles with
+  every pin change.
 - To point at a fork instead of upstream (e.g. for the experimental
   `reverie-dbi` / `reverie-kvm` backends), change the `git =` URL as well as the
   `rev`, and keep all Reverie crates on the same source.

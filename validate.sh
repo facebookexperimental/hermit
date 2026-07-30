@@ -42,6 +42,7 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --sabre-compat-only         # gate the measured SaBRe matrix;
 #                                            # needs executable HERMIT_SABRE_BINARY
 #   ./validate.sh --e9patch-compat-only       # gate core + installed e9patch L2 apps
+#   ./validate.sh --liteinst-compat-only      # run the portable CI liteinst_strict test
 #   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
 #   ./validate.sh --portable-only               # no PMU/CPUID hardware required
 #   ./validate.sh --privileged-only             # PMU/CPUID-dependent tests only
@@ -82,6 +83,7 @@ PORTABLE_STRICT_PROBE_ARGS=0
 RR_COMPAT_ONLY=0
 SABRE_COMPAT_ONLY=0
 E9PATCH_COMPAT_ONLY=0
+LITEINST_COMPAT_ONLY=0
 QEMU_L2_ONLY=0
 PRIVILEGED_ONLY=0
 LABEL_PR=1
@@ -115,6 +117,7 @@ while [[ $# -gt 0 ]]; do
         --sabre-compat-only) SABRE_COMPAT_ONLY=1; shift ;;
         # TODO-HUMAN-REVIEW(PR-664): Review the focused e9patch compatibility CLI.
         --e9patch-compat-only) E9PATCH_COMPAT_ONLY=1; shift ;;
+        --liteinst-compat-only) LITEINST_COMPAT_ONLY=1; shift ;;
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
         --privileged-only) PRIVILEGED_ONLY=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
@@ -134,6 +137,7 @@ only_modes=0
 ((RR_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((SABRE_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((E9PATCH_COMPAT_ONLY == 1)) && ((only_modes += 1))
+((LITEINST_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((QEMU_L2_ONLY == 1)) && ((only_modes += 1))
 ((PRIVILEGED_ONLY == 1)) && ((only_modes += 1))
 if ((only_modes > 1)); then
@@ -151,6 +155,7 @@ VALIDATION_PROFILE=$VALIDATION_LEVEL
 ((RR_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="rr-compat-only"
 ((SABRE_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="sabre-compat-only"
 ((E9PATCH_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="e9patch-compat-only"
+((LITEINST_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="liteinst-compat-only"
 ((QEMU_L2_ONLY == 1)) && VALIDATION_PROFILE="qemu-l2-only"
 ((PRIVILEGED_ONLY == 1)) && VALIDATION_PROFILE="privileged-only"
 
@@ -164,6 +169,7 @@ case "$VALIDATION_PROFILE" in
     rr-compat-only) VALIDATION_ESTIMATE="about 5-65 minutes when healthy; fails fast on canary failure" ;;
     sabre-compat-only) VALIDATION_ESTIMATE="about 10-20 minutes" ;;
     e9patch-compat-only) VALIDATION_ESTIMATE="about 5-20 minutes" ;;
+    liteinst-compat-only) VALIDATION_ESTIMATE="about 5-15 minutes" ;;
     qemu-l2-only) VALIDATION_ESTIMATE="about 30-60 minutes" ;;
     privileged-only) VALIDATION_ESTIMATE="about 60-180 minutes" ;;
     envelope-only) VALIDATION_ESTIMATE="about 5 minutes" ;;
@@ -207,7 +213,7 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
 fi
 readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
 readonly STRICT_COMPAT_ONLY PORTABLE_STRICT_COMPAT_ONLY RR_COMPAT_ONLY SABRE_COMPAT_ONLY
-readonly E9PATCH_COMPAT_ONLY QEMU_L2_ONLY PRIVILEGED_ONLY
+readonly E9PATCH_COMPAT_ONLY LITEINST_COMPAT_ONLY QEMU_L2_ONLY PRIVILEGED_ONLY
 readonly VALIDATION_LEVEL VALIDATION_PROFILE
 
 SUPER_REPETITIONS=${SUPER_REPETITIONS:-20}
@@ -3207,6 +3213,25 @@ if ((STRICT_COMPAT_ONLY == 1)); then
         exit 1
     fi
     run_strict_compatibility_envelope
+    exit $?
+fi
+
+if ((LITEINST_COMPAT_ONLY == 1)); then
+    run_check_with_timeout 1200 "Build release Hermit for LiteInst compatibility" \
+        cargo build --release --locked -p hermit
+    if ((failures == 0)); then
+        run_check_with_timeout 900 "Build release LiteInst runtime" \
+            "$ROOT_DIR/scripts/stage-liteinst-runtime.sh" release \
+            "$ROOT_DIR/target/release/libreverie_liteinst.so" \
+            "$ROOT_DIR/target/liteinst-runtime-build-4cee948e"
+    fi
+    if ((failures == 0)); then
+        run_check_with_timeout 900 "Portable CI liteinst_strict" \
+            env HERMIT_LITEINST_TEST_BINARY="$ROOT_DIR/target/release/hermit" \
+            cargo test -p hermit --test liteinst_advanced -- --test-threads=1
+    fi
+    print_summary
+    ((failures == 0))
     exit $?
 fi
 
