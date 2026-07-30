@@ -395,7 +395,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let raw_timeout = match call.timeout() {
             Some(timeout) => {
-                let timeout: Timespec = guest.memory().read_value(timeout.cast())?;
+                let timeout: Timespec = guest.memory().read_value(timeout)?;
                 Some(timeout)
             }
             None => None,
@@ -485,12 +485,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let readfds = call.readfds().map(|_| stack.reserve::<libc::fd_set>());
         let writefds = call.writefds().map(|_| stack.reserve::<libc::fd_set>());
         let exceptfds = call.exceptfds().map(|_| stack.reserve::<libc::fd_set>());
-        let probe_timeout = stack
-            .push(Timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            })
-            .cast::<libc::timeval>();
+        // pselect6's timeout is a writable in-out kernel timespec, so the probe
+        // needs a mutable scratch cell (re-zeroed each iteration below to keep
+        // every probe a non-blocking poll).
+        let probe_timeout = stack.reserve::<Timespec>();
         // Carry the temporary signal mask on every zero-timeout probe so the kernel
         // applies it atomically: a pending, mask-unblocked signal makes the probe return
         // EINTR at a deterministic scheduler point. The probe's wrapper points at scratch
@@ -521,6 +519,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.write_pselect6_remaining(guest, call, deadline).await?;
                 return Err(Errno::EINTR.into());
             }
+            guest.memory().write_value(
+                probe_timeout,
+                &Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+            )?;
             write_pselect6_fd_set(guest, probe.readfds(), &original_readfds)?;
             write_pselect6_fd_set(guest, probe.writefds(), &original_writefds)?;
             write_pselect6_fd_set(guest, probe.exceptfds(), &original_exceptfds)?;
@@ -581,9 +586,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 tv_sec: (remaining / 1_000_000_000) as libc::time_t,
                 tv_nsec: (remaining % 1_000_000_000) as libc::c_long,
             };
-            // SAFETY: pselect6's timeout is a writable in-out kernel timespec even though
-            // reverie-syscalls exposes the ABI-compatible pointer as shared.
-            let timeout = unsafe { timeout.cast::<Timespec>().into_mut() };
+            // pselect6's timeout is a writable in-out kernel timespec; reverie-syscalls
+            // now types it as `AddrMut<Timespec>`, so the remaining time can be written
+            // back directly without an unsafe pointer cast.
             if let Err(error) = guest.memory().write_value(timeout, &remaining) {
                 // Linux preserves the pselect6 result when remaining-time copyout faults.
                 trace!(?error, "ignoring pselect6 timeout writeback failure");
