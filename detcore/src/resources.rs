@@ -286,6 +286,15 @@ pub enum ResourceID {
     /// Relinquish the current scheduler turn without changing the thread's
     /// persistent priority.
     SchedYield,
+
+    /// A guest thread checking in with the scheduler at a happens-before anchor
+    /// point, carrying the thread's running syscall count. The scheduler
+    /// consults the configured `HappensBeforeProgram`: it fires any anchors this
+    /// checkpoint reaches, and parks the thread (removing it from the run queue)
+    /// when the checkpoint is the AFTER endpoint of a Hard edge whose BEFORE
+    /// endpoint has not yet fired. The contained value is the post-increment
+    /// syscall count observed by the guest.
+    HappensBeforeCheckpoint(u64),
 }
 
 /// Permission to a device, which behaves like a predefined "inode".

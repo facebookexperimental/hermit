@@ -369,6 +369,25 @@ impl HappensBeforeProgram {
             matches!(a.position, Position::Rip { addr: None, .. }) && !a.location.is_empty()
         })
     }
+
+    /// True when any anchor addresses a [`Position::SyscallCount`]. The scheduler
+    /// only issues per-syscall happens-before checkpoints when this holds, so a
+    /// program made entirely of not-yet-enforced positions adds no per-syscall
+    /// overhead.
+    pub fn has_syscall_count_anchors(&self) -> bool {
+        self.anchors
+            .values()
+            .any(|a| matches!(a.position, Position::SyscallCount(_)))
+    }
+
+    /// Anchors whose position kind the current scheduler does not yet enforce
+    /// (everything other than [`Position::SyscallCount`]). Reported so a run does
+    /// not silently ignore an authored ordering constraint it cannot honor.
+    pub fn unenforced_positions(&self) -> impl Iterator<Item = &Anchor> {
+        self.anchors
+            .values()
+            .filter(|a| !matches!(a.position, Position::SyscallCount(_)))
+    }
 }
 
 // ================================================================================

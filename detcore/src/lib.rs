@@ -1471,6 +1471,28 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             thread_state.stats.syscall_count
         };
 
+        // Happens-before enforcement checkpoint. When the run carries a
+        // happens-before program with syscall-count anchors, every intercepted
+        // syscall checks in with the scheduler at its prehook, carrying this
+        // thread's running syscall count. The scheduler fires any anchor at
+        // `Position::SyscallCount(new_count)` on this thread and parks the thread
+        // (out of the run queue) when that anchor is the AFTER endpoint of a Hard
+        // edge whose BEFORE endpoint has not fired yet. This is the gate that
+        // makes an authored partial order reproduce a known race deterministically
+        // (see detcore-model `happens_before`). It requires sequentialized
+        // threads (enforced by the CLI) so the scheduler owns ordering.
+        if config
+            .happens_before
+            .as_ref()
+            .is_some_and(|p| p.has_syscall_count_anchors())
+        {
+            let request = guest.thread_state().mk_request(
+                ResourceID::HappensBeforeCheckpoint(new_count),
+                Permission::R,
+            );
+            resource_request(guest, request).await;
+        }
+
         let res = match classify_syscall(call.number()) {
             // Rseq is not type-safe in the pinned Reverie revision. Dispatch by Sysno so a
             // future typed representation preserves this explicit policy.

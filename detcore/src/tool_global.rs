@@ -1257,6 +1257,10 @@ impl GlobalState {
                     .add_child(parent_dettid, child_dettid, is_group_leader);
             }
 
+            // Record this thread in deterministic creation order so a
+            // happens-before anchor addressed by `spawn_ordinal` resolves to it.
+            sched.hb_note_spawn(child_dettid);
+
             if self.cfg.replay_schedule_from.is_none() {
                 // Give the thread an initial priority
                 let old_prio = sched.priorities.insert(child_dettid, initial_priority);
