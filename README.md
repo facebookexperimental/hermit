@@ -347,6 +347,8 @@ and licensing guidelines.
 - [e9patch Compatibility](docs/E9PATCH_COMPATIBILITY.md): measured application
   envelope, preprocessing classifications, and known limits.
 - [Error Catalog](docs/ERROR_CATALOG.md): errors, triggers, and remediations.
+- [Per-test Hermit Code Coverage](docs/HERMIT_CODE_COVERAGE.md): measure and
+  diff the Hermit/Detcore implementation paths exercised by a test.
 - [Examples](examples/README.md): small programs demonstrating controlled
   nondeterminism.
 - [License](LICENSE): BSD 3-Clause.
