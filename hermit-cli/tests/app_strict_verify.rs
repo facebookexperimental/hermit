@@ -31,21 +31,21 @@
 //!
 //! - **L2 (bitwise-identical repeat run, `--strict --verify`):** compiled Go
 //!   programs (a hello world and a goroutine workload) and the JVM running
-//!   compiled classes. The startup-only `java Hello` and `Threads` cases run
-//!   under the `--max-timeslice=disabled` helper, while the small JIT+runtime
-//!   programs (`ThreadCounter`, `GcStress`, `JitHotLoop`, `HashMapString`) run
-//!   under `assert_l2_jvm_under_strict_verify` with Hermit's default RCB
-//!   preemption. The managed runtimes' scheduling, GC, JIT compilation, and
-//!   static initialization are fully determinized.
+//!   compiled classes. Every JVM case — the `java Hello` and `Threads`
+//!   baselines and the small JIT+runtime programs (`ThreadCounter`, `GcStress`,
+//!   `JitHotLoop`, `HashMapString`) — runs under
+//!   `assert_l2_jvm_under_strict_verify` with Hermit's default RCB preemption.
+//!   The managed runtimes' scheduling, GC, JIT compilation, and static
+//!   initialization are fully determinized.
 //!
 //!   A compute-bound JVM livelocks under Hermit when preemption is disabled
 //!   (`--max-timeslice=disabled`): the VM's internal GC/JIT/dispatcher threads
 //!   are starved once an application thread enters a CPU-bound region, so even a
-//!   trivial program never completes its first run within the timeout. Keeping
-//!   RCB-based preemption on breaks the livelock while remaining deterministic
-//!   (the RCB count is reproducible), so `--verify` still reaches L2. These
-//!   programs therefore require a usable PMU; see
-//!   `assert_l2_jvm_under_strict_verify`.
+//!   trivial program never completes its first run within the timeout (this
+//!   reproduces even for `java Hello`). Keeping RCB-based preemption on breaks
+//!   the livelock while remaining deterministic (the RCB count is reproducible),
+//!   so `--verify` still reaches L2. These programs therefore require a usable
+//!   PMU; see `assert_l2_jvm_under_strict_verify`.
 //! - **L1 only (output-deterministic under `--strict`, but `--verify`'s
 //!   internal two-run log diff diverges):** toolchain drivers such as `javac`
 //!   and a `make`-driven `gcc` build. Their exit code and emitted artifacts are
@@ -630,23 +630,27 @@ fn go_goroutines_are_deterministic_under_strict_verify() {
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + mount namespaces + a JDK"]
+#[ignore = "e2e: requires hermit + mount namespaces + PMU (RCB preemption) + a JDK"]
 fn java_hello_is_deterministic_under_strict_verify() {
     let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
     let classpath = compile_java(JAVA_HELLO_SRC, "Hello");
     let classpath = classpath.to_str().expect("classpath is valid UTF-8");
     let args = java_vm_args(&["-cp", classpath, "Hello"]);
-    assert_l2_under_strict_verify(&java, &args);
+    // Keep RCB preemption on: a JVM livelocks under `--max-timeslice=disabled`
+    // (see `assert_l2_jvm_under_strict_verify`), even for this startup-only case.
+    assert_l2_jvm_under_strict_verify(&java, &args);
 }
 
 #[test]
-#[ignore = "e2e: requires hermit + mount namespaces + a JDK"]
+#[ignore = "e2e: requires hermit + mount namespaces + PMU (RCB preemption) + a JDK"]
 fn java_threads_are_deterministic_under_strict_verify() {
     let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
     let classpath = compile_java(JAVA_THREADS_SRC, "Threads");
     let classpath = classpath.to_str().expect("classpath is valid UTF-8");
     let args = java_vm_args(&["-cp", classpath, "Threads"]);
-    assert_l2_under_strict_verify(&java, &args);
+    // Keep RCB preemption on: a JVM livelocks under `--max-timeslice=disabled`
+    // (see `assert_l2_jvm_under_strict_verify`).
+    assert_l2_jvm_under_strict_verify(&java, &args);
 }
 
 // Small JVM JIT + runtime programs. These use `assert_l2_jvm_under_strict_verify`
