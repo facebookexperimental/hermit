@@ -821,6 +821,29 @@ impl GlobalTime {
         self.time_vector.contains_key(&dtid)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1173): Review SaBRe exec clock reassignment.
+    /// Move a surviving thread's clock component to the process-leader TID
+    /// installed by Linux after a non-leader thread successfully execs.
+    ///
+    /// Work previously performed by the old leader remains part of aggregate
+    /// time, but no longer belongs to the new image's local thread clock.
+    pub fn reassign_thread(&mut self, from: DetTid, to: DetTid) {
+        if from == to {
+            return;
+        }
+
+        let survivor_time = self
+            .time_vector
+            .remove(&from)
+            .unwrap_or_else(|| panic!("cannot reassign missing thread clock {from}"));
+        if let Some(retired_leader_time) = self.time_vector.remove(&to) {
+            self.extra_time = self.extra_time + retired_leader_time;
+        }
+        self.time_vector.insert(to, survivor_time);
+        self.sanity();
+    }
+
     /// Project out the time consumed by the work of a given thread, i.e., its running duration.
     pub fn threads_duration(&self, dtid: DetTid) -> LogicalDuration {
         *self.time_vector.get(&dtid).unwrap_or_else(|| {
@@ -837,5 +860,31 @@ impl GlobalTime {
     /// This roughly models something like real time if all threads were running on one core.
     pub fn as_nanos(&self) -> LogicalTime {
         self.total
+    }
+}
+
+#[cfg(test)]
+mod global_time_tests {
+    use super::*;
+
+    #[test]
+    fn exec_reassigns_survivor_clock_without_losing_aggregate_time() {
+        let config = Config::default();
+        let mut time = GlobalTime::new(&config);
+        let leader = DetTid::from_raw(17);
+        let worker = DetTid::from_raw(18);
+        let start = DetTime::new(&config).as_nanos();
+        let leader_time = start + LogicalTime::from_nanos(100);
+        let worker_time = start + LogicalTime::from_nanos(250);
+        time.update_global_time(leader, leader_time);
+        time.update_global_time(worker, worker_time);
+        let total_before = time.as_nanos();
+
+        time.reassign_thread(worker, leader);
+
+        assert_eq!(time.as_nanos(), total_before);
+        assert_eq!(time.threads_time(leader), worker_time);
+        assert!(time.contains_thread(leader));
+        assert!(!time.contains_thread(worker));
     }
 }

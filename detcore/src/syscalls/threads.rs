@@ -44,10 +44,11 @@ use crate::syscalls::helpers::retry_nonblocking_syscall;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::tool_global::FutexAction;
 use crate::tool_global::ResumeStatus;
+use crate::tool_global::cancel_exec;
 use crate::tool_global::create_child_thread;
 use crate::tool_global::futex_action;
+use crate::tool_global::prepare_exec;
 use crate::tool_global::resource_request;
-use crate::tool_global::set_pending_exec_fd_blocking;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
 use crate::tool_local::PendingVfork;
@@ -646,13 +647,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Execveat,
     ) -> Result<i64, Error> {
-        let (old_metadata, old_memory_metadata, table_is_shared, dettid, old_mm_id) = {
+        let (old_metadata, old_memory_metadata, table_is_shared, dettid, detpid, old_mm_id) = {
             let thread_state = guest.thread_state();
             (
                 Arc::clone(&thread_state.file_metadata),
                 Arc::clone(&thread_state.memory_metadata),
                 Arc::strong_count(&thread_state.file_metadata) > 1,
                 thread_state.dettid,
+                thread_state.detpid.expect("detpid unset"),
                 thread_state.mm_id,
             )
         };
@@ -667,12 +669,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let preserve_exec_fd_status = guest.thread_state().discover_live_file_metadata;
 
-        {
-            let thread_state = guest.thread_state_mut();
-            thread_state.file_metadata = Arc::new(Mutex::new(new_metadata));
-            thread_state.memory_metadata = Arc::new(Mutex::new(MemoryMetadata::new()));
-            thread_state.mm_id = old_mm_id.for_exec(dettid);
-        }
+        prepare_exec(
+            guest,
+            old_mm_id,
+            if preserve_exec_fd_status {
+                exec_fd_blocking
+            } else {
+                Default::default()
+            },
+        )
+        .await;
 
         let mut released_ports = Vec::new();
         for open_file_id in closed_open_files {
@@ -681,27 +687,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
 
-        if preserve_exec_fd_status {
-            set_pending_exec_fd_blocking(guest, exec_fd_blocking).await;
+        {
+            let thread_state = guest.thread_state_mut();
+            thread_state.file_metadata = Arc::new(Mutex::new(new_metadata));
+            thread_state.memory_metadata = Arc::new(Mutex::new(MemoryMetadata::new()));
+            thread_state.mm_id = old_mm_id.for_exec(detpid);
         }
 
         // execve(2) doesn't return upon success.
         let errno = self.record_or_replay(guest, call).await.unwrap_err();
-
-        if preserve_exec_fd_status {
-            set_pending_exec_fd_blocking(guest, Default::default()).await;
-        }
-
-        for (open_file_id, port) in released_ports {
-            self.restore_port_for_open_file(guest, open_file_id, port)
-                .await;
-        }
 
         {
             let thread_state = guest.thread_state_mut();
             thread_state.file_metadata = old_metadata;
             thread_state.memory_metadata = old_memory_metadata;
             thread_state.mm_id = old_mm_id;
+        }
+
+        cancel_exec(guest).await;
+        for (open_file_id, port) in released_ports {
+            self.restore_port_for_open_file(guest, open_file_id, port)
+                .await;
         }
 
         Err(errno.into())

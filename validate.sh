@@ -320,7 +320,7 @@ readonly RR_COMPAT_EXPECTED=139
 # Require the established SaBRe compatibility floor across the full measured corpus.
 # Explicit must-pass rows below ratchet fixed programs without allowing host-sensitive
 # rows to make the aggregate floor alternate between green and red.
-readonly SABRE_COMPAT_EXPECTED=203
+readonly SABRE_COMPAT_EXPECTED=205
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(PR-1154): Review synchronization of the measured SaBRe corpus size.
 readonly SABRE_COMPAT_TOTAL=212
@@ -1640,12 +1640,14 @@ function run_compatibility_corpus {
     local known_flaky=0
     local unavailable=0
     local total=0
+    local sabre_cargo_passed=0
     local sabre_cpp_passed=0
     local sabre_flex_passed=0
     local sabre_gcc_passed=0
     local sabre_gxx_passed=0
     local sabre_ld_passed=0
     local sabre_make_passed=0
+    local sabre_rustc_passed=0
     PORTABLE_STRICT_DIAGNOSTIC_FAILURE_COUNT=0
 
     if [[ $COMPATIBILITY_MODE == rr ]]; then
@@ -1770,13 +1772,25 @@ function run_compatibility_corpus {
             && passed=$((passed + 1)) || failed=$((failed + 1))
         rm -rf "$shell_build_dir"
     fi
-    functional_compatibility_probe cargo \
-        && passed=$((passed + 1)) || failed=$((failed + 1))
+    if functional_compatibility_probe cargo; then
+        passed=$((passed + 1))
+        if [[ $COMPATIBILITY_MODE == sabre ]]; then
+            sabre_cargo_passed=1
+        fi
+    else
+        failed=$((failed + 1))
+    fi
     if defer_portable_strict_diagnostic_to_super rustc; then
         unavailable=$((unavailable + 1))
     else
-        functional_compatibility_probe rustc \
-            && passed=$((passed + 1)) || failed=$((failed + 1))
+        if functional_compatibility_probe rustc; then
+            passed=$((passed + 1))
+            if [[ $COMPATIBILITY_MODE == sabre ]]; then
+                sabre_rustc_passed=1
+            fi
+        else
+            failed=$((failed + 1))
+        fi
     fi
     if [[ $COMPATIBILITY_MODE == strict || $COMPATIBILITY_MODE == sabre ]]; then
         functional_compatibility_probe clang \
@@ -2432,6 +2446,10 @@ function run_compatibility_corpus {
             printf "❌ SaBRe compatibility required row flex regressed\n"
             return 1
         fi
+        if ((sabre_cargo_passed != 1)); then
+            printf "❌ SaBRe compatibility required row cargo regressed\n"
+            return 1
+        fi
         if ((sabre_cpp_passed != 1)); then
             printf "❌ SaBRe compatibility required row cpp regressed\n"
             return 1
@@ -2450,6 +2468,10 @@ function run_compatibility_corpus {
         fi
         if ((sabre_make_passed != 1)); then
             printf "❌ SaBRe compatibility required row make regressed\n"
+            return 1
+        fi
+        if ((sabre_rustc_passed != 1)); then
+            printf "❌ SaBRe compatibility required row rustc regressed\n"
             return 1
         fi
         if ((passed < SABRE_COMPAT_EXPECTED)); then

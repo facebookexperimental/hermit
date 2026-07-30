@@ -1274,7 +1274,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 &new_dettid,
                 guest.config()
             );
-            create_child_thread(guest, new_dettid, 0, None).await;
+            if let Some(post_exec_mm) = create_child_thread(guest, new_dettid, 0, None).await {
+                guest.thread_state_mut().mm_id = post_exec_mm;
+            }
         }
 
         // Except for the root task, let's block until it's our turn to go:

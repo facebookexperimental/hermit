@@ -65,6 +65,7 @@ use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::ConsumeResult;
 use crate::scheduler::DEFAULT_PRIORITY;
+use crate::scheduler::ExecReconnect;
 use crate::scheduler::MaybePrintStack;
 use crate::scheduler::Priority;
 use crate::scheduler::SchedResponse;
@@ -124,6 +125,20 @@ struct ChildRegistration {
     flags: Option<CloneFlags>,
     maybe_priority: Option<Priority>,
     parent_is_kernel_blocked: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingExecState {
+    caller: DetTid,
+    process: DetPid,
+    mm: MmId,
+    fd_blocking: ExecFdBlockingOverrides,
+}
+
+#[derive(Clone, Copy)]
+struct RpcIncarnation {
+    dettid: DetTid,
+    mm: MmId,
 }
 
 impl Default for InodePool {
@@ -274,8 +289,12 @@ pub struct GlobalState {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
-    /// Logically blocking descriptors awaiting restoration after a SaBRe exec reload.
-    pending_exec_fd_blocking: Mutex<BTreeMap<DetTid, ExecFdBlockingOverrides>>,
+    /// Pre-exec identity and descriptor state awaiting a SaBRe exec reload.
+    // TODO-HUMAN-REVIEW(PR-1173): Review SaBRe exec incarnation fencing.
+    pending_exec_states: Mutex<BTreeMap<DetPid, PendingExecState>>,
+
+    /// Descriptor state retained after the one-shot scheduler transition is consumed.
+    post_exec_fd_blocking: Mutex<BTreeMap<DetTid, ExecFdBlockingOverrides>>,
 
     sched_handle: Option<tokio::task::JoinHandle<()>>,
 
@@ -361,7 +380,8 @@ impl GlobalState {
             port_end_range: AtomicU16::new(range[1]),
             open_file_to_port: Mutex::new(HashMap::new()),
             past_first_execve: AtomicBool::new(false),
-            pending_exec_fd_blocking: Mutex::new(BTreeMap::new()),
+            pending_exec_states: Mutex::new(BTreeMap::new()),
+            post_exec_fd_blocking: Mutex::new(BTreeMap::new()),
             inodes: Arc::new(Mutex::new(InodePool::new())),
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping state.
@@ -396,6 +416,8 @@ impl GlobalState {
     /// exact process's barrier is released at this physical-waitability boundary.
     pub fn complete_physical_process_exit(&self, raw_pid: i32) {
         let detpid = DetPid::from_raw(raw_pid);
+        self.pending_exec_states.lock().unwrap().remove(&detpid);
+        self.post_exec_fd_blocking.lock().unwrap().remove(&detpid);
         if self
             .sched
             .lock()
@@ -412,6 +434,8 @@ impl GlobalState {
     /// Releases all physical-process-exit barriers after a backend supervisor has drained every
     /// tracee and no guest thread can race another lifecycle event.
     pub fn release_all_physical_process_exits(&self) {
+        self.pending_exec_states.lock().unwrap().clear();
+        self.post_exec_fd_blocking.lock().unwrap().clear();
         let released = self
             .sched
             .lock()
@@ -556,7 +580,7 @@ impl GlobalTool for GlobalState {
     ///
     /// Irrespective of which method we execute, we can "tick" our local component of the
     /// global time in the process.
-    type Request = (DetTime, GlobalRequest);
+    type Request = (DetTime, MmId, GlobalRequest);
 
     /// Response from the global portion of the Detcore instrumentation tool.
     /// The exact form of the response depends on which method was executed.
@@ -575,33 +599,65 @@ impl GlobalTool for GlobalState {
     async fn receive_rpc(&self, from: Tid, gr: Self::Request) -> Self::Response {
         type R = GlobalResponse;
         let dtid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
-        let time_from_guest = gr.0.as_nanos();
-        let is_deregister = matches!(&gr.1, GlobalRequest::DeregisterThread(_));
+        let (guest_time, request_mm, request) = gr;
+        let time_from_guest = guest_time.as_nanos();
+        let is_deregister = matches!(&request, GlobalRequest::DeregisterThread(_));
 
-        // Tombstones are permanent: raw Linux TID reuse is rejected rather than allowing a
-        // delayed backend RPC to bind to a new logical thread. Hold the scheduler admission lock
-        // through clock accounting so logical teardown cannot linearize between the two.
+        let (exec_reconnect, is_exec_caller_after_local_mm_swap) = {
+            let pending = self.pending_exec_states.lock().unwrap();
+            let reconnect = match &request {
+                GlobalRequest::CreateChildThread(child, process, _, None, _)
+                    if *child == dtid && *child == *process =>
+                {
+                    pending.get(process).cloned()
+                }
+                _ => None,
+            };
+            let is_exec_caller_after_local_mm_swap = pending.values().any(|state| {
+                state.caller == dtid && state.mm.for_exec(state.process) == request_mm
+            });
+            (reconnect, is_exec_caller_after_local_mm_swap)
+        };
+
+        // Tombstones reject raw Linux TID reuse except for the kernel-defined leader-TID takeover
+        // recorded by a successful non-leader exec. Hold the scheduler admission lock through
+        // clock accounting so logical teardown cannot linearize between the two.
         let mut tombstoned_deregistration = None;
-        let is_exec_reconnect;
         {
             let sched = self.sched.lock().unwrap();
-            let child = match &gr.1 {
+            if exec_reconnect.is_none()
+                && !is_exec_caller_after_local_mm_swap
+                && !sched.rpc_incarnation_matches(dtid, request_mm)
+            {
+                debug!(
+                    "[detcore, dtid {}] rejecting {:?} RPC from retired exec incarnation {:?}",
+                    dtid, request, request_mm,
+                );
+                return if is_deregister {
+                    (None, R::DeregisterThread(()))
+                } else {
+                    (None, R::ThreadExited)
+                };
+            }
+            let child = match &request {
                 GlobalRequest::CreateChildThread(child, ..)
                 | GlobalRequest::CreateVforkChildThread(_, _, child, ..) => Some(*child),
                 _ => None,
             };
-            if sched.thread_is_logically_killed(dtid) {
+            if sched.thread_is_logically_killed(dtid) && exec_reconnect.is_none() {
                 trace!(
                     "[detcore, dtid {}] rejecting RPC after permanent logical-thread removal",
                     dtid
                 );
-                if let GlobalRequest::DeregisterThread(deregistration) = &gr.1 {
+                if let GlobalRequest::DeregisterThread(deregistration) = &request {
                     tombstoned_deregistration = Some(deregistration.clone());
                 } else {
                     return (None, R::ThreadExited);
                 }
             }
-            if child.is_some_and(|child| sched.thread_is_logically_killed(child)) {
+            if child.is_some_and(|child| sched.thread_is_logically_killed(child))
+                && exec_reconnect.is_none()
+            {
                 trace!(
                     "[detcore, dtid {}] rejecting registration that reuses a tombstoned child TID",
                     dtid
@@ -609,17 +665,8 @@ impl GlobalTool for GlobalState {
                 return (None, R::ThreadExited);
             }
 
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-845): Review SaBRe exec-reload clock recovery.
-            // SaBRe reloads its plugin after exec, so the root thread reconnects
-            // with fresh local state while its scheduler entry remains live.
-            is_exec_reconnect = matches!(
-                &gr.1,
-                GlobalRequest::CreateChildThread(child_dettid, _, _, None, _)
-                    if *child_dettid == dtid && sched.next_turns.contains_key(&dtid)
-            );
             let is_thread_reconnect = matches!(
-                &gr.1,
+                &request,
                 GlobalRequest::StartNewThread(child_dettid, _) if *child_dettid == dtid
             ) && self.global_time.lock().unwrap().contains_thread(dtid);
 
@@ -627,7 +674,10 @@ impl GlobalTool for GlobalState {
             // TODO: eventually the vector clock should be in shared memory, and
             // the local clocks should update truly asynchrously.  Therefore it
             // SHOULD be safe to always push through this update on any rpc.
-            if tombstoned_deregistration.is_none() && !is_exec_reconnect && !is_thread_reconnect {
+            if tombstoned_deregistration.is_none()
+                && exec_reconnect.is_none()
+                && !is_thread_reconnect
+            {
                 self.global_time
                     .lock()
                     .unwrap()
@@ -643,9 +693,11 @@ impl GlobalTool for GlobalState {
         // time payload piggy-backing on each rpc. Maybe eventually once ticking a
         // threads' own clock happens through shared memory.)
         #[allow(clippy::unit_arg)]
-        let resp = match gr.1 {
+        let resp = match request {
             GlobalRequest::RequestResources(rs, pid) => {
-                let (response, _endtime) = self.recv_request_resources(from, pid, rs).await;
+                let (response, _endtime) = self
+                    .recv_request_resources(from, pid, rs, Some(request_mm))
+                    .await;
                 match response {
                     SchedulerRpcResult::Continue(response) => R::RequestResources(response),
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
@@ -672,23 +724,39 @@ impl GlobalTool for GlobalState {
                 }
                 R::ReportUnsupportedSyscall(())
             }
-            GlobalRequest::PrepareExecFdBlocking(overrides) => {
-                trace!(
-                    "[detcore, dtid {}] preparing logically blocking descriptors for exec: {:?}",
-                    dtid, overrides,
-                );
-                let mut pending = self.pending_exec_fd_blocking.lock().unwrap();
-                if overrides.is_empty() {
-                    pending.remove(&dtid);
-                } else {
-                    pending.insert(dtid, overrides);
+            GlobalRequest::PrepareExec(process, mm, fd_blocking) => {
+                if mm != request_mm {
+                    return (None, R::ThreadExited);
                 }
-                R::PrepareExecFdBlocking(())
+                trace!(
+                    "[detcore, dtid {}] preparing exec for process {} with mm {:?} and logically blocking descriptors {:?}",
+                    dtid, process, mm, fd_blocking,
+                );
+                self.pending_exec_states.lock().unwrap().insert(
+                    process,
+                    PendingExecState {
+                        caller: dtid,
+                        process,
+                        mm,
+                        fd_blocking,
+                    },
+                );
+                R::PrepareExec(())
+            }
+            GlobalRequest::CancelExec(process) => {
+                let mut pending = self.pending_exec_states.lock().unwrap();
+                if pending
+                    .get(&process)
+                    .is_some_and(|state| state.caller == dtid)
+                {
+                    pending.remove(&process);
+                }
+                R::CancelExec(())
             }
             GlobalRequest::MarkPastFirstExecve => {
                 self.past_first_execve.store(true, SeqCst);
                 let overrides = self
-                    .pending_exec_fd_blocking
+                    .post_exec_fd_blocking
                     .lock()
                     .unwrap()
                     .remove(&dtid)
@@ -701,16 +769,52 @@ impl GlobalTool for GlobalState {
             }
             // Requested by the parent thread:
             GlobalRequest::CreateChildThread(dettid, parent_detpid, ctid, flags, priority) => {
-                if is_exec_reconnect {
+                if let Some(prepared) = &exec_reconnect {
+                    let (pending, post_exec_mm) = {
+                        let mut states = self.pending_exec_states.lock().unwrap();
+                        let Some(pending) = states.remove(&parent_detpid) else {
+                            return (None, R::ThreadExited);
+                        };
+                        assert_eq!(&pending, prepared);
+                        let post_exec_mm = pending.mm.for_exec(pending.process);
+                        (pending, post_exec_mm)
+                    };
+                    assert_eq!(pending.process, parent_detpid);
+                    let retired = self
+                        .sched
+                        .lock()
+                        .unwrap()
+                        .reconnect_after_exec(ExecReconnect {
+                            caller: pending.caller,
+                            new_leader: dettid,
+                            detpid: parent_detpid,
+                            pre_exec_mm: pending.mm,
+                            post_exec_mm,
+                            child_tid_addr: ctid,
+                            reconnect_priority: priority,
+                        });
+                    if pending.caller != dettid {
+                        self.global_time
+                            .lock()
+                            .unwrap()
+                            .reassign_thread(pending.caller, dettid);
+                    }
+                    if !pending.fd_blocking.is_empty() {
+                        self.post_exec_fd_blocking
+                            .lock()
+                            .unwrap()
+                            .insert(dettid, pending.fd_blocking);
+                    }
                     debug!(
-                        "[detcore, dtid {}] reusing scheduler registration after exec",
-                        dtid
+                        "[detcore, dtid {}] reconciled successful exec from caller {}; retired prior identities {:?}",
+                        dtid, pending.caller, retired
                     );
-                    R::CreateChildThread(())
+                    R::CreateChildThread(Some(post_exec_mm))
                 } else {
                     match self
                         .recv_create_child_thread(
                             from,
+                            request_mm,
                             ChildRegistration {
                                 parent_dettid: DetTid::from_raw(from.into()),
                                 parent_detpid,
@@ -723,7 +827,7 @@ impl GlobalTool for GlobalState {
                         )
                         .await
                     {
-                        SchedulerRpcResult::Continue(()) => R::CreateChildThread(()),
+                        SchedulerRpcResult::Continue(()) => R::CreateChildThread(None),
                         SchedulerRpcResult::ThreadExited => R::ThreadExited,
                     }
                 }
@@ -739,6 +843,7 @@ impl GlobalTool for GlobalState {
             ) => match self
                 .recv_create_child_thread(
                     from,
+                    request_mm,
                     ChildRegistration {
                         parent_dettid,
                         parent_detpid,
@@ -751,12 +856,15 @@ impl GlobalTool for GlobalState {
                 )
                 .await
             {
-                SchedulerRpcResult::Continue(()) => R::CreateChildThread(()),
+                SchedulerRpcResult::Continue(()) => R::CreateChildThread(None),
                 SchedulerRpcResult::ThreadExited => R::ThreadExited,
             },
             // Requested by the child thread itself:
             GlobalRequest::StartNewThread(dettid, detpid) => {
-                match self.recv_start_new_thread(from, dettid, detpid).await {
+                match self
+                    .recv_start_new_thread(from, dettid, detpid, request_mm)
+                    .await
+                {
                     SchedulerRpcResult::Continue(history) => R::StartNewThread(history),
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
@@ -765,8 +873,17 @@ impl GlobalTool for GlobalState {
                 R::DeregisterThread(self.recv_deregister_thread(from, deregistration).await)
             }
             GlobalRequest::FutexAction(dettid, action, futexid, init_read, mask) => R::FutexAction(
-                self.recv_futex_action(from, dettid, action, futexid, init_read, mask)
-                    .await,
+                self.recv_futex_action(
+                    RpcIncarnation {
+                        dettid,
+                        mm: request_mm,
+                    },
+                    action,
+                    futexid,
+                    init_read,
+                    mask,
+                )
+                .await,
             ),
             GlobalRequest::DeterminizeInode(ino) => {
                 R::DeterminizeInode(self.recv_determinize_inode(from, ino).await)
@@ -785,7 +902,7 @@ impl GlobalTool for GlobalState {
                 R::GlobalTimeLowerBound(ns)
             }
             GlobalRequest::TraceSchedEvent(ev, detpid) => {
-                match self.recv_trace_schedevent(ev, detpid).await {
+                match self.recv_trace_schedevent(ev, detpid, request_mm).await {
                     SchedulerRpcResult::Continue(response) => R::TraceSchedEvent(response),
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
@@ -796,7 +913,17 @@ impl GlobalTool for GlobalState {
             GlobalRequest::RegisterAlarm(dpid, dtid, duration, interval, sig) => {
                 let now = self.global_time.lock().unwrap().as_nanos();
                 match self
-                    .recv_register_alarm(dpid, dtid, now, duration, interval, sig)
+                    .recv_register_alarm(
+                        dpid,
+                        RpcIncarnation {
+                            dettid: dtid,
+                            mm: request_mm,
+                        },
+                        now,
+                        duration,
+                        interval,
+                        sig,
+                    )
                     .await
                 {
                     SchedulerRpcResult::Continue(remaining) => R::RegisterAlarm(remaining),
@@ -813,7 +940,17 @@ impl GlobalTool for GlobalState {
             // TODO-HUMAN-REVIEW(#869)
             GlobalRequest::RegisterPosixTimer(dpid, dtid, timer_id, deadline, interval, sig) => {
                 match self
-                    .recv_register_posix_timer(dpid, dtid, timer_id, deadline, interval, sig)
+                    .recv_register_posix_timer(
+                        dpid,
+                        RpcIncarnation {
+                            dettid: dtid,
+                            mm: request_mm,
+                        },
+                        timer_id,
+                        deadline,
+                        interval,
+                        sig,
+                    )
                     .await
                 {
                     SchedulerRpcResult::Continue(()) => R::RegisterPosixTimer(()),
@@ -874,9 +1011,15 @@ impl GlobalTool for GlobalState {
 
         // Awaited scheduler operations may have raced logical teardown. Never return their
         // operation-specific response after the sender acquired a permanent tombstone.
-        if resp == R::ThreadExited
-            || (!is_deregister && self.sched.lock().unwrap().thread_is_logically_killed(dtid))
-        {
+        let sender_became_terminal =
+            if is_deregister || exec_reconnect.is_some() || is_exec_caller_after_local_mm_swap {
+                false
+            } else {
+                let sched = self.sched.lock().unwrap();
+                sched.thread_is_logically_killed(dtid)
+                    || !sched.rpc_incarnation_matches(dtid, request_mm)
+            };
+        if resp == R::ThreadExited || sender_became_terminal {
             return (None, R::ThreadExited);
         }
 
@@ -901,12 +1044,15 @@ impl GlobalState {
         from: Tid,
         detpid: DetPid,
         rs: Resources,
+        request_mm: Option<MmId>,
     ) -> (SchedulerRpcResult<ResumeStatus>, Option<LogicalTime>) {
         let dettid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
 
         let resp2 = {
             let mut sched = self.sched.lock().unwrap();
-            if sched.thread_is_logically_killed(dettid) {
+            if sched.thread_is_logically_killed(dettid)
+                || request_mm.is_some_and(|mm| !sched.rpc_incarnation_matches(dettid, mm))
+            {
                 return (SchedulerRpcResult::ThreadExited, None);
             }
             let Some(nextturn) = sched.next_turns.get(&dettid).cloned() else {
@@ -927,12 +1073,12 @@ impl GlobalState {
             dettid, &resp2, rs
         );
         let answer = resp2.get().await; // Block on the scheduler allowing our guest to proceed.
-        if self
-            .sched
-            .lock()
-            .unwrap()
-            .thread_is_logically_killed(dettid)
-        {
+        let request_became_stale = {
+            let sched = self.sched.lock().unwrap();
+            sched.thread_is_logically_killed(dettid)
+                || request_mm.is_some_and(|mm| !sched.rpc_incarnation_matches(dettid, mm))
+        };
+        if request_became_stale {
             // `logically_kill_thread` wakes an already-pending request with a
             // signal response.  Treat that wake-up as terminal: otherwise a
             // caller that ignores `ResumeStatus::Signaled` can inject the
@@ -957,7 +1103,9 @@ impl GlobalState {
             // blocked on, including us having blocked them in the `futex_waiters` list.
             {
                 let mut sched = self.sched.lock().unwrap();
-                if sched.thread_is_logically_killed(dettid) {
+                if sched.thread_is_logically_killed(dettid)
+                    || request_mm.is_some_and(|mm| !sched.rpc_incarnation_matches(dettid, mm))
+                {
                     return (SchedulerRpcResult::ThreadExited, None);
                 }
                 for tid in sched.thread_tree.my_thread_group(&dettid) {
@@ -1021,6 +1169,7 @@ impl GlobalState {
     async fn recv_create_child_thread(
         &self,
         rpc_sender: Tid,
+        request_mm: MmId,
         registration: ChildRegistration,
     ) -> SchedulerRpcResult<()> {
         let ChildRegistration {
@@ -1068,6 +1217,7 @@ impl GlobalState {
             let mut sched = self.sched.lock().unwrap();
             let sender = DetTid::from_raw(rpc_sender.into());
             if sched.thread_is_logically_killed(sender)
+                || !sched.rpc_incarnation_matches(sender, request_mm)
                 || sched.thread_is_logically_killed(child_dettid)
             {
                 return SchedulerRpcResult::ThreadExited;
@@ -1148,7 +1298,7 @@ impl GlobalState {
                 Permission::W,
             );
             if matches!(
-                self.recv_request_resources(rpc_sender, parent_detpid, rs)
+                self.recv_request_resources(rpc_sender, parent_detpid, rs, Some(request_mm))
                     .await
                     .0,
                 SchedulerRpcResult::ThreadExited
@@ -1167,13 +1317,16 @@ impl GlobalState {
         from: Tid,
         dettid: DetTid,
         detpid: DetPid,
+        request_mm: MmId,
     ) -> SchedulerRpcResult<Option<ThreadHistory>> {
         let mut tries: u64 = 0;
         // TODO: eliminate this loop. Could instead signal with an ivar.
         let response_ivar = loop {
             yield_once().await;
             let mut sched = self.sched.lock().unwrap();
-            if sched.thread_is_logically_killed(dettid) {
+            if sched.thread_is_logically_killed(dettid)
+                || !sched.rpc_incarnation_matches(dettid, request_mm)
+            {
                 return SchedulerRpcResult::ThreadExited;
             }
             // The resources that must be held for the fresh thread to run:
@@ -1219,12 +1372,12 @@ impl GlobalState {
             &dettid, &response_ivar
         );
         let _answer = response_ivar.get().await;
-        if self
-            .sched
-            .lock()
-            .unwrap()
-            .thread_is_logically_killed(dettid)
-        {
+        let request_became_stale = {
+            let sched = self.sched.lock().unwrap();
+            sched.thread_is_logically_killed(dettid)
+                || !sched.rpc_incarnation_matches(dettid, request_mm)
+        };
+        if request_became_stale {
             return SchedulerRpcResult::ThreadExited;
         }
         info!(
@@ -1241,7 +1394,9 @@ impl GlobalState {
             });
             let old_prio = {
                 let mut sched = self.sched.lock().unwrap();
-                if sched.thread_is_logically_killed(dettid) {
+                if sched.thread_is_logically_killed(dettid)
+                    || !sched.rpc_incarnation_matches(dettid, request_mm)
+                {
                     return SchedulerRpcResult::ThreadExited;
                 }
                 sched.priorities.insert(dettid, history.initial_priority())
@@ -1267,13 +1422,29 @@ impl GlobalState {
             timeslice_stats,
             chaos_epochs,
         } = deregistration;
-        self.pending_exec_fd_blocking
-            .lock()
-            .unwrap()
-            .remove(&dettid);
+        // A fatal signal can tear down the caller after its local state has advanced to the
+        // candidate exec image but before the successful reconnect (or failed-exec cancel).
+        // Retire that one-shot preparation before scheduler-incarnation admission rejects the
+        // candidate image's final cleanup RPC.
+        let mut pending = self.pending_exec_states.lock().unwrap();
+        if pending.get(&detpid).is_some_and(|state| {
+            state.caller == dettid && (mm == state.mm || mm == state.mm.for_exec(state.process))
+        }) {
+            pending.remove(&detpid);
+        }
+        drop(pending);
+
         // Invariant: will only be called when sequentialize-threads is on.
         assert!(self.cfg.sequentialize_threads);
         let mut sched = self.sched.lock().unwrap();
+        if !sched.rpc_incarnation_matches(dettid, mm) {
+            debug!(
+                "[detcore, dtid {}] ignoring deregistration from retired exec incarnation {:?}",
+                dettid, mm,
+            );
+            return;
+        }
+        self.post_exec_fd_blocking.lock().unwrap().remove(&dettid);
         if !sched.note_deregistration_accounted(dettid) {
             trace!(
                 "[detcore, dtid {}] acknowledging already-accounted deregistration",
@@ -1299,17 +1470,19 @@ impl GlobalState {
 
     async fn recv_futex_action(
         &self,
-        _from: Tid,
-        dettid: DetTid,
+        caller: RpcIncarnation,
         action: FutexAction,
         futexid: FutexID,
         init_read: i32,
         mask: u32,
     ) -> Option<SchedValue> {
+        let RpcIncarnation { dettid, mm } = caller;
         trace!("[detcore, dtid {}] Futex action: {:?}", &dettid, action);
         let response_iv = {
             let mut sched = self.sched.lock().unwrap();
-            if sched.thread_is_logically_killed(dettid) {
+            if sched.thread_is_logically_killed(dettid)
+                || !sched.rpc_incarnation_matches(dettid, mm)
+            {
                 return Some(SchedValue::Value(nix::errno::Errno::EINTR as u64));
             }
             let Some(resp_iv) = sched
@@ -1443,7 +1616,16 @@ impl GlobalState {
         &self,
         ev: SchedEvent,
         detpid: DetPid,
+        request_mm: MmId,
     ) -> SchedulerRpcResult<TraceSchedEventResponse> {
+        if !self
+            .sched
+            .lock()
+            .unwrap()
+            .rpc_incarnation_matches(ev.dettid, request_mm)
+        {
+            return SchedulerRpcResult::ThreadExited;
+        }
         // TODO(T124316762): debug address randomization in the tracer and get rid of this hack:
         let ev = {
             if self.past_first_execve.load(SeqCst) {
@@ -1466,7 +1648,9 @@ impl GlobalState {
         let result = if self.cfg.replay_schedule_from.is_some() {
             let (consumed, print_stack2) = {
                 let mut sched = self.sched.lock().unwrap();
-                if sched.thread_is_logically_killed(ev.dettid) {
+                if sched.thread_is_logically_killed(ev.dettid)
+                    || !sched.rpc_incarnation_matches(ev.dettid, request_mm)
+                {
                     return SchedulerRpcResult::ThreadExited;
                 }
                 let consumed = sched.consume_schedevent(&ev);
@@ -1496,7 +1680,9 @@ impl GlobalState {
                 let tid = reverie::Tid::from(ev.dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
                 let mut rsrcs = Resources::new(ev.dettid);
                 rsrcs.insert(ResourceID::TraceReplay, Permission::RW);
-                let (response, timeslice) = self.recv_request_resources(tid, detpid, rsrcs).await;
+                let (response, timeslice) = self
+                    .recv_request_resources(tid, detpid, rsrcs, Some(request_mm))
+                    .await;
                 if response == SchedulerRpcResult::ThreadExited {
                     return SchedulerRpcResult::ThreadExited;
                 }
@@ -1514,7 +1700,9 @@ impl GlobalState {
         } else {
             let print_stack_strace = {
                 let mut sched = self.sched.lock().unwrap();
-                if sched.thread_is_logically_killed(ev.dettid) {
+                if sched.thread_is_logically_killed(ev.dettid)
+                    || !sched.rpc_incarnation_matches(ev.dettid, request_mm)
+                {
                     return SchedulerRpcResult::ThreadExited;
                 }
                 if self.cfg.record_preemptions {
@@ -1574,14 +1762,15 @@ impl GlobalState {
     async fn recv_register_alarm(
         &self,
         detpid: DetPid,
-        dettid: DetTid,
+        caller: RpcIncarnation,
         now: LogicalTime,
         duration: LogicalTime,
         interval: LogicalTime,
         sig: SigWrapper,
     ) -> SchedulerRpcResult<(LogicalTime, LogicalTime)> {
+        let RpcIncarnation { dettid, mm } = caller;
         let mut sched = self.sched.lock().unwrap();
-        if sched.thread_is_logically_killed(dettid) {
+        if sched.thread_is_logically_killed(dettid) || !sched.rpc_incarnation_matches(dettid, mm) {
             return SchedulerRpcResult::ThreadExited;
         }
         SchedulerRpcResult::Continue(
@@ -1595,14 +1784,15 @@ impl GlobalState {
     async fn recv_register_posix_timer(
         &self,
         detpid: DetPid,
-        dettid: DetTid,
+        caller: RpcIncarnation,
         timer_id: i32,
         deadline: Option<LogicalTime>,
         interval: LogicalTime,
         sig: SigWrapper,
     ) -> SchedulerRpcResult<()> {
+        let RpcIncarnation { dettid, mm } = caller;
         let mut sched = self.sched.lock().unwrap();
-        if sched.thread_is_logically_killed(dettid) {
+        if sched.thread_is_logically_killed(dettid) || !sched.rpc_incarnation_matches(dettid, mm) {
             return SchedulerRpcResult::ThreadExited;
         }
         sched.register_posix_timer(detpid, dettid, timer_id, deadline, interval, sig.0);
@@ -1641,9 +1831,12 @@ pub enum GlobalRequest {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
-    /// Save logically blocking descriptors before a backend reloads its tool across exec.
-    /// An empty set clears a failed exec attempt.
-    PrepareExecFdBlocking(ExecFdBlockingOverrides),
+    /// Save the caller, address-space identity, and logically blocking descriptors before a
+    /// backend reloads its tool across exec.
+    PrepareExec(DetPid, MmId, ExecFdBlockingOverrides),
+
+    /// Clear the saved transition after an exec attempt returns with an error.
+    CancelExec(DetPid),
 
     /// Mark the initial image transition complete for backends that begin post-exec.
     MarkPastFirstExecve,
@@ -1748,9 +1941,10 @@ pub enum GlobalResponse {
     ReleaseAllResources(()),
     // TODO-HUMAN-REVIEW(PR-643): Review this new Detcore global RPC response.
     ReportUnsupportedSyscall(()),
-    PrepareExecFdBlocking(()),
+    PrepareExec(()),
+    CancelExec(()),
     MarkPastFirstExecve(ExecFdBlockingOverrides),
-    CreateChildThread(()),
+    CreateChildThread(Option<MmId>),
     /// Includes optional preemption points for the new thread.
     StartNewThread(Option<ThreadHistory>),
     DeregisterThread(()),
@@ -1802,14 +1996,25 @@ pub fn format_unsupported_syscall_warning(syscalls: &BTreeSet<String>) -> Option
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
-pub async fn set_pending_exec_fd_blocking<G, T>(guest: &mut G, overrides: ExecFdBlockingOverrides)
+pub async fn prepare_exec<G, T>(guest: &mut G, mm: MmId, fd_blocking: ExecFdBlockingOverrides)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    let detpid = guest.thread_state().detpid.expect("detpid unset");
     let (_, response) =
-        send_and_update_time(guest, GlobalRequest::PrepareExecFdBlocking(overrides)).await;
-    assert_eq!(response, GlobalResponse::PrepareExecFdBlocking(()));
+        send_and_update_time(guest, GlobalRequest::PrepareExec(detpid, mm, fd_blocking)).await;
+    assert_eq!(response, GlobalResponse::PrepareExec(()));
+}
+
+pub async fn cancel_exec<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let detpid = guest.thread_state().detpid.expect("detpid unset");
+    let (_, response) = send_and_update_time(guest, GlobalRequest::CancelExec(detpid)).await;
+    assert_eq!(response, GlobalResponse::CancelExec(()));
 }
 
 pub async fn mark_past_first_execve<G, T>(guest: &mut G)
@@ -1855,7 +2060,8 @@ where
     T: RecordOrReplay,
 {
     let mytime = guest.thread_state().thread_logical_time.clone();
-    let resp = guest.send_rpc((mytime, request)).await;
+    let mm = guest.thread_state().mm_id;
+    let resp = guest.send_rpc((mytime, mm, request)).await;
     if resp.1 == GlobalResponse::ThreadExited {
         let dettid = guest.thread_state().dettid;
         trace!(
@@ -1986,7 +2192,8 @@ pub async fn create_child_thread<G, T>(
     child_dettid: DetTid,
     ctid: usize,
     flags: Option<CloneFlags>,
-) where
+) -> Option<MmId>
+where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
@@ -2086,7 +2293,7 @@ pub async fn create_vfork_child_thread<G, T>(
     )
     .await;
     match resp.1 {
-        GlobalResponse::CreateChildThread(x) => x,
+        GlobalResponse::CreateChildThread(_) => (),
         _ => unreachable!(),
     }
 }
@@ -2105,9 +2312,10 @@ pub(crate) async fn deregister_thread<R>(
     R: GlobalRPC<GlobalState>,
 {
     if cfg.sequentialize_threads {
+        let mm = thread.mm;
         // TODO: void_send_rpc
         let resp = reverie
-            .send_rpc((threads_time, GlobalRequest::DeregisterThread(thread)))
+            .send_rpc((threads_time, mm, GlobalRequest::DeregisterThread(thread)))
             .await;
         // We can't update the thread time here.  But it's dead anyway!
         match resp.1 {
@@ -2449,9 +2657,10 @@ where
 {
     if cfg!(debug_assertions) {
         let mytime = guest.thread_state().thread_logical_time.clone();
+        let mm = guest.thread_state().mm_id;
         // TODO: void_send_rpc
         let _ = guest
-            .send_rpc((mytime, GlobalRequest::UnrecoverableShutdown))
+            .send_rpc((mytime, mm, GlobalRequest::UnrecoverableShutdown))
             .await;
     }
 
@@ -2474,6 +2683,8 @@ mod tests {
     use super::GlobalRequest;
     use super::GlobalResponse;
     use super::GlobalState;
+    use super::PendingExecState;
+    use super::RpcIncarnation;
     use super::SchedulerRpcResult;
     use super::SigWrapper;
     use super::ThreadDeregistration;
@@ -2488,6 +2699,7 @@ mod tests {
     use crate::scheduler::SchedResponse;
     use crate::scheduler::SchedValue;
     use crate::scheduler::ThreadNextTurn;
+    use crate::tool_local::ExecFdBlockingOverrides;
     use crate::types::DetPid;
     use crate::types::DetTid;
     use crate::types::DetTime;
@@ -2562,17 +2774,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exec_reconnect_reuses_live_scheduler_and_clock_state() {
+    async fn exec_reconnect_retires_siblings_and_reuses_live_scheduler_and_clock_state() {
         let (config, state, dettid, detpid) = cancellation_test_state();
+        let old_mm = MmId::initial(detpid).for_exec(detpid);
         install_test_registration(&state, dettid, Ivar::new());
+        let sibling = DetTid::from_raw(dettid.as_raw() + 1);
+        let sibling_request = Ivar::new();
         state
             .sched
             .lock()
             .unwrap()
-            .next_turns
-            .get_mut(&dettid)
-            .unwrap()
-            .resp = Ivar::full(SchedResponse::Go(None));
+            .thread_tree
+            .add_child(dettid, sibling, false);
+        install_test_registration(&state, sibling, sibling_request.clone());
+        {
+            let mut scheduler = state.sched.lock().unwrap();
+            scheduler.next_turns.get_mut(&dettid).unwrap().resp =
+                Ivar::full(SchedResponse::Go(None));
+            scheduler
+                .next_turns
+                .get_mut(&sibling)
+                .unwrap()
+                .child_tid_addr = 0x1234;
+        }
         let mut existing_time = DetTime::new(&config);
         existing_time.add_syscall();
         existing_time.add_syscall();
@@ -2586,12 +2810,41 @@ mod tests {
             (global_time.as_nanos(), global_time.threads_time(dettid))
         };
         let fresh_local_time = DetTime::new(&config);
+        state.pending_exec_states.lock().unwrap().insert(
+            detpid,
+            PendingExecState {
+                caller: dettid,
+                process: detpid,
+                mm: old_mm,
+                fd_blocking: Default::default(),
+            },
+        );
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .install_test_exec_incarnation(dettid, old_mm);
+        let in_flight_exec_response = state
+            .receive_rpc(
+                reverie::Tid::from_raw(dettid.as_raw()),
+                (
+                    existing_time.clone(),
+                    old_mm.for_exec(detpid),
+                    GlobalRequest::ReportUnsupportedSyscall("exec-in-flight".to_owned()),
+                ),
+            )
+            .await;
+        assert_eq!(
+            in_flight_exec_response.1,
+            GlobalResponse::ReportUnsupportedSyscall(())
+        );
 
         let create_response = state
             .receive_rpc(
                 reverie::Tid::from_raw(dettid.as_raw()),
                 (
                     fresh_local_time.clone(),
+                    MmId::initial(dettid),
                     GlobalRequest::CreateChildThread(
                         dettid,
                         detpid,
@@ -2604,7 +2857,10 @@ mod tests {
             .await;
         assert_eq!(
             create_response,
-            (Some(thread_before), GlobalResponse::CreateChildThread(()))
+            (
+                Some(thread_before),
+                GlobalResponse::CreateChildThread(Some(old_mm.for_exec(detpid)))
+            )
         );
 
         let start_response = state
@@ -2612,6 +2868,7 @@ mod tests {
                 reverie::Tid::from_raw(dettid.as_raw()),
                 (
                     fresh_local_time,
+                    old_mm.for_exec(detpid),
                     GlobalRequest::StartNewThread(dettid, detpid),
                 ),
             )
@@ -2623,11 +2880,345 @@ mod tests {
 
         let scheduler = state.sched.lock().unwrap();
         assert!(!scheduler.thread_is_logically_killed(dettid));
+        assert!(scheduler.thread_is_logically_killed(sibling));
         assert_eq!(scheduler.next_turns.len(), 1);
+        assert!(matches!(sibling_request.try_read(), Some(Err(_))));
+        assert!(
+            scheduler.child_tid_was_cleared(FutexID::private(old_mm, 0x1234), sibling.as_raw())
+        );
         drop(scheduler);
         let global_time = state.global_time.lock().unwrap();
         assert_eq!(global_time.as_nanos(), global_before);
         assert_eq!(global_time.threads_time(dettid), thread_before);
+    }
+
+    #[tokio::test]
+    async fn nonleader_exec_rebinds_caller_to_leader_and_preserves_its_clock() {
+        let (config, state, leader, detpid) = cancellation_test_state();
+        let worker = DetTid::from_raw(leader.as_raw() + 1);
+        let sibling = DetTid::from_raw(leader.as_raw() + 2);
+        let old_mm = MmId::initial(detpid).for_exec(detpid);
+        let leader_request = Ivar::new();
+        let worker_request = Ivar::new();
+        let sibling_request = Ivar::new();
+        install_test_registration(&state, leader, leader_request.clone());
+        {
+            let mut scheduler = state.sched.lock().unwrap();
+            scheduler.thread_tree.add_child(leader, worker, false);
+            scheduler.thread_tree.add_child(leader, sibling, false);
+        }
+        install_test_registration(&state, worker, worker_request.clone());
+        install_test_registration(&state, sibling, sibling_request.clone());
+        {
+            let mut scheduler = state.sched.lock().unwrap();
+            scheduler
+                .next_turns
+                .get_mut(&sibling)
+                .unwrap()
+                .child_tid_addr = 0x5678;
+            scheduler
+                .timeslices
+                .insert(leader, Some(LogicalTime::from_nanos(99)));
+            scheduler.install_test_vfork_barrier(leader, sibling);
+        }
+
+        let mut leader_clock = DetTime::new(&config);
+        leader_clock.add_syscall();
+        let mut worker_clock = DetTime::new(&config);
+        worker_clock.add_syscall();
+        worker_clock.add_syscall();
+        worker_clock.add_syscall();
+        {
+            let mut global_time = state.global_time.lock().unwrap();
+            global_time.update_global_time(leader, leader_clock.as_nanos());
+            global_time.update_global_time(worker, worker_clock.as_nanos());
+        }
+        let total_before = state.global_time.lock().unwrap().as_nanos();
+        let fd_blocking: ExecFdBlockingOverrides = [42].into_iter().collect();
+        state.pending_exec_states.lock().unwrap().insert(
+            detpid,
+            PendingExecState {
+                caller: worker,
+                process: detpid,
+                mm: old_mm,
+                fd_blocking: fd_blocking.clone(),
+            },
+        );
+        let fresh_local_time = DetTime::new(&config);
+
+        let create_response = state
+            .receive_rpc(
+                reverie::Tid::from_raw(leader.as_raw()),
+                (
+                    fresh_local_time.clone(),
+                    MmId::initial(leader),
+                    GlobalRequest::CreateChildThread(
+                        leader,
+                        detpid,
+                        0,
+                        None,
+                        Some(DEFAULT_PRIORITY),
+                    ),
+                ),
+            )
+            .await;
+        assert_eq!(
+            create_response,
+            (
+                Some(worker_clock.as_nanos()),
+                GlobalResponse::CreateChildThread(Some(old_mm.for_exec(detpid)))
+            )
+        );
+        assert!(state.pending_exec_states.lock().unwrap().is_empty());
+        assert_eq!(
+            state.post_exec_fd_blocking.lock().unwrap().get(&leader),
+            Some(&fd_blocking)
+        );
+
+        let late_old_request = state
+            .receive_rpc(
+                reverie::Tid::from_raw(leader.as_raw()),
+                (
+                    leader_clock.clone(),
+                    old_mm,
+                    GlobalRequest::RequestResources(Resources::new(leader), detpid),
+                ),
+            )
+            .await;
+        assert_eq!(late_old_request, (None, GlobalResponse::ThreadExited));
+        let admitted_before_fence = state
+            .recv_request_resources(
+                reverie::Tid::from_raw(leader.as_raw()),
+                detpid,
+                Resources::new(leader),
+                Some(old_mm),
+            )
+            .await;
+        assert_eq!(
+            admitted_before_fence,
+            (SchedulerRpcResult::ThreadExited, None)
+        );
+        let late_old_deregister = state
+            .receive_rpc(
+                reverie::Tid::from_raw(leader.as_raw()),
+                (
+                    leader_clock.clone(),
+                    old_mm,
+                    GlobalRequest::DeregisterThread(ThreadDeregistration {
+                        dettid: leader,
+                        detpid,
+                        mm: old_mm,
+                        timeslice_stats: TimesliceStats::default(),
+                        chaos_epochs: Vec::new(),
+                    }),
+                ),
+            )
+            .await;
+        assert_eq!(
+            late_old_deregister,
+            (None, GlobalResponse::DeregisterThread(()))
+        );
+        let duplicate_create = state
+            .receive_rpc(
+                reverie::Tid::from_raw(leader.as_raw()),
+                (
+                    fresh_local_time.clone(),
+                    MmId::initial(leader),
+                    GlobalRequest::CreateChildThread(
+                        leader,
+                        detpid,
+                        0,
+                        None,
+                        Some(DEFAULT_PRIORITY),
+                    ),
+                ),
+            )
+            .await;
+        assert_eq!(duplicate_create, (None, GlobalResponse::ThreadExited));
+
+        {
+            let mut scheduler = state.sched.lock().unwrap();
+            assert!(!scheduler.thread_is_logically_killed(leader));
+            assert!(scheduler.thread_is_logically_killed(worker));
+            assert!(scheduler.thread_is_logically_killed(sibling));
+            assert_eq!(scheduler.next_turns.len(), 1);
+            assert!(scheduler.next_turns.contains_key(&leader));
+            assert!(!scheduler.timeslices.contains_key(&leader));
+            assert!(!scheduler.vfork_barrier_mentions(leader));
+            assert!(!scheduler.vfork_barrier_mentions(sibling));
+            assert!(matches!(leader_request.try_read(), Some(Err(_))));
+            assert!(matches!(worker_request.try_read(), Some(Err(_))));
+            assert!(matches!(sibling_request.try_read(), Some(Err(_))));
+            assert!(
+                scheduler
+                    .child_tid_was_cleared(FutexID::private(old_mm, 0x5678), sibling.as_raw(),)
+            );
+            scheduler.next_turns.get_mut(&leader).unwrap().resp =
+                Ivar::full(SchedResponse::Go(None));
+        }
+
+        let start_response = state
+            .receive_rpc(
+                reverie::Tid::from_raw(leader.as_raw()),
+                (
+                    fresh_local_time,
+                    old_mm.for_exec(detpid),
+                    GlobalRequest::StartNewThread(leader, detpid),
+                ),
+            )
+            .await;
+        assert_eq!(
+            start_response,
+            (
+                Some(worker_clock.as_nanos()),
+                GlobalResponse::StartNewThread(None)
+            )
+        );
+        {
+            let global_time = state.global_time.lock().unwrap();
+            assert_eq!(global_time.as_nanos(), total_before);
+            assert_eq!(global_time.threads_time(leader), worker_clock.as_nanos());
+            assert!(!global_time.contains_thread(worker));
+        }
+
+        let mark_response = state
+            .receive_rpc(
+                reverie::Tid::from_raw(leader.as_raw()),
+                (
+                    worker_clock,
+                    old_mm.for_exec(detpid),
+                    GlobalRequest::MarkPastFirstExecve,
+                ),
+            )
+            .await;
+        assert_eq!(
+            mark_response.1,
+            GlobalResponse::MarkPastFirstExecve(fd_blocking)
+        );
+        assert!(state.post_exec_fd_blocking.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_exec_clears_prepared_state_without_retiring_siblings() {
+        let (config, state, leader, detpid) = cancellation_test_state();
+        let sibling = DetTid::from_raw(leader.as_raw() + 1);
+        install_test_registration(&state, leader, Ivar::new());
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(leader, sibling, false);
+        install_test_registration(&state, sibling, Ivar::new());
+        let clock = DetTime::new(&config);
+
+        let prepared = state
+            .receive_rpc(
+                reverie::Tid::from_raw(leader.as_raw()),
+                (
+                    clock.clone(),
+                    MmId::initial(leader),
+                    GlobalRequest::PrepareExec(detpid, MmId::initial(detpid), Default::default()),
+                ),
+            )
+            .await;
+        assert_eq!(prepared.1, GlobalResponse::PrepareExec(()));
+        assert!(
+            state
+                .pending_exec_states
+                .lock()
+                .unwrap()
+                .contains_key(&detpid)
+        );
+
+        let cancelled = state
+            .receive_rpc(
+                reverie::Tid::from_raw(leader.as_raw()),
+                (
+                    clock,
+                    MmId::initial(leader),
+                    GlobalRequest::CancelExec(detpid),
+                ),
+            )
+            .await;
+        assert_eq!(cancelled.1, GlobalResponse::CancelExec(()));
+        assert!(state.pending_exec_states.lock().unwrap().is_empty());
+        {
+            let scheduler = state.sched.lock().unwrap();
+            assert!(!scheduler.thread_is_logically_killed(leader));
+            assert!(!scheduler.thread_is_logically_killed(sibling));
+            assert_eq!(scheduler.next_turns.len(), 2);
+        }
+
+        state.pending_exec_states.lock().unwrap().insert(
+            detpid,
+            PendingExecState {
+                caller: leader,
+                process: detpid,
+                mm: MmId::initial(detpid),
+                fd_blocking: Default::default(),
+            },
+        );
+        state
+            .post_exec_fd_blocking
+            .lock()
+            .unwrap()
+            .insert(leader, [42].into_iter().collect());
+        state
+            .recv_deregister_thread(
+                reverie::Tid::from_raw(leader.as_raw()),
+                ThreadDeregistration {
+                    dettid: leader,
+                    detpid,
+                    mm: MmId::initial(detpid),
+                    timeslice_stats: TimesliceStats::default(),
+                    chaos_epochs: Vec::new(),
+                },
+            )
+            .await;
+        assert!(state.pending_exec_states.lock().unwrap().is_empty());
+        assert!(state.post_exec_fd_blocking.lock().unwrap().is_empty());
+
+        state.pending_exec_states.lock().unwrap().insert(
+            detpid,
+            PendingExecState {
+                caller: leader,
+                process: detpid,
+                mm: MmId::initial(detpid),
+                fd_blocking: Default::default(),
+            },
+        );
+        state
+            .recv_deregister_thread(
+                reverie::Tid::from_raw(leader.as_raw()),
+                ThreadDeregistration {
+                    dettid: leader,
+                    detpid,
+                    mm: MmId::initial(detpid).for_exec(detpid),
+                    timeslice_stats: TimesliceStats::default(),
+                    chaos_epochs: Vec::new(),
+                },
+            )
+            .await;
+        assert!(state.pending_exec_states.lock().unwrap().is_empty());
+
+        state.pending_exec_states.lock().unwrap().insert(
+            detpid,
+            PendingExecState {
+                caller: leader,
+                process: detpid,
+                mm: MmId::initial(detpid),
+                fd_blocking: Default::default(),
+            },
+        );
+        state
+            .post_exec_fd_blocking
+            .lock()
+            .unwrap()
+            .insert(leader, [42].into_iter().collect());
+        state.complete_physical_process_exit(detpid.as_raw());
+        assert!(state.pending_exec_states.lock().unwrap().is_empty());
+        assert!(state.post_exec_fd_blocking.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2704,8 +3295,10 @@ mod tests {
         let detpid = DetPid::from_raw(17);
         let response = state
             .recv_futex_action(
-                reverie::Tid::from_raw(17),
-                dettid,
+                RpcIncarnation {
+                    dettid,
+                    mm: MmId::initial(detpid),
+                },
                 FutexAction::WaitRequest(None),
                 FutexID::private(MmId::initial(detpid), 0x1000),
                 0,
@@ -2760,8 +3353,10 @@ mod tests {
 
         let response = state
             .recv_futex_action(
-                reverie::Tid::from_raw(detpid.as_raw()),
-                detpid,
+                RpcIncarnation {
+                    dettid: detpid,
+                    mm: MmId::initial(detpid),
+                },
                 FutexAction::WaitRequest(None),
                 futex,
                 child.as_raw(),
@@ -2801,6 +3396,7 @@ mod tests {
                 reverie::Tid::from_raw(dettid.as_raw()),
                 (
                     late_time,
+                    MmId::initial(dettid),
                     GlobalRequest::RequestResources(Resources::new(dettid), detpid),
                 ),
             )
@@ -2843,6 +3439,7 @@ mod tests {
                 reverie::Tid::from_raw(dettid.as_raw()),
                 (
                     late_time.clone(),
+                    MmId::initial(dettid),
                     GlobalRequest::DeregisterThread(ThreadDeregistration {
                         dettid,
                         detpid,
@@ -2870,6 +3467,7 @@ mod tests {
                 reverie::Tid::from_raw(dettid.as_raw()),
                 (
                     late_time,
+                    MmId::initial(dettid),
                     GlobalRequest::DeregisterThread(ThreadDeregistration {
                         dettid,
                         detpid,
@@ -2922,6 +3520,7 @@ mod tests {
                 reverie::Tid::from_raw(parent.as_raw()),
                 (
                     DetTime::new(&config),
+                    MmId::initial(parent),
                     GlobalRequest::CreateChildThread(
                         child,
                         detpid,
@@ -2951,6 +3550,7 @@ mod tests {
             reverie::Tid::from_raw(dettid.as_raw()),
             detpid,
             Resources::new(dettid),
+            None,
         );
         let kill_after_request = async {
             while request_seen.try_read().is_none() {
@@ -3014,7 +3614,7 @@ mod tests {
         install_test_registration(&state, dettid, request_seen.clone());
         install_test_registration(&state, next_tid, Ivar::new());
 
-        let replay = state.recv_trace_schedevent(event, detpid);
+        let replay = state.recv_trace_schedevent(event, detpid, MmId::initial(detpid));
         let kill_after_replay_yield = async {
             while request_seen.try_read().is_none() {
                 tokio::task::yield_now().await;
@@ -3043,6 +3643,7 @@ mod tests {
             reverie::Tid::from_raw(dettid.as_raw()),
             (
                 DetTime::new(&config),
+                MmId::initial(dettid),
                 GlobalRequest::StartNewThread(dettid, detpid),
             ),
         );
@@ -3076,7 +3677,10 @@ mod tests {
         let alarm = state
             .recv_register_alarm(
                 detpid,
-                dettid,
+                RpcIncarnation {
+                    dettid,
+                    mm: MmId::initial(detpid),
+                },
                 now,
                 LogicalTime::from_nanos(10),
                 LogicalTime::ZERO,
@@ -3088,7 +3692,10 @@ mod tests {
         let posix = state
             .recv_register_posix_timer(
                 detpid,
-                dettid,
+                RpcIncarnation {
+                    dettid,
+                    mm: MmId::initial(detpid),
+                },
                 1,
                 Some(now + LogicalTime::from_nanos(10)),
                 LogicalTime::ZERO,
@@ -3107,6 +3714,7 @@ mod tests {
             reverie::Tid::from_raw(dettid.as_raw()),
             (
                 DetTime::new(&config),
+                MmId::initial(dettid),
                 GlobalRequest::FutexAction(
                     dettid,
                     FutexAction::WaitRequest(None),
@@ -3145,6 +3753,7 @@ mod tests {
             reverie::Tid::from_raw(parent.as_raw()),
             (
                 DetTime::new(&config),
+                MmId::initial(parent),
                 GlobalRequest::CreateChildThread(child, detpid, 0, None, Some(DEFAULT_PRIORITY)),
             ),
         );

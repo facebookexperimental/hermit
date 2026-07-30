@@ -140,6 +140,17 @@ pub struct ThreadNextTurn {
     pub resp: Ivar<SchedResponse>,
 }
 
+/// State needed to replace a process's scheduler identity after successful exec.
+pub(crate) struct ExecReconnect {
+    pub caller: DetTid,
+    pub new_leader: DetTid,
+    pub detpid: DetPid,
+    pub pre_exec_mm: MmId,
+    pub post_exec_mm: MmId,
+    pub child_tid_addr: usize,
+    pub reconnect_priority: Option<Priority>,
+}
+
 /// Request for resources when the thread next parks.
 /// OR the thread might "park" because it's really exited.
 pub type SchedRequest = Result<Resources, ThreadExited>;
@@ -307,6 +318,9 @@ pub struct Scheduler {
     /// Raw TIDs removed by logical teardown. Tombstones are permanent for the life of this
     /// scheduler: accepting Linux TID reuse would let delayed backend RPCs bind to a new thread.
     logically_killed_threads: BTreeSet<DetTid>,
+
+    /// Accepted address-space incarnation for raw TIDs explicitly reused by exec.
+    exec_incarnations: BTreeMap<DetTid, MmId>,
 
     /// Tombstoned SaBRe threads whose final asynchronous deregistration statistics were merged.
     /// Logical exit-group teardown and physical exit cleanup are distinct events.
@@ -947,6 +961,7 @@ impl Scheduler {
             cleared_child_tids: Default::default(),
             cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
             logically_killed_threads: Default::default(),
+            exec_incarnations: Default::default(),
             deregistration_accounted: Default::default(),
             backend_reports_physical_process_exits: cfg.backend_reports_physical_process_exits,
             pending_physical_process_exits: Default::default(),
@@ -1186,9 +1201,119 @@ impl Scheduler {
         }
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1173): Review SaBRe exec incarnation reconciliation.
+    /// Apply Linux's successful-exec rule when a backend reloads its tool.
+    ///
+    /// Every sibling disappears. If a non-leader called exec, Linux also changes
+    /// that surviving task's TID to the process leader's TID. In that case the old
+    /// caller registration is retired and a fresh leader registration is installed
+    /// before it is removed, so process-exit barriers cannot observe a transiently
+    /// empty thread group.
+    pub fn reconnect_after_exec(&mut self, reconnect: ExecReconnect) -> Vec<DetTid> {
+        let ExecReconnect {
+            caller,
+            new_leader,
+            detpid,
+            pre_exec_mm,
+            post_exec_mm,
+            child_tid_addr,
+            reconnect_priority,
+        } = reconnect;
+        let group = self.thread_tree.my_thread_group(&detpid);
+        assert!(group.contains(&caller));
+        assert!(group.contains(&new_leader));
+        self.exec_incarnations.insert(new_leader, post_exec_mm);
+
+        if caller == new_leader {
+            let siblings: Vec<_> = group.into_iter().filter(|tid| *tid != caller).collect();
+            for sibling in &siblings {
+                self.logically_kill_thread(sibling, &detpid, pre_exec_mm);
+                self.timeslices.remove(sibling);
+            }
+            self.remove_exec_vfork_barriers(&siblings);
+            return siblings;
+        }
+
+        let survivor_priority = self
+            .priorities
+            .get(&caller)
+            .copied()
+            .or(reconnect_priority)
+            .expect("exec caller must have a scheduler priority");
+        let mut retired = Vec::new();
+        for old_tid in group.into_iter().filter(|tid| *tid != caller) {
+            self.logically_kill_thread(&old_tid, &detpid, pre_exec_mm);
+            self.timeslices.remove(&old_tid);
+            retired.push(old_tid);
+        }
+
+        // The leader identity was occupied by a thread the kernel destroyed as
+        // part of this exec. This is the one intentional exception to permanent
+        // raw-TID tombstones: the pending exec record proves why Linux reused it.
+        self.logically_killed_threads.remove(&new_leader);
+        self.deregistration_accounted.remove(&new_leader);
+        self.pending_physical_process_exits.remove(&detpid);
+        assert!(
+            self.next_turns
+                .insert(
+                    new_leader,
+                    ThreadNextTurn {
+                        dettid: new_leader,
+                        child_tid_addr,
+                        req: Ivar::new(),
+                        resp: Ivar::new(),
+                    },
+                )
+                .is_none(),
+            "retired exec leader still had a scheduler registration"
+        );
+        self.priorities.insert(new_leader, survivor_priority);
+        if let Some(writer) = &mut self.preemption_writer {
+            writer.set_current(new_leader, survivor_priority);
+        }
+        self.runqueue_push_back(new_leader);
+        self.started_up.try_put(());
+
+        self.logically_kill_thread(&caller, &detpid, pre_exec_mm);
+        self.timeslices.remove(&caller);
+        retired.push(caller);
+        self.remove_exec_vfork_barriers(&retired);
+        retired
+    }
+
+    fn remove_exec_vfork_barriers(&mut self, retired: &[DetTid]) {
+        self.vfork_barriers.retain(|parent, child| {
+            !retired.contains(parent) && !child.is_some_and(|tid| retired.contains(&tid))
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn vfork_barrier_mentions(&self, dettid: DetTid) -> bool {
+        self.vfork_barriers
+            .iter()
+            .any(|(parent, child)| *parent == dettid || child == &Some(dettid))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_vfork_barrier(&mut self, parent: DetTid, child: DetTid) {
+        self.vfork_barriers.insert(parent, Some(child));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_exec_incarnation(&mut self, dettid: DetTid, mm: MmId) {
+        self.exec_incarnations.insert(dettid, mm);
+    }
+
     // TODO-HUMAN-REVIEW(PR-1023): Review fail-closed SaBRe thread tombstones.
     pub(crate) fn thread_is_logically_killed(&self, dettid: DetTid) -> bool {
         self.cancel_killed_thread_rpcs && self.logically_killed_threads.contains(&dettid)
+    }
+
+    pub(crate) fn rpc_incarnation_matches(&self, dettid: DetTid, mm: MmId) -> bool {
+        self.exec_incarnations
+            .get(&dettid)
+            .is_none_or(|expected| *expected == mm)
     }
 
     /// Mark a physical exit cleanup as accounted. Non-cancelling backends preserve their existing
