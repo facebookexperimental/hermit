@@ -42,6 +42,7 @@ use super::container::IdentityGuard;
 use super::container::apply_affinity;
 use super::container::default_container;
 use super::container::identity_hardening_mounts;
+use super::container::image_container;
 use super::container::with_container;
 use super::global_opts::GlobalOpts;
 use super::tracing::init_file_tracing;
@@ -171,6 +172,7 @@ pub struct RunOpts {
             "bind",
             "network",
             "tmp",
+            "image",
             "namespace_only",
             "analyze_networking",
             "replay_schedule_from",
@@ -203,6 +205,17 @@ pub struct RunOpts {
     /// mounted over `/tmp`, and deleted when the guest has exited.
     #[clap(long, value_name = "dirpath")]
     tmp: Option<PathBuf>,
+
+    /// PROTOTYPE: run the guest against the root filesystem of a pinned OCI image
+    /// instead of the host filesystem. The reference is materialized (pulled and
+    /// unpacked, rootless) via `buildah` and the guest is `chroot`ed into it, so
+    /// its FILE INPUTS come deterministically from the image. Pin by digest for
+    /// reproducibility, e.g.
+    /// `--image docker.io/library/busybox@sha256:...`. The guest program path
+    /// must be absolute and resolve inside the image (e.g. `/bin/sh`). Requires
+    /// namespaces (incompatible with `--no-namespace`).
+    #[clap(long, value_name = "OCI-REFERENCE")]
+    image: Option<String>,
 
     /// Exactly like "seed" but we generate a seed for you. This is useful if multiple
     /// hermit runs execute in parallel and rand based collisions exist.  "Args" generates
@@ -481,6 +494,9 @@ impl fmt::Display for RunOpts {
         if let Some(p) = &self.tmp {
             let s = p.to_str().expect("valid unicode path");
             write!(f, " --tmp={}", shell_words::quote(s))?;
+        }
+        if let Some(image) = &self.image {
+            write!(f, " --image={}", shell_words::quote(image))?;
         }
         match &self.verify_allow {
             VerifyAllow::Success => {} // default
@@ -2041,6 +2057,33 @@ impl RunOpts {
     }
 
     fn validate_program(&self) -> Result<(), Error> {
+        // PROTOTYPE (--image): the guest program is interpreted inside the
+        // materialized OCI rootfs, not on the host filesystem. Resolve and
+        // validate it against the rootfs so that image-only binaries (e.g.
+        // busybox's `/bin/busybox`, absent from the host) are accepted, and so
+        // host binaries that merely happen to share a path are never used. The
+        // program path must be absolute; PATH search inside the image is out of
+        // scope for the prototype. materialize_rootfs is idempotent/cached, so
+        // this does not re-pull the image later in `container()`.
+        if let Some(image) = &self.image {
+            let command = self.guest_command()?;
+            let requested = Path::new(command.get_program());
+            if !requested.is_absolute() {
+                anyhow::bail!(
+                    "With --image, the program path must be absolute inside the image rootfs \
+                     (got {:?}); PATH search inside the image is not yet supported.",
+                    requested
+                );
+            }
+            let rootfs = crate::image::materialize_rootfs(image)?;
+            // Resolve chroot-aware: images (nixos/nix especially) expose
+            // `/bin/sh` as a symlink to an absolute `/nix/store/...` target that
+            // only resolves under the image root, so a naive host `stat` would
+            // follow it against the host `/` and fail.
+            let in_rootfs = crate::image::resolve_in_rootfs(&rootfs, requested);
+            return validate_executable(&in_rootfs, requested);
+        }
+
         if self.selected_backend() == Backend::E9patch {
             let (_, host) = self.resolve_guest_and_host_program()?;
             return validate_executable(&host, &self.program);
@@ -2338,6 +2381,15 @@ impl RunOpts {
 
     /// Returns a configured container to run a function in.
     fn container(&self, tmpfs: &Path) -> Result<(Container, IdentityGuard), Error> {
+        // PROTOTYPE: when an OCI image is requested, the guest runs against the
+        // image's materialized rootfs (deterministic file inputs) rather than
+        // the host filesystem. This replaces the default namespace+mounts setup
+        // with a chroot into the pinned image root.
+        if let Some(image) = &self.image {
+            let rootfs = crate::image::materialize_rootfs(image)?;
+            return image_container(&rootfs, self.pin_threads);
+        }
+
         let mut container = default_container(self.pin_threads);
 
         match &self.network {
@@ -2406,9 +2458,47 @@ impl RunOpts {
         if self.e9patch_program.is_some() {
             command.arg0(&self.program);
         }
+        // PROTOTYPE (--image): the guest lives inside the OCI rootfs, so the
+        // guest working directory must be one that exists under the image root.
+        // Default it to the image's declared `WorkingDir`, else `/` (a bare
+        // chroot leaves cwd pointing at the — now unreachable — host cwd, which
+        // makes `getcwd` fail inside the guest). An explicit `--workdir` wins.
         if let Some(current_dir) = &self.workdir {
             command.current_dir(current_dir);
+        } else if let Some(image) = &self.image {
+            let cfg = crate::image::read_image_config(image)?;
+            command.current_dir(cfg.workdir.as_deref().unwrap_or("/"));
         }
+
+        // PROTOTYPE (--image): an OCI rootfs is a self-contained filesystem, so
+        // leaking the host environment (a host `PATH` full of paths absent from
+        // the image) both breaks usability and undermines determinism. Instead
+        // apply the image's *own* declared `Env` — pinned by the image digest,
+        // hence deterministic — over an otherwise empty base, then merge user
+        // `--env` on top. If the image declares no `PATH`/`HOME` we fall back to
+        // the same hermetic defaults `--base-env=minimal` uses.
+        if let Some(image) = &self.image {
+            command.env_clear();
+            let cfg = crate::image::read_image_config(image)?;
+            let declares_path = cfg.env.iter().any(|(k, _)| k == "PATH");
+            let declares_home = cfg.env.iter().any(|(k, _)| k == "HOME");
+            command.env("HOSTNAME", "hermetic-container.local");
+            if !declares_path {
+                command.env(
+                    "PATH",
+                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                );
+            }
+            if !declares_home {
+                command.env("HOME", "/root");
+            }
+            for (key, value) in &cfg.env {
+                command.env(key, value);
+            }
+            self.merge_from_env_settings(&mut command)?;
+            return Ok(command);
+        }
+
         match self.base_env {
             BaseEnv::Empty => {
                 command.env_clear();

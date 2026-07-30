@@ -23,6 +23,7 @@ mod bnz;
 mod clean;
 mod container;
 mod global_opts;
+mod image;
 mod instruction_map;
 mod list;
 mod logdiff;

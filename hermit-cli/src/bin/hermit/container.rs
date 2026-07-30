@@ -27,8 +27,20 @@ const OVERFLOW_GID: &str = "65534";
 // caller until after `Container::run` returns so the backing temp files still
 // exist when the child binds them.
 pub(super) struct IdentityGuard {
-    _group_file: tempfile::NamedTempFile,
+    _group_file: Option<tempfile::NamedTempFile>,
     _nscd_dir: Option<tempfile::TempDir>,
+}
+
+impl IdentityGuard {
+    /// A guard that owns no backing temp files, for container configurations
+    /// (e.g. `--image`) that supply their filesystem from another source and do
+    /// not use the frozen-identity bind mounts.
+    pub(super) fn empty() -> Self {
+        Self {
+            _group_file: None,
+            _nscd_dir: None,
+        }
+    }
 }
 
 /// Snapshot the host group database into a private temp file, appending a
@@ -87,7 +99,7 @@ pub(super) fn identity_hardening_mounts() -> Result<(Vec<Mount>, IdentityGuard),
     Ok((
         mounts,
         IdentityGuard {
-            _group_file: group_file,
+            _group_file: Some(group_file),
             _nscd_dir: nscd_dir,
         },
     ))
@@ -112,6 +124,49 @@ pub fn default_container(pin_threads: bool) -> Container {
 
     apply_affinity(&mut container, pin_threads);
     container
+}
+
+/// PROTOTYPE: a container whose root filesystem is a materialized OCI image
+/// rootfs. This is the *filesystem half* of hermit-as-container-runtime: the
+/// guest's file inputs come deterministically from the pinned image rather than
+/// from the host filesystem.
+///
+/// Like the replay chroot path (`replay.rs`), mounts are applied at their
+/// literal (pre-chroot) target paths and then `chroot(rootfs)` makes them
+/// visible under the new root. We therefore mount the deterministic `/proc`
+/// *into* `<rootfs>/proc` (pre-created by the materializer) before chrooting, so
+/// the guest sees a `/proc` after entering the image root. The image already
+/// carries its own `/etc/group`, loader, and libc — pinned by the image digest —
+/// so the frozen-identity hardening mounts that `run` normally adds are
+/// unnecessary here; the returned [`IdentityGuard`] is empty.
+///
+/// This filesystem layer is deliberately backend-agnostic: it configures the
+/// mount namespace and root before any Detcore/Reverie backend attaches, so the
+/// same rootfs applies whether execution is driven by ptrace, DBI, or KVM. See
+/// the prototype write-up for the per-backend composition notes.
+pub(super) fn image_container(
+    rootfs: &Path,
+    pin_threads: bool,
+) -> Result<(Container, IdentityGuard), Error> {
+    let mut container = Container::new();
+    container
+        .unshare(Namespace::PID)
+        .map_root()
+        .hostname("hermetic-container.local")
+        .domainname("local");
+
+    // Mount the deterministic /proc into the target root. The materializer
+    // guarantees <rootfs>/proc exists, so we do not need `touch_target()` (which
+    // defers dir creation to the pre-exec child on a tiny clone stack).
+    let proc_target = rootfs.join("proc");
+    container.mount(Mount::proc().target(&proc_target));
+
+    // Enter the image root last, mirroring the replay chroot ordering
+    // (mounts first, then chroot).
+    container.chroot(rootfs);
+
+    apply_affinity(&mut container, pin_threads);
+    Ok((container, IdentityGuard::empty()))
 }
 
 /// A [`default_container`] hardened with the deterministic identity mounts
@@ -154,7 +209,11 @@ mod tests {
             !mounts.is_empty(),
             "expected at least the frozen /etc/group mount"
         );
-        let contents = fs::read_to_string(guard._group_file.path())
+        let group_file = guard
+            ._group_file
+            .as_ref()
+            .expect("identity hardening must produce a frozen group file");
+        let contents = fs::read_to_string(group_file.path())
             .expect("frozen group database should be readable");
         assert!(
             contents
