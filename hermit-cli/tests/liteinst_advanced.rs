@@ -215,6 +215,24 @@ fn liteinst_strict_verify_python_entropy() {
     );
 }
 
+#[test]
+fn liteinst_strict_verify_python_random_example() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let output = run_liteinst_strict_verify(&repository.join("examples/rand.py"), &[]);
+    let stdout = String::from_utf8(output.stdout).expect("Python output should be UTF-8");
+    let values = stdout
+        .split_whitespace()
+        .map(|field| field.parse::<u8>().expect("random value should be decimal"))
+        .collect::<Vec<_>>();
+    assert_eq!(values.len(), 10, "stdout={stdout:?}");
+    assert!(
+        values.iter().all(|value| (1..=101).contains(value)),
+        "stdout={stdout:?}"
+    );
+}
+
 fn assert_clone_boundary(mode: &str) {
     liteinst_runtime::ensure_liteinst_runtime();
     let mut child = Command::new(liteinst_runtime::hermit_binary())
