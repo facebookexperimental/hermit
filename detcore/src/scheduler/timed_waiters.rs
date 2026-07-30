@@ -35,12 +35,27 @@ pub struct TimedEvents {
 pub(crate) enum SignalTimerId {
     Alarm(DetPid),
     Posix(DetPid, i32),
+    /// A deterministic child-exit `SIGCHLD`, synthesized at the child's
+    /// scheduler-ordered `Exit` grant (`t_exit`) rather than delivered by the
+    /// host-async kernel signal. `child` is the exiting process (a unique
+    /// coalescing key so multiple reaped children never collide); `parent` is
+    /// the process that receives the signal. Unlike `Alarm`/`Posix`, a
+    /// `ChildExit` event is one-shot and is never re-armed or cancelled, so it
+    /// is inserted directly into the timed `map` and bypasses the
+    /// `signal_timers` re-arm bookkeeping (see `insert_child_exit`).
+    ChildExit {
+        child: DetPid,
+        parent: DetPid,
+    },
 }
 
 impl SignalTimerId {
+    /// The process the timed signal is delivered to. For `ChildExit` this is the
+    /// *parent* (the reaper), not the exiting child.
     pub(super) fn process(self) -> DetPid {
         match self {
             Self::Alarm(pid) | Self::Posix(pid, _) => pid,
+            Self::ChildExit { parent, .. } => parent,
         }
     }
 }
@@ -165,6 +180,33 @@ impl TimedEvents {
             .map(|state| (state.deadline, state.interval))
     }
 
+    /// Register a one-shot, deterministic child-exit `SIGCHLD` to be delivered to
+    /// `parent` (via thread `parent_tid`) at logical time `ns` (the child's
+    /// `Exit` grant time plus a tick). Inserted directly into the timed `map`,
+    /// deliberately bypassing the `signal_timers` re-arm/cancel bookkeeping used
+    /// by `alarm`/`setitimer`/POSIX timers: a child exit fires exactly once and
+    /// is never re-armed or replaced, and its key (`ChildExit{child,parent}`) is
+    /// unique per exiting child, so it cannot collide with a concurrent
+    /// `Alarm`/`Posix` timer on the same process. If an identical event is
+    /// already queued at `ns` (the same child reported twice), the insert is a
+    /// no-op — the redundant delivery is coalesced, matching Linux `SIGCHLD`.
+    pub fn insert_child_exit(
+        &mut self,
+        ns: LogicalTime,
+        child: DetPid,
+        parent: DetPid,
+        parent_tid: DetTid,
+    ) {
+        let evt = TimedEvent::SignalEvt(
+            SignalTimerId::ChildExit { child, parent },
+            parent_tid,
+            Signal::SIGCHLD,
+        );
+        // BTreeSet::insert returns false on a duplicate; coalescing it is
+        // intentional (see doc comment) rather than a panic.
+        self.map.entry(ns).or_default().insert(evt);
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#869)
     pub fn insert_posix_timer(
@@ -210,6 +252,9 @@ impl TimedEvents {
             .copied()
             .filter(|id| match id {
                 SignalTimerId::Alarm(pid) | SignalTimerId::Posix(pid, _) => *pid == dp,
+                // `ChildExit` events are never stored in `signal_timers`, so this
+                // arm is unreachable in practice; it exists only for exhaustiveness.
+                SignalTimerId::ChildExit { .. } => false,
             })
             .collect();
         for id in ids {
@@ -452,6 +497,92 @@ mod test {
         assert_eq!(ev.pop_if_before(at(1250)), Some((at(1250), event)));
         assert_eq!(ev.remove_alarm(p), Some((at(1500), at(250))));
         assert!(ev.is_empty());
+    }
+
+    /// A deterministic child-exit `SIGCHLD` must coexist with an `alarm(2)` on the
+    /// *same* process at the *same* deadline without hitting the
+    /// `insert_signal_timer` "already in set" panic (the collision that motivated
+    /// the distinct `ChildExit` key), and must be delivered to the parent.
+    #[test]
+    fn child_exit_coexists_with_process_alarm_at_same_deadline() {
+        let mut ev = TimedEvents::default();
+        let parent = pid(100);
+        let child = pid(200);
+        let deadline = at(1_000);
+
+        // Parent has an armed alarm...
+        ev.insert_alarm(
+            deadline,
+            parent,
+            tid(100),
+            Signal::SIGALRM,
+            LogicalTime::ZERO,
+        );
+        // ...and simultaneously reaps a child at the same logical time.
+        ev.insert_child_exit(deadline, child, parent, tid(100));
+
+        // Both are queued (no panic); popping yields the SIGALRM and the SIGCHLD.
+        let first = ev.pop().expect("first event");
+        let second = ev.pop().expect("second event");
+        let popped = [first.1, second.1];
+        assert!(popped.contains(&TimedEvent::SignalEvt(
+            SignalTimerId::Alarm(parent),
+            tid(100),
+            Signal::SIGALRM
+        )));
+        assert!(popped.contains(&TimedEvent::SignalEvt(
+            SignalTimerId::ChildExit { child, parent },
+            tid(100),
+            Signal::SIGCHLD
+        )));
+        assert!(ev.is_empty());
+
+        // The alarm bookkeeping is untouched by the child-exit event: re-arming
+        // sees no stale state (the fired alarm cleared itself) and does not panic.
+        assert_eq!(
+            ev.insert_alarm(
+                at(2_000),
+                parent,
+                tid(100),
+                Signal::SIGALRM,
+                LogicalTime::ZERO
+            ),
+            None
+        );
+    }
+
+    /// Two reports of the same child exit at the same deadline coalesce to a
+    /// single `SIGCHLD`, matching Linux non-RT signal semantics; distinct
+    /// children produce distinct events.
+    #[test]
+    fn child_exit_coalesces_duplicate_and_keeps_distinct_children() {
+        let mut ev = TimedEvents::default();
+        let parent = pid(100);
+        let deadline = at(1_000);
+
+        ev.insert_child_exit(deadline, pid(200), parent, tid(100));
+        ev.insert_child_exit(deadline, pid(200), parent, tid(100)); // duplicate: coalesced
+        ev.insert_child_exit(deadline, pid(201), parent, tid(100)); // distinct child
+
+        assert_eq!(ev.iter().count(), 2);
+        assert!(ev.iter().any(|(_, e)| e
+            == TimedEvent::SignalEvt(
+                SignalTimerId::ChildExit {
+                    child: pid(200),
+                    parent
+                },
+                tid(100),
+                Signal::SIGCHLD
+            )));
+        assert!(ev.iter().any(|(_, e)| e
+            == TimedEvent::SignalEvt(
+                SignalTimerId::ChildExit {
+                    child: pid(201),
+                    parent
+                },
+                tid(100),
+                Signal::SIGCHLD
+            )));
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

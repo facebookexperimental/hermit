@@ -548,6 +548,14 @@ pub struct ThreadTree {
     /// transitive closure of `thread_tree`).  Every thread should have an entry in
     /// here. If, however, a thread is a group leader, this will map back to itself.
     thread_to_leader: HashMap<DetTid, DetPid>,
+
+    /// Reverse map from a process (group-leader `DetPid`) to the `DetPid` of the
+    /// process that created it. Populated when a new group leader is registered
+    /// (a `clone`/`fork` without `CLONE_THREAD`); the root process has no entry.
+    /// Used to target a deterministic child-exit `SIGCHLD` at the reaping
+    /// parent. Entries are not removed on exit (mirroring `tree`/`thread_to_leader`);
+    /// a stale parent is handled gracefully by `select_signal_target`.
+    process_parent: HashMap<DetPid, DetPid>,
 }
 
 use pretty::Doc;
@@ -675,6 +683,14 @@ impl ThreadTree {
         if is_group_leader {
             self.thread_group_leaders.insert(child_dettid);
             self.thread_to_leader.insert(child_dettid, child_dettid);
+            // Record the creating process (the parent thread's group leader) so a
+            // deterministic child-exit SIGCHLD can later be targeted at it. The
+            // root process (parent == child) has no parent process.
+            if parent_dettid != child_dettid
+                && let Some(parent_leader) = self.thread_to_leader.get(&parent_dettid).copied()
+            {
+                self.process_parent.insert(child_dettid, parent_leader);
+            }
         } else {
             let parent_leader: DetPid =
                     *self
@@ -686,6 +702,14 @@ impl ThreadTree {
                         });
             self.thread_to_leader.insert(child_dettid, parent_leader);
         }
+    }
+
+    /// The process that created `pid` (its parent process), if `pid` is not the
+    /// root process. Returns a possibly-stale parent if that process has since
+    /// exited; callers deliver through `select_signal_target`, which drops a
+    /// signal to a `Gone` target.
+    pub fn parent_process(&self, pid: &DetPid) -> Option<DetPid> {
+        self.process_parent.get(pid).copied()
     }
 
     /// Return the set of thread IDs in the "same process" as me (same TGID), including
@@ -1869,6 +1893,30 @@ impl Scheduler {
         {
             match evt {
                 TimedEvent::ThreadEvt(dtid) => self.wake_timed_event(time_ns, dtid),
+                TimedEvent::SignalEvt(
+                    timed_waiters::SignalTimerId::ChildExit { parent, .. },
+                    dtid,
+                    sig,
+                ) => {
+                    // Deterministic child-exit SIGCHLD. If the host-async signal
+                    // already arrived and was parked by the InboundSignal deferral
+                    // gate, release it now at this logical time — that real signal
+                    // is sufficient, so do not also synthesize one (avoids a
+                    // duplicate delivery). Otherwise synthesize the delivery so the
+                    // parent is notified deterministically regardless of host
+                    // signal latency. Either way mark the parent `sigchld_ready` so
+                    // its InboundSignal turn is granted here rather than deferred a
+                    // second time. Releasing the deferred signal at a logical
+                    // deadline (rather than only at run-queue quiescence, as
+                    // step2e does) is what breaks the redis_deep starvation
+                    // deadlock: a busy sibling can no longer starve the reaper.
+                    self.blocked.sigchld_ready.insert(parent);
+                    if self.blocked.sigchld_deferred.remove(&parent) {
+                        self.run_queue.push_eager_io_repoll(parent);
+                    } else {
+                        self.fire_alarm(parent, dtid, sig);
+                    }
+                }
                 TimedEvent::SignalEvt(id, dtid, sig) => self.fire_alarm(id.process(), dtid, sig),
             }
         }
@@ -2496,7 +2544,24 @@ impl Scheduler {
             ResourceID::Path(_) => Ok(()),
             ResourceID::PathsTransitive(_) => Ok(()),
             ResourceID::Device(_) => Ok(()),
-            ResourceID::Exit { .. } => Ok(()),
+            // The scheduler-ordered `Exit` grant is the deterministic moment a
+            // child process leaves the run set. Register a one-shot child-exit
+            // `SIGCHLD` for the reaping parent, to be delivered at a deterministic
+            // logical time by `step2b_process_timed`, instead of relying on the
+            // host-async kernel `SIGCHLD` whose arrival time is host-timed (the
+            // `make -jN` / redis `--strict --verify` nondeterminism source).
+            ResourceID::Exit { group, process, .. } => {
+                if *group && let Some(parent) = self.thread_tree.parent_process(process) {
+                    // Fire strictly after the current committed time so the event
+                    // is dispatched on a subsequent scheduler pass (DetTid == DetPid
+                    // for a group leader, so `parent` is also the parent thread id).
+                    let deadline = self.committed_time + LogicalTime::from_nanos(1);
+                    self.blocked
+                        .timed_waiters
+                        .insert_child_exit(deadline, *process, parent, parent);
+                }
+                Ok(())
+            }
             ResourceID::ParentContinue { .. } => Ok(()),
             ResourceID::InternalIOPolling => Ok(()),
             ResourceID::FutexWait => Ok(()),
