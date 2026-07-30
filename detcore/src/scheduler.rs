@@ -215,8 +215,10 @@ pub struct BlockedPool {
     /// The protocol here is that the `(request,response)` pair (in `next_turns`) for
     /// threads in `external_io_blockers` will have the request filled in with an
     /// `BlockedExternalContinue` request when the thread is past its blocking action and
-    /// waiting for permission to resume.  The request will stay empty while the thread is
-    /// doing the blocking action.  This is different than the normal relationship
+    /// waiting for permission to resume. A failed operation governed by `BlockingVfork` instead
+    /// reports `VforkFailed`, which follows the same re-admission path after cancelling its
+    /// barrier. The request will stay empty while the thread is doing the blocking action. This is
+    /// different than the normal relationship
     pub external_io_blockers: BTreeMap<DetTid, ExternalOpId>,
 
     /// Parents parked awaiting deterministic delivery of a host-async `SIGCHLD`.
@@ -268,7 +270,7 @@ fn external_continue_id(req: &Resources) -> ExternalOpId {
     assert_eq!(req.resources.len(), 1);
     let rsrc = req.resources.iter().next().unwrap().0;
     match rsrc {
-        ResourceID::BlockedExternalContinue(op_id) => *op_id,
+        ResourceID::BlockedExternalContinue(op_id) | ResourceID::VforkFailed(op_id) => *op_id,
         other => panic!("expected external continue request, got {other:?}"),
     }
 }
@@ -333,6 +335,12 @@ pub struct Scheduler {
     /// final kernel exit status. While the run queue is empty, these prevent virtual timers from
     /// overtaking a child exit that is not physically waitable yet.
     pending_physical_process_exits: BTreeSet<DetPid>,
+
+    /// Whether the backend defers spawning a vfork child until after the parent posts its
+    /// continuation, so an unfulfilled vfork barrier at parent continuation means the child is
+    /// still on its way rather than that the clone failed. See
+    /// [`Config::backend_defers_vfork_child_registration`].
+    backend_defers_vfork_child_registration: bool,
 
     /// Ac table of "locks held": which action is using which resources.
     /// A given resource can be held by at most one action at a given time.
@@ -965,6 +973,7 @@ impl Scheduler {
             deregistration_accounted: Default::default(),
             backend_reports_physical_process_exits: cfg.backend_reports_physical_process_exits,
             pending_physical_process_exits: Default::default(),
+            backend_defers_vfork_child_registration: cfg.backend_defers_vfork_child_registration,
             resources: Default::default(),
             started_up: Default::default(),
             thread_tree: Default::default(),
@@ -1576,21 +1585,50 @@ impl Scheduler {
     /// Keep scheduling inside an active vfork until the parent can continue.
     /// Before child registration no guest may run; afterward step 3 admits only
     /// the child. A failed clone reaches the parent continuation without a child.
+    ///
+    /// On the ptrace backend the kernel keeps the vfork parent blocked inside the injected
+    /// `clone(2)` until the child execs or exits, so a registered child (barrier `Some`) is always
+    /// present by the time the parent posts its continuation; an unfulfilled barrier (`None`) at
+    /// that point therefore means the clone failed and the barrier must be dropped. On a backend
+    /// that defers the child spawn (see `backend_defers_vfork_child_registration`, e.g. KVM) the
+    /// child registers only *after* the parent posts its continuation, so an unfulfilled barrier at
+    /// parent continuation means the child is still on its way and the barrier must be kept.
     fn step2a_wait_for_vfork_barrier(&mut self) -> Result<(), SkipTurn> {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1152): Review deferred vfork child registration.
+        let defers_registration = self.backend_defers_vfork_child_registration;
         let completed_parents: Vec<_> = self
             .vfork_barriers
-            .keys()
-            .copied()
-            .filter(|parent| {
-                self.next_turns
+            .iter()
+            .filter_map(|(parent, registered_child)| {
+                let child_registered = registered_child.is_some();
+                let remove = match self
+                    .next_turns
                     .get(parent)
                     .and_then(|turn| turn.req.try_read())
-                    .is_some_and(|request| match request {
-                        Ok(resources) => resources.resources.keys().any(|resource| {
+                {
+                    // The parent exited: there will be no child; drop the barrier.
+                    Some(Err(ThreadExited)) => true,
+                    Some(Ok(resources)) => {
+                        let vfork_failed = resources
+                            .resources
+                            .keys()
+                            .any(|resource| matches!(resource, ResourceID::VforkFailed(_)));
+                        let at_continue = resources.resources.keys().any(|resource| {
                             matches!(resource, ResourceID::BlockedExternalContinue(_))
-                        }),
-                        Err(ThreadExited) => true,
-                    })
+                        });
+                        // A failed injected clone is an explicit deterministic outcome: no child
+                        // can ever register, so cancel the barrier on every backend. Successful
+                        // deferred spawns retain the ordinary continuation and keep waiting.
+                        // At parent continuation, drop a fulfilled barrier as normal cleanup. An
+                        // unfulfilled barrier is a failed clone only when the backend kept the
+                        // parent blocked until the child registered; when the backend defers child
+                        // registration the child is still coming, so keep waiting.
+                        vfork_failed || (at_continue && (child_registered || !defers_registration))
+                    }
+                    _ => false,
+                };
+                remove.then_some(*parent)
             })
             .collect();
         for parent in completed_parents {
@@ -2222,7 +2260,7 @@ impl Scheduler {
             }
 
             // Thread CONTINUES after completing [potentially] blocking IO.
-            ResourceID::BlockedExternalContinue(_) => {
+            ResourceID::BlockedExternalContinue(_) | ResourceID::VforkFailed(_) => {
                 // We leave the thread out of the run-queue.  At the point we put it back
                 // in, this resource request is immediately granted.
                 Ok(())
@@ -3108,6 +3146,81 @@ mod test {
 
         assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
         assert!(scheduler.vfork_barriers.is_empty());
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1152): Review deferred vfork child registration.
+    #[test]
+    fn vfork_registration_barrier_waits_for_deferred_child_at_continuation() {
+        // On a backend that defers the child spawn (e.g. KVM), the parent posts its continuation
+        // BEFORE the child registers. An unfulfilled barrier at continuation must be kept, not
+        // torn down as a failed clone; otherwise the late child panics on registration.
+        let config = Config {
+            backend_defers_vfork_child_registration: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        let parent = DetTid::from_raw(3);
+        let child = DetTid::from_raw(5);
+        let op_id = ExternalOpId::new(parent, 7);
+        let mut continuation = Resources::new(parent);
+        continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+
+        scheduler.vfork_barriers.insert(parent, None);
+        scheduler.next_turns.insert(
+            parent,
+            ThreadNextTurn {
+                dettid: parent,
+                child_tid_addr: 0,
+                req: Ivar::full(Ok(continuation)),
+                resp: Ivar::new(),
+            },
+        );
+
+        // Parent is at its continuation but the child has not registered: keep waiting, keep the
+        // barrier (the failed-clone teardown must NOT fire on a deferring backend).
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+        assert_eq!(scheduler.vfork_barriers.get(&parent), Some(&None));
+
+        // The deferred child registers; now the barrier is fulfilled and released.
+        scheduler.complete_vfork_registration(parent, child);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert!(scheduler.vfork_barriers.is_empty());
+    }
+
+    // TODO-HUMAN-REVIEW(PR-1152): Review failed deferred-vfork cancellation.
+    #[test]
+    fn vfork_registration_barrier_releases_deferred_failed_clone() {
+        let config = Config {
+            backend_defers_vfork_child_registration: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        let parent = DetTid::from_raw(3);
+        let op_id = ExternalOpId::new(parent, 7);
+        let mut failure = Resources::new(parent);
+        failure.insert(ResourceID::VforkFailed(op_id), Permission::RW);
+
+        scheduler.vfork_barriers.insert(parent, None);
+        scheduler.blocked.external_io_blockers.insert(parent, op_id);
+        scheduler.next_turns.insert(
+            parent,
+            ThreadNextTurn {
+                dettid: parent,
+                child_tid_addr: 0,
+                req: Ivar::full(Ok(failure)),
+                resp: Ivar::new(),
+            },
+        );
+
+        // The explicit failure proves that no deferred child is coming, so step2a cancels the
+        // barrier instead of waiting forever. The ordinary external-continuation path can then
+        // requeue the parent, whose syscall handler still owns and returns the original errno.
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert!(scheduler.vfork_barriers.is_empty());
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(scheduler.blocked.external_io_blockers.is_empty());
+        assert!(scheduler.run_queue.contains_tid(parent));
     }
 
     #[test]

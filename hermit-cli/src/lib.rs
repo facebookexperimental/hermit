@@ -1311,6 +1311,11 @@ fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig 
     config.backend_dispatches_thread_tools = backend != Backend::Kvm;
     config.backend_requires_thread_directed_process_signals = backend == Backend::Dbi;
     config.backend_virtualizes_capability_prctls = backend == Backend::Kvm;
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1152): KVM defers the vfork child spawn, so the child
+    // registers its vfork barrier only after the parent posts BlockedExternalContinue. ptrace keeps
+    // the parent kernel-blocked until the child registers, so this stays false there.
+    config.backend_defers_vfork_child_registration = backend == Backend::Kvm;
     config
 }
 
@@ -1835,6 +1840,7 @@ mod tests {
         assert!(sabre.backend_dispatches_thread_tools);
         assert!(!sabre.backend_requires_thread_directed_process_signals);
         assert!(!sabre.backend_virtualizes_capability_prctls);
+        assert!(!sabre.backend_defers_vfork_child_registration);
         let ptrace = prepare_backend_config(config, Backend::Ptrace);
         assert!(!ptrace.discover_live_file_metadata);
         assert!(!ptrace.use_thread_local_clock_reads);
@@ -1846,6 +1852,7 @@ mod tests {
         assert!(ptrace.backend_dispatches_thread_tools);
         assert!(!ptrace.backend_requires_thread_directed_process_signals);
         assert!(!ptrace.backend_virtualizes_capability_prctls);
+        assert!(!ptrace.backend_defers_vfork_child_registration);
     }
 
     #[test]
@@ -1856,12 +1863,14 @@ mod tests {
         assert!(!kvm.backend_dispatches_thread_tools);
         assert!(!kvm.backend_requires_thread_directed_process_signals);
         assert!(kvm.backend_virtualizes_capability_prctls);
+        assert!(kvm.backend_defers_vfork_child_registration);
     }
 
     #[test]
     fn dbi_backend_config_translates_process_signals_to_host_threads() {
         let config = prepare_backend_config(super::DetConfig::default(), Backend::Dbi);
         assert!(config.backend_requires_thread_directed_process_signals);
+        assert!(!config.backend_defers_vfork_child_registration);
     }
 
     #[test]

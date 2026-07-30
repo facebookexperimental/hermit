@@ -328,15 +328,32 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         if parent_blocks_for_child && self.cfg.sequentialize_threads {
             let mut resources = Resources::new(parent_dettid);
-            resources.insert(
-                ResourceID::BlockedExternalContinue(blocking_child_op_id),
-                Permission::RW,
-            );
-            resources.fyi(if is_vfork {
-                "clone_vfork"
+            if maybe_res.is_err() {
+                // TODO-HUMAN-REVIEW(PR-1152): Review failed deferred-vfork cancellation.
+                // A deferred-spawn backend cannot infer failure from the absence of a registered
+                // child: a successful child also registers after this continuation. Report the
+                // known injected-syscall outcome explicitly so the scheduler can cancel the
+                // barrier and re-admit this parent before we propagate the original error below.
+                resources.insert(
+                    ResourceID::VforkFailed(blocking_child_op_id),
+                    Permission::RW,
+                );
+                resources.fyi(if is_vfork {
+                    "clone_vfork_failed"
+                } else {
+                    "clone_serialized_child_failed"
+                });
             } else {
-                "clone_serialized_child"
-            });
+                resources.insert(
+                    ResourceID::BlockedExternalContinue(blocking_child_op_id),
+                    Permission::RW,
+                );
+                resources.fyi(if is_vfork {
+                    "clone_vfork"
+                } else {
+                    "clone_serialized_child"
+                });
+            }
             resource_request(guest, resources).await;
         }
 

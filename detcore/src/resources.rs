@@ -252,6 +252,13 @@ pub enum ResourceID {
     /// another guest turn until the child has registered or the clone has failed.
     BlockingVfork(ExternalOpId),
 
+    // TODO-HUMAN-REVIEW(PR-1152): Review failed deferred-vfork cancellation.
+    /// A clone operation governed by [`ResourceID::BlockingVfork`] failed before a child could
+    /// register. This is a continuation outcome rather than a new blocking operation: it lets the
+    /// scheduler cancel the pending vfork barrier, re-admit the parent, and preserve the original
+    /// injected syscall error.
+    VforkFailed(ExternalOpId),
+
     /// Permission to CONTINUE execution after returning from a potentially-blocking
     /// operation that reaches outside the container.
     BlockedExternalContinue(ExternalOpId),

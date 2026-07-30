@@ -174,6 +174,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         backend_dispatches_thread_tools: true,
         backend_requires_thread_directed_process_signals: false,
         backend_virtualizes_capability_prctls: false,
+        backend_defers_vfork_child_registration: false,
         has_uts_namespace: true,
         // The path to the directory where syscalls will be recorded.
         replay_data: Some(data.to_path_buf()),
