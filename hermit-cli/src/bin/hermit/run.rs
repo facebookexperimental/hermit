@@ -164,6 +164,11 @@ pub struct RunOpts {
     /// mounting an isolated `/tmp`. This is not a sandbox and must only be used with trusted
     /// guests. Host process, filesystem, and network state are shared, reducing determinism.
     /// Schedule and preemption replay require stable namespace PIDs and are not supported.
+    ///
+    /// Incompatible with `--image`, which chroots the guest into a materialized
+    /// OCI rootfs and therefore requires namespaces; that conflict is reported
+    /// at runtime with an explanatory message rather than as a generic clap
+    /// argument conflict.
     #[clap(
         long,
         visible_alias = "core-only",
@@ -172,7 +177,6 @@ pub struct RunOpts {
             "bind",
             "network",
             "tmp",
-            "image",
             "namespace_only",
             "analyze_networking",
             "replay_schedule_from",
@@ -212,8 +216,11 @@ pub struct RunOpts {
     /// its FILE INPUTS come deterministically from the image. Pin by digest for
     /// reproducibility, e.g.
     /// `--image docker.io/library/busybox@sha256:...`. The guest program path
-    /// must be absolute and resolve inside the image (e.g. `/bin/sh`). Requires
-    /// namespaces (incompatible with `--no-namespace`).
+    /// must resolve inside the image: give an absolute path (e.g. `/bin/sh`) or
+    /// a relative path containing a `/` (e.g. `./bin/sh`), which is resolved
+    /// against the image working directory; a bare command name (PATH search
+    /// inside the image) is not yet supported. Requires namespaces (incompatible
+    /// with `--no-namespace`).
     #[clap(long, value_name = "OCI-REFERENCE")]
     image: Option<String>,
 
@@ -1248,6 +1255,59 @@ fn ptrace_backend_keeps_uts_assumption_with_namespaces() {
 }
 
 #[test]
+fn image_conflicts_with_no_namespace_with_explanatory_error() {
+    // The clap layer no longer lists `image` in `--no-namespace`'s
+    // conflicts_with set, so parsing succeeds; the conflict is reported at
+    // validation time with a message that explains *why* they are incompatible.
+    let mut opts = RunOpts::parse_from([
+        "fakehermit",
+        "--image=docker.io/library/busybox@sha256:deadbeef",
+        "--no-namespace",
+        "/bin/sh",
+    ]);
+    let message = opts
+        .validate_args_with_perf_support(true)
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("--image"), "message: {message}");
+    assert!(message.contains("--no-namespace"), "message: {message}");
+    assert!(message.contains("chroot"), "message: {message}");
+}
+
+#[test]
+fn image_guest_program_resolution_matches_execve_pathname_rules() {
+    // Absolute paths pass through unchanged.
+    assert_eq!(
+        resolve_image_guest_program(Path::new("/bin/sh"), Path::new("/")).unwrap(),
+        PathBuf::from("/bin/sh")
+    );
+    // A relative path containing a '/' resolves against the guest working
+    // directory (the image WorkingDir) and is normalized.
+    assert_eq!(
+        resolve_image_guest_program(Path::new("bin/busybox"), Path::new("/opt/app")).unwrap(),
+        PathBuf::from("/opt/app/bin/busybox")
+    );
+    assert_eq!(
+        resolve_image_guest_program(Path::new("./run.sh"), Path::new("/srv")).unwrap(),
+        PathBuf::from("/srv/run.sh")
+    );
+    // Default working directory of `/` resolves relative paths at the root.
+    assert_eq!(
+        resolve_image_guest_program(Path::new("./bin/sh"), Path::new("/")).unwrap(),
+        PathBuf::from("/bin/sh")
+    );
+    // A bare command name (no '/') would need an unsupported in-image PATH
+    // search and is rejected with an actionable message.
+    let bare = resolve_image_guest_program(Path::new("sh"), Path::new("/"))
+        .unwrap_err()
+        .to_string();
+    assert!(bare.contains("PATH search"), "message: {bare}");
+    assert!(bare.contains("bin/sh"), "message: {bare}");
+    // Parent components cannot escape the guest root during validation.
+    assert!(resolve_image_guest_program(Path::new("../etc/x"), Path::new("/app")).is_err());
+}
+
+#[test]
 fn strict_help_describes_compatibility_and_opt_outs() {
     use clap::CommandFactory;
 
@@ -1406,6 +1466,30 @@ fn normalize_guest_path(path: &Path) -> Result<PathBuf, Error> {
         }
     }
     Ok(normalized)
+}
+
+/// Resolve a guest program path to an absolute path *inside the image rootfs*,
+/// mirroring execve(2) pathname resolution for the `--image` prototype:
+///
+///   * an absolute path is used as-is;
+///   * a relative path that contains a `/` (e.g. `./bin/sh`, `bin/busybox`) is
+///     resolved against `guest_cwd` (the image WorkingDir, or `/`), so the path
+///     validated here is the same one the chrooted guest will execve;
+///   * a bare command name (no `/`) would require a PATH search inside the
+///     image, which the prototype does not implement, so it is rejected.
+fn resolve_image_guest_program(requested: &Path, guest_cwd: &Path) -> Result<PathBuf, Error> {
+    if requested.is_absolute() {
+        Ok(requested.to_path_buf())
+    } else if requested.to_string_lossy().contains('/') {
+        normalize_guest_path(&guest_cwd.join(requested))
+    } else {
+        anyhow::bail!(
+            "With --image, a bare program name ({:?}) would require a PATH search inside the \
+             image, which is not yet supported; use a path containing '/' (absolute like \
+             `/bin/sh`, or relative to the working directory like `./bin/sh`).",
+            requested
+        )
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1668,6 +1752,13 @@ impl RunOpts {
                 "--skid-margin configures the Reverie ptrace PMU timer and requires a ptrace-backed backend"
             );
         }
+        if self.image.is_some() && self.no_namespace {
+            anyhow::bail!(
+                "--image chroots the guest into a materialized OCI rootfs, which requires mount \
+                 and PID namespaces; it is incompatible with --no-namespace"
+            );
+        }
+
         let config = &mut self.det_opts.det_config;
 
         // Only the ptrace-family backends launch the guest through Reverie's
@@ -2061,27 +2152,26 @@ impl RunOpts {
         // materialized OCI rootfs, not on the host filesystem. Resolve and
         // validate it against the rootfs so that image-only binaries (e.g.
         // busybox's `/bin/busybox`, absent from the host) are accepted, and so
-        // host binaries that merely happen to share a path are never used. The
-        // program path must be absolute; PATH search inside the image is out of
-        // scope for the prototype. materialize_rootfs is idempotent/cached, so
-        // this does not re-pull the image later in `container()`.
+        // host binaries that merely happen to share a path are never used.
+        // materialize_rootfs is idempotent/cached, so this does not re-pull the
+        // image later in `container()`.
         if let Some(image) = &self.image {
             let command = self.guest_command()?;
             let requested = Path::new(command.get_program());
-            if !requested.is_absolute() {
-                anyhow::bail!(
-                    "With --image, the program path must be absolute inside the image rootfs \
-                     (got {:?}); PATH search inside the image is not yet supported.",
-                    requested
-                );
-            }
+            // `guest_command()` sets the image working directory (WorkingDir, or
+            // `/`) as the guest cwd; resolve a relative program path against it.
+            let guest_cwd = command
+                .get_current_dir()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("/"));
+            let guest_abs = resolve_image_guest_program(requested, &guest_cwd)?;
             let rootfs = crate::image::materialize_rootfs(image)?;
             // Resolve chroot-aware: images (nixos/nix especially) expose
             // `/bin/sh` as a symlink to an absolute `/nix/store/...` target that
             // only resolves under the image root, so a naive host `stat` would
             // follow it against the host `/` and fail.
-            let in_rootfs = crate::image::resolve_in_rootfs(&rootfs, requested);
-            return validate_executable(&in_rootfs, requested);
+            let in_rootfs = crate::image::resolve_in_rootfs(&rootfs, &guest_abs);
+            return validate_executable(&in_rootfs, &guest_abs);
         }
 
         if self.selected_backend() == Backend::E9patch {
