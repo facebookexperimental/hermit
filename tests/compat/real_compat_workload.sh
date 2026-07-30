@@ -543,18 +543,33 @@ EOF
         printf 'as:compat_add\n'
         ;;
     ld)
-        cat >"$WORK_DIR/start.s" <<'EOF'
+        cat >"$WORK_DIR/compat.s" <<'EOF'
     .text
-    .globl _start
-_start:
-    mov $60, %rax
-    xor %rdi, %rdi
-    syscall
+    .globl compat_add
+    .type compat_add,@function
+compat_add:
+    lea (%rdi,%rsi), %eax
+    ret
+    .size compat_add, .-compat_add
+    .section .note.GNU-stack,"",@progbits
 EOF
-        /usr/bin/as --64 "$WORK_DIR/start.s" -o "$WORK_DIR/start.o"
-        /usr/bin/ld --build-id=none -o "$WORK_DIR/program" "$WORK_DIR/start.o"
-        "$WORK_DIR/program"
-        printf 'ld:exit-0\n'
+        /usr/bin/as --64 "$WORK_DIR/compat.s" -o "$WORK_DIR/compat.o"
+        /usr/bin/ld -shared --build-id=none \
+            -o "$WORK_DIR/libcompat.so" "$WORK_DIR/compat.o"
+        /usr/bin/readelf -h "$WORK_DIR/libcompat.so" \
+            | grep -q 'DYN (Shared object file)'
+        /usr/bin/python3 - "$WORK_DIR/libcompat.so" <<'PY'
+import ctypes
+import sys
+
+library = ctypes.CDLL(sys.argv[1])
+library.compat_add.argtypes = (ctypes.c_int, ctypes.c_int)
+library.compat_add.restype = ctypes.c_int
+result = library.compat_add(19, 23)
+if result != 42:
+    raise SystemExit(f"compat_add returned {result}, expected 42")
+PY
+        printf 'ld:shared-compat-add-42\n'
         ;;
     nm)
         build_assembly_object

@@ -320,7 +320,7 @@ readonly RR_COMPAT_EXPECTED=139
 # Require the established SaBRe compatibility floor across the full measured corpus.
 # Explicit must-pass rows below ratchet fixed programs without allowing host-sensitive
 # rows to make the aggregate floor alternate between green and red.
-readonly SABRE_COMPAT_EXPECTED=201
+readonly SABRE_COMPAT_EXPECTED=202
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(PR-1154): Review synchronization of the measured SaBRe corpus size.
 readonly SABRE_COMPAT_TOTAL=212
@@ -1641,6 +1641,7 @@ function run_compatibility_corpus {
     local unavailable=0
     local total=0
     local sabre_flex_passed=0
+    local sabre_ld_passed=0
     local sabre_make_passed=0
     PORTABLE_STRICT_DIAGNOSTIC_FAILURE_COUNT=0
 
@@ -1844,8 +1845,14 @@ function run_compatibility_corpus {
         && passed=$((passed + 1)) || failed=$((failed + 1))
     functional_compatibility_probe as \
         && passed=$((passed + 1)) || failed=$((failed + 1))
-    functional_compatibility_probe ld \
-        && passed=$((passed + 1)) || failed=$((failed + 1))
+    if functional_compatibility_probe ld; then
+        passed=$((passed + 1))
+        if [[ $COMPATIBILITY_MODE == sabre ]]; then
+            sabre_ld_passed=1
+        fi
+    else
+        failed=$((failed + 1))
+    fi
     functional_compatibility_probe nm \
         && passed=$((passed + 1)) || failed=$((failed + 1))
     functional_compatibility_probe objcopy \
@@ -2402,6 +2409,10 @@ function run_compatibility_corpus {
         fi
         if ((sabre_flex_passed != 1)); then
             printf "❌ SaBRe compatibility required row flex regressed\n"
+            return 1
+        fi
+        if ((sabre_ld_passed != 1)); then
+            printf "❌ SaBRe compatibility required row ld regressed\n"
             return 1
         fi
         if ((sabre_make_passed != 1)); then
