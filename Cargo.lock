@@ -560,6 +560,7 @@ dependencies = [
  "pretty_assertions",
  "reverie-syscalls",
  "serde",
+ "serde_json",
  "shell-words",
  "tracing",
 ]
