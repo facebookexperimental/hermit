@@ -25,6 +25,7 @@ use std::sync::LazyLock;
 use ::tracing::metadata::LevelFilter;
 use clap::Parser;
 use colored::Colorize;
+use detcore_model::happens_before::HappensBeforeProgram;
 use detcore_model::happens_before::Strength;
 use hermit::Backend;
 use hermit::Context;
@@ -114,6 +115,14 @@ pub struct RunOpts {
     /// exit without running the guest.
     #[clap(long, requires = "happens_before")]
     hb_list_events: bool,
+
+    /// Runtime-only cache of the resolved happens-before program. Populated in
+    /// `main()` after the guest binary's debug info is available (so anchor code
+    /// locations resolve to addresses), then copied into `DetConfig` for the
+    /// scheduler. It is never a CLI argument and never serialized; `#[clap(skip)]`
+    /// defaults it to `None` when `RunOpts` is parsed or round-tripped.
+    #[clap(skip)]
+    resolved_happens_before: Option<HappensBeforeProgram>,
 
     #[clap(flatten)]
     pub(crate) det_opts: DetOptions,
@@ -1759,6 +1768,12 @@ impl RunOpts {
         if self.hb_list_events {
             return self.list_happens_before_events();
         }
+        if self.happens_before.is_some() {
+            // Resolve the spec against the guest binary's debug info now and cache
+            // it so every subsequent `effective_det_config()` (including both
+            // `--verify` runs) hands the scheduler the identical resolved program.
+            self.resolved_happens_before = Some(self.load_and_resolve_happens_before()?);
+        }
         if backend == Backend::E9patch {
             self.prepare_e9patch_program()?;
         }
@@ -1984,6 +1999,19 @@ impl RunOpts {
             }
         }
 
+        // Happens-before enforcement parks the "after" thread until its "before"
+        // anchor fires. That deterministic parking is only meaningful when the
+        // scheduler owns thread selection; with threads running in parallel there
+        // is no single serial order to constrain. Fail closed rather than silently
+        // ignore the spec.
+        if self.happens_before.is_some() && !config.sequentialize_threads {
+            anyhow::bail!(
+                "--happens-before requires deterministic sequential thread execution; remove \
+                 --no-sequentialize-threads (and --strace-only) so the scheduler can enforce \
+                 ordering edges"
+            );
+        }
+
         // The gdbserver listens on a TCP port that is bound inside the guest's
         // network namespace. With the default isolated (`local`) networking, that
         // port lives in the guest's unshared netns and is unreachable from a host
@@ -2184,6 +2212,60 @@ impl RunOpts {
     /// program's debug info, print the resolved anchor/edge program, and return
     /// success without running the guest. Scheduler enforcement of these edges is
     /// a separate, forthcoming change; this path is pure introspection.
+    /// Load the `--happens-before` spec and resolve its anchor code locations
+    /// against the guest binary's debug info, returning the resolved program the
+    /// scheduler will enforce. Unresolved code locations are reported but do not
+    /// fail the run: a count-based anchor (after N syscalls / M RCBs) needs no
+    /// debug info, and a purely deferred RIP anchor that never resolves simply
+    /// never fires. This shares the same load/resolve path as
+    /// `list_happens_before_events` so the preview and the enforced program agree.
+    fn load_and_resolve_happens_before(&self) -> Result<HappensBeforeProgram, Error> {
+        let spec_path = self
+            .happens_before
+            .as_ref()
+            .expect("load_and_resolve_happens_before requires --happens-before");
+        let mut program = load_program(spec_path)?;
+
+        let (_, host) = self.resolve_guest_and_host_program()?;
+        match DebugInfoResolver::open(&host) {
+            Ok(resolver) if !resolver.is_empty() => {
+                let unresolved = resolve_program(&mut program, &resolver);
+                if !unresolved.is_empty() {
+                    eprintln!(
+                        "hermit: {} happens-before anchor(s) with unresolved code locations \
+                         (they will never fire): {}",
+                        unresolved.len(),
+                        unresolved.join(", ")
+                    );
+                }
+            }
+            Ok(_) => {
+                let unresolved: Vec<String> = program
+                    .unresolved_locations()
+                    .map(|a| a.name.clone())
+                    .collect();
+                if !unresolved.is_empty() {
+                    eprintln!(
+                        "hermit: {} has no usable symbol/debug info; {} code-location anchor(s) \
+                         will never fire: {}",
+                        host.display(),
+                        unresolved.len(),
+                        unresolved.join(", ")
+                    );
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "hermit: could not read debug info from {}: {:#}; code-location anchors will \
+                     never fire",
+                    host.display(),
+                    err
+                );
+            }
+        }
+        Ok(program)
+    }
+
     fn list_happens_before_events(&self) -> Result<ExitStatus, Error> {
         let spec_path = self
             .happens_before
@@ -2830,6 +2912,11 @@ impl RunOpts {
             config.panic_on_unsupported_syscalls = true;
         }
         config.shutdown_on_unsupported_syscall = config.panic_on_unsupported_syscalls;
+        // Hand the scheduler the resolved happens-before program (already resolved
+        // against the guest binary in `main()`). `#[serde(skip)]` on the field means
+        // this is in-process only; it reaches the ptrace backend directly and is not
+        // carried through the DBI JSON config or `--save-config`.
+        config.happens_before = self.resolved_happens_before.clone();
         config
     }
 

@@ -21,6 +21,7 @@ use clap::Parser;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::happens_before::HappensBeforeProgram;
 use crate::pid::DetTid;
 use crate::schedule::SigWrapper;
 use crate::time::NANOS_PER_RCB;
@@ -498,6 +499,18 @@ pub struct Config {
     /// interrupt points specified
     #[clap(long, value_name = "tid:rcbs", value_parser = try_parse_numbers_with_colon)]
     pub interrupt_at: Vec<(DetTid, u64)>,
+
+    /// Resolved happens-before program: deterministic ordering edges between
+    /// anchored events (see `detcore_model::happens_before`). This is populated
+    /// programmatically by hermit-cli after loading and resolving a
+    /// `--happens-before` spec against the guest binary; it is not a direct CLI
+    /// flag and is not serialized (it is reconstructed from the spec file each
+    /// run, so `#[serde(skip)]` avoids requiring serde on `Sysno`-bearing
+    /// positions and keeps save-config output stable). The scheduler enforces
+    /// these edges only when `sequentialize_threads` is set.
+    #[serde(skip)]
+    #[clap(skip)]
+    pub happens_before: Option<HappensBeforeProgram>,
 }
 
 fn try_parse_numbers_with_colon(from_str: &str) -> anyhow::Result<(DetTid, u64)> {

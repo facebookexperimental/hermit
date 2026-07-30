@@ -135,6 +135,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     sysinfo_uptime_offset: 60,
     memory: 1024 * 1024 * 1024, //1 GiB
     interrupt_at: vec![],
+    happens_before: None,
     fuzz_futexes: false,
     chaos_target_races: false,
     chaos_per_thread_slowdown: false,
@@ -210,6 +211,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     sysinfo_uptime_offset: 60,
     memory: 1024 * 1024 * 1024, //1 GiB
     interrupt_at: vec![],
+    happens_before: None,
     fuzz_futexes: false,
     chaos_target_races: false,
     chaos_per_thread_slowdown: false,
@@ -285,6 +287,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     sysinfo_uptime_offset: 60,
     memory: 1024 * 1024 * 1024, //1 GiB
     interrupt_at: vec![],
+    happens_before: None,
     fuzz_futexes: false,
     chaos_target_races: false,
     chaos_per_thread_slowdown: false,

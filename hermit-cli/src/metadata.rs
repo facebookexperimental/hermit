@@ -215,6 +215,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         sysinfo_uptime_offset: 120,
         memory: 1024 * 1024 * 1024,
         interrupt_at: vec![],
+        happens_before: None,
         fuzz_futexes: false,
         chaos_target_races: false,
         chaos_per_thread_slowdown: false,
