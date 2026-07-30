@@ -25,10 +25,15 @@ use std::sync::LazyLock;
 use ::tracing::metadata::LevelFilter;
 use clap::Parser;
 use colored::Colorize;
+use detcore_model::happens_before::Strength;
 use hermit::Backend;
 use hermit::Context;
 use hermit::DetConfig;
 use hermit::Error;
+use hermit::happens_before::DebugInfoResolver;
+use hermit::happens_before::describe_anchor;
+use hermit::happens_before::load_program;
+use hermit::happens_before::resolve_program;
 use reverie::process::Bind;
 use reverie::process::Command;
 use reverie::process::Container;
@@ -95,6 +100,20 @@ pub struct RunOpts {
     /// Arguments for the program.
     #[clap(value_name = "ARGS")]
     args: Vec<String>,
+
+    /// Path to a happens-before specification (JSON; see RFC #1146) that places
+    /// deterministic ordering edges between anchored events. Anchor code
+    /// locations (`func`, `file:line`) are resolved against the guest program's
+    /// debug info. Scheduler enforcement is not yet wired; combine with
+    /// `--hb-list-events` to preview how the spec resolves against the binary.
+    #[clap(long, value_name = "filepath")]
+    happens_before: Option<PathBuf>,
+
+    /// Load the `--happens-before` specification, resolve its anchors against the
+    /// guest program's debug info, print the resolved anchor/edge program, and
+    /// exit without running the guest.
+    #[clap(long, requires = "happens_before")]
+    hb_list_events: bool,
 
     #[clap(flatten)]
     pub(crate) det_opts: DetOptions,
@@ -538,6 +557,15 @@ impl fmt::Display for RunOpts {
         if let Some(p) = &self.save_config {
             let s = p.to_str().expect("valid string provided to --save-config");
             write!(f, " --save-config={}", shell_words::quote(s))?;
+        }
+        if let Some(p) = &self.happens_before {
+            let s = p
+                .to_str()
+                .expect("valid string provided to --happens-before");
+            write!(f, " --happens-before={}", shell_words::quote(s))?;
+        }
+        if self.hb_list_events {
+            write!(f, " --hb-list-events")?;
         }
 
         for mount in &self.mount {
@@ -1728,6 +1756,9 @@ impl RunOpts {
         // preprocessor and probes its ptrace runtime and tool separately.
         self.validate_mount_sources()?;
         self.validate_program()?;
+        if self.hb_list_events {
+            return self.list_happens_before_events();
+        }
         if backend == Backend::E9patch {
             self.prepare_e9patch_program()?;
         }
@@ -2147,6 +2178,77 @@ impl RunOpts {
             GuestPathMapping::Hidden => None,
             GuestPathMapping::Unchanged => Some(guest.to_path_buf()),
         }
+    }
+
+    /// Load the `--happens-before` spec, resolve its anchors against the guest
+    /// program's debug info, print the resolved anchor/edge program, and return
+    /// success without running the guest. Scheduler enforcement of these edges is
+    /// a separate, forthcoming change; this path is pure introspection.
+    fn list_happens_before_events(&self) -> Result<ExitStatus, Error> {
+        let spec_path = self
+            .happens_before
+            .as_ref()
+            .expect("--hb-list-events requires --happens-before");
+        let mut program = load_program(spec_path)?;
+
+        let (_, host) = self.resolve_guest_and_host_program()?;
+        let resolver = match DebugInfoResolver::open(&host) {
+            Ok(r) if !r.is_empty() => Some(r),
+            Ok(_) => {
+                eprintln!(
+                    "hermit: {} has no usable symbol/debug info; code-location anchors will not \
+                     resolve",
+                    host.display()
+                );
+                None
+            }
+            Err(err) => {
+                eprintln!(
+                    "hermit: could not read debug info from {}: {:#}",
+                    host.display(),
+                    err
+                );
+                None
+            }
+        };
+
+        let unresolved = match &resolver {
+            Some(r) => resolve_program(&mut program, r),
+            None => program
+                .unresolved_locations()
+                .map(|a| a.name.clone())
+                .collect(),
+        };
+
+        println!(
+            "happens-before program: {} anchor(s), {} edge(s)",
+            program.anchors.len(),
+            program.edges.len()
+        );
+        println!("anchors:");
+        for (name, anchor) in &program.anchors {
+            println!(
+                "  {} = {}",
+                name,
+                describe_anchor(anchor, resolver.as_ref())
+            );
+        }
+        println!("edges:");
+        for edge in &program.edges {
+            let op = match edge.strength {
+                Strength::Hard => "<",
+                Strength::Soft => "<~",
+            };
+            println!("  {} {} {}", edge.before, op, edge.after);
+        }
+        if !unresolved.is_empty() {
+            eprintln!(
+                "hermit: {} anchor(s) with unresolved code locations: {}",
+                unresolved.len(),
+                unresolved.join(", ")
+            );
+        }
+        Ok(ExitStatus::SUCCESS)
     }
 
     fn resolve_guest_and_host_program(&self) -> Result<(PathBuf, PathBuf), Error> {

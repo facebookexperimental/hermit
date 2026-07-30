@@ -435,11 +435,23 @@ impl fmt::Display for HappensBeforeError {
                 "unsupported happens-before schema version {} (this build understands {})",
                 v, HAPPENS_BEFORE_VERSION
             ),
-            HappensBeforeError::AmbiguousPosition { event, found } => write!(
-                f,
-                "event '{}' must name exactly one position, found {:?}",
-                event, found
-            ),
+            HappensBeforeError::AmbiguousPosition { event, found } => {
+                if found.is_empty() {
+                    write!(
+                        f,
+                        "event '{}' must specify a position: a count (syscalls/rcbs), a syscall, a \
+                         rip, a mark, or a code location (func/file/line)",
+                        event
+                    )
+                } else {
+                    write!(
+                        f,
+                        "event '{}' names conflicting positions {:?}; use at most one explicit \
+                         position selector (a code location may accompany it)",
+                        event, found
+                    )
+                }
+            }
             HappensBeforeError::UnknownSyscall { event, name } => {
                 write!(f, "event '{}' names unknown syscall '{}'", event, name)
             }
@@ -537,8 +549,12 @@ impl HappensBeforeSpec {
             line: ev.line,
         };
 
-        // Determine which position selectors are present. `func`/`file`/`line`
-        // count as a (deferred) RIP position only when no other position is set.
+        // Determine which *explicit* position selectors are present. A code
+        // location (`func`/`file`/`line`) is descriptive and may accompany any
+        // one of these — the owner's primary anchor is "function foo on thread T
+        // after N syscalls / M RBCs", i.e. a code location *and* a count. The
+        // code location only *becomes* the (deferred RIP) position when no
+        // explicit selector is present at all.
         let mut found: Vec<&str> = Vec::new();
         if ev.syscalls.is_some() {
             found.push("syscalls");
@@ -556,14 +572,20 @@ impl HappensBeforeSpec {
             found.push("mark");
         }
         let has_code_location = !location.is_empty();
-        if has_code_location {
-            found.push("func/line");
-        }
 
-        if found.len() != 1 {
+        // Reject multiple explicit selectors outright. A single explicit
+        // selector wins as the position (code location stays descriptive). Zero
+        // explicit selectors is only valid when a code location supplies a RIP.
+        if found.len() > 1 {
             return Err(HappensBeforeError::AmbiguousPosition {
                 event: name.to_string(),
                 found: found.iter().map(|s| s.to_string()).collect(),
+            });
+        }
+        if found.is_empty() && !has_code_location {
+            return Err(HappensBeforeError::AmbiguousPosition {
+                event: name.to_string(),
+                found: Vec::new(),
             });
         }
 
@@ -1042,6 +1064,42 @@ mod tests {
             spec.normalize().unwrap_err(),
             HappensBeforeError::AmbiguousPosition { .. }
         ));
+    }
+
+    #[test]
+    fn code_location_accompanies_count() {
+        // The owner's primary anchor: "function foo (line L) on thread T after
+        // N syscalls / M RBCs". The code location is descriptive and the count
+        // is the enforced position; the two must coexist, not conflict.
+        let json = r#"{
+          "version": 1,
+          "events": {
+            "w": {"thread": "1", "func": "free_buffer", "line": 342, "syscalls": 7},
+            "r": {"thread": "1", "func": "read_buffer", "rcbs": 900}
+          },
+          "edges": [ {"before": "w", "after": "r"} ]
+        }"#;
+        let prog = HappensBeforeSpec::from_json(json)
+            .unwrap()
+            .normalize()
+            .unwrap();
+
+        // The count wins as the position; the code location is retained.
+        assert_eq!(prog.anchors["w"].position, Position::SyscallCount(7));
+        assert_eq!(
+            prog.anchors["w"].location.function.as_deref(),
+            Some("free_buffer")
+        );
+        assert_eq!(prog.anchors["w"].location.line, Some(342));
+
+        assert_eq!(prog.anchors["r"].position, Position::Rcb(900));
+        assert_eq!(
+            prog.anchors["r"].location.function.as_deref(),
+            Some("read_buffer")
+        );
+
+        // A descriptive-only code location is not an unresolved RIP position.
+        assert_eq!(prog.unresolved_locations().count(), 0);
     }
 
     #[test]

@@ -28,6 +28,7 @@ use anyhow::Context as _;
 use detcore_model::happens_before::Anchor;
 use detcore_model::happens_before::CodeLocation;
 use detcore_model::happens_before::HappensBeforeProgram;
+use detcore_model::happens_before::HappensBeforeSpec;
 use detcore_model::happens_before::Position;
 use object::Object;
 use object::ObjectSection;
@@ -287,6 +288,20 @@ pub fn resolve_program(
         }
     }
     unresolved
+}
+
+/// Load a happens-before specification from a JSON file and normalize it into a
+/// [`HappensBeforeProgram`]. Code locations remain unresolved until
+/// [`resolve_program`] runs against a [`DebugInfoResolver`].
+pub fn load_program(path: &Path) -> anyhow::Result<HappensBeforeProgram> {
+    let json = std::fs::read_to_string(path)
+        .with_context(|| format!("reading happens-before spec: {}", path.display()))?;
+    let spec = HappensBeforeSpec::from_json(&json)
+        .with_context(|| format!("parsing happens-before spec: {}", path.display()))?;
+    let program = spec
+        .normalize()
+        .with_context(|| format!("normalizing happens-before spec: {}", path.display()))?;
+    Ok(program)
 }
 
 /// Render one anchor for `--list-events`-style introspection, showing the
