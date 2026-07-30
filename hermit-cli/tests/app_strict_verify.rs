@@ -31,9 +31,21 @@
 //!
 //! - **L2 (bitwise-identical repeat run, `--strict --verify`):** compiled Go
 //!   programs (a hello world and a goroutine workload) and the JVM running
-//!   compiled classes (`java Hello` and a multi-thread `Threads`). The managed
-//!   runtimes' scheduling, GC, and static
-//!   initialization are fully determinized.
+//!   compiled classes. The startup-only `java Hello` and `Threads` cases run
+//!   under the `--max-timeslice=disabled` helper, while the small JIT+runtime
+//!   programs (`ThreadCounter`, `GcStress`, `JitHotLoop`, `HashMapString`) run
+//!   under `assert_l2_jvm_under_strict_verify` with Hermit's default RCB
+//!   preemption. The managed runtimes' scheduling, GC, JIT compilation, and
+//!   static initialization are fully determinized.
+//!
+//!   A compute-bound JVM livelocks under Hermit when preemption is disabled
+//!   (`--max-timeslice=disabled`): the VM's internal GC/JIT/dispatcher threads
+//!   are starved once an application thread enters a CPU-bound region, so even a
+//!   trivial program never completes its first run within the timeout. Keeping
+//!   RCB-based preemption on breaks the livelock while remaining deterministic
+//!   (the RCB count is reproducible), so `--verify` still reaches L2. These
+//!   programs therefore require a usable PMU; see
+//!   `assert_l2_jvm_under_strict_verify`.
 //! - **L1 only (output-deterministic under `--strict`, but `--verify`'s
 //!   internal two-run log diff diverges):** toolchain drivers such as `javac`
 //!   and a `make`-driven `gcc` build. Their exit code and emitted artifacts are
@@ -181,6 +193,16 @@ fn java_vm_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
     bounded
 }
 
+/// Like [`java_vm_args`], but leaves the JIT compiler enabled (no `-Xint`) so a
+/// hot method is actually C1/C2-compiled at runtime. Used by the JIT hot-loop
+/// program to exercise the compiler's determinism rather than the interpreter's.
+/// GC and the compiler thread pool stay bounded so the run remains reproducible.
+fn java_jit_vm_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut bounded: Vec<&'a str> = vec!["-XX:+UseSerialGC", "-XX:ActiveProcessorCount=1"];
+    bounded.extend_from_slice(args);
+    bounded
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#651)
 fn javac_vm_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
@@ -217,6 +239,64 @@ fn assert_l2_under_strict_verify(program: &Path, args: &[&str]) {
             // weakening determinism (they do not disable strict mode).
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",
+            "--",
+        ])
+        .arg(program)
+        .args(args);
+
+    let rendered = format!("{command:?}");
+    let output = run_hermit_command(command);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "hermit run --strict --verify was not deterministic (L2) for {rendered}\n\
+         status: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status,
+    );
+    assert!(
+        stderr.contains("Determinism verified") || stdout.contains("Determinism verified"),
+        "hermit --verify exited 0 but did not report determinism for {rendered}\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+}
+
+/// Like [`assert_l2_under_strict_verify`], but keeps Hermit's default RCB-based
+/// preemption enabled (it does **not** pass `--max-timeslice=disabled`).
+///
+/// The JVM spins up internal helper threads (GC, the JIT compiler, the signal
+/// dispatcher) that must make progress concurrently with the application
+/// threads. With `--max-timeslice=disabled`, Hermit never preempts a running
+/// guest thread, so once one JVM thread enters a CPU-bound region the others are
+/// starved and the process livelocks under Hermit — even a trivial
+/// `System.out.println` never completes its first run within the 120s budget.
+/// Enabling PMU/RCB-based preemption breaks that livelock, and because the RCB
+/// count is itself deterministic, `--verify` still reaches a bitwise-identical
+/// repeat run (L2).
+///
+/// Consequently these JVM tests require accessible hardware performance counters
+/// (a working PMU), like the bulk of Hermit's determinism suite. On a host
+/// without a usable PMU they will fail; report that as a host limitation rather
+/// than weakening the assertion. CPUID interception is still relaxed via
+/// `--no-virtualize-cpuid`, which does not weaken strict determinism.
+fn assert_l2_jvm_under_strict_verify(program: &Path, args: &[&str]) {
+    let _guard = hermit_run_lock();
+
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after", HERMIT_VERIFY_KILL_AFTER])
+        .arg(hermit_verify_timeout())
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            // Relax only CPUID virtualization; keep RCB preemption on so the
+            // JVM's internal threads make progress (see the doc comment).
+            "--no-virtualize-cpuid",
             "--",
         ])
         .arg(program)
@@ -311,6 +391,98 @@ public class Threads {
             sum += v;
         }
         System.out.println("threads sum=" + sum + " results=" + Arrays.toString(results));
+    }
+}
+"#;
+
+// Small JVM programs exercising the JIT and runtime (threads, GC, hot-loop
+// compilation, hashing) without paying javac's compile cost. Each is bounded and
+// prints a single deterministic line, so `--verify` can reach L2.
+
+/// Multithreaded atomic counter: exercises thread creation/join and lock-free
+/// atomic contention. The final count is independent of interleaving.
+const JAVA_THREAD_COUNTER_SRC: &str = r#"import java.util.concurrent.atomic.AtomicLong;
+
+public class ThreadCounter {
+    public static void main(String[] args) throws InterruptedException {
+        final int nThreads = 4;
+        final int perThread = 5000;
+        final AtomicLong counter = new AtomicLong(0);
+        Thread[] ts = new Thread[nThreads];
+        for (int i = 0; i < nThreads; i++) {
+            ts[i] = new Thread(() -> {
+                for (int j = 0; j < perThread; j++) {
+                    counter.incrementAndGet();
+                }
+            });
+            ts[i].start();
+        }
+        for (Thread t : ts) {
+            t.join();
+        }
+        System.out.println("counter=" + counter.get());
+    }
+}
+"#;
+
+/// GC micro-stress: churns many short-lived allocations to drive minor GC. The
+/// checksum depends only on the loop, not on collection timing.
+const JAVA_GC_STRESS_SRC: &str = r#"public class GcStress {
+    public static void main(String[] args) {
+        long checksum = 0;
+        for (int i = 0; i < 50000; i++) {
+            byte[] b = new byte[64];
+            b[0] = (byte) i;
+            b[63] = (byte) (i >> 8);
+            checksum += (b[0] & 0xff) + (b[63] & 0xff);
+        }
+        System.out.println("gc checksum=" + checksum);
+    }
+}
+"#;
+
+/// JIT hot loop: a small integer method called enough times to be JIT-compiled
+/// (run with the JIT enabled, not `-Xint`), exercising compiler determinism.
+const JAVA_JIT_HOT_LOOP_SRC: &str = r#"public class JitHotLoop {
+    static long collatzSteps(long n) {
+        long steps = 0;
+        while (n != 1) {
+            n = (n % 2 == 0) ? n / 2 : 3 * n + 1;
+            steps++;
+        }
+        return steps;
+    }
+    public static void main(String[] args) {
+        long total = 0;
+        for (int i = 1; i <= 20000; i++) {
+            total += collatzSteps(i);
+        }
+        System.out.println("jit collatz total=" + total);
+    }
+}
+"#;
+
+/// HashMap/String workload: repeated string construction, hashing, and map
+/// merges, then a TreeMap-sorted checksum so output is iteration-order
+/// independent.
+const JAVA_HASHMAP_STRING_SRC: &str = r#"import java.util.HashMap;
+import java.util.Map;
+import java.util.TreeMap;
+
+public class HashMapString {
+    public static void main(String[] args) {
+        Map<String, Integer> counts = new HashMap<>();
+        String[] words = {"alpha", "beta", "gamma", "delta", "alpha", "beta", "alpha"};
+        for (int rep = 0; rep < 1000; rep++) {
+            for (String w : words) {
+                counts.merge(w + (rep % 7), 1, Integer::sum);
+            }
+        }
+        long sum = 0;
+        for (Map.Entry<String, Integer> e : new TreeMap<>(counts).entrySet()) {
+            sum += (long) e.getKey().hashCode() * e.getValue();
+        }
+        System.out.println("hashmap sum=" + sum + " keys=" + counts.size());
     }
 }
 "#;
@@ -475,6 +647,52 @@ fn java_threads_are_deterministic_under_strict_verify() {
     let classpath = classpath.to_str().expect("classpath is valid UTF-8");
     let args = java_vm_args(&["-cp", classpath, "Threads"]);
     assert_l2_under_strict_verify(&java, &args);
+}
+
+// Small JVM JIT + runtime programs. These use `assert_l2_jvm_under_strict_verify`
+// (RCB preemption enabled) rather than the `--max-timeslice=disabled` helper the
+// startup-only `java_hello`/`java_threads` tests use, because a compute-bound JVM
+// livelocks under Hermit without preemption; see that helper's doc comment.
+
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + a JDK + a usable PMU"]
+fn java_thread_counter_is_deterministic_under_strict_verify() {
+    let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
+    let classpath = compile_java(JAVA_THREAD_COUNTER_SRC, "ThreadCounter");
+    let classpath = classpath.to_str().expect("classpath is valid UTF-8");
+    let args = java_vm_args(&["-cp", classpath, "ThreadCounter"]);
+    assert_l2_jvm_under_strict_verify(&java, &args);
+}
+
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + a JDK + a usable PMU"]
+fn java_gc_stress_is_deterministic_under_strict_verify() {
+    let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
+    let classpath = compile_java(JAVA_GC_STRESS_SRC, "GcStress");
+    let classpath = classpath.to_str().expect("classpath is valid UTF-8");
+    let args = java_vm_args(&["-cp", classpath, "GcStress"]);
+    assert_l2_jvm_under_strict_verify(&java, &args);
+}
+
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + a JDK + a usable PMU"]
+fn java_jit_hot_loop_is_deterministic_under_strict_verify() {
+    let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
+    let classpath = compile_java(JAVA_JIT_HOT_LOOP_SRC, "JitHotLoop");
+    let classpath = classpath.to_str().expect("classpath is valid UTF-8");
+    // Run with the JIT compiler enabled (no -Xint) to exercise compilation.
+    let args = java_jit_vm_args(&["-cp", classpath, "JitHotLoop"]);
+    assert_l2_jvm_under_strict_verify(&java, &args);
+}
+
+#[test]
+#[ignore = "e2e: requires hermit + mount namespaces + a JDK + a usable PMU"]
+fn java_hashmap_string_is_deterministic_under_strict_verify() {
+    let java = required_jdk_app("java", &["/usr/local/bin/java", "/usr/bin/java"]);
+    let classpath = compile_java(JAVA_HASHMAP_STRING_SRC, "HashMapString");
+    let classpath = classpath.to_str().expect("classpath is valid UTF-8");
+    let args = java_vm_args(&["-cp", classpath, "HashMapString"]);
+    assert_l2_jvm_under_strict_verify(&java, &args);
 }
 
 // --- L1: toolchain drivers are output-deterministic but not bitwise (no L2) ---
