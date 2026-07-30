@@ -686,6 +686,12 @@
       "why": "tests/c/recvmsg_scm_rights_mmap.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "path": "tests/c/relaxed_flag_matrix.c",
+      "disposition": "guest-fixture",
+      "runner": "hermit-cli/tests/relaxed_flag_matrix.rs",
+      "why": "tests/c/relaxed_flag_matrix.c is owned by hermit-cli/tests/relaxed_flag_matrix.rs: The Rust integration test compiles this observation guest and runs it across the exhaustive strict/relaxed flag matrix with bounded execution and exact result classification; a generic manifest cell cannot express the matrix-wide flag cross-product or ratcheted expected-failure contract."
+    },
+    {
       "path": "tests/c/remap_file_pages_anonymous_enosys.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",

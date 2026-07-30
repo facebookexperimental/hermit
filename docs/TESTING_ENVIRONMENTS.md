@@ -52,6 +52,49 @@ run. The runner prints the host OS from `/etc/os-release`, repetition count,
 concurrency, and online CPU count so pass-rate reports retain their execution
 context.
 
+### Relaxed-mode flag matrix
+
+The `super` tier includes an occasional ptrace matrix that checks every
+meaningful combination from strict deterministic execution through the
+passthrough endpoints. The 60-state cross-product is:
+
+| Axis | States |
+| --- | --- |
+| Policy | relaxed; strict (which requires sequentialization and deterministic I/O) |
+| Thread scheduling | sequentialized; non-sequentialized (relaxed only) |
+| I/O | deterministic; host behavior (relaxed only) |
+| Time and metadata | both virtualized; time only; neither (metadata cannot be virtualized without time) |
+| CPUID | virtualized; host behavior |
+| Verification | off; two-run verification on |
+
+Three endpoint configurations add `--strace-only`, `--strace-only --verify`,
+and `--namespace-only`. Verification is invalid with `--namespace-only` and is
+therefore not presented as a runnable state. Each of the 63 configurations runs
+`/bin/true`, fixed stdio, and a threaded workload that observes clocks, file
+metadata, CPUID, and randomness: 189 bounded cases in total.
+
+Run the matrix directly with:
+
+```sh
+HERMIT_FLAG_MATRIX_REPORT=target/relaxed-flag-matrix/results.tsv \
+  cargo test -p hermit --test relaxed_flag_matrix \
+  meaningful_flag_combinations_run_without_crashing -- \
+  --exact --ignored --test-threads=1 --nocapture
+```
+
+The TSV report records the configuration, program, verification setting,
+outcome, and elapsed milliseconds. A valid non-verifying run must exit zero.
+A verifying run must either carry Hermit's deterministic success marker or its
+explicit nondeterminism result; timeouts, signals, panics, and unexplained
+nonzero exits fail the test. This distinction makes relaxed and passthrough
+verification useful without pretending those modes promise determinism.
+
+The exact strict/no-time `clock_gettime` failure is temporarily ratcheted as an
+expected failure linked to [issue #1176](https://github.com/rrnewton/hermit/issues/1176).
+Only that diagnostic signature is accepted, and the test requires its expected
+count so a fix prompts removal of the exception instead of silently leaving a
+stale waiver.
+
 The full and super backend gates probe actual runtime capability: KVM requires
 a readable and writable `/dev/kvm`; DBI must complete a bounded `/bin/true`
 smoke using either its bundled DynamoRIO runtime or explicit environment

@@ -3088,6 +3088,10 @@ function run_portable_slow_strict_diagnostics {
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(#719): Review the weekly placement of slow diagnostics.
 function run_super_diagnostic_suite {
+    run_check_with_timeout 1800 "Relaxed Hermit flag matrix" \
+        env HERMIT_FLAG_MATRIX_REPORT="$ROOT_DIR/target/relaxed-flag-matrix/results.tsv" \
+        cargo test -p hermit --test relaxed_flag_matrix \
+        meaningful_flag_combinations_run_without_crashing -- --exact --ignored --test-threads=1 --nocapture
     # These probes are useful for trend detection but do not gate PRs. On the
     # portable runner they consumed about 20 minutes after the blocking suite had
     # already passed, so keep their signal in the scheduled super tier.

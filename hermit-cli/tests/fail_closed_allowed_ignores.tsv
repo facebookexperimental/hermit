@@ -42,6 +42,7 @@ leveldb	full_leveldb_suite_is_deterministic_under_strict	full LevelDB suite cont
 leveldb	leveldb_env_posix_is_deterministic_under_strict	repeated fork+exec close-on-exec checks are slow under ptrace
 python_stdlib	strict_python_stdlib_is_deterministic	requires system CPython with its full Lib/test package
 random_determinism	random_sources_are_deterministic_under_strict_verify	e2e requires PMU and mount namespaces
+relaxed_flag_matrix	meaningful_flag_combinations_run_without_crashing	occasional exhaustive relaxed-mode flag matrix requires mount namespaces
 rcx_canonicalization	rcx_r11_are_canonical_and_deterministic_under_strict	e2e requires PMU and mount namespaces
 redis_strict	redis_source_build_and_extended_suite_under_strict_hermit	downloads and builds pinned Redis, then runs the extended strict suite
 rr_suite	rr_args	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
