@@ -1229,11 +1229,19 @@ async fn run_kvm(
     backend
         .set_random_seed(random_seed)
         .map_err(|error| anyhow!("failed to configure KVM guest random seed: {error}"))?;
-    // Option A: when CLONE_THREAD workers are dispatched through the Detcore
-    // tool and joined in its scheduler, thread-synchronization syscalls such as
-    // futex must route to Detcore rather than the host. Tell the backend which
-    // model is active so `is_backend_owned_syscall` classifies futex correctly.
-    backend.set_dispatch_thread_tools(config.backend_dispatches_thread_tools);
+    // The KVM backend now defaults to Tool-owned guest threads: CLONE_THREAD
+    // workers are driven through the Detcore tool loop and their futex/CLEARTID
+    // synchronization routes to Detcore, matching the golden ptrace model
+    // ("follow children"). Detcore's own clone logic treats a CLONE_THREAD as
+    // backend-uninstrumented iff `backend_dispatches_thread_tools` is false (see
+    // detcore/src/syscalls/threads.rs), so in exactly that case opt the backend
+    // out to host-owned threads to keep worker execution and futex ownership in
+    // one synchronization domain (mixing them deadlocks pthread_join). In the
+    // default (true) case the backend already follows children, so no call is
+    // needed.
+    if !config.backend_dispatches_thread_tools {
+        backend.unmonitored_threads();
+    }
 
     let execution_started = Instant::now();
     let (global_state, code, stdout, stderr) = backend
