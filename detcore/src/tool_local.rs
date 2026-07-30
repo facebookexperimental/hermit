@@ -332,6 +332,10 @@ impl FileMetadata {
             .len()
     }
 
+    fn has_loopback_peer(&self) -> bool {
+        self.file_handles.values().any(DetFd::is_loopback_peer)
+    }
+
     pub(crate) fn fork_for(&self, child: DetTid) -> Self {
         Self {
             files_id: FilesId::forked(child),
@@ -1777,6 +1781,11 @@ impl<T> ThreadState<T> {
 
     pub(crate) fn count_open_files_at_paths(&self, paths: &[&Path]) -> usize {
         self.metadata().count_open_files_at_paths(paths)
+    }
+
+    /// Whether this task owns a socket that attempted a loopback connection.
+    pub(crate) fn has_loopback_peer(&self) -> bool {
+        self.metadata().has_loopback_peer()
     }
 
     /// remove a rawfd

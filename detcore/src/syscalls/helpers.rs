@@ -114,7 +114,22 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let wrapped: Syscall = call.into();
 
-        let action = ioaction_based_on_fd_status(guest, call);
+        let action = match ioaction_based_on_fd_status(guest, call) {
+            Ok(action) => action,
+            Err(errno) => {
+                // Descriptor metadata is advisory for choosing an execution strategy. If the
+                // descriptor is invalid or cannot be classified, execute through the
+                // scheduler-safe blocking path and let the kernel provide the syscall errno.
+                // Returning the metadata error (or panicking on it) can change Linux error
+                // precedence, for example connect(-1, invalid_sockaddr, ...).
+                tracing::trace!(
+                    "NonblockableSyscall: fd classification failed with {}; executing kernel-authoritatively: {}",
+                    errno,
+                    call.name()
+                );
+                return self.record_or_replay_blocking(guest, wrapped).await;
+            }
+        };
 
         // Is this operation on a container-INTERNAL fd (currently: pipes)? Internal
         // pipes are made physically nonblocking even in record/replay (see
@@ -449,7 +464,10 @@ pub enum IOAction {
     PassThru,
 }
 
-/// Returns strategy based on FD-based call may actually block when executed.
+/// Returns the strategy for an FD-based call that may block when executed.
+///
+/// Failure means descriptor metadata could not classify the call; the caller must preserve the
+/// kernel's authority over the syscall result rather than exposing this advisory lookup error.
 pub fn ioaction_based_on_fd_status<
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -457,15 +475,12 @@ pub fn ioaction_based_on_fd_status<
 >(
     guest: &mut G,
     call: C,
-) -> IOAction {
+) -> Result<IOAction, Errno> {
     let wrapped: Syscall = call.into();
     let fd = get_fd(wrapped).unwrap_or_else(|| panic!("Failed to get fd for {}", call.name()));
-    let (phys, virt) = guest
-        .thread_state()
-        .with_detfd(fd, |detfd| {
-            (detfd.physically_nonblocking(), detfd.is_nonblocking())
-        })
-        .unwrap();
+    let (phys, virt) = guest.thread_state().with_detfd(fd, |detfd| {
+        (detfd.physically_nonblocking(), detfd.is_nonblocking())
+    })?;
     tracing::trace!(
         "Checking FD {} for nonblocking: physical {} / virtual {}",
         fd,
@@ -480,13 +495,13 @@ pub fn ioaction_based_on_fd_status<
         );
     } else if !virt && !phys {
         // FF: logically blocking, physically blocking, this could only work with BlockingExternalIO.
-        IOAction::Blocking
+        Ok(IOAction::Blocking)
     } else if virt && phys {
         // TT: both nonblocking, so firing once is sufficient
-        IOAction::PassThru
+        Ok(IOAction::PassThru)
     } else {
         // FT: Need to simulate blocking on top of nonblocking.
-        IOAction::NonblockizeRetry
+        Ok(IOAction::NonblockizeRetry)
     }
 }
 

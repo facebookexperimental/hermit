@@ -129,6 +129,9 @@ struct OpenFileDescription {
     /// whose binary dump replies carry host-assigned socket inode numbers that
     /// must be determinized (see `crate::sock_diag`).
     sock_diag: bool,
+    /// True when this socket connected to an IPv4 or IPv6 loopback peer.
+    #[serde(default)]
+    loopback_peer: bool,
 }
 
 impl PartialEq for DetFd {
@@ -172,6 +175,7 @@ impl DetFd {
                 procfs: None,
                 socket_receive_timestamp: None,
                 sock_diag: false,
+                loopback_peer: false,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             })),
@@ -440,6 +444,16 @@ impl DetFd {
     pub(crate) fn is_sock_diag(&self) -> bool {
         self.description().sock_diag
     }
+
+    /// Update whether this open file is connected to a loopback peer.
+    pub(crate) fn set_loopback_peer(&self, loopback_peer: bool) {
+        self.description().loopback_peer = loopback_peer;
+    }
+
+    /// Whether this open file is a socket connected to a loopback peer.
+    pub(crate) fn is_loopback_peer(&self) -> bool {
+        self.description().loopback_peer
+    }
 }
 
 impl fmt::Display for DetFd {
@@ -492,6 +506,18 @@ mod tests {
         assert!(
             duplicate.is_sock_diag(),
             "sock_diag marking through one alias must be visible through every alias"
+        );
+
+        assert!(!original.is_loopback_peer());
+        duplicate.set_loopback_peer(true);
+        assert!(
+            original.is_loopback_peer(),
+            "loopback-peer marking through one alias must be visible through every alias"
+        );
+        original.set_loopback_peer(false);
+        assert!(
+            !duplicate.is_loopback_peer(),
+            "reconnects through one alias must clear loopback state for every alias"
         );
     }
 

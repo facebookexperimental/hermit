@@ -30,6 +30,11 @@ use crate::types::SigWrapper;
 /// normalization as the polling turn itself.
 pub(crate) const SABRE_INTERNAL_PIPE_IO_FYI: &str = "sabre-internal-pipe-io";
 
+/// Identifies the strong one-turn yield issued before a SaBRe task with a loopback peer performs
+/// a zero-timeout poll. The number of these guest polling-loop iterations depends on when the
+/// peer's kernel readiness becomes visible, so the verifier normalizes their scheduler-only turns.
+pub(crate) const SABRE_LOOPBACK_POLL_YIELD_FYI: &str = "sabre-loopback-poll-zero-timeout";
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1151)
 /// An exact slowdown-factor transition recorded at a scheduler commit boundary.
