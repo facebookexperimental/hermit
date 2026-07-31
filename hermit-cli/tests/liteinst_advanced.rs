@@ -90,6 +90,36 @@ fn assert_liteinst_strict_verify(program: &Path, args: &[&str], expected_stdout:
     assert_eq!(output.stdout, expected_stdout);
 }
 
+fn assert_liteinst_virtual_time_is_continuous() {
+    const EPOCH_SECONDS: u64 = 1_767_225_600;
+    const MAX_STARTUP_SECONDS: u64 = 60;
+
+    // Whole seconds remain stable across verified LiteInst runs. Do not assert
+    // the old exact epoch: that encoded #1095's reset-on-exec behavior and
+    // rejects legitimate deterministic startup progress.
+    let output = run_liteinst_strict_verify(Path::new("/usr/bin/date"), &["-u", "+%s"]);
+    let timestamp = String::from_utf8(output.stdout).expect("date output should be UTF-8");
+    let seconds = timestamp
+        .trim()
+        .parse::<u64>()
+        .expect("date seconds should be numeric");
+
+    assert!(
+        seconds >= EPOCH_SECONDS,
+        "guest time preceded the configured epoch: {timestamp}"
+    );
+    assert!(
+        seconds < EPOCH_SECONDS + MAX_STARTUP_SECONDS,
+        "guest startup consumed an implausible amount of virtual time: {timestamp}"
+    );
+    // Verify continuous progression independently of the startup offset.
+    assert_liteinst_strict_verify(
+        advanced_guest(),
+        &["clock-progress"],
+        b"clock-progress-ok\n",
+    );
+}
+
 fn run_liteinst_strict_verify(program: &Path, args: &[&str]) -> Output {
     let output = run_liteinst(program, args, true);
     assert!(
@@ -151,7 +181,7 @@ fn liteinst_strict_verify_identity_utilities() {
 
 #[test]
 fn liteinst_strict_verify_virtual_identity_and_time() {
-    assert_liteinst_strict_verify(Path::new("/usr/bin/date"), &["-u", "+%s"], b"1767225600\n");
+    assert_liteinst_virtual_time_is_continuous();
     assert_liteinst_strict_verify(
         Path::new("/usr/bin/hostname"),
         &[],

@@ -264,6 +264,28 @@ static void run_phased_chaos(uint64_t seed) {
   run_fork_stress();
 }
 
+static uint64_t timespec_nanos(const struct timespec *time) {
+  return (uint64_t)time->tv_sec * 1000000000ULL + (uint64_t)time->tv_nsec;
+}
+
+static void run_clock_progress(void) {
+  struct timespec before;
+  struct timespec after;
+  if (clock_gettime(CLOCK_MONOTONIC, &before) != 0) {
+    fail("clock_gettime before");
+  }
+  for (unsigned int index = 0; index < 4; ++index) {
+    (void)syscall(SYS_gettid);
+  }
+  if (clock_gettime(CLOCK_MONOTONIC, &after) != 0) {
+    fail("clock_gettime after");
+  }
+  if (timespec_nanos(&after) <= timespec_nanos(&before)) {
+    fprintf(stderr, "CLOCK_MONOTONIC did not advance\n");
+    exit(1);
+  }
+}
+
 static uint64_t parse_seed(const char *value) {
   char *end = NULL;
   errno = 0;
@@ -276,6 +298,11 @@ static uint64_t parse_seed(const char *value) {
 }
 
 int main(int argc, char **argv) {
+  if (argc == 2 && strcmp(argv[1], "clock-progress") == 0) {
+    run_clock_progress();
+    puts("clock-progress-ok");
+    return 0;
+  }
   if (argc == 2 && strcmp(argv[1], "threads") == 0) {
     run_threads(1);
     puts("threads-ok");
@@ -302,6 +329,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   fprintf(stderr,
-          "usage: %s threads|signals|fork|chaos[-verify] SEED\n", argv[0]);
+          "usage: %s clock-progress|threads|signals|fork|chaos[-verify] SEED\n",
+          argv[0]);
   return 2;
 }
