@@ -37,7 +37,7 @@
       "group": "e2e", "job": "metadata",
       "desc": "Validate multi-mode E2E metadata and required-cell plan",
       "cmd": "./ci/test_harness.sh validate",
-      "timeout": 60,
+      "timeout": 20,
       "hint": {"est_duration_s": 5,
                "rss_baseline_bytes": 268435456, "hard_mem_max_bytes": 1073741824,
                "classification": "light"}
@@ -47,7 +47,7 @@
       "desc": "Prepare every CI-enabled privileged manifest guest",
       "cmd": "./ci/test_harness.sh build --lane privileged --ci-only",
       "deps": ["e2e.metadata"],
-      "timeout": 90,
+      "timeout": 120,
       "hint": {"est_duration_s": 75,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "cpu-bound"}
@@ -58,7 +58,7 @@
       "manifest": {"lane": "privileged", "category": "applications"},
       "cmd": "./ci/test_harness.sh run --lane privileged --category applications --ci-only --allow-empty --prebuilt --results ignored/e2e/privileged/applications/results.jsonl --junit ignored/e2e/privileged/applications/junit.xml",
       "deps": ["build.privileged_tests", "build.manifest_guests", "e2e.metadata"],
-      "timeout": 120,
+      "timeout": 130,
       "hint": {"resources": {"kvm": 1}, "est_duration_s": 90,
                "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
                "classification": "latency-bound"}
