@@ -230,17 +230,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::ClockGetres,
     ) -> Result<i64, Error> {
-        let res = call.res().ok_or(Errno::EFAULT)?;
+        // A NULL `res` pointer is valid for clock_getres: the kernel validates
+        // the clockid and returns 0 without storing the resolution. GHC's RTS
+        // probes the per-thread CPU clock exactly this way
+        // (clock_getres(clockid, NULL)) in getCurrentThreadCPUTime, so
+        // returning EFAULT here spuriously aborts the guest. Only write the
+        // resolution when the caller supplied a destination.
+        if let Some(res) = call.res() {
+            // For now we report a constant clock res of 10ms:
+            let clock_res = 10;
 
-        // For now we report a constant clock res of 10ms:
-        let clock_res = 10;
+            let t = Timespec {
+                tv_sec: 0,
+                tv_nsec: 1000 * clock_res as i64,
+            };
 
-        let t = Timespec {
-            tv_sec: 0,
-            tv_nsec: 1000 * clock_res as i64,
-        };
-
-        guest.memory().write_value(res, &t)?;
+            guest.memory().write_value(res, &t)?;
+        }
 
         Ok(0)
     }

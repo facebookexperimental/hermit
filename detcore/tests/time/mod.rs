@@ -312,6 +312,32 @@ fn tod_clock_getres() {
     );
 }
 
+// Regression: a NULL `res` pointer is valid for clock_getres (the kernel
+// validates the clockid and returns 0 without storing the resolution). GHC's
+// threaded RTS probes the per-thread CPU clock this way in
+// getCurrentThreadCPUTime; returning EFAULT here spuriously aborts the guest.
+#[test]
+fn clock_getres_null_res_is_ok() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            assert_eq!(
+                unsafe { libc::clock_getres(libc::CLOCK_MONOTONIC, std::ptr::null_mut()) },
+                0
+            );
+            assert_eq!(
+                unsafe { libc::clock_getres(libc::CLOCK_THREAD_CPUTIME_ID, std::ptr::null_mut()) },
+                0
+            );
+        },
+        config,
+        true,
+    );
+}
+
 #[test]
 fn tod_clock_getres_2() {
     let multiplier = 1000.0;
