@@ -118,6 +118,42 @@ without per-child Detcore tool callbacks. The CPUID row similarly validates
 reverie-kvm's backend-local `KVM_SET_CPUID2` policy, not Detcore CPUID-event
 parity.
 
+## e9patch preprocessing corpus
+
+e9patch is not a backend in this matrix. It is binary-rewriting *preprocessing*
+for the ptrace backend: e9tool rewrites the guest ELF ahead of time to pre-trap
+its `SYSCALL` sites, then Detcore runs the rewritten image under ptrace. e9tool
+rewrites only the *main* executable, so the dynamically linked libc guests above
+expose zero in-ELF `SYSCALL` sites (`candidate_sites=0`) and never exercise the
+rewrite path — which is why e9patch is not a column here. Its parity is instead
+ratcheted by `e9patch_corpus.py` over a freestanding, statically linked,
+raw-`syscall` corpus under `e9patch_corpus/`, where `candidate_sites > 0`.
+
+For each guest that harness enforces exit-status parity, stdout parity, golden
+L2 (`hermit run --strict --verify`), e9patch L2
+(`hermit --backend e9patch run --strict --verify`), full direct-AOT coverage
+(`mapped_sites == candidate_sites > 0`), no signal fallback (`b0_sites == 0`),
+and guest-syscall DETLOG **tail-match**: the golden guest-syscall sequence
+equals the suffix of the e9patch sequence. Byte-identical DETLOG parity is
+impossible by construction because the e9patch image runs a fixed deterministic
+e9loader prologue (readlink/open/arch_prctl/`N`×mmap/close) before the guest's
+`_start`; that prologue is a pure prefix, so the enforced parity is guest-syscall
+DETLOG identity *modulo* the deterministic prologue, plus L2 and guest-visible
+parity. No strict-detlog-identity claim is made.
+
+Like the KVM `/dev/kvm` gate, this harness is `BLOCKED` in CI: it needs a hermit
+built `--features e9patch` and a built e9tool/e9patch pair
+(`HERMIT_E9TOOL`/`HERMIT_E9PATCH_BACKEND`). Run it locally:
+
+```bash
+cargo build -p hermit --features e9patch
+HERMIT_E9TOOL=<path>/e9tool HERMIT_E9PATCH_BACKEND=<path>/e9patch \
+    python3 tests/backend-parity/e9patch_corpus.py \
+    --hermit target/debug/hermit --require-backend
+```
+
+Use `--check` to validate the corpus contract without prerequisites.
+
 ## Running
 
 Validate the checked-in matrix without backend prerequisites:
