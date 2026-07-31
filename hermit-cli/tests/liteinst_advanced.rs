@@ -12,6 +12,7 @@ mod liteinst_runtime;
 use std::fs;
 use std::io::Read;
 use std::io::Seek;
+use std::io::Write;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -81,20 +82,37 @@ fn semantic_fixture() -> &'static Path {
     LITEINST_SEMANTIC_FIXTURE.get_or_init(|| {
         let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-advanced");
         fs::create_dir_all(&build_root).expect("failed to create LiteInst fixture directory");
-        let fixture = build_root.join("semantic-fixture.txt");
-        fs::write(&fixture, SEMANTIC_FIXTURE_CONTENT)
-            .expect("failed to write LiteInst semantic fixture");
+        let mut fixture = tempfile::Builder::new()
+            .prefix("semantic-fixture-")
+            .tempfile_in(build_root)
+            .expect("failed to create LiteInst semantic fixture");
         fixture
+            .write_all(SEMANTIC_FIXTURE_CONTENT)
+            .expect("failed to write LiteInst semantic fixture");
+        let (_file, path) = fixture
+            .keep()
+            .expect("failed to retain LiteInst semantic fixture");
+        path
     })
 }
 
 fn run_liteinst(program: &Path, args: &[&str], verify: bool) -> Output {
     liteinst_runtime::ensure_liteinst_runtime();
+    let home = tempfile::tempdir().expect("failed to create isolated LiteInst HOME");
+    let xdg_config_home = home.path().join(".config");
+    fs::create_dir_all(&xdg_config_home).expect("failed to create isolated XDG config directory");
     let mut command = Command::new(liteinst_runtime::hermit_binary());
     command.args(["--log=info", "run", "--backend", "liteinst", "--strict"]);
     if verify {
         command.arg("--verify");
     }
+    command
+        .arg(format!("--env=HOME={}", home.path().display()))
+        .arg(format!(
+            "--env=XDG_CONFIG_HOME={}",
+            xdg_config_home.display()
+        ))
+        .env("HOME", home.path());
     command.arg("--").arg(program).args(args);
     command.output().expect("failed to run Hermit LiteInst")
 }
