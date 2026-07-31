@@ -1,0 +1,217 @@
+name: P0 Demo Gate (Hermit hot paths)
+
+# The unified demos live in rrnewton/dev-hermit, but the parent repository has
+# no self-hosted runner. Run the suite from Hermit's existing trusted PMU lane:
+# check out the current parent demo harness, then overlay the exact Hermit
+# commit that triggered this workflow. Keep this paths list synchronized with
+# the hot-path test in merge-gate.yml.
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/demo-hot-path.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "common/**"
+      - "detcore*/**"
+      - "examples/**"
+      - "flaky-tests/**"
+      - "hermit-cli/**"
+      - "hermit-install/**"
+      - "hermit-resources/**"
+      - "rust-toolchain.toml"
+      - "tests/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/demo-hot-path.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "common/**"
+      - "detcore*/**"
+      - "examples/**"
+      - "flaky-tests/**"
+      - "hermit-cli/**"
+      - "hermit-install/**"
+      - "hermit-resources/**"
+      - "rust-toolchain.toml"
+      - "tests/**"
+  workflow_dispatch:
+
+concurrency:
+  # Never cancel a main-push run: each red must identify its exact culprit.
+  # Superseded PR heads may be cancelled so they do not monopolize the serial
+  # PMU/QEMU lane.
+  group: hermit-demo-gate-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  DEMO08_REQUIRE_ASSETS: "1"
+  DETCORE_TEST_RUST_LOG: "off"
+  RUSTFLAGS: -D warnings -C link-arg=-llzma
+  RUSTDOCFLAGS: -D warnings
+  SUITE_DIR: ${{ github.workspace }}/dev-hermit-demo-suite
+  TARGET_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  reject-untrusted-fork:
+    name: P0 demo gate requires a trusted branch
+    if: >-
+      github.repository == 'rrnewton/hermit' &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "::error title=P0 demo gate not executed::Self-hosted demos do not execute fork-authored code. Move this change to a trusted rrnewton/hermit branch before landing."
+          exit 1
+
+  demos:
+    name: P0 demo gate (demos 1-8)
+    if: >-
+      github.repository == 'rrnewton/hermit' &&
+      (
+        github.event_name != 'pull_request' ||
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
+    runs-on: [Linux, X64, hermit, pmu, pmu-serial]
+    timeout-minutes: 360
+    steps:
+      - name: Remove stale checkout locks
+        run: |
+          set -euo pipefail
+          if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+            timeout --foreground --kill-after=5s 30s \
+              find "$GITHUB_WORKSPACE/.git" -type f -name "*.lock" -print -delete
+          fi
+
+      - name: Check out the unified demo suite
+        uses: actions/checkout@v4
+        with:
+          repository: rrnewton/dev-hermit
+          ref: main
+          path: dev-hermit-demo-suite
+          submodules: false
+
+      - name: Overlay the exact Hermit commit under test
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          path: dev-hermit-demo-suite/hermit
+          submodules: false
+
+      - name: Verify exact culprit attribution
+        run: |
+          set -euo pipefail
+          actual="$(git -C "$SUITE_DIR/hermit" rev-parse HEAD)"
+          test "$actual" = "$TARGET_SHA"
+          echo "Demo suite Hermit SHA: $actual"
+          echo "Demo harness SHA: $(git -C "$SUITE_DIR" rev-parse HEAD)"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: dev-hermit-demo-suite/hermit -> target
+          shared-key: hermit-hot-path-demo-gate
+          cache-on-failure: true
+
+      - name: Install demo dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v dnf >/dev/null; then
+            sudo dnf makecache || echo "::notice::dnf makecache failed; using existing metadata"
+            sudo dnf install -y \
+              autoconf automake binutils busybox cpio e2fsprogs e2fsprogs-devel \
+              cmake elfutils-libelf-devel file gcc gcc-c++ gzip \
+              libblkid-devel libunwind-devel libuuid-devel libzstd-devel \
+              lzo-devel make patch pkgconf-pkg-config python3 python3-devel \
+              python3-pip qemu-img qemu-kvm-core tcl-devel xz-devel zlib-devel
+          elif command -v apt-get >/dev/null; then
+            sudo apt-get update || echo "::notice::apt-get update failed; using existing metadata"
+            sudo apt-get install -y \
+              autoconf automake binutils build-essential busybox-static cpio \
+              cmake e2fsprogs file gzip libblkid-dev libdw-dev libelf-dev \
+              libext2fs-dev liblzo2-dev liblzma-dev libunwind-dev libzstd-dev \
+              patch pkg-config python3 python3-dev python3-pip \
+              qemu-system-x86 qemu-utils tcl-dev uuid-dev zlib1g-dev
+          else
+            echo "::error::Unsupported package manager"
+            exit 1
+          fi
+
+          if ! command -v drgn >/dev/null 2>&1; then
+            if command -v with-proxy >/dev/null 2>&1; then
+              with-proxy python3 -m pip install --user drgn || \
+                with-proxy python3 -m pip install --user --break-system-packages drgn
+            else
+              python3 -m pip install --user drgn || \
+                python3 -m pip install --user --break-system-packages drgn
+            fi
+            echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+          fi
+
+      - name: Require the demo host capabilities
+        working-directory: dev-hermit-demo-suite
+        run: |
+          set -euo pipefail
+          make doctor-qemu
+          command -v drgn readelf mkfs.ext4 patch
+          test -r /proc/sys/kernel/perf_event_paranoid
+          unshare --user --map-root-user --pid --fork true
+
+      - name: Restore pinned heavy-demo assets
+        uses: actions/cache@v4
+        with:
+          path: |
+            dev-hermit-demo-suite/ignored/demo08-btrfs
+            dev-hermit-demo-suite/ignored/demo08-build/btrfs-progs-v7.1
+          key: hermit-demo-assets-v1-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Run demos 1-8 at the exact Hermit SHA
+        working-directory: dev-hermit-demo-suite
+        run: |
+          set -euo pipefail
+          command=(scripts/super-validate.sh --demos-only)
+          if command -v with-proxy >/dev/null 2>&1; then
+            command=(with-proxy "${command[@]}")
+          fi
+          timeout --foreground --kill-after=60s 21000s \
+            "${command[@]}" 2>&1 | tee demo-sweep-validation.log
+
+      - name: Upload per-demo diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermit-demo-sweep-${{ github.event_name }}-${{ github.run_id }}
+          path: |
+            dev-hermit-demo-suite/demo-sweep-validation.log
+            dev-hermit-demo-suite/target/demo-sweep/
+            dev-hermit-demo-suite/ignored/qemu-linux/boot-anchor/run-metadata.json
+            dev-hermit-demo-suite/ignored/qemu-linux/run-history/*/run-metadata.json
+            dev-hermit-demo-suite/ignored/demo07-drgn/
+            dev-hermit-demo-suite/ignored/demo08-run/*.txt
+            dev-hermit-demo-suite/ignored/demo08-run/*.out
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Escalate every demo red as P0
+        if: failure()
+        run: |
+          echo "::error title=P0 Hermit demo regression::Demos 1-8 failed at exact Hermit SHA $TARGET_SHA. Treat this red as P0 and inspect the per-demo summary and artifacts."
+          {
+            echo
+            echo "## P0 demo-regression escalation"
+            echo "**Owner policy: every demo-sweep red is P0 and blocks landing.**"
+            echo
+            echo "- Hermit commit: \`$TARGET_SHA\`"
+            echo "- Event: \`${{ github.event_name }}\`"
+            echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            echo "The exact-SHA run identifies the Hermit commit or PR that introduced the regression."
+          } >>"$GITHUB_STEP_SUMMARY"
+          exit 1

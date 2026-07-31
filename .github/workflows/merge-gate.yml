@@ -7,7 +7,9 @@ on:
   merge_group:
     types: [checks_requested]
   workflow_run:
-    workflows: ["CI (GitHub-managed portable)"]
+    workflows:
+      - "CI (GitHub-managed portable)"
+      - "P0 Demo Gate (Hermit hot paths)"
     types: [completed]
   workflow_dispatch:
     inputs:
@@ -19,10 +21,12 @@ on:
         type: string
 
 # This lightweight required check accepts an exact PR head after the repository
-# GitHub-managed portable CI workflow succeeds or after a fully green local validate.sh
-# run applies the locally-validated label. Privileged CI is an independent
-# bonus signal. Merge-group checks inspect their constituent PR heads instead of
-# trusting the synthetic queue commit.
+# GitHub-managed portable CI workflow succeeds or after a fully green local
+# validate.sh run applies the locally-validated label. Demo-relevant changes
+# additionally require the exact-SHA P0 demo gate; local validation never bypasses
+# that owner-mandated gate. Privileged CI is an independent bonus signal.
+# Merge-group checks inspect their constituent PR heads instead of trusting the
+# synthetic queue commit.
 #
 # The gate is fork-only because facebookexperimental/hermit has no access to the
 # fork privileged runners and fork pull requests receive a read-only token in
@@ -43,7 +47,7 @@ jobs:
       contents: read
       pull-requests: read
     steps:
-      - name: Re-dispatch the gate for a completed PR CI run
+      - name: Re-dispatch the gate for completed portable CI or demo runs
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -319,26 +323,57 @@ jobs:
             fi
             if [ "$locally_validated" = true ]; then
               echo "PR #${pr_number} is locally validated at $head_sha."
-              continue
+            else
+              runs="$(
+                gh api "repos/${REPO}/actions/workflows/ci-portable.yml/runs?head_sha=${head_sha}&per_page=100"
+              )"
+              run="$(jq --arg sha "$head_sha" '
+                [.workflow_runs[] | select(.head_sha == $sha)]
+                | sort_by(.created_at)
+                | last // {}
+              ' <<< "$runs")"
+              status="$(jq -r '.status // "missing"' <<< "$run")"
+              conclusion="$(jq -r '.conclusion // ""' <<< "$run")"
+              url="$(jq -r '.html_url // ""' <<< "$run")"
+
+              if [ "$status:$conclusion" = completed:success ]; then
+                echo "GitHub-managed portable CI passed for PR #${pr_number} at $head_sha: $url"
+              else
+                echo "::error::GitHub-managed portable CI for PR #${pr_number} at $head_sha is $status/${conclusion:-none}: ${url:-no run URL}."
+                failed=1
+              fi
             fi
 
-            runs="$(
-              gh api "repos/${REPO}/actions/workflows/ci-portable.yml/runs?head_sha=${head_sha}&per_page=100"
+            # Keep this classifier synchronized with demo-hot-path.yml's paths.
+            files="$(
+              gh api "repos/${REPO}/pulls/${pr_number}/files" \
+                --paginate --jq '.[].filename'
             )"
-            run="$(jq --arg sha "$head_sha" '
-              [.workflow_runs[] | select(.head_sha == $sha)]
-              | sort_by(.created_at)
-              | last // {}
-            ' <<< "$runs")"
-            status="$(jq -r '.status // "missing"' <<< "$run")"
-            conclusion="$(jq -r '.conclusion // ""' <<< "$run")"
-            url="$(jq -r '.html_url // ""' <<< "$run")"
+            if grep -Eq '^([.]github/workflows/demo-hot-path[.]yml|Cargo[.](lock|toml)|rust-toolchain[.]toml|common/|detcore[^/]*/|examples/|flaky-tests/|hermit-cli/|hermit-install/|hermit-resources/|tests/)' <<< "$files"; then
+              all_runs="$(
+                gh api "repos/${REPO}/actions/runs?head_sha=${head_sha}&per_page=100"
+              )"
+              demo_run="$(jq --arg sha "$head_sha" '
+                [.workflow_runs[]
+                  | select(
+                      .head_sha == $sha
+                      and .name == "P0 Demo Gate (Hermit hot paths)"
+                    )]
+                | sort_by(.created_at)
+                | last // {}
+              ' <<< "$all_runs")"
+              demo_status="$(jq -r '.status // "missing"' <<< "$demo_run")"
+              demo_conclusion="$(jq -r '.conclusion // ""' <<< "$demo_run")"
+              demo_url="$(jq -r '.html_url // ""' <<< "$demo_run")"
 
-            if [ "$status:$conclusion" = completed:success ]; then
-              echo "GitHub-managed portable CI passed for PR #${pr_number} at $head_sha: $url"
+              if [ "$demo_status:$demo_conclusion" = completed:success ]; then
+                echo "P0 demo gate passed for hot-path PR #${pr_number} at $head_sha: $demo_url"
+              else
+                echo "::error::P0 demo gate for hot-path PR #${pr_number} at $head_sha is $demo_status/${demo_conclusion:-none}: ${demo_url:-no run URL}. Every demo red is P0 and blocks landing."
+                failed=1
+              fi
             else
-              echo "::error::GitHub-managed portable CI for PR #${pr_number} at $head_sha is $status/${conclusion:-none}: ${url:-no run URL}."
-              failed=1
+              echo "PR #${pr_number} does not touch a demo hot path; P0 demo gate not required."
             fi
           done < <(jq -r '
             .[]
