@@ -39,17 +39,26 @@
     },
     {
       "group": "build", "job": "dbi_release",
-      "desc": "Build release Hermit for DynamoRIO DBI and LiteInst",
-      "cmd": "cargo build --release --locked -p hermit -p detcore-dbi",
+      "desc": "Build release Hermit, the DBI plugin, and installed backend resources",
+      "cmd": "HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-common cargo build --release --locked -p hermit -p detcore-dbi -p hermit-install",
       "deps": ["build.workspace"],
       "timeout": 1200,
       "hint": {"est_duration_s": 240, "rss_baseline_bytes": 5368709120,
                "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
     },
     {
+      "group": "build", "job": "sabre_release",
+      "desc": "Build the release Detcore SaBRe plugin and restage the pinned loader",
+      "cmd": "cargo build --release --locked -p detcore-sabre && HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-sabre cargo build --release --locked -p hermit-install && sha256sum target/install_pkg/rsrcs/sabre && cat target/install_pkg/rsrcs/sabre.revision",
+      "deps": ["build.dbi_release"],
+      "timeout": 1200,
+      "hint": {"est_duration_s": 90, "rss_baseline_bytes": 3221225472,
+               "hard_mem_max_bytes": 6442450944, "classification": "cpu-bound"}
+    },
+    {
       "group": "build", "job": "liteinst_runtime_release",
       "desc": "Build and stage the release LiteInst runtime",
-      "cmd": "./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build-2afd1ecc",
+      "cmd": "./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build-adc14734",
       "deps": ["build.dbi_release"],
       "timeout": 900,
       "hint": {"est_duration_s": 120, "rss_baseline_bytes": 2147483648,
@@ -355,6 +364,16 @@
       "deps": ["build.liteinst_runtime_release"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "sabre_examples",
+      "desc": "SaBRe non-racy examples: strict verification and ptrace output parity",
+      "cmd": "HERMIT_SABRE_TEST_BINARY=$PWD/target/release/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre cargo test -p hermit --test sabre_examples -- --test-threads=1",
+      "deps": ["build.sabre_release"],
+      "timeout": 900,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "latency-bound"}
     },

@@ -56,6 +56,47 @@ struct PendingPatch {
     syscall: u64,
 }
 
+struct SignalDiagnostic {
+    signal: Signal,
+    si_code: Option<i32>,
+    si_errno: Option<i32>,
+    fault_address: Option<usize>,
+    mapping: Option<MappingDiagnostic>,
+    instruction_bytes: Option<[u8; 16]>,
+    registers: libc::user_regs_struct,
+}
+
+struct MappingDiagnostic {
+    line: String,
+    relative_offset: usize,
+    file_offset: usize,
+}
+
+fn should_replace_signal_diagnostic(
+    existing: Option<(Signal, Option<i32>, bool)>,
+    signal: Signal,
+    si_code: Option<i32>,
+) -> bool {
+    // SaBRe handles its reserved SIGILL markers in-process. For an unknown hardware SIGILL it
+    // restores SIG_DFL and raises SIGILL again, producing a second ptrace stop from SI_TKILL.
+    // Preserve the original kernel fault context across that re-raise, but let a later hardware
+    // fault replace it so a successfully handled marker cannot leave stale diagnostics behind.
+    if let Some((Signal::SIGILL, Some(existing_code), existing_is_marker)) = existing
+        && signal == Signal::SIGILL
+        && existing_code > 0
+        && !existing_is_marker
+        && !si_code.is_some_and(|code| code > 0)
+    {
+        return false;
+    }
+    true
+}
+
+fn is_sabre_sigill_marker(instruction_bytes: Option<&[u8; 16]>) -> bool {
+    instruction_bytes
+        .is_some_and(|bytes| matches!(&bytes[..2], [0x0f, 0xff] | [0x0f, 0x0b] | [0x0f, 0x0c]))
+}
+
 fn final_physical_exit(status: &WaitStatus) -> Option<(Pid, ExitStatus)> {
     match *status {
         WaitStatus::Exited(pid, code) => Some((pid, ExitStatus::from_raw(code << 8))),
@@ -77,6 +118,7 @@ struct Supervisor {
     readiness: Arc<AtomicBool>,
     ready_observed: bool,
     patched_sites: HashSet<(Pid, usize)>,
+    signal_diagnostics: HashMap<Pid, SignalDiagnostic>,
     physical_exit_observer: Arc<detcore::GlobalState>,
 }
 
@@ -98,6 +140,7 @@ impl Supervisor {
             plugin,
             ready_observed: false,
             patched_sites: HashSet::new(),
+            signal_diagnostics: HashMap::new(),
             physical_exit_observer,
         }
     }
@@ -130,6 +173,67 @@ impl Supervisor {
                 "received ptrace wait status",
             );
             if let Some((pid, exit_status)) = final_physical_exit(&status) {
+                if let WaitStatus::Signaled(_, signal, _) = status
+                    && let Some(diagnostic) = self
+                        .signal_diagnostics
+                        .get(&pid)
+                        .filter(|diagnostic| diagnostic.signal == signal)
+                {
+                    let instruction_bytes = diagnostic.instruction_bytes.as_ref().map(|bytes| {
+                        bytes
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    });
+                    tracing::error!(
+                        target: "hermit::sabre::fallback",
+                        tid = pid.as_raw(),
+                        ?signal,
+                        si_code = diagnostic.si_code,
+                        si_errno = diagnostic.si_errno,
+                        rip = format!("{:#x}", diagnostic.registers.rip),
+                        rsp = format!("{:#x}", diagnostic.registers.rsp),
+                        fault_address = diagnostic
+                            .fault_address
+                            .map(|address| format!("{address:#x}")),
+                        mapping = diagnostic
+                            .mapping
+                            .as_ref()
+                            .map(|mapping| mapping.line.as_str()),
+                        file_offset = diagnostic
+                            .mapping
+                            .as_ref()
+                            .map(|mapping| format!("{:#x}", mapping.file_offset)),
+                        relative_offset = diagnostic
+                            .mapping
+                            .as_ref()
+                            .map(|mapping| format!("{:#x}", mapping.relative_offset)),
+                        instruction_bytes,
+                        rax = format!("{:#x}", diagnostic.registers.rax),
+                        rbx = format!("{:#x}", diagnostic.registers.rbx),
+                        rcx = format!("{:#x}", diagnostic.registers.rcx),
+                        rdx = format!("{:#x}", diagnostic.registers.rdx),
+                        rsi = format!("{:#x}", diagnostic.registers.rsi),
+                        rdi = format!("{:#x}", diagnostic.registers.rdi),
+                        rbp = format!("{:#x}", diagnostic.registers.rbp),
+                        r8 = format!("{:#x}", diagnostic.registers.r8),
+                        r9 = format!("{:#x}", diagnostic.registers.r9),
+                        r10 = format!("{:#x}", diagnostic.registers.r10),
+                        r11 = format!("{:#x}", diagnostic.registers.r11),
+                        r12 = format!("{:#x}", diagnostic.registers.r12),
+                        r13 = format!("{:#x}", diagnostic.registers.r13),
+                        r14 = format!("{:#x}", diagnostic.registers.r14),
+                        r15 = format!("{:#x}", diagnostic.registers.r15),
+                        orig_rax = format!("{:#x}", diagnostic.registers.orig_rax),
+                        eflags = format!("{:#x}", diagnostic.registers.eflags),
+                        cs = format!("{:#x}", diagnostic.registers.cs),
+                        ss = format!("{:#x}", diagnostic.registers.ss),
+                        fs_base = format!("{:#x}", diagnostic.registers.fs_base),
+                        gs_base = format!("{:#x}", diagnostic.registers.gs_base),
+                        "SaBRe tracee terminated by a fatal signal",
+                    );
+                }
                 self.remove_tracee(pid);
                 self.physical_exit_observer
                     .complete_physical_process_exit(pid.as_raw());
@@ -149,7 +253,62 @@ impl Supervisor {
                         self.resume(pid, None)?;
                     } else {
                         if !matches!(signal, Signal::SIGSTOP | Signal::SIGCHLD) {
-                            let rip = ptrace::getregs(pid).map(|r| r.rip).unwrap_or(0);
+                            let registers = ptrace::getregs(pid).ok();
+                            let rip = registers.as_ref().map_or(0, |registers| registers.rip);
+                            let captures_fault_context = matches!(
+                                signal,
+                                Signal::SIGSEGV
+                                    | Signal::SIGILL
+                                    | Signal::SIGBUS
+                                    | Signal::SIGFPE
+                                    | Signal::SIGABRT
+                            );
+                            if captures_fault_context {
+                                let siginfo = ptrace::getsiginfo(pid).ok();
+                                let si_code = siginfo.as_ref().map(|info| info.si_code);
+                                let existing =
+                                    self.signal_diagnostics.get(&pid).map(|diagnostic| {
+                                        (
+                                            diagnostic.signal,
+                                            diagnostic.si_code,
+                                            is_sabre_sigill_marker(
+                                                diagnostic.instruction_bytes.as_ref(),
+                                            ),
+                                        )
+                                    });
+                                if should_replace_signal_diagnostic(existing, signal, si_code) {
+                                    if let Some(registers) = registers {
+                                        let fault_address = siginfo
+                                            .as_ref()
+                                            .filter(|info| info.si_code > 0)
+                                            .map(|info| unsafe { info.si_addr() as usize });
+                                        let mapping = fs::read_to_string(format!(
+                                            "/proc/{}/maps",
+                                            pid.as_raw()
+                                        ))
+                                        .ok()
+                                        .and_then(|maps| mapping_diagnostic(&maps, rip as usize));
+                                        let instruction_bytes =
+                                            read_diagnostic_bytes(pid, rip as usize).ok();
+                                        self.signal_diagnostics.insert(
+                                            pid,
+                                            SignalDiagnostic {
+                                                signal,
+                                                si_code,
+                                                si_errno: siginfo
+                                                    .as_ref()
+                                                    .map(|info| info.si_errno),
+                                                fault_address,
+                                                mapping,
+                                                instruction_bytes,
+                                                registers,
+                                            },
+                                        );
+                                    } else {
+                                        self.signal_diagnostics.remove(&pid);
+                                    }
+                                }
+                            }
                             tracing::debug!(
                                 target: "hermit::sabre::fallback",
                                 tid = pid.as_raw(),
@@ -255,6 +414,7 @@ impl Supervisor {
             self.mapping_cache
                 .retain(|(cached_pid, _), _| *cached_pid != pid);
             self.states.insert(pid, TraceeState::default());
+            self.signal_diagnostics.remove(&pid);
         }
         self.resume(pid, None)
     }
@@ -292,6 +452,7 @@ impl Supervisor {
         self.states.remove(&pid);
         self.mapping_cache
             .retain(|(cached_pid, _), _| *cached_pid != pid);
+        self.signal_diagnostics.remove(&pid);
     }
 }
 
@@ -320,19 +481,39 @@ fn get_syscall_info(pid: Pid) -> Result<libc::ptrace_syscall_info, Error> {
     Ok(unsafe { info.assume_init() })
 }
 
-fn mapping_path(maps: &str, address: usize) -> Option<&str> {
+fn mapping_line(maps: &str, address: usize) -> Option<&str> {
     maps.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
         let range = fields.next()?;
         let mut limits = range.split('-');
         let start = usize::from_str_radix(limits.next()?, 16).ok()?;
         let end = usize::from_str_radix(limits.next()?, 16).ok()?;
-        fields.next()?;
-        fields.next()?;
-        fields.next()?;
-        fields.next()?;
-        let path = fields.next().unwrap_or("");
-        (start <= address && address < end).then_some(path)
+        (start <= address && address < end).then_some(line)
+    })
+}
+
+fn mapping_path(maps: &str, address: usize) -> Option<&str> {
+    let mut fields = mapping_line(maps, address)?.split_whitespace();
+    fields.next()?;
+    fields.next()?;
+    fields.next()?;
+    fields.next()?;
+    fields.next()?;
+    Some(fields.next().unwrap_or(""))
+}
+
+fn mapping_diagnostic(maps: &str, address: usize) -> Option<MappingDiagnostic> {
+    let line = mapping_line(maps, address)?;
+    let mut fields = line.split_whitespace();
+    let mut limits = fields.next()?.split('-');
+    let start = usize::from_str_radix(limits.next()?, 16).ok()?;
+    fields.next()?;
+    let mapping_offset = usize::from_str_radix(fields.next()?, 16).ok()?;
+    let relative_offset = address.checked_sub(start)?;
+    Some(MappingDiagnostic {
+        line: line.to_owned(),
+        relative_offset,
+        file_offset: mapping_offset.checked_add(relative_offset)?,
     })
 }
 
@@ -368,6 +549,16 @@ fn read_two_bytes(pid: Pid, address: usize) -> Result<[u8; 2], Error> {
         let second = ptrace::read(pid, (aligned + word_size) as ptrace::AddressType)?.to_ne_bytes();
         Ok([first[offset], second[0]])
     }
+}
+
+fn read_diagnostic_bytes(pid: Pid, address: usize) -> Result<[u8; 16], Error> {
+    let mut bytes = [0; 16];
+    let word_size = std::mem::size_of::<libc::c_long>();
+    for (index, chunk) in bytes.chunks_mut(word_size).enumerate() {
+        let word = ptrace::read(pid, (address + index * word_size) as ptrace::AddressType)?;
+        chunk.copy_from_slice(&word.to_ne_bytes()[..chunk.len()]);
+    }
+    Ok(bytes)
 }
 
 fn write_two_bytes(pid: Pid, address: usize, bytes: [u8; 2]) -> Result<(), Error> {
@@ -519,14 +710,73 @@ mod tests {
     }
 
     #[test]
+    fn preserves_hardware_sigill_across_userspace_reraise() {
+        const KERNEL_FAULT: i32 = 2;
+        const USER_RERAISE: i32 = -6;
+        let hardware = Some((Signal::SIGILL, Some(KERNEL_FAULT), false));
+
+        assert!(!should_replace_signal_diagnostic(
+            hardware,
+            Signal::SIGILL,
+            Some(USER_RERAISE),
+        ));
+        assert!(!should_replace_signal_diagnostic(
+            hardware,
+            Signal::SIGILL,
+            None,
+        ));
+        assert!(should_replace_signal_diagnostic(
+            hardware,
+            Signal::SIGILL,
+            Some(KERNEL_FAULT),
+        ));
+        assert!(should_replace_signal_diagnostic(
+            hardware,
+            Signal::SIGSEGV,
+            Some(KERNEL_FAULT),
+        ));
+        assert!(should_replace_signal_diagnostic(
+            Some((Signal::SIGILL, Some(KERNEL_FAULT), true)),
+            Signal::SIGILL,
+            Some(USER_RERAISE),
+        ));
+        assert!(should_replace_signal_diagnostic(
+            Some((Signal::SIGILL, Some(USER_RERAISE), false)),
+            Signal::SIGILL,
+            Some(USER_RERAISE),
+        ));
+    }
+
+    #[test]
+    fn recognizes_sabre_sigill_markers() {
+        for marker in [[0x0f, 0xff], [0x0f, 0x0b], [0x0f, 0x0c]] {
+            let mut bytes = [0; 16];
+            bytes[..2].copy_from_slice(&marker);
+            assert!(is_sabre_sigill_marker(Some(&bytes)));
+        }
+
+        let mut unknown = [0; 16];
+        unknown[..2].copy_from_slice(&[0x62, 0xf1]);
+        assert!(!is_sabre_sigill_marker(Some(&unknown)));
+        assert!(!is_sabre_sigill_marker(None));
+    }
+
+    #[test]
     fn finds_mapping_path() {
         let maps = concat!(
-            "1000-2000 r-xp 00000000 00:00 0 /tmp/sabre\n",
+            "1000-2000 r-xp 00002000 00:00 0 /tmp/sabre\n",
             "3000-4000 rwxp 00000000 00:00 0 \n",
         );
         assert_eq!(mapping_path(maps, 0x1234), Some("/tmp/sabre"));
         assert_eq!(mapping_path(maps, 0x3456), Some(""));
         assert_eq!(mapping_path(maps, 0x2500), None);
+        let diagnostic = mapping_diagnostic(maps, 0x1234).unwrap();
+        assert_eq!(diagnostic.relative_offset, 0x234);
+        assert_eq!(diagnostic.file_offset, 0x2234);
+        assert_eq!(
+            diagnostic.line,
+            "1000-2000 r-xp 00002000 00:00 0 /tmp/sabre"
+        );
     }
 
     #[test]

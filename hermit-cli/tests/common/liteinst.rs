@@ -47,7 +47,7 @@ pub(super) fn ensure_liteinst_runtime() {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let runtime_target = target_dir.join("liteinst-runtime-build-2afd1ecc");
+        let runtime_target = target_dir.join("liteinst-runtime-build-adc14734");
         let runtime = liteinst_runtime_library();
         let output = Command::new(repository.join("scripts/stage-liteinst-runtime.sh"))
             .current_dir(repository)

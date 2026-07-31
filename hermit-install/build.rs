@@ -69,7 +69,12 @@ fn copy_file(source: &Path, destination: &Path) {
     });
 }
 
-fn ensure_submodule(repository: &Path, name: &str, relative: &str, marker: &str) -> PathBuf {
+fn ensure_submodule(
+    repository: &Path,
+    name: &str,
+    relative: &str,
+    marker: &str,
+) -> (PathBuf, String) {
     let source = repository.join(relative);
     if !source.join(marker).is_file() {
         run(
@@ -108,17 +113,20 @@ fn ensure_submodule(repository: &Path, name: &str, relative: &str, marker: &str)
         actual, expected,
         "{name} source is not at the pinned revision"
     );
-    source
+    (source, expected)
 }
 
 fn build_sabre(repository: &Path, build_root: &Path, resources: &Path) {
-    let source = ensure_submodule(repository, "SaBRe", "third-party/sabre", "CMakeLists.txt");
-    // CMake records the absolute source directory in CMakeCache.txt. Cargo
-    // checks each pinned Reverie revision out under a different path, so a
-    // stable build directory becomes invalid as soon as the pin advances.
+    let (source, revision) =
+        ensure_submodule(repository, "SaBRe", "third-party/sabre", "CMakeLists.txt");
+    // The target directory is restored by CI caches, while the installed
+    // package is a Cargo-external side effect. Include both the verified
+    // gitlink and the checkout path: the revision keeps stale SaBRe builds
+    // unreachable, while the path keeps CMakeCache.txt bound to its original
+    // absolute source directory.
     let mut source_hash = DefaultHasher::new();
     source.hash(&mut source_hash);
-    let build = build_root.join(format!("sabre-{:016x}", source_hash.finish()));
+    let build = build_root.join(format!("sabre-{revision}-{:016x}", source_hash.finish()));
     run(
         Command::new("cmake")
             .arg("-S")
@@ -138,10 +146,12 @@ fn build_sabre(repository: &Path, build_root: &Path, resources: &Path) {
     }
     run(&mut command, "build SaBRe");
     copy_file(&build.join("sabre"), &resources.join("sabre"));
+    fs::write(resources.join("sabre.revision"), format!("{revision}\n"))
+        .expect("failed to write SaBRe revision provenance");
 }
 
 fn build_e9patch(repository: &Path, build_root: &Path, resources: &Path) {
-    let source = ensure_submodule(repository, "e9patch", "third-party/e9patch", "Makefile");
+    let (source, _) = ensure_submodule(repository, "e9patch", "third-party/e9patch", "Makefile");
     let build = build_root.join("e9patch");
     if build.exists() {
         fs::remove_dir_all(&build)
@@ -277,7 +287,7 @@ fn build_liteinst_runtime(
     profile_dir: &Path,
     resources: &Path,
 ) {
-    let target = build_root.join("liteinst-runtime-2afd1ecc");
+    let target = build_root.join("liteinst-runtime-adc14734");
     let runtime = profile_dir.join("libreverie_liteinst.so");
     run(
         Command::new(repository.join("scripts/stage-liteinst-runtime.sh"))
@@ -297,23 +307,29 @@ fn build_liteinst_runtime(
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-env-changed=HERMIT_INSTALL_FORCE_RESTAGE");
     println!("cargo:rerun-if-changed=../scripts/stage-liteinst-runtime.sh");
     println!("cargo:rerun-if-changed=native-client/CMakeLists.txt");
     println!("cargo:rerun-if-changed=native-client/detcore_dbi_link_stub.c");
 
-    if env::var("PROFILE").as_deref() != Ok("release")
+    let profile = env::var("PROFILE");
+    if profile.as_deref() != Ok("release")
         || env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux")
         || env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("x86_64")
     {
         return;
     }
+    let profile = profile.expect("Cargo did not set PROFILE");
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let profile_dir = out_dir
         .ancestors()
-        .nth(3)
-        .expect("Cargo OUT_DIR does not have a profile ancestor")
+        .find(|ancestor| {
+            ancestor.file_name().and_then(|name| name.to_str()) == Some(profile.as_str())
+        })
+        .expect("Cargo OUT_DIR does not have the active profile ancestor")
         .to_path_buf();
     let target_dir = profile_dir
         .parent()

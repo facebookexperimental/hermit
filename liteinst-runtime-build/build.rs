@@ -79,6 +79,7 @@ fn copy_into_protected_stage(source: &Path, destination: &Path) -> io::Result<()
 
 fn main() {
     println!("cargo:rerun-if-env-changed=HERMIT_LITEINST_STAGE");
+    println!("cargo:rerun-if-env-changed=PROFILE");
     println!("cargo:rerun-if-changed=Cargo.lock");
     println!("cargo:rerun-if-changed=artifact.rs");
     println!("cargo:rerun-if-changed=runtime/Cargo.toml");
@@ -99,7 +100,9 @@ fn main() {
     // documented env var is robust against that layout drift.
     let profile = match env::var("PROFILE").as_deref() {
         Ok("debug") => "dev",
-        _ => "release",
+        Ok("release") => "release",
+        Ok(other) => panic!("unexpected Cargo PROFILE {other:?}; expected debug or release"),
+        Err(error) => panic!("Cargo did not set PROFILE: {error}"),
     };
     let manifest_dir = PathBuf::from(
         env::var_os("CARGO_MANIFEST_DIR").expect("Cargo did not set CARGO_MANIFEST_DIR"),
