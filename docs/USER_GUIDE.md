@@ -199,6 +199,12 @@ The release installation package provides the DynamoRIO, SaBRe, LiteInst, and
 e9patch runtime artifacts. KVM requires read-write `/dev/kvm` access plus a
 guest-kernel ABI.
 
+SaBRe is available only in builds using the non-default
+`third-party-backends` feature. See
+[SaBRe backend compatibility](SABRE_COMPATIBILITY.md) for the measured
+strict-verify allowlist, build commands, and known gaps. An enabled probe is
+not a blanket support claim for every workload in its subsystem.
+
 `e9patch` is an experimental hybrid rather than a standalone Detcore runtime.
 It uses the cached offline instruction map and conservative `e9tool -O0` mode
 to apply `before empty` trampolines at exact candidate offsets in the main ELF.

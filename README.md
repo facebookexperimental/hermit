@@ -138,6 +138,11 @@ The release installation package supplies the DynamoRIO, SaBRe, LiteInst, and
 e9patch runtime artifacts. KVM requires read-write `/dev/kvm` access plus its
 guest-kernel Linux ABI.
 
+SaBRe is built only with the non-default `third-party-backends` feature. Its
+measured post-0.2 strict-verify envelope, build instructions, and explicit
+unsupported cases are documented in
+[SaBRe backend compatibility](docs/SABRE_COMPATIBILITY.md).
+
 The experimental `e9patch` selection is intentionally a hybrid backend. At
 startup it loads or generates the main ELF's cached instruction map, then runs
 `e9tool -O0` with exact file-offset matches to install semantics-preserving
