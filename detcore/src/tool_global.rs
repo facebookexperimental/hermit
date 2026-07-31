@@ -356,8 +356,16 @@ impl GlobalState {
 
         let unsupported_syscall_report_fd = cfg.unsupported_syscall_report_fd.and_then(|fd| {
             // This writer is internal controller state. In an in-process DBI
-            // runtime it must not leak into the next guest image across exec.
-            let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+            // runtime it must not leak into the next guest image across exec
+            // (hence F_DUPFD_CLOEXEC), and it must not perturb the descriptor
+            // namespace the *current* guest observes. The backend places the
+            // report fd itself high, out of the guest's working range (e.g. 199
+            // for the DBI backend). Duplicating with a min hint of `fd` keeps
+            // this private copy up in that same reserved band instead of
+            // grabbing the lowest free descriptor (fd 3), which would shift
+            // every fd the guest subsequently opens and diverge from the golden
+            // ptrace reference (where this fd is unset and no dup happens).
+            let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, fd) };
             if duplicate == -1 {
                 warn!(
                     "failed to duplicate unsupported-syscall report fd {fd}: {}",
