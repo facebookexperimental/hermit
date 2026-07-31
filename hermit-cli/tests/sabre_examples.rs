@@ -159,6 +159,7 @@ fn run_bounded(mut command: Command, label: &str, diagnostic_log: Option<&Path>)
 
 fn example_command(
     example: &Path,
+    args: &[&str],
     backend: Option<&Path>,
     verify: bool,
     diagnostic_log: Option<&Path>,
@@ -182,11 +183,11 @@ fn example_command(
     if verify {
         command.arg("--verify");
     }
-    command.arg("--").arg(example);
+    command.arg("--").arg(example).args(args);
     command
 }
 
-fn parity_run(example: &Path, backend: Option<&Path>, label: &str) -> Output {
+fn parity_run(example: &Path, args: &[&str], backend: Option<&Path>, label: &str) -> Output {
     // Hermit gives the guest a private /tmp, so keep the controller sidecar in the host-visible
     // Cargo target directory. The freshly created unique file prevents stale or cross-run logs.
     let diagnostic_log = tempfile::Builder::new()
@@ -194,10 +195,106 @@ fn parity_run(example: &Path, backend: Option<&Path>, label: &str) -> Output {
         .tempfile_in(env!("CARGO_TARGET_TMPDIR"))
         .unwrap_or_else(|error| panic!("failed to create {label} diagnostic log: {error}"));
     run_bounded(
-        example_command(example, backend, false, Some(diagnostic_log.path())),
+        example_command(example, args, backend, false, Some(diagnostic_log.path())),
         label,
         Some(diagnostic_log.path()),
     )
+}
+
+fn assert_backend_parity_and_sabre_verify(
+    program: &Path,
+    args: &[&str],
+    loader: &Path,
+    label: &str,
+) {
+    let ptrace = parity_run(
+        program,
+        args,
+        None,
+        &format!("ptrace strict portable reference for {label}"),
+    );
+    let sabre = parity_run(
+        program,
+        args,
+        Some(loader),
+        &format!("SaBRe strict portable parity run for {label}"),
+    );
+    assert_eq!(
+        sabre.status.code(),
+        ptrace.status.code(),
+        "example: {label}"
+    );
+    assert_eq!(sabre.stdout, ptrace.stdout, "stdout parity: {label}");
+    assert_eq!(sabre.stderr, ptrace.stderr, "stderr parity: {label}");
+
+    assert_sabre_verify(program, args, loader, label);
+}
+
+fn assert_sabre_verify(program: &Path, args: &[&str], loader: &Path, label: &str) {
+    let verify = run_bounded(
+        example_command(program, args, Some(loader), true, None),
+        &format!("SaBRe strict portable verification for {label}"),
+        None,
+    );
+    let diagnostics = format!(
+        "{}{}",
+        String::from_utf8_lossy(&verify.stdout),
+        String::from_utf8_lossy(&verify.stderr),
+    );
+    assert!(
+        diagnostics.contains("Success: deterministic. Determinism verified."),
+        "SaBRe verifier omitted its success verdict for {label}:\n{diagnostics}",
+    );
+}
+
+fn assert_three_run_determinism(
+    program: &Path,
+    args: &[&str],
+    backend: Option<&Path>,
+    backend_label: &str,
+    label: &str,
+) -> Output {
+    let baseline = parity_run(
+        program,
+        args,
+        backend,
+        &format!("{backend_label} strict portable run 1 for {label}"),
+    );
+    for run in 2..=3 {
+        let repeated = parity_run(
+            program,
+            args,
+            backend,
+            &format!("{backend_label} strict portable run {run} for {label}"),
+        );
+        assert_eq!(
+            repeated.stdout, baseline.stdout,
+            "{backend_label} stdout changed across strict runs: {label}, run {run}",
+        );
+        assert_eq!(
+            repeated.stderr, baseline.stderr,
+            "{backend_label} stderr changed across strict runs: {label}, run {run}",
+        );
+    }
+    baseline
+}
+
+fn assert_date_output_is_sane(output: &Output, backend_label: &str) {
+    let rendered = std::str::from_utf8(&output.stdout)
+        .unwrap_or_else(|error| panic!("{backend_label} date output was not UTF-8: {error}"))
+        .trim();
+    let (date_and_time, nanos) = rendered
+        .rsplit_once('_')
+        .unwrap_or_else(|| panic!("{backend_label} date output lacked nanoseconds: {rendered}"));
+    assert_eq!(
+        date_and_time.len(),
+        19,
+        "{backend_label} date/time shape was unexpected: {rendered}",
+    );
+    assert!(
+        nanos.len() == 9 && nanos.bytes().all(|byte| byte.is_ascii_digit()),
+        "{backend_label} nanoseconds were malformed: {rendered}",
+    );
 }
 
 #[test]
@@ -215,34 +312,60 @@ fn sabre_non_racy_examples_verify_and_match_ptrace() {
     // or CPUID-faulting support. Route Hermit diagnostics to failure-only sidecars while comparing
     // guest output; strict handling remains enabled, and SaBRe verification keeps info logs.
     for name in NON_RACY_EXAMPLES {
-        let example = repository.join("examples").join(name);
-        let ptrace = parity_run(
-            &example,
-            None,
-            &format!("ptrace strict portable reference for {name}"),
-        );
-        let sabre = parity_run(
-            &example,
-            Some(&loader),
-            &format!("SaBRe strict portable parity run for {name}"),
-        );
-        assert_eq!(sabre.status.code(), ptrace.status.code(), "example: {name}");
-        assert_eq!(sabre.stdout, ptrace.stdout, "stdout parity: {name}");
-        assert_eq!(sabre.stderr, ptrace.stderr, "stderr parity: {name}");
-
-        let verify = run_bounded(
-            example_command(&example, Some(&loader), true, None),
-            &format!("SaBRe strict portable verification for {name}"),
-            None,
-        );
-        let diagnostics = format!(
-            "{}{}",
-            String::from_utf8_lossy(&verify.stdout),
-            String::from_utf8_lossy(&verify.stderr),
-        );
-        assert!(
-            diagnostics.contains("Success: deterministic. Determinism verified."),
-            "SaBRe verifier omitted its success verdict for {name}:\n{diagnostics}",
-        );
+        let program = repository.join("examples").join(name);
+        if name == "date.sh" {
+            // Removing the #1095 exec reset intentionally exposes that ptrace and
+            // SaBRe currently accumulate different, but individually deterministic,
+            // continuous clock trajectories. Do not restore fake all-zero parity.
+            // Cross-backend trajectory alignment is tracked by task
+            // `cross-backend-continuous-clock-trajectory-parity`.
+            let ptrace = assert_three_run_determinism(&program, &[], None, "ptrace", name);
+            let sabre = assert_three_run_determinism(&program, &[], Some(&loader), "SaBRe", name);
+            assert_date_output_is_sane(&ptrace, "ptrace");
+            assert_date_output_is_sane(&sabre, "SaBRe");
+            assert_sabre_verify(&program, &[], &loader, name);
+        } else {
+            assert_backend_parity_and_sabre_verify(&program, &[], &loader, name);
+        }
     }
+
+    // A matching one-shot timestamp could conceal a frozen clock. This guest
+    // requires CLOCK_MONOTONIC to advance across deterministic syscall work.
+    let guest_dir = tempfile::Builder::new()
+        .prefix("sabre-clock-progress-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create SaBRe clock-progress guest directory");
+    let clock_progress = guest_dir.path().join("clock-progress");
+    let build = Command::new("cc")
+        .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(repository.join("tests/c/liteinst_advanced.c"))
+        .arg("-o")
+        .arg(&clock_progress)
+        .output()
+        .expect("failed to compile clock-progress guest");
+    assert!(
+        build.status.success(),
+        "clock-progress guest compilation failed:\n{}",
+        String::from_utf8_lossy(&build.stderr),
+    );
+    assert_three_run_determinism(
+        &clock_progress,
+        &["clock-progress"],
+        None,
+        "ptrace",
+        "clock-progress",
+    );
+    assert_three_run_determinism(
+        &clock_progress,
+        &["clock-progress"],
+        Some(&loader),
+        "SaBRe",
+        "clock-progress",
+    );
+    assert_sabre_verify(
+        &clock_progress,
+        &["clock-progress"],
+        &loader,
+        "clock-progress",
+    );
 }
