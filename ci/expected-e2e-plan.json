@@ -34,6 +34,7 @@
     {"test":"system-utils/clock-determinism","category":"system-utils","lane":"portable","mode":"custom","backend":"ptrace"},
     {"test":"system-utils/clock-determinism","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"system-utils/date-nanoseconds","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"},
+    {"test":"system-utils/date-nanoseconds","category":"system-utils","lane":"portable","mode":"verify","backend":"sabre"},
     {"test":"system-utils/random-device","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"system-utils/random-device","category":"system-utils","lane":"portable","mode":"verify","backend":"sabre"},
     {"test":"system-utils/record-getpid","category":"system-utils","lane":"portable","mode":"replay","backend":"ptrace"},

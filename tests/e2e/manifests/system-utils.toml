@@ -27,11 +27,10 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "sabre"]
 [test.modes.verify.backends_disabled]
 dbi = "DBI coverage is owned by its backend parity partition"
 kvm = "KVM requires the privileged runner"
-sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 
 [test.modes.replay]
