@@ -16,6 +16,27 @@ members = [
   "hermit-verify",
   "tests",
 ]
+# Bare `cargo build`/`cargo test` (no `--workspace`) builds only these members.
+# The three third-party-dependency crates -- `detcore-dbi` and `hermit-install`
+# (pull `reverie-dbi`/DynamoRIO) and `detcore-sabre` (pulls `reverie-sabre`) --
+# are deliberately excluded so the default developer build produces the
+# `hermit` binary (ptrace/kvm/liteinst) with no DynamoRIO/e9patch/SaBRe
+# third-party dependencies. CI opts them back in with `--workspace` plus
+# `cargo ... -p hermit --features third-party-backends`.
+default-members = [
+  "common/digest",
+  "common/edit-distance",
+  "common/test-allocator",
+  "ci/manifest-plan",
+  "detcore",
+  "detcore-model",
+  "detcore/tests/testutils",
+  "flaky-tests",
+  "hermit-cli",
+  "hermit-resources",
+  "hermit-verify",
+  "tests",
+]
 resolver = "2"
 
 [workspace.package]

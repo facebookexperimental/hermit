@@ -3039,7 +3039,7 @@ function run_calibrated_analyze_tests {
         "$recommended" "$analyze_minimum_margin" "$margin"
 
     HERMIT_ANALYZE_SKID_MARGIN=$margin \
-        cargo test -p hermit --test analyze "$@"
+        cargo test -p hermit --features third-party-backends --test analyze "$@"
 }
 
 function run_privileged_validation {
@@ -3049,7 +3049,7 @@ function run_privileged_validation {
 }
 
 function run_quick_suite {
-    run_check "Build workspace" cargo build --workspace
+    run_check "Build workspace" cargo build --workspace --features third-party-backends
     run_check "Portable E2E metadata" ./ci/test_harness.sh validate
     run_check "Portable ptrace E2E verification" \
         ./ci/test_harness.sh run --lane portable --mode verify --backend ptrace --ci-only
@@ -3096,7 +3096,7 @@ function run_portable_slow_strict_diagnostics {
 function run_super_diagnostic_suite {
     run_check_with_timeout 1800 "Relaxed Hermit flag matrix" \
         env HERMIT_FLAG_MATRIX_REPORT="$ROOT_DIR/target/relaxed-flag-matrix/results.tsv" \
-        cargo test -p hermit --test relaxed_flag_matrix \
+        cargo test -p hermit --features third-party-backends --test relaxed_flag_matrix \
         meaningful_flag_combinations_run_without_crashing -- --exact --ignored --test-threads=1 --nocapture
     # These probes are useful for trend detection but do not gate PRs. On the
     # portable runner they consumed about 20 minutes after the blocking suite had
@@ -3117,74 +3117,74 @@ function run_super_diagnostic_suite {
     # AUTONOMOUS-BOT-IMPLEMENTED
     # TODO-HUMAN-REVIEW(#673)
     run_check_with_timeout 300 "Pselect signal-interruption diagnostic" \
-        cargo test -p hermit --test pselect6_simulation -- --test-threads=1
+        cargo test -p hermit --features third-party-backends --test pselect6_simulation -- --test-threads=1
     # AUTONOMOUS-BOT-IMPLEMENTED
     # TODO-HUMAN-REVIEW(#678)
     run_check_with_timeout 300 "Record/replay matrix diagnostic" \
-        cargo test -p hermit --test record_replay record_replay_matrix -- --exact --test-threads=1
+        cargo test -p hermit --features third-party-backends --test record_replay record_replay_matrix -- --exact --test-threads=1
     # AUTONOMOUS-BOT-IMPLEMENTED
     # TODO-HUMAN-REVIEW(#657)
     run_check_with_timeout 300 "Managed JVM strict-verify diagnostics" \
         env HERMIT_APP_VERIFY_TIMEOUT=20s RUST_BACKTRACE=1 \
-        cargo test -p hermit --test app_strict_verify java -- --ignored --test-threads=1 --nocapture
+        cargo test -p hermit --features third-party-backends --test app_strict_verify java -- --ignored --test-threads=1 --nocapture
     run_check_with_timeout 180 "Post-fork scheduling diagnostics" \
         cargo test -p detcore --test tests_misc ordinary_clone_ -- --test-threads=1
     run_check_with_timeout 180 "Network syscall determinism diagnostic" \
         cargo test -p detcore --test tests_misc network_syscalls_are_deterministic_across_five_runs -- --exact --test-threads=1
     run_check_with_timeout 180 "IPC determinism diagnostic" \
-        cargo test -p hermit --test ipc_determinism ipc_patterns_are_deterministic_across_five_runs -- --exact --test-threads=1
+        cargo test -p hermit --features third-party-backends --test ipc_determinism ipc_patterns_are_deterministic_across_five_runs -- --exact --test-threads=1
     run_check_with_timeout 180 "Random-source determinism diagnostic" \
-        cargo test -p hermit --test random_determinism random_sources_repeat_across_runs_and_change_with_seed -- --exact --test-threads=1
+        cargo test -p hermit --features third-party-backends --test random_determinism random_sources_repeat_across_runs_and_change_with_seed -- --exact --test-threads=1
     run_check_with_timeout 300 "Threaded integration matrix diagnostic" \
-        cargo test -p hermit --test integration_matrix -- --test-threads=1
+        cargo test -p hermit --features third-party-backends --test integration_matrix -- --test-threads=1
     run_check_with_timeout 300 "LiteInst python3 verify diagnostics" \
-        cargo test -p hermit --test cli -- \
+        cargo test -p hermit --features third-party-backends --test cli -- \
         run_liteinst_rejects_non_fork_clone \
         run_liteinst_handles_inherited_ignored_sigchld \
         run_liteinst_verifies_forked_guest \
         run_liteinst_verifies_raw_fork_guest --test-threads=1
     run_check_with_timeout 300 "Chaos hello-race verification diagnostic" \
-        cargo test -p hermit --test hermit_modes hello_race_chaos_verify -- --exact --test-threads=1
+        cargo test -p hermit --features third-party-backends --test hermit_modes hello_race_chaos_verify -- --exact --test-threads=1
     # AUTONOMOUS-BOT-IMPLEMENTED
     # TODO-HUMAN-REVIEW(#598)
     run_check_with_timeout 300 "DBI pipe backpressure diagnostic" \
-        cargo test -p hermit --test cli run_dbi_verifies_pipe_backpressure -- --exact --test-threads=1
+        cargo test -p hermit --features third-party-backends --test cli run_dbi_verifies_pipe_backpressure -- --exact --test-threads=1
     # AUTONOMOUS-BOT-IMPLEMENTED
     # TODO-HUMAN-REVIEW(#736): Review weekly routing for the DBI failed-exec stall.
     run_check_with_timeout 180 "DBI failed-exec recovery diagnostic" \
-        cargo test -p hermit --test cli run_dbi_recovers_after_failed_exec -- --exact --test-threads=1
+        cargo test -p hermit --features third-party-backends --test cli run_dbi_recovers_after_failed_exec -- --exact --test-threads=1
     # This test exercises verify, tampered reports, fork/exec, and strict DBI
     # teardown in one case. Keep its coverage, but do not let a backend
     # lifecycle deadlock consume the portable PR gate.
     run_check_with_timeout 180 "DBI unsupported-syscall aggregation diagnostic" \
-        cargo test -p hermit --test cli run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them -- --exact --test-threads=1
+        cargo test -p hermit --features third-party-backends --test cli run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them -- --exact --test-threads=1
     run_check_with_timeout 30 "DBI strict blocked-stdin teardown diagnostic" \
-        cargo test -p hermit --test cli run_dbi_strict_returns_with_blocked_stdin_source -- --exact --test-threads=1
+        cargo test -p hermit --features third-party-backends --test cli run_dbi_strict_returns_with_blocked_stdin_source -- --exact --test-threads=1
     run_check_with_timeout 120 "DBI guest-stderr isolation diagnostic" \
-        cargo test -p hermit --test cli run_dbi_keeps_diagnostics_out_of_guest_stderr -- --exact --test-threads=1
+        cargo test -p hermit --features third-party-backends --test cli run_dbi_keeps_diagnostics_out_of_guest_stderr -- --exact --test-threads=1
 }
 
 function run_super_suite {
     local leveldb_install="$ROOT_DIR/target/hermit-leveldb-super"
     local leveldb_build="$ROOT_DIR/target/hermit-leveldb-build-super"
 
-    run_check "Build workspace" cargo build --workspace
-    run_check "Build release Hermit" cargo build --release -p hermit
+    run_check "Build workspace" cargo build --workspace --features third-party-backends
+    run_check "Build release Hermit" cargo build --release -p hermit --features third-party-backends
     run_super_diagnostic_suite
     run_check "Super repeated determinism probes" run_super_stress_suite
     if [[ -s $VALIDATION_TMP_DIR/super-report ]]; then
         printf "\n== Super stress pass rates ==\n"
         cat "$VALIDATION_TMP_DIR/super-report"
     fi
-    run_check "Weekly relaxed default-mode cases" cargo test -p hermit --test hermit_modes default_ -- --test-threads=1
-    run_check "Weekly portable chaos cases" cargo test -p hermit --test stress_suite -- --skip slow_cas_search_and_replay --test-threads=1
-    run_check "Weekly ignored portable chaos cases" cargo test -p hermit --test stress_suite -- --ignored --skip slow_cas_search_and_replay --test-threads=1
-    run_check "PMU Buck chaos cases" cargo test -p hermit --test hermit_modes chaos_buck_ -- --ignored --test-threads=1
+    run_check "Weekly relaxed default-mode cases" cargo test -p hermit --features third-party-backends --test hermit_modes default_ -- --test-threads=1
+    run_check "Weekly portable chaos cases" cargo test -p hermit --features third-party-backends --test stress_suite -- --skip slow_cas_search_and_replay --test-threads=1
+    run_check "Weekly ignored portable chaos cases" cargo test -p hermit --features third-party-backends --test stress_suite -- --ignored --skip slow_cas_search_and_replay --test-threads=1
+    run_check "PMU Buck chaos cases" cargo test -p hermit --features third-party-backends --test hermit_modes chaos_buck_ -- --ignored --test-threads=1
     run_check "PMU analyze hello-race stress (calibrated skid)" \
         run_calibrated_analyze_tests analyze_hello_race -- --exact --ignored --test-threads=1
     run_check "Build pinned LevelDB super fixture" ./hermit-cli/tests/prepare_leveldb.sh "$leveldb_install" "$leveldb_build"
-    run_check "Full LevelDB strict determinism" env HERMIT_LEVELDB_BUILD_DIR="$leveldb_build" cargo test -p hermit --test leveldb full_leveldb_suite_is_deterministic_under_strict -- --exact --ignored --test-threads=1
-    run_check "SQLite veryquick strict determinism" cargo test -p hermit --test sqlite_veryquick sqlite_veryquick_is_deterministic_under_strict_hermit -- --exact --ignored --test-threads=1
+    run_check "Full LevelDB strict determinism" env HERMIT_LEVELDB_BUILD_DIR="$leveldb_build" cargo test -p hermit --features third-party-backends --test leveldb full_leveldb_suite_is_deterministic_under_strict -- --exact --ignored --test-threads=1
+    run_check "SQLite veryquick strict determinism" cargo test -p hermit --features third-party-backends --test sqlite_veryquick sqlite_veryquick_is_deterministic_under_strict_hermit -- --exact --ignored --test-threads=1
 }
 
 # Envelope-only fast path: build the binary, measure the envelope, optionally
@@ -3203,7 +3203,7 @@ if ((STRICT_COMPAT_ONLY == 1)); then
     # TODO-HUMAN-REVIEW(#719): Review reuse of a caller-provided Hermit binary.
     if [[ $STRICT_COMPAT_HERMIT_BIN == "$DEFAULT_STRICT_COMPAT_HERMIT_BIN" ]]; then
         run_check "Build release Hermit for strict compatibility" \
-            cargo build --release -p hermit
+            cargo build --release -p hermit --features third-party-backends
         if ((failures != 0)); then
             exit 1
         fi
@@ -3218,7 +3218,7 @@ fi
 
 if ((LITEINST_COMPAT_ONLY == 1)); then
     run_check_with_timeout 1200 "Build release Hermit for LiteInst compatibility" \
-        cargo build --release --locked -p hermit
+        cargo build --release --locked -p hermit --features third-party-backends
     if ((failures == 0)); then
         run_check_with_timeout 900 "Build release LiteInst runtime" \
             "$ROOT_DIR/scripts/stage-liteinst-runtime.sh" release \
@@ -3228,7 +3228,7 @@ if ((LITEINST_COMPAT_ONLY == 1)); then
     if ((failures == 0)); then
         run_check_with_timeout 900 "Portable CI liteinst_strict" \
             env HERMIT_LITEINST_TEST_BINARY="$ROOT_DIR/target/release/hermit" \
-            cargo test -p hermit --test liteinst_advanced -- --test-threads=1
+            cargo test -p hermit --features third-party-backends --test liteinst_advanced -- --test-threads=1
     fi
     print_summary
     ((failures == 0))
@@ -3239,7 +3239,7 @@ if ((SABRE_COMPAT_ONLY == 1)); then
     run_check "SaBRe artifacts configured" require_sabre_artifacts
     if ((failures == 0)); then
         run_check "Build release Hermit and Detcore plugin for SaBRe compatibility" \
-            cargo build --release -p hermit -p detcore-sabre
+            cargo build --release -p hermit --features third-party-backends -p detcore-sabre
     fi
     if ((failures == 0)); then
         run_check "SaBRe compatibility ratchet (${SABRE_COMPAT_TOTAL} programs)" \
@@ -3254,7 +3254,7 @@ if ((E9PATCH_COMPAT_ONLY == 1)); then
     run_check "e9patch artifacts configured" require_e9patch_artifacts
     if ((failures == 0)); then
         run_check "Build release Hermit for e9patch compatibility" \
-            cargo build --release -p hermit
+            cargo build --release -p hermit --features third-party-backends
     fi
     if ((failures == 0)); then
         run_check "e9patch compatibility matrix ($E9PATCH_COMPAT_TOTAL programs)" \
@@ -3267,7 +3267,7 @@ fi
 
 if ((RR_COMPAT_ONLY == 1)); then
     run_check "Build release Hermit for record/replay compatibility" \
-        cargo build --release -p hermit
+        cargo build --release -p hermit --features third-party-backends
     if ((failures == 0)); then
         run_check "Record/replay compatibility baseline ($RR_COMPAT_EXPECTED programs)" \
             run_rr_compatibility_envelope
@@ -3281,7 +3281,7 @@ fi
 # TODO-HUMAN-REVIEW(#553)
 if ((QEMU_L2_ONLY == 1)); then
     run_check "Build release Hermit for QEMU L2" \
-        cargo build --release -p hermit
+        cargo build --release -p hermit --features third-party-backends
     if ((failures == 0)); then
         run_check "QEMU strict L2 boot (heavyweight)" \
             ./tests/qemu-boot/strict_l2_test.sh
@@ -3292,7 +3292,7 @@ if ((QEMU_L2_ONLY == 1)); then
 fi
 
 if [[ $ENVELOPE_MODE == only ]]; then
-    run_check "Build workspace for envelope measurement" cargo build --workspace
+    run_check "Build workspace for envelope measurement" cargo build --workspace --features third-party-backends
     if ((failures != 0)); then
         exit 1
     fi

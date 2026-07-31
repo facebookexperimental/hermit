@@ -1503,9 +1503,10 @@ impl RunOpts {
                     explicit_backend.as_str()
                 );
             }
-        } else if backend == Backend::E9patch {
-            Backend::Ptrace.ensure_available()?;
         } else if backend != Backend::Kvm {
+            // E9patch's own availability check covers both its ptrace runtime and
+            // the `e9patch` cargo feature (it reports "not included in this build"
+            // when the feature is disabled), so it no longer needs a special case.
             backend.ensure_available()?;
         }
         self.install_pmu_config()?;

@@ -31,8 +31,8 @@
     },
     {
       "group": "build", "job": "workspace",
-      "desc": "Build workspace (cargo build --workspace)",
-      "cmd": "cargo build --workspace",
+      "desc": "Build workspace (cargo build --workspace --features third-party-backends)",
+      "cmd": "cargo build --workspace --features third-party-backends",
       "timeout": 1200,
       "hint": {"est_duration_s": 360, "rss_baseline_bytes": 5368709120,
                "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
@@ -40,7 +40,7 @@
     {
       "group": "build", "job": "dbi_release",
       "desc": "Build release Hermit, the DBI plugin, and installed backend resources",
-      "cmd": "HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-common cargo build --release --locked -p hermit -p detcore-dbi -p hermit-install",
+      "cmd": "HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-common cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbi -p hermit-install",
       "deps": ["build.workspace"],
       "timeout": 1200,
       "hint": {"est_duration_s": 240, "rss_baseline_bytes": 5368709120,
@@ -253,8 +253,8 @@
     },
     {
       "group": "doc", "job": "doctests",
-      "desc": "Test workspace documentation (cargo test --workspace --doc)",
-      "cmd": "cargo test --workspace --doc",
+      "desc": "Test workspace documentation (cargo test --workspace --features third-party-backends --doc)",
+      "cmd": "cargo test --workspace --features third-party-backends --doc",
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"est_duration_s": 180, "rss_baseline_bytes": 3221225472,
@@ -290,7 +290,7 @@
     {
       "group": "test", "job": "hermit_unit",
       "desc": "Test Hermit unit and binary targets (-p hermit --lib --bins)",
-      "cmd": "cargo test -p hermit --lib --bins -- --test-threads=1",
+      "cmd": "cargo test -p hermit --features third-party-backends --lib --bins -- --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
@@ -330,7 +330,7 @@
     {
       "group": "test", "job": "hermit_integration",
       "desc": "Portable Hermit integration targets (batched compile, serial test binaries)",
-      "cmd": "cargo test -p hermit --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test clock_determinism --test clock_discipline_determinism --test cpufreq_avg_determinism --test epoll_determinism --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test zero_copy_pipe_fallback -- --test-threads=1",
+      "cmd": "cargo test -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test clock_determinism --test clock_discipline_determinism --test cpufreq_avg_determinism --test epoll_determinism --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test zero_copy_pipe_fallback -- --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 1200,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 300,
@@ -340,7 +340,7 @@
     {
       "group": "test", "job": "arbitrary_binaries",
       "desc": "Portable arbitrary-binary cases",
-      "cmd": "cargo test -p hermit --test arbitrary_binaries -- --skip record_replay_stable_arbitrary_binaries --test-threads=1",
+      "cmd": "cargo test -p hermit --features third-party-backends --test arbitrary_binaries -- --skip record_replay_stable_arbitrary_binaries --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
@@ -350,7 +350,7 @@
     {
       "group": "test", "job": "cli",
       "desc": "Portable CLI cases (skips KVM/DBI-backend-only cases)",
-      "cmd": "cargo test -p hermit --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbi_strict_returns_with_blocked_stdin_source --skip run_dbi_verifies_pipe_backpressure --skip run_dbi_keeps_diagnostics_out_of_guest_stderr --skip run_dbi_recovers_after_failed_exec --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --test-threads=1",
+      "cmd": "cargo test -p hermit --features third-party-backends --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbi_strict_returns_with_blocked_stdin_source --skip run_dbi_verifies_pipe_backpressure --skip run_dbi_keeps_diagnostics_out_of_guest_stderr --skip run_dbi_recovers_after_failed_exec --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
@@ -360,7 +360,7 @@
     {
       "group": "test", "job": "liteinst_strict",
       "desc": "Portable LiteInst strict compatibility",
-      "cmd": "HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit cargo test -p hermit --test liteinst_advanced -- --test-threads=1",
+      "cmd": "HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit cargo test -p hermit --features third-party-backends --test liteinst_advanced -- --test-threads=1",
       "deps": ["build.liteinst_runtime_release"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
@@ -370,7 +370,7 @@
     {
       "group": "test", "job": "sabre_examples",
       "desc": "SaBRe non-racy examples: per-backend time determinism and non-time ptrace parity",
-      "cmd": "HERMIT_SABRE_TEST_BINARY=$PWD/target/release/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre cargo test -p hermit --test sabre_examples -- --test-threads=1",
+      "cmd": "HERMIT_SABRE_TEST_BINARY=$PWD/target/release/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre cargo test -p hermit --features third-party-backends --test sabre_examples -- --test-threads=1",
       "deps": ["build.sabre_release"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
@@ -380,7 +380,7 @@
     {
       "group": "test", "job": "hermit_modes",
       "desc": "Portable Hermit mode cases (skips default_ and chaos_buck_)",
-      "cmd": "cargo test -p hermit --test hermit_modes -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify --test-threads=1",
+      "cmd": "cargo test -p hermit --features third-party-backends --test hermit_modes -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
@@ -390,7 +390,7 @@
     {
       "group": "test", "job": "app_strict_verify",
       "desc": "Portable application strict verification (skips java/javac)",
-      "cmd": "cargo test -p hermit --test app_strict_verify -- --ignored --skip java_ --skip javac_ --test-threads=1",
+      "cmd": "cargo test -p hermit --features third-party-backends --test app_strict_verify -- --ignored --skip java_ --skip javac_ --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
@@ -400,7 +400,7 @@
     {
       "group": "test", "job": "command_strict_verify",
       "desc": "Portable command strict verification",
-      "cmd": "cargo test -p hermit --test command_strict_verify -- --ignored --test-threads=1",
+      "cmd": "cargo test -p hermit --features third-party-backends --test command_strict_verify -- --ignored --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
@@ -410,7 +410,7 @@
     {
       "group": "test", "job": "ignored_syscall_regressions",
       "desc": "Portable ignored syscall regressions (epoll_determinism, rcx_canonicalization)",
-      "cmd": "cargo test -p hermit --test epoll_determinism --test rcx_canonicalization -- --ignored --test-threads=1",
+      "cmd": "cargo test -p hermit --features third-party-backends --test epoll_determinism --test rcx_canonicalization -- --ignored --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
@@ -420,7 +420,7 @@
     {
       "group": "test", "job": "rr_suite_contract",
       "desc": "rr suite source contract (scratch dirs fresh and cleaned)",
-      "cmd": "cargo test -p hermit --test rr_suite rr_scratch_directories_are_fresh_and_cleaned -- --exact",
+      "cmd": "cargo test -p hermit --features third-party-backends --test rr_suite rr_scratch_directories_are_fresh_and_cleaned -- --exact",
       "deps": ["build.workspace"],
       "timeout": 300,
       "hint": {"est_duration_s": 30, "rss_baseline_bytes": 1073741824,

@@ -10,9 +10,19 @@ license = "BSD-3-Clause"
 [lib]
 crate-type = ["rlib", "cdylib"]
 
+# Third-party-dependency execution backends are OFF by default so the shipped
+# `hermit` binary is a single static binary with the ptrace/kvm/liteinst
+# backends and no DynamoRIO/e9patch/SaBRe third-party dependencies. CI builds
+# with `--features third-party-backends` to compile and test them. `dbi` is the
+# only feature that adds Rust dependencies (detcore-dbi + reverie-dbi); `sabre`
+# and `e9patch` shell out to external artifacts at runtime and only gate their
+# in-crate dispatch code.
 [features]
-default = ["dbi"]
+default = []
 dbi = ["dep:detcore-dbi", "dep:reverie-dbi"]
+sabre = []
+e9patch = []
+third-party-backends = ["dbi", "sabre", "e9patch"]
 
 [dependencies]
 anyhow = "1.0.103"

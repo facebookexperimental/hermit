@@ -664,14 +664,41 @@ impl Backend {
             Self::Dbi => dbi_unavailable_reason(),
             Self::Liteinst => liteinst_runtime_unavailable_reason(),
             // TODO-HUMAN-REVIEW(#589): Review SaBRe backend availability reporting.
-            Self::Sabre => sabre_runtime_unavailable_reason(),
+            Self::Sabre => sabre_unavailable_reason(),
             Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")),
-            Self::E9patch => validate_tracing_environment()
-                .err()
-                .map(|error| error.to_string())
-                .or_else(e9patch::unavailable_reason),
+            Self::E9patch => e9patch_unavailable_reason(),
         }
     }
+}
+
+// SaBRe and e9patch add no third-party Rust dependencies to `hermit-cli` (SaBRe
+// shells out to an external loader plus `libdetcore_sabre.so`, and e9patch shells
+// out to `e9tool`/`e9patch`). They are still gated behind the `sabre` and
+// `e9patch` cargo features so the default `hermit` binary reports them as absent
+// and only the `third-party-backends` build offers them. The reverie-sabre Rust
+// dependency lives in the `detcore-sabre` crate, which is excluded from the
+// workspace's `default-members`.
+#[cfg(feature = "sabre")]
+fn sabre_unavailable_reason() -> Option<String> {
+    sabre_runtime_unavailable_reason()
+}
+
+#[cfg(not(feature = "sabre"))]
+fn sabre_unavailable_reason() -> Option<String> {
+    Some("SaBRe support was not included in this build".to_owned())
+}
+
+#[cfg(feature = "e9patch")]
+fn e9patch_unavailable_reason() -> Option<String> {
+    validate_tracing_environment()
+        .err()
+        .map(|error| error.to_string())
+        .or_else(e9patch::unavailable_reason)
+}
+
+#[cfg(not(feature = "e9patch"))]
+fn e9patch_unavailable_reason() -> Option<String> {
+    Some("e9patch support was not included in this build".to_owned())
 }
 
 #[cfg(feature = "dbi")]
@@ -862,6 +889,7 @@ fn sabre_runtime_library_path() -> io::Result<PathBuf> {
     })
 }
 
+#[cfg(feature = "sabre")]
 fn sabre_runtime_unavailable_reason() -> Option<String> {
     if let Err(error) = resolve_sabre_binary() {
         return Some(error.to_string());
@@ -1873,8 +1901,6 @@ mod tests {
     use super::resolve_kvm_shebang;
     use super::resolve_sabre_binary_from;
     use super::sabre_program_needs_neutral_name;
-    #[cfg(feature = "dbi")]
-    use super::sabre_runtime_unavailable_reason;
     use super::shutdown_sabre_rpc;
     use super::stage_sabre_program_in;
     use super::stop_sabre_rpc_server;
@@ -2043,7 +2069,7 @@ mod tests {
         );
         assert_eq!(
             available.contains(&Backend::Sabre),
-            sabre_runtime_unavailable_reason().is_none()
+            Backend::Sabre.is_available()
         );
         assert_eq!(
             available.contains(&Backend::Kvm),
