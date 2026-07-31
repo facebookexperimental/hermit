@@ -141,7 +141,7 @@
       "desc": "Portable manifest bucket: data-handling",
       "manifest": {"lane": "portable", "category": "data-handling"},
       "cmd": "./ci/test_harness.sh run --lane portable --category data-handling --ci-only --allow-empty --prebuilt --results target/e2e/portable/data-handling/results.jsonl --junit target/e2e/portable/data-handling/junit.xml",
-      "deps": ["build.workspace", "build.manifest_guests", "e2e.metadata"],
+      "deps": ["build.workspace", "build.manifest_guests", "build.sabre_release", "e2e.metadata"],
       "timeout": 600,
       "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 90,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
