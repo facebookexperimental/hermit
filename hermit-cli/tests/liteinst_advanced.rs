@@ -25,10 +25,13 @@ use std::time::Instant;
 
 static LITEINST_ADVANCED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_COMPAT_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+static LITEINST_SEMANTIC_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 
 const COMPAT_FIXTURE_CONTENT: &[u8] = b"liteinst compatibility fixture\n";
 const COMPAT_FIXTURE_SHA256: &str =
     "e5c4447a0a9f796a0b72bb47875e9879aa7722c74e601385e74058f029ae60cd";
+const SEMANTIC_FIXTURE_CONTENT: &[u8] = b"gamma:3\nalpha:1\nalpha:1\nbeta:2\n";
+const SEMANTIC_FIXTURE_MD5: &str = "c61c6cb65c4b5e1a6f3eb32b601db629";
 
 fn group_name_by_gid<'a>(contents: &'a str, gid: &str) -> Option<&'a str> {
     contents.lines().find_map(|line| {
@@ -70,6 +73,17 @@ fn compatibility_fixture() -> &'static Path {
         fs::create_dir_all(&build_root).expect("failed to create LiteInst fixture directory");
         let fixture = build_root.join("compatibility-fixture.txt");
         fs::write(&fixture, COMPAT_FIXTURE_CONTENT).expect("failed to write LiteInst fixture");
+        fixture
+    })
+}
+
+fn semantic_fixture() -> &'static Path {
+    LITEINST_SEMANTIC_FIXTURE.get_or_init(|| {
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-advanced");
+        fs::create_dir_all(&build_root).expect("failed to create LiteInst fixture directory");
+        let fixture = build_root.join("semantic-fixture.txt");
+        fs::write(&fixture, SEMANTIC_FIXTURE_CONTENT)
+            .expect("failed to write LiteInst semantic fixture");
         fixture
     })
 }
@@ -235,6 +249,70 @@ fn liteinst_strict_verify_file_and_text_utilities() {
         Path::new("/usr/bin/stat"),
         &["-c", "%s", fixture],
         format!("{}\n", COMPAT_FIXTURE_CONTENT.len()).as_bytes(),
+    );
+}
+
+#[test]
+fn liteinst_strict_verify_semantic_text_utilities() {
+    let fixture = semantic_fixture();
+    let fixture = fixture.to_str().expect("fixture path should be UTF-8");
+
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/tail"),
+        &["-n", "2", fixture],
+        b"alpha:1\nbeta:2\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/uniq"),
+        &[fixture],
+        b"gamma:3\nalpha:1\nbeta:2\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/cut"),
+        &["-d", ":", "-f", "1", fixture],
+        b"gamma\nalpha\nalpha\nbeta\n",
+    );
+    assert_liteinst_strict_verify(Path::new("/usr/bin/diff"), &[fixture, fixture], b"");
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/sed"),
+        &["-n", "2,3p", fixture],
+        b"alpha:1\nalpha:1\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/sort"),
+        &[fixture],
+        b"alpha:1\nalpha:1\nbeta:2\ngamma:3\n",
+    );
+}
+
+#[test]
+fn liteinst_strict_verify_semantic_file_and_sqlite_utilities() {
+    let fixture = semantic_fixture();
+    let fixture = fixture.to_str().expect("fixture path should be UTF-8");
+
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/find"),
+        &[fixture, "-maxdepth", "0", "-type", "f", "-print"],
+        format!("{fixture}\n").as_bytes(),
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/md5sum"),
+        &[fixture],
+        format!("{SEMANTIC_FIXTURE_MD5}  {fixture}\n").as_bytes(),
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/du"),
+        &["-b", fixture],
+        format!("{}\t{fixture}\n", SEMANTIC_FIXTURE_CONTENT.len()).as_bytes(),
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/sqlite3"),
+        &[
+            ":memory:",
+            "CREATE TABLE t(v); INSERT INTO t VALUES(3),(1),(2); \
+             SELECT v FROM t ORDER BY v;",
+        ],
+        b"1\n2\n3\n",
     );
 }
 
