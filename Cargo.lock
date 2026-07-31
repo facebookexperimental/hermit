@@ -991,7 +991,7 @@ dependencies = [
 
 [[package]]
 name = "hermit"
-version = "0.0.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bincode 2.0.1",

@@ -8,9 +8,6 @@
 
 use std::sync::OnceLock;
 
-#[cfg(not(fbcode_build))]
-const OSS_VERSION: &str = "0.1";
-
 pub struct Version(String);
 
 impl Version {
@@ -43,6 +40,17 @@ impl Version {
         }
 
         #[cfg(not(fbcode_build))]
-        Self(OSS_VERSION.to_owned())
+        {
+            // Single source of truth: the crate version from `Cargo.toml`,
+            // augmented with the build date and source revision emitted by
+            // `build.rs`. Produces, for example:
+            //   0.2.0 (2026-07-31, gabc123def456)
+            Self(format!(
+                "{} ({}, g{})",
+                env!("CARGO_PKG_VERSION"),
+                env!("HERMIT_BUILD_DATE"),
+                env!("HERMIT_BUILD_GIT_SHA"),
+            ))
+        }
     }
 }
