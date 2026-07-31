@@ -32,7 +32,7 @@ exec "$qemu_bin" \
   -m 256M \
   -accel 'tcg,thread=single' \
   -smp 1 \
-  -icount 'shift=0,sleep=off' \
+  -icount 'shift=0,sleep=on' \
   -rtc 'base=utc,clock=vm' \
   -kernel "$kernel_image" \
   -initrd "$initramfs_image" \
