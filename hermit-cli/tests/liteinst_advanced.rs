@@ -31,6 +31,11 @@ static LITEINST_SEMANTIC_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 const COMPAT_FIXTURE_CONTENT: &[u8] = b"liteinst compatibility fixture\n";
 const COMPAT_FIXTURE_SHA256: &str =
     "e5c4447a0a9f796a0b72bb47875e9879aa7722c74e601385e74058f029ae60cd";
+const COMPAT_FIXTURE_SHA1: &str = "41396e2c2d5ce6332143190b04e78ba101db58f8";
+const COMPAT_FIXTURE_SHA224: &str = "344c0ace4382f9d738db9a385af4435e493e876fdc334c21485917ba";
+const COMPAT_FIXTURE_SHA384: &str = "38184361b2dbdee2b75d92506acf3ab1dba402eed33cc0691841d5b33521382e5752437b3cfa2232d2241ad6baaf5fa9";
+const COMPAT_FIXTURE_SHA512: &str = "2c856cc937ac0a50cedf2a3d3d0a6c10570791ace2e3cd44374a1308844bc2acca0fd6e100b38306da9844c7248bebcca3fd46a1c2651b98d36f588126925078";
+const COMPAT_FIXTURE_BLAKE2: &str = "d69629a852f326482ab1e50881d63a17028e3205b66a6a54d7d85c0cb9ceff149ba03c45585a6a94e1a1edd120fe50c44e9dfce62830ffac3460a57bde29c5aa";
 const SEMANTIC_FIXTURE_CONTENT: &[u8] = b"gamma:3\nalpha:1\nalpha:1\nbeta:2\n";
 const SEMANTIC_FIXTURE_MD5: &str = "c61c6cb65c4b5e1a6f3eb32b601db629";
 
@@ -331,6 +336,68 @@ fn liteinst_strict_verify_semantic_file_and_sqlite_utilities() {
              SELECT v FROM t ORDER BY v;",
         ],
         b"1\n2\n3\n",
+    );
+}
+
+#[test]
+fn liteinst_strict_verify_encoding_and_digest_utilities() {
+    let fixture = compatibility_fixture();
+    let fixture = fixture.to_str().expect("fixture path should be UTF-8");
+
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/base64"),
+        &["--wrap=0", fixture],
+        b"bGl0ZWluc3QgY29tcGF0aWJpbGl0eSBmaXh0dXJlCg==",
+    );
+    for (program, digest) in [
+        ("/usr/bin/sha1sum", COMPAT_FIXTURE_SHA1),
+        ("/usr/bin/sha224sum", COMPAT_FIXTURE_SHA224),
+        ("/usr/bin/sha384sum", COMPAT_FIXTURE_SHA384),
+        ("/usr/bin/sha512sum", COMPAT_FIXTURE_SHA512),
+        ("/usr/bin/b2sum", COMPAT_FIXTURE_BLAKE2),
+    ] {
+        let expected = format!("{digest}  {fixture}\n");
+        assert_liteinst_strict_verify(Path::new(program), &[fixture], expected.as_bytes());
+    }
+    let expected_cksum = format!("2216041199 {} {fixture}\n", COMPAT_FIXTURE_CONTENT.len());
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/cksum"),
+        &[fixture],
+        expected_cksum.as_bytes(),
+    );
+}
+
+#[test]
+fn liteinst_strict_verify_formatting_and_sequence_utilities() {
+    let compat_fixture = compatibility_fixture();
+    let compat_fixture = compat_fixture
+        .to_str()
+        .expect("fixture path should be UTF-8");
+    let semantic_fixture = semantic_fixture();
+    let semantic_fixture = semantic_fixture
+        .to_str()
+        .expect("fixture path should be UTF-8");
+
+    assert_liteinst_strict_verify(Path::new("/usr/bin/seq"), &["5"], b"1\n2\n3\n4\n5\n");
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/fmt"),
+        &["--width=10", compat_fixture],
+        b"liteinst\ncompatibility\nfixture\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/fold"),
+        &["--width=8", compat_fixture],
+        b"liteinst\n compati\nbility f\nixture\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/nl"),
+        &["-ba", semantic_fixture],
+        b"     1\tgamma:3\n     2\talpha:1\n     3\talpha:1\n     4\tbeta:2\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/tac"),
+        &[semantic_fixture],
+        b"beta:2\nalpha:1\nalpha:1\ngamma:3\n",
     );
 }
 
