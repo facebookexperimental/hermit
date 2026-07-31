@@ -58,7 +58,7 @@
     {
       "group": "build", "job": "liteinst_runtime_release",
       "desc": "Build and stage the release LiteInst runtime",
-      "cmd": "./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build-adc14734",
+      "cmd": "./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build-aa6f1283",
       "deps": ["build.dbi_release"],
       "timeout": 900,
       "hint": {"est_duration_s": 120, "rss_baseline_bytes": 2147483648,
