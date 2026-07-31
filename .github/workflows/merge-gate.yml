@@ -89,24 +89,129 @@ jobs:
       issues: write
       pull-requests: write
     steps:
-      - name: Remove validation inherited from an older PR head
+      - name: Remove validation and stale approvals inherited from an older PR head
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          # A new push invalidates prior sign-off on the previous revision:
+          #   - locally-validated: the local test evidence no longer matches HEAD.
+          #   - passed-review-{codex,claude}: the reviewers approved an older diff,
+          #     so their approval must be re-earned before the core-review-protocol
+          #     job (below) will let a post-facto-human-review PR land again.
           labels="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name')"
-          if grep -Fxq locally-validated <<< "$labels"; then
-            gh api --method DELETE \
-              "repos/${REPO}/issues/${PR_NUMBER}/labels/locally-validated" \
-              --silent
-            echo "Removed stale locally-validated label from PR #$PR_NUMBER."
+          for stale in locally-validated passed-review-codex passed-review-claude; do
+            if grep -Fxq "$stale" <<< "$labels"; then
+              gh api --method DELETE \
+                "repos/${REPO}/issues/${PR_NUMBER}/labels/${stale}" \
+                --silent
+              echo "Removed stale ${stale} label from PR #$PR_NUMBER."
+            fi
+          done
+
+  core-review-protocol:
+    name: core-review-protocol
+    if: >-
+      github.repository == 'rrnewton/hermit' &&
+      github.event_name != 'workflow_run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out the review-protocol linter
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Enforce the core-change review protocol
+        env:
+          BASE_REF: ${{ github.event.merge_group.base_ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # Resolve the pull request number(s) this event covers, mirroring the
+          # merge-gate job so the same PRs are gated at PR time and in the queue.
+          if [ "$EVENT_NAME" = pull_request ] || [ "$EVENT_NAME" = workflow_dispatch ]; then
+            if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = null ]; then
+              echo "::error::workflow_dispatch requires a pr_number input."
+              exit 1
+            fi
+            pr_numbers="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" |
+              jq -r 'select(.base.ref == "main") | .number')"
+          else
+            owner="${REPO%%/*}"
+            name="${REPO#*/}"
+            base_branch="${BASE_REF#refs/heads/}"
+            pr_numbers="$(
+              gh api graphql \
+                -f owner="$owner" \
+                -f name="$name" \
+                -f branch="$base_branch" \
+                -f query='query($owner: String!, $name: String!, $branch: String!) {
+                repository(owner: $owner, name: $name) {
+                  mergeQueue(branch: $branch) {
+                    entries(first: 100) {
+                      nodes {
+                        headCommit { oid }
+                        pullRequest { number baseRefName }
+                      }
+                    }
+                  }
+                }
+              }' | jq -r --arg sha "$SHA" --arg base "$base_branch" '
+                .data.repository.mergeQueue.entries.nodes
+                | map(select(
+                    .headCommit.oid == $sha
+                    and .pullRequest.baseRefName == $base
+                  ) | .pullRequest.number)
+                | .[]
+              ')"
           fi
+
+          if [ -z "$pr_numbers" ]; then
+            echo "No main-branch pull request is associated with $SHA; nothing to enforce."
+            exit 0
+          fi
+
+          failed=0
+          while read -r pr_number; do
+            [ -n "$pr_number" ] || continue
+
+            pr_json="$(gh api "repos/${REPO}/pulls/${pr_number}")"
+            labels="$(jq -r '.labels[].name' <<< "$pr_json")"
+            body="$(jq -r '.body // ""' <<< "$pr_json")"
+
+            # A PR "touches KVM" when a changed file path or a label mentions kvm.
+            files="$(gh api "repos/${REPO}/pulls/${pr_number}/files" \
+              --paginate --jq '.[].filename' || true)"
+            if grep -qiE 'kvm' <<< "$files" || grep -Fixq kvm <<< "$labels"; then
+              is_kvm=true
+            else
+              is_kvm=false
+            fi
+
+            if PR_LABELS="$labels" PR_BODY="$body" PR_IS_KVM="$is_kvm" \
+               PR_NUMBER="$pr_number" \
+               bash scripts/core-review-protocol-lint.sh; then
+              :
+            else
+              failed=1
+            fi
+          done <<< "$pr_numbers"
+
+          exit "$failed"
 
   merge-gate:
     name: merge-gate
-    needs: [invalidate-local-validation]
+    needs: [invalidate-local-validation, core-review-protocol]
     if: >-
       always() &&
       github.repository == 'rrnewton/hermit' &&
@@ -114,6 +219,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Require the core-change review protocol
+        env:
+          PROTOCOL_RESULT: ${{ needs.core-review-protocol.result }}
+        run: |
+          set -euo pipefail
+          # core-review-protocol shares merge-gate's activation conditions, so it
+          # runs whenever this job does; treat anything other than a clean pass
+          # (or a defensive skip) as a landing block.
+          case "$PROTOCOL_RESULT" in
+            success | skipped)
+              echo "core-review-protocol result: $PROTOCOL_RESULT"
+              ;;
+            *)
+              echo "::error::Core-change review protocol did not pass (result=$PROTOCOL_RESULT); blocking landing."
+              exit 1
+              ;;
+          esac
       - name: Require successful CI or local validation
         env:
           BASE_REF: ${{ github.event.merge_group.base_ref }}

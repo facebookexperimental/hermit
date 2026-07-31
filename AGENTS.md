@@ -330,10 +330,15 @@ backend-parity work toward the golden ptrace reference does not trigger review
 unless it also meets one of these four criteria.
 
 Every PR description requires **Summary**, **Determinism** (why the change is
-deterministic plus a logic or informal proof, not only tests), and
+deterministic plus a logic or informal proof, not only tests), **Linux
+Semantics** (how the change preserves faithful Linux behavior), and
 **Validation**. KVM changes also require **Relationship to gVisor**. A labeled
 PR additionally requires **Human Review Required**, naming the specific
-numbered trigger rather than a vague category such as "backend change".
+numbered trigger rather than a vague category such as "backend change". For a
+`post-facto-human-review` PR these sections and the dual-reviewer approval
+labels are enforced by the `core-review-protocol` merge-gate job
+(`scripts/core-review-protocol-lint.sh`), which blocks landing when any are
+missing.
 
 GitHub Issues are the public issue tracker. In Meta environments, use
 appropriate proxies for accessing the web.

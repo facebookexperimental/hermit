@@ -91,6 +91,15 @@ Every PR description must contain:
   applied. Name the specific numbered trigger(s); vague prose such as "backend
   change" is insufficient.
 
+For a `post-facto-human-review` PR these sections are not merely convention:
+the `core-review-protocol` merge-gate job runs
+`scripts/core-review-protocol-lint.sh`, which **blocks landing** unless the PR
+also carries dual adversarial-review rounds
+(`adversarial-review-codex<N>` + `adversarial-review-claude<N>`, N in 1..4) and
+current dual approval (`passed-review-codex` + `passed-review-claude`). A new
+push drops the `passed-review-*` labels, so approval must be re-earned on the
+latest revision.
+
 PR #1151 is the canonical good example for trigger 4: its slowdown model is
 explained as weighted virtual-time progression with deterministic epochs and
 replay evidence, rather than asserted from passing tests alone. New PRs must
