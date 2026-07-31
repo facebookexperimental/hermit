@@ -369,7 +369,7 @@
     },
     {
       "group": "test", "job": "sabre_examples",
-      "desc": "SaBRe non-racy examples: strict verification and ptrace output parity",
+      "desc": "SaBRe non-racy examples: per-backend time determinism and non-time ptrace parity",
       "cmd": "HERMIT_SABRE_TEST_BINARY=$PWD/target/release/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre cargo test -p hermit --test sabre_examples -- --test-threads=1",
       "deps": ["build.sabre_release"],
       "timeout": 900,

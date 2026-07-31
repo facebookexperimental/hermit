@@ -298,7 +298,7 @@ fn assert_date_output_is_sane(output: &Output, backend_label: &str) {
 }
 
 #[test]
-fn sabre_non_racy_examples_verify_and_match_ptrace() {
+fn sabre_non_racy_examples_verify_current_envelope() {
     let Some(loader) = sabre_loader() else {
         return;
     };
