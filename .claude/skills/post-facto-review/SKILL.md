@@ -71,7 +71,20 @@ Every PR description must contain:
 - **Summary**.
 - **Determinism** — mandatory for every PR; explain why the change is
   deterministic and give the logic or informal proof, not only test results.
+  For any time/clock/scheduling change, the proof must argue that virtual time
+  stays **continuous and fine-grained** (see
+  [continuous-virtual-time-is-sacred](../continuous-virtual-time-is-sacred/SKILL.md));
+  a change that achieves determinism or parity by rounding, freezing,
+  coarsening, or resetting time is a red flag, not a proof.
+- **Linux Semantics** — state how the change matches real Linux kernel behavior
+  for the affected syscalls/interfaces (return values, error codes, ordering,
+  edge cases), or explain why a deliberate deviation is safe. Determinism must
+  not come at the cost of guest-visible semantics.
 - **Validation** — exact commands, outcomes, limitations, and relaxations.
+  Parity/determinism evidence must demonstrate **continuous evolution** —
+  repeated reads across the run, and cross-exec/cross-thread/cross-backend
+  samples where relevant — **not a single first-sample** match. First-read
+  agreement on a tidy origin is a classic false green.
 - **Relationship to gVisor** — required for KVM changes; state the comparison
   or explain why none applies.
 - **Human Review Required** — mandatory when `post-facto-human-review` is
@@ -82,6 +95,21 @@ PR #1151 is the canonical good example for trigger 4: its slowdown model is
 explained as weighted virtual-time progression with deterministic epochs and
 replay evidence, rather than asserted from passing tests alone. New PRs must
 use the section names above and identify trigger 4 explicitly.
+
+### Dual adversarial review for core determinism/time/scheduling changes
+
+A change to core determinism, virtual time, or the scheduler (any of triggers 3
+and 4, and any clock/time-virtualization change) must survive **two independent
+adversarial reviews before landing — one by a `claude` agent and one by a
+`codex` agent**. Using two different model families reduces correlated blind
+spots on exactly the changes where a subtle determinism regression is most
+costly and hardest to see. Each reviewer's job is to *refute* the change over
+repeated author-fix/reviewer-recheck rounds, covering correctness, continuous
+fine-grained virtual time, the Reverie/Detcore boundary, Linux semantics, and
+security, with evidence bound to exact commands and SHAs. Do not land such a
+change until both reviews are resolved (and authoritative CI is green). Routine,
+single-backend parity work that meets none of the triggers keeps the standard
+single-reviewer bar.
 
 ## 3. Labels and new-syscall code markers
 

@@ -27,13 +27,26 @@ a trigger merely because it changes a non-ptrace backend. It is labeled only if
 it also meets one of the four triggers.
 
 Every PR description requires `Summary`, mandatory `Determinism` (why the
-change is deterministic plus its logic or informal proof), and `Validation`.
-KVM PRs also require `Relationship to gVisor`. A labeled PR additionally
-requires `Human Review Required`, naming the specific numbered trigger rather
-than vague prose such as "backend change". The syscall tags above verify trigger
-1; they are not blanket backend-change markers. Hermit
+change is deterministic plus its logic or informal proof), `Linux Semantics`
+(how it matches real Linux kernel behavior, or why a deviation is safe), and
+`Validation`. KVM PRs also require `Relationship to gVisor`. A labeled PR
+additionally requires `Human Review Required`, naming the specific numbered
+trigger rather than vague prose such as "backend change". The syscall tags above
+verify trigger 1; they are not blanket backend-change markers. Hermit
 [PR #1151](https://github.com/rrnewton/hermit/pull/1151), which moved slowdown
 into virtual-time/epoch scheduling, is the canonical good example for trigger 4.
+
+For any time/clock/scheduling change, the `Determinism` argument must show that
+virtual time stays **continuous and fine-grained**, and `Validation` must
+demonstrate **continuous evolution** (repeated and cross-exec/cross-thread/
+cross-backend reads), **not a single first-sample** match. A backend that
+"achieves parity" by rounding, freezing, coarsening, or resetting time is faking
+it — score it as unproven and see
+[continuous-virtual-time-is-sacred](../continuous-virtual-time-is-sacred/SKILL.md).
+Core determinism/time/scheduling changes (triggers 3 and 4, and any
+time-virtualization change) must pass **dual independent adversarial review — one
+`claude` agent and one `codex` agent — before landing**, per
+[post-facto-review](../post-facto-review/SKILL.md).
 
 ## Milestone Completion Gate
 
