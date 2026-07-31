@@ -167,6 +167,17 @@ util-c/pmu-skid
 
 Additional backend-wide limits:
 
+- GNU `patch` reaches `getrandom` through glibc at a libc site that the SaBRe
+  syscall rewriter can miss. The plugin detours that libc function through
+  Detcore; the canonical `patch` workload then passed five consecutive strict
+  verification probes with matching DETLOG/COMMIT streams. This does not close
+  the broader random-source gap: the multithreaded `random-sources` probe still
+  produces different ptrace and SaBRe stdout and DETLOG streams and remains
+  disabled.
+- The exhaustive `relaxed_flag_matrix` integration test is currently a
+  ptrace-only cross-product. It exercises getrandom in its observation guest,
+  but provides no SaBRe flag-matrix coverage; adding a bounded SaBRe slice is a
+  separate qualification batch.
 - SaBRe supports deterministic `run` and the narrow SaBRe `strace` command;
   record/replay and chaos scheduling are unsupported.
 - `race.sh` is excluded. SaBRe does not serialize arbitrary guest instructions

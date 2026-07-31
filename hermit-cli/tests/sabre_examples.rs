@@ -369,3 +369,31 @@ fn sabre_non_racy_examples_verify_current_envelope() {
         "clock-progress",
     );
 }
+
+#[test]
+fn sabre_libc_getrandom_keeps_patch_tempfile_deterministic() {
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    if !Command::new("patch")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        eprintln!("skipping SaBRe libc getrandom regression: patch is unavailable");
+        return;
+    }
+
+    let script = r#"set -euo pipefail
+d=$(mktemp -d)
+printf 'old\n' >"$d/file"
+printf '%s\n' '--- file' '+++ file' '@@ -1 +1 @@' '-old' '+new' | (cd "$d" && patch -s file)
+cat "$d/file"
+rm -rf "$d""#;
+    assert_backend_parity_and_sabre_verify(
+        Path::new("/bin/bash"),
+        &["-c", script],
+        &loader,
+        "GNU patch libc getrandom tempfile",
+    );
+}

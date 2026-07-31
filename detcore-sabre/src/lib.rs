@@ -8,6 +8,7 @@
 
 //! SaBRe plugin that executes Hermit's Detcore tool inside each guest process.
 
+use std::cell::Cell;
 use std::ffi::CString;
 use std::ffi::OsStr;
 use std::ffi::OsString;
@@ -36,6 +37,22 @@ pub const RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-771): Review fork-inherited SaBRe coordinator discovery.
 static RPC_SOCKET: OnceLock<PathBuf> = OnceLock::new();
+
+thread_local! {
+    // Function detours are registered before the process-local tool is built.
+    // Adapter construction may itself call libc getrandom, so recursive calls
+    // must use the captured original while the first call initializes the
+    // process-local Plugin.
+    static LIBC_GETRANDOM_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+struct DetourGuard<'a>(&'a Cell<bool>);
+
+impl Drop for DetourGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
 
 fn coordinator_socket() -> Option<PathBuf> {
     if let Some(socket) = RPC_SOCKET.get() {
@@ -172,6 +189,40 @@ impl Plugin {
 impl reverie_sabre::Tool for Plugin {
     type Client = ();
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1214): Review libc getrandom function interception.
+    // GNU patch calls glibc's getrandom wrapper from libc, whose raw syscall
+    // site SaBRe deliberately does not rewrite. Route that wrapper through the
+    // same Detcore syscall handler used by rewritten guest call sites.
+    #[detour(lib = "libc", func = "getrandom")]
+    fn libc_getrandom(
+        buffer: *mut libc::c_void,
+        length: libc::size_t,
+        flags: libc::c_uint,
+    ) -> libc::ssize_t {
+        LIBC_GETRANDOM_ACTIVE.with(|active| {
+            if active.replace(true) {
+                return Self::libc_getrandom_undetoured(buffer, length, flags);
+            }
+            let _guard = DetourGuard(active);
+
+            let syscall = Syscall::from_raw(
+                Sysno::getrandom,
+                SyscallArgs::new(buffer as usize, length, flags as usize, 0, 0, 0),
+            );
+            match <Self as reverie_sabre::ToolGlobal>::global()
+                .adapter
+                .handle_syscall(syscall)
+            {
+                Ok(result) => result as libc::ssize_t,
+                Err(error) => {
+                    unsafe { *libc::__errno_location() = error.into_raw() };
+                    -1
+                }
+            }
+        })
+    }
+
     fn new(_client: Self::Client) -> Self {
         Self::connect()
     }
@@ -256,6 +307,8 @@ impl reverie_sabre::Tool for Plugin {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CStr;
+
     use super::*;
 
     #[test]
@@ -281,6 +334,19 @@ mod tests {
     #[test]
     fn rpc_socket_uses_sabre_private_environment_namespace() {
         assert!(RPC_SOCKET_ENV.starts_with("REVERIE_SABRE_"));
+    }
+
+    #[test]
+    fn registers_libc_getrandom_detour() {
+        let detour = <Plugin as reverie_sabre::Tool>::detours()
+            .iter()
+            .find(|detour| unsafe { CStr::from_ptr(detour.fn_name) }.to_bytes() == b"getrandom")
+            .expect("libc getrandom detour should be registered");
+
+        assert_eq!(
+            unsafe { CStr::from_ptr(detour.lib_name) }.to_bytes(),
+            b"libc"
+        );
     }
 
     #[test]
