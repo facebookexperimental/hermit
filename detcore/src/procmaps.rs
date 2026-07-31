@@ -72,10 +72,25 @@ pub fn compute_hash<G, T: Tool>(guest: &mut G, map: &MemoryMap) -> Result<Digest
 where
     G: Guest<T>,
 {
-    let size = (map.address.1 - map.address.0) as usize;
+    compute_hash_range(guest, map.address.0, map.address.1)
+}
+
+/// Hash the guest bytes in the half-open guest-virtual range `[start, end)`,
+/// read through `guest.memory()`. Used for backend-reported memory regions
+/// ([`reverie::Guest::detlog_memory_regions`]) where the range is a guest
+/// address rather than an entry parsed from a host `/proc/<pid>/maps`.
+pub fn compute_hash_range<G, T: Tool>(
+    guest: &mut G,
+    start: u64,
+    end: u64,
+) -> Result<Digest, reverie::Error>
+where
+    G: Guest<T>,
+{
+    let size = end.saturating_sub(start) as usize;
     let memory = guest.memory();
     let mut buf = vec![0; size];
-    let start = Addr::<u8>::from_raw(map.address.0 as usize).unwrap();
+    let start = Addr::<u8>::from_raw(start as usize).unwrap();
     memory.read_values(start, buf.as_mut_slice())?;
     Ok(Digest::new(buf.as_slice()))
 }

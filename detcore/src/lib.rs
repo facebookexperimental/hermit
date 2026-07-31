@@ -719,6 +719,34 @@ impl<T: RecordOrReplay> Detcore<T> {
             // /proc/maps unless one of these flags is enabled.
             return Ok(());
         }
+        // Out-of-process backends (e.g. KVM) report their guest memory regions
+        // directly, because `guest.pid()` is the host VMM process there and its
+        // `/proc/<pid>/maps` describes the VMM, not the guest address space.
+        // Reading those host addresses through `guest.memory()` (guest-address
+        // space) would fault and abort the syscall. When the backend supplies
+        // regions, hash those guest ranges; otherwise fall back to the ptrace
+        // path of parsing `/proc/<pid>/maps`.
+        if let Some(regions) = guest.detlog_memory_regions() {
+            for region in regions {
+                let want = match region.kind {
+                    reverie::DetlogRegionKind::Stack => self.cfg.detlog_stack,
+                    reverie::DetlogRegionKind::Heap => self.cfg.detlog_heap,
+                };
+                if !want {
+                    continue;
+                }
+                let dettid = guest.thread_state().dettid;
+                detlog!(
+                    "[memory][dtid {}] {:?} {:#x}-{:#x}->{}",
+                    dettid,
+                    region.kind,
+                    region.start,
+                    region.end,
+                    procmaps::compute_hash_range(guest, region.start, region.end)?
+                )
+            }
+            return Ok(());
+        }
         for mmap in procmaps::from_pid(guest.pid(), |map| match map.pathname {
             procmaps::MMapPath::Stack if self.cfg.detlog_stack => true,
             procmaps::MMapPath::Heap if self.cfg.detlog_heap => true,
