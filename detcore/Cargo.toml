@@ -23,7 +23,8 @@
 
 [package]
 name = "detcore"
-version = "0.0.0"
+description = "Detcore: the deterministic scheduler and syscall determinization core of the Hermit execution engine."
+version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"
@@ -50,8 +51,8 @@ async-trait = "0.1.86"
 bitflags = { version = "2.13.1", features = ["serde"], default-features = false }
 chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
-detcore-model = { version = "0.0.0", path = "../detcore-model" }
-digest = { version = "0.0.0", path = "../common/digest" }
+detcore-model = { version = "0.2.0", path = "../detcore-model" }
+digest = { version = "0.2.0", path = "../common/digest" }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
@@ -73,10 +74,10 @@ tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
-detcore-testutils = { version = "0.0.0", path = "tests/testutils" }
+detcore-testutils = { version = "0.2.0", path = "tests/testutils" }
 # ALLOWED test-only backend: detcore's integration tests drive a real tracer to
 # exercise the tool. This is a dev-dependency and never reaches the shipped
 # `detcore` rlib. It is the ONLY backend crate permitted in this manifest.
 reverie-ptrace = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "d973a85b328610c14c41c39fa57495b9f77c3c90" }
-test-allocator = { version = "0.0.0", path = "../common/test-allocator" }
+test-allocator = { version = "0.2.0", path = "../common/test-allocator" }
 test-case = "3.3.1"

@@ -2,7 +2,7 @@
 
 [package]
 name = "hermetic_infra_hermit_flaky-tests"
-version = "0.0.0"
+version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"

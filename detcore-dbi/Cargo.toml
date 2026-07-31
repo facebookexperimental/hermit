@@ -1,6 +1,7 @@
 [package]
 name = "detcore-dbi"
-version = "0.0.0"
+description = "DynamoRIO DBI backend glue for Detcore, the Hermit deterministic execution engine."
+version = "0.2.0"
 edition = "2024"
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
@@ -9,8 +10,8 @@ repository = "https://github.com/facebookexperimental/hermit"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-detcore = { version = "0.0.0", path = "../detcore" }
-hermit-resources = { version = "0.0.0", path = "../hermit-resources" }
+detcore = { version = "0.2.0", path = "../detcore" }
+hermit-resources = { version = "0.2.0", path = "../hermit-resources" }
 libc = "0.2.186"
 rand = "0.10.2"
 reverie = { package = "reverie-core", version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "d973a85b328610c14c41c39fa57495b9f77c3c90" }

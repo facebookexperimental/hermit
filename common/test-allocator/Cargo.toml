@@ -2,7 +2,8 @@
 
 [package]
 name = "test-allocator"
-version = "0.0.0"
+description = "Test-only allocator utilities for the Hermit deterministic execution engine."
+version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"

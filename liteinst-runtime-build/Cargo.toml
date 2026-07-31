@@ -5,7 +5,7 @@ default-members = ["."]
 
 [package]
 name = "hermit-liteinst-runtime-build"
-version = "0.0.0"
+version = "0.2.0"
 edition = "2024"
 publish = false
 

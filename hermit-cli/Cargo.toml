@@ -2,6 +2,7 @@
 
 [package]
 name = "hermit"
+description = "Hermit: a deterministic Linux execution engine for reproducible runs, record and replay, and concurrency-race search."
 version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/facebookexperimental/hermit"
@@ -30,16 +31,16 @@ bincode = { version = "2", features = ["serde"] }
 addr2line = "0.26.1"
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 colored = "2.1.0"
-detcore = { version = "0.0.0", path = "../detcore" }
-detcore-dbi = { version = "0.0.0", path = "../detcore-dbi", optional = true }
-detcore-model = { version = "0.0.0", path = "../detcore-model" }
+detcore = { version = "0.2.0", path = "../detcore" }
+detcore-dbi = { version = "0.2.0", path = "../detcore-dbi", optional = true }
+detcore-model = { version = "0.2.0", path = "../detcore-model" }
 diff = "0.1.13"
-digest = { version = "0.0.0", path = "../common/digest" }
+digest = { version = "0.2.0", path = "../common/digest" }
 dirs = "6.0"
-edit-distance = { version = "0.0.0", path = "../common/edit-distance" }
+edit-distance = { version = "0.2.0", path = "../common/edit-distance" }
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 goblin = { version = "0.10.7", features = ["elf32", "elf64", "endian_fd"] }
-hermit-resources = { version = "0.0.0", path = "../hermit-resources" }
+hermit-resources = { version = "0.2.0", path = "../hermit-resources" }
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"] }
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
