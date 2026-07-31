@@ -113,11 +113,44 @@ jobs:
           echo "Demo suite Hermit SHA: $actual"
           echo "Demo harness SHA: $(git -C "$SUITE_DIR" rev-parse HEAD)"
 
+      - name: Ensure the repository Rust toolchain
+        working-directory: dev-hermit-demo-suite/hermit
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            rustup_init="$RUNNER_TEMP/rustup-init.sh"
+            download=(curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$rustup_init")
+            if command -v with-proxy >/dev/null 2>&1; then
+              with-proxy "${download[@]}"
+            else
+              "${download[@]}"
+            fi
+            install_rustup=(sh "$rustup_init" -y --profile minimal --default-toolchain none)
+            if command -v with-proxy >/dev/null 2>&1; then
+              with-proxy "${install_rustup[@]}"
+            else
+              "${install_rustup[@]}"
+            fi
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"
+          channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
+          test -n "$channel"
+          install_toolchain=(rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt)
+          if command -v with-proxy >/dev/null 2>&1; then
+            with-proxy "${install_toolchain[@]}"
+          else
+            "${install_toolchain[@]}"
+          fi
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: dev-hermit-demo-suite/hermit -> target
           shared-key: hermit-hot-path-demo-gate
           cache-on-failure: true
+          # The self-hosted runner's rustup/cargo executables are toolchain
+          # prerequisites, not disposable build cache entries.
+          cache-bin: false
 
       - name: Install demo dependencies
         shell: bash
