@@ -40,7 +40,7 @@
     {
       "group": "build", "job": "dbi_release",
       "desc": "Build release Hermit for DynamoRIO DBI and LiteInst",
-      "cmd": "cargo build --release --locked -p hermit",
+      "cmd": "cargo build --release --locked -p hermit -p detcore-dbi",
       "deps": ["build.workspace"],
       "timeout": 1200,
       "hint": {"est_duration_s": 240, "rss_baseline_bytes": 5368709120,
