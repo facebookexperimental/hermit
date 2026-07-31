@@ -119,7 +119,7 @@
       "desc": "Portable manifest bucket: c-programs",
       "manifest": {"lane": "portable", "category": "c-programs"},
       "cmd": "./ci/test_harness.sh run --lane portable --category c-programs --ci-only --allow-empty --prebuilt --results target/e2e/portable/c-programs/results.jsonl --junit target/e2e/portable/c-programs/junit.xml",
-      "deps": ["build.workspace", "build.manifest_guests", "e2e.metadata"],
+      "deps": ["build.workspace", "build.manifest_guests", "build.sabre_release", "e2e.metadata"],
       "timeout": 600,
       "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 5,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
