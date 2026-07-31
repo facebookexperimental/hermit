@@ -1159,53 +1159,22 @@ impl ProcessCpuTime {
     }
 }
 
-/// Guest-visible wall-clock calibration shared by an entire process tree.
+/// Guest-visible logical clock shared by an entire process tree.
 ///
-/// Detcore's raw logical clock includes backend-specific implementation work
-/// (for example, ptrace RCBs versus DBI's syscall-only fallback). Each task
-/// therefore calibrates its raw backend offset on first observation and after
-/// exec. The elapsed value is shared by the whole tree and never reset, so
-/// fork and exec cannot create a second guest-visible clock domain.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct GuestClockCalibration {
-    origin: LogicalTime,
-    elapsed_at_origin: LogicalTime,
-}
-
+/// The scheduler's raw logical time already includes the configured epoch and
+/// is the clock used to judge absolute deadlines. Guest time must therefore
+/// track it directly: subtracting a per-process or per-exec origin can put a
+/// newly computed absolute deadline in the scheduler's past. The shared floor
+/// preserves monotonicity if a backend supplies a stale local observation.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct GuestClock {
-    calibrations: BTreeMap<DetTid, GuestClockCalibration>,
-    elapsed: LogicalTime,
+    now: LogicalTime,
 }
 
 impl GuestClock {
-    fn observe(&mut self, dettid: DetTid, raw: LogicalTime, epoch: LogicalTime) -> LogicalTime {
-        let calibration = self
-            .calibrations
-            .entry(dettid)
-            .or_insert(GuestClockCalibration {
-                origin: raw,
-                elapsed_at_origin: self.elapsed,
-            });
-        let raw_elapsed = if raw >= calibration.origin {
-            raw - calibration.origin
-        } else {
-            LogicalTime::ZERO
-        };
-        let candidate = calibration.elapsed_at_origin + raw_elapsed;
-        self.elapsed = self.elapsed.max(candidate);
-        epoch + self.elapsed
-    }
-
-    /// Give a new task its parent's raw-to-guest calibration in this domain.
-    pub(crate) fn inherit(&mut self, parent: DetTid, child: DetTid) {
-        if let Some(calibration) = self.calibrations.get(&parent).cloned() {
-            self.calibrations.insert(child, calibration);
-        }
-    }
-
-    fn rebase_after_exec(&mut self, dettid: DetTid) {
-        self.calibrations.remove(&dettid);
+    fn observe(&mut self, raw: LogicalTime) -> LogicalTime {
+        self.now = self.now.max(raw);
+        self.now
     }
 }
 
@@ -1276,7 +1245,7 @@ pub struct ThreadState<T> {
     /// Logical CPU accounting shared by all threads in this process.
     pub(crate) process_cpu_time: Arc<Mutex<ProcessCpuTime>>,
 
-    /// Wall-clock calibration shared by every task in this process tree.
+    /// Guest-visible logical clock shared by every task in this process tree.
     #[serde(default)]
     pub(crate) guest_clock: Arc<Mutex<GuestClock>>,
 
@@ -1504,18 +1473,11 @@ pub(crate) fn chaos_per_thread_slowdown_factor(
 }
 
 impl<T> ThreadState<T> {
-    pub(crate) fn observe_guest_clock(&self, raw: LogicalTime, epoch: LogicalTime) -> LogicalTime {
+    pub(crate) fn observe_guest_clock(&self, raw: LogicalTime) -> LogicalTime {
         self.guest_clock
             .lock()
             .expect("guest clock mutex poisoned")
-            .observe(self.dettid, raw, epoch)
-    }
-
-    pub(crate) fn rebase_guest_clock_after_exec(&self) {
-        self.guest_clock
-            .lock()
-            .expect("guest clock mutex poisoned")
-            .rebase_after_exec(self.dettid);
+            .observe(raw)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2173,81 +2135,64 @@ mod timeslice_tests {
     use crate::preemptions::ThreadHistory;
 
     #[test]
-    fn guest_clock_rebases_backend_startup_work_and_preserves_deltas() {
+    fn guest_clock_tracks_raw_logical_time_without_lag() {
         let epoch = LogicalTime::from_secs(1_000);
-        let dettid = DetTid::from_raw(1);
-        let mut ptrace = GuestClock::default();
-        let mut dbi = GuestClock::default();
+        let mut clock = GuestClock::default();
 
         assert_eq!(
-            ptrace.observe(dettid, epoch + Duration::from_nanos(41_000_000), epoch),
-            epoch
+            clock.observe(epoch + Duration::from_nanos(41_000_000)),
+            epoch + Duration::from_nanos(41_000_000)
         );
         assert_eq!(
-            dbi.observe(dettid, epoch + Duration::from_nanos(822_000_000), epoch),
-            epoch
+            clock.observe(epoch + Duration::from_nanos(41_025_000)),
+            epoch + Duration::from_nanos(41_025_000)
         );
+        // A stale backend-local sample cannot move the process-tree clock back.
         assert_eq!(
-            ptrace.observe(dettid, epoch + Duration::from_nanos(41_025_000), epoch),
-            epoch + Duration::from_nanos(25_000)
+            clock.observe(epoch + Duration::from_nanos(41_010_000)),
+            epoch + Duration::from_nanos(41_025_000)
         );
-        assert_eq!(
-            dbi.observe(dettid, epoch + Duration::from_nanos(822_025_000), epoch),
-            epoch + Duration::from_nanos(25_000)
-        );
+    }
+
+    #[test]
+    fn guest_clock_absolute_deadline_stays_ahead_of_committed_time() {
+        let committed_time = LogicalTime::from_secs(1_000) + Duration::from_millis(250);
+        let mut clock = GuestClock::default();
+        let guest_now = clock.observe(committed_time);
+        let deadline = guest_now + Duration::from_millis(100);
+
+        assert_eq!(guest_now, committed_time);
+        assert!(deadline > committed_time);
     }
 
     #[test]
     fn guest_clock_process_tree_shares_one_monotonic_domain() {
         let epoch = LogicalTime::from_secs(1_000);
-        let root_dettid = DetTid::from_raw(1);
-        let child_dettid = DetTid::from_raw(2);
         let root = Arc::new(Mutex::new(GuestClock::default()));
         let forked_child = Arc::clone(&root);
 
         assert!(Arc::ptr_eq(&root, &forked_child));
         assert_eq!(
-            root.lock()
-                .unwrap()
-                .observe(root_dettid, epoch + Duration::from_secs(1), epoch),
-            epoch
-        );
-        root.lock().unwrap().inherit(root_dettid, child_dettid);
-        assert_eq!(
-            forked_child.lock().unwrap().observe(
-                child_dettid,
-                epoch + Duration::from_secs(2),
-                epoch
-            ),
+            root.lock().unwrap().observe(epoch + Duration::from_secs(1)),
             epoch + Duration::from_secs(1)
+        );
+        assert_eq!(
+            forked_child
+                .lock()
+                .unwrap()
+                .observe(epoch + Duration::from_secs(2)),
+            epoch + Duration::from_secs(2)
         );
 
-        // Exec recalibrates the child's raw backend offset without replacing
-        // the shared domain or moving its elapsed value back to zero.
+        // Exec retains the same clock object and does not rebase elapsed time.
         let execed_child = Arc::clone(&forked_child);
         assert!(Arc::ptr_eq(&root, &execed_child));
-        execed_child.lock().unwrap().rebase_after_exec(child_dettid);
         assert_eq!(
-            execed_child.lock().unwrap().observe(
-                child_dettid,
-                epoch + Duration::from_secs(9),
-                epoch
-            ),
-            epoch + Duration::from_secs(1)
-        );
-        assert_eq!(
-            root.lock()
+            execed_child
+                .lock()
                 .unwrap()
-                .observe(root_dettid, epoch + Duration::from_secs(3), epoch),
-            epoch + Duration::from_secs(2)
-        );
-        assert_eq!(
-            execed_child.lock().unwrap().observe(
-                child_dettid,
-                epoch + Duration::from_secs(10),
-                epoch
-            ),
-            epoch + Duration::from_secs(2)
+                .observe(epoch + Duration::from_secs(9)),
+            epoch + Duration::from_secs(9)
         );
     }
 

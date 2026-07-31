@@ -37,7 +37,6 @@ use crate::tool_global::register_posix_timer;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
-use crate::types::DetTime;
 use crate::types::LogicalTime;
 
 fn time_from_resources(rsrcs: &Resources) -> Option<LogicalTime> {
@@ -104,8 +103,7 @@ where
     } else {
         thread_observe_time(guest).await
     };
-    let epoch = DetTime::from(&guest.config().epoch).as_nanos();
-    guest.thread_state().observe_guest_clock(raw, epoch)
+    guest.thread_state().observe_guest_clock(raw)
 }
 
 fn remaining_sleep_duration(target: LogicalTime, now: LogicalTime) -> Duration {
