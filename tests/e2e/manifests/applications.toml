@@ -26,11 +26,10 @@ native = "Elapsed time drives progress but final output is intentionally stable"
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "sabre"]
 [test.modes.verify.backends_disabled]
 dbi = "DBI application coverage is owned by backend parity"
 kvm = "KVM requires the privileged runner"
-sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst application coverage is owned by backend compatibility"
 
 [test.modes.replay]
