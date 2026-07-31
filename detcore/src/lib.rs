@@ -1131,6 +1131,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 if !clone_flags.contains(CloneFlags::CLONE_THREAD) {
                     pts.1.prepare_child_process_cpu_time(dettid);
                 }
+                let guest_clock = Arc::clone(&pts.1.guest_clock);
+                guest_clock
+                    .lock()
+                    .expect("guest clock mutex poisoned")
+                    .inherit(pts.1.dettid, dettid);
 
                 ThreadState {
                     dettid,
@@ -1195,17 +1200,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     } else {
                         Arc::new(Mutex::new(ProcessCpuTime::default()))
                     },
-                    guest_clock: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
-                        Arc::clone(&pts.1.guest_clock)
-                    } else {
-                        Arc::new(Mutex::new(
-                            pts.1
-                                .guest_clock
-                                .lock()
-                                .expect("guest clock mutex poisoned")
-                                .clone(),
-                        ))
-                    },
+                    // Wall time belongs to the traced process tree, not to an
+                    // individual process. Forked processes and cloned threads
+                    // therefore retain one monotonic elapsed domain and inherit
+                    // the parent's raw-to-guest calibration.
+                    guest_clock,
                     parent_process_cpu_time: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
                         pts.1.parent_process_cpu_time.clone()
                     } else {
@@ -1311,7 +1310,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         guest.thread_state_mut().past_global_first_execve = true;
-        guest.thread_state().reset_guest_clock();
+        guest.thread_state().rebase_guest_clock_after_exec();
         tool_global::mark_past_first_execve(guest).await;
         self.pre_handler_hook(guest, false).await;
 
@@ -2471,5 +2470,26 @@ mod timeslice_timer_tests {
         };
 
         let _ = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+    }
+}
+
+#[cfg(test)]
+mod process_tree_guest_clock_tests {
+    use super::*;
+
+    #[test]
+    fn forked_process_shares_guest_clock_domain() {
+        let config = Config::default();
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+        let mut parent = ThreadState::new(DetPid::from_raw(1), &config, ());
+        parent.clone_flags = Some(CloneFlags::empty());
+
+        let child = <Detcore as Tool>::init_thread_state(
+            &tool,
+            Tid::from_raw(2),
+            Some((Tid::from_raw(1), &parent)),
+        );
+
+        assert!(Arc::ptr_eq(&parent.guest_clock, &child.guest_clock));
     }
 }
