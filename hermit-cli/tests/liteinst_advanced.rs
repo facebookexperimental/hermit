@@ -28,6 +28,7 @@ static LITEINST_ADVANCED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_COMPAT_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_SEMANTIC_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+static LITEINST_COMPRESSED_FIXTURES: OnceLock<[PathBuf; 3]> = OnceLock::new();
 
 const COMPAT_FIXTURE_CONTENT: &[u8] = b"liteinst compatibility fixture\n";
 const COMPAT_FIXTURE_SHA256: &str =
@@ -127,7 +128,50 @@ fn semantic_fixture() -> &'static Path {
     })
 }
 
+fn compressed_fixtures() -> &'static [PathBuf; 3] {
+    LITEINST_COMPRESSED_FIXTURES.get_or_init(|| {
+        let source = compatibility_fixture();
+        let build_root = source
+            .parent()
+            .expect("compatibility fixture should have a parent directory");
+        [
+            (
+                "/usr/bin/gzip",
+                &["-n", "-c"][..],
+                "compatibility-fixture.gz",
+            ),
+            ("/usr/bin/bzip2", &["-c"][..], "compatibility-fixture.bz2"),
+            ("/usr/bin/xz", &["-c"][..], "compatibility-fixture.xz"),
+        ]
+        .map(|(program, args, filename)| {
+            let output = Command::new(program)
+                .args(args)
+                .arg(source)
+                .output()
+                .unwrap_or_else(|error| panic!("failed to run {program}: {error}"));
+            assert!(
+                output.status.success(),
+                "{program} failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let path = build_root.join(filename);
+            fs::write(&path, output.stdout).expect("failed to write compressed fixture");
+            path
+        })
+    })
+}
+
 fn run_liteinst(program: &Path, args: &[&str], verify: bool) -> Output {
+    run_liteinst_with_input(program, args, verify, None)
+}
+
+fn run_liteinst_with_input(
+    program: &Path,
+    args: &[&str],
+    verify: bool,
+    input: Option<&[u8]>,
+) -> Output {
     liteinst_runtime::ensure_liteinst_runtime();
     let home = tempfile::tempdir().expect("failed to create isolated LiteInst HOME");
     let xdg_config_home = home.path().join(".config");
@@ -145,7 +189,25 @@ fn run_liteinst(program: &Path, args: &[&str], verify: bool) -> Output {
         ))
         .env("HOME", home.path());
     command.arg("--").arg(program).args(args);
-    command.output().expect("failed to run Hermit LiteInst")
+    let Some(input) = input else {
+        return command.output().expect("failed to run Hermit LiteInst");
+    };
+
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to run Hermit LiteInst with stdin");
+    child
+        .stdin
+        .take()
+        .expect("LiteInst stdin pipe should exist")
+        .write_all(input)
+        .expect("failed to write LiteInst stdin");
+    child
+        .wait_with_output()
+        .expect("failed to collect Hermit LiteInst output")
 }
 
 fn assert_liteinst_strict_verify(program: &Path, args: &[&str], expected_stdout: &[u8]) {
@@ -194,7 +256,14 @@ fn liteinst_strict_verify_heap_growth_avoids_trampoline_mappings() {
 }
 
 fn run_liteinst_strict_verify(program: &Path, args: &[&str]) -> Output {
-    let output = run_liteinst(program, args, true);
+    assert_liteinst_strict_verify_output(run_liteinst(program, args, true))
+}
+
+fn run_liteinst_strict_verify_with_stdin(program: &Path, args: &[&str], input: &[u8]) -> Output {
+    assert_liteinst_strict_verify_output(run_liteinst_with_input(program, args, true, Some(input)))
+}
+
+fn assert_liteinst_strict_verify_output(output: Output) -> Output {
     assert!(
         output.status.success(),
         "status={:?}\nstdout={}\nstderr={}",
@@ -525,6 +594,91 @@ fn liteinst_strict_verify_round2_arithmetic_and_predicate_utilities() {
     );
     assert_liteinst_strict_verify(Path::new("/usr/bin/test"), &["-f", fixture], b"");
     assert_liteinst_strict_verify(Path::new("/usr/bin/pathchk"), &[fixture], b"");
+}
+
+#[test]
+fn liteinst_strict_verify_round3_portable_system_utilities() {
+    assert_liteinst_strict_verify(Path::new("/usr/bin/arch"), &[], b"x86_64\n");
+    assert_liteinst_strict_verify(Path::new("/usr/bin/getconf"), &["LONG_BIT"], b"64\n");
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/getopt"),
+        &["-o", "ab:", "--", "-a", "-b", "value", "rest"],
+        b" -a -b 'value' -- 'rest'\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/bin/bash"),
+        &[
+            "--noprofile",
+            "--norc",
+            "-c",
+            "printf 'liteinst-bash-ok\\n'",
+        ],
+        b"liteinst-bash-ok\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/jq"),
+        &["-nr", "[3,1,2] | sort | join(\",\")"],
+        b"1,2,3\n",
+    );
+
+    let existing_directory = compatibility_fixture()
+        .parent()
+        .expect("compatibility fixture should have a parent directory");
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/mkdir"),
+        &[
+            "-p",
+            existing_directory.to_str().expect("path should be UTF-8"),
+        ],
+        b"",
+    );
+}
+
+#[test]
+fn liteinst_strict_verify_round3_encoding_and_compression_utilities() {
+    let fixture = compatibility_fixture();
+    let fixture = fixture.to_str().expect("fixture path should be UTF-8");
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/iconv"),
+        &["-f", "UTF-8", "-t", "UTF-16LE", fixture],
+        b"l\0i\0t\0e\0i\0n\0s\0t\0 \0c\0o\0m\0p\0a\0t\0i\0b\0i\0l\0i\0t\0y\0 \0f\0i\0x\0t\0u\0r\0e\0\n\0",
+    );
+
+    let [gzip_fixture, bzip2_fixture, xz_fixture] = compressed_fixtures();
+    for (program, compressed_fixture) in [
+        ("/usr/bin/gzip", gzip_fixture),
+        ("/usr/bin/bzip2", bzip2_fixture),
+        ("/usr/bin/xz", xz_fixture),
+    ] {
+        assert_liteinst_strict_verify(
+            Path::new(program),
+            &[
+                "-cd",
+                compressed_fixture
+                    .to_str()
+                    .expect("compressed fixture path should be UTF-8"),
+            ],
+            COMPAT_FIXTURE_CONTENT,
+        );
+    }
+}
+
+#[test]
+fn liteinst_strict_verify_round3_stdin_filter_utilities() {
+    let output = run_liteinst_strict_verify_with_stdin(
+        Path::new("/usr/bin/tr"),
+        &["a-z", "A-Z"],
+        b"gamma\nalpha\nbeta\n",
+    );
+    assert_eq!(output.stdout, b"GAMMA\nALPHA\nBETA\n");
+
+    let output =
+        run_liteinst_strict_verify_with_stdin(Path::new("/usr/bin/tee"), &[], b"liteinst-tee-ok\n");
+    assert_eq!(output.stdout, b"liteinst-tee-ok\n");
+
+    let output =
+        run_liteinst_strict_verify_with_stdin(Path::new("/usr/bin/tsort"), &[], b"a b\nb c\n");
+    assert_eq!(output.stdout, b"a\nb\nc\n");
 }
 
 #[test]
