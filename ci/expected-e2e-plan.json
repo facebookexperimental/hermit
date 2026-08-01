@@ -24,6 +24,7 @@
     {"test":"c-programs/keyctl-enosys","category":"c-programs","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"c-programs/listmount-enosys","category":"c-programs","lane":"portable","mode":"verify","backend":"dbi"},
     {"test":"c-programs/listmount-enosys","category":"c-programs","lane":"portable","mode":"verify","backend":"ptrace"},
+    {"test":"c-programs/random-sources","category":"c-programs","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"data-handling/archive-roundtrip","category":"data-handling","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"data-handling/archive-roundtrip","category":"data-handling","lane":"portable","mode":"verify","backend":"sabre"},
     {"test":"data-handling/shell-pipeline","category":"data-handling","lane":"portable","mode":"verify","backend":"ptrace"},

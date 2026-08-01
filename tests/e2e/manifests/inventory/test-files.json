@@ -742,8 +742,8 @@
     {
       "path": "tests/c/random_sources.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/random_sources.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml",
+      "why": "tests/c/random_sources.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml: Direct C guest asserting that getrandom(2), /dev/urandom, and /dev/random entropy plus GRND flag/fault semantics reproduce bitwise under strict ptrace verification; its standalone build and stdout+status contract are calibrated, so the verify/ptrace cell gates CI (ci=true)"
     },
     {
       "path": "tests/c/rcx_canonicalization.c",
