@@ -2,16 +2,40 @@
 
 This directory tracks executable parity contracts across Hermit's ptrace,
 DynamoRIO (DBI), and KVM backends. `matrix.tsv` is the ratchet: changing a pair
-from `gap` to `pass` makes `run_matrix.py` enforce it on every subsequent run.
-A `gap` must have a concrete implementation reason.
+from `gap` to `pass` (L1) or from `gap` to `detlog`/`guest` (L2) makes
+`run_matrix.py` enforce it on every subsequent run. A `gap` must have a concrete
+implementation reason.
 
 ## Current ratchet
+
+The L1 ratchet (`--strict`, run three times, byte-identical stdout) and the L2
+ratchet (`--strict --verify`, hermit's own double-run bitwise comparison) are
+tracked separately, because a contract can hold at L1 yet not at L2.
+
+L1 (`hermit run --strict`):
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
 | ptrace | 23/23 | 100% |
 | DBI | 22/23 | 96% |
 | KVM | 22/23 | 96% |
+
+L2 (`hermit run --strict --verify`):
+
+| Backend | Verified pairs | L2 kind | Parity vs ptrace |
+| --- | ---: | --- | ---: |
+| ptrace | 23/23 | DETLOG-bitwise | 100% |
+| DBI | 21/23 | DETLOG-bitwise | 91% |
+| KVM | 21/23 | guest-visible only | 91% |
+
+The two L2 assurance *kinds* are not interchangeable. **DETLOG-bitwise** L2
+(ptrace, DBI) means hermit re-ran the guest and found the two normalized DETLOG
+streams — the full syscall and scheduling trace — bitwise-identical.
+**guest-visible** L2 (KVM) is strictly weaker: reverie-kvm runs concurrently and
+declares outright that its internal syscall trace order is not deterministic, so
+`--verify` compares only guest stdout and exit status across the two runs. KVM's
+column is therefore capped at `guest`, never `detlog`. See the L2 subsection
+below for the two contracts that hold at L1 but not L2.
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
 measures the backend's own Reverie suite. The 22/23 number above is deliberately
@@ -71,31 +95,35 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 
 ## Matrix
 
+Each cell shows the L1 status and, after `/`, the L2 status: `detlog` for
+DETLOG-bitwise L2, `guest` for KVM guest-visible L2, and `gap` where the level
+is not reached.
+
 | Test | ptrace | DBI | KVM |
 | --- | --- | --- | --- |
-| `hello_stdout` | pass | pass | pass |
-| `argument_forwarding` | pass | pass | pass |
-| `exit_zero` | pass | pass | pass |
-| `exit_status` | pass | pass | pass |
-| `file_read` | pass | pass | pass |
-| `file_mutation` | pass | pass | pass |
-| `file_metadata` | pass | pass | pass |
-| `io_uring_fallback` | pass | pass | pass |
-| `listmount_unavailable` | pass | pass | pass |
-| `process_vm_readv_refusal` | pass | pass | pass |
-| `process_vm_writev_refusal` | pass | pass | pass |
-| `executable_mmap` | pass | pass | pass |
-| `memory_advice` | pass | pass | pass |
-| `heap_growth` | pass | pass | pass |
-| `anonymous_mmap_layout` | pass | pass | pass |
-| `shared_anonymous_mmap` | pass | pass | pass |
-| `pthread_lifecycle` | pass | gap | pass |
-| `process_wait_accounting` | pass | pass | pass |
-| `process_wait_lifecycle` | pass | pass | gap |
-| `cpuid_policy` | pass | pass | pass |
-| `virtual_clock` | pass | pass | pass |
-| `random_sources` | pass | pass | pass |
-| `virtual_pid` | pass | pass | pass |
+| `hello_stdout` | pass / detlog | pass / detlog | pass / guest |
+| `argument_forwarding` | pass / detlog | pass / detlog | pass / guest |
+| `exit_zero` | pass / detlog | pass / detlog | pass / guest |
+| `exit_status` | pass / detlog | pass / **gap** | pass / guest |
+| `file_read` | pass / detlog | pass / detlog | pass / guest |
+| `file_mutation` | pass / detlog | pass / detlog | pass / guest |
+| `file_metadata` | pass / detlog | pass / detlog | pass / guest |
+| `io_uring_fallback` | pass / detlog | pass / detlog | pass / guest |
+| `listmount_unavailable` | pass / detlog | pass / detlog | pass / guest |
+| `process_vm_readv_refusal` | pass / detlog | pass / detlog | pass / guest |
+| `process_vm_writev_refusal` | pass / detlog | pass / detlog | pass / guest |
+| `executable_mmap` | pass / detlog | pass / detlog | pass / guest |
+| `memory_advice` | pass / detlog | pass / detlog | pass / guest |
+| `heap_growth` | pass / detlog | pass / detlog | pass / guest |
+| `anonymous_mmap_layout` | pass / detlog | pass / detlog | pass / guest |
+| `shared_anonymous_mmap` | pass / detlog | pass / detlog | pass / guest |
+| `pthread_lifecycle` | pass / detlog | gap / gap | pass / guest |
+| `process_wait_accounting` | pass / detlog | pass / detlog | pass / **gap** |
+| `process_wait_lifecycle` | pass / detlog | pass / detlog | gap / gap |
+| `cpuid_policy` | pass / detlog | pass / detlog | pass / guest |
+| `virtual_clock` | pass / detlog | pass / detlog | pass / guest |
+| `random_sources` | pass / detlog | pass / detlog | pass / guest |
+| `virtual_pid` | pass / detlog | pass / detlog | pass / guest |
 
 The authoritative reasons live in `matrix.tsv`, next to the status they
 justify. The runner executes each passing pair three times and checks exit
@@ -108,8 +136,34 @@ the fixture's root-only mode to keep that comparison independent of the
 pthread lifecycle row.
 Without `--strict`, repeat-run results are compatibility evidence rather than
 an assurance level. With `--strict`, they are L1 strict-mode evidence backed by
-three byte-identical runs. The runner disables PMU timeslicing for portability
-and does not pass `--verify`.
+three byte-identical runs. The runner disables PMU timeslicing for portability.
+
+### L2 verification (`--verify`)
+
+Passing `--verify` lifts every probe to L2: the runner invokes
+`hermit run --strict --verify --verify-allow both`, so hermit itself runs each
+guest twice and asserts a bitwise-identical result. Because `--verify` diverts
+the guest's own stdout into per-run temporary logs, the L2 path cannot re-check
+stdout the way the L1 path does; instead it enforces that the guest exit status
+matches and that hermit's double-run comparison succeeded at *at least* the
+assurance kind recorded in `matrix.tsv`. The runner keys on two distinct stderr
+witnesses: `Determinism verified` (DETLOG-bitwise, ptrace and DBI) and
+`guest output and exit status matched` (KVM guest-visible). A DETLOG result
+satisfies a `guest` contract because it is strictly stronger; the reverse fails.
+
+Two contracts hold at L1 but not L2, and both are recorded as L2 `gap`s with
+reasons in `matrix.tsv`:
+
+- **`exit_status` on DBI.** With `--verify-allow both`, hermit runs the DBI
+  guest only once when the first run exits non-zero — it never performs the
+  second run — so the double-run DETLOG comparison never executes for this
+  non-zero-exit contract. ptrace performs both runs and reaches `detlog` here.
+- **`process_wait_accounting` on KVM.** The `--verify` concurrent double-run
+  races child reaping: `waitid` on the already-reaped child returns `ECHILD`
+  (`No child processes`), so the second run exits non-zero and verification
+  fails. reverie-kvm synchronizes `wait4` child state but not `waitid`. This is
+  reproducible across repeated runs; L1's stdout-only, three-run check does not
+  surface it, which is precisely the value of the L2 lift.
 
 Hermit's KVM root process enters the shared tool through
 `run_static_elf_with_tool::<Detcore>`, but child process and thread syscalls
@@ -183,7 +237,19 @@ Run KVM on a host with read-write `/dev/kvm` access:
 python3 tests/backend-parity/run_matrix.py --backend kvm --require-backend
 ```
 
-Use `--probe-gaps` to execute documented gaps and report `XPASS` candidates.
+Enforce the L2 ratchet on any backend by adding `--verify` (it implies
+`--strict`); hermit's own double-run then asserts the recorded L2 kind per
+contract:
+
+```bash
+python3 tests/backend-parity/run_matrix.py --backend ptrace --verify --require-backend
+python3 tests/backend-parity/run_matrix.py --hermit target/release/hermit \
+    --backend dbi --verify --require-backend
+python3 tests/backend-parity/run_matrix.py --backend kvm --verify --require-backend
+```
+
+Use `--probe-gaps` to execute documented gaps and report `XPASS` candidates
+(in `--verify` mode the probe reports which L2 kind a gap actually reached).
 Use `--output /tmp/backend-parity.tsv` to retain machine-readable observations.
 `BLOCKED` means a required host capability or runtime artifact was absent; it
 does not change the checked-in pass/gap claim.

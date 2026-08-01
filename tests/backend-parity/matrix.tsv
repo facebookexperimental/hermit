@@ -1,24 +1,24 @@
-test_name	ptrace	dbi	kvm	dbi_reason	kvm_reason
-hello_stdout	pass	pass	pass	-	-
-argument_forwarding	pass	pass	pass	-	-
-exit_zero	pass	pass	pass	-	-
-exit_status	pass	pass	pass	-	-
-file_read	pass	pass	pass	-	-
-file_mutation	pass	pass	pass	-	-
-file_metadata	pass	pass	pass	-	-
-io_uring_fallback	pass	pass	pass	-	-
-listmount_unavailable	pass	pass	pass	-	-
-process_vm_readv_refusal	pass	pass	pass	-	-
-process_vm_writev_refusal	pass	pass	pass	-	-
-executable_mmap	pass	pass	pass	-	-
-memory_advice	pass	pass	pass	-	-
-heap_growth	pass	pass	pass	-	-
-anonymous_mmap_layout	pass	pass	pass	-	-
-shared_anonymous_mmap	pass	pass	pass	-	-
-pthread_lifecycle	pass	gap	pass	Portable release DynamoRIO can stall or exit during native pthread startup before Detcore readiness	-
-process_wait_accounting	pass	pass	pass	-	-
-process_wait_lifecycle	pass	pass	gap	-	KVM records serialized child exits and implements wait4/waitid, but does not synthesize guest SIGCHLD handler delivery
-cpuid_policy	pass	pass	pass	-	-
-virtual_clock	pass	pass	pass	-	-
-random_sources	pass	pass	pass	-	-
-virtual_pid	pass	pass	pass	-	-
+test_name	ptrace	dbi	kvm	dbi_reason	kvm_reason	ptrace_l2	dbi_l2	kvm_l2	dbi_l2_reason	kvm_l2_reason
+hello_stdout	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+argument_forwarding	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+exit_zero	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+exit_status	pass	pass	pass	-	-	detlog	gap	guest	hermit --verify runs the DBI guest only once when the first run exits non-zero (--verify-allow both), so the double-run DETLOG comparison never executes for this non-zero-exit contract	-
+file_read	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+file_mutation	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+file_metadata	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+io_uring_fallback	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+listmount_unavailable	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+process_vm_readv_refusal	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+process_vm_writev_refusal	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+executable_mmap	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+memory_advice	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+heap_growth	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+anonymous_mmap_layout	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+shared_anonymous_mmap	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+pthread_lifecycle	pass	gap	pass	Portable release DynamoRIO can stall or exit during native pthread startup before Detcore readiness	-	detlog	gap	guest	inherited from the L1 DBI pthread_lifecycle gap: DynamoRIO startup stall prevents any L2 verify run	-
+process_wait_accounting	pass	pass	pass	-	-	detlog	detlog	gap	-	under --verify the concurrent double-run races child reaping: waitid on the already-reaped child returns ECHILD, so the second run exits non-zero; reverie-kvm synchronizes wait4 child state but not waitid
+process_wait_lifecycle	pass	pass	gap	-	KVM records serialized child exits and implements wait4/waitid, but does not synthesize guest SIGCHLD handler delivery	detlog	detlog	gap	-	inherited from the L1 KVM process_wait_lifecycle gap: no guest SIGCHLD frame synthesis, so there is no L2 run to verify
+cpuid_policy	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+virtual_clock	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+random_sources	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+virtual_pid	pass	pass	pass	-	-	detlog	detlog	guest	-	-

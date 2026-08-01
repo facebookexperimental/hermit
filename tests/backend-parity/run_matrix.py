@@ -21,6 +21,20 @@ MATRIX_PATH = SCRIPT_DIR / "matrix.tsv"
 BACKENDS = ("ptrace", "dbi", "kvm")
 RUNS = 3
 
+# L2 (--verify) assurance kinds, ordered weakest to strongest. "gap" means the
+# contract cannot currently be verified at L2 on that backend. "guest" is
+# guest-visible L2: the two --verify runs produced identical stdout+exit but the
+# internal trace is not compared (KVM concurrent mode). "detlog" is full L2: the
+# two runs produced a bitwise-identical DETLOG after normalization (ptrace, DBI).
+L2_RANK = {"gap": 0, "guest": 1, "detlog": 2}
+# Per-backend L2 values the matrix may record. KVM's concurrent verify path can
+# never emit a DETLOG witness, so it is capped at guest-visible L2.
+L2_ALLOWED = {
+    "ptrace": {"detlog"},
+    "dbi": {"detlog", "gap"},
+    "kvm": {"guest", "gap"},
+}
+
 
 class MatrixError(Exception):
     """An invalid matrix or failed regression contract."""
@@ -37,6 +51,11 @@ def read_matrix() -> list[dict[str, str]]:
         "kvm",
         "dbi_reason",
         "kvm_reason",
+        "ptrace_l2",
+        "dbi_l2",
+        "kvm_l2",
+        "dbi_l2_reason",
+        "kvm_l2_reason",
     }
     if not rows or set(rows[0]) != required:
         raise MatrixError(f"{MATRIX_PATH} must contain columns {sorted(required)}")
@@ -49,9 +68,23 @@ def read_matrix() -> list[dict[str, str]]:
         names.add(name)
         if row["ptrace"] != "pass":
             raise MatrixError(f"{name}: ptrace is the baseline and must be pass")
+        if row["ptrace_l2"] != "detlog":
+            raise MatrixError(f"{name}: ptrace_l2 baseline must be detlog")
         for backend in BACKENDS:
             if row[backend] not in {"pass", "gap"}:
                 raise MatrixError(f"{name}/{backend}: expected pass or gap")
+            l2 = row[f"{backend}_l2"]
+            if l2 not in L2_ALLOWED[backend]:
+                raise MatrixError(
+                    f"{name}/{backend}_l2: expected one of "
+                    f"{sorted(L2_ALLOWED[backend])}, got {l2!r}"
+                )
+            # An L1 gap cannot be verified at L2, and an L2 assurance cannot
+            # exceed the L1 result it presupposes.
+            if row[backend] == "gap" and l2 != "gap":
+                raise MatrixError(
+                    f"{name}/{backend}: an L1 gap must record an L2 gap too"
+                )
             if backend != "ptrace":
                 reason = row[f"{backend}_reason"]
                 if row[backend] == "gap" and reason in {"", "-"}:
@@ -59,6 +92,13 @@ def read_matrix() -> list[dict[str, str]]:
                 if row[backend] == "pass" and reason != "-":
                     raise MatrixError(
                         f"{name}/{backend}: passing pair reason must be -"
+                    )
+                l2_reason = row[f"{backend}_l2_reason"]
+                if l2 == "gap" and l2_reason in {"", "-"}:
+                    raise MatrixError(f"{name}/{backend}_l2: gap needs a reason")
+                if l2 != "gap" and l2_reason != "-":
+                    raise MatrixError(
+                        f"{name}/{backend}_l2: non-gap L2 reason must be -"
                     )
     return rows
 
@@ -278,13 +318,24 @@ def backend_block(backend: str, hermit: Path, strict: bool) -> str | None:
 
 
 def hermit_command(
-    hermit: Path, backend: str, guest: list[str], name: str, strict: bool
+    hermit: Path,
+    backend: str,
+    guest: list[str],
+    name: str,
+    strict: bool,
+    verify: bool = False,
 ) -> list[str]:
     command = [str(hermit), "run"]
     if backend != "ptrace":
         command.extend(["--backend", backend])
     if strict:
         command.append("--strict")
+    if verify:
+        # L2: hermit runs the guest twice internally and asserts a
+        # bitwise-identical DETLOG. `--verify-allow both` keeps the guest's own
+        # exit status (including deliberate non-zero cases such as exit_status)
+        # flowing through so the runner can still enforce exit-status parity.
+        command.extend(["--verify", "--verify-allow", "both"])
     command.extend(
         [
             "--base-env=minimal",
@@ -380,14 +431,109 @@ def root_random_output(stdout: bytes) -> bytes:
     )
 
 
+# Two distinct `--verify` success witnesses, and they are NOT the same assurance:
+#
+#  * DETLOG-bitwise (ptrace, DBI): hermit re-runs the guest and finds the two
+#    DETLOG streams bitwise-identical after normalization. This is full L2 -- the
+#    internal syscall/scheduling trace is itself reproducible.
+#  * guest-visible (KVM): reverie-kvm runs concurrently and states outright that
+#    "internal syscall trace order is not deterministic", so `--verify` compares
+#    only guest stdout and exit status across the two runs. That is a strictly
+#    weaker guest-visible L2; do not report it as DETLOG determinism.
+#
+# Recording which witness fired keeps the matrix honest about what each backend
+# actually proves under --verify (no false parity).
+VERIFY_WITNESS_DETLOG = b"Determinism verified"
+VERIFY_WITNESS_GUEST_VISIBLE = b"guest output and exit status matched"
+
+
+def run_case_verify(
+    hermit: Path,
+    backend: str,
+    name: str,
+    guest: list[str],
+    expected_status: int,
+    expected_l2: str,
+) -> tuple[str, str, float]:
+    """L2 probe: one `hermit run --strict --verify` invocation.
+
+    `--verify` runs the guest twice inside hermit and diverts the guest's own
+    stdout into per-run temp logs, so this path cannot compare guest stdout the
+    way the L1 path does. The L2 contract it enforces instead is: the guest exit
+    status matches, and hermit's internal double-run comparison reports success
+    at *at least* the assurance kind the matrix records (`expected_l2`). A run
+    that only reaches guest-visible L2 fails a `detlog` contract; DETLOG L2
+    satisfies a `guest` contract because it is strictly stronger.
+    """
+    started = time.monotonic()
+    command = hermit_command(hermit, backend, guest, name, strict=True, verify=True)
+    result = run_with_timeout(command)
+    if result is None:
+        return "FAIL", "verify run timed out", time.monotonic() - started
+    diagnostic = result.stderr.decode(errors="replace").strip()
+    if result.returncode != expected_status:
+        if (
+            backend == "ptrace"
+            and name == "cpuid_policy"
+            and (
+                "continuing without CPUID interception" in diagnostic
+                or "CPUID faulting is unavailable" in diagnostic
+            )
+        ):
+            return (
+                "BLOCKED",
+                "host kernel/CPU lacks CPUID faulting",
+                time.monotonic() - started,
+            )
+        return (
+            "FAIL",
+            f"verify exited {result.returncode}, expected {expected_status}: "
+            f"{diagnostic[-300:]}",
+            time.monotonic() - started,
+        )
+    if VERIFY_WITNESS_DETLOG in result.stderr:
+        observed = "detlog"
+    elif VERIFY_WITNESS_GUEST_VISIBLE in result.stderr:
+        observed = "guest"
+    else:
+        return (
+            "FAIL",
+            f"verify produced no determinism witness: {diagnostic[-300:]}",
+            time.monotonic() - started,
+        )
+    # A gap being probed (--probe-gaps) has no positive contract to meet; report
+    # what it actually reached so it can be evaluated for promotion.
+    if expected_l2 != "gap" and L2_RANK[observed] < L2_RANK[expected_l2]:
+        return (
+            "FAIL",
+            f"reached L2 {observed} but contract requires {expected_l2}",
+            time.monotonic() - started,
+        )
+    label = {
+        "detlog": "L2 DETLOG-bitwise: --verify double-run matched",
+        "guest": "L2 guest-visible: output+exit matched (internal trace nondeterministic)",
+    }[observed]
+    return "PASS", label, time.monotonic() - started
+
+
 def run_case(
-    hermit: Path, backend: str, name: str, fixtures: Fixtures, strict: bool
+    hermit: Path,
+    backend: str,
+    name: str,
+    fixtures: Fixtures,
+    strict: bool,
+    verify: bool = False,
+    expected_l2: str = "gap",
 ) -> tuple[str, str, float]:
     guest, expected_status, expected_stdout = case_command(name, fixtures)
     if backend == "dbi" and name == "random_sources":
         guest = [*guest, "--root-only"]
     if backend == "kvm" and name == "memory_advice":
         guest = [*guest, "--kvm"]
+    if verify:
+        return run_case_verify(
+            hermit, backend, name, guest, expected_status, expected_l2
+        )
     baseline: bytes | None = None
     started = time.monotonic()
     ptrace_random: bytes | None = None
@@ -526,6 +672,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="run every guest with hermit run --strict",
     )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help=(
+            "lift every probe to L2: run with hermit run --strict --verify so "
+            "hermit's internal double-run asserts a bitwise-identical DETLOG "
+            "(implies --strict; guest stdout is diverted, so stdout parity is "
+            "not checked in this mode)"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -533,10 +689,29 @@ def main() -> int:
     args = parse_args()
     rows = read_matrix()
     backends = args.backends or list(BACKENDS)
+    # --verify is the L2 lift and presupposes strict mode (L2 = --strict
+    # --verify); enable strict implicitly so callers can ask for L2 with one flag.
+    strict = args.strict or args.verify
+    if args.verify:
+        print("MODE: L2 (--strict --verify), byte-identical DETLOG per probe")
+    elif strict:
+        print("MODE: L1 (--strict), byte-identical stdout across 3 runs")
+    else:
+        print("MODE: compatibility (repeat-run), byte-identical stdout across 3 runs")
     baseline = sum(row["ptrace"] == "pass" for row in rows)
     for backend in BACKENDS:
         passing = sum(row[backend] == "pass" for row in rows)
         print(f"RATCHET {backend}: {passing}/{baseline} ({passing / baseline:.1%})")
+    # L2 ratchet: how many contracts each backend verifies under --verify, split
+    # by assurance kind so DETLOG-bitwise L2 is never conflated with guest-visible.
+    for backend in BACKENDS:
+        detlog = sum(row[f"{backend}_l2"] == "detlog" for row in rows)
+        guest = sum(row[f"{backend}_l2"] == "guest" for row in rows)
+        verified = detlog + guest
+        print(
+            f"RATCHET-L2 {backend}: {verified}/{baseline} "
+            f"({verified / baseline:.1%}) [detlog={detlog} guest-visible={guest}]"
+        )
     if args.check:
         return 0
 
@@ -549,7 +724,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="hermit-backend-parity-") as tempdir:
         fixtures = Fixtures(Path(tempdir))
         for backend in backends:
-            block = backend_block(backend, hermit, args.strict)
+            block = backend_block(backend, hermit, strict)
             if block:
                 print(f"BLOCKED {backend}: {block}")
                 if args.require_backend:
@@ -558,9 +733,17 @@ def main() -> int:
 
             for row in rows:
                 name = row["test_name"]
-                expectation = row[backend]
-                if expectation == "gap" and not args.probe_gaps:
-                    reason = row[f"{backend}_reason"]
+                # In L2 mode the ratcheted contract is the *_l2 column (with its
+                # own reason); otherwise it is the L1 pass/gap column.
+                if args.verify:
+                    expectation = row[f"{backend}_l2"]
+                    reason_key = f"{backend}_l2_reason"
+                else:
+                    expectation = row[backend]
+                    reason_key = f"{backend}_reason"
+                is_gap = expectation == "gap"
+                if is_gap and not args.probe_gaps:
+                    reason = row[reason_key]
                     print(f"GAP {backend}/{name}: {reason}")
                     results.append(
                         {
@@ -575,11 +758,11 @@ def main() -> int:
                     continue
 
                 status, detail, duration = run_case(
-                    hermit, backend, name, fixtures, args.strict
+                    hermit, backend, name, fixtures, strict, args.verify, expectation
                 )
-                if expectation == "gap" and status == "PASS":
+                if is_gap and status == "PASS":
                     status = "XPASS"
-                    detail = "candidate for promotion from gap to pass"
+                    detail = f"candidate for promotion from gap: {detail}"
                 print(f"{status} {backend}/{name}: {detail}")
                 results.append(
                     {
@@ -591,7 +774,7 @@ def main() -> int:
                         "detail": detail,
                     }
                 )
-                if expectation == "pass" and status == "FAIL":
+                if not is_gap and status == "FAIL":
                     failures += 1
 
     if args.output:
