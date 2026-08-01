@@ -1310,6 +1310,12 @@
       "why": "tests/e2e/data-handling/archive-roundtrip.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
+      "path": "tests/e2e/data-handling/shell-pipeline.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/data-handling/shell-pipeline.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
       "path": "tests/e2e/determinism-stress/README.md",
       "disposition": "support-data",
       "runner": "maintainers of tests/e2e/determinism-stress",

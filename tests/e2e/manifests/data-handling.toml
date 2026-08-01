@@ -61,3 +61,58 @@ dbi = "No edge-case Hermit arguments are required"
 kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
+
+[[test]]
+id = "data-handling/shell-pipeline"
+description = "Deterministic multi-stage shell pipeline (sort|uniq|awk|wc) exercising fork/exec/pipe"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace"]
+timeout_seconds = 60
+occasional = false
+program = "tests/e2e/data-handling/shell-pipeline.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "The LC_ALL=C pipeline output is deterministic by construction"
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "DBI coverage is owned by its backend parity partition"
+kvm = "KVM requires the privileged runner"
+sabre = "SaBRe pipeline parity is not yet validated for this fixture; tracked as a follow-up"
+liteinst = "LiteInst omits the fork/clone/pipe process model this pipeline requires"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "The verify mode owns this fixture's blocking determinism contract"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The pipeline stages are short-lived and single-threaded per process"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
