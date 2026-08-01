@@ -412,6 +412,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "system-utils/shuf-permutation"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/sort-random"
     }
   ],
   "schema": 1
