@@ -165,7 +165,7 @@ Separately, the same full scorecard found the already-enabled
 `stdout_parity=false`. That regression is outside the historical 18-cell set
 and requires independent requalification; it is not counted as progress here.
 
-The following 30 candidates fail SaBRe strict verification or its timeout and
+The following 28 candidates fail SaBRe strict verification or its timeout and
 remain disabled:
 
 ```text
@@ -174,7 +174,6 @@ bin-c/robust-futex-test
 c-programs/arch-prctl-determinism
 c-programs/clone
 c-programs/dbi-unsupported-syscall
-c-programs/epoll-determinism
 c-programs/fp-reduction-nondeterminism
 c-programs/hello-nostdlib
 c-programs/ipc-determinism
@@ -184,7 +183,6 @@ c-programs/pread64-nostdlib
 c-programs/pselect6-simulation
 c-programs/racewrite-nostdlib
 c-programs/record-replay-file-state
-c-programs/record-replay-lseek-seek-cur
 c-programs/resource-determinism
 c-programs/signal-determinism
 c-programs/sigpipe-siginfo

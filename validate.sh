@@ -496,7 +496,7 @@ readonly RR_COMPAT_EXPECTED=139
 # Require the established SaBRe compatibility floor across the full measured corpus.
 # Explicit must-pass rows below ratchet fixed programs without allowing host-sensitive
 # rows to make the aggregate floor alternate between green and red.
-readonly SABRE_COMPAT_EXPECTED=205
+readonly SABRE_COMPAT_EXPECTED=207
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(PR-1154): Review synchronization of the measured SaBRe corpus size.
 readonly SABRE_COMPAT_TOTAL=212
