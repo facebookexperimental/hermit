@@ -78,6 +78,19 @@ CORPUS: dict[str, tuple[int, bytes | None]] = {
     "uname": (0, b""),
     "sigmask": (0, b""),
     "compute": (0, None),
+    # Round-2 fd/output-hygiene ratchet batch (non-time, non-gated). These probe
+    # descriptor allocation, reuse, and process-metadata output; e9patch
+    # preprocessing must not perturb any of it (the e9loader closes its self-fd
+    # and leaves /proc/self/exe pointing at the original guest binary). The two
+    # environment-dependent guests assert golden==e9patch parity only (None).
+    "fd_open_number": (0, b"fd=3\n"),
+    "fd_lowest_free": (0, b"a=3\nb=4\nc=3\n"),
+    "pipe_fds": (0, b"r=0\nrd=3\nwr=4\n"),
+    "dup3_high": (0, b"dup3=10\nviaten\n"),
+    "writev_multi": (0, b"ABC\nwrote=4\n"),
+    "fcntl_cloexec": (0, b"stdout_fd_flags=0\nopened_fd=3\nopened_flags=0\n"),
+    "proc_self_fd_count": (0, None),
+    "readlink_exe": (0, None),
 }
 
 FREESTANDING_FLAGS = (
