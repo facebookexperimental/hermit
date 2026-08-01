@@ -1490,6 +1490,12 @@
       "why": "tests/e2e/language-runtimes/bash-loop-pipe-time.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It exercises Bash file I/O, loops, pipelines, hashing, and virtual time under strict verification"
     },
     {
+      "path": "tests/e2e/language-runtimes/cpp-stl-determinism.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
+      "why": "tests/e2e/language-runtimes/cpp-stl-determinism.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It compiles a small C++17 STL program in --prepare and execs it under Hermit, exercising std::random_device entropy through std::set/std::map/std::unordered_map/std::sort/std::string plus a file-I/O roundtrip and std::chrono timestamp under strict verification"
+    },
+    {
       "path": "tests/e2e/language-runtimes/gawk-random.sh",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
