@@ -5,6 +5,10 @@ description: "Debug Hermit hangs, deadlocks, futex stalls, timed-wait failures, 
 
 # Debugging Hermit Deadlocks
 
+> **Don't break the demos.** If a fix touches a demo, verify it still runs GREEN
+> before landing — demo-touching commits need an adversarial green-demo review,
+> not just code-review.
+
 Start with Hermit's logs, not `scheduler.rs`. A deadlock report is useful only
 after you can name the last productive scheduler turn, every blocked thread,
 and the event that should make one of them runnable.
