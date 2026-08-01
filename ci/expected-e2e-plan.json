@@ -278,6 +278,13 @@
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "verify",
+      "test": "language-runtimes/perl-random"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
       "test": "language-runtimes/python-hash-determinism"
     },
     {
