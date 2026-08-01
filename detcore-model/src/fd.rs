@@ -83,19 +83,33 @@ pub struct OpenFileId {
     sequence: u64,
 }
 
+const SOCKET_SEQUENCE_DOMAIN: u64 = 1 << 63;
+
 impl OpenFileId {
     /// Create an identity from the task that observed the open and its local sequence.
     pub const fn new(creator: DetTid, sequence: u64) -> Self {
+        assert!(sequence < SOCKET_SEQUENCE_DOMAIN);
         Self { creator, sequence }
     }
 
+    /// Create a socket identity from a backend-independent socket-open sequence.
+    pub const fn new_socket(creator: DetTid, sequence: u64) -> Self {
+        assert!(sequence < SOCKET_SEQUENCE_DOMAIN);
+        Self {
+            creator,
+            sequence: SOCKET_SEQUENCE_DOMAIN | sequence,
+        }
+    }
+
     // TODO-HUMAN-REVIEW(PR-886): Review stable socket-cookie identity encoding.
-    /// Encode the ordinary per-task open sequence as a deterministic socket cookie.
+    /// Encode the per-task socket-open sequence as a deterministic socket cookie.
     ///
     /// Linux promises that live socket cookies are unique and that descriptor aliases
-    /// for one open file description share a cookie. Detcore's virtual task IDs and
-    /// open-file sequences provide those same properties for realistic descriptor
-    /// counts while avoiding the kernel's host-global cookie allocator.
+    /// for one open file description share a cookie. Detcore's virtual task IDs and a
+    /// socket-specific sequence provide those same properties for realistic descriptor
+    /// counts while avoiding the kernel's host-global cookie allocator. The sequence is
+    /// independent of regular-file opens because backend loaders do not expose the same
+    /// dynamic-linker file operations to Detcore.
     pub fn deterministic_socket_cookie(self) -> u64 {
         let creator = self.creator.as_raw() as u32 as u64;
         (creator << 32) | (self.sequence & u32::MAX as u64)
@@ -108,10 +122,10 @@ mod tests {
 
     #[test]
     fn deterministic_socket_cookies_track_open_file_identity() {
-        let first = OpenFileId::new(DetTid::from_raw(3), 7);
+        let first = OpenFileId::new_socket(DetTid::from_raw(3), 7);
         let alias = first;
-        let next = OpenFileId::new(DetTid::from_raw(3), 8);
-        let other_task = OpenFileId::new(DetTid::from_raw(4), 7);
+        let next = OpenFileId::new_socket(DetTid::from_raw(3), 8);
+        let other_task = OpenFileId::new_socket(DetTid::from_raw(4), 7);
 
         assert_ne!(first.deterministic_socket_cookie(), 0);
         assert_eq!(
@@ -126,5 +140,7 @@ mod tests {
             first.deterministic_socket_cookie(),
             other_task.deterministic_socket_cookie()
         );
+        assert_ne!(first, OpenFileId::new(DetTid::from_raw(3), 7));
+        assert_eq!(first.deterministic_socket_cookie(), (3_u64 << 32) | 7);
     }
 }

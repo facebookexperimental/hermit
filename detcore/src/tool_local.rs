@@ -80,6 +80,9 @@ pub struct FileMetadata {
     pub(crate) files_id: FilesId,
     /// Sequence used to allocate open file descriptions observed through this table.
     next_open_file_sequence: u64,
+    /// Socket-only sequence used for backend-independent socket cookies.
+    #[serde(default)]
+    next_socket_open_file_sequence: u64,
     /// Track what file handles actually point to (e.g. after dup2).
     /// This includes both the identifying resource (usually inode) and the deterministic file handle.
     pub(crate) file_handles: HashMap<RawFd, DetFd>,
@@ -310,14 +313,21 @@ impl FileMetadata {
         FileMetadata {
             files_id: FilesId::initial(owner),
             next_open_file_sequence: 0,
+            next_socket_open_file_sequence: 0,
             file_handles: HashMap::new(),
         }
     }
 
-    fn allocate_open_file_id(&mut self, creator: DetTid) -> OpenFileId {
-        let id = OpenFileId::new(creator, self.next_open_file_sequence);
-        self.next_open_file_sequence += 1;
-        id
+    fn allocate_open_file_id(&mut self, creator: DetTid, ty: FdType) -> OpenFileId {
+        if ty == FdType::Socket {
+            let id = OpenFileId::new_socket(creator, self.next_socket_open_file_sequence);
+            self.next_socket_open_file_sequence += 1;
+            id
+        } else {
+            let id = OpenFileId::new(creator, self.next_open_file_sequence);
+            self.next_open_file_sequence += 1;
+            id
+        }
     }
 
     fn count_open_files_at_paths(&self, paths: &[&Path]) -> usize {
@@ -340,6 +350,7 @@ impl FileMetadata {
         Self {
             files_id: FilesId::forked(child),
             next_open_file_sequence: self.next_open_file_sequence,
+            next_socket_open_file_sequence: self.next_socket_open_file_sequence,
             file_handles: self.file_handles.clone(),
         }
     }
@@ -348,6 +359,7 @@ impl FileMetadata {
         Self {
             files_id: self.files_id.for_exec(task),
             next_open_file_sequence: self.next_open_file_sequence,
+            next_socket_open_file_sequence: self.next_socket_open_file_sequence,
             file_handles: self
                 .file_handles
                 .iter()
@@ -431,7 +443,7 @@ impl FileMetadata {
             0,
             OFlag::empty(),
             FdType::Regular,
-            self.allocate_open_file_id(owner),
+            self.allocate_open_file_id(owner, FdType::Regular),
         )
         .with_stat(stat)
         .with_resource(ResourceID::Device(Device::ContainerStdin));
@@ -439,7 +451,7 @@ impl FileMetadata {
             1,
             OFlag::empty(),
             FdType::Regular,
-            self.allocate_open_file_id(owner),
+            self.allocate_open_file_id(owner, FdType::Regular),
         )
         .with_stat(stat)
         .with_resource(ResourceID::Device(Device::ContainerStdout));
@@ -447,7 +459,7 @@ impl FileMetadata {
             2,
             OFlag::empty(),
             FdType::Regular,
-            self.allocate_open_file_id(owner),
+            self.allocate_open_file_id(owner, FdType::Regular),
         )
         .with_stat(stat)
         .with_resource(ResourceID::Device(Device::ContainerStderr));
@@ -523,7 +535,7 @@ impl FileMetadata {
         ty: FdType,
         stat: Option<DetStat>,
     ) -> Result<(), Errno> {
-        let id = self.allocate_open_file_id(creator);
+        let id = self.allocate_open_file_id(creator, ty);
         let detfd = DetFd::new(fd, flags, ty, id).with_stat(stat);
         self.add_detfd(detfd);
         Ok(())
@@ -2133,6 +2145,20 @@ mod timeslice_tests {
     use super::*;
     use crate::DEFAULT_PRIORITY;
     use crate::preemptions::ThreadHistory;
+
+    #[test]
+    fn regular_file_opens_do_not_shift_socket_cookie_identity() {
+        let owner = DetTid::from_raw(3);
+        let mut files = FileMetadata::new(owner);
+        let first = files.allocate_open_file_id(owner, FdType::Socket);
+        for _ in 0..4 {
+            files.allocate_open_file_id(owner, FdType::Regular);
+        }
+        let second = files.allocate_open_file_id(owner, FdType::Socket);
+
+        assert_eq!(first.deterministic_socket_cookie(), 3_u64 << 32);
+        assert_eq!(second.deterministic_socket_cookie(), (3_u64 << 32) | 1);
+    }
 
     #[test]
     fn guest_clock_tracks_raw_logical_time_without_lag() {

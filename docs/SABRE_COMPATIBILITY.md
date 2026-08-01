@@ -109,13 +109,23 @@ matching ptrace, instead of assigning 3 to the worker and 4 to the guest. This
 qualifies `backend-parity-c/pid-probe` and `debugger-c/debuggee` at SaBRe L2
 with byte-identical ptrace output under the portable profile. It does not claim
 parity for child/thread identities, whose backend task topologies still differ.
-At this increment's source tree, the executable plan enables SaBRe for 133/199
-ptrace verify cells (66.8%, B3), up by two cells from 131/199 (65.8%) on the
-same plan.
+The socket-cookie increment gives sockets their own per-task open sequence.
+Linux specifies a nonzero identity that is unique among live sockets and shared
+by descriptor aliases, but does not specify its numeric value. Keeping the
+socket sequence separate from regular-file opens preserves those properties and
+prevents ptrace-only dynamic-linker file operations from shifting SaBRe-visible
+cookies. This qualifies `c-programs/socket-cookie-tcp`,
+`c-programs/socket-cookie-udp`, and `c-programs/socket-cookie-unix` at SaBRe L2
+with byte-identical ptrace output under the portable profile.
+
+At this increment's source tree, the executable plan enables SaBRe for 136/199
+ptrace verify cells (68.3%, B3): seven blocking-CI cells and 129 manual cells.
+That is up by three cells from the stacked root-process identity increment's
+133/199 (66.8%).
 
 ## Known gaps
 
-The following 16 cells are deterministic inside SaBRe but do not match ptrace
+The following 13 cells are deterministic inside SaBRe but do not match ptrace
 guest output, so they remain disabled:
 
 ```text
@@ -125,9 +135,6 @@ c-programs/proc-fdinfo
 c-programs/random-sources
 c-programs/setitimer-determinism
 c-programs/sigtimedwait-timeout-1s
-c-programs/socket-cookie-tcp
-c-programs/socket-cookie-udp
-c-programs/socket-cookie-unix
 c-programs/socket-timestamp-edge-cases
 c-programs/socket-timestamp-timespec
 c-programs/socket-timestamp-timeval
