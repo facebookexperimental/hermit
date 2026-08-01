@@ -1412,6 +1412,12 @@
       "why": "tests/e2e/language-runtimes/bash-loop-pipe-time.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It exercises Bash file I/O, loops, pipelines, hashing, and virtual time under strict verification"
     },
     {
+      "path": "tests/e2e/language-runtimes/gawk-random.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
+      "why": "tests/e2e/language-runtimes/gawk-random.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: GNU awk's pid-seeded rand() output varies natively and repeats under strict verification"
+    },
+    {
       "path": "tests/e2e/language-runtimes/javascript.js",
       "disposition": "guest-fixture",
       "runner": "tests/e2e/lib/language-runtimes/run.sh",
