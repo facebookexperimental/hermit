@@ -9,6 +9,62 @@ schema = 2
 bucket = "system-utils"
 
 [[test]]
+id = "system-utils/clock-determinism"
+description = "clock_gettime/gettimeofday output is identical across repeated Hermit runs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/c/clock_determinism.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.build]
+cflags = ["-O0", "-D_GNU_SOURCE"]
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "The date-nanoseconds entry owns the native clock nondeterminism control"
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace", "liteinst"]
+[test.modes.verify.backends_disabled]
+dbi = "Enable after the ptrace baseline for direct C guests is trusted"
+kvm = "Enable after the ptrace baseline for direct C guests is trusted"
+sabre = "SaBRe does not intercept RDTSCP; clock probes can leak raw host TSC"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Clock replay divergence is tracked separately from this determinism entry"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The clock matrix guest is single-threaded"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = true
+args = ["--base-env=minimal", "--no-virtualize-cpuid", "--max-timeslice=disabled"]
+assert = { runs = 5, repeat_identical = true }
+backends_enabled = ["ptrace", "liteinst"]
+[test.modes.custom.backends_disabled]
+dbi = "The custom clock matrix baseline is ptrace-only"
+kvm = "The custom clock matrix baseline is ptrace-only"
+sabre = "The custom clock matrix baseline is ptrace-only"
+[[test]]
 id = "system-utils/date-nanoseconds"
 description = "A valid wall-clock timestamp varies natively and repeats under Hermit"
 lane = "portable"
@@ -169,69 +225,13 @@ sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 
 [[test]]
-id = "system-utils/clock-determinism"
-description = "clock_gettime/gettimeofday output is identical across repeated Hermit runs"
-lane = "portable"
-requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
-timeout_seconds = 90
-occasional = false
-program = "tests/c/clock_determinism.c"
-observation = { status = true, stdout = true, stderr = false, artifacts = [] }
-
-[test.build]
-cflags = ["-O0", "-D_GNU_SOURCE"]
-
-[test.modes.naked]
-ci = false
-backends_enabled = []
-[test.modes.naked.backends_disabled]
-native = "The date-nanoseconds entry owns the native clock nondeterminism control"
-
-[test.modes.verify]
-ci = true
-backends_enabled = ["ptrace", "liteinst"]
-[test.modes.verify.backends_disabled]
-dbi = "Enable after the ptrace baseline for direct C guests is trusted"
-kvm = "Enable after the ptrace baseline for direct C guests is trusted"
-sabre = "SaBRe does not intercept RDTSCP; clock probes can leak raw host TSC"
-
-[test.modes.replay]
-ci = false
-backends_enabled = []
-[test.modes.replay.backends_disabled]
-ptrace = "Clock replay divergence is tracked separately from this determinism entry"
-dbi = "Record/replay is unsupported by DBI"
-kvm = "Record/replay is unsupported by KVM"
-sabre = "Record/replay is unsupported by SaBRe"
-liteinst = "Record/replay is unsupported by LiteInst"
-
-[test.modes.chaos]
-ci = false
-backends_enabled = []
-[test.modes.chaos.backends_disabled]
-ptrace = "The clock matrix guest is single-threaded"
-dbi = "Chaos scheduling is unsupported by DBI"
-kvm = "Chaos scheduling is unsupported by KVM"
-sabre = "Chaos scheduling is unsupported by SaBRe"
-liteinst = "Chaos scheduling is unsupported by LiteInst"
-
-[test.modes.custom]
-ci = true
-args = ["--base-env=minimal", "--no-virtualize-cpuid", "--max-timeslice=disabled"]
-assert = { runs = 5, repeat_identical = true }
-backends_enabled = ["ptrace", "liteinst"]
-[test.modes.custom.backends_disabled]
-dbi = "The custom clock matrix baseline is ptrace-only"
-kvm = "The custom clock matrix baseline is ptrace-only"
-sabre = "The custom clock matrix baseline is ptrace-only"
-[[test]]
-id = "system-utils/random-device"
-description = "Kernel random bytes vary natively and repeat under Hermit"
+id = "system-utils/mktemp-name"
+description = "mktemp -u random temp-name suffix varies natively and repeats under Hermit"
 lane = "portable"
 requires = ["linux","x86_64","userns","ptrace"]
 timeout_seconds = 60
 occasional = false
-program = "tests/e2e/system-utils/random-device.sh"
+program = "tests/e2e/system-utils/mktemp-name.sh"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.naked]
@@ -247,62 +247,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "DBI coverage is owned by its backend parity partition"
 kvm = "KVM requires the privileged runner"
-liteinst = "LiteInst coverage is owned by its backend compatibility partition"
-sabre = "SaBRe loses its private coordinator socket after guest exec; tracked by sabre_non_gated_parity"
-
-[test.modes.replay]
-ci = false
-backends_enabled = []
-[test.modes.replay.backends_disabled]
-ptrace = "The hexdump process tree currently diverges during replay"
-dbi = "Record/replay is unsupported by DBI"
-kvm = "Record/replay is unsupported by KVM"
-sabre = "Record/replay is unsupported by SaBRe"
-liteinst = "Record/replay is unsupported by LiteInst"
-
-[test.modes.chaos]
-ci = false
-backends_enabled = []
-[test.modes.chaos.backends_disabled]
-ptrace = "Random-byte generation has no scheduling oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
-kvm = "Chaos scheduling is unsupported by KVM"
-sabre = "Chaos scheduling is unsupported by SaBRe"
-liteinst = "Chaos scheduling is unsupported by LiteInst"
-
-[test.modes.custom]
-ci = false
-backends_enabled = []
-[test.modes.custom.backends_disabled]
-ptrace = "No edge-case Hermit arguments are required"
-dbi = "No edge-case Hermit arguments are required"
-kvm = "No edge-case Hermit arguments are required"
-sabre = "No edge-case Hermit arguments are required"
-liteinst = "No edge-case Hermit arguments are required"
-[[test]]
-id = "system-utils/openssl-rand"
-description = "OpenSSL DRBG hex output varies natively and repeats under Hermit"
-lane = "portable"
-requires = ["linux","x86_64","userns","ptrace","openssl"]
-timeout_seconds = 60
-occasional = false
-program = "tests/e2e/system-utils/openssl-rand.sh"
-observation = { status = true, stdout = true, stderr = false, artifacts = [] }
-
-[test.modes.naked]
-ci = false
-runs = 3
-assert = { min_distinct = 2 }
-backends_enabled = ["native"]
-[test.modes.naked.backends_disabled]
-
-[test.modes.verify]
-ci = true
-backends_enabled = ["ptrace"]
-[test.modes.verify.backends_disabled]
-dbi = "DBI coverage is owned by its backend parity partition"
-kvm = "KVM requires the privileged runner"
-sabre = "SaBRe openssl qualification is tracked by backend compatibility"
+sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 
 [test.modes.replay]
@@ -319,7 +264,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
-ptrace = "DRBG generation is single-threaded with no scheduling oracle"
+ptrace = "The temp-name workload is single-threaded"
 dbi = "Chaos scheduling is unsupported by DBI"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
@@ -334,62 +279,6 @@ dbi = "No edge-case Hermit arguments are required"
 kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
-[[test]]
-id = "system-utils/record-getpid"
-description = "Process identity is deterministic in run and record/replay modes"
-lane = "portable"
-requires = ["linux","x86_64","userns","ptrace","cc"]
-timeout_seconds = 60
-occasional = false
-program = "tests/c/getpid.c"
-observation = { status = true, stdout = true, stderr = false, artifacts = [] }
-
-[test.build]
-cflags = []
-
-[test.modes.naked]
-ci = false
-backends_enabled = []
-[test.modes.naked.backends_disabled]
-native = "The test asserts Hermit's virtualized process identity"
-
-[test.modes.verify]
-ci = true
-backends_enabled = ["ptrace", "liteinst"]
-[test.modes.verify.backends_disabled]
-dbi = "DBI coverage is owned by its backend parity partition"
-kvm = "KVM requires the privileged runner"
-sabre = "SaBRe requires its external runtime"
-
-[test.modes.replay]
-ci = true
-backends_enabled = ["ptrace"]
-[test.modes.replay.backends_disabled]
-dbi = "Record/replay is unsupported by DBI"
-kvm = "Record/replay is unsupported by KVM"
-sabre = "Record/replay is unsupported by SaBRe"
-liteinst = "Record/replay is unsupported by LiteInst"
-
-[test.modes.chaos]
-ci = false
-backends_enabled = []
-[test.modes.chaos.backends_disabled]
-ptrace = "The guest is single-threaded"
-dbi = "Chaos scheduling is unsupported by DBI"
-kvm = "Chaos scheduling is unsupported by KVM"
-sabre = "Chaos scheduling is unsupported by SaBRe"
-liteinst = "Chaos scheduling is unsupported by LiteInst"
-
-[test.modes.custom]
-ci = false
-backends_enabled = []
-[test.modes.custom.backends_disabled]
-ptrace = "No edge-case Hermit arguments are required"
-dbi = "No edge-case Hermit arguments are required"
-kvm = "No edge-case Hermit arguments are required"
-sabre = "No edge-case Hermit arguments are required"
-liteinst = "No edge-case Hermit arguments are required"
-
 [[test]]
 id = "system-utils/openssl-passwd"
 description = "openssl passwd -6 salted hash varies natively and repeats under Hermit"
@@ -446,6 +335,61 @@ kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 
+[[test]]
+id = "system-utils/openssl-rand"
+description = "OpenSSL DRBG hex output varies natively and repeats under Hermit"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace","openssl"]
+timeout_seconds = 60
+occasional = false
+program = "tests/e2e/system-utils/openssl-rand.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+ci = false
+runs = 3
+assert = { min_distinct = 2 }
+backends_enabled = ["native"]
+[test.modes.naked.backends_disabled]
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "DBI coverage is owned by its backend parity partition"
+kvm = "KVM requires the privileged runner"
+sabre = "SaBRe openssl qualification is tracked by backend compatibility"
+liteinst = "LiteInst coverage is owned by its backend compatibility partition"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "The focused C sentinel owns the blocking replay contract"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "DRBG generation is single-threaded with no scheduling oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
 [[test]]
 id = "system-utils/openssl-x509"
 description = "openssl self-signed X.509 cert varies natively and repeats under Hermit"
@@ -560,13 +504,124 @@ liteinst = "No edge-case Hermit arguments are required"
 
 
 [[test]]
-id = "system-utils/mktemp-name"
-description = "mktemp -u random temp-name suffix varies natively and repeats under Hermit"
+id = "system-utils/random-device"
+description = "Kernel random bytes vary natively and repeat under Hermit"
 lane = "portable"
 requires = ["linux","x86_64","userns","ptrace"]
 timeout_seconds = 60
 occasional = false
-program = "tests/e2e/system-utils/mktemp-name.sh"
+program = "tests/e2e/system-utils/random-device.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+ci = false
+runs = 3
+assert = { min_distinct = 2 }
+backends_enabled = ["native"]
+[test.modes.naked.backends_disabled]
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "DBI coverage is owned by its backend parity partition"
+kvm = "KVM requires the privileged runner"
+liteinst = "LiteInst coverage is owned by its backend compatibility partition"
+sabre = "SaBRe loses its private coordinator socket after guest exec; tracked by sabre_non_gated_parity"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "The hexdump process tree currently diverges during replay"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Random-byte generation has no scheduling oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
+[[test]]
+id = "system-utils/record-getpid"
+description = "Process identity is deterministic in run and record/replay modes"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace","cc"]
+timeout_seconds = 60
+occasional = false
+program = "tests/c/getpid.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.build]
+cflags = []
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "The test asserts Hermit's virtualized process identity"
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace", "liteinst"]
+[test.modes.verify.backends_disabled]
+dbi = "DBI coverage is owned by its backend parity partition"
+kvm = "KVM requires the privileged runner"
+sabre = "SaBRe requires its external runtime"
+
+[test.modes.replay]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.replay.backends_disabled]
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The guest is single-threaded"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
+
+[[test]]
+id = "system-utils/shuf-permutation"
+description = "A shuf random permutation varies natively and repeats under Hermit"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace"]
+timeout_seconds = 60
+occasional = false
+program = "tests/e2e/system-utils/shuf-permutation.sh"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.naked]
@@ -599,7 +654,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
-ptrace = "The temp-name workload is single-threaded"
+ptrace = "The shuf workload is single-threaded"
 dbi = "Chaos scheduling is unsupported by DBI"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"

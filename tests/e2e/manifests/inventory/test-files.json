@@ -2041,6 +2041,12 @@
       "why": "tests/e2e/system-utils/random-device.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/system-utils/shuf-permutation.sh",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/system-utils/shuf-permutation.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
       "disposition": "support-data",
       "path": "tests/e2e/xdg-config/README.md",
       "runner": "maintainers of tests/e2e/xdg-config",
