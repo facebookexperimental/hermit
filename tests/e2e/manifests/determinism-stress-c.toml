@@ -77,12 +77,13 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
   cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare"]
 
 [test.modes.verify]
-ci = false
-backends_enabled = ["ptrace", "sabre"]
+ci = true
+backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
-dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
-kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+dbi = "This determinism cell calibrates the ptrace strict-verify baseline; qualify DBI separately"
+kvm = "This determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately"
+sabre = "This determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately"
+liteinst = "This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately"
 
 [test.modes.naked]
 ci = false
@@ -131,13 +132,13 @@ program = "tests/e2e/determinism-stress/guests/pid_tid.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
-dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
-kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
-liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+dbi = "This determinism cell calibrates the ptrace strict-verify baseline; qualify DBI separately"
+kvm = "This determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately"
+sabre = "This determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately"
+liteinst = "This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately"
 
 [test.modes.naked]
 ci = false
@@ -189,12 +190,13 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
   cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare"]
 
 [test.modes.verify]
-ci = false
-backends_enabled = ["ptrace", "sabre"]
+ci = true
+backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
-dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
-kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+dbi = "This determinism cell calibrates the ptrace strict-verify baseline; qualify DBI separately"
+kvm = "This determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately"
+sabre = "This determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately"
+liteinst = "This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately"
 
 [test.modes.naked]
 ci = false
@@ -351,12 +353,13 @@ program = "tests/e2e/determinism-stress/pipe_prefill.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-backends_enabled = ["ptrace", "sabre"]
+ci = true
+backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
-dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
-kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+dbi = "This determinism cell calibrates the ptrace strict-verify baseline; qualify DBI separately"
+kvm = "This determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately"
+sabre = "This determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately"
+liteinst = "This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately"
 
 [test.modes.naked]
 ci = false

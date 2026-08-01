@@ -1330,20 +1330,20 @@
     {
       "path": "tests/e2e/determinism-stress/guests/lock_free.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/e2e/determinism-stress/guests/lock_free.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true)",
+      "why": "tests/e2e/determinism-stress/guests/lock_free.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true): Calibrated blocking C determinism cell; its lock-free atomic/CAS interleaving resolves to a deterministic function of virtual time under ptrace strict verification, with a standalone cc build and a schedule-sensitive stdout contract"
     },
     {
       "path": "tests/e2e/determinism-stress/guests/pid_tid.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/e2e/determinism-stress/guests/pid_tid.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true)",
+      "why": "tests/e2e/determinism-stress/guests/pid_tid.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true): Calibrated blocking C determinism cell; its per-thread pid/tid observation is deterministically virtualized under ptrace strict verification, with a standalone cc build and a schedule-sensitive stdout contract"
     },
     {
       "path": "tests/e2e/determinism-stress/guests/signal_order.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/e2e/determinism-stress/guests/signal_order.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true)",
+      "why": "tests/e2e/determinism-stress/guests/signal_order.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true): Calibrated blocking C determinism cell; its signal delivery ordering resolves to a deterministic function of virtual time under ptrace strict verification, with a standalone cc build and a schedule-sensitive stdout contract"
     },
     {
       "path": "tests/e2e/determinism-stress/mmap_fork_shared.c",
@@ -1360,8 +1360,8 @@
     {
       "path": "tests/e2e/determinism-stress/pipe_prefill.c",
       "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/e2e/determinism-stress/pipe_prefill.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true)",
+      "why": "tests/e2e/determinism-stress/pipe_prefill.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true): Calibrated blocking C determinism cell; its prefilled-pipe read/write ordering resolves to a deterministic function of virtual time under ptrace strict verification, with a standalone cc build and a schedule-sensitive stdout contract"
     },
     {
       "path": "tests/e2e/determinism-stress/process-chains.sh",
