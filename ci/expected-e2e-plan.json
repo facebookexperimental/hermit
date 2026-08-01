@@ -446,6 +446,13 @@
       "category": "system-utils",
       "lane": "portable",
       "mode": "verify",
+      "test": "system-utils/ssh-keygen-ed25519"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
       "test": "system-utils/uuidgen-random"
     }
   ],
