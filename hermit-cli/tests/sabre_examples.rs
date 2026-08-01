@@ -387,29 +387,53 @@ fn sabre_non_racy_examples_verify_current_envelope() {
 }
 
 #[test]
-fn sabre_libc_getrandom_keeps_patch_tempfile_deterministic() {
+fn sabre_libc_getrandom_is_deterministic() {
     let Some(loader) = sabre_loader() else {
         return;
     };
-    if !Command::new("patch")
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
-    {
-        eprintln!("skipping SaBRe libc getrandom regression: patch is unavailable");
-        return;
-    }
 
-    let script = r#"set -euo pipefail
-d=$(mktemp -d)
-printf 'old\n' >"$d/file"
-printf '%s\n' '--- file' '+++ file' '@@ -1 +1 @@' '-old' '+new' | (cd "$d" && patch -s file)
-cat "$d/file"
-rm -rf "$d""#;
-    assert_backend_parity_and_sabre_verify(
-        Path::new("/bin/bash"),
-        &["-c", script],
-        &loader,
-        "GNU patch libc getrandom tempfile",
+    // Compile a hermetic caller of the public glibc getrandom function. Host
+    // patch packages do not share one implementation: some call the public
+    // symbol that SaBRe detours, while others reach an internal libc alias or
+    // raw syscall site. Those package-specific paths belong in the measured
+    // compatibility corpus rather than this portable mechanism test.
+    let guest_dir = tempfile::Builder::new()
+        .prefix("sabre-libc-getrandom-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create SaBRe libc-getrandom guest directory");
+    let source = guest_dir.path().join("libc-getrandom.c");
+    let program = guest_dir.path().join("libc-getrandom");
+    std::fs::write(
+        &source,
+        r#"#include <errno.h>
+#include <stdio.h>
+#include <sys/random.h>
+
+int main(void) {
+  unsigned char bytes[16];
+  if (getrandom(bytes, sizeof(bytes), 0) != sizeof(bytes)) return 1;
+  for (unsigned int i = 0; i < sizeof(bytes); i++) printf("%02x", bytes[i]);
+  putchar('\n');
+  errno = 0;
+  if (getrandom(bytes, sizeof(bytes), 0x80000000u) != -1 || errno != EINVAL)
+    return 2;
+  return 0;
+}
+"#,
+    )
+    .expect("failed to write SaBRe libc-getrandom guest source");
+    let build = Command::new("cc")
+        .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&program)
+        .output()
+        .expect("failed to compile SaBRe libc-getrandom guest");
+    assert!(
+        build.status.success(),
+        "libc-getrandom guest compilation failed:\n{}",
+        String::from_utf8_lossy(&build.stderr),
     );
+
+    assert_backend_parity_and_sabre_verify(&program, &[], &loader, "public libc getrandom");
 }
