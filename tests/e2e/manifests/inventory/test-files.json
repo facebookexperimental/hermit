@@ -379,6 +379,12 @@
       "why": "tests/backend-parity/fixtures/seccomp_refusal.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/shutdown_socketpair.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/shutdown_socketpair.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/backend-parity/fixtures/sigaction_state.c",
       "runner": "tests/backend-parity/run_matrix.py",
@@ -401,6 +407,18 @@
       "path": "tests/backend-parity/fixtures/sigprocmask_state.c",
       "runner": "tests/backend-parity/run_matrix.py",
       "why": "tests/backend-parity/fixtures/sigprocmask_state.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic sigprocmask(2) signal-mask block/unblock/query round-tripping as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBI/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/socket_options.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/socket_options.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/sockname_unnamed.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/sockname_unnamed.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "disposition": "manifest-test",
@@ -2162,6 +2180,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/e2e/system-utils/openssl-genpkey.sh",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/system-utils/openssl-genpkey.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/e2e/system-utils/openssl-passwd.sh",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
       "why": "tests/e2e/system-utils/openssl-passwd.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
@@ -2771,24 +2795,6 @@
       "path": "tests/util/ssl_server.py",
       "runner": "validate.sh or Hermit integration targets",
       "why": "tests/util/ssl_server.py is owned by validate.sh or Hermit integration targets: The `ssl_server` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
-    },
-    {
-      "path": "tests/backend-parity/fixtures/socket_options.c",
-      "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/backend-parity/fixtures/socket_options.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "path": "tests/backend-parity/fixtures/shutdown_socketpair.c",
-      "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/backend-parity/fixtures/shutdown_socketpair.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "path": "tests/backend-parity/fixtures/sockname_unnamed.c",
-      "disposition": "manifest-test",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/backend-parity/fixtures/sockname_unnamed.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     }
   ],
   "schema": 2

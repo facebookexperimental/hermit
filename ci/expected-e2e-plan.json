@@ -348,6 +348,13 @@
       "category": "system-utils",
       "lane": "portable",
       "mode": "verify",
+      "test": "system-utils/openssl-genpkey"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
       "test": "system-utils/openssl-passwd"
     },
     {
