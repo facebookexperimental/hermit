@@ -31,6 +31,7 @@
     {"test":"determinism-stress/process-chains","category":"determinism-stress","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"determinism-stress/thread-contention","category":"determinism-stress","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"determinism-stress/thread-output","category":"determinism-stress","lane":"portable","mode":"verify","backend":"ptrace"},
+    {"test":"determinism-stress-c/producer-consumer","category":"determinism-stress-c","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"language-runtimes/bash-loop-pipe-time","category":"language-runtimes","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"language-runtimes/perl-io-subprocess-time","category":"language-runtimes","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"language-runtimes/python-io-subprocess-time","category":"language-runtimes","lane":"portable","mode":"verify","backend":"ptrace"},

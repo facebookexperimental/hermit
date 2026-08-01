@@ -1364,6 +1364,12 @@
       "why": "tests/e2e/determinism-stress/process-chains.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
+      "path": "tests/e2e/determinism-stress/producer_consumer.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true)",
+      "why": "tests/e2e/determinism-stress/producer_consumer.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true): Calibrated blocking C determinism cell; its multi-producer/multi-consumer bounded-queue condvar/futex schedule is a deterministic function of virtual time under ptrace strict verification, with a standalone cc build and a schedule-sensitive stdout contract"
+    },
+    {
       "path": "tests/e2e/determinism-stress/thread-contention.sh",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
