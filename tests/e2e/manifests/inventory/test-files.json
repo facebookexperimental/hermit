@@ -2216,6 +2216,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/e2e/system-utils/openssl-enc.sh",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/system-utils/openssl-enc.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/e2e/system-utils/openssl-genpkey.sh",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
       "why": "tests/e2e/system-utils/openssl-genpkey.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
