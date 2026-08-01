@@ -65,7 +65,7 @@ raw-cpuid = "10.7.0"
 regex = "1.13.1"
 # Abstract Reverie interface ONLY. Never add a concrete backend here (see the
 # BACKEND-ABSTRACTION COMMANDMENT at the top of this file).
-reverie = { package = "reverie-core", version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "aa6f1283aeee3efd174c57f6dd8198310bd307e1" }
+reverie = { package = "reverie-core", version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "26ffc1a6a5a13da92bb70bc0caac6b8d8524deb9" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 tempfile = "3.27.0"
@@ -77,6 +77,6 @@ detcore-testutils = { version = "0.0.0", path = "tests/testutils" }
 # ALLOWED test-only backend: detcore's integration tests drive a real tracer to
 # exercise the tool. This is a dev-dependency and never reaches the shipped
 # `detcore` rlib. It is the ONLY backend crate permitted in this manifest.
-reverie-ptrace = { version = "0.1.0", git = "https://github.com/rrnewton/reverie.git", rev = "aa6f1283aeee3efd174c57f6dd8198310bd307e1" }
+reverie-ptrace = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "26ffc1a6a5a13da92bb70bc0caac6b8d8524deb9" }
 test-allocator = { version = "0.0.0", path = "../common/test-allocator" }
 test-case = "3.3.1"
