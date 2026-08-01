@@ -1424,6 +1424,12 @@
       "why": "tests/e2e/language-runtimes/perl-io-subprocess-time.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It exercises Perl file I/O, subprocess pipes, hashing, and virtual time under strict verification"
     },
     {
+      "path": "tests/e2e/language-runtimes/python-hash-determinism.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
+      "why": "tests/e2e/language-runtimes/python-hash-determinism.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It proves CPython hash-seed order varies natively yet repeats bitwise under strict verification"
+    },
+    {
       "path": "tests/e2e/language-runtimes/python-io-subprocess-time.sh",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
