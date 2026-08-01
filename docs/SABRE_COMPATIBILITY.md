@@ -109,8 +109,9 @@ matching ptrace, instead of assigning 3 to the worker and 4 to the guest. This
 qualifies `backend-parity-c/pid-probe` and `debugger-c/debuggee` at SaBRe L2
 with byte-identical ptrace output under the portable profile. It does not claim
 parity for child/thread identities, whose backend task topologies still differ.
-At this increment's source tree, the executable plan enables SaBRe for 133/195
-ptrace verify cells (68.2%, B3), up from 131/195 (67.2%).
+At this increment's source tree, the executable plan enables SaBRe for 133/199
+ptrace verify cells (66.8%, B3), up by two cells from 131/199 (65.8%) on the
+same plan.
 
 ## Known gaps
 
