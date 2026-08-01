@@ -5,6 +5,10 @@ description: Audit Hermit backend completion claims against real CLI execution, 
 
 # Backend Reality Reviewer
 
+> **Don't break the demos.** A backend- or demo-touching change must be
+> adversarially reviewed with a green-demo run (the demo still passes) before it
+> lands — see the demo-touching-commit adversarial-review policy.
+
 ## Purpose
 This skill is used by hermit-coord to audit backend claims. Every time a backend agent reports completion, run this checklist to determine how "real" the backend is.
 

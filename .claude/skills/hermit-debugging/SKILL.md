@@ -5,6 +5,10 @@ description: "Debug hermit/detcore runs (nondeterminism, hangs, syscall gaps, sc
 
 # Debugging Hermit Runs
 
+> **Don't break the demos.** If a fix touches a demo, verify the demo still runs
+> GREEN before landing — demo-touching commits require an adversarial green-demo
+> review, not just code-review.
+
 **Thesis: reach for hermit's logs before you reach for the source.** Detcore
 emits a rich, structured trace of every scheduling decision, syscall, and
 virtual-time advance. Most "why did this diverge / hang / behave oddly?"

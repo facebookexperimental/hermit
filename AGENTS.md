@@ -257,6 +257,9 @@ limitations, not necessarily product bugs.
   Clippy checks before finishing. Clearly document checks that the current
   hardware cannot execute.
 - Keep unrelated changes and generated artifacts out of the patch.
+- Don't break the demos: if a change touches a demo, an adversarial reviewer must
+  confirm the demo still runs GREEN (not just code-review) before it lands — see
+  the demo-touching-commit adversarial-review policy.
 
 ## Pre-Commit Cleanliness Protocol
 
