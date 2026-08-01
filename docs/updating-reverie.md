@@ -6,6 +6,46 @@ a moving `branch = "main"`. Pinning makes builds reproducible: when hermit's
 tests pass, the exact Reverie commit is recorded in the manifests (and is not
 silently changed by an upstream push).
 
+Hermit's fork policy adds a freshness invariant: absent an explicitly justified
+temporary exception, the pin must equal the current `rrnewton/reverie:main` tip.
+A stale pin can silently omit already-merged correctness or performance fixes.
+The demo5 investigation found exactly this failure mode when Hermit remained on
+`aa6f1283` and missed the merged ptrace-notifier fast path.
+
+## Freshness lint
+
+`scripts/check-reverie-pin.rs` checks that every Reverie `rev` in Hermit's
+manifests is identical and equals the live `rrnewton/reverie:main` tip. It fails
+closed when the remote cannot be checked. Run it locally through the proxy:
+
+```bash
+with-proxy ./scripts/check-reverie-pin.rs
+```
+
+Install the tracked pre-commit gate once per clone/worktree repository:
+
+```bash
+scripts/setup-hooks.sh
+```
+
+Portable preland CI runs the same checker. A deliberate temporary stale pin must
+state why latest main cannot be used. Local commits require a substantive reason:
+
+```bash
+HERMIT_STALE_REVERIE_PIN_REASON="Testing unmerged Reverie PR #123 before its merge" \
+  git commit ...
+```
+
+The equivalent direct checker flag is `--allow-stale-reverie-pin "<reason>"`.
+For preland CI, put this auditable line in the pull request body:
+
+```text
+Stale-Reverie-Pin-Reason: Testing unmerged Reverie PR #123 before its merge
+```
+
+An override only permits the exceptional commit; it does not make the pin
+current. Remove it and repin to main as soon as the dependency lands.
+
 ## Where the pin lives
 
 The same `rev` appears in every crate that depends on a Reverie crate. Keep them
@@ -37,7 +77,7 @@ or mislabel artifacts from the previous revision:
 1. Pick the target commit and confirm it exists upstream:
 
    ```bash
-   with-proxy git ls-remote https://github.com/facebookexperimental/reverie.git refs/heads/main
+   with-proxy git ls-remote https://github.com/rrnewton/reverie.git refs/heads/main
    # or choose any specific commit hash you want to pin to
    ```
 

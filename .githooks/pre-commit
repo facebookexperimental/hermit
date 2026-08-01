@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Block Hermit commits whose Reverie dependency pin is not latest Reverie main.
+# See scripts/check-reverie-pin.rs and docs/updating-reverie.md.
+
+set -u
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 1
+checker="$root/scripts/check-reverie-pin.rs"
+
+if [[ ! -f "$checker" ]]; then
+  echo "REVERIE PIN LINT: checker missing at $checker -- BLOCKED" >&2
+  exit 1
+fi
+
+args=()
+if [[ -n ${HERMIT_STALE_REVERIE_PIN_REASON:-} ]]; then
+  args+=(--allow-stale-reverie-pin "$HERMIT_STALE_REVERIE_PIN_REASON")
+fi
+
+cd "$root" || exit 1
+if command -v with-proxy >/dev/null 2>&1; then
+  exec with-proxy "$checker" "${args[@]}"
+fi
+exec "$checker" "${args[@]}"

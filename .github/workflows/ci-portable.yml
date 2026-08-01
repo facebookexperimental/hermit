@@ -23,6 +23,32 @@ env:
   STRICT_COMPAT_HERMIT_BIN: ${{ github.workspace }}/target/debug/hermit
 
 jobs:
+  reverie-pin:
+    name: Reverie pin is current
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Reject a stale Reverie dependency pin
+      env:
+        PR_BODY: ${{ github.event.pull_request.body }}
+      run: |
+        set -euo pipefail
+        checker="$RUNNER_TEMP/check-reverie-pin"
+        RUSTUP_TOOLCHAIN=stable rustc --edition=2021 scripts/check-reverie-pin.rs -o "$checker"
+
+        reason="$({
+          printf '%s\n' "$PR_BODY" |
+            sed -n 's/^Stale-Reverie-Pin-Reason:[[:space:]]*//p' |
+            head -n 1
+        } || true)"
+        args=()
+        if [[ -n "$reason" ]]; then
+          args+=(--allow-stale-reverie-pin "$reason")
+        fi
+        "$checker" "${args[@]}"
+
   regular:
     name: Regular tests (GitHub-managed portable)
     runs-on: ubuntu-latest
