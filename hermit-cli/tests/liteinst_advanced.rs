@@ -411,7 +411,14 @@ fn liteinst_strict_verify_round2_encoding_and_comparison_utilities() {
         &["--wrap=0", fixture],
         b"NRUXIZLJNZZXIIDDN5WXAYLUNFRGS3DJOR4SAZTJPB2HK4TFBI======",
     );
-    assert_liteinst_strict_verify(Path::new("/usr/bin/sum"), &[fixture], b"04458     1\n");
+    let sum_output = run_liteinst_strict_verify(Path::new("/usr/bin/sum"), &[fixture]);
+    let sum_stdout = String::from_utf8(sum_output.stdout).expect("sum output should be UTF-8");
+    let sum_fields = sum_stdout.split_whitespace().collect::<Vec<_>>();
+    match sum_fields.as_slice() {
+        ["04458", "1"] => {}
+        ["04458", "1", output_path] => assert_eq!(*output_path, fixture),
+        _ => panic!("unexpected sum output: {sum_stdout:?}"),
+    }
     assert_liteinst_strict_verify(Path::new("/usr/bin/cmp"), &[fixture, fixture], b"");
     assert_liteinst_strict_verify(
         Path::new("/usr/bin/comm"),
