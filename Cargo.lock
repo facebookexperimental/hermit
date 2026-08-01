@@ -500,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "detcore"
-version = "0.0.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -509,7 +509,7 @@ dependencies = [
  "clap",
  "detcore-model",
  "detcore-testutils",
- "digest 0.0.0",
+ "digest 0.2.0",
  "futures 0.3.33",
  "libc",
  "nix 0.30.1",
@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "detcore-dbi"
-version = "0.0.0"
+version = "0.2.0"
 dependencies = [
  "detcore",
  "hermit-resources",
@@ -548,7 +548,7 @@ dependencies = [
 
 [[package]]
 name = "detcore-model"
-version = "0.0.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bitvec",
@@ -567,7 +567,7 @@ dependencies = [
 
 [[package]]
 name = "detcore-sabre"
-version = "0.0.0"
+version = "0.2.0"
 dependencies = [
  "detcore",
  "libc",
@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "detcore-testutils"
-version = "0.0.0"
+version = "0.2.0"
 dependencies = [
  "detcore",
  "pretty_assertions",
@@ -601,7 +601,7 @@ checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
 
 [[package]]
 name = "digest"
-version = "0.0.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "serde",
@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "edit-distance"
-version = "0.0.0"
+version = "0.2.0"
 dependencies = [
  "rand",
  "serde",
@@ -976,11 +976,11 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermetic_infra_hermit_flaky-tests"
-version = "0.0.0"
+version = "0.2.0"
 
 [[package]]
 name = "hermetic_infra_hermit_tests"
-version = "0.0.0"
+version = "0.2.0"
 dependencies = [
  "close-err",
  "detcore",
@@ -1003,7 +1003,7 @@ dependencies = [
  "detcore-dbi",
  "detcore-model",
  "diff",
- "digest 0.0.0",
+ "digest 0.2.0",
  "dirs",
  "edit-distance",
  "fbinit",
@@ -1043,7 +1043,7 @@ checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
 name = "hermit-install"
-version = "0.0.0"
+version = "0.2.0"
 dependencies = [
  "reverie-dbi",
 ]
@@ -1058,11 +1058,11 @@ dependencies = [
 
 [[package]]
 name = "hermit-resources"
-version = "0.0.0"
+version = "0.2.0"
 
 [[package]]
 name = "hermit-verify"
-version = "0.0.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2269,7 +2269,7 @@ dependencies = [
 
 [[package]]
 name = "test-allocator"
-version = "0.0.0"
+version = "0.2.0"
 dependencies = [
  "libc",
 ]
