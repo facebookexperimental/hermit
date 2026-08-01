@@ -53,6 +53,8 @@ Filters:
   --allow-empty           permit an empty selection (DAG bucket nodes only)
   --include-occasional    include tests marked occasional
   --include-manual        include a ci=false cell; requires exact --test and --mode
+  --probe-disabled        run one explicitly disabled backend cell; requires exact
+                          --test, --mode, and --backend filters (run only)
 
 The run command defaults to all CI-enabled, non-occasional cells in both lanes.
 Naked controls are meta-CI checks and run only when explicitly selected.
@@ -468,6 +470,7 @@ RESULTS=
 JUNIT=
 INCLUDE_OCCASIONAL=0
 INCLUDE_MANUAL=0
+PROBE_DISABLED=0
 CI_ONLY=0
 PREBUILT=0
 ALLOW_EMPTY=0
@@ -488,6 +491,7 @@ function parse_options {
             --junit) JUNIT=${2:?missing JUnit path}; shift 2 ;;
             --include-occasional) INCLUDE_OCCASIONAL=1; shift ;;
             --include-manual) INCLUDE_MANUAL=1; shift ;;
+            --probe-disabled) PROBE_DISABLED=1; shift ;;
             -h|--help) usage; exit 0 ;;
             *) die "unknown option: $1" ;;
         esac
@@ -503,6 +507,15 @@ function parse_options {
     if ((INCLUDE_MANUAL)); then
         [[ -n $TEST_FILTER && -n $MODE_FILTER ]] ||
             die "--include-manual requires exact --test and --mode filters"
+    fi
+    if ((PROBE_DISABLED)); then
+        [[ $subcommand == run ]] || die "--probe-disabled is accepted by run only"
+        [[ -n $TEST_FILTER && -n $MODE_FILTER && -n $BACKEND_FILTER ]] ||
+            die "--probe-disabled requires exact --test, --mode, and --backend filters"
+        ((INCLUDE_MANUAL == 0)) ||
+            die "--probe-disabled and --include-manual are mutually exclusive"
+        ((CI_ONLY == 0)) ||
+            die "--probe-disabled and --ci-only are mutually exclusive"
     fi
 }
 
@@ -796,7 +809,7 @@ function execute_attempt {
 
 function append_result {
     local test_id=$1 category=$2 lane=$3 mode=$4 backend=$5 outcome=$6 duration_ms=$7 reason=$8
-    local test_file test_sha256 binary_sha256 effective_args guest_args guest_backend relaxations log_level
+    local test_file test_sha256 binary_sha256 effective_args guest_args guest_backend relaxations log_level classification
     test_file=${TEST_BY_ID[$test_id]}
     if [[ -f $test_file ]]; then
         test_sha256=$(sha256sum "$test_file" | cut -d' ' -f1)
@@ -812,6 +825,8 @@ function append_result {
     guest_args=$(jq -c --arg mode "$mode" --arg backend "$guest_backend" \
         '.modes[$mode].guest_args[$backend] // []' <<<"${METADATA_BY_ID[$test_id]}")
     relaxations='[]'
+    classification=required
+    ((PROBE_DISABLED)) && classification=disabled
     case "$mode" in
         naked)
             effective_args='[]'
@@ -852,6 +867,7 @@ function append_result {
         --arg lane "$lane" \
         --arg mode "$mode" \
         --arg backend "$backend" \
+        --arg classification "$classification" \
         --arg outcome "$outcome" \
         --arg reason "$reason" \
         --arg log_level "$log_level" \
@@ -862,7 +878,7 @@ function append_result {
         '{schema:1,run_id:$run_id,hermit_sha:$hermit_sha,source_tree_dirty:$source_tree_dirty,
           binary_sha256:(if $binary_sha256 == "" then null else $binary_sha256 end),
           test_sha256:$test_sha256,test:$test,category:$category,lane:$lane,mode:$mode,
-          backend:(if $backend == "" then null else $backend end),classification:"required",
+          backend:(if $backend == "" then null else $backend end),classification:$classification,
           outcome:$outcome,duration_ms:$duration_ms,
           log_level:(if $log_level == "" then null else $log_level end),
           effective_args:$effective_args,guest_args:$guest_args,
@@ -1027,7 +1043,11 @@ function run_required {
     : >"$RESULTS"
 
     local planned test_id mode backend test metadata failures=0 selected=0
-    planned=$(emit_required_plan)
+    if ((PROBE_DISABLED)); then
+        planned=$(emit_gap_plan)
+    else
+        planned=$(emit_required_plan)
+    fi
     while IFS=$'\t' read -r test_id mode backend; do
         [[ -n $test_id ]] || continue
         selected=$((selected + 1))

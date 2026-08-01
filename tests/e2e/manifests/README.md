@@ -96,6 +96,19 @@ run one enabled manual cell with explicit test and mode filters:
 
 `--include-manual` requires both exact filters so a broad CI command cannot
 accidentally pull the uncalibrated corpus into its run plan.
+
+To measure one documented backend gap without first promoting it into the
+known-green envelope, use all three exact cell filters:
+
+```bash
+./ci/test_harness.sh run --probe-disabled --test c-programs/example \
+  --mode verify --backend sabre --results target/e2e/probe/results.jsonl
+```
+
+`--probe-disabled` selects from `backends_disabled`, is accepted only by
+`run`, and cannot be combined with `--ci-only` or `--include-manual`. This is
+the bounded expansion path: a passing probe is evidence for a later manifest
+ratchet, not an implicit promotion into the regression envelope.
 Callers that combine explicit mode/backend filters with CI policy must add
 `--ci-only`. This is how `validate.sh quick` avoids expanding the manual C
 inventory.
