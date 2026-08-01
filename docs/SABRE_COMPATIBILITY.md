@@ -118,10 +118,11 @@ cookies. This qualifies `c-programs/socket-cookie-tcp`,
 `c-programs/socket-cookie-udp`, and `c-programs/socket-cookie-unix` at SaBRe L2
 with byte-identical ptrace output under the portable profile.
 
-At this increment's source tree, the executable plan enables SaBRe for 136/199
-ptrace verify cells (68.3%, B3): seven blocking-CI cells and 129 manual cells.
-That is up by three cells from the stacked root-process identity increment's
-133/199 (66.8%).
+At this increment's source tree, the executable plan enables SaBRe for 133/200
+ptrace verify cells (66.5%, B3): seven blocking-CI cells and 126 manual cells.
+That is up by three cells from the live `origin/main` plan's 130/200 (65.0%);
+the denominator and enabled set have changed since the historical 133/199
+root-process-identity snapshot above.
 
 ## Known gaps
 
