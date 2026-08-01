@@ -146,14 +146,19 @@ impl Supervisor {
     }
 
     fn run(mut self) -> Result<(ExitStatus, usize), Error> {
+        ptrace::attach(self.root).context("failed to attach SaBRe supervisor worker")?;
         match waitpid(self.root, Some(WaitPidFlag::__WALL))? {
-            WaitStatus::Stopped(pid, Signal::SIGTRAP) if pid == self.root => {}
-            status => return Err(anyhow!("unexpected initial SaBRe ptrace stop: {status:?}")),
+            WaitStatus::Stopped(pid, Signal::SIGSTOP) if pid == self.root => {}
+            status => {
+                return Err(anyhow!(
+                    "unexpected SaBRe supervisor attach stop: {status:?}"
+                ));
+            }
         }
         tracing::trace!(
             target: "hermit::sabre::fallback",
             tid = self.root.as_raw(),
-            "received initial exec stop",
+            "received supervisor attach stop",
         );
         self.set_options(self.root)
             .context("failed to set options on the initial SaBRe tracee")?;
@@ -593,28 +598,6 @@ fn write_two_bytes(pid: Pid, address: usize, bytes: [u8; 2]) -> Result<(), Error
 }
 
 pub async fn run(
-    command: std::process::Command,
-    sabre: PathBuf,
-    plugin: PathBuf,
-    readiness: Arc<AtomicBool>,
-    physical_exit_observer: Arc<detcore::GlobalState>,
-    capture_output: bool,
-) -> Result<Output, Error> {
-    tokio::task::spawn_blocking(move || {
-        run_blocking(
-            command,
-            sabre,
-            plugin,
-            readiness,
-            physical_exit_observer,
-            capture_output,
-        )
-    })
-    .await
-    .context("SaBRe ptrace supervisor task panicked")?
-}
-
-fn run_blocking(
     mut command: std::process::Command,
     sabre: PathBuf,
     plugin: PathBuf,
@@ -625,6 +608,28 @@ fn run_blocking(
     if capture_output {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
     }
+    // Spawn before creating the blocking supervisor worker. A worker thread consumes a task ID
+    // in the guest PID namespace; creating it first shifts the root guest from PID 3 to PID 4 and
+    // makes otherwise identical ptrace and SaBRe programs observe different process identities.
+    let child = spawn_tracee(command)?;
+    let root = Pid::from_raw(child.id() as i32);
+    match waitpid(root, Some(WaitPidFlag::__WALL))? {
+        WaitStatus::Stopped(pid, Signal::SIGTRAP) if pid == root => {}
+        status => return Err(anyhow!("unexpected initial SaBRe ptrace stop: {status:?}")),
+    }
+    // Ptrace ownership belongs to the individual tracer task, not its thread group. Leave the
+    // tracee stopped while handing ownership from this async caller to the blocking supervisor.
+    // Injecting SIGSTOP as part of detach prevents any guest instruction from running in between.
+    ptrace::detach(root, Some(Signal::SIGSTOP))
+        .context("failed to hand SaBRe tracee to supervisor worker")?;
+    tokio::task::spawn_blocking(move || {
+        run_blocking(child, sabre, plugin, readiness, physical_exit_observer)
+    })
+    .await
+    .context("SaBRe ptrace supervisor task panicked")?
+}
+
+fn spawn_tracee(mut command: std::process::Command) -> Result<std::process::Child, Error> {
     // TODO-HUMAN-REVIEW(PR-845): Review SaBRe launch-time ASLR disabling.
     // PTRACE_TRACEME makes exec stop with SIGTRAP. A pre-exec SIGSTOP would
     // deadlock std::process::Command on its exec error pipe. personality(2)
@@ -643,9 +648,18 @@ fn run_blocking(
         });
     }
 
-    let mut child = command
+    command
         .spawn()
-        .context("failed to spawn ptraced SaBRe guest")?;
+        .context("failed to spawn ptraced SaBRe guest")
+}
+
+fn run_blocking(
+    mut child: std::process::Child,
+    sabre: PathBuf,
+    plugin: PathBuf,
+    readiness: Arc<AtomicBool>,
+    physical_exit_observer: Arc<detcore::GlobalState>,
+) -> Result<Output, Error> {
     let root = Pid::from_raw(child.id() as i32);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();

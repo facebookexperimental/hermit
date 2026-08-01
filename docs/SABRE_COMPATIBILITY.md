@@ -65,9 +65,9 @@ Snapshot:
 - Log level: INFO for verification. Every cell was bounded by its manifest
   timeout. `race.sh` was not run.
 
-The ptrace strict-verify plan has 194 cells. Before this ratchet, SaBRe was
-enabled for 22 (11.3%). This ratchet evaluates 157 previously disabled C
-candidates:
+The initial post-0.2 ptrace strict-verify plan had 194 cells. Before that
+ratchet, SaBRe was enabled for 22 (11.3%). This ratchet evaluates 157
+previously disabled C candidates:
 
 | Result | Cells | Meaning |
 | --- | ---: | --- |
@@ -103,13 +103,21 @@ socket autobind, TCP info, syscall-refusal semantics, pipes, fork trees, shared
 mappings, and signal ordering. These are probe-specific claims; for example,
 some fork and signal probes pass while other probes in those categories do not.
 
+The root-process identity increment starts the SaBRe tracee before creating its
+blocking ptrace-supervisor worker. Linux assigns the guest namespace PID 3,
+matching ptrace, instead of assigning 3 to the worker and 4 to the guest. This
+qualifies `backend-parity-c/pid-probe` and `debugger-c/debuggee` at SaBRe L2
+with byte-identical ptrace output under the portable profile. It does not claim
+parity for child/thread identities, whose backend task topologies still differ.
+At this increment's source tree, the executable plan enables SaBRe for 133/195
+ptrace verify cells (68.2%, B3), up from 131/195 (67.2%).
+
 ## Known gaps
 
-The following 18 cells are deterministic inside SaBRe but do not match ptrace
+The following 16 cells are deterministic inside SaBRe but do not match ptrace
 guest output, so they remain disabled:
 
 ```text
-backend-parity-c/pid-probe
 c-programs/dbi-pid-virtualization
 c-programs/print-memaddrs
 c-programs/proc-fdinfo
@@ -125,7 +133,6 @@ c-programs/socket-timestamp-timeval
 c-programs/sysinfo
 c-programs/sysinfo-uptime
 c-programs/wait-on-child
-debugger-c/debuggee
 determinism-stress-c/pid-tid
 ```
 

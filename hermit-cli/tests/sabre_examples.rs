@@ -298,6 +298,22 @@ fn assert_date_output_is_sane(output: &Output, backend_label: &str) {
 }
 
 #[test]
+fn sabre_root_pid_matches_ptrace() {
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+
+    // The SaBRe ptrace safety net must not consume the root guest's namespace PID before launch.
+    // `printf` is a shell builtin, so this observes the root shell rather than a forked utility.
+    assert_backend_parity_and_sabre_verify(
+        Path::new("/bin/sh"),
+        &["-c", "printf 'pid=%s\\n' \"$$\""],
+        &loader,
+        "root-pid",
+    );
+}
+
+#[test]
 fn sabre_non_racy_examples_verify_current_envelope() {
     let Some(loader) = sabre_loader() else {
         return;
