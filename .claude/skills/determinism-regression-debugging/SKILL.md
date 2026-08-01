@@ -46,6 +46,16 @@ first (a boot wedge that reproduces on the *good* SHA under the same host load
 is not a code regression — see the demo5 case below). The output of Step 1 is
 one culprit commit, not a hunch.
 
+### Post-breakage bisect: detect a stacked second regression
+
+Finding first-bad commit `N` proves only where the original breakage began.
+Apply the candidate fix at both `N` and current `HEAD`. If it restores `N` but
+`HEAD` is still broken, hold that fix constant and bisect `[N..HEAD]`, applying
+the same fix and identical repro at every tested revision. The first bad
+`N+K` is a second, stacked regression; repair and validate it separately. This
+prevents declaring victory because reverting or fixing `N` is green at `N` while
+the accumulated history remains broken.
+
 ## Step 2 — Diff a known-good vs broken FULL log to the first divergence
 
 This is the move that turns a multi-hour hunt into one diff. Capture a full
@@ -134,13 +144,15 @@ relaxations) bound to the fixed SHA — see the ladder in
 1. Pin an exact `(good, bad)` SHA pair; confirm the symptom is code, not host
    load.
 2. `git bisect run` the identical repro to one culprit commit.
-3. Capture good vs broken full logs to *files*; `log-diff` (or canonicalize +
+3. Test the candidate fix at first-bad `N` and `HEAD`; if only `N` is green,
+   bisect `[N..HEAD]` with the fix held constant to find the stacked regression.
+4. Capture good vs broken full logs to *files*; `log-diff` (or canonicalize +
    diff) to the **first** divergence.
-4. Classify: step-backward → revert/targeted fix; latent-bug-exposed →
+5. Classify: step-backward → revert/targeted fix; latent-bug-exposed →
    fix-forward.
-5. Never re-fake broken time/results to pass a test; fix the test to assert
+6. Never re-fake broken time/results to pass a test; fix the test to assert
    correct behavior and defer the real fix honestly.
-6. Add a regression test; report the restored level/backend/relaxations at the
+7. Add a regression test; report the restored level/backend/relaxations at the
    fixed SHA.
 
 ## Related
