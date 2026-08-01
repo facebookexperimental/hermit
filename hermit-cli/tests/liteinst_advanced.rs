@@ -402,6 +402,89 @@ fn liteinst_strict_verify_formatting_and_sequence_utilities() {
 }
 
 #[test]
+fn liteinst_strict_verify_round2_encoding_and_comparison_utilities() {
+    let fixture = compatibility_fixture();
+    let fixture = fixture.to_str().expect("fixture path should be UTF-8");
+
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/base32"),
+        &["--wrap=0", fixture],
+        b"NRUXIZLJNZZXIIDDN5WXAYLUNFRGS3DJOR4SAZTJPB2HK4TFBI======",
+    );
+    assert_liteinst_strict_verify(Path::new("/usr/bin/sum"), &[fixture], b"04458     1\n");
+    assert_liteinst_strict_verify(Path::new("/usr/bin/cmp"), &[fixture, fixture], b"");
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/comm"),
+        &[fixture, fixture],
+        b"\t\tliteinst compatibility fixture\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/join"),
+        &[fixture, fixture],
+        b"liteinst compatibility fixture compatibility fixture\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/paste"),
+        &[fixture, fixture],
+        b"liteinst compatibility fixture\tliteinst compatibility fixture\n",
+    );
+}
+
+#[test]
+fn liteinst_strict_verify_round2_representation_and_path_utilities() {
+    let fixture = compatibility_fixture();
+    let fixture = fixture.to_str().expect("fixture path should be UTF-8");
+
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/od"),
+        &["-An", "-tx1", fixture],
+        b" 6c 69 74 65 69 6e 73 74 20 63 6f 6d 70 61 74 69\n 62 69 6c 69 74 79 20 66 69 78 74 75 72 65 0a\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/pr"),
+        &["-t", fixture],
+        COMPAT_FIXTURE_CONTENT,
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/readlink"),
+        &["-f", "/etc/../etc/hostname"],
+        b"/etc/hostname\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/rev"),
+        &[fixture],
+        b"erutxif ytilibitapmoc tsnietil\n",
+    );
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/strings"),
+        &[fixture],
+        COMPAT_FIXTURE_CONTENT,
+    );
+    let dd_input = format!("if={fixture}");
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/dd"),
+        &[&dd_input, "bs=7", "count=2", "status=none"],
+        b"liteinst compa",
+    );
+}
+
+#[test]
+fn liteinst_strict_verify_round2_arithmetic_and_predicate_utilities() {
+    let fixture = compatibility_fixture();
+    let fixture = fixture.to_str().expect("fixture path should be UTF-8");
+
+    assert_liteinst_strict_verify(Path::new("/usr/bin/factor"), &["84"], b"84: 2 2 3 7\n");
+    assert_liteinst_strict_verify(Path::new("/usr/bin/expr"), &["6", "*", "7"], b"42\n");
+    assert_liteinst_strict_verify(
+        Path::new("/usr/bin/numfmt"),
+        &["--to=iec", "1024"],
+        b"1.0K\n",
+    );
+    assert_liteinst_strict_verify(Path::new("/usr/bin/test"), &["-f", fixture], b"");
+    assert_liteinst_strict_verify(Path::new("/usr/bin/pathchk"), &[fixture], b"");
+}
+
+#[test]
 fn liteinst_strict_verify_path_and_language_utilities() {
     assert_liteinst_strict_verify(
         Path::new("/usr/bin/basename"),
