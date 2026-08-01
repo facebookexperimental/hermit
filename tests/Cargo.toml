@@ -2,6 +2,7 @@
 
 [package]
 name = "hermetic_infra_hermit_tests"
+description = "Guest programs used by Hermit integration and compatibility tests."
 version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/facebookexperimental/hermit"

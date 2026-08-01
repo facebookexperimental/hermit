@@ -2,6 +2,7 @@
 
 [package]
 name = "detcore-testutils"
+description = "Test utilities for Detcore integration tests in the Hermit deterministic execution engine."
 version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/facebookexperimental/hermit"
