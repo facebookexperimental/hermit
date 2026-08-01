@@ -16,6 +16,7 @@ use hermit::Error;
 use hermit::SerializableError;
 use reverie::process::Container;
 use reverie::process::Mount;
+use reverie::process::MountFlags;
 use reverie::process::Namespace;
 
 const GROUP_FILE: &str = "/etc/group";
@@ -140,12 +141,12 @@ pub fn default_container(pin_threads: bool) -> Container {
 /// so the frozen-identity hardening mounts that `run` normally adds are
 /// unnecessary here; the returned [`IdentityGuard`] is empty.
 ///
-/// This filesystem layer is deliberately backend-agnostic: it configures the
-/// mount namespace and root before any Detcore/Reverie backend attaches, so the
-/// same rootfs applies whether execution is driven by ptrace, DBI, or KVM. See
-/// the prototype write-up for the per-backend composition notes.
+/// The CLI currently enables this only for the ptrace backend. Other backends
+/// have distinct launch/runtime-file requirements and must be qualified before
+/// they can safely share this filesystem setup.
 pub(super) fn image_container(
     rootfs: &Path,
+    tmpfs: &Path,
     pin_threads: bool,
 ) -> Result<(Container, IdentityGuard), Error> {
     let mut container = Container::new();
@@ -154,6 +155,17 @@ pub(super) fn image_container(
         .map_root()
         .hostname("hermetic-container.local")
         .domainname("local");
+
+    // The cache is a deterministic input, not a writable container layer. Bind
+    // it onto itself and remount it read-only so a guest cannot poison later
+    // runs or mutate run one underneath `--verify` run two. A fresh writable
+    // /tmp is mounted separately for ordinary scratch files.
+    container.mount(Mount::bind(rootfs, rootfs));
+    container.mount(
+        Mount::new(rootfs)
+            .flags(MountFlags::MS_BIND | MountFlags::MS_REMOUNT | MountFlags::MS_RDONLY),
+    );
+    container.mount(Mount::bind(tmpfs, rootfs.join("tmp")).rshared());
 
     // Mount the deterministic /proc into the target root. The materializer
     // guarantees <rootfs>/proc exists, so we do not need `touch_target()` (which

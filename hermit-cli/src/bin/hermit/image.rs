@@ -32,6 +32,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
 
+use digest::Digest;
 use hermit::Context;
 use hermit::Error;
 
@@ -46,9 +47,9 @@ const ENV_BASENAME: &str = ".hermit-oci-env";
 /// Basename of the captured `Config.WorkingDir` file (single line).
 const WORKDIR_BASENAME: &str = ".hermit-oci-workdir";
 
-/// Compute the cache directory that holds materialized rootfs trees. Keyed by a
-/// filesystem-safe encoding of the image reference so that re-running the same
-/// pinned reference reuses the same bytes (deterministic file inputs).
+/// Compute the cache directory that holds materialized rootfs trees. Keyed by
+/// the SHA-256 of the complete image reference so distinct references cannot
+/// alias after filesystem sanitization.
 fn rootfs_cache_dir(image_ref: &str) -> Result<PathBuf, Error> {
     let base = if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
         PathBuf::from(xdg)
@@ -57,11 +58,7 @@ fn rootfs_cache_dir(image_ref: &str) -> Result<PathBuf, Error> {
     } else {
         std::env::temp_dir()
     };
-    // Sanitize the reference into a single path component.
-    let key: String = image_ref
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
+    let key = Digest::new(image_ref.as_bytes()).to_string();
     Ok(base.join("hermit").join("oci-rootfs").join(key))
 }
 
@@ -90,6 +87,7 @@ fn env_file(cache: &Path) -> PathBuf {
 
 /// The subset of an image's OCI runtime config that the prototype applies so the
 /// guest sees the deterministic, digest-pinned environment the image declares.
+#[derive(Default)]
 pub(crate) struct ImageConfig {
     /// `Config.Env` entries, split into `(key, value)` pairs.
     pub env: Vec<(String, String)>,
@@ -97,10 +95,50 @@ pub(crate) struct ImageConfig {
     pub workdir: Option<String>,
 }
 
+fn read_image_config_files(
+    env_path: &Path,
+    workdir_path: &Path,
+) -> Result<Option<ImageConfig>, Error> {
+    let env_exists = env_path.try_exists().with_context(|| {
+        format!(
+            "Failed to inspect OCI environment file {}",
+            env_path.display()
+        )
+    })?;
+    let workdir_exists = workdir_path.try_exists().with_context(|| {
+        format!(
+            "Failed to inspect OCI working-directory file {}",
+            workdir_path.display()
+        )
+    })?;
+    if !env_exists && !workdir_exists {
+        return Ok(None);
+    }
+
+    let env = if env_exists {
+        parse_env(&std::fs::read_to_string(env_path).with_context(|| {
+            format!("Failed to read OCI environment file {}", env_path.display())
+        })?)
+    } else {
+        Vec::new()
+    };
+    let workdir = if workdir_exists {
+        parse_workdir(&std::fs::read_to_string(workdir_path).with_context(|| {
+            format!(
+                "Failed to read OCI working-directory file {}",
+                workdir_path.display()
+            )
+        })?)
+    } else {
+        None
+    };
+    Ok(Some(ImageConfig { env, workdir }))
+}
+
 /// Read the persisted OCI config (Env + WorkingDir) captured at materialization
-/// time. Missing files yield empty/None rather than an error so that a rootfs
-/// materialized before config capture, or an image that declares neither, still
-/// runs.
+/// time. Missing files yield empty/None so images that declare neither still
+/// run. File *presence*, rather than a non-empty Env, selects the location: an
+/// image may legitimately declare a WorkingDir and no Env.
 ///
 /// This is read from two candidate locations, in order, and the first that
 /// yields a non-empty `Env` wins:
@@ -117,27 +155,17 @@ pub(crate) struct ImageConfig {
 /// chrooted child, so it can only see files that live inside the rootfs.
 pub(crate) fn read_image_config(image_ref: &str) -> Result<ImageConfig, Error> {
     let cache = rootfs_cache_dir(image_ref)?;
-    let host = ImageConfig {
-        env: parse_env(&std::fs::read_to_string(env_file(&cache)).unwrap_or_default()),
-        workdir: parse_workdir(&std::fs::read_to_string(workdir_file(&cache)).unwrap_or_default()),
-    };
-    if !host.env.is_empty() {
+    if let Some(host) = read_image_config_files(&env_file(&cache), &workdir_file(&cache))? {
         return Ok(host);
     }
     // Fall back to the in-root copy (post-chroot view).
-    let in_root = ImageConfig {
-        env: parse_env(
-            &std::fs::read_to_string(Path::new("/").join(ENV_BASENAME)).unwrap_or_default(),
-        ),
-        workdir: parse_workdir(
-            &std::fs::read_to_string(Path::new("/").join(WORKDIR_BASENAME)).unwrap_or_default(),
-        ),
-    };
-    if !in_root.env.is_empty() {
+    if let Some(in_root) = read_image_config_files(
+        &Path::new("/").join(ENV_BASENAME),
+        &Path::new("/").join(WORKDIR_BASENAME),
+    )? {
         return Ok(in_root);
     }
-    // Neither location had env; keep any workdir the host copy provided.
-    Ok(host)
+    Ok(ImageConfig::default())
 }
 
 fn parse_env(contents: &str) -> Vec<(String, String)> {
@@ -223,13 +251,16 @@ pub(crate) fn materialize_rootfs(image_ref: &str) -> Result<PathBuf, Error> {
 cid=$(buildah from -- {ref})
 trap 'buildah umount "$cid" >/dev/null 2>&1 || true; buildah rm "$cid" >/dev/null 2>&1 || true' EXIT
 mp=$(buildah mount "$cid")
-cp -a "$mp"/. {dest}/
-mkdir -p {mkdirs}
-chmod u+rwx {mkdirs}
-buildah inspect --type image --format '{{{{.OCIv1.Config.WorkingDir}}}}' {ref} > {workdir_file} || true
-buildah inspect --type image --format '{{{{range .OCIv1.Config.Env}}}}{{{{println .}}}}{{{{end}}}}' {ref} > {env_file} || true
-cp -f {workdir_file} {dest}/{workdir_base} 2>/dev/null || true
-cp -f {env_file} {dest}/{env_base} 2>/dev/null || true
+	cp -a "$mp"/. {dest}/
+	root_mode=$(stat -c '%a' {dest})
+	chmod u+w {dest}
+	mkdir -p {mkdirs}
+	chmod u+rwx {mkdirs}
+	buildah inspect --type image --format '{{{{.OCIv1.Config.WorkingDir}}}}' {ref} > {workdir_file}
+	buildah inspect --type image --format '{{{{range .OCIv1.Config.Env}}}}{{{{println .}}}}{{{{end}}}}' {ref} > {env_file}
+	cp -f {workdir_file} {dest}/{workdir_base}
+	cp -f {env_file} {dest}/{env_base}
+	chmod "$root_mode" {dest}
 "#,
         ref = shell_quote(image_ref),
         dest = shell_quote(&rootfs.to_string_lossy()),
@@ -382,8 +413,8 @@ mod tests {
         assert_eq!(a, b, "same reference must map to the same cache dir");
         let comp = a.file_name().unwrap().to_string_lossy();
         assert!(
-            comp.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
-            "cache key component must be filesystem-safe, got {comp}"
+            comp.len() == 64 && comp.chars().all(|c| c.is_ascii_hexdigit()),
+            "cache key component must be a SHA-256 hex digest, got {comp}"
         );
     }
 
@@ -392,6 +423,11 @@ mod tests {
         let a = rootfs_cache_dir("busybox@sha256:aaaa").unwrap();
         let b = rootfs_cache_dir("busybox@sha256:bbbb").unwrap();
         assert_ne!(a, b);
+
+        // These collided under the old punctuation-to-underscore sanitizer.
+        let slash = rootfs_cache_dir("registry.example/a/b:latest").unwrap();
+        let colon = rootfs_cache_dir("registry.example/a:b/latest").unwrap();
+        assert_ne!(slash, colon);
     }
 
     #[test]
@@ -419,6 +455,19 @@ mod tests {
         assert_eq!(parse_workdir("  \n"), None);
         assert_eq!(parse_workdir("/"), None);
         assert_eq!(parse_workdir("/srv/app\n"), Some("/srv/app".to_string()));
+    }
+
+    #[test]
+    fn config_location_with_empty_env_still_preserves_workdir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = tmp.path().join("env");
+        let workdir = tmp.path().join("workdir");
+        std::fs::write(&env, "").unwrap();
+        std::fs::write(&workdir, "/srv/app\n").unwrap();
+
+        let config = read_image_config_files(&env, &workdir).unwrap().unwrap();
+        assert!(config.env.is_empty());
+        assert_eq!(config.workdir.as_deref(), Some("/srv/app"));
     }
 
     // The chroot-aware resolver must follow an *absolute* symlink target as if
