@@ -12,8 +12,16 @@ Build Hermit and run one strict boot:
 
 ```bash
 cargo build --release -p hermit --bin hermit
-KERNEL_IMAGE=/path/to/bzImage ./demos/05-qemu-busybox.sh
+./demos/05-qemu-busybox.sh
 ```
+
+With no `KERNEL_IMAGE` set, the demo auto-fetches a pinned x86-64 `bzImage`
+(SHA-256 `e4b1c0248a31c7e1f7cb31d82a1a03d4e7cab408ee1b8e622dd897c17eae46a2`)
+into the gitignored cache at `target/qemu-busybox/bzImage`, verifies its
+SHA-256, and reuses it on later runs. The download tries a direct connection
+first and falls back to a `with-proxy` helper when one is on `PATH`. Set
+`KERNEL_IMAGE=/path/to/bzImage` to use a local kernel instead, or
+`QEMU_KERNEL_URL` / `QEMU_KERNEL_SHA256` to pin a different one.
 
 The default backend is ptrace. This command uses `--log info --strict` with no
 determinism relaxations, so a successful run is L1 evidence for the exact
@@ -40,8 +48,7 @@ construction, timeouts, live serial output, log capture, and result checks.
 Run Hermit's two-execution comparison for L2 evidence:
 
 ```bash
-KERNEL_IMAGE=/path/to/bzImage VERIFY=1 \
-  DEMO_TIMEOUT_SECONDS=900 ./demos/05-qemu-busybox.sh
+VERIFY=1 DEMO_TIMEOUT_SECONDS=900 ./demos/05-qemu-busybox.sh
 ```
 
 `VERIFY=1` adds `--verify` and requires Hermit's explicit
@@ -58,7 +65,7 @@ reported recommendation explicitly:
 cc -O2 -Wall -Wextra -Werror -std=gnu11 \
   tests/util/pmu_skid.c -o /tmp/pmu-skid-test
 /tmp/pmu-skid-test --iterations 1000
-KERNEL_IMAGE=/path/to/bzImage VERIFY=1 SKID_MARGIN=66276 \
+VERIFY=1 SKID_MARGIN=66276 \
   DEMO_TIMEOUT_SECONDS=3600 ./demos/05-qemu-busybox.sh
 ```
 
@@ -70,7 +77,9 @@ example blindly.
 ### Inputs and dependencies
 
 - x86-64 Linux with `qemu-system-x86_64`
-- a readable x86-64 `bzImage` supplied with `KERNEL_IMAGE`
+- a readable x86-64 `bzImage`: auto-fetched by default (pinned URL + SHA-256),
+  or supplied locally with `KERNEL_IMAGE`
+- `curl` for the default auto-fetch (not needed when `KERNEL_IMAGE` is set)
 - a statically linked BusyBox supplied with `BUSYBOX` when it is not on `PATH`
 - `cpio`, `file`, `find`, `gzip`, `install`, `sha256sum`, `sort`, `stat`,
   `tee`, `timeout`, `touch`, and `wc`
@@ -91,9 +100,9 @@ scheduler.
 
 The ptrace backend must be permitted to trace its own child processes. A
 container seccomp policy or host Yama/LSM policy that denies
-`PTRACE_TRACEME` blocks the run before QEMU starts. The demo deliberately
-requires an external kernel image rather than silently choosing a host- or
-network-dependent kernel.
+`PTRACE_TRACEME` blocks the run before QEMU starts. The auto-fetched kernel is
+pinned by URL and verified against a fixed SHA-256, so it is reproducible rather
+than a host- or network-varying kernel; `KERNEL_IMAGE` still overrides it.
 
 ### Measured result
 

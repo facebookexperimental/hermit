@@ -7,10 +7,37 @@ fail() {
   exit 1
 }
 
+# Download a URL to a file, portably across open-internet and proxied networks:
+# smoke-test a direct connection, download directly when it succeeds, otherwise
+# retry through an optional `with-proxy` helper before failing with guidance.
+fetch_url() {
+  local url="$1" out="$2"
+  if curl --fail --location --silent --show-error --head \
+       --connect-timeout "${QEMU_FETCH_CONNECT_TIMEOUT:-10}" \
+       --max-time "${QEMU_FETCH_PROBE_TIMEOUT:-20}" \
+       "$url" -o /dev/null 2>/dev/null; then
+    curl --fail --location --silent --show-error "$url" --output "$out"
+    return $?
+  fi
+  if command -v with-proxy >/dev/null 2>&1; then
+    printf '  direct connection failed; retrying through with-proxy...\n' >&2
+    with-proxy curl --fail --location --silent --show-error \
+      "$url" --output "$out"
+    return $?
+  fi
+  fail "cannot reach $url: direct connection failed and no 'with-proxy' helper is on PATH. Provide the kernel locally via KERNEL_IMAGE=/path/to/bzImage, or set http(s)_proxy for your network."
+}
+
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/.." && pwd)
 hermit_bin=${HERMIT_BIN:-$repo_root/target/release/hermit}
 kernel_image=${KERNEL_IMAGE:-}
+# Pinned QEMU kernel provisioning (mirrors dev-hermit demos/lib/qemu-assets.sh).
+# When KERNEL_IMAGE is unset the demo auto-fetches this exact bzImage into the
+# gitignored cache under target/, so it runs out of the box with no manual step.
+# Override with QEMU_KERNEL_URL / QEMU_KERNEL_SHA256 to pin a different kernel.
+kernel_sha256=${QEMU_KERNEL_SHA256:-e4b1c0248a31c7e1f7cb31d82a1a03d4e7cab408ee1b8e622dd897c17eae46a2}
+kernel_url=${QEMU_KERNEL_URL:-https://github.com/rrnewton/dev-hermit/releases/download/qemu-kernel-$kernel_sha256/bzImage}
 qemu_bin=${QEMU_BIN:-}
 output_dir=${OUTPUT_DIR:-$repo_root/target/qemu-busybox}
 timeout_seconds=${DEMO_TIMEOUT_SECONDS:-300}
@@ -23,8 +50,6 @@ fi
 
 [[ -x $hermit_bin ]] || fail \
   "Hermit release binary not found: $hermit_bin (run cargo build --release -p hermit --bin hermit)"
-[[ -n $kernel_image ]] || fail "set KERNEL_IMAGE to a readable x86-64 bzImage"
-[[ -r $kernel_image ]] || fail "kernel image is not readable: $kernel_image"
 [[ -n $qemu_bin && -x $qemu_bin ]] || fail \
   "qemu-system-x86_64 not found; install it or set QEMU_BIN"
 [[ $timeout_seconds =~ ^[1-9][0-9]*$ ]] || fail \
@@ -38,6 +63,40 @@ for command in grep sha256sum tee timeout; do
 done
 
 mkdir -p "$output_dir"
+
+# Resolve the kernel image: honor an explicit KERNEL_IMAGE, otherwise fetch the
+# pinned bzImage into the gitignored cache under target/ and verify its sha256
+# so the demo works out of the box with no manual provisioning step.
+if [[ -z $kernel_image ]]; then
+  [[ $kernel_sha256 =~ ^[0-9a-f]{64}$ ]] || fail \
+    "QEMU_KERNEL_SHA256 must be a lowercase 64-character SHA-256"
+  command -v curl >/dev/null || fail \
+    "curl is required to auto-fetch the kernel; install it or set KERNEL_IMAGE"
+  kernel_image=$output_dir/bzImage
+  cached_kernel_sha=""
+  [[ -r $kernel_image ]] && \
+    cached_kernel_sha=$(sha256sum "$kernel_image" | cut -d' ' -f1)
+  if [[ $cached_kernel_sha != "$kernel_sha256" ]]; then
+    [[ -n $cached_kernel_sha ]] && printf \
+      'kernel: replacing cache with unexpected sha256 %s\n' \
+      "$cached_kernel_sha" >&2
+    kernel_tmp=$output_dir/.bzImage.$$
+    printf 'Downloading pinned QEMU kernel (%s)...\n' "$kernel_url" >&2
+    fetch_url "$kernel_url" "$kernel_tmp" || \
+      fail "kernel download failed: $kernel_url"
+    downloaded_kernel_sha=$(sha256sum "$kernel_tmp" | cut -d' ' -f1)
+    if [[ $downloaded_kernel_sha != "$kernel_sha256" ]]; then
+      rm -f "$kernel_tmp"
+      fail "kernel sha256 mismatch from $kernel_url: expected $kernel_sha256, got $downloaded_kernel_sha"
+    fi
+    mv "$kernel_tmp" "$kernel_image"
+    printf 'kernel ready: %s\n' "$kernel_image" >&2
+  else
+    printf 'kernel ready: %s (cached)\n' "$kernel_image" >&2
+  fi
+fi
+[[ -r $kernel_image ]] || fail "kernel image is not readable: $kernel_image"
+
 initramfs_image=${INITRAMFS_IMAGE:-$output_dir/initramfs-busybox.cpio.gz}
 console_log=$output_dir/console.log
 info_log=$output_dir/hermit-info.log
