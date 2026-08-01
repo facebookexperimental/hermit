@@ -419,6 +419,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "system-utils/sort-random"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/uuidgen-random"
     }
   ],
   "schema": 1
