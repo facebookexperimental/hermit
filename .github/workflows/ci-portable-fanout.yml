@@ -1,0 +1,221 @@
+name: CI (portable, per-cell fan-out)
+
+# Per-cell fan-out of the portable compat-envelope matrix.
+#
+# WHY: the monolithic `regular` job in ci-portable.yml runs the entire 46-step
+# portable DAG serially on ONE ubuntu-latest runner. As the compat envelope
+# expanded 1 -> 6 backends its median wall time roughly tripled (14.7 -> 44.0 min)
+# and its p90 (48.9 min) is at the GitHub-hosted job ceiling
+# (experiments/ci-runtime-trend-10day_20260801). The e2e manifest x backend
+# cells are the dominant, embarrassingly-parallel part of that cost.
+#
+# WHAT: build hermit + backends + guest fixtures EXACTLY ONCE, publish them as a
+# single short-lived Actions artifact, then fan every portable (manifest,
+# backend) cell out to its own small runner that downloads the prebuilt tree and
+# runs just that cell with `--prebuilt`. Wall time becomes
+# max(build, slowest single cell) instead of the serial sum.
+#
+# CORRESPONDENCE: the cell matrix is generated at run time from the SAME audited
+# plan that ci/test_harness.sh validate ratchets (ci/expected-e2e-plan.json), so
+# the fan-out can never silently cover a different set than the trusted DAG. This
+# workflow does NOT call `ci/run-dag.sh portable`; the monolithic ci-portable.yml
+# and its fail-closed correspondence guards are left intact. Retiring the
+# monolith is a follow-up that also teaches those guards the fan-out shape.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    # Self-test on CI-infra PRs without doubling cost on unrelated PRs.
+    paths:
+      - ".github/workflows/ci-portable-fanout.yml"
+      - "ci/**"
+      - "tests/e2e/**"
+      - "scripts/**"
+
+concurrency:
+  group: portable-fanout-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings -C link-arg=-llzma
+  RUSTDOCFLAGS: -D warnings
+  DETCORE_TEST_RUST_LOG: "off"
+  # One shared artifact name per run; every cell downloads it, cleanup deletes it.
+  BUILD_ARTIFACT: hermit-build-${{ github.run_id }}
+  BUILD_TARBALL: hermit-portable-build.tzst
+
+jobs:
+  build:
+    name: Build hermit + stage guests once
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      matrix: ${{ steps.cells.outputs.matrix }}
+      count: ${{ steps.cells.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize safe-ci-dag-runner submodule
+        run: git submodule update --init agent-utils
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: portable-fanout-build
+          cache-on-failure: true
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
+      - name: Rust components
+        run: rustup component add clippy rustfmt
+      # Build-once: reproduce exactly the portable DAG build-node commands that
+      # the e2e cells depend on (build.workspace, build.dbi_release,
+      # build.sabre_release, e2e.metadata, build.manifest_guests).
+      - name: Build workspace + third-party backends
+        run: cargo build --workspace --features third-party-backends
+      - name: Stage DBI release install
+        run: HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-common cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbi -p hermit-install
+      - name: Stage SaBRe release install
+        run: cargo build --release --locked -p detcore-sabre && HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-sabre cargo build --release --locked -p hermit-install && sha256sum target/install_pkg/rsrcs/sabre && cat target/install_pkg/rsrcs/sabre.revision
+      - name: Validate e2e metadata / DAG correspondence
+        run: ./ci/test_harness.sh validate
+      - name: Stage portable guest fixtures
+        run: ./ci/test_harness.sh build --lane portable --ci-only
+      - name: Enumerate portable (manifest x backend) cells from the audited plan
+        id: cells
+        run: |
+          set -euo pipefail
+          plan=$(./ci/test_harness.sh plan --lane portable --ci-only --format json)
+          # One matrix entry per non-empty (category, backend) required cell,
+          # plus any naked/native cells (backend-independent). Derived from the
+          # ratcheted plan so coverage == the trusted DAG by construction.
+          matrix=$(jq -c '
+            (([ .[] | select(.backend != null) | {category, backend} ] | unique)
+             + ([ .[] | select(.mode == "naked") | {category, backend: "naked"} ] | unique))
+            | sort_by(.category, .backend)
+            | { include: map({ category, backend, slug: (.category + "__" + .backend) }) }
+          ' <<<"$plan")
+          count=$(jq '.include | length' <<<"$matrix")
+          [[ "$count" -gt 0 ]] || { echo "empty portable cell matrix" >&2; exit 1; }
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Fanning out $count portable cells:" >&2
+          jq -r '.include[] | "  - \(.category) x \(.backend)"' <<<"$matrix" >&2
+      # Curated to the exact --prebuilt consumption set (debug hermit binary,
+      # staged backend install resources, and staged guest fixtures) rather than
+      # the whole multi-GB target/ tree, to keep the per-cell download cheap.
+      - name: Pack prebuilt tree
+        run: |
+          set -euo pipefail
+          tar --zstd -cf "$BUILD_TARBALL" \
+            --exclude='target/release/deps' \
+            --exclude='target/release/build' \
+            --exclude='target/release/incremental' \
+            --exclude='target/release/.fingerprint' \
+            --exclude='target/release/examples' \
+            target/debug/hermit \
+            target/release \
+            target/install_pkg \
+            target/e2e/build
+          ls -lh "$BUILD_TARBALL"
+      - name: Upload prebuilt tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUILD_ARTIFACT }}
+          path: ${{ env.BUILD_TARBALL }}
+          if-no-files-found: error
+          # Requirement: short-lived; a final cleanup job deletes it proactively.
+          retention-days: 1
+
+  cell:
+    name: "cell: ${{ matrix.slug }}"
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.build.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize safe-ci-dag-runner submodule
+        run: git submodule update --init agent-utils
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
+      - name: Enable unprivileged user and mount namespaces
+        run: |
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
+      - name: Download prebuilt tree
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BUILD_ARTIFACT }}
+          path: .
+      - name: Unpack prebuilt tree
+        run: |
+          set -euo pipefail
+          tar --zstd -xf "$BUILD_TARBALL"
+          rm -f "$BUILD_TARBALL"
+          test -x target/debug/hermit
+      - name: Run cell (${{ matrix.category }} x ${{ matrix.backend }})
+        run: |
+          set -euo pipefail
+          out="target/e2e/portable/${{ matrix.slug }}"
+          if [[ "${{ matrix.backend }}" == "naked" ]]; then
+            ./ci/test_harness.sh run --lane portable --category "${{ matrix.category }}" \
+              --mode naked --ci-only --allow-empty --prebuilt \
+              --results "$out/results.jsonl" --junit "$out/junit.xml"
+          else
+            ./ci/test_harness.sh run --lane portable --category "${{ matrix.category }}" \
+              --backend "${{ matrix.backend }}" --ci-only --allow-empty --prebuilt \
+              --results "$out/results.jsonl" --junit "$out/junit.xml"
+          fi
+      - name: Upload cell results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-results-portable-${{ matrix.slug }}
+          path: target/e2e/portable/${{ matrix.slug }}
+          if-no-files-found: warn
+          retention-days: 14
+
+  cleanup:
+    name: Delete prebuilt build artifact
+    needs: [build, cell]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      # Defense-in-depth: the 1-day retention is the backstop; this deletes the
+      # (large) binary artifact as soon as every cell has consumed it, on success
+      # OR failure, so a failed/cancelled run never leaves it lingering.
+      - name: Delete ${{ env.BUILD_ARTIFACT }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const name = `hermit-build-${context.runId}`;
+            const arts = await github.paginate(
+              github.rest.actions.listWorkflowRunArtifacts,
+              { owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId }
+            );
+            const mine = arts.filter(a => a.name === name);
+            if (mine.length === 0) {
+              core.info(`No artifact named ${name} to delete (already expired or never uploaded).`);
+            }
+            for (const a of mine) {
+              await github.rest.actions.deleteArtifact({
+                owner: context.repo.owner, repo: context.repo.repo, artifact_id: a.id,
+              });
+              core.info(`Deleted artifact ${a.name} (id=${a.id}, ${a.size_in_bytes} bytes).`);
+            }
