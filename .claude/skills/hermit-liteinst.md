@@ -16,7 +16,10 @@ Ratchet coverage upward with evidence; keep callback isolation correct.
 - The LiteInst Guest/Tool integration in `reverie` (and `liteinst2/` tooling in
   the parent when an experiment needs it).
 - LiteInst-specific handling in `hermit`.
-- LiteInst example-tool / real-program exercises.
+- LiteInst example-tool / real-program exercises. For a tight per-backend
+  iteration loop run **`make validate-liteinst`**, which runs ONLY the LiteInst
+  strict corpus (wraps `validate.sh --liteinst-compat-only`); the full
+  multi-backend suite is `./validate.sh`.
 
 ## Constraints
 

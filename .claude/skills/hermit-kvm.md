@@ -18,8 +18,10 @@ per-syscall cost/behavior comparison current.
 
 - KVM backend code in `reverie` (KVM guest/tool adapter, syscall transport,
   hypercall path) and the KVM-specific classification/handling in `hermit`.
-- The KVM columns of `validate.sh --backend-compat-only` (full strict corpus
-  per backend; non-blocking real numbers).
+- The KVM columns of the backend-parity matrix (`tests/backend-parity/run_matrix.py`).
+  For a tight per-backend iteration loop run **`make validate-kvm`**, which runs
+  ONLY the KVM corpus (needs `/dev/kvm`); the full multi-backend suite is
+  `./validate.sh`.
 - KVM example-tool / static-guest exercises.
 
 ## Constraints

@@ -16,7 +16,10 @@ selection/fork behavior of example tools correct.
 
 - `reverie/experimental/reverie-sabre/src/` and its focused tests.
 - SaBRe-specific `Guest`/`Tool` adapter surface and example-tool exercises.
-- The SaBRe columns of `validate.sh --backend-compat-only`.
+- The SaBRe columns of the compatibility suite. For a tight per-backend
+  iteration loop run **`make validate-sabre`**, which runs ONLY the SaBRe corpus
+  (wraps `validate.sh --sabre-compat-only`; needs `HERMIT_SABRE_BINARY`); the
+  full multi-backend suite is `./validate.sh`.
 
 ## Constraints
 

@@ -16,7 +16,10 @@ runtime footprint, RPATH) working.
 
 - The DBI client and `DbiGuest`/Tool adapter in `reverie`, and DBI-specific
   handling in `hermit`.
-- The DBI columns of `validate.sh --backend-compat-only`.
+- The DBI columns of the backend-parity matrix (`tests/backend-parity/run_matrix.py`).
+  For a tight per-backend iteration loop run **`make validate-dbi`**, which runs
+  ONLY the DBI corpus (builds with the `third-party-backends` feature); the full
+  multi-backend suite is `./validate.sh`.
 - DBI example-tool exercises and the vendored DynamoRIO runtime wiring.
 
 ## Constraints
