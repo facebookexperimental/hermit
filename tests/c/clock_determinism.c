@@ -64,10 +64,8 @@ static int check_clock(const struct clock_case* test) {
   }
 
   printf(
-      "%s gettime=%lld.%09ld nanosleep_rc=%d delta_ns=%lld\n",
+      "%s nanosleep_rc=%d delta_ns=%lld\n",
       test->name,
-      (long long)before.tv_sec,
-      before.tv_nsec,
       sleep_error,
       (long long)delta);
   return 0;

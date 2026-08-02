@@ -45,6 +45,7 @@
     {"test":"language-runtimes/python-io-subprocess-time","category":"language-runtimes","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"language-runtimes/python-random","category":"language-runtimes","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"system-utils/clock-determinism","category":"system-utils","lane":"portable","mode":"custom","backend":"ptrace"},
+    {"test":"system-utils/clock-determinism","category":"system-utils","lane":"portable","mode":"verify","backend":"liteinst"},
     {"test":"system-utils/clock-determinism","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"system-utils/date-nanoseconds","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"system-utils/date-nanoseconds","category":"system-utils","lane":"portable","mode":"verify","backend":"sabre"},
