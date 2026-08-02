@@ -251,14 +251,12 @@ function assert_parallel_portable_workflow {
         die "GitHub portable debug artifact must preserve the installed DBI runtime"
     [[ $(grep -Fxc '          test -f target/install_pkg/rsrcs/libdetcore_dbi.so' "$workflow") == 1 ]] ||
         die "GitHub portable debug shards must verify the installed DBI runtime"
-    [[ $(grep -Fxc '            target/install_pkg/rsrcs/dynamorio \' "$workflow") == 1 ]] ||
-        die "GitHub portable debug artifact must preserve the DynamoRIO runtime"
-    [[ $(grep -Fxc '            target/install_pkg/rsrcs/libreverie_dbi_client.so \' "$workflow") == 1 ]] ||
-        die "GitHub portable debug artifact must preserve the DynamoRIO client"
-    [[ $(grep -Fxc '          test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun' "$workflow") == 2 ]] ||
-        die "GitHub portable debug build and shards must verify the DynamoRIO launcher"
-    [[ $(grep -Fxc '          test -f target/install_pkg/rsrcs/libreverie_dbi_client.so' "$workflow") == 2 ]] ||
-        die "GitHub portable debug build and shards must verify the DynamoRIO client"
+    [[ $(grep -Fxc '    needs: [plan, build-debug, build-dbi]' "$workflow") == 1 ]] ||
+        die "GitHub portable debug shards must wait for the complete DBI install package"
+    [[ $(grep -Fxc '          test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun' "$workflow") == 1 ]] ||
+        die "GitHub portable debug shards must verify the DynamoRIO launcher"
+    [[ $(grep -Fxc '          test -f target/install_pkg/rsrcs/libreverie_dbi_client.so' "$workflow") == 1 ]] ||
+        die "GitHub portable debug shards must verify the DynamoRIO client"
 }
 
 function assert_validate_entrypoint {

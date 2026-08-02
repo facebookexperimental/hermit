@@ -203,14 +203,10 @@ jobs:
           # not depend on that mutable Cargo output directory.
           install -Dm755 target/debug/deps/libdetcore_dbi.so \
             target/install_pkg/rsrcs/libdetcore_dbi.so
-          test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun
-          test -f target/install_pkg/rsrcs/libreverie_dbi_client.so
           tar --zstd -cf "$DEBUG_TARBALL" \
             target/debug/hermit \
             target/debug/deps/libdetcore_dbi.so \
             target/install_pkg/rsrcs/libdetcore_dbi.so \
-            target/install_pkg/rsrcs/dynamorio \
-            target/install_pkg/rsrcs/libreverie_dbi_client.so \
             ignored/e2e/build
           ls -lh "$DEBUG_TARBALL"
       - name: Upload debug prebuilt tree
@@ -369,7 +365,7 @@ jobs:
   # ------------------------------------------------- test shards (debug-backed)
   test-debug:
     name: "test: ${{ matrix.slug }}"
-    needs: [plan, build-debug]
+    needs: [plan, build-debug, build-dbi]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -399,11 +395,18 @@ jobs:
         with:
           name: ${{ env.DEBUG_ARTIFACT }}
           path: .
-      - name: Unpack debug prebuilt tree
+      - name: Download dbi install package
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.RELEASE_DBI_ARTIFACT }}
+          path: .
+      - name: Unpack debug tree and dbi install package
         run: |
           set -euo pipefail
           tar --zstd -xf "$DEBUG_TARBALL"
           rm -f "$DEBUG_TARBALL"
+          tar --zstd -xf "$RELEASE_TARBALL"
+          rm -f "$RELEASE_TARBALL"
           test -x target/debug/hermit
           test -f target/install_pkg/rsrcs/libdetcore_dbi.so
           test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun
