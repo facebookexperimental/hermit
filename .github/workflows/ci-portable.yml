@@ -219,7 +219,7 @@ jobs:
       # exact release fingerprints/build outputs, so the final Hermit/install
       # staging command reuses this work instead of repeating the cold long pole.
       - name: Compile Detcore DBI release library
-        run: CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-8} cargo build --release --locked -p detcore-dbi
+        run: CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-64} cargo build --release --locked -p detcore-dbi
       - name: Pack dbi release compile cache
         run: |
           set -euo pipefail
