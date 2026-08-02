@@ -25,6 +25,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 static LITEINST_ADVANCED_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static LITEINST_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_COMPAT_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_SEMANTIC_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 
@@ -66,6 +67,31 @@ fn advanced_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "LiteInst advanced guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn mmap_guest() -> &'static Path {
+    LITEINST_MMAP_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-advanced");
+        fs::create_dir_all(&build_root).expect("failed to create LiteInst guest directory");
+        let guest = build_root.join("mmap_determinism");
+        let output = Command::new("cc")
+            .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/mmap_determinism.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile LiteInst mmap guest");
+        assert!(
+            output.status.success(),
+            "LiteInst mmap guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -154,6 +180,16 @@ fn assert_liteinst_virtual_time_is_continuous() {
         advanced_guest(),
         &["clock-progress"],
         b"clock-progress-ok\n",
+    );
+}
+
+#[test]
+fn liteinst_strict_verify_heap_growth_avoids_trampoline_mappings() {
+    let output = run_liteinst_strict_verify(mmap_guest(), &["heap"]);
+    assert!(
+        output.stdout.starts_with(b"heap "),
+        "heap-growth guest omitted its success marker: {}",
+        String::from_utf8_lossy(&output.stdout),
     );
 }
 

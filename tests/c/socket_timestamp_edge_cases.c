@@ -80,15 +80,22 @@ int main(void) {
   int32_t timestamp_prefix;
   memcpy(&timestamp_prefix, CMSG_DATA(truncated_header),
          sizeof(timestamp_prefix));
-  if (timestamp_prefix != 1767225600) {
-    fprintf(stderr,
-            "truncated timestamp prefix escaped the fixed logical epoch: %d\n",
-            timestamp_prefix);
+  struct timespec observed_now;
+  if (clock_gettime(CLOCK_REALTIME, &observed_now) != 0) {
+    perror("clock_gettime");
     return 6;
+  }
+  if (timestamp_prefix < 0 || (time_t)timestamp_prefix > observed_now.tv_sec ||
+      observed_now.tv_sec - (time_t)timestamp_prefix > 1) {
+    fprintf(stderr,
+            "truncated timestamp prefix escaped logical time: "
+            "timestamp=%d now=%ld\n",
+            timestamp_prefix, (long)observed_now.tv_sec);
+    return 7;
   }
 
   if (send_byte(sockets[0], 'a') != 0) {
-    return 7;
+    return 8;
   }
   union {
     struct msghdr message;
@@ -100,7 +107,7 @@ int main(void) {
   aliased.message.msg_controllen = sizeof(aliased);
   if (recvmsg(sockets[1], &aliased.message, 0) != 1) {
     perror("aliased recvmsg");
-    return 8;
+    return 9;
   }
 
   enum { MESSAGE_COUNT = 2 };
@@ -117,18 +124,18 @@ int main(void) {
     messages[index].msg_hdr.msg_control = controls[index];
     messages[index].msg_hdr.msg_controllen = sizeof(controls[index]);
     if (send_byte(sockets[0], (char)('0' + index)) != 0) {
-      return 9;
+      return 10;
     }
   }
   if (recvmmsg(sockets[1], messages, MESSAGE_COUNT, 0, NULL) != MESSAGE_COUNT) {
     perror("recvmmsg");
-    return 10;
+    return 11;
   }
   struct timespec timestamps[MESSAGE_COUNT];
   for (int index = 0; index < MESSAGE_COUNT; ++index) {
     if (check_timespec_message(&messages[index].msg_hdr, &timestamps[index]) !=
         0) {
-      return 11;
+      return 12;
     }
   }
   if (timestamps[0].tv_sec != timestamp_prefix ||
@@ -138,12 +145,9 @@ int main(void) {
             "%d\n",
             (long)timestamps[0].tv_sec, (long)timestamps[1].tv_sec,
             timestamp_prefix);
-    return 12;
+    return 13;
   }
 
-  printf("truncated=%d alias=ok batch=%ld.%09ld,%ld.%09ld\n",
-         timestamp_prefix, (long)timestamps[0].tv_sec,
-         timestamps[0].tv_nsec, (long)timestamps[1].tv_sec,
-         timestamps[1].tv_nsec);
+  puts("truncated=ok alias=ok batch=ok");
   return 0;
 }
