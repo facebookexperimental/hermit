@@ -457,14 +457,14 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "hermit-liteinst-runtime-artifact"
-version = "0.0.0"
+version = "0.2.0"
 dependencies = [
  "reverie-liteinst",
 ]
 
 [[package]]
 name = "hermit-liteinst-runtime-build"
-version = "0.0.0"
+version = "0.2.0"
 dependencies = [
  "goblin",
  "serde_json",
