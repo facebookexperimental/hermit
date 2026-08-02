@@ -25,6 +25,7 @@ use reverie::syscalls::PathPtr;
 use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
 
+use super::deterministic_stdio_inode;
 use crate::record_or_replay::RecordOrReplay;
 use crate::tool_global::determinize_inode;
 use crate::tool_local::Detcore;
@@ -178,7 +179,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 libc::S_IFSOCK => "socket",
                 _ => return Ok(result),
             };
-            let (inode, _) = determinize_inode(guest, stat.st_ino).await;
+            let inode = match deterministic_stdio_inode(fd) {
+                Some(inode) => inode,
+                None => determinize_inode(guest, stat.st_ino).await.0,
+            };
             format!("{kind}:[{inode}]").into_bytes()
         } else {
             return Ok(result);

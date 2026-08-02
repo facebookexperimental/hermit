@@ -2479,9 +2479,9 @@ impl RunOpts {
         };
         if let Some(backend_banner) = backend_banner {
             eprintln!(":: Backend: {backend_banner}");
-            std::io::stdout().write_all(&out1.stdout)?;
-            std::io::stderr().write_all(&out1.stderr)?;
         }
+        std::io::stdout().write_all(&out1.stdout)?;
+        std::io::stderr().write_all(&out1.stderr)?;
         Ok(status)
     }
 

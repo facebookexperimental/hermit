@@ -35,6 +35,7 @@ use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
+use super::deterministic_stdio_inode;
 use crate::config::SchedHeuristic;
 use crate::dirents::*;
 use crate::fd::*;
@@ -393,7 +394,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Some(inode) => inode,
                 None => self.inject_fstat(guest, target_fd).await?.st_ino,
             };
-            let (virtual_inode, _) = determinize_inode(guest, raw_inode).await;
+            let virtual_inode = match deterministic_stdio_inode(target_fd) {
+                Some(inode) => inode,
+                None => determinize_inode(guest, raw_inode).await.0,
+            };
             Some((
                 virtual_inode,
                 logical_flags,
@@ -1318,7 +1322,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     //     increase monolitically and won't be re-used (like ext4)
     //   - use logical modtime which could be used by program like GNU make
     //     to determine file changes
-    async fn determinize_stat<G, S>(&self, guest: &mut G, stat: S) -> Result<DetStat, Error>
+    async fn determinize_stat<G, S>(
+        &self,
+        guest: &mut G,
+        stat: S,
+        inode_override: Option<DetInode>,
+    ) -> Result<DetStat, Error>
     where
         G: Guest<Self>,
         S: Into<DetStat>,
@@ -1326,7 +1335,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         let cfg = guest.config().clone();
 
         let mut stat: DetStat = stat.into();
-        let (d_ino, global_mtime) = determinize_inode(guest, stat.inode).await;
+        let (d_ino, global_mtime) = match inode_override {
+            Some(inode) => {
+                let nanos = cfg
+                    .epoch
+                    .timestamp_nanos_opt()
+                    .expect("epoch cannot be represented in nanoseconds")
+                    as u64;
+                (inode, LogicalTime::from_nanos(nanos))
+            }
+            None => determinize_inode(guest, stat.inode).await,
+        };
         stat.inode = d_ino; // Reveal only the deterministic inode.
 
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1365,9 +1384,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             // filesystem (squashfs_ll).
             guest.inject(Syscall::from(call)).await?;
             let statptr = call.stat().ok_or(Errno::EFAULT)?;
+            let inode_override = match call {
+                StatFamily::Fstat(call) => deterministic_stdio_inode(call.fd()),
+                _ => None,
+            };
             let mut memory = guest.memory();
             let stat = memory.read_value(statptr.0)?;
-            let stat = self.determinize_stat(guest, stat).await?;
+            let stat = self.determinize_stat(guest, stat, inode_override).await?;
             memory.write_value(statptr.0, &stat.into())?;
             Ok(0)
         } else {
@@ -1389,7 +1412,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let statptr = call.statx().ok_or(Errno::EFAULT)?;
             let mut memory = guest.memory();
             let stat = memory.read_value(statptr.0)?;
-            let stat = self.determinize_stat(guest, stat).await?;
+            let stat = self.determinize_stat(guest, stat, None).await?;
             memory.write_value(statptr.0, &stat.into())?;
             Ok(0)
         } else {

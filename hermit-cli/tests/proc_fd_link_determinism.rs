@@ -11,6 +11,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
+#[path = "common/liteinst.rs"]
+mod liteinst_runtime;
+
 const STDOUT_LINK: &str = "/proc/self/fd/1";
 
 struct ProgramCase {
@@ -110,6 +113,7 @@ fn proc_fd_link_consumers_verify() {
 
 #[test]
 fn proc_fd_link_aliases_and_truncation_verify() {
+    liteinst_runtime::ensure_liteinst_runtime();
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
@@ -134,7 +138,15 @@ fn proc_fd_link_aliases_and_truncation_verify() {
         candidates: &[],
         args: &[],
     };
-    for backend in ["ptrace", "dbi"] {
+    let expected = concat!(
+        "canonical=pipe:[1001]\n",
+        "truncated=pipe:[1001\n",
+        "numeric=pipe:[1001]\n",
+        "dev-fd=pipe:[1001]\n",
+        "lexical=pipe:[1001]\n",
+        "readlinkat=pipe:[1001]\n",
+    );
+    for backend in ["ptrace", "dbi", "liteinst"] {
         let output = Command::new("timeout")
             .args(["--kill-after", "10s", "90s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
@@ -156,5 +168,6 @@ fn proc_fd_link_aliases_and_truncation_verify() {
             "{} omitted {backend} verification marker\nstdout:\n{stdout}\nstderr:\n{stderr}",
             case.name
         );
+        assert_eq!(stdout, expected, "{} differed on {backend}", case.name);
     }
 }
