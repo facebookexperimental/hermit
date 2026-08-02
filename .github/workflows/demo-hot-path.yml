@@ -110,7 +110,14 @@ jobs:
           set -euo pipefail
           actual="$(git -C "$SUITE_DIR/hermit" rev-parse HEAD)"
           test "$actual" = "$TARGET_SHA"
+          # The parent harness records a stable Hermit gitlink. Stage the
+          # overlaid PR SHA so its recursive submodule init cannot restore the
+          # older parent pin before the demos run.
+          git -C "$SUITE_DIR" add hermit
+          recorded="$(git -C "$SUITE_DIR" rev-parse :hermit)"
+          test "$recorded" = "$TARGET_SHA"
           echo "Demo suite Hermit SHA: $actual"
+          echo "Demo suite staged Hermit gitlink: $recorded"
           echo "Demo harness SHA: $(git -C "$SUITE_DIR" rev-parse HEAD)"
 
       - name: Ensure the repository Rust toolchain
