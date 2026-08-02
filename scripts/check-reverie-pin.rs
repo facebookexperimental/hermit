@@ -21,6 +21,9 @@
 //!   --allow-stale-reverie-pin "Depends on unmerged Reverie PR #123 for testing"
 //! ```
 
+#[path = "lib/rust_script_prelude.rs"]
+mod rust_script_prelude;
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
@@ -354,6 +357,7 @@ fn run() -> Result<i32, String> {
 }
 
 fn main() {
+    rust_script_prelude::init();
     match run() {
         Ok(code) => std::process::exit(code),
         Err(error) => {

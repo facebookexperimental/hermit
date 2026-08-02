@@ -64,6 +64,110 @@ sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 
 [[test]]
+id = "system-utils/example-date"
+description = "The user-facing nanosecond date example repeats under every applicable backend"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "date"]
+timeout_seconds = 60
+occasional = false
+direct = "./examples/date.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "The existing date-nanoseconds test owns the native-variation assertion"
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace", "dbi", "kvm", "sabre"]
+[test.modes.verify.backends_disabled]
+liteinst = "The preload runtime cannot survive the date script's post-start exec"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Strict verification owns the examples-directory parity contract"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The example is single-threaded"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
+
+[[test]]
+id = "system-utils/example-devrand"
+description = "The user-facing /dev/urandom example repeats under every applicable backend"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "hexdump"]
+timeout_seconds = 60
+occasional = false
+direct = "./examples/devrand.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "The existing random-device test owns the native-variation assertion"
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace", "dbi", "kvm", "sabre"]
+[test.modes.verify.backends_disabled]
+liteinst = "The preload runtime cannot survive the hexdump script's post-start exec"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Strict verification owns the examples-directory parity contract"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The example is single-threaded"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No edge-case Hermit arguments are required"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"
+
+[[test]]
 id = "system-utils/clock-determinism"
 description = "clock_gettime/gettimeofday output is identical across repeated Hermit runs"
 lane = "portable"

@@ -12,9 +12,9 @@
 //! asks about a single test:
 //!
 //! ```text
-//! ./scripts/manifest-cli.rs list [--bucket B] [--backend BE] [--tag T] [--mode M]
-//! ./scripts/manifest-cli.rs get  <test-id> [--mode M] [--backend BE] [--lane L] [--log LVL]
-//! ./scripts/manifest-cli.rs run  <test-id> [--mode M] [--backend BE] [--lane L] [--log LVL] [-- <extra hermit flags>]
+//! ./tests/manifest-cli.rs list [--bucket B] [--backend BE] [--tag T] [--mode M]
+//! ./tests/manifest-cli.rs get  <test-id> [--mode M] [--backend BE] [--lane L] [--log LVL]
+//! ./tests/manifest-cli.rs run  <test-id> [--mode M] [--backend BE] [--lane L] [--log LVL] [-- <extra hermit flags>]
 //! ```
 //!
 //! - `list` enumerates tests across all manifests, filterable by bucket,
@@ -35,6 +35,9 @@
 //! [dependencies]
 //! toml = "0.8"
 //! ```
+
+#[path = "../scripts/lib/rust_script_prelude.rs"]
+mod rust_script_prelude;
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -719,6 +722,7 @@ ENV:
 }
 
 fn main() -> ExitCode {
+    rust_script_prelude::init();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.is_empty() {
         usage();

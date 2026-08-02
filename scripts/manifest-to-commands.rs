@@ -24,6 +24,9 @@
 //! toml = "0.8"
 //! ```
 
+#[path = "lib/rust_script_prelude.rs"]
+mod rust_script_prelude;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -315,6 +318,7 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
 
 // TODO-HUMAN-REVIEW(PR-1081): Review the manifest-to-command CLI and generated shell contract.
 fn main() -> ExitCode {
+    rust_script_prelude::init();
     let root = repo_root();
     let manifests = root.join("tests/e2e/manifests");
     let output = root.join("ignored/e2e-commands");

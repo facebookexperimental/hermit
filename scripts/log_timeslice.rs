@@ -32,7 +32,11 @@
 //!   * `[dtid D] inbound rdtsc, new logical time: DetTime { ... rcbs: R, ... }`
 //!   * `DETLOG [syscall]... inbound syscall:`
 
-use std::io::{self, Read};
+#[path = "lib/rust_script_prelude.rs"]
+mod rust_script_prelude;
+
+use std::io::Read;
+use std::io::{self};
 
 #[derive(Default, Clone)]
 struct Slice {
@@ -117,6 +121,7 @@ fn label(s: &Slice) -> String {
 }
 
 fn main() {
+    rust_script_prelude::init();
     let mut input = String::new();
     io::stdin().read_to_string(&mut input).expect("read stdin");
 
@@ -415,8 +420,15 @@ fn report(slices: &[Slice], first_wall: Option<i128>, last_wall: Option<i128>) {
     if !stuck.is_empty() {
         let idxs: Vec<String> = stuck.iter().map(|s| label(s)).collect();
         let show = idxs.len().min(20);
-        println!("  affected: {}{}", idxs[..show].join(", "),
-            if idxs.len() > show { format!(", … (+{})", idxs.len() - show) } else { String::new() });
+        println!(
+            "  affected: {}{}",
+            idxs[..show].join(", "),
+            if idxs.len() > show {
+                format!(", … (+{})", idxs.len() - show)
+            } else {
+                String::new()
+            }
+        );
     }
 
     // Big virtual jumps.

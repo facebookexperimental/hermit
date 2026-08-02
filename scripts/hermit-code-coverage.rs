@@ -13,6 +13,9 @@
 //! serde_json = "1"
 //! ```
 
+#[path = "lib/rust_script_prelude.rs"]
+mod rust_script_prelude;
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
@@ -1050,6 +1053,7 @@ fn run() -> Result<ExitCode, String> {
 }
 
 fn main() -> ExitCode {
+    rust_script_prelude::init();
     match run() {
         Ok(code) => code,
         Err(error) => {

@@ -1,17 +1,14 @@
-#!/usr/bin/env run-cargo-script
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
+#!/usr/bin/env rust-script
+//! Copyright (c) Meta Platforms, Inc. and affiliates.
+//! All rights reserved.
+//!
+//! This source code is licensed under the BSD-style license found in the
+//! LICENSE file in the root directory of this source tree.
+//!
 //! Script to update hermit_syscalls.csv
 //!
-//! This is for interactive use on devservers, so it's fine to use cargo.
-//! Prereqs:
-//!    cargo install cargo-script
+//! This is for interactive use on devservers. It follows the repository's
+//! rust-script convention so it shares the same CLI process prelude.
 //!
 //! Partial Cargo manifest:
 //!
@@ -20,6 +17,9 @@
 //! csv = "1.1.3"
 //! ```
 
+#[path = "lib/rust_script_prelude.rs"]
+mod rust_script_prelude;
+
 extern crate csv;
 use std::io;
 use std::process::Command;
@@ -27,7 +27,6 @@ use std::process::Command;
 use csv::Reader;
 use csv::StringRecord;
 use csv::Writer;
-use csv::WriterBuilder;
 
 fn search_and_count_hits(syscall_name: &str) -> usize {
     let output = Command::new("rg")
@@ -39,6 +38,7 @@ fn search_and_count_hits(syscall_name: &str) -> usize {
 }
 
 fn main() {
+    rust_script_prelude::init();
     let fd =
         std::fs::File::open("./hermit_syscalls.csv").expect("Could not open ./hermit_syscalls.csv");
     let mut rdr = Reader::from_reader(fd);
@@ -72,9 +72,9 @@ fn main() {
                 &format!("{}", search_and_count_hits(name)),
                 &record,
             );
-            wtr.write_record(&record);
+            wtr.write_record(&record).unwrap();
         } else {
-            wtr.write_record(&record);
+            wtr.write_record(&record).unwrap();
         }
     }
 }

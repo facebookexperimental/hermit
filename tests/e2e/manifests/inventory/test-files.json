@@ -1832,6 +1832,12 @@
       "why": "tests/helpers.bzl is owned by Meta Buck test targets: helpers.bzl defines Buck macros and target wiring for internal tests. Buck evaluates it during graph construction; it is build policy, not guest code runnable by the public manifest harness."
     },
     {
+      "path": "tests/manifest-cli.rs",
+      "disposition": "special-driver",
+      "runner": "test-corpus operators",
+      "why": "tests/manifest-cli.rs is owned by test-corpus operators: This rust-script command lists, renders, and runs centrally declared manifest cells for interactive inspection. It is a method over the test corpus rather than a guest workload, and classifying it as a manifest test would recursively ask the CLI to execute itself under Hermit."
+    },
+    {
       "path": "tests/python/hashseed_order.py",
       "disposition": "guest-fixture",
       "runner": "hermit-cli Python integration targets",

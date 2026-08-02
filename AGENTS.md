@@ -114,8 +114,12 @@ and the reason is documented.
 - Project scripts use rust-script as `.rs` files with the shebang
   `#!/usr/bin/env rust-script`.
 - Prefer rust-script over Python for all new scripts.
-- Scripts are usually single files, but may be split into subdirectories when
-  useful.
+- `scripts/` is reserved for repository-wide utilities. Co-locate actions over
+  a directory's data with that directory; see `docs/DIRECTORY_ACTIONS.md`.
+- Standalone CLI scripts must call `scripts/lib/rust_script_prelude.rs::init`
+  before producing output so Unix pipelines terminate cleanly on `SIGPIPE`.
+- Scripts are usually single files, but shared support may live under
+  `scripts/lib/`.
 - Install rust-script with `cargo install rust-script` if it is not already
   available.
 

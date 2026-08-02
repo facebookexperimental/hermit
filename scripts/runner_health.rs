@@ -19,6 +19,9 @@
 //! This script persists the first observation of an offline runner so repeated
 //! checks can alert only after the configured grace period has really elapsed.
 
+#[path = "lib/rust_script_prelude.rs"]
+mod rust_script_prelude;
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
@@ -612,6 +615,7 @@ fn run(options: Options) -> Result<bool, String> {
 }
 
 fn main() -> ExitCode {
+    rust_script_prelude::init();
     let options = match parse_options(env::args().skip(1)) {
         Ok(Some(options)) => options,
         Ok(None) => {
