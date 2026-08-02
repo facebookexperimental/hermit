@@ -13,7 +13,7 @@ MANIFEST_ROOT="$TEST_ROOT/manifests"
 INVENTORY="$MANIFEST_ROOT/inventory/test-files.json"
 EXPECTED_PLAN="$ROOT_DIR/ci/expected-e2e-plan.json"
 HERMIT_BIN=${HERMIT_BIN:-$ROOT_DIR/target/debug/hermit}
-RESULT_ROOT=${E2E_RESULT_ROOT:-$ROOT_DIR/target/e2e}
+RESULT_ROOT=${E2E_RESULT_ROOT:-$ROOT_DIR/ignored/e2e}
 RUN_ID=${E2E_RUN_ID:-"local-$(date +%s)-$$"}
 SOURCE_TREE_SHA=$(git -C "$ROOT_DIR" rev-parse HEAD)
 BUILD_ROOT=${E2E_BUILD_ROOT:-$RESULT_ROOT/build/$SOURCE_TREE_SHA}
@@ -319,7 +319,7 @@ function audit_ci_correspondence {
         dag="$DAG_ROOT/$lane.json"
         jq -e --arg lane "$lane" '
             def expected_command($m):
-                "./ci/test_harness.sh run --lane \($m.lane) --category \($m.category) --ci-only --allow-empty --prebuilt --results target/e2e/\($m.lane)/\($m.category)/results.jsonl --junit target/e2e/\($m.lane)/\($m.category)/junit.xml";
+                "./ci/test_harness.sh run --lane \($m.lane) --category \($m.category) --ci-only --allow-empty --prebuilt --results ignored/e2e/\($m.lane)/\($m.category)/results.jsonl --junit ignored/e2e/\($m.lane)/\($m.category)/junit.xml";
             ([.steps[] | select(.cmd | startswith("./ci/test_harness.sh run "))] | all(has("manifest")))
             and ([.steps[] | select(has("manifest"))] | all(
                 . as $step

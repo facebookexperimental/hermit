@@ -105,6 +105,6 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: e2e-results-${{ github.job }}
-        path: target/e2e/portable
+        path: ignored/e2e/portable
         if-no-files-found: error
         retention-days: 14

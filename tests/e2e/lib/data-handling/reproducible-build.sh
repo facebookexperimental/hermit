@@ -38,8 +38,8 @@ EOF
 
 if [[ ${1:-} == --guest ]]; then
     proc_macro=${2:?build_timestamp proc-macro path is required}
-    mkdir -p "$REPO_ROOT/target/e2e-data-handling"
-    work=$(mktemp -d "$REPO_ROOT/target/e2e-data-handling/build-crate.XXXXXX")
+    mkdir -p "$REPO_ROOT/ignored/e2e-data-handling"
+    work=$(mktemp -d "$REPO_ROOT/ignored/e2e-data-handling/build-crate.XXXXXX")
     trap 'rm -rf -- "$work"' EXIT
     write_crate "$work"
 
@@ -67,10 +67,10 @@ require_tools cargo rustc cc sha256sum awk dirname
 # Guest rustc then invokes the published build_timestamp proc-macro while
 # compiling the final application; that invocation is the nondeterministic
 # operation this test places under strict verification.
-mkdir -p "$REPO_ROOT/target/e2e-data-handling"
+mkdir -p "$REPO_ROOT/ignored/e2e-data-handling"
 fixture_dir=$(mktemp -d "${TMPDIR:-/tmp}/hermit-build-fetch.XXXXXX")
 dependency_dir=$(mktemp -d \
-    "$REPO_ROOT/target/e2e-data-handling/build-deps.XXXXXX")
+    "$REPO_ROOT/ignored/e2e-data-handling/build-deps.XXXXXX")
 trap 'rm -rf -- "$fixture_dir" "$dependency_dir"' EXIT
 write_crate "$fixture_dir"
 CARGO_TARGET_DIR=$dependency_dir \

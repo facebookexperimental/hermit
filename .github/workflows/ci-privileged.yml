@@ -93,6 +93,6 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: e2e-results-${{ github.job }}
-        path: target/e2e/privileged
+        path: ignored/e2e/privileged
         if-no-files-found: error
         retention-days: 14
