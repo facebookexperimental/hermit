@@ -559,6 +559,72 @@ jobs:
           retention-days: 1
           compression-level: 0
 
+  # These known-red exec probes stay visible and publish structured evidence,
+  # but do not taint the required portable result while SaBRe's private
+  # coordinator socket cannot survive guest exec.
+  sabre_non_gated_parity:
+    name: SaBRe non-gating exec diagnostics
+    needs: build-aux
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      HERMIT_BIN: ${{ github.workspace }}/target/release/hermit
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bsdextrautils jq libunwind-dev liblzma-dev zstd
+      - name: Enable unprivileged user and mount namespaces
+        run: |
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
+      - name: Download full release prebuilt tree
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.RELEASE_ARTIFACT }}
+          path: .
+      - name: Unpack full release prebuilt tree
+        run: |
+          set -euo pipefail
+          tar --zstd -xf "$RELEASE_TARBALL"
+          rm -f "$RELEASE_TARBALL"
+          test -x target/release/hermit
+          test -x target/install_pkg/rsrcs/sabre
+      - name: Run known-red SaBRe exec probes
+        run: |
+          set -euo pipefail
+          failures=0
+          probe() {
+            test_id=$1
+            slug=${test_id//\//-}
+            out="ignored/e2e/sabre-non-gating/$slug"
+            if timeout --foreground --kill-after=5s 75s \
+              ./ci/test_harness.sh run --lane portable --test "$test_id" \
+                --mode verify --backend sabre --probe-disabled \
+                --results "$out/results.jsonl" --junit "$out/junit.xml"; then
+              echo "::notice::SaBRe diagnostic unexpectedly passed: $test_id"
+            else
+              failures=$((failures + 1))
+              echo "::warning::Known SaBRe exec gap remains: $test_id"
+            fi
+          }
+          probe data-handling/archive-roundtrip
+          probe system-utils/date-nanoseconds
+          probe system-utils/random-device
+          echo "SaBRe non-gating diagnostics: $failures known-red probe(s)."
+      - name: Upload SaBRe diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sabre-non-gating-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ignored/e2e/sabre-non-gating
+          if-no-files-found: warn
+          retention-days: 14
+
   # ------------------------------------------ reduce per-cell transport evidence
   reduce-e2e:
     name: Reduce e2e parity archives
@@ -654,7 +720,7 @@ jobs:
     name: Delete prebuilt build artifacts
     # Name every artifact consumer directly. In particular, test-debug is a
     # matrix job whose integration shard owns test.cli and the run_dbi_* tests.
-    needs: [test-debug, test-release, e2e, reduce-e2e, regular]
+    needs: [test-debug, test-release, e2e, sabre_non_gated_parity, reduce-e2e, regular]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

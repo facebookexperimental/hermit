@@ -259,18 +259,42 @@ function assert_parallel_portable_workflow {
         die "GitHub portable debug shards must verify the DynamoRIO launcher"
     [[ $(grep -Fxc '          test -f target/install_pkg/rsrcs/libreverie_dbi_client.so' "$workflow") == 1 ]] ||
         die "GitHub portable debug shards must verify the DynamoRIO client"
-    [[ $(grep -Fxc '      - name: Enable unprivileged user and mount namespaces' "$workflow") == 3 ]] ||
-        die "GitHub portable debug, release, and e2e shards must enable user namespaces"
-    [[ $(grep -Fxc '            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0' "$workflow") == 3 ]] ||
+    [[ $(grep -Fxc '      - name: Enable unprivileged user and mount namespaces' "$workflow") == 4 ]] ||
+        die "GitHub portable debug, release, e2e, and SaBRe diagnostics must enable user namespaces"
+    [[ $(grep -Fxc '            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0' "$workflow") == 4 ]] ||
         die "GitHub portable test shards must lift AppArmor's user-namespace restriction"
-    [[ $(grep -Fxc '    needs: [test-debug, test-release, e2e, reduce-e2e, regular]' "$workflow") == 1 ]] ||
+    [[ $(grep -Fxc '    needs: [test-debug, test-release, e2e, sabre_non_gated_parity, reduce-e2e, regular]' "$workflow") == 1 ]] ||
         die "GitHub portable artifact cleanup must wait for every test consumer"
+    [[ $(grep -Fxc '  sabre_non_gated_parity:' "$workflow") == 1 ]] ||
+        die "GitHub portable workflow must retain the SaBRe non-gating diagnostic job"
+    [[ $(grep -Fxc '    continue-on-error: true' "$workflow") == 1 ]] ||
+        die "SaBRe exec diagnostics must remain explicitly non-gating"
+    [[ $(grep -Fxc '          probe data-handling/archive-roundtrip' "$workflow") == 1 ]] ||
+        die "SaBRe diagnostics must probe archive-roundtrip"
+    [[ $(grep -Fxc '          probe system-utils/date-nanoseconds' "$workflow") == 1 ]] ||
+        die "SaBRe diagnostics must probe date-nanoseconds"
+    [[ $(grep -Fxc '          probe system-utils/random-device' "$workflow") == 1 ]] ||
+        die "SaBRe diagnostics must probe random-device"
+    [[ $(grep -Fc -- '--mode verify --backend sabre --probe-disabled' "$workflow") == 1 ]] ||
+        die "SaBRe diagnostics must execute disabled cells through the harness"
     jq -e '
         .debug_shards[]
         | select(.slug == "integration")
         | .nodes | index("test.cli") != null
     ' "$ROOT_DIR/ci/portable-shards.json" >/dev/null ||
         die "GitHub portable integration shard must retain the run_dbi_* CLI tests"
+}
+
+function assert_privileged_diagnostics {
+    local workflow=$1
+    [[ $(grep -Fxc '    - name: Run non-gating occasional KVM probes' "$workflow") == 1 ]] ||
+        die "GitHub privileged workflow must run the occasional KVM diagnostics"
+    [[ $(grep -Fc -- '--ci-only --include-occasional' "$workflow") == 2 ]] ||
+        die "GitHub privileged workflow must build and run occasional KVM cells"
+    [[ $(grep -Fxc '      continue-on-error: true' "$workflow") == 1 ]] ||
+        die "GitHub occasional KVM diagnostics must remain explicitly non-gating"
+    [[ $(grep -Fxc '              --results ignored/e2e/privileged/occasional/results.jsonl \' "$workflow") == 1 ]] ||
+        die "GitHub occasional KVM diagnostics must publish structured results"
 }
 
 function assert_validate_entrypoint {
@@ -320,6 +344,7 @@ function audit_ci_correspondence {
     # shellcheck disable=SC2016
     assert_workflow_entrypoint privileged "$ROOT_DIR/.github/workflows/ci-privileged.yml" \
         'timeout --foreground --kill-after=10s 270s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner flock /tmp/hermit-privileged-pmu.lock ci/run-dag.sh privileged -j 2 --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
+    assert_privileged_diagnostics "$ROOT_DIR/.github/workflows/ci-privileged.yml"
     # shellcheck disable=SC2016
     assert_validate_entrypoint portable run_portable_only_suite \
         '    run_ci_manifest_lane portable "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}"'
