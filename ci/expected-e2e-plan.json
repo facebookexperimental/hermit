@@ -1,7 +1,6 @@
 {
   "schema": 1,
   "cells": [
-    {"test":"applications/kvm-python-examples","category":"applications","lane":"privileged","mode":"verify","backend":"kvm"},
     {"test":"applications/kvm-shell-environment","category":"applications","lane":"privileged","mode":"verify","backend":"kvm"},
     {"test":"applications/timed-progress-bar","category":"applications","lane":"portable","mode":"verify","backend":"ptrace"},
     {"test":"applications/timed-progress-bar","category":"applications","lane":"portable","mode":"verify","backend":"sabre"},

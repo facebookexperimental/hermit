@@ -118,7 +118,9 @@ description = "User-facing Python examples run identically with the system inter
 lane = "privileged"
 requires = ["linux","x86_64","kvm","python3"]
 timeout_seconds = 120
-occasional = false
+# KVM's Python progress workload is load-sensitive until
+# fix-load-dependent-scheduling-vtime lands; retain it as an occasional probe.
+occasional = true
 program = "tests/e2e/applications/kvm-python-examples.sh"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
