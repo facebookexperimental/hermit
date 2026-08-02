@@ -44,7 +44,7 @@ pub const E9PATCH_BACKEND_ENV: &str = "HERMIT_E9PATCH_BACKEND";
 /// A/B-measured against `preprocess_us` within a single build.
 const NO_DIGEST_CACHE_ENV: &str = "HERMIT_E9PATCH_NO_DIGEST_CACHE";
 
-const REWRITE_SCHEMA_VERSION: u32 = 6;
+const REWRITE_SCHEMA_VERSION: u32 = 7;
 
 /// Result of preparing the main guest ELF for the e9patch backend.
 // TODO-HUMAN-REVIEW(PR-594): Review cached rewrite result semantics.
@@ -98,6 +98,14 @@ struct RewriteMetadata {
     patched_sites: usize,
     recovered_sites: usize,
     b0_sites: usize,
+    /// Size and modification time of the rewritten artifact recorded at rewrite
+    /// time. A warm run trusts the content-addressed artifact by this `(len,
+    /// mtime)` stamp instead of re-hashing the whole (multi-MiB) file every run,
+    /// matching the tool-digest memo's trust model. The schema-version bump
+    /// invalidates pre-existing metadata that lacks these fields.
+    output_len: u64,
+    output_mtime_seconds: i64,
+    output_mtime_nanoseconds: i64,
 }
 
 /// Memoized SHA-256 of a trusted executable, keyed on its `(len, mtime)` so an
@@ -158,7 +166,7 @@ fn prepare_in_impl(
 ) -> Result<PreparedBinary, Error> {
     let cache_dir = cache_dir.as_ref();
     ensure_private_cache_dir(cache_dir)?;
-    let snapshot = snapshot_binary(binary.as_ref(), cache_dir)?;
+    let snapshot = load_or_snapshot_binary(binary.as_ref(), cache_dir)?;
     let result = load_or_generate(&snapshot.binary, cache_dir)?;
     if !trusted_regular_file(&result.cache_path, false) {
         return Err(Error::msg(format!(
@@ -362,6 +370,12 @@ fn prepare_in_impl(
             rewritten.display()
         )
     })?;
+    let rewritten_metadata = fs::symlink_metadata(&rewritten).with_context(|| {
+        format!(
+            "failed to stat persisted rewritten executable {}",
+            rewritten.display()
+        )
+    })?;
     write_metadata(
         &metadata_path,
         &RewriteMetadata {
@@ -370,6 +384,9 @@ fn prepare_in_impl(
             patched_sites: patched,
             recovered_sites: total,
             b0_sites,
+            output_len: rewritten_metadata.len(),
+            output_mtime_seconds: rewritten_metadata.mtime(),
+            output_mtime_nanoseconds: rewritten_metadata.mtime_nsec(),
         },
     )?;
 
@@ -506,8 +523,24 @@ fn read_valid_rewrite(
     valid_cached_coverage(&metadata, expected).then_some(())?;
     let binary = rewrite_artifact_path(cache_dir, rewrite_key, metadata.output_digest);
     let mode = fs::metadata(&binary).ok()?.permissions().mode() & 0o777;
-    (mode == expected.input_mode && trusted_file_with_digest(&binary, metadata.output_digest, true))
-        .then_some((binary, metadata))
+    // Trust the content-addressed artifact by its recorded `(len, mtime)` stamp
+    // rather than re-hashing the whole file on every warm run: the artifact lives
+    // in the private, uid-owned, ancestor-validated 0700 cache and its name
+    // encodes `output_digest`, the same trust model the tool-digest memo relies
+    // on. HERMIT_E9PATCH_NO_DIGEST_CACHE restores the always-re-hash behavior so
+    // the old warm-path cost can be A/B-measured against `preprocess_us`.
+    let verified = if env::var_os(NO_DIGEST_CACHE_ENV).is_some() {
+        trusted_file_with_digest(&binary, metadata.output_digest, true)
+    } else {
+        fresh_cached_file(
+            &binary,
+            metadata.output_len,
+            metadata.output_mtime_seconds,
+            metadata.output_mtime_nanoseconds,
+            true,
+        )
+    };
+    (mode == expected.input_mode && verified).then_some((binary, metadata))
 }
 
 fn valid_cached_coverage(metadata: &RewriteMetadata, expected: &RewriteIdentity) -> bool {
@@ -616,6 +649,84 @@ fn trusted_regular_file(path: &Path, executable: bool) -> bool {
 fn trusted_file_with_digest(path: &Path, expected: Digest, executable: bool) -> bool {
     trusted_regular_file(path, executable)
         && Digest::digest_path(path).is_ok_and(|actual| actual == expected)
+}
+
+/// Trust a content-addressed cache file by its recorded `(len, mtime)` without
+/// re-hashing it. `path` must be a trusted regular file (uid-owned, not a
+/// symlink, not group/other-writable) whose current size and modification time
+/// match the recorded stamp. Any mismatch returns false so the caller falls back
+/// to regenerating (or, under the diagnostic toggle, re-hashing) the entry.
+fn fresh_cached_file(
+    path: &Path,
+    len: u64,
+    mtime_seconds: i64,
+    mtime_nanoseconds: i64,
+    executable: bool,
+) -> bool {
+    trusted_regular_file(path, executable)
+        && fs::symlink_metadata(path).is_ok_and(|metadata| {
+            metadata.len() == len
+                && metadata.mtime() == mtime_seconds
+                && metadata.mtime_nsec() == mtime_nanoseconds
+        })
+}
+
+/// Snapshot the guest ELF, reusing the memoized digest and content-addressed
+/// snapshot copy when the guest is unchanged so the multi-MiB ELF is not read
+/// and re-hashed on every run. Falls back to the authoritative `snapshot_binary`
+/// on any miss, on a stale sidecar, or when `HERMIT_E9PATCH_NO_DIGEST_CACHE` is
+/// set, and always refreshes the sidecar on that slow path.
+fn load_or_snapshot_binary(binary: &Path, cache_dir: &Path) -> Result<BinarySnapshot, Error> {
+    if env::var_os(NO_DIGEST_CACHE_ENV).is_none()
+        && let Some(snapshot) = fast_snapshot(binary, cache_dir)
+    {
+        return Ok(snapshot);
+    }
+    let snapshot = snapshot_binary(binary, cache_dir)?;
+    store_file_digest(binary, snapshot.digest, cache_dir);
+    Ok(snapshot)
+}
+
+/// Fast path for [`load_or_snapshot_binary`]: reconstruct the guest snapshot from
+/// the `(path, len, mtime)`-keyed digest memo without reading the guest bytes.
+/// Returns `None` (never an error) whenever the fast path cannot be taken safely
+/// so the caller falls back to the authoritative slow path. Preserves the slow
+/// path's refusal of privilege-bearing guests: a set-ID or file-capability
+/// binary is never fast-pathed (the slow path turns it into a hard error).
+fn fast_snapshot(binary: &Path, cache_dir: &Path) -> Option<BinarySnapshot> {
+    let original = fs::canonicalize(binary).ok()?;
+    let digest = cached_file_digest(&original, cache_dir)?;
+    let metadata = fs::symlink_metadata(&original).ok()?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || metadata.mode() & 0o6000 != 0
+    {
+        return None;
+    }
+    // A file capability is privilege-bearing even without a set-ID bit; opening
+    // the guest is cheap (no read) and lets the fast path refuse it too.
+    let file = File::open(&original).ok()?;
+    if file_has_security_capability(&file).ok()? {
+        return None;
+    }
+    // The snapshot is content-addressed by the guest digest; trust it by stat and
+    // require its length to equal the guest's so a truncated or mismatched copy
+    // forces a full re-snapshot.
+    let snapshot = cache_dir
+        .join("elf-snapshots")
+        .join(format!("{digest}.elf"));
+    if !trusted_regular_file(&snapshot, true)
+        || fs::symlink_metadata(&snapshot).ok()?.len() != metadata.len()
+    {
+        return None;
+    }
+    Some(BinarySnapshot {
+        original,
+        binary: snapshot,
+        digest,
+        mode: metadata.mode() & 0o777,
+    })
 }
 
 fn file_digest_cache_path(cache_dir: &Path, canonical: &Path) -> PathBuf {
@@ -879,6 +990,7 @@ mod tests {
         let mut permissions = fs::metadata(&artifact).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&artifact, permissions).unwrap();
+        let artifact_stat = fs::symlink_metadata(&artifact).unwrap();
         let metadata_path = directory.path().join("rewrite.json");
         let mut metadata = RewriteMetadata {
             identity: expected,
@@ -886,6 +998,9 @@ mod tests {
             patched_sites: 24,
             recovered_sites: 24,
             b0_sites: 0,
+            output_len: artifact_stat.len(),
+            output_mtime_seconds: artifact_stat.mtime(),
+            output_mtime_nanoseconds: artifact_stat.mtime_nsec(),
         };
         let write = |metadata: &RewriteMetadata| {
             fs::write(&metadata_path, serde_json::to_vec(metadata).unwrap()).unwrap();
@@ -947,6 +1062,121 @@ mod tests {
             second.digest,
             true
         ));
+    }
+
+    #[test]
+    fn fast_snapshot_reuses_memo_and_falls_back_on_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("input");
+        fs::write(&binary, b"guest-elf-contents").unwrap();
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&binary, permissions).unwrap();
+        let cache = directory.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+
+        // No memo yet: the fast path declines and the slow path populates it.
+        assert!(fast_snapshot(&binary, &cache).is_none());
+        let slow = load_or_snapshot_binary(&binary, &cache).unwrap();
+
+        // Warm: the fast path reconstructs the identical snapshot from the memo,
+        // and it agrees with the authoritative slow-path result.
+        let fast = fast_snapshot(&binary, &cache).expect("warm fast path");
+        assert_eq!(fast.digest, slow.digest);
+        assert_eq!(fast.binary, slow.binary);
+        assert_eq!(fast.mode, slow.mode);
+        assert_eq!(fast.original, slow.original);
+
+        // A changed guest (different length) invalidates the stale memo, so the
+        // fast path declines and the slow path re-snapshots the new contents.
+        fs::write(&binary, b"different-guest-elf-contents").unwrap();
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&binary, permissions).unwrap();
+        assert!(fast_snapshot(&binary, &cache).is_none());
+        let refreshed = load_or_snapshot_binary(&binary, &cache).unwrap();
+        assert_ne!(refreshed.digest, slow.digest);
+        assert!(fast_snapshot(&binary, &cache).is_some());
+    }
+
+    #[test]
+    fn fast_snapshot_refuses_setuid_guest() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("input");
+        fs::write(&binary, b"guest").unwrap();
+        let cache = directory.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        // Prime the digest memo while the file is still an ordinary executable.
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&binary, permissions).unwrap();
+        let real = Digest::digest_path(&binary).unwrap();
+        store_file_digest(&binary, real, &cache);
+        assert!(fast_snapshot(&binary, &cache).is_none()); // no snapshot copy yet
+        load_or_snapshot_binary(&binary, &cache).unwrap();
+        assert!(fast_snapshot(&binary, &cache).is_some());
+
+        // Turning on the set-UID bit must force the fast path to decline so the
+        // slow path can reject the privilege-bearing guest.
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o4755);
+        fs::set_permissions(&binary, permissions).unwrap();
+        assert!(fast_snapshot(&binary, &cache).is_none());
+        assert!(snapshot_binary(&binary, &cache).is_err());
+    }
+
+    #[test]
+    fn warm_rewrite_trusts_len_mtime_stamp_without_rehash() {
+        let directory = tempfile::tempdir().unwrap();
+        let rewrite_key = "rewrite";
+        let expected = RewriteIdentity {
+            schema_version: REWRITE_SCHEMA_VERSION,
+            input_mode: 0o755,
+            input_digest: Digest::new(b"input"),
+            e9tool_digest: Digest::new(b"e9tool"),
+            instruction_map_digest: Digest::new(b"map"),
+            candidate_sites: 24,
+            e9patch_backend_digest: Digest::new(b"backend"),
+        };
+        let artifact_contents = b"rewritten-artifact";
+        let output_digest = Digest::new(artifact_contents);
+        let artifact = rewrite_artifact_path(directory.path(), rewrite_key, output_digest);
+        fs::write(&artifact, artifact_contents).unwrap();
+        let mut permissions = fs::metadata(&artifact).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&artifact, permissions).unwrap();
+        let stat = fs::symlink_metadata(&artifact).unwrap();
+        let metadata_path = directory.path().join("rewrite.json");
+        let metadata = RewriteMetadata {
+            identity: expected,
+            output_digest,
+            patched_sites: 24,
+            recovered_sites: 24,
+            b0_sites: 0,
+            output_len: stat.len(),
+            output_mtime_seconds: stat.mtime(),
+            output_mtime_nanoseconds: stat.mtime_nsec(),
+        };
+        fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+
+        // A matching `(len, mtime)` stamp is trusted with no re-hash. Corrupting
+        // the bytes in place (without touching the stamp fields) is deliberately
+        // still accepted here — the point is that the whole-file hash is skipped;
+        // integrity rests on the private uid-owned cache, exactly as the
+        // tool-digest memo does.
+        assert!(
+            read_valid_rewrite(directory.path(), rewrite_key, &metadata_path, &expected).is_some()
+        );
+
+        // A stale stamp (wrong recorded length) is rejected, forcing a rebuild.
+        let stale = RewriteMetadata {
+            output_len: stat.len() + 1,
+            ..metadata
+        };
+        fs::write(&metadata_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+        assert!(
+            read_valid_rewrite(directory.path(), rewrite_key, &metadata_path, &expected).is_none()
+        );
     }
 
     #[test]
