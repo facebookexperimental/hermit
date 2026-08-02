@@ -126,24 +126,44 @@ root-process-identity snapshot above.
 
 ## Known gaps
 
-The following 13 cells are deterministic inside SaBRe but do not match ptrace
-guest output, so they remain disabled:
+The historical output-differ audit contained 18 cells. Five now have
+byte-identical ptrace/SaBRe output and are enabled. Ten remain under the owners
+of clock, multithreaded-random, SIGCHLD, or multithreaded-identity semantics.
+The three remaining non-gated cells pass SaBRe L2 but stay disabled because
+their guest output is still backend-specific:
 
-```text
-c-programs/dbi-pid-virtualization
-c-programs/print-memaddrs
-c-programs/proc-fdinfo
-c-programs/random-sources
-c-programs/setitimer-determinism
-c-programs/sigtimedwait-timeout-1s
-c-programs/socket-timestamp-edge-cases
-c-programs/socket-timestamp-timespec
-c-programs/socket-timestamp-timeval
-c-programs/sysinfo
-c-programs/sysinfo-uptime
-c-programs/wait-on-child
-determinism-stress-c/pid-tid
-```
+| Cell | Disposition | Evidence |
+| --- | --- | --- |
+| `backend-parity-c/pid-probe` | Fixed and promoted | Root PID alignment makes ptrace and SaBRe output byte-identical. |
+| `c-programs/dbi-pid-virtualization` | Blocked | Child allocation and vfork/exec behavior still expose different backend task topologies. |
+| `c-programs/print-memaddrs` | Blocked | SaBRe relocation changes the stack, brk heap, and large-allocation addresses. |
+| `c-programs/proc-fdinfo` | Blocked | Loader-visible regular-file opens shift the virtual inode: ptrace reports 3 and SaBRe reports 1. |
+| `c-programs/random-sources` | Owner-gated | Multithreaded random ordering belongs to the MT-random owner. |
+| `c-programs/setitimer-determinism` | Owner-gated | The mismatch is part of cross-backend virtual-clock trajectories. |
+| `c-programs/sigtimedwait-timeout-1s` | Owner-gated | The mismatch is part of cross-backend virtual-clock trajectories. |
+| `c-programs/socket-cookie-tcp` | Fixed and promoted | The socket-only open sequence makes ptrace and SaBRe output byte-identical. |
+| `c-programs/socket-cookie-udp` | Fixed and promoted | The socket-only open sequence makes ptrace and SaBRe output byte-identical. |
+| `c-programs/socket-cookie-unix` | Fixed and promoted | The socket-only open sequence makes ptrace and SaBRe output byte-identical. |
+| `c-programs/socket-timestamp-edge-cases` | Owner-gated | The mismatch is part of cross-backend virtual-clock trajectories. |
+| `c-programs/socket-timestamp-timespec` | Owner-gated | The mismatch is part of cross-backend virtual-clock trajectories. |
+| `c-programs/socket-timestamp-timeval` | Owner-gated | The mismatch is part of cross-backend virtual-clock trajectories. |
+| `c-programs/sysinfo` | Owner-gated | Uptime and memory observations are owned with guest-clock/vtime semantics. |
+| `c-programs/sysinfo-uptime` | Owner-gated | The mismatch is part of cross-backend virtual-clock trajectories. |
+| `c-programs/wait-on-child` | Owner-gated | Child completion ordering belongs to the SIGCHLD owner. |
+| `debugger-c/debuggee` | Fixed and promoted | Root PID alignment makes ptrace and SaBRe output byte-identical. |
+| `determinism-stress-c/pid-tid` | Owner-gated | Thread identity allocation belongs to MT identity and scheduling. |
+
+The three non-gated probes were rerun at Hermit
+`cc026964cf8b992ecd95883418991571783799c0` with Reverie
+`aa6f1283aeee3efd174c57f6dd8198310bd307e1`. All three passed SaBRe INFO-level
+L2 under the portable profile, but direct strict ptrace/SaBRe stdout comparison
+failed for all three. This audit therefore makes no manifest promotion: the
+plan remains 133/200 before and after it.
+
+Separately, the same full scorecard found the already-enabled
+`c-programs/mmap-determinism` at L2 on both backends but with
+`stdout_parity=false`. That regression is outside the historical 18-cell set
+and requires independent requalification; it is not counted as progress here.
 
 The following 30 candidates fail SaBRe strict verification or its timeout and
 remain disabled:
