@@ -227,6 +227,28 @@ function assert_workflow_entrypoint {
         die "GitHub $lane workflow command diverged: ${commands[0]}"
 }
 
+function assert_parallel_portable_workflow {
+    local workflow=$1
+    local run_dag_count run_node_count
+    run_dag_count=$(grep -Ec '^[[:space:]]+run: .*ci/run-dag[.]sh portable([[:space:]]|$)' "$workflow" || true)
+    run_node_count=$(grep -Ec '^[[:space:]]+run: .*ci/run-node[.]sh portable([[:space:]]|$)' "$workflow" || true)
+
+    ((run_dag_count == 0)) ||
+        die "GitHub portable workflow must not retain the serial ci/run-dag.sh entrypoint"
+    ((run_node_count == 6)) ||
+        die "GitHub portable workflow must have six audited ci/run-node.sh entrypoints"
+    [[ $(grep -Fxc '        run: ./ci/check-shard-coverage.sh' "$workflow") == 1 ]] ||
+        die "GitHub portable workflow must run the shard-coverage guard exactly once"
+    # Match the literal command embedded in workflow YAML.
+    # shellcheck disable=SC2016
+    [[ $(grep -Fxc '          plan=$(./ci/test_harness.sh plan --lane portable --ci-only --format json)' "$workflow") == 1 ]] ||
+        die "GitHub portable workflow must derive one e2e matrix from the audited plan"
+    [[ $(grep -Fxc '    name: Regular tests (GitHub-managed portable)' "$workflow") == 1 ]] ||
+        die "GitHub portable workflow must expose exactly one stable aggregate gate"
+    [[ $(grep -Fxc '  merge_group:' "$workflow") == 1 ]] ||
+        die "GitHub portable workflow must run against merge-queue commits"
+}
+
 function assert_validate_entrypoint {
     local lane=$1 function_name=$2 expected=$3
     local body
@@ -267,10 +289,10 @@ function audit_ci_correspondence {
         ' "$dag" >/dev/null || die "invalid or duplicate CI DAG steps: ${dag#"$ROOT_DIR/"}"
     done
 
-    # These are literal workflow/validate expressions, not local expansions.
-    # shellcheck disable=SC2016
-    assert_workflow_entrypoint portable "$ROOT_DIR/.github/workflows/ci-portable.yml" \
-        'env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh portable --max-mem 14G --perf-dir "$RUNNER_TEMP/hermit-dag-perf" -v'
+    # Portable CI fans the audited DAG out across jobs; privileged CI still runs
+    # its small hardware DAG within one job.
+    assert_parallel_portable_workflow "$ROOT_DIR/.github/workflows/ci-portable.yml"
+    # This is a literal workflow expression, not a local expansion.
     # shellcheck disable=SC2016
     assert_workflow_entrypoint privileged "$ROOT_DIR/.github/workflows/ci-privileged.yml" \
         'timeout --foreground --kill-after=10s 270s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner flock /tmp/hermit-privileged-pmu.lock ci/run-dag.sh privileged -j 2 --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
