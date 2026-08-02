@@ -217,6 +217,21 @@ fn string_array(value: Option<&Value>, location: &str) -> Vec<String> {
         .collect()
 }
 
+fn validate_direct(value: &Value, id: &str) {
+    match value {
+        Value::String(command) if !command.trim().is_empty() => {}
+        Value::String(_) => die(format!("{id}: direct command must not be empty")),
+        Value::Array(_) => {
+            if string_array(Some(value), &format!("{id}.direct")).is_empty() {
+                die(format!("{id}: direct argv must not be empty"));
+            }
+        }
+        _ => die(format!(
+            "{id}: direct must be a shell command string or an argv array"
+        )),
+    }
+}
+
 fn ensure_keys(value: &Value, allowed: &[&str], location: &str) {
     let table = value
         .as_table()
@@ -299,7 +314,7 @@ fn validate_and_expand(
     let _requires = string_array(test.get("requires"), &format!("{id}.requires"));
 
     let program = test.get("program").and_then(Value::as_str);
-    let direct = test.get("direct").and_then(Value::as_str);
+    let direct = test.get("direct");
     let mut program_path = None;
     match (program, direct) {
         (Some(_), Some(_)) => die(format!("{id}: set only one of `program`/`direct`")),
@@ -328,10 +343,7 @@ fn validate_and_expand(
                 ));
             }
         }
-        (None, Some(command)) if command.trim().is_empty() => {
-            die(format!("{id}: direct command must not be empty"));
-        }
-        (None, Some(_)) => {}
+        (None, Some(direct)) => validate_direct(direct, &id),
     }
 
     if let Some(build) = test.get("build") {
@@ -618,6 +630,19 @@ mod tests {
     fn rejects_unknown_schema_keys() {
         let value = parse_mode("known = true\nunknown = false\n");
         ensure_keys(&value, &["known"], "test");
+    }
+
+    #[test]
+    fn accepts_structured_direct_argv() {
+        let value = parse_mode("direct = [\"./example\", \"argument with spaces\"]\n");
+        validate_direct(value.get("direct").unwrap(), "bucket/test");
+    }
+
+    #[test]
+    #[should_panic(expected = "direct argv must not be empty")]
+    fn rejects_empty_direct_argv() {
+        let value = parse_mode("direct = []\n");
+        validate_direct(value.get("direct").unwrap(), "bucket/test");
     }
 
     #[test]

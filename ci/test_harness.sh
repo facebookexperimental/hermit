@@ -82,13 +82,15 @@ function normalize_metadata {
     jq -c '
         . + {
           program_kind:
-            (if has("direct") then "direct"
+            (if (has("direct") and (.direct | type == "array")) then "direct-argv"
+             elif has("direct") then "direct"
              elif (.program | endswith(".sh")) then "shell"
              elif (.program | endswith(".c")) then "c"
              elif (.program | endswith(".rs")) then "rust"
              else error("unsupported program kind") end),
           program_path: (.program // ""),
-          direct_command: (.direct // ""),
+          direct_command: (if ((.direct // null) | type) == "string" then .direct else "" end),
+          direct_argv: (if ((.direct // null) | type) == "array" then .direct else [] end),
           prepare_args: (if ((.program // "") | endswith(".sh")) then ["--prepare"] else [] end),
           compile_args: (.build.cflags // .build.rustflags // []),
           run_args: (if ((.program // "") | endswith(".sh")) then ["--run"] else [] end),
@@ -670,7 +672,7 @@ function prepare_test {
     metadata=$(metadata_json "$test")
     kind=$(jq -r .program_kind <<<"$metadata")
     id=$(jq -r .id <<<"$metadata")
-    if ((PREBUILT == 1)) && [[ $kind != direct ]]; then
+    if ((PREBUILT == 1)) && [[ $kind != direct && $kind != direct-argv ]]; then
         prebuilt_fixtures="$BUILD_ROOT/${id//\//-}/fixtures"
         [[ -d $prebuilt_fixtures ]] || {
             echo "prebuilt fixture is missing for $id: $prebuilt_fixtures" >&2
@@ -701,7 +703,7 @@ function prepare_test {
         fi
         return 0
     fi
-    [[ $kind != direct ]] || return 0
+    [[ $kind != direct && $kind != direct-argv ]] || return 0
     mapfile -t prepare_args < <(jq -r '.prepare_args[]' <<<"$metadata")
     if ! run_capture "$stdout_file" "$stderr_file" "$timeout_seconds" \
         "${env_args[@]}" "$test" "${prepare_args[@]}"; then
@@ -764,6 +766,10 @@ function execute_attempt {
                 guest_command+=(-- "${guest_args[@]}")
             fi
             ;;
+        direct-argv)
+            mapfile -t guest_command < <(jq -r '.direct_argv[]' <<<"$metadata")
+            guest_command+=("${guest_args[@]}")
+            ;;
         *) die "internal error: unsupported program kind $kind" ;;
     esac
     profile=()
@@ -809,12 +815,17 @@ function execute_attempt {
 
 function append_result {
     local test_id=$1 category=$2 lane=$3 mode=$4 backend=$5 outcome=$6 duration_ms=$7 reason=$8
-    local test_file test_sha256 binary_sha256 effective_args guest_args guest_backend relaxations log_level classification
+    local test_file test_sha256 binary_sha256 effective_args guest_args guest_backend relaxations log_level classification kind
     test_file=${TEST_BY_ID[$test_id]}
     if [[ -f $test_file ]]; then
         test_sha256=$(sha256sum "$test_file" | cut -d' ' -f1)
     else
-        test_sha256=$(jq -r .direct_command <<<"${METADATA_BY_ID[$test_id]}" | sha256sum | cut -d' ' -f1)
+        kind=$(jq -r .program_kind <<<"${METADATA_BY_ID[$test_id]}")
+        if [[ $kind == direct-argv ]]; then
+            test_sha256=$(jq -c .direct_argv <<<"${METADATA_BY_ID[$test_id]}" | sha256sum | cut -d' ' -f1)
+        else
+            test_sha256=$(jq -r .direct_command <<<"${METADATA_BY_ID[$test_id]}" | sha256sum | cut -d' ' -f1)
+        fi
     fi
     if [[ -x $HERMIT_BIN ]]; then
         binary_sha256=$(sha256sum "$HERMIT_BIN" | cut -d' ' -f1)

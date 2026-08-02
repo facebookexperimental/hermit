@@ -121,11 +121,24 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
     ];
 
     let program = test.get("program").and_then(Value::as_str);
-    let direct = test.get("direct").and_then(Value::as_str);
+    let direct = test.get("direct");
     let guest = match (program, direct) {
         (Some(_), Some(_)) => fail(format!("{id}: set only one of `program` and `direct`")),
         (None, None) => fail(format!("{id}: missing `program` or `direct`")),
-        (None, Some(command)) => format!("sh -c {}", shell_quote(command)),
+        (None, Some(Value::String(command))) => format!("sh -c {}", shell_quote(command)),
+        (None, Some(Value::Array(_))) => {
+            let argv = string_array(direct, &format!("{id}.direct"));
+            if argv.is_empty() {
+                fail(format!("{id}: direct argv must not be empty"));
+            }
+            argv.iter()
+                .map(|argument| shell_quote(argument))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        (None, Some(_)) => fail(format!(
+            "{id}: direct must be a shell command string or an argv array"
+        )),
         (Some(program), None) => match Path::new(program).extension().and_then(|x| x.to_str()) {
             Some("sh") => {
                 let script = shell_quote(program);
