@@ -408,6 +408,7 @@ jobs:
           tar --zstd -xf "$RELEASE_TARBALL"
           rm -f "$RELEASE_TARBALL"
           test -x target/debug/hermit
+          test -f target/debug/deps/libdetcore_dbi.so
           test -f target/install_pkg/rsrcs/libdetcore_dbi.so
           test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun
           test -f target/install_pkg/rsrcs/libreverie_dbi_client.so
@@ -645,7 +646,9 @@ jobs:
   # ------------------------------------------------------------- cleanup
   cleanup:
     name: Delete prebuilt build artifacts
-    needs: [regular]
+    # Name every artifact consumer directly. In particular, test-debug is a
+    # matrix job whose integration shard owns test.cli and the run_dbi_* tests.
+    needs: [test-debug, test-release, e2e, reduce-e2e, regular]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

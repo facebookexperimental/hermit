@@ -251,12 +251,22 @@ function assert_parallel_portable_workflow {
         die "GitHub portable debug artifact must preserve the installed DBI runtime"
     [[ $(grep -Fxc '          test -f target/install_pkg/rsrcs/libdetcore_dbi.so' "$workflow") == 1 ]] ||
         die "GitHub portable debug shards must verify the installed DBI runtime"
+    [[ $(grep -Fxc '          test -f target/debug/deps/libdetcore_dbi.so' "$workflow") == 2 ]] ||
+        die "GitHub portable workflow must package and verify the debug DBI cdylib"
     [[ $(grep -Fxc '    needs: [plan, build-debug, build-dbi]' "$workflow") == 1 ]] ||
         die "GitHub portable debug shards must wait for the complete DBI install package"
     [[ $(grep -Fxc '          test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun' "$workflow") == 1 ]] ||
         die "GitHub portable debug shards must verify the DynamoRIO launcher"
     [[ $(grep -Fxc '          test -f target/install_pkg/rsrcs/libreverie_dbi_client.so' "$workflow") == 1 ]] ||
         die "GitHub portable debug shards must verify the DynamoRIO client"
+    [[ $(grep -Fxc '    needs: [test-debug, test-release, e2e, reduce-e2e, regular]' "$workflow") == 1 ]] ||
+        die "GitHub portable artifact cleanup must wait for every test consumer"
+    jq -e '
+        .debug_shards[]
+        | select(.slug == "integration")
+        | .nodes | index("test.cli") != null
+    ' "$ROOT_DIR/ci/portable-shards.json" >/dev/null ||
+        die "GitHub portable integration shard must retain the run_dbi_* CLI tests"
 }
 
 function assert_validate_entrypoint {
