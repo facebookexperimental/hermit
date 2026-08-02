@@ -26,11 +26,12 @@ native = "Normalized archive metadata is deterministic by construction"
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace", "sabre"]
+backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "DBI coverage is owned by its backend parity partition"
 kvm = "KVM requires the privileged runner"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
+sabre = "SaBRe loses its private coordinator socket after guest exec; tracked by sabre_non_gated_parity"
 
 [test.modes.replay]
 ci = false
