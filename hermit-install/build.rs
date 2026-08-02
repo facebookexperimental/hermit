@@ -287,7 +287,7 @@ fn build_liteinst_runtime(
     profile_dir: &Path,
     resources: &Path,
 ) {
-    let target = build_root.join("liteinst-runtime-6b8ed64f");
+    let target = build_root.join("liteinst-runtime-d973a85");
     let runtime = profile_dir.join("libreverie_liteinst.so");
     run(
         Command::new(repository.join("scripts/stage-liteinst-runtime.sh"))
