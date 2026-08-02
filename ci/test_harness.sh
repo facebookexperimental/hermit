@@ -259,6 +259,10 @@ function assert_parallel_portable_workflow {
         die "GitHub portable debug shards must verify the DynamoRIO launcher"
     [[ $(grep -Fxc '          test -f target/install_pkg/rsrcs/libreverie_dbi_client.so' "$workflow") == 1 ]] ||
         die "GitHub portable debug shards must verify the DynamoRIO client"
+    [[ $(grep -Fxc '      - name: Enable unprivileged user and mount namespaces' "$workflow") == 3 ]] ||
+        die "GitHub portable debug, release, and e2e shards must enable user namespaces"
+    [[ $(grep -Fxc '            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0' "$workflow") == 3 ]] ||
+        die "GitHub portable test shards must lift AppArmor's user-namespace restriction"
     [[ $(grep -Fxc '    needs: [test-debug, test-release, e2e, reduce-e2e, regular]' "$workflow") == 1 ]] ||
         die "GitHub portable artifact cleanup must wait for every test consumer"
     jq -e '
