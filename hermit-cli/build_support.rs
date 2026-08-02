@@ -57,15 +57,15 @@ pub fn git_watch_paths_in(root: &Path) -> Vec<PathBuf> {
             .map(PathBuf::from)
         })
         .collect();
-    if let Some(repository) = repository {
-        if let Some(tracked) = git(&repository, &["ls-files", "--full-name"]) {
-            paths.extend(
-                tracked
-                    .lines()
-                    .filter(|path| !path.is_empty())
-                    .map(|path| repository.join(path)),
-            );
-        }
+    if let Some(repository) = repository
+        && let Some(tracked) = git(&repository, &["ls-files", "--full-name"])
+    {
+        paths.extend(
+            tracked
+                .lines()
+                .filter(|path| !path.is_empty())
+                .map(|path| repository.join(path)),
+        );
     }
     paths.sort();
     paths.dedup();
