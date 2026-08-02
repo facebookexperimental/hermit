@@ -17,7 +17,8 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 	validate-kvm validate-dbi validate-sabre validate-liteinst validate-e9patch
 
 build: install-deps ## Build the development Hermit binary with every backend
-	$(CARGO) build --locked -p hermit --features third-party-backends
+	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --locked \
+		-p hermit --features third-party-backends
 
 install-deps: check-submodules ## Build and stage all third-party backend runtimes and plugins
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --release --locked \
