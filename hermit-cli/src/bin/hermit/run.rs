@@ -1174,6 +1174,34 @@ fn no_namespace_uses_host_resources_and_disables_uts_assumption() {
 }
 
 #[test]
+fn dbi_backend_disables_uts_assumption() {
+    // The DBI backend runs the guest under DynamoRIO without Reverie's
+    // `Container`, so it never enters a UTS namespace or applies the
+    // deterministic hostname. `has_uts_namespace` must therefore be false even
+    // with namespaces otherwise enabled, so Detcore's `handle_uname` rewrites
+    // the nodename to `hermetic-container.local` instead of leaking the host
+    // FQDN. Regression guard for DBI uname parity with the ptrace backend.
+    let mut opts = RunOpts::parse_from(["fakehermit", "--backend=dbi", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(opts.selected_backend(), Backend::Dbi);
+    assert!(!opts.no_namespace);
+    assert!(!opts.det_opts.det_config.has_uts_namespace);
+}
+
+#[test]
+fn ptrace_backend_keeps_uts_assumption_with_namespaces() {
+    // The default (ptrace) backend does launch through Reverie's `Container`,
+    // which unshares CLONE_NEWUTS and sets the deterministic hostname, so the
+    // UTS assumption must stay enabled when namespaces are on. Pins the fix to
+    // DBI so it does not regress the ptrace trust-the-namespace path.
+    let mut opts = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(opts.selected_backend(), Backend::Ptrace);
+    assert!(!opts.no_namespace);
+    assert!(opts.det_opts.det_config.has_uts_namespace);
+}
+
+#[test]
 fn strict_help_describes_compatibility_and_opt_outs() {
     use clap::CommandFactory;
 
@@ -1595,7 +1623,19 @@ impl RunOpts {
         }
         let config = &mut self.det_opts.det_config;
 
-        config.has_uts_namespace = !self.no_namespace;
+        // Only the ptrace-family backends launch the guest through Reverie's
+        // `Container` (see `container::default_container`), which unshares
+        // `CLONE_NEWUTS` and applies the deterministic hostname
+        // `hermetic-container.local`. The DBI backend returns early from
+        // dispatch and runs the guest under DynamoRIO with no UTS namespace, so
+        // its `uname()` nodename would otherwise leak the real host FQDN.
+        // Reflect that reality here so Detcore's `handle_uname` deterministic
+        // nodename/domainname rewrite fires for DBI (it is gated on
+        // `!has_uts_namespace`). Guest `sethostname`/`setdomainname` are refused
+        // with a deterministic `EPERM` on every backend, so this never masks a
+        // hostname the guest legitimately set.
+        let backend_applies_uts_hostname = !matches!(backend, Backend::Dbi);
+        config.has_uts_namespace = !self.no_namespace && backend_applies_uts_hostname;
 
         if self.no_namespace {
             self.network = NetworkingMode::Host;
