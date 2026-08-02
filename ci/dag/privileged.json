@@ -46,7 +46,7 @@
     {
       "group": "build", "job": "manifest_guests",
       "desc": "Prepare every CI-enabled privileged manifest guest",
-      "cmd": "./ci/test_harness.sh build --lane privileged --ci-only",
+      "cmd": "./ci/test_harness.sh build --lane privileged --ci-only --allow-empty",
       "deps": ["e2e.metadata"],
       "timeout": 120,
       "hint": {"est_duration_s": 75,

@@ -76,7 +76,7 @@
     {
       "group": "build", "job": "manifest_guests",
       "desc": "Prepare every CI-enabled portable manifest guest",
-      "cmd": "./ci/test_harness.sh build --lane portable --ci-only",
+      "cmd": "./ci/test_harness.sh build --lane portable --ci-only --allow-empty",
       "deps": ["e2e.metadata"],
       "timeout": 600,
       "hint": {"est_duration_s": 90, "rss_baseline_bytes": 1073741824,

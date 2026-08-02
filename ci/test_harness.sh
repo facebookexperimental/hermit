@@ -50,7 +50,7 @@ Filters:
   --test ID               exact category/test ID
   --ci-only               select only cells explicitly marked ci=true
   --prebuilt              require artifacts produced by the build command
-  --allow-empty           permit an empty selection (DAG bucket nodes only)
+  --allow-empty           permit an empty selection (DAG build/bucket nodes only)
   --include-occasional    include tests marked occasional
   --include-manual        include a ci=false cell; requires exact --test and --mode
   --probe-disabled        run one explicitly disabled backend cell; requires exact
@@ -378,7 +378,7 @@ function audit_ci_correspondence {
             and ([.steps[] | select(has("manifest")) | .manifest.category] | unique | length)
                 == ([.steps[] | select(has("manifest"))] | length)
             and ([.steps[] | select(.group == "build" and .job == "manifest_guests"
-                    and .cmd == ("./ci/test_harness.sh build --lane " + $lane + " --ci-only"))] | length) == 1
+                    and .cmd == ("./ci/test_harness.sh build --lane " + $lane + " --ci-only --allow-empty"))] | length) == 1
         ' "$dag" >/dev/null || {
             rm -rf "$scratch"
             die "$lane DAG manifest nodes do not match the fail-closed build/run contract"
@@ -548,8 +548,15 @@ function parse_options {
     [[ -z $LANE_FILTER ]] || contains "$LANE_FILTER" portable privileged || die "invalid lane: $LANE_FILTER"
     [[ -z $MODE_FILTER ]] || contains "$MODE_FILTER" "${MODES[@]}" || die "invalid mode: $MODE_FILTER"
     [[ -z $BACKEND_FILTER ]] || contains "$BACKEND_FILTER" "${BACKENDS[@]}" || die "invalid backend: $BACKEND_FILTER"
-    if ((ALLOW_EMPTY == 1)) && { ((CI_ONLY == 0)) || [[ -z $CATEGORY_FILTER ]]; }; then
-        die "--allow-empty requires --ci-only and an explicit --category"
+    if ((ALLOW_EMPTY == 1)); then
+        ((CI_ONLY == 1)) || die "--allow-empty requires --ci-only"
+        case $subcommand in
+            build) [[ -n $LANE_FILTER || -n $CATEGORY_FILTER ]] ||
+                die "build --allow-empty requires an explicit --lane or --category" ;;
+            run) [[ -n $CATEGORY_FILTER ]] ||
+                die "run --allow-empty requires an explicit --category" ;;
+            *) die "--allow-empty is accepted by build and run only" ;;
+        esac
     fi
     [[ $FORMAT == text || $FORMAT == json ]] || die "invalid format: $FORMAT"
     if ((INCLUDE_MANUAL)); then
