@@ -16,5 +16,6 @@ envelope.json
 **/__pycache__/
 **/.mypy_cache/
 
-# Regenerated human-readable commands from tests/e2e/manifests/*.toml.
-/ignored/e2e-commands/
+# Generated validation/e2e output. Everything under ignored/ is disposable and
+# must not taint source provenance or the version string.
+/ignored/
