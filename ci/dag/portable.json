@@ -33,6 +33,7 @@
       "group": "build", "job": "workspace",
       "desc": "Build workspace (cargo build --workspace --features third-party-backends)",
       "cmd": "CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-8} cargo build --workspace --features third-party-backends",
+      "deps": ["e2e.metadata"],
       "timeout": 1200,
       "hint": {"est_duration_s": 360, "rss_baseline_bytes": 5368709120,
                "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
