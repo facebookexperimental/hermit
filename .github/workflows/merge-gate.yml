@@ -21,8 +21,9 @@ on:
         type: string
 
 # This lightweight required check accepts an exact PR head after the repository
-# GitHub-managed portable CI workflow succeeds or after a fully green local
-# validate.sh run applies the locally-validated label. Demo-relevant changes
+# GitHub-managed portable CI job succeeds or after a fully green local validate.sh
+# run applies the locally-validated label. The independent Reverie-pin lint does
+# not taint this product-test result. Demo-relevant changes
 # additionally require the exact-SHA P0 demo gate; local validation never bypasses
 # that owner-mandated gate. Privileged CI is an independent bonus signal.
 # Merge-group checks inspect their constituent PR heads instead of trusting the
@@ -332,15 +333,33 @@ jobs:
                 | sort_by(.created_at)
                 | last // {}
               ' <<< "$runs")"
-              status="$(jq -r '.status // "missing"' <<< "$run")"
-              conclusion="$(jq -r '.conclusion // ""' <<< "$run")"
+              run_id="$(jq -r '.id // ""' <<< "$run")"
               url="$(jq -r '.html_url // ""' <<< "$run")"
 
-              if [ "$status:$conclusion" = completed:success ]; then
-                echo "GitHub-managed portable CI passed for PR #${pr_number} at $head_sha: $url"
-              else
-                echo "::error::GitHub-managed portable CI for PR #${pr_number} at $head_sha is $status/${conclusion:-none}: ${url:-no run URL}."
+              # Gate on the authoritative product-test job, not the whole run.
+              # The same workflow contains the independent `reverie-pin` lint;
+              # a stale pin can fail that job while Regular tests are green.
+              if [ -z "$run_id" ]; then
+                echo "::error::No ci-portable.yml run for PR #${pr_number} at $head_sha."
                 failed=1
+              else
+                jobs="$(
+                  gh api "repos/${REPO}/actions/runs/${run_id}/jobs?filter=latest&per_page=100"
+                )"
+                regular_job="$(jq '
+                  [.jobs[] | select(.name == "Regular tests (GitHub-managed portable)")]
+                  | last // {}
+                ' <<< "$jobs")"
+                job_status="$(jq -r '.status // "missing"' <<< "$regular_job")"
+                job_conclusion="$(jq -r '.conclusion // ""' <<< "$regular_job")"
+                job_url="$(jq -r '.html_url // ""' <<< "$regular_job")"
+
+                if [ "$job_status:$job_conclusion" = completed:success ]; then
+                  echo "Authoritative portable job passed for PR #${pr_number} at $head_sha: ${job_url:-$url}"
+                else
+                  echo "::error::Regular tests (GitHub-managed portable) for PR #${pr_number} at $head_sha is $job_status/${job_conclusion:-none}: ${job_url:-${url:-no run URL}}."
+                  failed=1
+                fi
               fi
             fi
 
