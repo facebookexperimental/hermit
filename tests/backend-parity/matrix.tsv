@@ -22,3 +22,4 @@ cpuid_policy	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 virtual_clock	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 random_sources	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 virtual_pid	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+scheduler_policy_queries	pass	pass	pass	-	-	detlog	detlog	guest	-	-

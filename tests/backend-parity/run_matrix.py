@@ -187,6 +187,10 @@ class Fixtures:
                 ("-D_GNU_SOURCE", "-pthread"),
             ),
             "pid_probe": (local / "pid_probe.c", ()),
+            "scheduler_policy_queries": (
+                REPOSITORY / "tests/c/scheduler_policy_queries.c",
+                (),
+            ),
         }
         source, flags = sources[name]
         binary = compile_fixture(source, self.root / name, *flags)
@@ -284,6 +288,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
         "virtual_clock": ([str(fixtures.binary("clock_determinism"))], 0, None),
         "random_sources": ([str(fixtures.binary("random_sources"))], 0, None),
         "virtual_pid": ([str(fixtures.binary("pid_probe"))], 0, None),
+        "scheduler_policy_queries": (
+            [str(fixtures.binary("scheduler_policy_queries"))],
+            0,
+            b"scheduler-policy-queries-ok\n",
+        ),
     }
     try:
         return cases[name]
