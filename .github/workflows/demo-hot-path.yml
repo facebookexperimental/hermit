@@ -189,9 +189,9 @@ jobs:
           # Fedora host kernel, but the real generic bpftool is kernel-agnostic
           # for BTF decoding. Promote that binary ahead of the wrapper.
           if ! bpftool version >/dev/null 2>&1; then
-            bpftool_bin=$(find /usr/lib/linux-tools -type f -name bpftool -perm -111 -print |
+            bpftool_bin=$(find /usr/lib/linux-tools -name bpftool -print |
               sort -V | tail -n 1)
-            test -n "$bpftool_bin"
+            test -x "$bpftool_bin"
             sudo install -m755 "$bpftool_bin" /usr/local/bin/bpftool
           fi
 
