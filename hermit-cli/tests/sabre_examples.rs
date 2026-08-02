@@ -245,6 +245,10 @@ fn assert_sabre_verify(program: &Path, args: &[&str], loader: &Path, label: &str
         diagnostics.contains("Success: deterministic. Determinism verified."),
         "SaBRe verifier omitted its success verdict for {label}:\n{diagnostics}",
     );
+    assert!(
+        diagnostics.contains("SaBRe syscall DETLOG records included: run1="),
+        "SaBRe verifier omitted its syscall DETLOG inclusion count for {label}:\n{diagnostics}",
+    );
 }
 
 fn assert_three_run_determinism(
@@ -310,32 +314,6 @@ fn sabre_root_pid_matches_ptrace() {
         &["-c", "printf 'pid=%s\\n' \"$$\""],
         &loader,
         "root-pid",
-    );
-}
-
-#[test]
-fn sabre_info_includes_syscall_detlogs() {
-    let Some(loader) = sabre_loader() else {
-        return;
-    };
-
-    let mut command = Command::new(hermit_binary());
-    command.env("HERMIT_SABRE_BINARY", loader).args([
-        "--log=info",
-        "run",
-        "--backend",
-        "sabre",
-        "--strict",
-        "--no-virtualize-cpuid",
-        "--max-timeslice=disabled",
-        "--",
-        "/bin/true",
-    ]);
-    let output = run_bounded(command, "SaBRe syscall DETLOG forwarding", None);
-    let diagnostics = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        diagnostics.contains("DETLOG [syscall]") && diagnostics.contains("finish syscall #"),
-        "SaBRe INFO output omitted syscall DETLOG records:\n{diagnostics}",
     );
 }
 

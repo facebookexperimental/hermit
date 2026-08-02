@@ -63,15 +63,17 @@ const TMP_DIR: &str = "/tmp";
 const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
 const NORMALIZED_SABRE_DETLOG_TIMESTAMP: &str = "1970-01-01T00:00:00.000000Z";
 
-fn append_sabre_detlogs(path: &Path, stderr: &[u8]) -> Result<(), Error> {
+fn append_sabre_detlogs(path: &Path, stderr: &[u8]) -> Result<usize, Error> {
     let mut log = OpenOptions::new().append(true).open(path)?;
+    let mut syscall_records = 0;
     for line in String::from_utf8_lossy(stderr).lines() {
         let line = line.trim_start();
         if line.starts_with("INFO detcore") && line.contains(" DETLOG ") {
             writeln!(log, "{NORMALIZED_SABRE_DETLOG_TIMESTAMP} {line}")?;
+            syscall_records += usize::from(line.contains("DETLOG [syscall]"));
         }
     }
-    Ok(())
+    Ok(syscall_records)
 }
 struct PreparedMounts {
     mounts: Vec<Mount>,
@@ -2615,9 +2617,9 @@ impl RunOpts {
         eprintln!(":: {}", "Run1...".yellow().bold());
 
         let out1: Output = self.run_verify(log1_file, global)?;
-        if self.selected_backend() == Backend::Sabre {
-            append_sabre_detlogs(&log1_path, &out1.stderr)?;
-        }
+        let sabre_syscalls1 = (self.selected_backend() == Backend::Sabre)
+            .then(|| append_sabre_detlogs(&log1_path, &out1.stderr))
+            .transpose()?;
 
         // With --verify the first run's `--log` output was diverted to a
         // temporary file for later comparison rather than shown to the user.
@@ -2647,8 +2649,16 @@ impl RunOpts {
 
         eprintln!(":: {}", "Run2...".yellow().bold());
         let out2 = self.run_verify(log2_file, global)?;
-        if self.selected_backend() == Backend::Sabre {
-            append_sabre_detlogs(&log2_path, &out2.stderr)?;
+        if let Some(sabre_syscalls1) = sabre_syscalls1 {
+            let sabre_syscalls2 = append_sabre_detlogs(&log2_path, &out2.stderr)?;
+            if sabre_syscalls1 == 0 || sabre_syscalls2 == 0 {
+                return Err(Error::msg(format!(
+                    "SaBRe verification captured no syscall DETLOG records: run1={sabre_syscalls1}, run2={sabre_syscalls2}"
+                )));
+            }
+            eprintln!(
+                ":: SaBRe syscall DETLOG records included: run1={sabre_syscalls1}, run2={sabre_syscalls2}"
+            );
         }
 
         let kvm_output_only = self.selected_backend() == Backend::Kvm;
@@ -3037,13 +3047,14 @@ mod tests {
             "2026-08-02T00:00:00.000000Z INFO detcore: coordinator message\n",
         )
         .unwrap();
-        append_sabre_detlogs(
+        let syscall_records = append_sabre_detlogs(
             log.path(),
             b"guest stderr\n INFO detcore: inbound syscall: getpid() = ?\n\
               INFO detcore: DETLOG [syscall] finish syscall #1: getpid() = Ok(3)\n",
         )
         .unwrap();
 
+        assert_eq!(syscall_records, 1);
         assert_eq!(
             std::fs::read_to_string(log.path()).unwrap(),
             "2026-08-02T00:00:00.000000Z INFO detcore: coordinator message\n\
