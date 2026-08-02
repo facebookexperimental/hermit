@@ -247,6 +247,10 @@ function assert_parallel_portable_workflow {
         die "GitHub portable workflow must expose exactly one stable aggregate gate"
     [[ $(grep -Fxc '  merge_group:' "$workflow") == 1 ]] ||
         die "GitHub portable workflow must run against merge-queue commits"
+    [[ $(grep -Fxc '            target/install_pkg/rsrcs/libdetcore_dbi.so \' "$workflow") == 1 ]] ||
+        die "GitHub portable debug artifact must preserve the installed DBI runtime"
+    [[ $(grep -Fxc '          test -f target/install_pkg/rsrcs/libdetcore_dbi.so' "$workflow") == 1 ]] ||
+        die "GitHub portable debug shards must verify the installed DBI runtime"
 }
 
 function assert_validate_entrypoint {

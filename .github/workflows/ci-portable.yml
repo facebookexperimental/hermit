@@ -198,9 +198,15 @@ jobs:
           # simply find no prebuilt fixtures, exactly as an unstaged tree intends.
           mkdir -p ignored/e2e/build
           test -f target/debug/deps/libdetcore_dbi.so
+          # Cargo test shards may rewrite target/debug/deps. Keep the DBI runtime
+          # in Hermit's normal install-resource location so later CLI nodes do
+          # not depend on that mutable Cargo output directory.
+          install -Dm755 target/debug/deps/libdetcore_dbi.so \
+            target/install_pkg/rsrcs/libdetcore_dbi.so
           tar --zstd -cf "$DEBUG_TARBALL" \
             target/debug/hermit \
             target/debug/deps/libdetcore_dbi.so \
+            target/install_pkg/rsrcs/libdetcore_dbi.so \
             ignored/e2e/build
           ls -lh "$DEBUG_TARBALL"
       - name: Upload debug prebuilt tree
@@ -395,6 +401,7 @@ jobs:
           tar --zstd -xf "$DEBUG_TARBALL"
           rm -f "$DEBUG_TARBALL"
           test -x target/debug/hermit
+          test -f target/install_pkg/rsrcs/libdetcore_dbi.so
       - name: Run shard nodes (${{ matrix.slug }})
         run: ./ci/run-node.sh portable "${{ matrix.nodes }}"
 
