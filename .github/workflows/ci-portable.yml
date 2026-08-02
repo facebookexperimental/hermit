@@ -149,6 +149,21 @@ jobs:
       # build.flaky_harnesses.
       - name: Run debug build nodes
         run: ./ci/run-node.sh portable "$(jq -r '.build_debug_nodes|join(",")' ci/portable-shards.json)"
+      - name: Stage debug DBI runtime
+        run: |
+          set -euo pipefail
+          runtime=$(
+            cargo build -p detcore-dbi --message-format=json-render-diagnostics |
+              jq -r '
+                select(.reason == "compiler-artifact" and .target.name == "detcore_dbi")
+                | .filenames[]
+                | select(endswith(".so"))
+              ' |
+              tail -n 1
+          )
+          test -n "$runtime"
+          test -f "$runtime"
+          install -Dm755 "$runtime" target/debug/deps/libdetcore_dbi.so
       - name: Enumerate portable (mode x manifest block x backend) e2e cells
         id: cells
         run: |
@@ -182,8 +197,10 @@ jobs:
           # empty dir so the pack is robust — e2e cells run with --allow-empty and
           # simply find no prebuilt fixtures, exactly as an unstaged tree intends.
           mkdir -p ignored/e2e/build
+          test -f target/debug/deps/libdetcore_dbi.so
           tar --zstd -cf "$DEBUG_TARBALL" \
             target/debug/hermit \
+            target/debug/deps/libdetcore_dbi.so \
             ignored/e2e/build
           ls -lh "$DEBUG_TARBALL"
       - name: Upload debug prebuilt tree
