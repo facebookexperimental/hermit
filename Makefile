@@ -13,24 +13,24 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 
 .DEFAULT_GOAL := build
 
-.PHONY: build install-deps release-core help checkout-all validate \
+.PHONY: build install-deps release-core help checkout-all check-submodules validate \
 	validate-kvm validate-dbi validate-sabre validate-liteinst validate-e9patch
 
 build: install-deps ## Build the development Hermit binary with every backend
 	$(CARGO) build --locked -p hermit --features third-party-backends
 
-install-deps: ## Build and stage all third-party backend runtimes and plugins
+install-deps: check-submodules ## Build and stage all third-party backend runtimes and plugins
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --release --locked \
 		-p detcore-dbi -p detcore-sabre -p hermit-install
 
-release-core: ## Build the lean core-only release binary (ptrace/kvm/liteinst)
+release-core: check-submodules ## Build the lean core-only release binary (ptrace/kvm/liteinst)
 	$(CARGO) build --release --locked -p hermit
 
 # NOTE: `validate` MUST stay a .PHONY target with an explicit recipe. Without it,
 # GNU Make's built-in implicit rule "%: %.sh" (cat $< >$@; chmod a+x $@) fires
 # against validate.sh and merely COPIES it to a file named `validate` instead of
 # running validation. .PHONY + this recipe overrides that implicit rule.
-validate: ## Run the full multi-backend validation suite (pass extra flags via ARGS="--help")
+validate: check-submodules ## Run the full multi-backend validation suite (pass extra flags via ARGS="--help")
 	./validate.sh $(ARGS)
 
 help: ## Show this help (the list of make targets)
@@ -47,6 +47,16 @@ help: ## Show this help (the list of make targets)
 checkout-all: ## Initialize/update all git submodules (uses with-proxy if present)
 	@$(SUBMODULE_GIT) submodule update --init --recursive
 
+check-submodules: checkout-all ## Verify every pinned submodule is initialized at its recorded revision
+	@status="$$($(SUBMODULE_GIT) submodule status --recursive)"; \
+		printf '%s\n' "$$status"; \
+		if printf '%s\n' "$$status" | grep -Eq '^[-+U]'; then \
+			echo 'error: a required submodule is missing or not at its pinned revision' >&2; \
+			exit 1; \
+		fi
+	@test -f agent-utils/README.md || { echo 'error: agent-utils submodule is missing' >&2; exit 1; }
+	@test -f third-party/rr/CMakeLists.txt || { echo 'error: rr submodule is missing' >&2; exit 1; }
+
 # ---------------------------------------------------------------------------
 # Per-backend validation targets.
 #
@@ -61,19 +71,19 @@ checkout-all: ## Initialize/update all git submodules (uses with-proxy if presen
 #     and any backend artifacts.
 # ---------------------------------------------------------------------------
 
-validate-kvm: ## Run ONLY the KVM backend parity corpus (needs /dev/kvm)
+validate-kvm: check-submodules ## Run ONLY the KVM backend parity corpus (needs /dev/kvm)
 	cargo build -p hermit
 	$(RUN_MATRIX) --hermit $(HERMIT_DEBUG_BIN) --backend kvm --probe-gaps --require-backend
 
-validate-dbi: ## Run ONLY the DBI backend parity corpus (third-party-backends feature)
+validate-dbi: check-submodules ## Run ONLY the DBI backend parity corpus (third-party-backends feature)
 	cargo build -p hermit --features third-party-backends
 	$(RUN_MATRIX) --hermit $(HERMIT_DEBUG_BIN) --backend dbi --probe-gaps --require-backend
 
-validate-sabre: ## Run ONLY the SaBRe compatibility corpus (needs HERMIT_SABRE_BINARY)
+validate-sabre: check-submodules ## Run ONLY the SaBRe compatibility corpus (needs HERMIT_SABRE_BINARY)
 	./validate.sh --sabre-compat-only
 
-validate-liteinst: ## Run ONLY the LiteInst strict compatibility corpus
+validate-liteinst: check-submodules ## Run ONLY the LiteInst strict compatibility corpus
 	./validate.sh --liteinst-compat-only
 
-validate-e9patch: ## Run ONLY the e9patch (ptrace-preprocessing) compat corpus (needs HERMIT_E9PATCH_BACKEND)
+validate-e9patch: check-submodules ## Run ONLY the e9patch (ptrace-preprocessing) compat corpus (needs HERMIT_E9PATCH_BACKEND)
 	./validate.sh --e9patch-compat-only
