@@ -37,10 +37,28 @@ fn search_and_count_hits(syscall_name: &str) -> usize {
     String::from_utf8(output.stdout).unwrap().lines().count()
 }
 
+const USAGE: &str = "\
+Usage: update_spreadsheet.rs [-h|--help]
+
+Recompute the TEST_COVERAGE column of ./hermit_syscalls.csv by counting
+`SYS_<name>` hits under ../detcore/tests/ (via ripgrep), and write the updated
+CSV to stdout. Run from a directory containing hermit_syscalls.csv; requires
+`rg` on PATH. This is for interactive use on devservers.";
+
 fn main() {
     rust_script_prelude::init();
-    let fd =
-        std::fs::File::open("./hermit_syscalls.csv").expect("Could not open ./hermit_syscalls.csv");
+    if std::env::args().skip(1).any(|a| a == "-h" || a == "--help") {
+        println!("{USAGE}");
+        return;
+    }
+    let fd = match std::fs::File::open("./hermit_syscalls.csv") {
+        Ok(fd) => fd,
+        Err(e) => {
+            eprintln!("update_spreadsheet: cannot open ./hermit_syscalls.csv: {e}");
+            eprintln!("Run this script from a directory that contains hermit_syscalls.csv.");
+            std::process::exit(1);
+        }
+    };
     let mut rdr = Reader::from_reader(fd);
     let headers = rdr.headers().unwrap();
     let headers2 = headers.clone();

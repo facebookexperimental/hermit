@@ -330,8 +330,19 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
 }
 
 // TODO-HUMAN-REVIEW(PR-1081): Review the manifest-to-command CLI and generated shell contract.
+const USAGE: &str = "\
+Usage: manifest-to-commands.rs [-h|--help]
+
+Regenerate the flattened e2e command files under ignored/e2e-commands/ from the
+TOML manifests in tests/e2e/manifests/. Takes no arguments; it discovers the
+repo root from git and rewrites the generated *.txt files in place.";
+
 fn main() -> ExitCode {
     rust_script_prelude::init();
+    if std::env::args().skip(1).any(|a| a == "-h" || a == "--help") {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     let root = repo_root();
     let manifests = root.join("tests/e2e/manifests");
     let output = root.join("ignored/e2e-commands");

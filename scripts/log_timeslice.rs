@@ -120,8 +120,20 @@ fn label(s: &Slice) -> String {
     }
 }
 
+const USAGE: &str = "\
+Usage: hermit --log info run -- <prog> 2>&1 | log_timeslice.rs
+
+Summarize per-timeslice scheduling from a Hermit log on stdin. Reads
+`ending timeslice T..` and ` COMMIT turn ..` lines (present at --log info or
+higher) and prints one row per timeslice with commit counts and virtual/RCB/wall
+advance. Give it a log stream on stdin; -h/--help prints this message.";
+
 fn main() {
     rust_script_prelude::init();
+    if std::env::args().skip(1).any(|a| a == "-h" || a == "--help") {
+        println!("{USAGE}");
+        return;
+    }
     let mut input = String::new();
     io::stdin().read_to_string(&mut input).expect("read stdin");
 
