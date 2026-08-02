@@ -188,12 +188,11 @@ native = "The date-nanoseconds entry owns the native clock nondeterminism contro
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "liteinst"]
 [test.modes.verify.backends_disabled]
 dbi = "Enable after the ptrace baseline for direct C guests is trusted"
 kvm = "Enable after the ptrace baseline for direct C guests is trusted"
 sabre = "SaBRe does not intercept RDTSCP; clock probes can leak raw host TSC"
-liteinst = "LiteInst interception is incomplete and nondeterministic under verification"
 
 [test.modes.replay]
 ci = false
@@ -219,12 +218,11 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 ci = true
 args = ["--base-env=minimal", "--no-virtualize-cpuid", "--max-timeslice=disabled"]
 assert = { runs = 5, repeat_identical = true }
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "liteinst"]
 [test.modes.custom.backends_disabled]
 dbi = "The custom clock matrix baseline is ptrace-only"
 kvm = "The custom clock matrix baseline is ptrace-only"
 sabre = "The custom clock matrix baseline is ptrace-only"
-liteinst = "The custom clock matrix baseline is ptrace-only"
 [[test]]
 id = "system-utils/random-device"
 description = "Kernel random bytes vary natively and repeat under Hermit"
