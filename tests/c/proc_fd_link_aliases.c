@@ -26,18 +26,41 @@ static void print_link(const char *label, const char *path, size_t capacity) {
 }
 
 int main(void) {
-  char numeric_path[64];
-  int written = snprintf(numeric_path, sizeof(numeric_path), "/proc/%ld/fd/1",
-                         (long)getpid());
-  if (written < 0 || (size_t)written >= sizeof(numeric_path)) {
+  const char *target = "/tmp/hermit-proc-fd-link-aliases";
+  int target_fd = open(target, O_CREAT | O_RDWR | O_TRUNC, 0600);
+  if (target_fd < 0) {
+    perror("open target");
     return EXIT_FAILURE;
   }
 
-  print_link("canonical", "/proc/self/fd/1", 128);
-  print_link("truncated", "/proc/self/fd/1", 10);
+  char canonical_path[64];
+  char numeric_path[64];
+  char dev_fd_path[64];
+  char lexical_path[64];
+  char fd_name[16];
+  int canonical_written = snprintf(canonical_path, sizeof(canonical_path),
+                                   "/proc/self/fd/%d", target_fd);
+  int numeric_written = snprintf(numeric_path, sizeof(numeric_path),
+                                 "/proc/%ld/fd/%d", (long)getpid(), target_fd);
+  int dev_fd_written =
+      snprintf(dev_fd_path, sizeof(dev_fd_path), "/dev/fd/%d", target_fd);
+  int lexical_written = snprintf(lexical_path, sizeof(lexical_path),
+                                 "/proc/self/fd/../fd/%d", target_fd);
+  int fd_name_written = snprintf(fd_name, sizeof(fd_name), "%d", target_fd);
+  if (canonical_written < 0 ||
+      (size_t)canonical_written >= sizeof(canonical_path) ||
+      numeric_written < 0 || (size_t)numeric_written >= sizeof(numeric_path) ||
+      dev_fd_written < 0 || (size_t)dev_fd_written >= sizeof(dev_fd_path) ||
+      lexical_written < 0 || (size_t)lexical_written >= sizeof(lexical_path) ||
+      fd_name_written < 0 || (size_t)fd_name_written >= sizeof(fd_name)) {
+    return EXIT_FAILURE;
+  }
+
+  print_link("canonical", canonical_path, 128);
+  print_link("truncated", canonical_path, 10);
   print_link("numeric", numeric_path, 128);
-  print_link("dev-fd", "/dev/fd/1", 128);
-  print_link("lexical", "/proc/self/fd/../fd/1", 128);
+  print_link("dev-fd", dev_fd_path, 128);
+  print_link("lexical", lexical_path, 128);
 
   int directory = open("/proc/self/fd", O_PATH | O_DIRECTORY);
   if (directory < 0) {
@@ -45,11 +68,12 @@ int main(void) {
     return EXIT_FAILURE;
   }
   char buffer[128];
-  ssize_t count = readlinkat(directory, "1", buffer, sizeof(buffer));
+  ssize_t count = readlinkat(directory, fd_name, buffer, sizeof(buffer));
   if (count < 0) {
     perror("readlinkat");
     return EXIT_FAILURE;
   }
   printf("readlinkat=%.*s\n", (int)count, buffer);
-  return close(directory) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  int result = close(directory) | close(target_fd) | unlink(target);
+  return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
