@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 int main(void) {
@@ -50,12 +51,30 @@ int main(void) {
   }
   struct cmsghdr *header = CMSG_FIRSTHDR(&message);
   if (header == NULL || header->cmsg_level != SOL_SOCKET ||
-      header->cmsg_type != SCM_TIMESTAMP) {
+      header->cmsg_type != SCM_TIMESTAMP ||
+      header->cmsg_len < CMSG_LEN(sizeof(struct timeval))) {
     fputs("missing SCM_TIMESTAMP\n", stderr);
     return 3;
   }
   struct timeval value;
   memcpy(&value, CMSG_DATA(header), sizeof(value));
-  printf("%ld.%06ld\n", (long)value.tv_sec, (long)value.tv_usec);
+  struct timespec observed_now;
+  if (clock_gettime(CLOCK_REALTIME, &observed_now) != 0) {
+    perror("clock_gettime");
+    return 4;
+  }
+  if (value.tv_sec < 0 || value.tv_usec < 0 || value.tv_usec >= 1000000L ||
+      value.tv_sec > observed_now.tv_sec ||
+      observed_now.tv_sec - value.tv_sec > 1 ||
+      (value.tv_sec == observed_now.tv_sec &&
+       value.tv_usec * 1000L > observed_now.tv_nsec)) {
+    fprintf(stderr,
+            "SCM_TIMESTAMP escaped logical time: timestamp=%ld.%06ld "
+            "now=%ld.%09ld\n",
+            (long)value.tv_sec, (long)value.tv_usec, (long)observed_now.tv_sec,
+            observed_now.tv_nsec);
+    return 5;
+  }
+  puts("timestamp=ok");
   return 0;
 }
