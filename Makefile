@@ -13,7 +13,7 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 
 .DEFAULT_GOAL := build
 
-.PHONY: build install-deps release-core help checkout-all check-submodules validate \
+.PHONY: build install-deps release-core help check-submodules validate lint \
 	validate-kvm validate-dbi validate-sabre validate-liteinst validate-e9patch
 
 build: install-deps ## Build the development Hermit binary with every backend
@@ -33,6 +33,31 @@ release-core: check-submodules ## Build the lean core-only release binary (ptrac
 validate: check-submodules ## Run the full multi-backend validation suite (pass extra flags via ARGS="--help")
 	./validate.sh $(ARGS)
 
+# `make lint` mirrors the lint gate CI's merge-gate enforces, so a developer can
+# reproduce every lint failure locally before pushing. Cheap checks run first for
+# fast feedback; the compile-heavy clippy pass and the networked Reverie-pin
+# invariant run last. The exact clippy/rustfmt invocations match
+# ci/dag/portable.json (lint.clippy / lint.rustfmt).
+#
+# shellcheck runs at --severity=error: an enforceable floor that is clean on
+# current main (0/122 tracked scripts fail at error level) while 24 still carry
+# warning/style findings. Ratchet the severity down (warning -> style) as that
+# debt is retired rather than blocking the target on it today.
+lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, reverie pin)
+	$(CARGO) fmt --all -- --check
+	@sh_files="$$(git ls-files '*.sh' ':!:third-party/**')"; \
+		if [ -z "$$sh_files" ]; then \
+			echo 'lint: no tracked shell scripts to check'; \
+		elif command -v shellcheck >/dev/null 2>&1; then \
+			printf '%s\n' "$$sh_files" | xargs shellcheck --severity=error; \
+		else \
+			echo 'error: shellcheck is not installed (see https://www.shellcheck.net)' >&2; \
+			exit 1; \
+		fi
+	@git diff --check
+	$(CARGO) clippy --workspace --all-targets -- -D warnings
+	$(SUBMODULE_PROXY) ./scripts/check-reverie-pin.rs
+
 help: ## Show this help (the list of make targets)
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 	@printf '\nPer-backend validate targets run ONLY one backend'"'"'s compatibility\n'
@@ -44,10 +69,7 @@ help: ## Show this help (the list of make targets)
 	@printf '  validate-e9patch   e9patch corpus        (needs HERMIT_E9PATCH_BACKEND) ~5-20 min\n'
 	@printf '\nThe full multi-backend suite is ./validate.sh (see ./validate.sh --help).\n'
 
-checkout-all: ## Initialize/update all git submodules (uses with-proxy if present)
-	@$(SUBMODULE_GIT) submodule update --init --recursive
-
-check-submodules: checkout-all ## Verify every pinned submodule is initialized at its recorded revision
+check-submodules: ## Verify every pinned submodule is checked out at its recorded revision
 	@status="$$($(SUBMODULE_GIT) submodule status --recursive)"; \
 		printf '%s\n' "$$status"; \
 		if printf '%s\n' "$$status" | grep -Eq '^[-+U]'; then \
