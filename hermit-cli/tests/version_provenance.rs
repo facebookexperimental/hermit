@@ -55,6 +55,22 @@ fn initialized_repo() -> TempDir {
 }
 
 #[test]
+fn git_watch_paths_resolve_from_a_nested_crate() {
+    let repo = initialized_repo();
+    let crate_dir = repo.path().join("hermit-cli");
+    fs::create_dir(&crate_dir).expect("failed to create nested crate directory");
+
+    let paths = build_support::git_watch_paths_in(&crate_dir);
+    let git_dir = repo.path().join(".git");
+    let reference = git(repo.path(), &["symbolic-ref", "HEAD"]);
+
+    assert!(paths.contains(&git_dir.join("HEAD")));
+    assert!(paths.contains(&git_dir.join("index")));
+    assert!(paths.contains(&git_dir.join(reference)));
+    assert!(paths.iter().all(|path| path.is_absolute()));
+}
+
+#[test]
 fn untracked_generated_output_does_not_taint_version() {
     let repo = initialized_repo();
     let expected = git(repo.path(), &["rev-parse", "--short=12", "HEAD"]);

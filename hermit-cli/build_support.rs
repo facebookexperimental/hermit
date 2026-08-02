@@ -7,6 +7,7 @@
  */
 
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -27,6 +28,33 @@ pub fn git_short_sha_in(root: &Path) -> String {
         .map(|status| !status.is_empty())
         .unwrap_or(false);
     if dirty { format!("{sha}-dirty") } else { sha }
+}
+
+/// Git metadata that can change the embedded revision or dirty state. Resolve
+/// these through Git so this also works from a nested crate and a worktree.
+pub fn git_watch_paths() -> Vec<PathBuf> {
+    git_watch_paths_in(Path::new("."))
+}
+
+pub fn git_watch_paths_in(root: &Path) -> Vec<PathBuf> {
+    let mut names = vec![
+        "HEAD".to_owned(),
+        "index".to_owned(),
+        "packed-refs".to_owned(),
+    ];
+    if let Some(reference) = git(root, &["symbolic-ref", "-q", "HEAD"]) {
+        names.push(reference);
+    }
+    names
+        .into_iter()
+        .filter_map(|name| {
+            git(
+                root,
+                &["rev-parse", "--path-format=absolute", "--git-path", &name],
+            )
+            .map(PathBuf::from)
+        })
+        .collect()
 }
 
 /// UTC build date (`YYYY-MM-DD`). Honors `SOURCE_DATE_EPOCH` for reproducible

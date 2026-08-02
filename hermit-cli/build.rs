@@ -23,6 +23,7 @@ mod build_support;
 
 use build_support::build_date;
 use build_support::git_short_sha;
+use build_support::git_watch_paths;
 
 fn main() {
     let sha = git_short_sha();
@@ -31,8 +32,11 @@ fn main() {
     println!("cargo:rustc-env=HERMIT_BUILD_GIT_SHA={sha}");
     println!("cargo:rustc-env=HERMIT_BUILD_DATE={date}");
 
-    // Re-run when the checked-out revision moves so the embedded SHA stays
-    // accurate, and when a reproducible-build timestamp is supplied.
-    println!("cargo:rerun-if-changed=.git/HEAD");
+    // Re-run when the checked-out revision or index moves so the embedded
+    // provenance stays accurate, and when a reproducible-build timestamp is
+    // supplied.
+    for path in git_watch_paths() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
 }
