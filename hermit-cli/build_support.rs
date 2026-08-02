@@ -26,17 +26,19 @@ pub fn git_short_sha_in(root: &Path) -> String {
     };
     let dirty = git(root, &["status", "--porcelain", "--untracked-files=no"])
         .map(|status| !status.is_empty())
-        .unwrap_or(false);
+        .unwrap_or(true);
     if dirty { format!("{sha}-dirty") } else { sha }
 }
 
-/// Git metadata that can change the embedded revision or dirty state. Resolve
-/// these through Git so this also works from a nested crate and a worktree.
+/// Git metadata and tracked source files that can change the embedded revision
+/// or dirty state. Resolve these through Git so this also works from a nested
+/// crate and a worktree.
 pub fn git_watch_paths() -> Vec<PathBuf> {
     git_watch_paths_in(Path::new("."))
 }
 
 pub fn git_watch_paths_in(root: &Path) -> Vec<PathBuf> {
+    let repository = git(root, &["rev-parse", "--show-toplevel"]).map(PathBuf::from);
     let mut names = vec![
         "HEAD".to_owned(),
         "index".to_owned(),
@@ -45,7 +47,7 @@ pub fn git_watch_paths_in(root: &Path) -> Vec<PathBuf> {
     if let Some(reference) = git(root, &["symbolic-ref", "-q", "HEAD"]) {
         names.push(reference);
     }
-    names
+    let mut paths: Vec<PathBuf> = names
         .into_iter()
         .filter_map(|name| {
             git(
@@ -54,7 +56,20 @@ pub fn git_watch_paths_in(root: &Path) -> Vec<PathBuf> {
             )
             .map(PathBuf::from)
         })
-        .collect()
+        .collect();
+    if let Some(repository) = repository {
+        if let Some(tracked) = git(&repository, &["ls-files", "--full-name"]) {
+            paths.extend(
+                tracked
+                    .lines()
+                    .filter(|path| !path.is_empty())
+                    .map(|path| repository.join(path)),
+            );
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 /// UTC build date (`YYYY-MM-DD`). Honors `SOURCE_DATE_EPOCH` for reproducible
