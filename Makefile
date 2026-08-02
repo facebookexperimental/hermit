@@ -2,8 +2,9 @@ SUBMODULE_PROXY ?= $(shell command -v with-proxy 2>/dev/null)
 SUBMODULE_GIT = $(SUBMODULE_PROXY) git
 CARGO_PROXY ?= $(SUBMODULE_PROXY)
 CARGO = $(CARGO_PROXY) cargo
-# Avoid letting DynamoRIO's nested CMake build consume every core on shared hosts.
-THIRD_PARTY_BUILD_JOBS ?= 8
+# Keep Cargo and nested native builds wide enough for high-core CI hosts without
+# immediately saturating every hardware thread. Override on smaller shared hosts.
+THIRD_PARTY_BUILD_JOBS ?= 64
 
 # Hermit debug binary used by the per-backend parity targets below. Override to
 # point the matrix at a prebuilt binary and skip the build step, e.g.
