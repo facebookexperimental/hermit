@@ -1,0 +1,45 @@
+{
+  "_comment": [
+    "Job-assignment map for the parallel portable fan-out (ci-portable-parallel.yml).",
+    "Every non-e2e-manifest node of ci/dag/portable.json is assigned to exactly one",
+    "job here; the 13 e2e.manifest_* nodes are covered instead by the audited e2e",
+    "matrix (ci/test_harness.sh plan). ci/check-shard-coverage.sh fails closed if this",
+    "map ever drifts from portable.json, so coverage == the trusted DAG by construction.",
+    "Node commands live ONLY in portable.json; shards reference nodes by group.job key",
+    "and execute them via ci/run-node.sh. Blocks are sized so each job targets <10min."
+  ],
+  "preflight_nodes": [
+    "check.backend_abstraction",
+    "check.portability_paths",
+    "lint.rustfmt"
+  ],
+  "build_debug_nodes": [
+    "e2e.metadata",
+    "setup.nextest",
+    "build.workspace",
+    "build.manifest_guests",
+    "build.flaky_harnesses"
+  ],
+  "build_dbi_nodes": [
+    "build.dbi_release"
+  ],
+  "build_aux_nodes": [
+    "build.sabre_release",
+    "build.liteinst_runtime_release"
+  ],
+  "debug_shards": [
+    { "slug": "unit",          "nodes": ["test.hermit_unit", "test.detcore_unit", "test.detcore_misc"] },
+    { "slug": "unit-parallel", "nodes": ["test.detcore_parallel", "test.regular_crates"] },
+    { "slug": "integration",   "nodes": ["test.hermit_integration", "test.cli", "test.arbitrary_binaries", "test.applications_e2e"] },
+    { "slug": "modes",         "nodes": ["test.hermit_modes", "test.app_strict_verify"] },
+    { "slug": "strict-verify", "nodes": ["test.command_strict_verify", "test.ignored_syscall_regressions", "test.envelope_levels", "test.rr_suite_contract"] },
+    { "slug": "clippy",        "nodes": ["lint.clippy"] },
+    { "slug": "docs",          "nodes": ["doc.doctests", "doc.rustdoc"] },
+    { "slug": "strict-compat", "nodes": ["test.strict_compat"] }
+  ],
+  "release_shards": [
+    { "slug": "dbi-parity", "needs": "dbi", "nodes": ["test.dbi_parity"] },
+    { "slug": "sabre",      "needs": "aux", "nodes": ["test.sabre_examples"] },
+    { "slug": "liteinst",   "needs": "aux", "nodes": ["test.liteinst_strict"] }
+  ]
+}

@@ -1,0 +1,428 @@
+name: CI (portable, parallel fan-out)
+
+# Full-lane parallel fan-out of the portable CI DAG.
+#
+# WHY: the authoritative `regular` job in ci-portable.yml runs the entire 46-node
+# portable DAG on ONE ubuntu-latest runner with outer concurrency 1 (serial
+# nodes). Its measured wall (dag-perf-regular @c7531a83) is ~32 min: total
+# node-work 1918s ~= wall 1920s, i.e. the ~2.7x core usage is entirely WITHIN
+# nodes (cargo/nextest -j), not across them. The critical path is only 935s
+# (build.workspace 241s -> build.dbi_release 564s -> build.liteinst_runtime 79s ->
+# test.liteinst_strict 52s), so ~half the wall is left on the table
+# (benchmarks/ci-dag-portable_20260802). This workflow exploits that headroom.
+#
+# WHAT: build the workspace + backends ONCE, split so no single build job exceeds
+# ~10 min (build.dbi_release alone is 564s), publish short-lived artifacts, then
+# fan every test/lint/doc block out to its own small runner that runs EXACTLY its
+# assigned DAG nodes via ci/run-node.sh against the prebuilt tree. Wall time
+# becomes max(build stage, slowest single shard) instead of the serial sum, and
+# every JOB targets <10 min for fast, GitHub-hosted-ceiling-safe feedback.
+#
+# CORRESPONDENCE (fail-closed): ci/check-shard-coverage.sh asserts the shard map
+# (ci/portable-shards.json) assigns every non-e2e portable node to exactly one
+# job; the 13 e2e.manifest_* cells are covered by the SAME audited plan the
+# existing ci-portable-fanout.yml ratchets (ci/test_harness.sh plan). Node
+# COMMANDS live only in ci/dag/portable.json — shards reference nodes by key, so
+# this fan-out can never silently diverge from the trusted DAG. This workflow
+# does NOT call `ci/run-dag.sh portable`; the monolithic ci-portable.yml and its
+# guards are left intact until this lane is validated live and promoted.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    # Self-test on CI-infra PRs without doubling cost on unrelated PRs.
+    paths:
+      - ".github/workflows/ci-portable-parallel.yml"
+      - "ci/**"
+      - "tests/e2e/**"
+      - "scripts/**"
+
+concurrency:
+  group: portable-parallel-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings -C link-arg=-llzma
+  RUSTDOCFLAGS: -D warnings
+  DETCORE_TEST_RUST_LOG: "off"
+  DEBUG_ARTIFACT: hermit-debug-${{ github.run_id }}
+  DEBUG_TARBALL: hermit-portable-debug.tzst
+  RELEASE_DBI_ARTIFACT: hermit-release-dbi-${{ github.run_id }}
+  RELEASE_ARTIFACT: hermit-release-${{ github.run_id }}
+  RELEASE_TARBALL: hermit-portable-release.tzst
+
+jobs:
+  # ---------------------------------------------------------------- plan (cheap)
+  plan:
+    name: Plan shards + verify coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      debug_matrix: ${{ steps.shards.outputs.debug_matrix }}
+      release_matrix: ${{ steps.shards.outputs.release_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fail-closed shard/DAG coverage guard
+        run: ./ci/check-shard-coverage.sh
+      - name: Derive shard matrices from the audited shard map
+        id: shards
+        run: |
+          set -euo pipefail
+          dbg=$(jq -c '{include: [ .debug_shards[] | {slug, nodes: (.nodes|join(","))} ]}' ci/portable-shards.json)
+          rel=$(jq -c '{include: [ .release_shards[] | {slug, needs, nodes: (.nodes|join(","))} ]}' ci/portable-shards.json)
+          echo "debug_matrix=$dbg" >> "$GITHUB_OUTPUT"
+          echo "release_matrix=$rel" >> "$GITHUB_OUTPUT"
+          echo "debug shards:";   jq -r '.debug_shards[]   | "  - \(.slug): \(.nodes|join(", "))"' ci/portable-shards.json
+          echo "release shards:"; jq -r '.release_shards[] | "  - \(.slug) (needs \(.needs)): \(.nodes|join(", "))"' ci/portable-shards.json
+
+  # ------------------------------------------------------- preflight (no build)
+  preflight:
+    name: Preflight (fmt + abstraction + portability)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust components
+        run: rustup component add rustfmt
+      - name: Run preflight nodes
+        run: ./ci/run-node.sh portable "$(jq -r '.preflight_nodes|join(",")' ci/portable-shards.json)"
+
+  # ------------------------------------------------------------ build (debug)
+  build-debug:
+    name: Build debug workspace + guests once
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      e2e_matrix: ${{ steps.cells.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize safe-ci-dag-runner submodule
+        run: git submodule update --init agent-utils
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: portable-parallel-debug
+          cache-on-failure: true
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
+      - name: Rust components
+        run: rustup component add clippy rustfmt
+      # Reproduce the debug build nodes EXACTLY from portable.json (no drift):
+      # e2e.metadata, setup.nextest, build.workspace, build.manifest_guests,
+      # build.flaky_harnesses.
+      - name: Run debug build nodes
+        run: ./ci/run-node.sh portable "$(jq -r '.build_debug_nodes|join(",")' ci/portable-shards.json)"
+      - name: Enumerate portable (manifest x backend) e2e cells from the audited plan
+        id: cells
+        run: |
+          set -euo pipefail
+          plan=$(./ci/test_harness.sh plan --lane portable --ci-only --format json)
+          matrix=$(jq -c '
+            (([ .[] | select(.backend != null) | {category, backend} ] | unique)
+             + ([ .[] | select(.mode == "naked") | {category, backend: "naked"} ] | unique))
+            | sort_by(.category, .backend)
+            | { include: map({ category, backend, slug: (.category + "__" + .backend) }) }
+          ' <<<"$plan")
+          count=$(jq '.include | length' <<<"$matrix")
+          [[ "$count" -gt 0 ]] || { echo "empty portable cell matrix" >&2; exit 1; }
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "Fanning out $count portable e2e cells:" >&2
+          jq -r '.include[] | "  - \(.category) x \(.backend)"' <<<"$matrix" >&2
+      - name: Pack debug prebuilt tree
+        run: |
+          set -euo pipefail
+          # target/e2e/build is created lazily by `test_harness.sh build` only
+          # when at least one guest fixture stages; on trees that stage none it
+          # never exists and `tar` would abort with "Cannot stat". Materialize an
+          # empty dir so the pack is robust — e2e cells run with --allow-empty and
+          # simply find no prebuilt fixtures, exactly as an unstaged tree intends.
+          mkdir -p target/e2e/build
+          tar --zstd -cf "$DEBUG_TARBALL" \
+            target/debug/hermit \
+            target/e2e/build
+          ls -lh "$DEBUG_TARBALL"
+      - name: Upload debug prebuilt tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.DEBUG_ARTIFACT }}
+          path: ${{ env.DEBUG_TARBALL }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------- build (release: dbi long pole)
+  build-dbi:
+    name: Build dbi release (long pole, <10m)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize safe-ci-dag-runner submodule
+        run: git submodule update --init agent-utils
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: portable-parallel-release
+          cache-on-failure: true
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake file g++ gcc git jq libelf-dev libunwind-dev liblzma-dev make pkg-config python3-full zlib1g-dev zstd
+      - name: Run dbi release build node
+        run: ./ci/run-node.sh portable "$(jq -r '.build_dbi_nodes|join(",")' ci/portable-shards.json)"
+      - name: Pack dbi release prebuilt tree
+        run: |
+          set -euo pipefail
+          tar --zstd -cf "$RELEASE_TARBALL" \
+            --exclude='target/release/deps' \
+            --exclude='target/release/build' \
+            --exclude='target/release/incremental' \
+            --exclude='target/release/.fingerprint' \
+            --exclude='target/release/examples' \
+            target/release \
+            target/install_pkg
+          ls -lh "$RELEASE_TARBALL"
+      - name: Upload dbi release prebuilt tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RELEASE_DBI_ARTIFACT }}
+          path: ${{ env.RELEASE_TARBALL }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # --------------------------------- build (release: sabre + liteinst, warm cache)
+  build-aux:
+    name: Build sabre + liteinst release (warm)
+    needs: build-dbi
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize safe-ci-dag-runner submodule
+        run: git submodule update --init agent-utils
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: portable-parallel-release
+          save-if: false
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake file g++ gcc git jq libelf-dev libunwind-dev liblzma-dev make pkg-config python3-full zlib1g-dev zstd
+      - name: Download dbi release prebuilt tree
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.RELEASE_DBI_ARTIFACT }}
+          path: .
+      - name: Unpack dbi release prebuilt tree
+        run: |
+          set -euo pipefail
+          tar --zstd -xf "$RELEASE_TARBALL"
+          rm -f "$RELEASE_TARBALL"
+          test -x target/release/hermit
+      - name: Run sabre + liteinst release build nodes
+        run: ./ci/run-node.sh portable "$(jq -r '.build_aux_nodes|join(",")' ci/portable-shards.json)"
+      - name: Repack full release prebuilt tree (dbi + sabre + liteinst)
+        run: |
+          set -euo pipefail
+          tar --zstd -cf "$RELEASE_TARBALL" \
+            --exclude='target/release/deps' \
+            --exclude='target/release/build' \
+            --exclude='target/release/incremental' \
+            --exclude='target/release/.fingerprint' \
+            --exclude='target/release/examples' \
+            target/release \
+            target/install_pkg
+          ls -lh "$RELEASE_TARBALL"
+      - name: Upload full release prebuilt tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RELEASE_ARTIFACT }}
+          path: ${{ env.RELEASE_TARBALL }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # ------------------------------------------------- test shards (debug-backed)
+  test-debug:
+    name: "test: ${{ matrix.slug }}"
+    needs: [plan, build-debug]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.debug_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize safe-ci-dag-runner submodule
+        run: git submodule update --init agent-utils
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: portable-parallel-debug
+          save-if: false
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
+      - name: Rust components
+        run: rustup component add clippy rustfmt
+      - name: Enable unprivileged user and mount namespaces
+        run: |
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Download debug prebuilt tree
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.DEBUG_ARTIFACT }}
+          path: .
+      - name: Unpack debug prebuilt tree
+        run: |
+          set -euo pipefail
+          tar --zstd -xf "$DEBUG_TARBALL"
+          rm -f "$DEBUG_TARBALL"
+          test -x target/debug/hermit
+      - name: Run shard nodes (${{ matrix.slug }})
+        run: ./ci/run-node.sh portable "${{ matrix.nodes }}"
+
+  # ----------------------------------------------- test shards (release-backed)
+  test-release:
+    name: "test: ${{ matrix.slug }}"
+    needs: [plan, build-dbi, build-aux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.release_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize safe-ci-dag-runner submodule
+        run: git submodule update --init agent-utils
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: portable-parallel-release
+          save-if: false
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc binutils bzip2 clang cmake file g++ gcc git jq libc6-dbg libelf-dev libunwind-dev liblzma-dev make pkg-config procps python3-full time zlib1g-dev zstd
+      - name: Download full release prebuilt tree
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.RELEASE_ARTIFACT }}
+          path: .
+      - name: Unpack full release prebuilt tree
+        run: |
+          set -euo pipefail
+          tar --zstd -xf "$RELEASE_TARBALL"
+          rm -f "$RELEASE_TARBALL"
+          test -x target/release/hermit
+      - name: Run shard nodes (${{ matrix.slug }})
+        run: ./ci/run-node.sh portable "${{ matrix.nodes }}"
+
+  # ------------------------------------------------------------- e2e cells
+  e2e:
+    name: "e2e: ${{ matrix.slug }}"
+    needs: [build-debug, build-aux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.build-debug.outputs.e2e_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize safe-ci-dag-runner submodule
+        run: git submodule update --init agent-utils
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
+      - name: Enable unprivileged user and mount namespaces
+        run: |
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
+      - name: Download debug prebuilt tree
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.DEBUG_ARTIFACT }}
+          path: .
+      - name: Download full release prebuilt tree
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.RELEASE_ARTIFACT }}
+          path: .
+      - name: Unpack prebuilt trees
+        run: |
+          set -euo pipefail
+          tar --zstd -xf "$DEBUG_TARBALL"; rm -f "$DEBUG_TARBALL"
+          tar --zstd -xf "$RELEASE_TARBALL"; rm -f "$RELEASE_TARBALL"
+          test -x target/debug/hermit
+          test -x target/release/hermit
+      - name: Run cell (${{ matrix.category }} x ${{ matrix.backend }})
+        run: |
+          set -euo pipefail
+          out="target/e2e/portable/${{ matrix.slug }}"
+          if [[ "${{ matrix.backend }}" == "naked" ]]; then
+            ./ci/test_harness.sh run --lane portable --category "${{ matrix.category }}" \
+              --mode naked --ci-only --allow-empty --prebuilt \
+              --results "$out/results.jsonl" --junit "$out/junit.xml"
+          else
+            ./ci/test_harness.sh run --lane portable --category "${{ matrix.category }}" \
+              --backend "${{ matrix.backend }}" --ci-only --allow-empty --prebuilt \
+              --results "$out/results.jsonl" --junit "$out/junit.xml"
+          fi
+      - name: Upload cell results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-results-portable-parallel-${{ matrix.slug }}
+          path: target/e2e/portable/${{ matrix.slug }}
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ------------------------------------------------------------- cleanup
+  cleanup:
+    name: Delete prebuilt build artifacts
+    needs: [build-debug, build-dbi, build-aux, test-debug, test-release, e2e]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Delete short-lived build artifacts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const names = new Set([
+              `hermit-debug-${context.runId}`,
+              `hermit-release-dbi-${context.runId}`,
+              `hermit-release-${context.runId}`,
+            ]);
+            const arts = await github.paginate(
+              github.rest.actions.listWorkflowRunArtifacts,
+              { owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId }
+            );
+            const mine = arts.filter(a => names.has(a.name));
+            if (mine.length === 0) core.info("No build artifacts to delete (already expired or never uploaded).");
+            for (const a of mine) {
+              await github.rest.actions.deleteArtifact({
+                owner: context.repo.owner, repo: context.repo.repo, artifact_id: a.id,
+              });
+              core.info(`Deleted artifact ${a.name} (id=${a.id}, ${a.size_in_bytes} bytes).`);
+            }
