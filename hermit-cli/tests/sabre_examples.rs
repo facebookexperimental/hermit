@@ -314,6 +314,32 @@ fn sabre_root_pid_matches_ptrace() {
 }
 
 #[test]
+fn sabre_info_includes_syscall_detlogs() {
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+
+    let mut command = Command::new(hermit_binary());
+    command.env("HERMIT_SABRE_BINARY", loader).args([
+        "--log=info",
+        "run",
+        "--backend",
+        "sabre",
+        "--strict",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+        "--",
+        "/bin/true",
+    ]);
+    let output = run_bounded(command, "SaBRe syscall DETLOG forwarding", None);
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        diagnostics.contains("DETLOG [syscall]") && diagnostics.contains("finish syscall #"),
+        "SaBRe INFO output omitted syscall DETLOG records:\n{diagnostics}",
+    );
+}
+
+#[test]
 fn sabre_non_racy_examples_verify_current_envelope() {
     let Some(loader) = sabre_loader() else {
         return;

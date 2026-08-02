@@ -11,6 +11,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::fs::File;
+use std::fs::OpenOptions;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::io::Read;
@@ -60,6 +61,18 @@ use super::verify::validate_log_level;
 
 const TMP_DIR: &str = "/tmp";
 const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
+const NORMALIZED_SABRE_DETLOG_TIMESTAMP: &str = "1970-01-01T00:00:00.000000Z";
+
+fn append_sabre_detlogs(path: &Path, stderr: &[u8]) -> Result<(), Error> {
+    let mut log = OpenOptions::new().append(true).open(path)?;
+    for line in String::from_utf8_lossy(stderr).lines() {
+        let line = line.trim_start();
+        if line.starts_with("INFO detcore") && line.contains(" DETLOG ") {
+            writeln!(log, "{NORMALIZED_SABRE_DETLOG_TIMESTAMP} {line}")?;
+        }
+    }
+    Ok(())
+}
 struct PreparedMounts {
     mounts: Vec<Mount>,
     identity_sources: IdentityGuard,
@@ -2602,6 +2615,9 @@ impl RunOpts {
         eprintln!(":: {}", "Run1...".yellow().bold());
 
         let out1: Output = self.run_verify(log1_file, global)?;
+        if self.selected_backend() == Backend::Sabre {
+            append_sabre_detlogs(&log1_path, &out1.stderr)?;
+        }
 
         // With --verify the first run's `--log` output was diverted to a
         // temporary file for later comparison rather than shown to the user.
@@ -2631,6 +2647,9 @@ impl RunOpts {
 
         eprintln!(":: {}", "Run2...".yellow().bold());
         let out2 = self.run_verify(log2_file, global)?;
+        if self.selected_backend() == Backend::Sabre {
+            append_sabre_detlogs(&log2_path, &out2.stderr)?;
+        }
 
         let kvm_output_only = self.selected_backend() == Backend::Kvm;
         let status = compare_two_runs(
@@ -3003,5 +3022,32 @@ impl<'a> Tmpfs<'a> {
             Self::Path(path) => path,
             Self::Temp(temp) => temp.path(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn appends_only_sabre_detlogs_with_normalized_timestamps() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            log.path(),
+            "2026-08-02T00:00:00.000000Z INFO detcore: coordinator message\n",
+        )
+        .unwrap();
+        append_sabre_detlogs(
+            log.path(),
+            b"guest stderr\n INFO detcore: inbound syscall: getpid() = ?\n\
+              INFO detcore: DETLOG [syscall] finish syscall #1: getpid() = Ok(3)\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(log.path()).unwrap(),
+            "2026-08-02T00:00:00.000000Z INFO detcore: coordinator message\n\
+             1970-01-01T00:00:00.000000Z INFO detcore: DETLOG [syscall] finish syscall #1: getpid() = Ok(3)\n",
+        );
     }
 }

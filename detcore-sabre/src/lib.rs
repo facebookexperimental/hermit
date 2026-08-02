@@ -13,6 +13,7 @@ use std::ffi::CString;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io;
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -33,6 +34,9 @@ use reverie_syscalls::Sysno;
 /// Environment variable containing the coordinator's Unix-domain socket path.
 // TODO-HUMAN-REVIEW(PR-745): Review the private SaBRe exec environment contract.
 pub const RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
+
+/// Private opt-in for forwarding injected-process Detcore INFO events.
+pub const DETLOG_FORWARD_ENV: &str = "REVERIE_SABRE_HERMIT_FORWARD_DETLOG";
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-771): Review fork-inherited SaBRe coordinator discovery.
@@ -62,6 +66,53 @@ fn coordinator_socket() -> Option<PathBuf> {
     // SAFETY: Plugin construction runs before SaBRe starts guest callbacks.
     let requested = unsafe { sabre::take_private_env(RPC_SOCKET_ENV) };
     remember_coordinator_socket(&RPC_SOCKET, requested.as_deref())
+}
+
+struct RawStderr;
+
+impl Write for RawStderr {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        loop {
+            let written = unsafe {
+                libc::write(
+                    libc::STDERR_FILENO,
+                    bytes.as_ptr().cast::<libc::c_void>(),
+                    bytes.len(),
+                )
+            };
+            if written >= 0 {
+                return Ok(written as usize);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn forward_detlog(message: std::fmt::Arguments<'_>) {
+    let mut stderr = RawStderr;
+    let _ = stderr.write_all(b"INFO detcore: DETLOG ");
+    let _ = stderr.write_fmt(message);
+    let _ = stderr.write_all(b"\n");
+}
+
+fn init_detlog_forwarder() {
+    // SAFETY: Plugin construction runs before SaBRe starts guest callbacks.
+    let requested = unsafe { sabre::take_private_env(DETLOG_FORWARD_ENV) };
+    if requested.as_deref() != Some(OsStr::new("1")) {
+        return;
+    }
+
+    // Stderr is protected by reverie-sabre and is captured separately during
+    // verification. A direct sink avoids tracing's thread-local dispatcher:
+    // libc may issue its final exit_group after Rust TLS destruction begins.
+    let _ = detcore::detlog::set_forwarder(forward_detlog);
 }
 
 fn remember_coordinator_socket(
@@ -146,6 +197,7 @@ struct Plugin {
 
 impl Plugin {
     fn connect() -> Self {
+        init_detlog_forwarder();
         let socket = coordinator_socket().unwrap_or_else(|| panic!("{RPC_SOCKET_ENV} is not set"));
 
         let adapter = RemoteReverieAdapter::connect(socket)
@@ -334,6 +386,7 @@ mod tests {
     #[test]
     fn rpc_socket_uses_sabre_private_environment_namespace() {
         assert!(RPC_SOCKET_ENV.starts_with("REVERIE_SABRE_"));
+        assert!(DETLOG_FORWARD_ENV.starts_with("REVERIE_SABRE_"));
     }
 
     #[test]
