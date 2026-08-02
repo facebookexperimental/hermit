@@ -14,11 +14,13 @@ use std::fs::File;
 use std::io::Read;
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Instant;
 
 use digest::Digest;
 use serde::Deserialize;
@@ -37,6 +39,10 @@ pub const E9TOOL_ENV: &str = "HERMIT_E9TOOL";
 /// Environment variable that overrides the e9patch backend executable.
 // TODO-HUMAN-REVIEW(PR-594): Review the public e9patch backend override.
 pub const E9PATCH_BACKEND_ENV: &str = "HERMIT_E9PATCH_BACKEND";
+/// When set, disable the tool-digest memo and always re-snapshot the e9tool and
+/// e9patch executables. Diagnostic only: lets the old always-snapshot cost be
+/// A/B-measured against `preprocess_us` within a single build.
+const NO_DIGEST_CACHE_ENV: &str = "HERMIT_E9PATCH_NO_DIGEST_CACHE";
 
 const REWRITE_SCHEMA_VERSION: u32 = 6;
 
@@ -59,6 +65,10 @@ pub struct PreparedBinary {
     pub b0_sites: usize,
     /// SHA-256 of the rewritten ELF, absent when no rewrite artifact is retained.
     pub artifact_sha256: Option<String>,
+    /// Wall-clock spent in `prepare`, in microseconds. Attributes e9patch
+    /// preprocessing cost so a warm cache hit can be distinguished from a cold
+    /// rewrite in the run banner.
+    pub preprocess_micros: u64,
 }
 
 #[derive(Debug)]
@@ -88,6 +98,16 @@ struct RewriteMetadata {
     patched_sites: usize,
     recovered_sites: usize,
     b0_sites: usize,
+}
+
+/// Memoized SHA-256 of a trusted executable, keyed on its `(len, mtime)` so an
+/// unchanged tool is not re-read and re-hashed on every run.
+#[derive(Debug, Deserialize, Serialize)]
+struct FileDigestCacheEntry {
+    len: u64,
+    mtime_seconds: i64,
+    mtime_nanoseconds: i64,
+    digest: Digest,
 }
 
 /// Return an actionable error when e9tool cannot be executed.
@@ -126,6 +146,16 @@ fn prepare_in(
     binary: impl AsRef<Path>,
     cache_dir: impl AsRef<Path>,
 ) -> Result<PreparedBinary, Error> {
+    let started = Instant::now();
+    let mut prepared = prepare_in_impl(binary, cache_dir)?;
+    prepared.preprocess_micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    Ok(prepared)
+}
+
+fn prepare_in_impl(
+    binary: impl AsRef<Path>,
+    cache_dir: impl AsRef<Path>,
+) -> Result<PreparedBinary, Error> {
     let cache_dir = cache_dir.as_ref();
     ensure_private_cache_dir(cache_dir)?;
     let snapshot = snapshot_binary(binary.as_ref(), cache_dir)?;
@@ -146,36 +176,81 @@ fn prepare_in(
             rewrite_cache_hit: false,
             b0_sites: 0,
             artifact_sha256: None,
+            preprocess_micros: 0,
         });
     }
 
     let e9tool_path = resolve_e9tool()?;
     let e9patch_backend_path = resolve_e9patch_backend(&e9tool_path)?;
+
+    // Forming the content-addressed rewrite key needs only the *digests* of the
+    // e9tool/e9patch executables, not trusted copies of them: on a rewrite-cache
+    // hit those binaries are never executed. Reading and SHA-256-hashing these
+    // multi-hundred-KiB tools (twice each, via `snapshot_binary`) on every
+    // invocation was the dominant per-run cost of the warm path, so take their
+    // digests from a `(path, len, mtime)`-keyed sidecar cache and defer the
+    // trusted snapshot copy to the miss path, where e9tool actually runs.
+    let candidate_sites = result.map.sites.len();
+    let input_digest = snapshot.digest;
+    let input_mode = snapshot.mode;
+    let make_identity = |e9tool_digest, e9patch_backend_digest| RewriteIdentity {
+        schema_version: REWRITE_SCHEMA_VERSION,
+        input_digest,
+        instruction_map_digest,
+        e9tool_digest,
+        e9patch_backend_digest,
+        input_mode,
+        candidate_sites,
+    };
+    let cached_hit = |identity: &RewriteIdentity| -> Result<Option<PreparedBinary>, Error> {
+        let rewrite_key = Digest::new(&serde_json::to_vec(identity)?).to_string();
+        let metadata_path = cache_dir.join(format!("{rewrite_key}.json"));
+        Ok(
+            read_valid_rewrite(cache_dir, &rewrite_key, &metadata_path, identity).map(
+                |(binary, metadata)| PreparedBinary {
+                    binary,
+                    candidate_sites,
+                    patched_sites: metadata.patched_sites,
+                    instruction_map_cache_status: result.cache_status,
+                    rewrite_cache_hit: true,
+                    b0_sites: metadata.b0_sites,
+                    artifact_sha256: Some(metadata.output_digest.to_string()),
+                    preprocess_micros: 0,
+                },
+            ),
+        )
+    };
+
+    // Fast path: look up the rewrite artifact from the memoized tool digests,
+    // without reading, hashing, or copying the tools themselves. Setting
+    // HERMIT_E9PATCH_NO_DIGEST_CACHE disables the memo so the cost of the old
+    // always-snapshot behavior can be A/B-measured against `preprocess_us` in a
+    // single build.
+    if env::var_os(NO_DIGEST_CACHE_ENV).is_none()
+        && let (Some(e9tool_digest), Some(e9patch_backend_digest)) = (
+            cached_file_digest(&e9tool_path, cache_dir),
+            cached_file_digest(&e9patch_backend_path, cache_dir),
+        )
+        && let Some(prepared) = cached_hit(&make_identity(e9tool_digest, e9patch_backend_digest))?
+    {
+        return Ok(prepared);
+    }
+
+    // Miss, or no memoized digest yet: produce authoritative trusted snapshots of
+    // the tools — required to execute e9tool — refresh the sidecar cache, and
+    // rebuild the key from the authoritative digests so a stale memo can never
+    // write metadata under the wrong key.
     let e9tool = snapshot_binary(&e9tool_path, cache_dir)?;
     let e9patch_backend = snapshot_binary(&e9patch_backend_path, cache_dir)?;
-    let rewrite_identity = RewriteIdentity {
-        schema_version: REWRITE_SCHEMA_VERSION,
-        input_digest: snapshot.digest,
-        instruction_map_digest,
-        e9tool_digest: e9tool.digest,
-        e9patch_backend_digest: e9patch_backend.digest,
-        input_mode: snapshot.mode,
-        candidate_sites: result.map.sites.len(),
-    };
+    store_file_digest(&e9tool_path, e9tool.digest, cache_dir);
+    store_file_digest(&e9patch_backend_path, e9patch_backend.digest, cache_dir);
+    let rewrite_identity = make_identity(e9tool.digest, e9patch_backend.digest);
     let rewrite_key = Digest::new(&serde_json::to_vec(&rewrite_identity)?).to_string();
     let metadata_path = cache_dir.join(format!("{rewrite_key}.json"));
-    if let Some((binary, metadata)) =
-        read_valid_rewrite(cache_dir, &rewrite_key, &metadata_path, &rewrite_identity)
-    {
-        return Ok(PreparedBinary {
-            binary,
-            candidate_sites: result.map.sites.len(),
-            patched_sites: metadata.patched_sites,
-            instruction_map_cache_status: result.cache_status,
-            rewrite_cache_hit: true,
-            b0_sites: metadata.b0_sites,
-            artifact_sha256: Some(metadata.output_digest.to_string()),
-        });
+    // A stale sidecar digest can make the fast path miss even though a valid
+    // artifact exists under the authoritative key; re-check before rewriting.
+    if let Some(prepared) = cached_hit(&rewrite_identity)? {
+        return Ok(prepared);
     }
 
     let temporary = tempfile::Builder::new()
@@ -253,6 +328,7 @@ fn prepare_in(
             rewrite_cache_hit: false,
             b0_sites: 0,
             artifact_sha256: None,
+            preprocess_micros: 0,
         });
     }
     if !is_executable_file(&temporary_binary) {
@@ -305,6 +381,7 @@ fn prepare_in(
         rewrite_cache_hit: false,
         b0_sites,
         artifact_sha256: Some(output_digest.to_string()),
+        preprocess_micros: 0,
     })
 }
 
@@ -539,6 +616,70 @@ fn trusted_regular_file(path: &Path, executable: bool) -> bool {
 fn trusted_file_with_digest(path: &Path, expected: Digest, executable: bool) -> bool {
     trusted_regular_file(path, executable)
         && Digest::digest_path(path).is_ok_and(|actual| actual == expected)
+}
+
+fn file_digest_cache_path(cache_dir: &Path, canonical: &Path) -> PathBuf {
+    let key = Digest::new(canonical.as_os_str().as_bytes());
+    cache_dir.join("tool-digests").join(format!("{key}.json"))
+}
+
+/// Return the memoized SHA-256 of `path` when a sidecar entry matches the file's
+/// current `(len, mtime)`, or `None` when the file is untrusted, changed, or not
+/// yet memoized. A poisoned sidecar cannot cause a wrong artifact to run: the
+/// key it produces is still verified by `read_valid_rewrite`, which re-hashes the
+/// artifact, and a miss falls through to the authoritative snapshot path.
+fn cached_file_digest(path: &Path, cache_dir: &Path) -> Option<Digest> {
+    let canonical = fs::canonicalize(path).ok()?;
+    let metadata = fs::symlink_metadata(&canonical).ok()?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+    {
+        return None;
+    }
+    let entry_path = file_digest_cache_path(cache_dir, &canonical);
+    if !trusted_regular_file(&entry_path, false) {
+        return None;
+    }
+    let entry: FileDigestCacheEntry =
+        serde_json::from_reader(File::open(&entry_path).ok()?).ok()?;
+    (entry.len == metadata.len()
+        && entry.mtime_seconds == metadata.mtime()
+        && entry.mtime_nanoseconds == metadata.mtime_nsec())
+    .then_some(entry.digest)
+}
+
+/// Best-effort: memoize `digest` for `path` keyed on its `(len, mtime)`. A write
+/// failure only forgoes the fast path on the next run and is not fatal.
+fn store_file_digest(path: &Path, digest: Digest, cache_dir: &Path) {
+    let _ = store_file_digest_inner(path, digest, cache_dir);
+}
+
+fn store_file_digest_inner(path: &Path, digest: Digest, cache_dir: &Path) -> Result<(), Error> {
+    let canonical = fs::canonicalize(path)?;
+    let metadata = fs::symlink_metadata(&canonical)?;
+    let entry = FileDigestCacheEntry {
+        len: metadata.len(),
+        mtime_seconds: metadata.mtime(),
+        mtime_nanoseconds: metadata.mtime_nsec(),
+        digest,
+    };
+    let entry_path = file_digest_cache_path(cache_dir, &canonical);
+    let parent = entry_path
+        .parent()
+        .ok_or_else(|| Error::msg("tool-digest cache path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".tool-digest-")
+        .tempfile_in(parent)?;
+    serde_json::to_writer(&mut temporary, &entry)?;
+    temporary.write_all(b"\n")?;
+    temporary.as_file().sync_all()?;
+    let mut permissions = temporary.as_file().metadata()?.permissions();
+    permissions.set_mode(0o600);
+    temporary.as_file().set_permissions(permissions)?;
+    temporary.persist(&entry_path)?;
+    Ok(())
 }
 
 fn resolve_e9tool() -> Result<PathBuf, Error> {
@@ -806,6 +947,54 @@ mod tests {
             second.digest,
             true
         ));
+    }
+
+    #[test]
+    fn tool_digest_memo_matches_real_digest_and_detects_staleness() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        let tool = directory.path().join("e9tool");
+        fs::write(&tool, b"first-contents").unwrap();
+
+        // Not memoized yet.
+        assert_eq!(cached_file_digest(&tool, &cache), None);
+
+        // After storing, the memo returns the real on-disk digest without a re-read.
+        let real = Digest::digest_path(&tool).unwrap();
+        store_file_digest(&tool, real, &cache);
+        assert_eq!(cached_file_digest(&tool, &cache), Some(real));
+
+        // A changed file (different length) invalidates the stale memo.
+        fs::write(&tool, b"second-contents-longer").unwrap();
+        assert_eq!(cached_file_digest(&tool, &cache), None);
+
+        // Refreshing the memo tracks the new contents.
+        let refreshed = Digest::digest_path(&tool).unwrap();
+        assert_ne!(refreshed, real);
+        store_file_digest(&tool, refreshed, &cache);
+        assert_eq!(cached_file_digest(&tool, &cache), Some(refreshed));
+    }
+
+    #[test]
+    fn tool_digest_memo_rejects_group_writable_sidecar() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        let tool = directory.path().join("e9tool");
+        fs::write(&tool, b"contents").unwrap();
+        let real = Digest::digest_path(&tool).unwrap();
+        store_file_digest(&tool, real, &cache);
+
+        let canonical = fs::canonicalize(&tool).unwrap();
+        let sidecar = file_digest_cache_path(&cache, &canonical);
+        let mut permissions = fs::metadata(&sidecar).unwrap().permissions();
+        permissions.set_mode(0o666);
+        fs::set_permissions(&sidecar, permissions).unwrap();
+
+        // An untrusted (group/other-writable) sidecar is ignored, forcing the
+        // authoritative snapshot path instead of trusting a plantable memo.
+        assert_eq!(cached_file_digest(&tool, &cache), None);
     }
 
     #[test]

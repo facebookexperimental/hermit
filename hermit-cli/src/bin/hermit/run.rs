@@ -2326,13 +2326,15 @@ impl RunOpts {
         eprintln!(
             ":: Backend: e9patch preprocessing + ptrace runtime; candidate_sites={}; \
              mapped_sites={}; b0_sites={}; \
-             instruction_map_cache={:?}; rewrite_cache={}; artifact_sha256={}",
+             instruction_map_cache={:?}; rewrite_cache={}; artifact_sha256={}; \
+             preprocess_us={}",
             prepared.candidate_sites,
             prepared.patched_sites,
             prepared.b0_sites,
             prepared.instruction_map_cache_status,
             rewrite_cache,
             prepared.artifact_sha256.as_deref().unwrap_or("none"),
+            prepared.preprocess_micros,
         );
         Ok(())
     }
