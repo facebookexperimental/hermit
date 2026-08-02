@@ -113,6 +113,13 @@ jobs:
       - name: Pack prebuilt tree
         run: |
           set -euo pipefail
+          # target/e2e/build is created lazily by `test_harness.sh build` only
+          # when >=1 guest fixture stages; on a tree that stages zero fixtures it
+          # never exists and `tar` aborts ("Cannot stat: No such file or
+          # directory"), failing the Pack step even though the compile succeeded.
+          # Materialize it so an empty staged tree packs cleanly (cells run
+          # --allow-empty --prebuilt and handle an empty staged tree).
+          mkdir -p target/e2e/build
           tar --zstd -cf "$BUILD_TARBALL" \
             --exclude='target/release/deps' \
             --exclude='target/release/build' \
