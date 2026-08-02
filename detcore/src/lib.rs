@@ -1427,9 +1427,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             );
         }
 
-        let config = guest.config().clone(); // TODO/FIXME: this is an inefficient and unnecessary copy
+        // The hot syscall path only reads a few Copy flags from the config, so copy
+        // just those out instead of cloning the entire Config on every intercepted
+        // syscall (previously flagged inline as an unnecessary copy). guest.config()
+        // borrows guest immutably; bind the flags in a tight scope so the borrow ends
+        // before the later thread_state_mut()/&mut guest borrows below.
+        let (sequentialize_threads, virtualize_time, panic_on_unsupported_syscalls) = {
+            let config = guest.config();
+            (
+                config.sequentialize_threads,
+                config.virtualize_time,
+                config.panic_on_unsupported_syscalls,
+            )
+        };
 
-        if config.sequentialize_threads && self.cfg.should_trace_schedevent() {
+        if sequentialize_threads && self.cfg.should_trace_schedevent() {
             trace_schedevent(
                 guest,
                 with_guest_time(
@@ -1441,7 +1453,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .await;
         }
 
-        let virtualize_time = config.virtualize_time;
         let syscall_cost_ns = syscall_time::cost_ns(call.number());
         let new_count = {
             // which results from not being able to borrow guest twice.
@@ -1461,7 +1472,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // Rseq is not type-safe in the pinned Reverie revision. Dispatch by Sysno so a
             // future typed representation preserves this explicit policy.
             SyscallClassification::Determinized if call.number() == Sysno::rseq => {
-                if config.panic_on_unsupported_syscalls {
+                if panic_on_unsupported_syscalls {
                     Err(Error::Errno(Errno::ENOSYS))
                 } else {
                     self.passthrough(guest, call).await
@@ -1548,7 +1559,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // guest asserts add_key + keyctl(SETPERM) succeed. Under strict mode
             // the deterministic ENOSYS boundary is preserved.
             SyscallClassification::Determinized if is_kernel_keyring_syscall(call.number()) => {
-                if config.panic_on_unsupported_syscalls {
+                if panic_on_unsupported_syscalls {
                     Err(Error::Errno(Errno::ENOSYS))
                 } else {
                     self.passthrough(guest, call).await
@@ -1561,7 +1572,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // mode pass-through used by the existing rr splice compatibility
             // test.
             SyscallClassification::Determinized if is_zero_copy_pipe_syscall(call.number()) => {
-                if config.panic_on_unsupported_syscalls {
+                if panic_on_unsupported_syscalls {
                     Err(Error::Errno(Errno::ENOSYS))
                 } else {
                     self.passthrough(guest, call).await
@@ -1827,7 +1838,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                             guest,
                             call,
                             dettid,
-                            config.panic_on_unsupported_syscalls,
+                            panic_on_unsupported_syscalls,
                         )
                         .await
                     }
@@ -1840,7 +1851,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                             guest,
                             call,
                             dettid,
-                            config.panic_on_unsupported_syscalls,
+                            panic_on_unsupported_syscalls,
                         )
                         .await
                     }
@@ -1853,7 +1864,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                             guest,
                             call,
                             dettid,
-                            config.panic_on_unsupported_syscalls,
+                            panic_on_unsupported_syscalls,
                         )
                         .await
                     }
@@ -1866,7 +1877,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                             guest,
                             call,
                             dettid,
-                            config.panic_on_unsupported_syscalls,
+                            panic_on_unsupported_syscalls,
                         )
                         .await
                     }
@@ -1890,7 +1901,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                             guest,
                             call,
                             dettid,
-                            config.panic_on_unsupported_syscalls,
+                            panic_on_unsupported_syscalls,
                         )
                         .await
                     }
@@ -1905,7 +1916,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                             guest,
                             call,
                             dettid,
-                            config.panic_on_unsupported_syscalls,
+                            panic_on_unsupported_syscalls,
                         )
                         .await
                     }
@@ -2164,7 +2175,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         guest,
                         unexpected,
                         dettid,
-                        config.panic_on_unsupported_syscalls,
+                        panic_on_unsupported_syscalls,
                     )
                     .await
                 }
@@ -2176,13 +2187,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // TODO-HUMAN-REVIEW(PR-644): Keep dispatch aligned with the reviewed classification.
             SyscallClassification::PassThrough => self.passthrough(guest, call).await,
             SyscallClassification::Unsupported => {
-                self.handle_unsupported_syscall(
-                    guest,
-                    call,
-                    dettid,
-                    config.panic_on_unsupported_syscalls,
-                )
-                .await
+                self.handle_unsupported_syscall(guest, call, dettid, panic_on_unsupported_syscalls)
+                    .await
             }
         };
 
@@ -2196,7 +2202,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
         self.detlog_memory_maps(guest)?;
 
-        if config.sequentialize_threads && self.cfg.should_trace_schedevent() {
+        if sequentialize_threads && self.cfg.should_trace_schedevent() {
             trace_schedevent(
                 guest,
                 with_guest_time(
