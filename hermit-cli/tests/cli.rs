@@ -729,6 +729,23 @@ fn run_liteinst_verifies_detcore_backend() {
 }
 
 #[test]
+fn backend_stats_are_info_gated_for_ptrace() {
+    let default_args = ["run", "--strict", "--", "/bin/true"];
+    let default_output = hermit(&default_args);
+    assert_success(&default_output, &default_args);
+    assert!(!stderr(&default_output).contains("backend run complete"));
+
+    let info_args = ["--log", "info", "run", "--strict", "--", "/bin/true"];
+    let info_output = hermit(&info_args);
+    assert_success(&info_output, &info_args);
+    assert!(
+        stderr(&info_output).contains("backend run complete backend=ptrace stats=metrics=none"),
+        "{}",
+        stderr(&info_output)
+    );
+}
+
+#[test]
 fn run_liteinst_rejects_a_non_runtime_override_before_activation_claim() {
     let args = [
         "run",
