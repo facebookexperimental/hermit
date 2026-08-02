@@ -732,6 +732,36 @@ fn non_e9patch_validation_preserves_parent_component_paths() {
     ro.validate_program().unwrap();
 }
 
+/// The guest environment must be identical across backends. Sanitizer leak
+/// detection is disabled in `guest_command()` (the single backend-independent
+/// place) rather than only in the ptrace tracer, so the out-of-process KVM
+/// backend presents the guest the same environment as ptrace/e9patch/sabre.
+/// Regression test for the KVM-vs-ptrace env divergence, where the guest saw
+/// two fewer variables under KVM.
+#[test]
+fn guest_env_disables_sanitizer_leak_detection_on_every_backend() {
+    let asan = OsStr::new("ASAN_OPTIONS");
+    let lsan = OsStr::new("LSAN_OPTIONS");
+    let expected = OsStr::new("detect_leaks=0").to_os_string();
+
+    // The two variables are present with identical values regardless of the
+    // selected backend, so no backend-specific spawn hook is required for parity.
+    for backend in ["ptrace", "kvm", "sabre", "dbi"] {
+        let ro = RunOpts::parse_from(["fakehermit", "--backend", backend, "/bin/echo", "hi"]);
+        let envs = ro.guest_command().unwrap().get_captured_envs();
+        assert_eq!(
+            envs.get(asan),
+            Some(&expected),
+            "ASAN_OPTIONS not set for backend {backend}"
+        );
+        assert_eq!(
+            envs.get(lsan),
+            Some(&expected),
+            "LSAN_OPTIONS not set for backend {backend}"
+        );
+    }
+}
+
 #[test]
 fn guest_path_normalization_rejects_parent_components() {
     let error = normalize_guest_path(Path::new("/mnt/../tool")).unwrap_err();
@@ -2395,6 +2425,25 @@ impl RunOpts {
             }
             BaseEnv::Host => self.merge_from_env_settings(&mut command)?,
         }
+
+        // Disable sanitizer leak detection in the guest for EVERY backend, so
+        // the guest environment is identical regardless of which backend runs
+        // it. The ptrace-family backends (ptrace, e9patch, sabre) already force
+        // this at spawn time in reverie-ptrace, because a sanitizer-built
+        // guest's at-exit leak check itself uses ptrace and would collide with
+        // the tracer. The out-of-process KVM backend has no such spawn hook, so
+        // without setting it here the guest would see two fewer variables under
+        // KVM than under ptrace/e9patch/sabre. That is a real cross-backend
+        // divergence: env-sensitive guests behave differently, and it is
+        // directly observable as a differing DETLOG `[env ...]` hash. Setting it
+        // in this single backend-independent place makes the guest env a
+        // deterministic function of the invocation alone. Leak detection is also
+        // inherently nondeterministic (it reports host addresses at exit), so
+        // forcing it off is the determinism-preserving choice for all backends.
+        // Applied after `--env` handling to match the pre-existing ptrace
+        // precedence, where the tracer overrides any user-supplied value.
+        command.env("ASAN_OPTIONS", "detect_leaks=0");
+        command.env("LSAN_OPTIONS", "detect_leaks=0");
 
         Ok(command)
     }
