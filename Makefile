@@ -13,7 +13,7 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 
 .DEFAULT_GOAL := build
 
-.PHONY: build install-deps release-core help check-submodules validate lint \
+.PHONY: build install-deps release-core help checkout-all check-submodules validate lint \
 	validate-kvm validate-dbi validate-sabre validate-liteinst validate-e9patch
 
 build: install-deps ## Build the development Hermit binary with every backend
@@ -69,7 +69,10 @@ help: ## Show this help (the list of make targets)
 	@printf '  validate-e9patch   e9patch corpus        (needs HERMIT_E9PATCH_BACKEND) ~5-20 min\n'
 	@printf '\nThe full multi-backend suite is ./validate.sh (see ./validate.sh --help).\n'
 
-check-submodules: ## Verify every pinned submodule is checked out at its recorded revision
+checkout-all: ## Initialize every pinned submodule before builds and validation
+	@$(SUBMODULE_GIT) submodule update --init --recursive
+
+check-submodules: checkout-all ## Verify every pinned submodule is checked out at its recorded revision
 	@status="$$($(SUBMODULE_GIT) submodule status --recursive)"; \
 		printf '%s\n' "$$status"; \
 		if printf '%s\n' "$$status" | grep -Eq '^[-+U]'; then \
