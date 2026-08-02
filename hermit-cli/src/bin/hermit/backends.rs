@@ -78,6 +78,31 @@ impl DbiSummary {
     }
 }
 
+/// Render the native DBI counters as a labeled `--summary` block.
+///
+/// These are the counters the DynamoRIO client already emits at exit; hermit
+/// simply surfaces them on the normal run path. Labels are deliberately honest
+/// about what each number is: `branches` is Detcore's deterministic
+/// counted-branch clock (cbr/ubr/call/return retired), **not** a count of
+/// translated basic blocks, and `memory hash` is the client's observed
+/// guest-memory digest, not a Detcore RunSummary field.
+#[cfg(feature = "dbi")]
+fn format_dbi_stats(summary: &DbiSummary) -> String {
+    format!(
+        "=== DBI backend stats (native DynamoRIO client) ===\n\
+         counted branches (deterministic branch clock): {}\n\
+         syscalls intercepted:                          {}\n\
+         syscall instructions rewritten:                {}\n\
+         stdin (fd 0) reads:                            {}\n\
+         observed guest-memory hash:                    {}\n",
+        summary.branches,
+        summary.syscalls,
+        summary.rewritten,
+        summary.stdin_reads,
+        summary.memory_hash,
+    )
+}
+
 #[derive(Debug, Eq, PartialEq)]
 #[cfg(feature = "dbi")]
 struct DbiGuestCommand {
@@ -349,6 +374,7 @@ pub(super) fn run_dbi(
     program: &Path,
     args: &[String],
     verify: bool,
+    summary: bool,
     log: Option<LevelFilter>,
     config: &Config,
     mut environment: BTreeMap<OsString, OsString>,
@@ -417,10 +443,30 @@ pub(super) fn run_dbi(
             let status = runner
                 .status(&guest)
                 .map_err(|error| launch_error(&drrun, error))?;
+            if summary {
+                // stdout/stderr are inherited on the terminal path, so the
+                // client's raw `reverie-dbi:` counter line has already been
+                // printed above; we cannot re-parse it here.
+                eprintln!(
+                    ":: DBI summary: see the `reverie-dbi: tool=Detcore ...` line above \
+                     (run without a terminal on stdin for the labeled block)"
+                );
+            }
             return Ok(process_status(status));
         }
         let output = run_once(&runner, &guest, &drrun, std::io::stdin())?;
         write_output(&output)?;
+        if summary {
+            // Best-effort: surface the native DBI counters the client already
+            // emitted. A parse failure here is non-fatal — the run itself
+            // succeeded and the raw `reverie-dbi:` line is still on stderr.
+            match detcore_summary(&output) {
+                Ok(stats) => eprint!("{}", format_dbi_stats(&stats)),
+                Err(error) => {
+                    eprintln!(":: DBI summary unavailable: {error}");
+                }
+            }
+        }
         return Ok(output_status(&output));
     }
 
@@ -493,6 +539,9 @@ pub(super) fn run_dbi(
     );
     eprintln!(":: DBI path confirmed: DynamoRIO client reported tool=Detcore");
     eprintln!(":: Success: deterministic. Determinism verified.");
+    if summary {
+        eprint!("{}", format_dbi_stats(&first_summary));
+    }
     Ok(ExitStatus::Exited(0))
 }
 
@@ -501,6 +550,7 @@ pub(super) fn run_dbi(
     _program: &Path,
     _args: &[String],
     _verify: bool,
+    _summary: bool,
     _log: Option<LevelFilter>,
     _config: &Config,
     _environment: BTreeMap<OsString, OsString>,
@@ -783,6 +833,38 @@ mod tests {
     #[cfg(feature = "dbi")]
     fn dbi_summary_treats_last_syscall_branch_count_as_telemetry() {
         assert!(dbi_summary(563_145).same_observable_behavior(&dbi_summary(563_103)));
+    }
+
+    #[test]
+    #[cfg(feature = "dbi")]
+    fn dbi_stats_block_labels_counters_honestly() {
+        let rendered = format_dbi_stats(&dbi_summary(563_145));
+        // The branch counter must be labeled as a branch clock, never as
+        // "basic blocks translated" — the client counts retired branches.
+        assert!(rendered.contains("counted branches (deterministic branch clock): 563145"));
+        assert!(rendered.contains("syscalls intercepted:                          169"));
+        assert!(rendered.contains("syscall instructions rewritten:                168"));
+        assert!(rendered.contains("stdin (fd 0) reads:                            0"));
+        assert!(
+            rendered.contains("observed guest-memory hash:                    4b5e0e70f3050157")
+        );
+        assert!(!rendered.to_lowercase().contains("basic block"));
+    }
+
+    #[test]
+    #[cfg(feature = "dbi")]
+    fn dbi_stats_block_round_trips_from_a_client_summary_line() {
+        let output = dbi_output(
+            "reverie-dbi: tool=Detcore branches=42 syscalls=7 rewritten=6 \
+             stdin_reads=0 memory_hash=cbf29ce484222325\n",
+        );
+        let parsed = detcore_summary(&output).unwrap();
+        let rendered = format_dbi_stats(&parsed);
+        assert!(rendered.contains("counted branches (deterministic branch clock): 42"));
+        assert!(rendered.contains("syscalls intercepted:                          7"));
+        assert!(
+            rendered.contains("observed guest-memory hash:                    cbf29ce484222325")
+        );
     }
 
     #[test]
