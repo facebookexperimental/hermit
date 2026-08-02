@@ -46,6 +46,12 @@ cd "$ROOT_DIR" || exit 1
 #   ./validate.sh --qemu-l2-only              # run the heavyweight QEMU L2 boot
 #   ./validate.sh --portable-only               # no PMU/CPUID hardware required
 #   ./validate.sh --privileged-only             # PMU/CPUID-dependent tests only
+#   ./validate.sh --only <lane> <group.job>[,...] # run ONE DAG shard, no deps,
+#                                            # skipping the full harness — fast
+#                                            # local iteration on a single failing
+#                                            # shard (e.g. --only portable
+#                                            # test.sabre_examples). Build the tree
+#                                            # first (ci/run-dag.sh <lane>).
 #   ./validate.sh --verbose                  # stream each gate's command, PID,
 #                                            # elapsed time, and subprocess output
 # Every foreground/background gate has a process-tree timeout. Override the
@@ -86,6 +92,9 @@ E9PATCH_COMPAT_ONLY=0
 LITEINST_COMPAT_ONLY=0
 QEMU_L2_ONLY=0
 PRIVILEGED_ONLY=0
+ONLY_MODE=0
+ONLY_LANE=""
+ONLY_NODES=""
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
 VERBOSE=0
@@ -120,6 +129,14 @@ while [[ $# -gt 0 ]]; do
         --liteinst-compat-only) LITEINST_COMPAT_ONLY=1; shift ;;
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
         --privileged-only) PRIVILEGED_ONLY=1; shift ;;
+        --only)
+            ONLY_LANE=${2:-}; ONLY_NODES=${3:-}
+            if [[ -z $ONLY_LANE || -z $ONLY_NODES ]]; then
+                echo "validate.sh: --only needs <lane> <group.job>[,<group.job>...]" >&2
+                echo "             e.g. ./validate.sh --only portable test.sabre_examples" >&2
+                exit 2
+            fi
+            ONLY_MODE=1; shift 3 ;;
         --label-pr) LABEL_PR=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
         --no-label-pr) LABEL_PR=0; shift ;;
@@ -128,6 +145,15 @@ while [[ $# -gt 0 ]]; do
         *) echo "validate.sh: unknown argument: $1 (try --help)" >&2; exit 2 ;;
     esac
 done
+
+# --only: fast single-shard iteration. Delegate straight to the DAG node runner
+# (ci/run-node.sh runs exactly the named node(s) against the already-built tree,
+# WITHOUT their dependencies) and skip the full validation harness entirely. This
+# is the first-class command for iterating on one failing shard locally instead
+# of re-running the whole lane — or the whole 40-50 min CI DAG — each cycle.
+if ((ONLY_MODE == 1)); then
+    exec "$ROOT_DIR/ci/run-node.sh" "$ONLY_LANE" "$ONLY_NODES"
+fi
 
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(#553)
