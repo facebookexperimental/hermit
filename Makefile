@@ -13,7 +13,7 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 
 .DEFAULT_GOAL := build
 
-.PHONY: build install-deps release-core help checkout-all \
+.PHONY: build install-deps release-core help checkout-all validate \
 	validate-kvm validate-dbi validate-sabre validate-liteinst validate-e9patch
 
 build: install-deps ## Build the development Hermit binary with every backend
@@ -25,6 +25,13 @@ install-deps: ## Build and stage all third-party backend runtimes and plugins
 
 release-core: ## Build the lean core-only release binary (ptrace/kvm/liteinst)
 	$(CARGO) build --release --locked -p hermit
+
+# NOTE: `validate` MUST stay a .PHONY target with an explicit recipe. Without it,
+# GNU Make's built-in implicit rule "%: %.sh" (cat $< >$@; chmod a+x $@) fires
+# against validate.sh and merely COPIES it to a file named `validate` instead of
+# running validation. .PHONY + this recipe overrides that implicit rule.
+validate: ## Run the full multi-backend validation suite (pass extra flags via ARGS="--help")
+	./validate.sh $(ARGS)
 
 help: ## Show this help (the list of make targets)
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
