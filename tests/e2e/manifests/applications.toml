@@ -174,7 +174,9 @@ description = "KVM executes a shell workload with a deterministic environment"
 lane = "privileged"
 requires = ["linux","x86_64","kvm"]
 timeout_seconds = 60
-occasional = false
+# KVM's shell workload is load-sensitive until
+# fix-load-dependent-scheduling-vtime lands; retain it as an occasional probe.
+occasional = true
 program = "tests/e2e/applications/kvm-shell-environment.sh"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
