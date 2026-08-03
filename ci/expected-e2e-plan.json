@@ -313,6 +313,13 @@
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "verify",
+      "test": "language-runtimes/ruby-random"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
       "test": "language-runtimes/rust-hashmap-iteration"
     },
     {

@@ -1861,6 +1861,12 @@
       "why": "tests/e2e/language-runtimes/python.py is owned by tests/e2e/lib/language-runtimes/run.sh: The `python.py` source is the py runtime payload. The language-runtime driver resolves the interpreter/compiler, injects a sentinel, and validates RANDOM/TIME/THREAD/SYSTEM categories; the generic manifest builder supports only shell, C, and Rust programs."
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/language-runtimes/ruby-random.sh",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/language-runtimes/ruby-random.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/e2e/language-runtimes/ruby.rb",
       "runner": "tests/e2e/lib/language-runtimes/run.sh",
