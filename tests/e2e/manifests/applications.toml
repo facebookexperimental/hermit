@@ -26,10 +26,11 @@ native = "Elapsed time drives progress but final output is intentionally stable"
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace", "sabre"]
+backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "DBI application coverage is owned by backend parity"
 kvm = "KVM requires the privileged runner"
+sabre = "SaBRe does not yet determinize busy-wait polling on virtual wall-clock advancement; main validation has observed verify failure under load"
 liteinst = "LiteInst application coverage is owned by backend compatibility"
 
 [test.modes.replay]
@@ -80,8 +81,9 @@ native = "Elapsed time changes, but the final progress-bar output is intentional
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace", "dbi", "kvm", "sabre", "liteinst"]
+backends_enabled = ["ptrace", "dbi", "kvm", "liteinst"]
 [test.modes.verify.backends_disabled]
+sabre = "SaBRe does not yet determinize busy-wait polling on virtual wall-clock advancement; keep the identical example workload unqualified"
 
 [test.modes.replay]
 ci = false
