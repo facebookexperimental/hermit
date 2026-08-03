@@ -56,7 +56,7 @@ permissions:
 # ci-portable's ~34-min build flood saturating the hosted pool, so even this ~5s
 # stamp-check queued behind 40-min builds and NOTHING landed. Routing to
 # `[self-hosted, gate]` targets an always-idle lightweight runner
-# (`hermit-gate-newton`, gate-label only) that picks these jobs up in seconds;
+# (selected by the `gate` label only) that picks these jobs up in seconds;
 # the three PMU runners also carry the `gate` label as fallback, so a single-node
 # outage cannot block landing. Because the required-check context is the job name
 # (`merge-gate`), changing `runs-on` does not change the ruleset-required check.
