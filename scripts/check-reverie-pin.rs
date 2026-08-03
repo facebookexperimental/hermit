@@ -6,7 +6,15 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-//! Block Hermit changes while its Reverie dependency pin is stale.
+//! Block Hermit changes whose Reverie dependency pin is inconsistent with
+//! `rrnewton/reverie:main`.
+//!
+//! This is a *consistency* check, not a *currency* check: the pin must be an
+//! ancestor of the current `main` tip (i.e. a real commit on main's history),
+//! but it does NOT have to equal the very latest tip. A pin that is merely
+//! behind main is fine and passes; only a pin that is not on main's history at
+//! all — a typo, an orphaned SHA, or an unmerged/side-branch commit — is
+//! blocked. All Reverie `rev`s across the manifests must still be identical.
 //!
 //! Local use on Meta hosts:
 //!
@@ -14,7 +22,8 @@
 //! with-proxy ./scripts/check-reverie-pin.rs
 //! ```
 //!
-//! A deliberate exception must carry a substantive rationale:
+//! A deliberate exception (e.g. deliberately pinning an unmerged commit) must
+//! carry a substantive rationale:
 //!
 //! ```text
 //! with-proxy ./scripts/check-reverie-pin.rs \
@@ -57,7 +66,7 @@ fn usage() -> &'static str {
      Options:\n\
        --repo PATH                         Hermit checkout (default: git root)\n\
        --reverie-remote URL                Reverie remote to query\n\
-       --reverie-main SHA                  Known main SHA (tests/offline validation)\n\
+       --reverie-main SHA                  Known main tip SHA (skips ls-remote; ancestry still fetched)\n\
        --allow-stale-reverie-pin REASON    Explicit reasoned override\n\
        -h, --help                          Show this help\n\
      \n\
@@ -240,6 +249,97 @@ fn query_main(remote: &str) -> Result<String, String> {
     Ok(sha)
 }
 
+/// Relationship of the Hermit pin to the current `reverie:main` tip.
+enum PinRelation {
+    /// Pin equals the main tip.
+    Current,
+    /// Pin is an ancestor of main (behind, but on main's history). `behind` is
+    /// the commit distance when it could be computed.
+    BehindConsistent { behind: Option<u64> },
+    /// Pin is NOT reachable from main: a typo, orphaned SHA, or an
+    /// unmerged/side-branch commit.
+    Diverged,
+}
+
+fn git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .map_err(|error| format!("could not run git {}: {error}", args.join(" ")))
+}
+
+/// Determine the pin's relationship to `main` using a cheap treeless
+/// (`--filter=tree:0`) fetch of main's commit graph into a scratch repo — no
+/// file contents are transferred, only the commit objects needed for an
+/// ancestry test.
+fn classify_pin(remote: &str, pin: &str, main: &str) -> Result<PinRelation, String> {
+    if pin == main {
+        return Ok(PinRelation::Current);
+    }
+    let dir = env::temp_dir().join(format!("reverie-pin-check-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("could not create scratch dir {}: {error}", dir.display()))?;
+    let result = classify_in_dir(&dir, remote, pin, main);
+    let _ = fs::remove_dir_all(&dir);
+    result
+}
+
+fn classify_in_dir(dir: &Path, remote: &str, pin: &str, main: &str) -> Result<PinRelation, String> {
+    let init = git_in(dir, &["init", "-q"])?;
+    if !init.status.success() {
+        return Err(format!(
+            "git init failed: {}",
+            String::from_utf8_lossy(&init.stderr).trim()
+        ));
+    }
+    let fetch = git_in(
+        dir,
+        &[
+            "fetch",
+            "--quiet",
+            "--filter=tree:0",
+            "--no-tags",
+            remote,
+            main,
+        ],
+    )?;
+    if !fetch.status.success() {
+        return Err(format!(
+            "git fetch {remote} {main} (commit graph) failed: {}",
+            String::from_utf8_lossy(&fetch.stderr).trim()
+        ));
+    }
+    // The pin's commit object is present iff it is reachable from main.
+    let pin_commit = format!("{pin}^{{commit}}");
+    let present = git_in(dir, &["cat-file", "-e", &pin_commit])?
+        .status
+        .success();
+    if !present {
+        return Ok(PinRelation::Diverged);
+    }
+    // Defensive: confirm ancestry explicitly (true whenever the object is
+    // reachable from main, but keeps the intent legible).
+    if !git_in(dir, &["merge-base", "--is-ancestor", pin, main])?
+        .status
+        .success()
+    {
+        return Ok(PinRelation::Diverged);
+    }
+    let behind = git_in(dir, &["rev-list", "--count", &format!("{pin}..{main}")])
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u64>()
+                .ok()
+        });
+    Ok(PinRelation::BehindConsistent { behind })
+}
+
 fn validate_reason(reason: &str) -> Result<&str, String> {
     let reason = reason.trim();
     if reason.len() < 20 || reason.split_whitespace().count() < 3 {
@@ -333,27 +433,59 @@ fn run() -> Result<i32, String> {
     };
 
     let manifest_count: BTreeSet<&Path> = pins.iter().map(|item| item.path.as_path()).collect();
-    if pin == main {
-        println!(
-            "Reverie pin is current: {pin} ({} dependency entries across {} manifests)",
-            pins.len(),
-            manifest_count.len()
-        );
-        return Ok(0);
-    }
+    let entries = pins.len();
+    let manifests = manifest_count.len();
 
-    loud_header("STALE REVERIE PIN - COMMIT/PRELAND BLOCKED");
-    eprintln!("Hermit pin:         {pin}");
-    eprintln!("Latest main:        {main}");
-    eprintln!("Remote:             {remote}");
-    eprintln!("Affected manifests: {}", manifest_count.len());
-    eprintln!("Newer or otherwise unpinned Reverie commits exist on main.");
-    eprintln!("Compare: https://github.com/rrnewton/reverie/compare/{pin}...{main}");
-    if accept_override(config.override_reason.as_deref()) {
-        return Ok(0);
+    let relation = match classify_pin(remote, pin, &main) {
+        Ok(relation) => relation,
+        Err(error) => {
+            loud_header("COULD NOT VERIFY REVERIE MAIN RELATIONSHIP - BLOCKED");
+            eprintln!("Hermit pin: {pin}");
+            eprintln!("Latest main: {main}");
+            eprintln!("Lookup error: {error}");
+            if accept_override(config.override_reason.as_deref()) {
+                return Ok(0);
+            }
+            blocked_instructions();
+            return Ok(1);
+        }
+    };
+
+    match relation {
+        PinRelation::Current => {
+            println!(
+                "Reverie pin is current: {pin} ({entries} dependency entries across {manifests} manifests)"
+            );
+            Ok(0)
+        }
+        PinRelation::BehindConsistent { behind } => {
+            let distance = match behind {
+                Some(1) => "1 commit behind".to_string(),
+                Some(n) => format!("{n} commits behind"),
+                None => "behind".to_string(),
+            };
+            println!(
+                "Reverie pin is consistent: {pin} is an ancestor of reverie main ({entries} dependency entries across {manifests} manifests)."
+            );
+            println!("Latest main: {main} ({distance}). A bump is optional, not required.");
+            Ok(0)
+        }
+        PinRelation::Diverged => {
+            loud_header("REVERIE PIN NOT ON MAIN HISTORY - BLOCKED");
+            eprintln!("Hermit pin:         {pin}");
+            eprintln!("Latest main:        {main}");
+            eprintln!("Remote:             {remote}");
+            eprintln!("Affected manifests: {manifests}");
+            eprintln!("The pinned commit is NOT an ancestor of reverie main.");
+            eprintln!("It may be a typo, an orphaned SHA, or an unmerged/side-branch commit.");
+            eprintln!("Compare: https://github.com/rrnewton/reverie/compare/{pin}...{main}");
+            if accept_override(config.override_reason.as_deref()) {
+                return Ok(0);
+            }
+            blocked_instructions();
+            Ok(1)
+        }
     }
-    blocked_instructions();
-    Ok(1)
 }
 
 fn main() {

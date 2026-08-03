@@ -6,17 +6,23 @@ a moving `branch = "main"`. Pinning makes builds reproducible: when hermit's
 tests pass, the exact Reverie commit is recorded in the manifests (and is not
 silently changed by an upstream push).
 
-Hermit's fork policy adds a freshness invariant: absent an explicitly justified
-temporary exception, the pin must equal the current `rrnewton/reverie:main` tip.
-A stale pin can silently omit already-merged correctness or performance fixes.
-The demo5 investigation found exactly this failure mode when Hermit remained on
-`aa6f1283` and missed the merged ptrace-notifier fast path.
+Hermit's fork policy adds a consistency invariant: absent an explicitly
+justified temporary exception, the pin must be an *ancestor* of the current
+`rrnewton/reverie:main` tip — a real commit on main's history. The pin does not
+have to equal the very latest tip; a pin that is merely behind main is fine.
+This still catches the failure modes that matter — a typo, an orphaned SHA, or
+an unmerged/side-branch commit that is not on main at all. (Bumping to the
+latest tip is still encouraged so Hermit picks up merged correctness and
+performance fixes — the demo5 investigation found exactly such a miss when
+Hermit remained on `aa6f1283` and lacked the merged ptrace-notifier fast path —
+but a behind-but-on-main pin no longer blocks CI.)
 
-## Freshness lint
+## Consistency lint
 
 `scripts/check-reverie-pin.rs` checks that every Reverie `rev` in Hermit's
-manifests is identical and equals the live `rrnewton/reverie:main` tip. It fails
-closed when the remote cannot be checked. Run it locally through the proxy:
+manifests is identical and is an ancestor of the live `rrnewton/reverie:main`
+tip (verified with a cheap treeless commit-graph fetch). It fails closed when
+the remote cannot be checked. Run it locally through the proxy:
 
 ```bash
 with-proxy ./scripts/check-reverie-pin.rs

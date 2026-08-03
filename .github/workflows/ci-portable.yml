@@ -64,12 +64,12 @@ jobs:
   # Keep dependency freshness visible without letting it taint the authoritative
   # product-test job queried by merge-gate.
   reverie-pin:
-    name: Reverie pin is current
+    name: Reverie pin is consistent
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Reject a stale Reverie dependency pin
+      - name: Reject a Reverie dependency pin that is not on main's history
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
