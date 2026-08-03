@@ -10,6 +10,168 @@ schema = 2
 bucket = "backend-parity-c"
 
 [[test]]
+id = "backend-parity-c/aio-refusal"
+description = "Strict verification for tests/backend-parity/fixtures/aio_refusal.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/aio_refusal.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+[[test]]
+id = "backend-parity-c/cachestat-refusal"
+description = "Strict verification for tests/backend-parity/fixtures/cachestat_refusal.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/cachestat_refusal.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+[[test]]
+id = "backend-parity-c/child-subreaper-refusal"
+description = "Strict verification for tests/backend-parity/fixtures/child_subreaper_refusal.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/child_subreaper_refusal.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+[[test]]
 id = "backend-parity-c/close-range-fds"
 description = "Strict verification for tests/backend-parity/fixtures/close_range_fds.c"
 lane = "portable"
@@ -175,6 +337,61 @@ sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
+id = "backend-parity-c/epoll-pwait2"
+description = "Strict verification for tests/backend-parity/fixtures/epoll_pwait2_readiness.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/epoll_pwait2_readiness.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "KVM ElfExecutor returns deterministic ENOSYS for epoll_pwait2 (syscall 441); it implements the classic epoll_wait but not the newer wait entry point"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
 id = "backend-parity-c/epoll-readiness"
 description = "Strict verification for tests/backend-parity/fixtures/epoll_readiness.c"
 lane = "portable"
@@ -182,6 +399,61 @@ requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
 timeout_seconds = 90
 occasional = false
 program = "tests/backend-parity/fixtures/epoll_readiness.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
+id = "backend-parity-c/faccessat2-flags"
+description = "Strict verification for tests/backend-parity/fixtures/faccessat2_flags.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/faccessat2_flags.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
@@ -450,6 +722,223 @@ sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
+id = "backend-parity-c/getrusage-self-accounting"
+description = "Strict verification for tests/backend-parity/fixtures/getrusage_self_accounting.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/getrusage_self_accounting.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
+id = "backend-parity-c/inotify-watch"
+description = "Strict verification for tests/backend-parity/fixtures/inotify_watch.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/inotify_watch.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "KVM ElfExecutor returns a deterministic error for the inotify family (inotify_init1), so the filesystem-watch descriptor lifecycle is unavailable"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+[[test]]
+id = "backend-parity-c/ioctl-fionread"
+description = "Strict verification for tests/backend-parity/fixtures/ioctl_fionread.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/ioctl_fionread.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "KVM ElfExecutor returns ENOTTY for the FIONREAD pipe ioctl; FIONBIO is supported"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+[[test]]
+id = "backend-parity-c/kcmp-refusal"
+description = "Strict verification for tests/backend-parity/fixtures/kcmp_refusal.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/kcmp_refusal.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+[[test]]
 id = "backend-parity-c/linkat-flags"
 description = "Strict verification for tests/backend-parity/fixtures/linkat_flags.c"
 lane = "portable"
@@ -505,6 +994,60 @@ sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
+id = "backend-parity-c/mce-kill-refusal"
+description = "Strict verification for tests/backend-parity/fixtures/mce_kill_policy.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/mce_kill_policy.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+[[test]]
 id = "backend-parity-c/memfd-create"
 description = "Strict verification for tests/backend-parity/fixtures/memfd_create.c"
 lane = "portable"
@@ -520,6 +1063,115 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
 kvm = "KVM ElfExecutor personality returns deterministic ENOSYS for memfd_create; ptrace and DBI forward the anonymous-memfd syscall"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
+id = "backend-parity-c/mempolicy-default"
+description = "Strict verification for tests/backend-parity/fixtures/mempolicy_default.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/mempolicy_default.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+[[test]]
+id = "backend-parity-c/mincore-residency"
+description = "Strict verification for tests/backend-parity/fixtures/mincore_residency.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/mincore_residency.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
 liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
 
@@ -669,6 +1321,168 @@ kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
+[[test]]
+id = "backend-parity-c/name-to-handle-refusal"
+description = "Strict verification for tests/backend-parity/fixtures/name_to_handle.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/name_to_handle.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+[[test]]
+id = "backend-parity-c/no-new-privs-refusal"
+description = "Strict verification for tests/backend-parity/fixtures/no_new_privs_refusal.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/no_new_privs_refusal.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+[[test]]
+id = "backend-parity-c/openat2-refusal"
+description = "Strict verification for tests/backend-parity/fixtures/openat2_refusal.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/openat2_refusal.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 [[test]]
 id = "backend-parity-c/path-file-ops"
 description = "Strict verification for tests/backend-parity/fixtures/path_file_ops.c"
@@ -832,6 +1646,60 @@ kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
+[[test]]
+id = "backend-parity-c/prctl-pdeathsig"
+description = "Strict verification for tests/backend-parity/fixtures/prctl_pdeathsig.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/prctl_pdeathsig.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "KVM ElfExecutor returns deterministic ENOSYS for prctl PR_SET_PDEATHSIG/PR_GET_PDEATHSIG; ptrace and DBI drive the full parent-death-signal state machine"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 [[test]]
 id = "backend-parity-c/preadv2-flags"
 description = "Strict verification for tests/backend-parity/fixtures/preadv2_flags.c"
@@ -1105,6 +1973,222 @@ kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 [[test]]
+id = "backend-parity-c/robust-list"
+description = "Strict verification for tests/backend-parity/fixtures/robust_list.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/robust_list.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+[[test]]
+id = "backend-parity-c/seccomp-refusal"
+description = "Strict verification for tests/backend-parity/fixtures/seccomp_refusal.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/seccomp_refusal.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+[[test]]
+id = "backend-parity-c/signalfd-create"
+description = "Strict verification for tests/backend-parity/fixtures/signalfd_create.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/signalfd_create.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+[[test]]
+id = "backend-parity-c/statfs-free-determinism"
+description = "Strict verification for tests/backend-parity/fixtures/statfs_free_determinism.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/statfs_free_determinism.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+[[test]]
 id = "backend-parity-c/statx-metadata"
 description = "Strict verification for tests/backend-parity/fixtures/statx_metadata.c"
 lane = "portable"
@@ -1215,6 +2299,168 @@ sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
+id = "backend-parity-c/sync-file-range"
+description = "Strict verification for tests/backend-parity/fixtures/sync_file_range.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/sync_file_range.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+[[test]]
+id = "backend-parity-c/sysv-ipc-refusal"
+description = "Strict verification for tests/backend-parity/fixtures/sysv_ipc_refusal.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/sysv_ipc_refusal.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+[[test]]
+id = "backend-parity-c/thp-disable"
+description = "Strict verification for tests/backend-parity/fixtures/thp_disable.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/thp_disable.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+kvm = "KVM ElfExecutor returns deterministic ENOSYS for prctl PR_SET_THP_DISABLE/PR_GET_THP_DISABLE; ptrace and DBI drive the full transparent-hugepage flag round-trip"
+sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
+liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+[[test]]
 id = "backend-parity-c/umask-mode"
 description = "Strict verification for tests/backend-parity/fixtures/umask_mode.c"
 lane = "portable"
@@ -1270,20 +2516,20 @@ sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
-id = "backend-parity-c/mincore-residency"
-description = "Strict verification for tests/backend-parity/fixtures/mincore_residency.c"
+id = "backend-parity-c/uname-identity"
+description = "Strict verification for tests/backend-parity/fixtures/uname_identity.c"
 lane = "portable"
 requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
 timeout_seconds = 90
 occasional = false
-program = "tests/backend-parity/fixtures/mincore_residency.c"
+program = "tests/backend-parity/fixtures/uname_identity.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
-dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
+dbi = "DBI forwards the host uname(2) nodename instead of pinning it; ptrace and KVM determinize the hostname, DBI leaks the real host name"
 kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
 liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
@@ -1323,7 +2569,6 @@ dbi = "No custom edge-case arguments have been calibrated for this C guest"
 kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
-
 [[test]]
 id = "backend-parity-c/utimensat-determinism"
 description = "Strict verification for tests/backend-parity/fixtures/utimensat_determinism.c"
@@ -1379,222 +2624,3 @@ kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
-[[test]]
-id = "backend-parity-c/getrusage-self-accounting"
-description = "Strict verification for tests/backend-parity/fixtures/getrusage_self_accounting.c"
-lane = "portable"
-requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
-timeout_seconds = 90
-occasional = false
-program = "tests/backend-parity/fixtures/getrusage_self_accounting.c"
-observation = { status = true, stdout = true, stderr = false, artifacts = [] }
-
-[test.modes.verify]
-ci = false
-backends_enabled = ["ptrace"]
-[test.modes.verify.backends_disabled]
-dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
-kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
-sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
-liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
-
-[test.modes.naked]
-ci = false
-backends_enabled = []
-[test.modes.naked.backends_disabled]
-native = "This migration inventories strict verification; it does not assert native nondeterminism"
-
-[test.modes.replay]
-ci = false
-backends_enabled = []
-[test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
-kvm = "Record/replay is unsupported by KVM"
-sabre = "Record/replay is unsupported by SaBRe"
-liteinst = "Record/replay is unsupported by LiteInst"
-
-[test.modes.chaos]
-ci = false
-backends_enabled = []
-[test.modes.chaos.backends_disabled]
-ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
-kvm = "Chaos scheduling is unsupported by KVM"
-sabre = "Chaos scheduling is unsupported by SaBRe"
-liteinst = "Chaos scheduling is unsupported by LiteInst"
-
-[test.modes.custom]
-ci = false
-backends_enabled = []
-[test.modes.custom.backends_disabled]
-ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
-kvm = "No custom edge-case arguments have been calibrated for this C guest"
-sabre = "No custom edge-case arguments have been calibrated for this C guest"
-liteinst = "No custom edge-case arguments have been calibrated for this C guest"
-
-[[test]]
-id = "backend-parity-c/epoll-pwait2"
-description = "Strict verification for tests/backend-parity/fixtures/epoll_pwait2_readiness.c"
-lane = "portable"
-requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
-timeout_seconds = 90
-occasional = false
-program = "tests/backend-parity/fixtures/epoll_pwait2_readiness.c"
-observation = { status = true, stdout = true, stderr = false, artifacts = [] }
-
-[test.modes.verify]
-ci = false
-backends_enabled = ["ptrace"]
-[test.modes.verify.backends_disabled]
-dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
-kvm = "KVM ElfExecutor returns deterministic ENOSYS for epoll_pwait2 (syscall 441); it implements the classic epoll_wait but not the newer wait entry point"
-sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
-liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
-
-[test.modes.naked]
-ci = false
-backends_enabled = []
-[test.modes.naked.backends_disabled]
-native = "This migration inventories strict verification; it does not assert native nondeterminism"
-
-[test.modes.replay]
-ci = false
-backends_enabled = []
-[test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
-kvm = "Record/replay is unsupported by KVM"
-sabre = "Record/replay is unsupported by SaBRe"
-liteinst = "Record/replay is unsupported by LiteInst"
-
-[test.modes.chaos]
-ci = false
-backends_enabled = []
-[test.modes.chaos.backends_disabled]
-ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
-kvm = "Chaos scheduling is unsupported by KVM"
-sabre = "Chaos scheduling is unsupported by SaBRe"
-liteinst = "Chaos scheduling is unsupported by LiteInst"
-
-[test.modes.custom]
-ci = false
-backends_enabled = []
-[test.modes.custom.backends_disabled]
-ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
-kvm = "No custom edge-case arguments have been calibrated for this C guest"
-sabre = "No custom edge-case arguments have been calibrated for this C guest"
-liteinst = "No custom edge-case arguments have been calibrated for this C guest"
-
-[[test]]
-id = "backend-parity-c/faccessat2-flags"
-description = "Strict verification for tests/backend-parity/fixtures/faccessat2_flags.c"
-lane = "portable"
-requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
-timeout_seconds = 90
-occasional = false
-program = "tests/backend-parity/fixtures/faccessat2_flags.c"
-observation = { status = true, stdout = true, stderr = false, artifacts = [] }
-
-[test.modes.verify]
-ci = false
-backends_enabled = ["ptrace"]
-[test.modes.verify.backends_disabled]
-dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
-kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
-sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
-liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
-
-[test.modes.naked]
-ci = false
-backends_enabled = []
-[test.modes.naked.backends_disabled]
-native = "This migration inventories strict verification; it does not assert native nondeterminism"
-
-[test.modes.replay]
-ci = false
-backends_enabled = []
-[test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
-kvm = "Record/replay is unsupported by KVM"
-sabre = "Record/replay is unsupported by SaBRe"
-liteinst = "Record/replay is unsupported by LiteInst"
-
-[test.modes.chaos]
-ci = false
-backends_enabled = []
-[test.modes.chaos.backends_disabled]
-ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
-kvm = "Chaos scheduling is unsupported by KVM"
-sabre = "Chaos scheduling is unsupported by SaBRe"
-liteinst = "Chaos scheduling is unsupported by LiteInst"
-
-[test.modes.custom]
-ci = false
-backends_enabled = []
-[test.modes.custom.backends_disabled]
-ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
-kvm = "No custom edge-case arguments have been calibrated for this C guest"
-sabre = "No custom edge-case arguments have been calibrated for this C guest"
-liteinst = "No custom edge-case arguments have been calibrated for this C guest"
-
-[[test]]
-id = "backend-parity-c/ioctl-fionread"
-description = "Strict verification for tests/backend-parity/fixtures/ioctl_fionread.c"
-lane = "portable"
-requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
-timeout_seconds = 90
-occasional = false
-program = "tests/backend-parity/fixtures/ioctl_fionread.c"
-observation = { status = true, stdout = true, stderr = false, artifacts = [] }
-
-[test.modes.verify]
-ci = false
-backends_enabled = ["ptrace"]
-[test.modes.verify.backends_disabled]
-dbi = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBI separately"
-kvm = "KVM ElfExecutor returns ENOTTY for the FIONREAD pipe ioctl; FIONBIO is supported"
-sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
-liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
-
-[test.modes.naked]
-ci = false
-backends_enabled = []
-[test.modes.naked.backends_disabled]
-native = "This migration inventories strict verification; it does not assert native nondeterminism"
-
-[test.modes.replay]
-ci = false
-backends_enabled = []
-[test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
-kvm = "Record/replay is unsupported by KVM"
-sabre = "Record/replay is unsupported by SaBRe"
-liteinst = "Record/replay is unsupported by LiteInst"
-
-[test.modes.chaos]
-ci = false
-backends_enabled = []
-[test.modes.chaos.backends_disabled]
-ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
-kvm = "Chaos scheduling is unsupported by KVM"
-sabre = "Chaos scheduling is unsupported by SaBRe"
-liteinst = "Chaos scheduling is unsupported by LiteInst"
-
-[test.modes.custom]
-ci = false
-backends_enabled = []
-[test.modes.custom.backends_disabled]
-ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
-kvm = "No custom edge-case arguments have been calibrated for this C guest"
-sabre = "No custom edge-case arguments have been calibrated for this C guest"
-liteinst = "No custom edge-case arguments have been calibrated for this C guest"
