@@ -94,7 +94,8 @@ Each node's tag is `group.job` (e.g. `build.workspace`, `lint.clippy`).
 
 The centralized manifests use an explicit build barrier before execution:
 
-1. `e2e.metadata` validates schema, inventory, and CI correspondence.
+1. `e2e.metadata` validates schema, inventory, generated test-footprint freshness,
+   and CI correspondence.
 2. `build.manifest_guests` prepares every `ci=true` program once.
 3. One `e2e.manifest_<bucket>` node per TOML bucket runs with `--prebuilt`.
 

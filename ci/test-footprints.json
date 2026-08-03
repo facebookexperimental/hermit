@@ -133,6 +133,7 @@
         "test.strict_compat"
       ],
       "paths": [
+        "common/edit-distance/**",
         "common/edit-distance/**/*.rs",
         "common/edit-distance/Cargo.toml"
       ]
@@ -231,6 +232,7 @@
         "test.strict_compat"
       ],
       "paths": [
+        "detcore/**",
         "detcore/**/*.rs",
         "detcore/Cargo.toml"
       ]
@@ -400,6 +402,7 @@
         "lint.rustfmt"
       ],
       "paths": [
+        "flaky-tests/**",
         "flaky-tests/**/*.rs",
         "flaky-tests/Cargo.toml"
       ]
@@ -444,6 +447,7 @@
         "test.strict_compat"
       ],
       "paths": [
+        "hermit-cli/**",
         "hermit-cli/**/*.rs",
         "hermit-cli/Cargo.toml"
       ]
@@ -490,6 +494,7 @@
         "test.strict_compat"
       ],
       "paths": [
+        "hermit-install/**",
         "hermit-install/**/*.rs",
         "hermit-install/Cargo.toml"
       ]
@@ -635,6 +640,7 @@
         "test.rr_suite_contract"
       ],
       "paths": [
+        "examples/**",
         "tests/bin/**",
         "tests/c/**",
         "tests/chaos/**",

@@ -404,6 +404,46 @@ fn validate_path_footprints(policy: &Value, nodes: &BTreeSet<String>) {
     }
 }
 
+fn load_package_paths(
+    policy: &Value,
+    packages: &BTreeMap<String, Package>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let raw = policy["package_paths"]
+        .as_object()
+        .unwrap_or_else(|| die(format!("{POLICY}: `package_paths` must be an object")));
+    let mut result = BTreeMap::new();
+    for (package_name, value) in raw {
+        let package = packages.get(package_name).unwrap_or_else(|| {
+            die(format!(
+                "{POLICY}: package_paths names unknown workspace package `{package_name}`"
+            ))
+        });
+        let location = format!("{POLICY}: package_paths.{package_name}");
+        let paths: BTreeSet<String> = value
+            .as_array()
+            .unwrap_or_else(|| die(format!("{location} must be an array")))
+            .iter()
+            .map(|path| {
+                path.as_str()
+                    .filter(|path| !path.is_empty())
+                    .unwrap_or_else(|| die(format!("{location} entries must be non-empty strings")))
+                    .to_owned()
+            })
+            .collect();
+        let root_prefix = format!("{}/", package.root);
+        for path in &paths {
+            if path != &package.root && !path.starts_with(&root_prefix) {
+                die(format!(
+                    "{location}: `{path}` must stay below package root `{}`",
+                    package.root
+                ));
+            }
+        }
+        result.insert(package_name.clone(), paths);
+    }
+    result
+}
+
 fn generated_footprints(root: &Path) -> Value {
     let metadata = cargo_metadata(root);
     let policy = read_json(&root.join(POLICY));
@@ -414,6 +454,7 @@ fn generated_footprints(root: &Path) -> Value {
     let (packages, defaults) = load_packages(root, &metadata);
     let (all_nodes, dag_targets) = load_dag_targets(&dag, &packages, &defaults);
     let rules = load_rules(&policy, &packages, &all_nodes);
+    let package_paths = load_package_paths(&policy, &packages);
     validate_path_footprints(&policy, &all_nodes);
 
     let mut package_footprints = Vec::new();
@@ -441,12 +482,16 @@ fn generated_footprints(root: &Path) -> Value {
                 reverse.iter().cloned().collect::<Vec<_>>().join(", ")
             )),
         );
+        let mut paths = BTreeSet::from([
+            format!("{}/**/*.rs", package.root),
+            format!("{}/Cargo.toml", package.root),
+        ]);
+        if let Some(extra_paths) = package_paths.get(&package.name) {
+            paths.extend(extra_paths.iter().cloned());
+        }
         footprint.insert(
             "paths".into(),
-            json!([
-                format!("{}/**/*.rs", package.root),
-                format!("{}/Cargo.toml", package.root)
-            ]),
+            Value::Array(paths.into_iter().map(Value::String).collect()),
         );
         footprint.insert(
             "nodes".into(),
@@ -591,5 +636,22 @@ mod tests {
             BTreeSet::from(["b".into(), "c".into()])
         );
         assert!(cargo_command_packages("cargo nextest show-config", &all, &defaults).is_empty());
+    }
+
+    #[test]
+    fn accepts_package_local_non_cargo_paths() {
+        let packages = BTreeMap::from([("crate-a".into(), package("crate-a", &[]))]);
+        let policy = json!({
+            "package_paths": {
+                "crate-a": ["crate-a/fixtures/**", "crate-a/scripts/*.sh"]
+            }
+        });
+        assert_eq!(
+            load_package_paths(&policy, &packages),
+            BTreeMap::from([(
+                "crate-a".into(),
+                BTreeSet::from(["crate-a/fixtures/**".into(), "crate-a/scripts/*.sh".into()])
+            )])
+        );
     }
 }

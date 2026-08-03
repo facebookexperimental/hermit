@@ -40,6 +40,7 @@ Usage:
   ci/test_harness.sh run [filters] [--results PATH] [--junit PATH]
   ci/test_harness.sh audit-gaps [--lane portable|privileged] [--format text|json]
   ci/test_harness.sh audit-inventory
+  ci/test_harness.sh audit-test-footprints
   ci/test_harness.sh audit-ci
 
 Filters:
@@ -204,6 +205,12 @@ function audit_inventory {
 
     jq '{files:(.files|length),by_disposition:(.files|group_by(.disposition)|map({key:.[0].disposition,value:length})|from_entries)}' \
         "$INVENTORY"
+}
+
+function audit_test_footprints {
+    cargo run --quiet -p hermit-manifest-plan \
+        --bin generate-test-footprints -- --check ||
+        die "ci/test-footprints.json is stale relative to Cargo metadata, the portable DAG, or footprint policy"
 }
 
 function function_body {
@@ -1171,6 +1178,7 @@ load_tests
 case "$subcommand" in
     validate)
         (($# == 0)) || true
+        audit_test_footprints
         audit_inventory
         audit_ci_correspondence
         echo "PASS: ${#TESTS[@]} E2E tests have valid syntax and centralized schema-v2 manifests"
@@ -1193,6 +1201,9 @@ case "$subcommand" in
         ;;
     audit-inventory)
         audit_inventory
+        ;;
+    audit-test-footprints)
+        audit_test_footprints
         ;;
     audit-ci)
         audit_ci_correspondence

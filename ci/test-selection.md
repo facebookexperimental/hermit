@@ -12,8 +12,38 @@ entirely.
 
 Both read `ci/dag/portable.json` as the single source of truth for the node
 universe, node commands, and build dependencies. `select-tests.rs` adds one
-thing the DAG does not encode: the **source-path → node** relation, held in
-`ci/test-footprints.json`.
+thing the DAG does not encode: the **source-path → node** relation. The checked-in
+`ci/test-footprints.json` is generated from the real Cargo workspace graph, the
+portable DAG commands, and the small non-Cargo policy in
+`ci/test-footprints-policy.json`.
+
+## Generated footprint map
+
+Regenerate the artifact after changing a workspace manifest, local dependency,
+portable DAG command, or footprint policy:
+
+```bash
+cargo run -p hermit-manifest-plan --bin generate-test-footprints
+```
+
+The generator reads `cargo metadata` to map paths to their owning workspace
+crate and compute each crate's transitive reverse-dependency closure. It then
+selects every portable DAG Cargo node whose target packages intersect that
+closure. Cargo cannot describe non-Cargo guest fixtures, backend runtime
+staging, or standalone scripts, so those semantic edges remain explicit in
+`ci/test-footprints-policy.json`.
+
+`ci/test_harness.sh validate` runs the generator in `--check` mode and fails the
+`e2e.metadata` gate if the committed artifact differs byte-for-byte. A focused
+check is also available:
+
+```bash
+ci/test_harness.sh audit-test-footprints
+```
+
+The generated map does not weaken selection. Unknown paths and force-full paths
+still run the complete suite; CI is skipped only when every changed path is
+explicitly listed as inert policy.
 
 ## The selection model
 

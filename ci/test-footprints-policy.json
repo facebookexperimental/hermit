@@ -6,7 +6,8 @@
     "",
     "Keep ci_irrelevant deliberately narrow: it is the only classification that can",
     "skip CI. Unmatched paths still force the complete suite. Package Rust sources,",
-    "manifests, reverse dependencies, and Cargo-command DAG nodes are generated."
+    "manifests, reverse dependencies, and Cargo-command DAG nodes are generated.",
+    "package_paths adds package-local fixtures/resources that Cargo metadata cannot name."
   ],
   "version": 1,
   "force_full": [
@@ -37,6 +38,13 @@
     "**/*.jpg",
     ".github/**"
   ],
+  "package_paths": {
+    "detcore": ["detcore/**"],
+    "edit-distance": ["common/edit-distance/**"],
+    "hermetic_infra_hermit_flaky-tests": ["flaky-tests/**"],
+    "hermit": ["hermit-cli/**"],
+    "hermit-install": ["hermit-install/**"]
+  },
   "package_rules": [
     {
       "_why": "Shared Detcore/CLI code drives the non-Cargo strict, backend-parity, and manifest harnesses.",
@@ -170,6 +178,7 @@
     {
       "_why": "Shared non-Cargo guest fixtures are consumed by the manifest and Hermit integration harnesses.",
       "paths": [
+        "examples/**",
         "tests/bin/**",
         "tests/c/**",
         "tests/chaos/**",

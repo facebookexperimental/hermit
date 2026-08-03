@@ -1044,12 +1044,14 @@ fn self_test() {
     check("full ⇒ all cells", rp_full.cells.len() == total_cells);
     check("full ⇒ all builds", rp_full.build_debug && rp_full.build_dbi && rp_full.build_aux);
 
-    // DBI backend change: only DBI e2e cells, dbi-parity shard, dbi build.
+    // DBI is a Cargo dependency of hermit. Package-level reverse-dependency
+    // closure therefore includes Hermit's other third-party-backend test
+    // nodes, while explicit backend affinity still limits e2e cells to DBI.
     let rp_dbi = derive_run_plan(&dbi, &shards, &plan);
     check("dbi ⇒ dbi-parity shard", rp_dbi.shards.contains(&"dbi-parity".to_string()));
-    check("dbi ⇒ no sabre shard", !rp_dbi.shards.contains(&"sabre".to_string()));
+    check("dbi ⇒ hermit reverse-dep sabre shard", rp_dbi.shards.contains(&"sabre".to_string()));
     check("dbi ⇒ only dbi cells", !rp_dbi.cells.is_empty() && rp_dbi.cells.iter().all(|c| c.backend == "dbi"));
-    check("dbi ⇒ build_dbi, not aux", rp_dbi.build_dbi && !rp_dbi.build_aux);
+    check("dbi ⇒ reverse-dep builds dbi and aux", rp_dbi.build_dbi && rp_dbi.build_aux);
     check("dbi ⇒ cells are a strict subset", rp_dbi.cells.len() < total_cells);
 
     // SaBRe backend change: only sabre cells + sabre shard.
