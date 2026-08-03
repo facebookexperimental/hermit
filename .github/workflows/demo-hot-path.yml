@@ -53,13 +53,39 @@ on:
       - "!tests/e2e/**"
       - "!tests/backend-parity/**"
   workflow_dispatch:
+    inputs:
+      sha:
+        description: >-
+          Exact Hermit SHA to demo-gate on demand. Use this to attribute a
+          post-land main red to a specific landed commit (git-bisect style)
+          now that main runs collapse to the newest tip. Empty = the dispatched
+          ref's tip.
+        required: false
+        type: string
 
 concurrency:
-  # Never cancel a main-push run: each red must identify its exact culprit.
-  # Superseded PR heads may be cancelled so they do not monopolize the serial
-  # PMU/QEMU lane.
-  group: hermit-demo-gate-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # One serial pmu-serial runner hosts every demo run, so a burst of landings or
+  # PR pushes must never STACK on this lane. Collapse each ref to its newest run:
+  #   * pull_request -> group per PR number: a new push to a PR cancels the
+  #     superseded head (unchanged behavior; the head that lands re-runs).
+  #   * push(main) -> group per github.ref, so all main pushes share ONE group
+  #     and a burst of N landings collapses to the newest run (= current main
+  #     tip). This replaces the old per-run_id group, which never cancelled and
+  #     let 19+ distinct main SHAs stack ~6h deep on the one runner. The main run
+  #     is POST-land health, not a pre-land gate (the pre-land gate is the
+  #     pull_request run required by merge-gate.yml at the head SHA), so keeping
+  #     only the newest main run still reports whether main tip is demo-green.
+  #   * workflow_dispatch -> group per github.run_id (unique), so manual on-demand
+  #     runs NEVER cancel each other. This preserves per-SHA post-land culprit
+  #     attribution -- the thing the old never-cancel comment protected: bisect a
+  #     post-land main red by dispatching several `sha` inputs and letting them
+  #     queue serially (or `git bisect` with scripts/super-validate.sh
+  #     --demos-only).
+  # cancel-in-progress cancels only PENDING/IN-PROGRESS runs, never COMPLETED
+  # ones, so a submodule bump or queue-health check that cites the newest
+  # completed main demo run as evidence is unaffected.
+  group: hermit-demo-gate-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name == 'push' && github.ref || github.run_id }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -71,7 +97,7 @@ env:
   RUSTFLAGS: -D warnings -C link-arg=-llzma
   RUSTDOCFLAGS: -D warnings
   SUITE_DIR: ${{ github.workspace }}/dev-hermit-demo-suite
-  TARGET_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+  TARGET_SHA: ${{ github.event.inputs.sha || github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   reject-untrusted-fork:
