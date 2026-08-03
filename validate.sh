@@ -16,6 +16,43 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly ROOT_DIR
 cd "$ROOT_DIR" || exit 1
 
+function find_dev_hermit_parent {
+    local candidate=$ROOT_DIR
+    local hermit_path
+
+    while [[ $candidate != / ]]; do
+        if [[ -f $candidate/.gitmodules ]]; then
+            hermit_path=$(git -C "$candidate" config -f .gitmodules \
+                --get submodule.hermit.path 2>/dev/null || true)
+            if [[ $hermit_path == hermit ]]; then
+                printf "%s\n" "$candidate"
+                return 0
+            fi
+        fi
+        candidate=$(dirname -- "$candidate")
+    done
+    return 1
+}
+
+function validation_slot_name {
+    local parent=$1
+    local relative
+
+    if [[ -z $parent ]]; then
+        printf "standalone\n"
+        return
+    fi
+    relative=${ROOT_DIR#"$parent"/}
+    case "$relative" in
+        hermit) printf "primary\n" ;;
+        worktrees/*/hermit)
+            relative=${relative#worktrees/}
+            printf "%s\n" "${relative%%/*}"
+            ;;
+        *) printf "standalone\n" ;;
+    esac
+}
+
 # --- Argument parsing -------------------------------------------------------
 # Usage: ./validate.sh [quick|portable-only|full|super] [options]
 # Default (no level): run the full validation suite, which also prints the
@@ -184,6 +221,7 @@ Environment:
   VALIDATE_TIMEOUT_KILL_GRACE_SECONDS=N          TERM-to-KILL grace period.
   VALIDATE_LABEL_PR=0                            Disable PR labeling (same as --no-label-pr).
   VALIDATE_VERBOSE=1                             Same as --verbose.
+  HERMIT_VALIDATE_LEDGER=FILE                    Override the parent JSONL ledger path.
   PR_NUMBER=N                                    Override branch-based PR detection.
 
 Examples:
@@ -198,15 +236,6 @@ USAGE
     esac
 done
 
-# --only: fast single-shard iteration. Delegate straight to the DAG node runner
-# (ci/run-node.sh runs exactly the named node(s) against the already-built tree,
-# WITHOUT their dependencies) and skip the full validation harness entirely. This
-# is the first-class command for iterating on one failing shard locally instead
-# of re-running the whole lane — or the whole 40-50 min CI DAG — each cycle.
-if ((ONLY_MODE == 1)); then
-    exec "$ROOT_DIR/ci/run-node.sh" "$ONLY_LANE" "$ONLY_NODES"
-fi
-
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(#553)
 only_modes=0
@@ -218,6 +247,7 @@ only_modes=0
 ((LITEINST_COMPAT_ONLY == 1)) && ((only_modes += 1))
 ((QEMU_L2_ONLY == 1)) && ((only_modes += 1))
 ((PRIVILEGED_ONLY == 1)) && ((only_modes += 1))
+((ONLY_MODE == 1)) && ((only_modes += 1))
 if ((only_modes > 1)); then
     echo "validate.sh: choose only one focused validation mode" >&2
     exit 2
@@ -236,6 +266,7 @@ VALIDATION_PROFILE=$VALIDATION_LEVEL
 ((LITEINST_COMPAT_ONLY == 1)) && VALIDATION_PROFILE="liteinst-compat-only"
 ((QEMU_L2_ONLY == 1)) && VALIDATION_PROFILE="qemu-l2-only"
 ((PRIVILEGED_ONLY == 1)) && VALIDATION_PROFILE="privileged-only"
+((ONLY_MODE == 1)) && VALIDATION_PROFILE="only-$ONLY_LANE"
 
 case "$VALIDATION_PROFILE" in
     quick) VALIDATION_ESTIMATE="about 3 minutes" ;;
@@ -251,6 +282,7 @@ case "$VALIDATION_PROFILE" in
     qemu-l2-only) VALIDATION_ESTIMATE="about 30-60 minutes" ;;
     privileged-only) VALIDATION_ESTIMATE="about 60-180 minutes" ;;
     envelope-only) VALIDATION_ESTIMATE="about 5 minutes" ;;
+    only-*) VALIDATION_ESTIMATE="one prebuilt DAG shard" ;;
 esac
 readonly VALIDATION_ESTIMATE
 
@@ -294,6 +326,27 @@ readonly STRICT_COMPAT_ONLY PORTABLE_STRICT_COMPAT_ONLY RR_COMPAT_ONLY SABRE_COM
 readonly E9PATCH_COMPAT_ONLY LITEINST_COMPAT_ONLY QEMU_L2_ONLY PRIVILEGED_ONLY
 readonly VALIDATION_LEVEL VALIDATION_PROFILE
 
+VALIDATION_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+VALIDATION_STARTED_EPOCH=$(date +%s)
+DEV_HERMIT_PARENT=$(find_dev_hermit_parent || true)
+VALIDATION_SLOT=$(validation_slot_name "$DEV_HERMIT_PARENT")
+VALIDATION_LEDGER_FILE=${HERMIT_VALIDATE_LEDGER:-}
+if [[ -z $VALIDATION_LEDGER_FILE && -n $DEV_HERMIT_PARENT ]]; then
+    VALIDATION_LEDGER_FILE="$DEV_HERMIT_PARENT/ignored/validate-run-ledger.jsonl"
+fi
+VALIDATION_COMMIT=$(git rev-parse HEAD 2>/dev/null || printf "unknown")
+VALIDATION_GIT_DEPTH=$(git rev-list --count HEAD 2>/dev/null || printf "0")
+VALIDATION_GIT_AHEAD=0
+VALIDATION_GIT_BEHIND=0
+if git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null; then
+    read -r VALIDATION_GIT_BEHIND VALIDATION_GIT_AHEAD < <(
+        git rev-list --left-right --count origin/main...HEAD 2>/dev/null || printf "0 0\n"
+    )
+fi
+readonly VALIDATION_STARTED_AT VALIDATION_STARTED_EPOCH DEV_HERMIT_PARENT
+readonly VALIDATION_SLOT VALIDATION_LEDGER_FILE VALIDATION_COMMIT VALIDATION_GIT_DEPTH
+readonly VALIDATION_GIT_AHEAD VALIDATION_GIT_BEHIND
+
 SUPER_REPETITIONS=${SUPER_REPETITIONS:-20}
 if [[ ! $SUPER_REPETITIONS =~ ^[1-9][0-9]*$ ]]; then
     echo "validate.sh: SUPER_REPETITIONS must be a positive integer" >&2
@@ -323,6 +376,9 @@ declare -a background_pids=()
 declare -a background_names=()
 declare -a background_logs=()
 declare -a background_duration_files=()
+declare -a ledger_gate_names=()
+declare -a ledger_gate_statuses=()
+declare -a ledger_gate_durations=()
 
 mkdir -p "$ROOT_DIR/target/validation"
 VALIDATION_TMP_DIR=$(mktemp -d "$ROOT_DIR/target/validation/hermit-validate.XXXXXX")
@@ -555,8 +611,105 @@ function kill_process_tree {
     kill "-$signal" "$pid" 2>/dev/null || true
 }
 
+function record_ledger_gate {
+    ledger_gate_names+=("$1")
+    ledger_gate_statuses+=("$2")
+    ledger_gate_durations+=("$3")
+}
+
+function json_quote {
+    local value=$1
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\t'/\\t}
+    printf '"%s"' "$value"
+}
+
+function append_validation_ledger {
+    local exit_status=$1
+    local finished_at finished_epoch wall_seconds cpu_times cpu_user cpu_sys
+    local result gates_json gate_result line host
+    local i
+
+    [[ -n $VALIDATION_LEDGER_FILE ]] || return 0
+
+    finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    finished_epoch=$(date +%s)
+    wall_seconds=$((finished_epoch - VALIDATION_STARTED_EPOCH))
+    times >"$VALIDATION_TMP_DIR/cpu-times"
+    cpu_times=$(<"$VALIDATION_TMP_DIR/cpu-times")
+    read -r cpu_user cpu_sys < <(
+        awk '
+            function seconds(value, parts) {
+                split(value, parts, "m")
+                sub(/s$/, "", parts[2])
+                return parts[1] * 60 + parts[2]
+            }
+            NR == 1 { user += seconds($1); sys += seconds($2) }
+            NR == 2 { user += seconds($1); sys += seconds($2) }
+            END { printf "%.3f %.3f\n", user, sys }
+        ' <<<"$cpu_times"
+    )
+
+    if ((exit_status == 0 && failures == 0)); then
+        result=pass
+    else
+        result=fail
+    fi
+
+    gates_json='['
+    for i in "${!ledger_gate_names[@]}"; do
+        ((i == 0)) || gates_json+=','
+        if ((ledger_gate_statuses[i] == 0)); then
+            gate_result=pass
+        else
+            gate_result=fail
+        fi
+        gates_json+="{\"name\":$(json_quote "${ledger_gate_names[i]}"),"
+        gates_json+="\"result\":\"$gate_result\","
+        gates_json+="\"exit_code\":${ledger_gate_statuses[i]},"
+        gates_json+="\"real_seconds\":${ledger_gate_durations[i]}}"
+    done
+    gates_json+=']'
+
+    host=$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf "unknown")
+    line="{\"schema_version\":1,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
+    line+="\"finished_at\":$(json_quote "$finished_at"),\"host\":$(json_quote "$host"),"
+    line+="\"slot\":$(json_quote "$VALIDATION_SLOT"),\"cwd\":$(json_quote "$ROOT_DIR"),"
+    line+="\"profile\":$(json_quote "$VALIDATION_PROFILE"),"
+    line+="\"commit\":$(json_quote "$VALIDATION_COMMIT"),\"git_depth\":$VALIDATION_GIT_DEPTH,"
+    line+="\"git_ahead\":$VALIDATION_GIT_AHEAD,\"git_behind\":$VALIDATION_GIT_BEHIND,"
+    line+="\"result\":\"$result\",\"exit_code\":$exit_status,"
+    line+="\"checks\":$checks,\"failures\":$failures,"
+    line+="\"real_seconds\":$wall_seconds,\"user_seconds\":$cpu_user,\"sys_seconds\":$cpu_sys,"
+    line+="\"log_file\":$(json_quote "$LOG_FILE"),\"gates\":$gates_json}"
+
+    if ! mkdir -p "$(dirname -- "$VALIDATION_LEDGER_FILE")"; then
+        printf "⚠️  unable to create validation ledger directory for %s\n" \
+            "$VALIDATION_LEDGER_FILE" >&2
+        return 0
+    fi
+    if command -v flock >/dev/null 2>&1; then
+        if ! (
+            flock -x 9
+            printf "%s\n" "$line" >&9
+        ) 9>>"$VALIDATION_LEDGER_FILE"; then
+            printf "⚠️  unable to append validation ledger %s\n" \
+                "$VALIDATION_LEDGER_FILE" >&2
+        fi
+    elif ! printf "%s\n" "$line" >>"$VALIDATION_LEDGER_FILE"; then
+        printf "⚠️  unable to append validation ledger %s\n" \
+            "$VALIDATION_LEDGER_FILE" >&2
+    fi
+}
+
 function cleanup {
+    local exit_status=$?
     local pid
+
+    trap - EXIT
 
     if [[ -n $active_check_pid ]]; then
         kill_process_tree "$active_check_pid" TERM
@@ -568,8 +721,10 @@ function cleanup {
     if declare -F print_compatibility_summary >/dev/null; then
         print_compatibility_summary
     fi
+    append_validation_ledger "$exit_status"
     rm -rf "$VALIDATION_TMP_DIR"
     rm -rf "$REAL_COMPAT_FIXTURES"
+    exit "$exit_status"
 }
 
 function interrupted {
@@ -684,6 +839,7 @@ function run_check_with_timeout {
     local output_start
     local status
     local summary
+    local duration
 
     {
         printf "=== %s ===\n" "$name"
@@ -702,10 +858,12 @@ function run_check_with_timeout {
 
     if run_timed_command "$name" "$LOG_FILE" "$timeout_seconds" "$@"; then
         status=0
+        duration=$((SECONDS - started_at))
         printf "✅ %s (1 passed, 0 failed, %ss)\n" \
-            "$name" "$((SECONDS - started_at))"
+            "$name" "$duration"
     else
         status=$?
+        duration=$((SECONDS - started_at))
         failures=$((failures + 1))
         summary=$(failure_summary "$output_start")
         printf "❌ %s (0 passed, 1 failed, exit %s: %s; full log: %s)\n" \
@@ -714,13 +872,38 @@ function run_check_with_timeout {
 
     {
         printf "Exit: %s\n" "$status"
-        printf "Duration: %ss\n\n" "$((SECONDS - started_at))"
+        printf "Duration: %ss\n\n" "$duration"
     } >>"$LOG_FILE"
+    record_ledger_gate "$name" "$status" "$duration"
     checks=$((checks + 1))
 }
 
 function run_check {
     run_check_with_timeout "$GATE_TIMEOUT_SECONDS" "$@"
+}
+
+function initialize_repository_submodules {
+    local status
+    local -a git_command=(git)
+
+    if command -v with-proxy >/dev/null 2>&1; then
+        git_command=(with-proxy git)
+    fi
+    "${git_command[@]}" submodule update --init --recursive
+    status=$(git submodule status --recursive)
+    printf "%s\n" "$status"
+    if grep -Eq '^[-+U]' <<<"$status"; then
+        printf "validate.sh: a required submodule is missing or not at its pinned revision\n" >&2
+        return 1
+    fi
+    [[ -f agent-utils/README.md ]] || {
+        printf "validate.sh: agent-utils submodule is missing\n" >&2
+        return 1
+    }
+    [[ -f third-party/rr/CMakeLists.txt ]] || {
+        printf "validate.sh: rr submodule is missing\n" >&2
+        return 1
+    }
 }
 
 function start_check {
@@ -806,6 +989,7 @@ function wait_for_background_checks {
             printf "Exit: %s\n" "$status"
             printf "Duration: %ss\n\n" "$duration"
         } >>"$LOG_FILE"
+        record_ledger_gate "$name" "$status" "$duration"
     done
 
     background_pids=()
@@ -3264,6 +3448,26 @@ function run_super_suite {
     run_check "Full LevelDB strict determinism" env HERMIT_LEVELDB_BUILD_DIR="$leveldb_build" cargo test -p hermit --features third-party-backends --test leveldb full_leveldb_suite_is_deterministic_under_strict -- --exact --ignored --test-threads=1
     run_check "SQLite veryquick strict determinism" cargo test -p hermit --features third-party-backends --test sqlite_veryquick sqlite_veryquick_is_deterministic_under_strict_hermit -- --exact --ignored --test-threads=1
 }
+
+# Keep direct ./validate.sh invocations as self-sufficient as `make validate`.
+# This initializes Hermit's registered submodules; Cargo's pinned Reverie build
+# script separately materializes its nested DynamoRIO checkout.
+run_check "Initialize repository submodules" initialize_repository_submodules
+if ((failures != 0)); then
+    print_summary
+    exit 1
+fi
+
+# --only is the first-class fast path for one already-built DAG shard. Run it
+# through the normal gate wrapper so it receives the same log and parent-ledger
+# accounting as every other validation profile.
+if ((ONLY_MODE == 1)); then
+    run_check "DAG shard ${ONLY_LANE}:${ONLY_NODES}" \
+        "$ROOT_DIR/ci/run-node.sh" "$ONLY_LANE" "$ONLY_NODES"
+    print_summary
+    ((failures == 0))
+    exit $?
+fi
 
 # Envelope-only fast path: build the binary, measure the envelope, optionally
 # enforce monotonicity, and exit. CI uses this so its numbers match validate.sh.
