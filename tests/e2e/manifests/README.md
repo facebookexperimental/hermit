@@ -34,6 +34,23 @@ and the correspondence audit proves that this cannot hide a calibrated cell.
 Every entry still declares all five modes and every backend exclusion, so
 inventory does not silently imply support.
 
+## Matrix symmetry and the test front door
+
+Compatibility coverage enters through these shared schema-v2 manifests, not
+through a backend-owned guest list. Every test declares all five modes, and
+every non-naked mode partitions the complete `ptrace`, `dbi`, `kvm`, `sabre`,
+and `liteinst` axis into enabled cells and explicit gaps. Any active mode must
+include ptrace so the reference behavior is established before another backend
+ratchets it.
+
+`ci/matrix-symmetry-baseline.json` records the small amount of older policy
+debt: ptrace-less manifest rows and guest fixtures owned by a backend-specific
+or legacy backend-parity driver. `hermit-manifest-plan` requires that baseline
+to match exactly, so private corpora cannot grow. Migrating a baseline entry to
+a shared manifest is allowed, but the same change must remove it from the
+baseline. This makes the shared test identity the row axis; backend support or
+gaps remain cells of that one row rather than creating backend-private rows.
+
 ## Schema contract
 
 Every `[[test]]` names either a repo-relative `program` or a `direct` shell

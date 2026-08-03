@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "asymmetric_manifest_tests": [
+    "applications/kvm-python-examples",
+    "applications/kvm-shell-environment"
+  ],
+  "backend_private_guest_files": [
+    "tests/backend-parity/e9patch_corpus/clock_gettime.c",
+    "tests/backend-parity/e9patch_corpus/compute.c",
+    "tests/backend-parity/e9patch_corpus/dup3_high.c",
+    "tests/backend-parity/e9patch_corpus/fcntl_cloexec.c",
+    "tests/backend-parity/e9patch_corpus/fd_lowest_free.c",
+    "tests/backend-parity/e9patch_corpus/fd_open_number.c",
+    "tests/backend-parity/e9patch_corpus/getpid_check.c",
+    "tests/backend-parity/e9patch_corpus/getrandom.c",
+    "tests/backend-parity/e9patch_corpus/loop_write.c",
+    "tests/backend-parity/e9patch_corpus/minimal_exit.c",
+    "tests/backend-parity/e9patch_corpus/mmap_anon.c",
+    "tests/backend-parity/e9patch_corpus/multi_site.c",
+    "tests/backend-parity/e9patch_corpus/nanosleep.c",
+    "tests/backend-parity/e9patch_corpus/pipe_fds.c",
+    "tests/backend-parity/e9patch_corpus/proc_self_fd_count.c",
+    "tests/backend-parity/e9patch_corpus/readlink_exe.c",
+    "tests/backend-parity/e9patch_corpus/sigmask.c",
+    "tests/backend-parity/e9patch_corpus/uname.c",
+    "tests/backend-parity/e9patch_corpus/write_stdout.c",
+    "tests/backend-parity/e9patch_corpus/writev_multi.c",
+    "tests/backend-parity/fixtures/input.txt",
+    "tests/backend-parity/fixtures/sigaction_state.c",
+    "tests/backend-parity/fixtures/sigaltstack_state.c",
+    "tests/backend-parity/fixtures/sigprocmask_state.c",
+    "tests/c/liteinst_host_activation.c",
+    "tests/c/liteinst_inert_runtime.c",
+    "tests/c/sabre_exit_group_parked.c",
+    "tests/c/signal_disposition.c"
+  ]
+}

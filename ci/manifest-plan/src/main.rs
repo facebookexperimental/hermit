@@ -17,11 +17,14 @@ use std::path::PathBuf;
 #[cfg(not(test))]
 use std::process::exit;
 
+use serde_json::Value as JsonValue;
 use serde_json::json;
 use toml::Value;
 
 const KNOWN_BACKENDS: [&str; 5] = ["ptrace", "dbi", "kvm", "sabre", "liteinst"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
+const MATRIX_SYMMETRY_BASELINE: &str = "ci/matrix-symmetry-baseline.json";
+const TEST_INVENTORY: &str = "tests/e2e/manifests/inventory/test-files.json";
 
 #[derive(Debug)]
 struct PlanRow {
@@ -137,6 +140,8 @@ fn main() {
         documents.push(document);
     }
 
+    validate_front_door(&repo_root, &documents);
+
     rows.sort_by(|left, right| {
         (&left.bucket, &left.id, &left.mode, &left.backend).cmp(&(
             &right.bucket,
@@ -193,6 +198,178 @@ fn main() {
             );
         }
     }
+}
+
+fn json_string_set(value: &JsonValue, key: &str, location: &str) -> BTreeSet<String> {
+    let values = value
+        .get(key)
+        .and_then(JsonValue::as_array)
+        .unwrap_or_else(|| die(format!("{location}: `{key}` must be an array")));
+    let result: BTreeSet<String> = values
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    die(format!(
+                        "{location}: `{key}` entries must be non-empty strings"
+                    ))
+                })
+        })
+        .collect();
+    if result.len() != values.len() {
+        die(format!("{location}: `{key}` contains duplicate entries"));
+    }
+    result
+}
+
+fn names_backend(value: &str) -> bool {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|token| {
+            let token = token.to_ascii_lowercase();
+            matches!(
+                token.as_str(),
+                "ptrace" | "dbi" | "dynamorio" | "kvm" | "sabre" | "e9patch"
+            ) || token.starts_with("liteinst")
+        })
+}
+
+fn backend_private_guest_files(inventory: &JsonValue) -> BTreeSet<String> {
+    inventory
+        .get("files")
+        .and_then(JsonValue::as_array)
+        .unwrap_or_else(|| die(format!("{TEST_INVENTORY}: `files` must be an array")))
+        .iter()
+        .filter(|entry| {
+            entry.get("disposition").and_then(JsonValue::as_str) == Some("guest-fixture")
+        })
+        .filter_map(|entry| {
+            let path = entry.get("path").and_then(JsonValue::as_str)?;
+            let runner = entry
+                .get("runner")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
+            let parity_private = path.starts_with("tests/backend-parity/")
+                || runner.contains("tests/backend-parity/");
+            (parity_private || names_backend(path) || names_backend(runner))
+                .then(|| path.to_string())
+        })
+        .collect()
+}
+
+fn asymmetric_manifest_tests(documents: &[Value]) -> BTreeSet<String> {
+    let mut asymmetric = BTreeSet::new();
+    for document in documents {
+        for test in document
+            .get("test")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(id) = test.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(modes) = test.get("modes").and_then(Value::as_table) else {
+                continue;
+            };
+            let mut has_ptrace_front_door = false;
+            let mut has_backend_without_ptrace = false;
+            for mode in MODES.into_iter().filter(|mode| *mode != "naked") {
+                let enabled = modes
+                    .get(mode)
+                    .and_then(Value::as_table)
+                    .and_then(|spec| spec.get("backends_enabled"))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>();
+                let has_ptrace = enabled.contains(&"ptrace");
+                has_ptrace_front_door |= has_ptrace;
+                has_backend_without_ptrace |= !enabled.is_empty() && !has_ptrace;
+            }
+            if !has_ptrace_front_door || has_backend_without_ptrace {
+                asymmetric.insert(id.to_string());
+            }
+        }
+    }
+    asymmetric
+}
+
+fn enforce_exact_ratchet(label: &str, actual: &BTreeSet<String>, baseline: &BTreeSet<String>) {
+    let unexpected: Vec<_> = actual.difference(baseline).cloned().collect();
+    let stale: Vec<_> = baseline.difference(actual).cloned().collect();
+    if !unexpected.is_empty() || !stale.is_empty() {
+        die(format!(
+            "matrix symmetry {label} changed; unexpected={unexpected:?}, stale_baseline={stale:?}. New compatibility coverage must enter a shared schema-v2 TOML manifest, establish ptrace first, and declare every backend/mode cell; remove migrated debt from {MATRIX_SYMMETRY_BASELINE}"
+        ));
+    }
+}
+
+fn validate_front_door(repo_root: &Path, documents: &[Value]) {
+    let baseline_path = repo_root.join(MATRIX_SYMMETRY_BASELINE);
+    let baseline_text = std::fs::read_to_string(&baseline_path)
+        .unwrap_or_else(|error| die(format!("cannot read {}: {error}", baseline_path.display())));
+    let baseline: JsonValue = serde_json::from_str(&baseline_text).unwrap_or_else(|error| {
+        die(format!(
+            "{}: invalid JSON: {error}",
+            baseline_path.display()
+        ))
+    });
+    let baseline_keys: BTreeSet<_> = baseline
+        .as_object()
+        .unwrap_or_else(|| die(format!("{MATRIX_SYMMETRY_BASELINE}: expected an object")))
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let expected_keys: BTreeSet<_> = [
+        "schema",
+        "asymmetric_manifest_tests",
+        "backend_private_guest_files",
+    ]
+    .into_iter()
+    .collect();
+    if baseline_keys != expected_keys {
+        die(format!(
+            "{MATRIX_SYMMETRY_BASELINE}: keys must be exactly {expected_keys:?}, got {baseline_keys:?}"
+        ));
+    }
+    if baseline.get("schema").and_then(JsonValue::as_u64) != Some(1) {
+        die(format!("{MATRIX_SYMMETRY_BASELINE}: schema must be 1"));
+    }
+    let expected_asymmetric = json_string_set(
+        &baseline,
+        "asymmetric_manifest_tests",
+        MATRIX_SYMMETRY_BASELINE,
+    );
+    let expected_private = json_string_set(
+        &baseline,
+        "backend_private_guest_files",
+        MATRIX_SYMMETRY_BASELINE,
+    );
+
+    let inventory_path = repo_root.join(TEST_INVENTORY);
+    let inventory_text = std::fs::read_to_string(&inventory_path)
+        .unwrap_or_else(|error| die(format!("cannot read {}: {error}", inventory_path.display())));
+    let inventory: JsonValue = serde_json::from_str(&inventory_text).unwrap_or_else(|error| {
+        die(format!(
+            "{}: invalid JSON: {error}",
+            inventory_path.display()
+        ))
+    });
+
+    enforce_exact_ratchet(
+        "manifest ptrace-front-door debt",
+        &asymmetric_manifest_tests(documents),
+        &expected_asymmetric,
+    );
+    enforce_exact_ratchet(
+        "backend-private guest debt",
+        &backend_private_guest_files(&inventory),
+        &expected_private,
+    );
 }
 
 fn required_string<'a>(value: &'a Value, key: &str, location: &str) -> &'a str {
@@ -721,6 +898,106 @@ liteinst = "unsupported"
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].backend, "ptrace");
         assert!(rows[0].ci);
+    }
+
+    #[test]
+    fn identifies_backend_private_guest_fixtures() {
+        let inventory = json!({
+            "files": [
+                {
+                    "path": "tests/backend-parity/fixtures/new_contract.c",
+                    "disposition": "guest-fixture",
+                    "runner": "tests/backend-parity/run_matrix.py"
+                },
+                {
+                    "path": "tests/c/liteinst_only.c",
+                    "disposition": "guest-fixture",
+                    "runner": "hermit-cli/tests/liteinst.rs"
+                },
+                {
+                    "path": "tests/c/shared.c",
+                    "disposition": "manifest-test",
+                    "runner": "ci/test_harness.sh"
+                },
+                {
+                    "path": "tests/c/cargo_fixture.c",
+                    "disposition": "guest-fixture",
+                    "runner": "detcore integration tests"
+                }
+            ]
+        });
+        assert_eq!(
+            backend_private_guest_files(&inventory),
+            BTreeSet::from([
+                "tests/backend-parity/fixtures/new_contract.c".to_string(),
+                "tests/c/liteinst_only.c".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn identifies_manifest_mode_without_ptrace_front_door() {
+        let document = r#"
+[[test]]
+id = "applications/kvm-only"
+
+[test.modes.verify]
+backends_enabled = ["kvm"]
+
+[test.modes.chaos]
+backends_enabled = []
+
+[test.modes.replay]
+backends_enabled = []
+
+[test.modes.naked]
+backends_enabled = []
+
+[test.modes.custom]
+backends_enabled = []
+"#
+        .parse::<Value>()
+        .expect("test manifest must be valid TOML");
+        assert_eq!(
+            asymmetric_manifest_tests(&[document]),
+            BTreeSet::from(["applications/kvm-only".to_string()])
+        );
+    }
+
+    #[test]
+    fn accepts_ptrace_established_shared_manifest_row() {
+        let document = r#"
+[[test]]
+id = "applications/shared"
+
+[test.modes.verify]
+backends_enabled = ["ptrace", "kvm"]
+
+[test.modes.chaos]
+backends_enabled = []
+
+[test.modes.replay]
+backends_enabled = ["ptrace"]
+
+[test.modes.naked]
+backends_enabled = []
+
+[test.modes.custom]
+backends_enabled = []
+"#
+        .parse::<Value>()
+        .expect("test manifest must be valid TOML");
+        assert!(asymmetric_manifest_tests(&[document]).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected=[\"tests/backend-parity/private.c\"]")]
+    fn rejects_backend_private_guest_growth() {
+        enforce_exact_ratchet(
+            "backend-private guest debt",
+            &BTreeSet::from(["tests/backend-parity/private.c".to_string()]),
+            &BTreeSet::new(),
+        );
     }
 
     #[test]
