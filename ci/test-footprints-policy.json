@@ -1,0 +1,234 @@
+{
+  "_comment": [
+    "Policy inputs that Cargo metadata cannot derive for ci/test-footprints.json.",
+    "Run `cargo run -p hermit-manifest-plan --bin generate-test-footprints` after",
+    "changing this file, the workspace Cargo graph, or ci/dag/portable.json.",
+    "",
+    "Keep ci_irrelevant deliberately narrow: it is the only classification that can",
+    "skip CI. Unmatched paths still force the complete suite. Package Rust sources,",
+    "manifests, reverse dependencies, and Cargo-command DAG nodes are generated."
+  ],
+  "version": 1,
+  "force_full": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    ".cargo/**",
+    "ci/**",
+    "validate.sh",
+    "scripts/lib/**",
+    ".github/workflows/ci-portable.yml",
+    ".github/workflows/merge-gate.yml",
+    ".github/workflows/ci-privileged.yml"
+  ],
+  "ci_irrelevant": [
+    "**/*.md",
+    "docs/**",
+    "ai_docs/**",
+    "experiments/**",
+    "LICENSE",
+    "CODEOWNERS",
+    ".gitignore",
+    "**/.gitignore",
+    ".gitattributes",
+    ".editorconfig",
+    "**/*.png",
+    "**/*.svg",
+    "**/*.jpg",
+    ".github/**"
+  ],
+  "package_rules": [
+    {
+      "_why": "Shared Detcore/CLI code drives the non-Cargo strict, backend-parity, and manifest harnesses.",
+      "packages": [
+        "detcore",
+        "detcore-model",
+        "detcore-testutils",
+        "digest",
+        "edit-distance",
+        "hermit",
+        "hermit-resources",
+        "test-allocator"
+      ],
+      "nodes": [
+        "e2e.manifest_applications",
+        "e2e.manifest_backend_parity_c",
+        "e2e.manifest_bin_c",
+        "e2e.manifest_c_programs",
+        "e2e.manifest_chaos_c",
+        "e2e.manifest_data_handling",
+        "e2e.manifest_debugger_c",
+        "e2e.manifest_determinism_stress_c",
+        "e2e.manifest_determinism_stress",
+        "e2e.manifest_language_runtimes",
+        "e2e.manifest_shared_futex_c",
+        "e2e.manifest_system_utils",
+        "e2e.manifest_util_c",
+        "test.applications_e2e",
+        "test.dbi_parity",
+        "test.envelope_levels",
+        "test.strict_compat"
+      ],
+      "e2e_all": true
+    },
+    {
+      "_why": "hermit-install stages runtime resources used by every Hermit and backend test path.",
+      "packages": ["hermit-install"],
+      "nodes": [
+        "e2e.manifest_applications",
+        "e2e.manifest_backend_parity_c",
+        "e2e.manifest_bin_c",
+        "e2e.manifest_c_programs",
+        "e2e.manifest_chaos_c",
+        "e2e.manifest_data_handling",
+        "e2e.manifest_debugger_c",
+        "e2e.manifest_determinism_stress_c",
+        "e2e.manifest_determinism_stress",
+        "e2e.manifest_language_runtimes",
+        "e2e.manifest_shared_futex_c",
+        "e2e.manifest_system_utils",
+        "e2e.manifest_util_c",
+        "test.applications_e2e",
+        "test.app_strict_verify",
+        "test.arbitrary_binaries",
+        "test.cli",
+        "test.command_strict_verify",
+        "test.dbi_parity",
+        "test.envelope_levels",
+        "test.hermit_integration",
+        "test.hermit_modes",
+        "test.hermit_unit",
+        "test.ignored_syscall_regressions",
+        "test.liteinst_strict",
+        "test.rr_suite_contract",
+        "test.sabre_examples",
+        "test.strict_compat"
+      ],
+      "e2e_all": true
+    },
+    {
+      "_why": "The shared guest crate and fixtures are consumed by Hermit integration tests and every manifest backend.",
+      "packages": ["hermetic_infra_hermit_tests"],
+      "nodes": [
+        "e2e.manifest_applications",
+        "e2e.manifest_backend_parity_c",
+        "e2e.manifest_bin_c",
+        "e2e.manifest_c_programs",
+        "e2e.manifest_chaos_c",
+        "e2e.manifest_data_handling",
+        "e2e.manifest_debugger_c",
+        "e2e.manifest_determinism_stress_c",
+        "e2e.manifest_determinism_stress",
+        "e2e.manifest_language_runtimes",
+        "e2e.manifest_shared_futex_c",
+        "e2e.manifest_system_utils",
+        "e2e.manifest_util_c",
+        "test.applications_e2e",
+        "test.app_strict_verify",
+        "test.arbitrary_binaries",
+        "test.cli",
+        "test.command_strict_verify",
+        "test.hermit_integration",
+        "test.hermit_modes",
+        "test.hermit_unit",
+        "test.ignored_syscall_regressions",
+        "test.rr_suite_contract"
+      ],
+      "e2e_all": true
+    },
+    {
+      "_why": "The DBI plugin has a backend-private release/parity harness and DBI cells.",
+      "packages": ["detcore-dbi"],
+      "nodes": ["e2e.manifest_backend_parity_c", "test.dbi_parity"],
+      "e2e_backends": ["dbi"]
+    },
+    {
+      "_why": "The SaBRe plugin has a backend-private release/examples harness and SaBRe cells.",
+      "packages": ["detcore-sabre"],
+      "nodes": ["test.sabre_examples"],
+      "e2e_backends": ["sabre"]
+    },
+    {
+      "_why": "Flaky guest binaries feed the chaos and determinism-stress manifest buckets.",
+      "packages": ["hermetic_infra_hermit_flaky-tests"],
+      "nodes": [
+        "build.flaky_harnesses",
+        "e2e.manifest_chaos_c",
+        "e2e.manifest_determinism_stress",
+        "e2e.manifest_determinism_stress_c"
+      ],
+      "e2e_all": true
+    }
+  ],
+  "path_footprints": [
+    {
+      "_why": "Legacy DBI parity fixtures are outside Cargo targets.",
+      "paths": ["tests/backend-parity/**"],
+      "nodes": ["e2e.manifest_backend_parity_c", "test.dbi_parity"],
+      "e2e_backends": ["dbi"]
+    },
+    {
+      "_why": "Shared non-Cargo guest fixtures are consumed by the manifest and Hermit integration harnesses.",
+      "paths": [
+        "tests/bin/**",
+        "tests/c/**",
+        "tests/chaos/**",
+        "tests/compat/**",
+        "tests/debugger/**",
+        "tests/e2e/**",
+        "tests/python/**",
+        "tests/qemu-boot/**",
+        "tests/reproducible-builds/**",
+        "tests/runtime/**",
+        "tests/rust/**",
+        "tests/shared-futex-verify/**",
+        "tests/shell/**",
+        "tests/standalone/**",
+        "tests/stress/**",
+        "tests/util/**"
+      ],
+      "nodes": [
+        "e2e.manifest_applications",
+        "e2e.manifest_backend_parity_c",
+        "e2e.manifest_bin_c",
+        "e2e.manifest_c_programs",
+        "e2e.manifest_chaos_c",
+        "e2e.manifest_data_handling",
+        "e2e.manifest_debugger_c",
+        "e2e.manifest_determinism_stress_c",
+        "e2e.manifest_determinism_stress",
+        "e2e.manifest_language_runtimes",
+        "e2e.manifest_shared_futex_c",
+        "e2e.manifest_system_utils",
+        "e2e.manifest_util_c",
+        "test.applications_e2e",
+        "test.app_strict_verify",
+        "test.arbitrary_binaries",
+        "test.cli",
+        "test.command_strict_verify",
+        "test.hermit_integration",
+        "test.hermit_modes",
+        "test.hermit_unit",
+        "test.ignored_syscall_regressions",
+        "test.rr_suite_contract"
+      ],
+      "e2e_all": true
+    },
+    {
+      "_why": "LiteInst runtime staging is outside Cargo's workspace graph.",
+      "paths": ["scripts/stage-liteinst-runtime.sh"],
+      "nodes": ["test.liteinst_strict"],
+      "e2e_backends": ["liteinst"]
+    },
+    {
+      "_why": "Standalone checks map to their own portable DAG node.",
+      "paths": ["scripts/check-detcore-backend-abstraction.sh"],
+      "nodes": ["check.backend_abstraction"]
+    },
+    {
+      "_why": "Standalone checks map to their own portable DAG node.",
+      "paths": ["scripts/check-portable-paths.sh"],
+      "nodes": ["check.portability_paths"]
+    }
+  ]
+}
