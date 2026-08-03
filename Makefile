@@ -15,13 +15,19 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 .DEFAULT_GOAL := build
 
 .PHONY: build install-deps release-core help checkout-all check-build-tools \
-	check-submodules validate lint \
+	install-build-tools check-submodules validate lint \
 	validate-kvm validate-dbi validate-sabre validate-liteinst validate-e9patch
 
 build: install-deps ## Build the development Hermit binary with every backend
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --locked \
 		-p hermit --features third-party-backends
 
+# `install-deps` is the "install everything this repo needs to build" entrypoint,
+# so it opts into best-effort auto-installation of the native build toolchain via
+# INSTALL_BUILD_TOOLS. Target-specific variables propagate to prerequisites, so
+# the transitive `check-build-tools` prereq sees this and installs before it
+# asserts. `validate`/`release-core` do NOT set it and therefore only assert.
+install-deps: INSTALL_BUILD_TOOLS := 1
 install-deps: check-submodules ## Build and stage all third-party backend runtimes and plugins
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --release --locked \
 		-p detcore-dbi -p detcore-sabre -p hermit-install
@@ -72,32 +78,67 @@ help: ## Show this help (the list of make targets)
 	@printf '  validate-e9patch   e9patch corpus        (needs HERMIT_E9PATCH_BACKEND) ~5-20 min\n'
 	@printf '\nThe full multi-backend suite is ./validate.sh (see ./validate.sh --help).\n'
 
-# Fail fast when the native toolchain that the third-party backends need is
-# absent. The DBI backend (reverie-dbi) builds DynamoRIO from source with CMake
-# during `cargo build`, roughly 30s into the compile. When cmake or a C/C++
-# compiler is missing, that build.rs step fails to SPAWN cmake and panics with
-# the cryptic "failed to configure DynamoRIO: No such file or directory (os
-# error 2)" — an ENOENT on the cmake executable, not a missing source tree.
-# On a warm developer box these tools are already present, so this check is a
-# no-op; on a freshly provisioned host it converts that late, opaque failure
-# into an immediate, actionable message.
+# Detect the native build toolchain (cmake + a C and C++ compiler) that the
+# third-party backends need. reverie-dbi's build.rs CMake-configures DynamoRIO
+# roughly 30s into `cargo build`; when cmake or a compiler is absent that step
+# fails to SPAWN cmake and panics with the cryptic "failed to configure
+# DynamoRIO: No such file or directory (os error 2)" — an ENOENT on the cmake
+# executable, not a missing source tree (a missing source instead makes cmake
+# exit non-zero). `make install-deps` sets INSTALL_BUILD_TOOLS=1 to best-effort
+# install the toolchain first; every other entrypoint asserts only and fails
+# fast with an actionable message. On a warm box the tools are present and this
+# is a no-op.
 check-build-tools: ## Verify the native build toolchain (cmake + C/C++ compiler) is present
-	@missing=; \
-		command -v cmake >/dev/null 2>&1 || missing="$$missing cmake"; \
+	@detect() { \
+		miss=; \
+		command -v cmake >/dev/null 2>&1 || miss="$$miss cmake"; \
 		{ command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 \
 			|| command -v clang >/dev/null 2>&1; } \
-			|| missing="$$missing C-compiler(cc/gcc/clang)"; \
+			|| miss="$$miss C-compiler(cc/gcc/clang)"; \
 		{ command -v c++ >/dev/null 2>&1 || command -v g++ >/dev/null 2>&1 \
 			|| command -v clang++ >/dev/null 2>&1; } \
-			|| missing="$$missing C++-compiler(c++/g++/clang++)"; \
-		if [ -n "$$missing" ]; then \
-			echo "error: required native build tool(s) not found on PATH:$$missing" >&2; \
-			echo "  The DBI backend builds DynamoRIO from source with CMake; without" >&2; \
-			echo "  these the build fails ~30s in with a cryptic \"failed to configure" >&2; \
-			echo "  DynamoRIO: No such file or directory\". Install them, for example:" >&2; \
-			echo "    Debian/Ubuntu: sudo apt-get install -y cmake build-essential" >&2; \
-			echo "    Fedora/RHEL:   sudo dnf install -y cmake gcc gcc-c++ make" >&2; \
-			exit 1; \
+			|| miss="$$miss C++-compiler(c++/g++/clang++)"; \
+		printf '%s' "$$miss"; \
+	}; \
+	missing="$$(detect)"; \
+	if [ -n "$$missing" ] && [ "$(INSTALL_BUILD_TOOLS)" = 1 ]; then \
+		$(MAKE) --no-print-directory install-build-tools; \
+		missing="$$(detect)"; \
+	fi; \
+	if [ -n "$$missing" ]; then \
+		echo "error: required native build tool(s) not found on PATH:$$missing" >&2; \
+		echo "  The DBI backend builds DynamoRIO from source with CMake; without" >&2; \
+		echo "  these the build fails ~30s in with a cryptic \"failed to configure" >&2; \
+		echo "  DynamoRIO: No such file or directory\". Install them, for example:" >&2; \
+		echo "    Debian/Ubuntu: sudo apt-get install -y cmake build-essential" >&2; \
+		echo "    Fedora/RHEL:   sudo dnf install -y cmake gcc gcc-c++ make" >&2; \
+		echo "  or run 'make install-deps', which installs them automatically." >&2; \
+		exit 1; \
+	fi
+
+# Best-effort install of the native build toolchain via the platform package
+# manager. Invoked only from the `install-deps` path (INSTALL_BUILD_TOOLS=1).
+# Uses non-interactive sudo so it never hangs on a password prompt in an
+# automated context; if privileges or a package manager are unavailable it warns
+# and returns success, leaving check-build-tools to emit the actionable error.
+install-build-tools: ## Best-effort install of cmake + a C/C++ toolchain via the platform package manager
+	@echo "install-deps: ensuring native build toolchain (cmake + C/C++ compiler) is installed..."; \
+		SUDO=; \
+		if [ "$$(id -u)" != 0 ]; then \
+			if command -v sudo >/dev/null 2>&1; then SUDO="sudo -n"; \
+			else echo "warning: not root and sudo unavailable; cannot auto-install build tools" >&2; exit 0; fi; \
+		fi; \
+		if command -v apt-get >/dev/null 2>&1; then \
+			$$SUDO apt-get update && $$SUDO apt-get install -y cmake build-essential \
+				|| echo "warning: apt-get could not install build tools (insufficient privileges?)" >&2; \
+		elif command -v dnf >/dev/null 2>&1; then \
+			$$SUDO dnf install -y cmake gcc gcc-c++ make \
+				|| echo "warning: dnf could not install build tools (insufficient privileges?)" >&2; \
+		elif command -v yum >/dev/null 2>&1; then \
+			$$SUDO yum install -y cmake gcc gcc-c++ make \
+				|| echo "warning: yum could not install build tools (insufficient privileges?)" >&2; \
+		else \
+			echo "warning: no supported package manager (apt-get/dnf/yum) found; install cmake + a C/C++ compiler manually" >&2; \
 		fi
 
 checkout-all: check-build-tools ## Initialize every pinned submodule before builds and validation
