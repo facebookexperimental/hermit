@@ -191,6 +191,22 @@ class Fixtures:
                 REPOSITORY / "tests/c/scheduler_policy_queries.c",
                 (),
             ),
+            "signal_disposition": (
+                REPOSITORY / "tests/c/signal_disposition.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "sigaction_state": (
+                local / "sigaction_state.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "sigprocmask_state": (
+                local / "sigprocmask_state.c",
+                ("-D_GNU_SOURCE",),
+            ),
+            "sigaltstack_state": (
+                local / "sigaltstack_state.c",
+                ("-D_GNU_SOURCE",),
+            ),
         }
         source, flags = sources[name]
         binary = compile_fixture(source, self.root / name, *flags)
@@ -292,6 +308,26 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             [str(fixtures.binary("scheduler_policy_queries"))],
             0,
             b"scheduler-policy-queries-ok\n",
+        ),
+        "signal_disposition": (
+            [str(fixtures.binary("signal_disposition"))],
+            0,
+            b"signal-disposition-ok\n",
+        ),
+        "sigaction_state": (
+            [str(fixtures.binary("sigaction_state"))],
+            0,
+            b"sigaction ok=5\n",
+        ),
+        "sigprocmask_state": (
+            [str(fixtures.binary("sigprocmask_state"))],
+            0,
+            b"sigprocmask ok=5\n",
+        ),
+        "sigaltstack_state": (
+            [str(fixtures.binary("sigaltstack_state"))],
+            0,
+            b"sigaltstack ok=4\n",
         ),
     }
     try:

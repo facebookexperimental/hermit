@@ -176,6 +176,24 @@
       "why": "tests/backend-parity/fixtures/pthread_lifecycle.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "path": "tests/backend-parity/fixtures/sigaction_state.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/backend-parity/fixtures/sigaction_state.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic sigaction(2) handler installation and SA_* flag round-tripping as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBI/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+    },
+    {
+      "path": "tests/backend-parity/fixtures/sigaltstack_state.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/backend-parity/fixtures/sigaltstack_state.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic sigaltstack(2) alternate signal-stack install/query round-tripping as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBI/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+    },
+    {
+      "path": "tests/backend-parity/fixtures/sigprocmask_state.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/backend-parity/fixtures/sigprocmask_state.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic sigprocmask(2) signal-mask block/unblock/query round-tripping as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBI/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+    },
+    {
       "path": "tests/backend-parity/matrix.tsv",
       "disposition": "support-data",
       "runner": "tests/backend-parity/run_matrix.py",
@@ -930,6 +948,12 @@
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
       "why": "tests/c/signal_determinism.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "path": "tests/c/signal_disposition.c",
+      "disposition": "guest-fixture",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/c/signal_disposition.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic signal disposition inheritance (SIG_DFL/SIG_IGN and pending-signal state) as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBI/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
     },
     {
       "path": "tests/c/sigpipe_siginfo.c",

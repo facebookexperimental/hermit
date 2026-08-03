@@ -23,3 +23,7 @@ virtual_clock	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 random_sources	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 virtual_pid	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 scheduler_policy_queries	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+signal_disposition	pass	pass	gap	-	KVM parity not re-verified during signal-wave consolidation (build host KVM saturated under concurrent load); recorded as a gap pending a dedicated KVM ratchet	detlog	detlog	gap	-	inherited from the L1 KVM gap: no verified L2 KVM run was produced during consolidation
+sigaction_state	pass	pass	gap	-	KVM parity not re-verified during signal-wave consolidation (build host KVM saturated under concurrent load); recorded as a gap pending a dedicated KVM ratchet	detlog	detlog	gap	-	inherited from the L1 KVM gap: no verified L2 KVM run was produced during consolidation
+sigprocmask_state	pass	pass	gap	-	KVM parity not re-verified during signal-wave consolidation (build host KVM saturated under concurrent load); recorded as a gap pending a dedicated KVM ratchet	detlog	detlog	gap	-	inherited from the L1 KVM gap: no verified L2 KVM run was produced during consolidation
+sigaltstack_state	pass	pass	gap	-	KVM parity not re-verified during signal-wave consolidation (build host KVM saturated under concurrent load); recorded as a gap pending a dedicated KVM ratchet	detlog	detlog	gap	-	inherited from the L1 KVM gap: no verified L2 KVM run was produced during consolidation

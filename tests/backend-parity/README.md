@@ -16,17 +16,17 @@ L1 (`hermit run --strict`):
 
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
-| ptrace | 24/24 | 100% |
-| DBI | 23/24 | 96% |
-| KVM | 23/24 | 96% |
+| ptrace | 28/28 | 100% |
+| DBI | 27/28 | 96% |
+| KVM | 23/28 | 82% |
 
 L2 (`hermit run --strict --verify`):
 
 | Backend | Verified pairs | L2 kind | Parity vs ptrace |
 | --- | ---: | --- | ---: |
-| ptrace | 24/24 | DETLOG-bitwise | 100% |
-| DBI | 22/24 | DETLOG-bitwise | 92% |
-| KVM | 22/24 | guest-visible only | 92% |
+| ptrace | 28/28 | DETLOG-bitwise | 100% |
+| DBI | 26/28 | DETLOG-bitwise | 93% |
+| KVM | 22/28 | guest-visible only | 79% |
 
 The two L2 assurance *kinds* are not interchangeable. **DETLOG-bitwise** L2
 (ptrace, DBI) means hermit re-ran the guest and found the two normalized DETLOG
@@ -126,6 +126,10 @@ is not reached.
 | `random_sources` | pass / detlog | pass / detlog | pass / guest |
 | `virtual_pid` | pass / detlog | pass / detlog | pass / guest |
 | `scheduler_policy_queries` | pass / detlog | pass / detlog | pass / guest |
+| `signal_disposition` | pass / detlog | pass / detlog | **gap** / gap |
+| `sigaction_state` | pass / detlog | pass / detlog | **gap** / gap |
+| `sigprocmask_state` | pass / detlog | pass / detlog | **gap** / gap |
+| `sigaltstack_state` | pass / detlog | pass / detlog | **gap** / gap |
 
 The `scheduler_policy_queries` contract pins Detcore's inert-scheduler-policy
 model: the guest arms and re-reads an `ITIMER_REAL` one-shot against virtual
