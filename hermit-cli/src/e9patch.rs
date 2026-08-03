@@ -9,6 +9,7 @@
 //! Content-addressed offline rewriting for the experimental e9patch backend.
 
 use std::env;
+use std::fmt;
 use std::fs;
 use std::fs::File;
 use std::io::Read;
@@ -23,6 +24,12 @@ use std::process::Command;
 use std::time::Instant;
 
 use detcore::Digest;
+use reverie::BackendStatsRequest;
+use reverie::BackendStatsSnapshot;
+use reverie::BackendStatsSource;
+use reverie::InstructionPatchShape;
+use reverie::PatchShapeCollector;
+use reverie::PatchShapeStats;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -43,6 +50,25 @@ pub const E9PATCH_BACKEND_ENV: &str = "HERMIT_E9PATCH_BACKEND";
 /// e9patch executables. Diagnostic only: lets the old always-snapshot cost be
 /// A/B-measured against `preprocess_us` within a single build.
 const NO_DIGEST_CACHE_ENV: &str = "HERMIT_E9PATCH_NO_DIGEST_CACHE";
+
+/// When set to a truthy value, collect and report the arch-neutral e9patch
+/// preparation-time patch-shape statistics. Collection is strictly opt-in so the
+/// default prepare path performs no statistics-only allocation or work; any
+/// value other than an empty string, `0`, `false`, `no`, or `off` enables it.
+const STATS_ENV: &str = "HERMIT_E9PATCH_STATS";
+
+/// Cache-line size, in bytes, used to classify whether a candidate instruction
+/// straddles a cache-line boundary.
+///
+/// The classification is computed from the ELF *file offset* of the site, yet it
+/// equals the classification at the runtime *virtual address*: for any `PT_LOAD`
+/// segment the ELF loading contract requires `p_offset ≡ p_vaddr (mod p_align)`,
+/// and `p_align` for a loadable code segment is the page size, a multiple of 64.
+/// Hence `offset % 64 == vaddr % 64`, so cache-line straddle is invariant under
+/// the offset→virtual-address mapping and independent of ASLR. This keeps the
+/// statistics a pure property of the ahead-of-time rewrite with no dependence on
+/// the eventual execution address.
+const CACHE_LINE_BYTES: u64 = 64;
 
 const REWRITE_SCHEMA_VERSION: u32 = 7;
 
@@ -69,6 +95,171 @@ pub struct PreparedBinary {
     /// preprocessing cost so a warm cache hit can be distinguished from a cold
     /// rewrite in the run banner.
     pub preprocess_micros: u64,
+    /// Arch-neutral preparation-time patch-shape statistics, present only when
+    /// collection was requested via `HERMIT_E9PATCH_STATS`. This is a property
+    /// of the ahead-of-time rewrite (independent of whether the rewritten binary
+    /// later runs under the ptrace host or a future in-guest runtime) and covers
+    /// only the single root guest image; it makes no cross-exec or cross-process
+    /// aggregation claim.
+    pub patch_shape: Option<E9patchPatchShapeSnapshot>,
+}
+
+/// Typed, end-of-preparation patch-shape statistics for the e9patch path.
+///
+/// Describes the shape distribution of the syscall sites the ahead-of-time
+/// e9tool rewrite targets in the root guest ELF, derived from the typed
+/// instruction map — never from parsing tool text. Being a property of the AOT
+/// rewrite, it is architecture-neutral: it carries forward unchanged from the
+/// current ptrace-host runtime to any future in-guest runtime. It reflects the
+/// single root image only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct E9patchPatchShapeSnapshot {
+    shape: PatchShapeStats,
+}
+
+impl E9patchPatchShapeSnapshot {
+    /// Returns the aggregate patch-shape counters.
+    pub const fn shape(&self) -> &PatchShapeStats {
+        &self.shape
+    }
+}
+
+impl fmt::Display for E9patchPatchShapeSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let shape = &self.shape;
+        write!(
+            formatter,
+            "candidate_rips={} patched_rips={} classified={} cacheline_straddlers={} \
+             non_straddling={} instruction_lengths=[{}] straddle_after=[{}]",
+            shape.candidate_rips(),
+            shape.patched_rips(),
+            shape.classified_candidates(),
+            shape.cacheline_straddlers(),
+            shape.non_straddling(),
+            render_length_histogram(shape.instruction_lengths()),
+            render_length_histogram(shape.straddle_after()),
+        )
+    }
+}
+
+impl BackendStatsSnapshot for E9patchPatchShapeSnapshot {
+    const BACKEND_NAME: &'static str = "e9patch";
+}
+
+/// A [`BackendStatsSource`] over a captured e9patch patch-shape snapshot.
+#[derive(Clone, Debug)]
+pub struct E9patchPatchShapeSource {
+    snapshot: E9patchPatchShapeSnapshot,
+}
+
+impl E9patchPatchShapeSource {
+    /// Wraps an already-captured snapshot as a source.
+    pub const fn from_snapshot(snapshot: E9patchPatchShapeSnapshot) -> Self {
+        Self { snapshot }
+    }
+
+    /// Returns the captured snapshot without recomputing it.
+    pub const fn snapshot(&self) -> &E9patchPatchShapeSnapshot {
+        &self.snapshot
+    }
+}
+
+impl fmt::Display for E9patchPatchShapeSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.snapshot.fmt(formatter)
+    }
+}
+
+impl BackendStatsSource for E9patchPatchShapeSource {
+    type Snapshot = E9patchPatchShapeSnapshot;
+
+    fn backend_stats(&self) -> Self::Snapshot {
+        self.snapshot.clone()
+    }
+}
+
+/// Renders the non-zero buckets of a one-through-fifteen-byte histogram as a
+/// compact, deterministic `bytes:count` list (empty when every bucket is zero).
+fn render_length_histogram(buckets: &[u64; reverie::MAX_X86_INSTRUCTION_LENGTH]) -> String {
+    buckets
+        .iter()
+        .enumerate()
+        .filter(|&(_, &count)| count != 0)
+        .map(|(index, &count)| format!("{}:{count}", index + 1))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Returns the patch-shape statistics request derived from the environment.
+///
+/// Collection is opt-in: an unset variable yields [`BackendStatsRequest::DISABLED`],
+/// so the default prepare path allocates no collector and iterates no sites.
+fn e9patch_stats_request() -> BackendStatsRequest {
+    match env::var_os(STATS_ENV) {
+        None => BackendStatsRequest::DISABLED,
+        Some(value) => {
+            let enabled = !matches!(
+                value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no" | "off"
+            );
+            BackendStatsRequest::new(enabled)
+        }
+    }
+}
+
+/// Decodes one candidate site's instruction shape.
+///
+/// Returns `None` when the recorded instruction length is outside the valid x86
+/// range (1..=15) and therefore cannot be classified, so a malformed length
+/// never panics the shape collector.
+fn decode_shape(site: &InstructionSite) -> Option<InstructionPatchShape> {
+    let length = site.length;
+    if !(1..=reverie::MAX_X86_INSTRUCTION_LENGTH as u8).contains(&length) {
+        return None;
+    }
+    let start_in_line = site.offset % CACHE_LINE_BYTES;
+    // 1..=CACHE_LINE_BYTES: bytes from the site to the next cache-line boundary.
+    let bytes_before_boundary = CACHE_LINE_BYTES - start_in_line;
+    let straddle_after = if bytes_before_boundary < u64::from(length) {
+        // `bytes_before_boundary < length <= 15` fits in u8 and is `>= 1`, so it
+        // satisfies `InstructionPatchShape`'s `1..length` requirement.
+        Some(bytes_before_boundary as u8)
+    } else {
+        None
+    };
+    Some(InstructionPatchShape::new(length, straddle_after))
+}
+
+/// Collects arch-neutral patch-shape statistics for the root guest ELF.
+///
+/// Returns `None` when `request` is disabled, doing no allocation or site
+/// iteration in that case. Otherwise records every candidate site's decoded
+/// shape into a [`PatchShapeCollector`] and returns the snapshot.
+///
+/// `patched_sites` is e9tool's aggregate recovered-and-rewritten count; e9tool
+/// reports only that aggregate, not per-site identity. When every candidate was
+/// recovered (`patched_sites == sites.len()`, the accepted norm, since a rewrite
+/// using the B0 signal fallback is rejected upstream) each site is recorded as
+/// patched, so `patched_rips == candidate_rips`. On a partial recovery the exact
+/// count remains available from the run banner's `mapped_sites`; the shape
+/// snapshot leaves `patched_rips` at zero rather than attributing specific
+/// instruction pointers it cannot identify.
+fn collect_patch_shape(
+    request: BackendStatsRequest,
+    sites: &[InstructionSite],
+    patched_sites: usize,
+) -> Option<E9patchPatchShapeSnapshot> {
+    if !request.is_enabled() {
+        return None;
+    }
+    let all_patched = patched_sites == sites.len();
+    let mut collector = PatchShapeCollector::default();
+    for site in sites {
+        collector.record_site(site.offset, all_patched, decode_shape(site));
+    }
+    Some(E9patchPatchShapeSnapshot {
+        shape: collector.snapshot(),
+    })
 }
 
 #[derive(Debug)]
@@ -175,6 +366,10 @@ fn prepare_in_impl(
         )));
     }
     let instruction_map_digest = Digest::new(&serde_json::to_vec(&result.map.sites)?);
+    // Opt-in patch-shape stats: an unset `HERMIT_E9PATCH_STATS` yields a disabled
+    // request, so the default prepare path allocates no collector and iterates no
+    // sites. Computed once here and threaded to every return site.
+    let stats_request = e9patch_stats_request();
     if result.map.sites.is_empty() {
         return Ok(PreparedBinary {
             binary: snapshot.original,
@@ -185,6 +380,7 @@ fn prepare_in_impl(
             b0_sites: 0,
             artifact_sha256: None,
             preprocess_micros: 0,
+            patch_shape: collect_patch_shape(stats_request, &result.map.sites, 0),
         });
     }
 
@@ -224,6 +420,11 @@ fn prepare_in_impl(
                     b0_sites: metadata.b0_sites,
                     artifact_sha256: Some(metadata.output_digest.to_string()),
                     preprocess_micros: 0,
+                    patch_shape: collect_patch_shape(
+                        stats_request,
+                        &result.map.sites,
+                        metadata.patched_sites,
+                    ),
                 },
             ),
         )
@@ -337,6 +538,7 @@ fn prepare_in_impl(
             b0_sites: 0,
             artifact_sha256: None,
             preprocess_micros: 0,
+            patch_shape: collect_patch_shape(stats_request, &result.map.sites, 0),
         });
     }
     if !is_executable_file(&temporary_binary) {
@@ -399,6 +601,7 @@ fn prepare_in_impl(
         b0_sites,
         artifact_sha256: Some(output_digest.to_string()),
         preprocess_micros: 0,
+        patch_shape: collect_patch_shape(stats_request, &result.map.sites, patched),
     })
 }
 
@@ -1312,5 +1515,126 @@ mod tests {
         permissions.set_mode(0o775);
         fs::set_permissions(&artifact, permissions).unwrap();
         assert!(!trusted_file_with_digest(&artifact, digest, true));
+    }
+
+    fn site_len(offset: u64, length: u8) -> InstructionSite {
+        InstructionSite {
+            offset,
+            instruction: "syscall".to_owned(),
+            length,
+        }
+    }
+
+    #[test]
+    fn stats_request_defaults_to_disabled_without_env() {
+        // The default prepare path must not collect stats: a disabled request
+        // makes `collect_patch_shape` return `None` with no allocation.
+        assert!(!BackendStatsRequest::DISABLED.is_enabled());
+        assert_eq!(
+            collect_patch_shape(BackendStatsRequest::DISABLED, &[site(0x1000)], 1),
+            None
+        );
+    }
+
+    #[test]
+    fn decode_shape_marks_non_straddling_site() {
+        // A two-byte syscall wholly inside one 64-byte line never straddles.
+        let shape = decode_shape(&site_len(0x1000, 2)).unwrap();
+        assert_eq!(shape.straddle_after(), None);
+    }
+
+    #[test]
+    fn decode_shape_detects_cacheline_straddle() {
+        // A two-byte instruction starting one byte before a 64-byte boundary
+        // (offset % 64 == 63) puts one byte in this line and one in the next.
+        let shape = decode_shape(&site_len(63, 2)).unwrap();
+        assert_eq!(shape.straddle_after(), Some(1));
+        // Starting exactly on a boundary does not straddle.
+        assert_eq!(
+            decode_shape(&site_len(64, 2)).unwrap().straddle_after(),
+            None
+        );
+        // A 15-byte instruction ending on the last byte of the line fits.
+        assert_eq!(
+            decode_shape(&site_len(64 - 15, 15))
+                .unwrap()
+                .straddle_after(),
+            None
+        );
+        // One byte later it spills a single byte into the next line.
+        assert_eq!(
+            decode_shape(&site_len(64 - 14, 15))
+                .unwrap()
+                .straddle_after(),
+            Some(14)
+        );
+    }
+
+    #[test]
+    fn decode_shape_rejects_out_of_range_length() {
+        // Length zero and length > 15 are not classifiable x86 instructions.
+        assert_eq!(decode_shape(&site_len(0x1000, 0)), None);
+        assert_eq!(decode_shape(&site_len(0x1000, 16)), None);
+    }
+
+    #[test]
+    fn collect_marks_every_site_patched_on_full_recovery() {
+        // e9tool reports only an aggregate recovered count; when it equals the
+        // candidate count each candidate is attributed as patched.
+        let sites = [site_len(0x1000, 2), site_len(63, 2)];
+        let snapshot =
+            collect_patch_shape(BackendStatsRequest::ENABLED, &sites, sites.len()).unwrap();
+        let shape = snapshot.shape();
+        assert_eq!(shape.candidate_rips(), 2);
+        assert_eq!(shape.patched_rips(), 2);
+        assert_eq!(shape.classified_candidates(), 2);
+        assert_eq!(shape.cacheline_straddlers(), 1);
+        assert_eq!(shape.non_straddling(), 1);
+        assert_eq!(shape.instruction_lengths()[1], 2); // two 2-byte instructions
+        assert_eq!(shape.straddle_after()[0], 1); // one straddle after 1 byte
+    }
+
+    #[test]
+    fn collect_attributes_no_patched_rips_on_partial_recovery() {
+        // A partial recovery cannot identify which sites were rewritten, so no
+        // instruction pointer is attributed as patched; the exact count remains
+        // available from the run banner's mapped_sites.
+        let sites = [site_len(0x1000, 2), site_len(0x2000, 2)];
+        let snapshot = collect_patch_shape(BackendStatsRequest::ENABLED, &sites, 1).unwrap();
+        assert_eq!(snapshot.shape().candidate_rips(), 2);
+        assert_eq!(snapshot.shape().patched_rips(), 0);
+    }
+
+    #[test]
+    fn snapshot_backend_name_is_e9patch() {
+        assert_eq!(E9patchPatchShapeSnapshot::BACKEND_NAME, "e9patch");
+    }
+
+    #[test]
+    fn snapshot_display_renders_deterministic_histograms() {
+        let sites = [site_len(0x1000, 2), site_len(63, 2)];
+        let snapshot =
+            collect_patch_shape(BackendStatsRequest::ENABLED, &sites, sites.len()).unwrap();
+        let rendered = snapshot.to_string();
+        assert!(rendered.contains("candidate_rips=2"), "{rendered}");
+        assert!(rendered.contains("patched_rips=2"), "{rendered}");
+        assert!(rendered.contains("cacheline_straddlers=1"), "{rendered}");
+        assert!(rendered.contains("instruction_lengths=[2:2]"), "{rendered}");
+        assert!(rendered.contains("straddle_after=[1:1]"), "{rendered}");
+    }
+
+    #[test]
+    fn source_round_trips_captured_snapshot() {
+        let sites = [site_len(0x1000, 2)];
+        let snapshot =
+            collect_patch_shape(BackendStatsRequest::ENABLED, &sites, sites.len()).unwrap();
+        let source = E9patchPatchShapeSource::from_snapshot(snapshot.clone());
+        assert_eq!(source.snapshot(), &snapshot);
+        assert_eq!(source.backend_stats(), snapshot);
+        // The typed request path yields the same snapshot for an enabled request.
+        assert_eq!(
+            BackendStatsRequest::ENABLED.collect(&source),
+            Some(snapshot)
+        );
     }
 }

@@ -2554,6 +2554,16 @@ impl RunOpts {
             prepared.artifact_sha256.as_deref().unwrap_or("none"),
             prepared.preprocess_micros,
         );
+        // Opt-in (HERMIT_E9PATCH_STATS) patch-shape stats. These describe the
+        // ahead-of-time rewrite of the single root guest image; the selected
+        // `e9patch` spelling runs on the ptrace runtime, so this measures the
+        // preprocessing shape, not any runtime instrumentation cost.
+        if let Some(shape) = &prepared.patch_shape {
+            eprintln!(
+                ":: e9patch patch-shape stats (selected=e9patch, runtime=ptrace, \
+                 scope=root-image): {shape}"
+            );
+        }
         Ok(())
     }
 
