@@ -271,6 +271,13 @@
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "verify",
+      "test": "language-runtimes/lua-random"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
       "test": "language-runtimes/m4-macro-mkstemp"
     },
     {

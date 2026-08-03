@@ -1819,6 +1819,12 @@
       "why": "tests/e2e/language-runtimes/javascript.js is owned by tests/e2e/lib/language-runtimes/run.sh: The `javascript.js` source is the js runtime payload. The language-runtime driver resolves the interpreter/compiler, injects a sentinel, and validates RANDOM/TIME/THREAD/SYSTEM categories; the generic manifest builder supports only shell, C, and Rust programs."
     },
     {
+      "path": "tests/e2e/language-runtimes/lua-random.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
+      "why": "tests/e2e/language-runtimes/lua-random.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: It exercises Lua 5.4 math.random entropy determinization under strict verification"
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/e2e/language-runtimes/m4-macro-mkstemp.sh",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
