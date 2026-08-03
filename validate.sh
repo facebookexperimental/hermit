@@ -132,6 +132,8 @@ PRIVILEGED_ONLY=0
 ONLY_MODE=0
 ONLY_LANE=""
 ONLY_NODES=""
+SELECTIVE_MODE=0
+SELECTIVE_BASELINE=""
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
 VERBOSE=0
@@ -166,6 +168,11 @@ while [[ $# -gt 0 ]]; do
         --liteinst-compat-only) LITEINST_COMPAT_ONLY=1; shift ;;
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
         --privileged-only) PRIVILEGED_ONLY=1; shift ;;
+        --selective|--since-green) SELECTIVE_MODE=1; shift ;;
+        --baseline)
+            SELECTIVE_BASELINE=${2:-}
+            [[ -n $SELECTIVE_BASELINE ]] || { echo "validate.sh: --baseline needs a SHA" >&2; exit 2; }
+            shift 2 ;;
         --only)
             ONLY_LANE=${2:-}; ONLY_NODES=${3:-}
             if [[ -z $ONLY_LANE || -z $ONLY_NODES ]]; then
@@ -208,6 +215,11 @@ Focused gates (run one matrix/lane and exit):
   --privileged-only             PMU/CPUID-dependent tests only.
   --only <lane> <group.job>[,...]  Run ONE DAG shard (no deps) against the already-built
                                 tree; build first with ci/run-dag.sh <lane>.
+  --selective, --since-green    Run only the portable DAG nodes affected by changes
+                                since the last known-green baseline (fail-safe: any
+                                doubt or no trustworthy baseline runs the full lane).
+  --baseline <sha>              Known-green baseline commit for --selective (else
+                                $HERMIT_LAST_GREEN_SHA, else the ledger's last green).
 
 Other options:
   --verbose        Stream each gate's command, PID, elapsed time, and output.
@@ -248,6 +260,7 @@ only_modes=0
 ((QEMU_L2_ONLY == 1)) && ((only_modes += 1))
 ((PRIVILEGED_ONLY == 1)) && ((only_modes += 1))
 ((ONLY_MODE == 1)) && ((only_modes += 1))
+((SELECTIVE_MODE == 1)) && ((only_modes += 1))
 if ((only_modes > 1)); then
     echo "validate.sh: choose only one focused validation mode" >&2
     exit 2
@@ -267,6 +280,7 @@ VALIDATION_PROFILE=$VALIDATION_LEVEL
 ((QEMU_L2_ONLY == 1)) && VALIDATION_PROFILE="qemu-l2-only"
 ((PRIVILEGED_ONLY == 1)) && VALIDATION_PROFILE="privileged-only"
 ((ONLY_MODE == 1)) && VALIDATION_PROFILE="only-$ONLY_LANE"
+((SELECTIVE_MODE == 1)) && VALIDATION_PROFILE="selective"
 
 case "$VALIDATION_PROFILE" in
     quick) VALIDATION_ESTIMATE="about 3 minutes" ;;
@@ -283,6 +297,7 @@ case "$VALIDATION_PROFILE" in
     privileged-only) VALIDATION_ESTIMATE="about 60-180 minutes" ;;
     envelope-only) VALIDATION_ESTIMATE="about 5 minutes" ;;
     only-*) VALIDATION_ESTIMATE="one prebuilt DAG shard" ;;
+    selective) VALIDATION_ESTIMATE="a dependency-closed subset of the portable lane (full lane on any doubt)" ;;
 esac
 readonly VALIDATION_ESTIMATE
 
@@ -3377,6 +3392,122 @@ function run_portable_only_suite {
     ((failures == 0))
 }
 
+# Resolve the last-known-green baseline commit for --selective. Precedence:
+# explicit --baseline, then $HERMIT_LAST_GREEN_SHA, then the most recent passing
+# validate-run-ledger entry (preferring this slot). Only a commit that exists
+# locally is returned; anything else prints nothing so selection falls back to
+# the full lane. Never fail-open on a stale or missing baseline.
+function resolve_selective_baseline {
+    local sha=""
+    if [[ -n ${SELECTIVE_BASELINE:-} ]]; then
+        sha=$SELECTIVE_BASELINE
+    elif [[ -n ${HERMIT_LAST_GREEN_SHA:-} ]]; then
+        sha=$HERMIT_LAST_GREEN_SHA
+    elif [[ -n $VALIDATION_LEDGER_FILE && -f $VALIDATION_LEDGER_FILE ]] \
+        && command -v jq >/dev/null 2>&1; then
+        sha=$(jq -r --arg slot "$VALIDATION_SLOT" '
+            select(.result == "pass" and .commit != "unknown" and .slot == $slot)
+            | .commit' "$VALIDATION_LEDGER_FILE" 2>/dev/null | tail -n 1)
+        if [[ -z $sha ]]; then
+            sha=$(jq -r '
+                select(.result == "pass" and .commit != "unknown")
+                | .commit' "$VALIDATION_LEDGER_FILE" 2>/dev/null | tail -n 1)
+        fi
+    fi
+    [[ -n $sha ]] || return 0
+    # select-tests diffs against this commit; trust it only if it exists here.
+    if git cat-file -e "${sha}^{commit}" 2>/dev/null; then
+        printf '%s\n' "$sha"
+    fi
+}
+
+# Write a dependency-closed subset of ci/dag/portable.json (keeping only the
+# selected nodes and top-level lane config) to $2. Each surviving step's deps are
+# pruned to the selected set; because select-tests emits a closed node set, no
+# genuine dependency is dropped. Returns non-zero if no step survives.
+function build_selected_portable_dag {
+    local nodes_csv=$1 out=$2 nodes_json
+    nodes_json=$(printf '%s' "$nodes_csv" | tr ', ' '\n\n' \
+        | sed '/^$/d' | jq -R . | jq -s .) || return 1
+    jq --argjson keep "$nodes_json" '
+        ($keep) as $k
+        | .steps |= [ .[]
+            | (.group + "." + .job) as $tag
+            | select($k | index($tag))
+            | if (.deps // null) != null
+              then .deps |= [ .[] | select($k | index(.)) ]
+              else . end ]
+    ' "$ROOT_DIR/ci/dag/portable.json" > "$out" || return 1
+    [[ $(jq '.steps | length' "$out" 2>/dev/null || echo 0) -gt 0 ]]
+}
+
+# --selective / --since-green: run only the portable DAG nodes affected by the
+# delta since the last known-green baseline. FAIL-SAFE: a skip decision runs
+# nothing, a selective decision runs the dependency-closed subset, and ANY other
+# outcome (full, tool error, no baseline, empty/failed subset build) runs the
+# complete portable lane — never fewer tests than the tool proved safe to omit.
+function run_selective_suite {
+    local baseline sel_json decision nodes total dag_override rc
+    baseline=$(resolve_selective_baseline)
+    local -a sel_args=(--since-green --format json)
+    if [[ -n $baseline ]]; then
+        sel_args=(--since-green --baseline "$baseline" --format json)
+        printf "Selective validation: last-known-green baseline = %s\n" "$baseline"
+    else
+        printf "Selective validation: no trustworthy green baseline; running the FULL portable lane.\n"
+    fi
+
+    if ! sel_json=$("$ROOT_DIR/ci/select-tests.rs" "${sel_args[@]}" 2>>"$LOG_FILE"); then
+        printf "Selective validation: select-tests.rs failed; running the FULL portable lane.\n"
+        run_portable_only_suite
+        return $?
+    fi
+    decision=$(printf '%s' "$sel_json" | jq -r '.decision // "full"' 2>/dev/null || echo full)
+    total=$(jq '.steps | length' "$ROOT_DIR/ci/dag/portable.json")
+
+    case "$decision" in
+        skip)
+            printf "Selective validation: no CI-relevant changes since baseline — nothing to run (0/%s nodes).\n" \
+                "$total"
+            print_summary
+            ((failures == 0))
+            return $?
+            ;;
+        selective)
+            nodes=$(printf '%s' "$sel_json" | jq -r '.nodes | join(",")' 2>/dev/null || echo "")
+            if [[ -z $nodes ]]; then
+                printf "Selective validation: empty selected node set — running the FULL portable lane.\n"
+                run_portable_only_suite
+                return $?
+            fi
+            dag_override="$VALIDATION_TMP_DIR/portable-selective.json"
+            if ! build_selected_portable_dag "$nodes" "$dag_override"; then
+                printf "Selective validation: could not build subset DAG; running the FULL portable lane.\n"
+                run_portable_only_suite
+                return $?
+            fi
+            printf "Selective validation: running %s/%s portable DAG nodes:\n  %s\n" \
+                "$(printf '%s' "$sel_json" | jq -r '.node_count')" "$total" \
+                "${nodes//,/ }"
+            run_check "Centralized test manifest and inventory" ./ci/test_harness.sh validate
+            export RUN_DAG_FILE_OVERRIDE="$dag_override"
+            run_check_with_timeout "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}" \
+                "portable CI DAG (selective subset)" \
+                ./ci/run-dag.sh portable -j "${CI_DAG_JOBS:-2}" -v
+            rc=$?
+            unset RUN_DAG_FILE_OVERRIDE
+            print_summary
+            ((failures == 0))
+            return $?
+            ;;
+        *)
+            printf "Selective validation: decision=%s — running the FULL portable lane.\n" "$decision"
+            run_portable_only_suite
+            return $?
+            ;;
+    esac
+}
+
 function run_exact_detcore_cases {
     local label=$1
     local target=$2
@@ -3615,6 +3746,14 @@ if ((ONLY_MODE == 1)); then
         "$ROOT_DIR/ci/run-node.sh" "$ONLY_LANE" "$ONLY_NODES"
     print_summary
     ((failures == 0))
+    exit $?
+fi
+
+# --selective / --since-green: run only the portable DAG nodes affected by the
+# delta since the last known-green baseline, falling back to the full portable
+# lane on any doubt (see run_selective_suite for the fail-safe rules).
+if ((SELECTIVE_MODE == 1)); then
+    run_selective_suite
     exit $?
 fi
 

@@ -25,7 +25,12 @@
 #   ci/run-dag.sh portable ascii   # any non-`run` verb also works
 #
 # Environment:
-#   SAFE_CI_DAG_RUNNER   override the runner executable to use.
+#   SAFE_CI_DAG_RUNNER     override the runner executable to use.
+#   RUN_DAG_FILE_OVERRIDE  run this exact DAG file instead of ci/dag/<lane>.json.
+#                          Used by validate.sh --selective to feed a subset DAG
+#                          (a dependency-closed slice of the lane) while keeping
+#                          the lane argument for runner labeling. The override
+#                          must exist and be readable, or run-dag.sh fails closed.
 
 set -uo pipefail
 
@@ -40,11 +45,20 @@ fi
 lane=$1
 shift
 
-dag="$ROOT_DIR/ci/dag/${lane}.json"
-if [[ ! -f $dag ]]; then
-    echo "run-dag.sh: unknown lane '$lane' (no such file: $dag)" >&2
-    echo "            known lanes: portable, privileged" >&2
-    exit 2
+if [[ -n ${RUN_DAG_FILE_OVERRIDE:-} ]]; then
+    dag="$RUN_DAG_FILE_OVERRIDE"
+    if [[ ! -f $dag ]]; then
+        echo "run-dag.sh: RUN_DAG_FILE_OVERRIDE set but not a file: $dag" >&2
+        exit 2
+    fi
+    echo "run-dag.sh: using DAG override for lane '$lane': $dag" >&2
+else
+    dag="$ROOT_DIR/ci/dag/${lane}.json"
+    if [[ ! -f $dag ]]; then
+        echo "run-dag.sh: unknown lane '$lane' (no such file: $dag)" >&2
+        echo "            known lanes: portable, privileged" >&2
+        exit 2
+    fi
 fi
 
 # Locate the runner. Prefer an explicit override, then the compiled Rust binary

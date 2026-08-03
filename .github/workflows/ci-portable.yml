@@ -66,6 +66,112 @@ env:
   RELEASE_TARBALL: hermit-portable-release.tzst
 
 jobs:
+  # -------------------------------------------------- affected-test selection
+  # Consume ci/select-tests.rs (#1500) to shrink the matrix for a limited-
+  # footprint pull request. FAIL-SAFE by construction: only a pull_request with a
+  # resolvable base and the kill-switch off is eligible for a reduced suite.
+  # merge_group, push-to-main, workflow_dispatch, a disabled kill-switch, an
+  # unresolvable base, ANY tool error, or an unrecognized decision all fall
+  # through to the full matrix — the exact behavior before this job existed. The
+  # `skip`/`selective` decisions themselves are the tool's audited, proof-of-inert
+  # judgements (docs-only => skip; a scoped source change => a dependency-closed
+  # subset); this job only translates them into matrices, never widens `skip`.
+  select:
+    name: Select affected tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      decision: ${{ steps.sel.outputs.decision }}
+      build_debug: ${{ steps.sel.outputs.build_debug }}
+      build_release: ${{ steps.sel.outputs.build_release }}
+      run_debug_shards: ${{ steps.sel.outputs.run_debug_shards }}
+      run_release_shards: ${{ steps.sel.outputs.run_release_shards }}
+      run_e2e: ${{ steps.sel.outputs.run_e2e }}
+      cell_backends: ${{ steps.sel.outputs.cell_backends }}
+      debug_matrix: ${{ steps.sel.outputs.debug_matrix }}
+      release_matrix: ${{ steps.sel.outputs.release_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # select-tests.rs diffs base...HEAD, which needs full history.
+          fetch-depth: 0
+      - name: "Compute affected-test selection (fail-safe: full on any doubt)"
+        id: sel
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          DISABLE: ${{ vars.DISABLE_TEST_SELECTION }}
+        run: |
+          set -uo pipefail
+
+          # Emit the FULL matrix straight from the audited shard map — the safe
+          # default used for every non-selective path.
+          emit_full() {
+            local dbg rel
+            dbg=$(jq -c '{include: [ .debug_shards[]   | {slug, nodes: (.nodes|join(","))} ]}' ci/portable-shards.json)
+            rel=$(jq -c '{include: [ .release_shards[] | {slug, needs, nodes: (.nodes|join(","))} ]}' ci/portable-shards.json)
+            {
+              echo "decision=full"
+              echo "build_debug=true"
+              echo "build_release=true"
+              echo "run_debug_shards=true"
+              echo "run_release_shards=true"
+              echo "run_e2e=true"
+              echo "cell_backends=ALL"
+              echo "debug_matrix=$dbg"
+              echo "release_matrix=$rel"
+            } >> "$GITHUB_OUTPUT"
+            echo "selection: FULL matrix (reason: $1)" >&2
+          }
+
+          if [[ "$EVENT" != "pull_request" ]]; then emit_full "event=$EVENT is not a pull_request"; exit 0; fi
+          if [[ "${DISABLE:-}" == "true" ]]; then emit_full "kill-switch vars.DISABLE_TEST_SELECTION=true"; exit 0; fi
+          if [[ -z "${BASE_SHA:-}" ]]; then emit_full "no resolvable pull_request base SHA"; exit 0; fi
+
+          if ! sel_json=$(./ci/select-tests.rs --base "$BASE_SHA" --format json 2>sel.err); then
+            echo "select-tests.rs failed; falling back to full:" >&2; cat sel.err >&2
+            emit_full "select-tests.rs error"; exit 0
+          fi
+          if ! decision=$(jq -er '.decision' <<<"$sel_json" 2>/dev/null); then
+            emit_full "unparseable selection JSON"; exit 0
+          fi
+          case "$decision" in
+            full)                emit_full "tool decision=full"; exit 0 ;;
+            skip|selective)      : ;;   # handled below
+            *)                   emit_full "unrecognized decision=$decision"; exit 0 ;;
+          esac
+
+          # skip or selective: derive filtered matrices by intersecting the
+          # selected shard slugs with the audited shard map. Unknown slugs simply
+          # match nothing (they cannot smuggle in an unlisted node).
+          sel_shards=$(jq -c '.shards' <<<"$sel_json")
+          backends=$(jq -r '[.cell_matrix.include[].backend] | unique | join(" ")' <<<"$sel_json")
+          dbg=$(jq -c --argjson sel "$sel_shards" \
+            '{include: [ .debug_shards[]   | select(.slug as $s | $sel | index($s)) | {slug, nodes: (.nodes|join(","))} ]}' \
+            ci/portable-shards.json)
+          rel=$(jq -c --argjson sel "$sel_shards" \
+            '{include: [ .release_shards[] | select(.slug as $s | $sel | index($s)) | {slug, needs, nodes: (.nodes|join(","))} ]}' \
+            ci/portable-shards.json)
+          run_dbg=$(jq -e '.include|length>0' <<<"$dbg" >/dev/null 2>&1 && echo true || echo false)
+          run_rel=$(jq -e '.include|length>0' <<<"$rel" >/dev/null 2>&1 && echo true || echo false)
+          build_debug=$(jq -r '.build.debug' <<<"$sel_json")
+          build_release=$(jq -r 'if (.build.dbi or .build.aux) then "true" else "false" end' <<<"$sel_json")
+          if [[ -n "$backends" ]]; then run_e2e=true; else run_e2e=false; fi
+          # e2e cells consume BOTH prebuilt trees, so force their builds on.
+          if [[ "$run_e2e" == "true" ]]; then build_debug=true; build_release=true; fi
+          {
+            echo "decision=$decision"
+            echo "build_debug=$build_debug"
+            echo "build_release=$build_release"
+            echo "run_debug_shards=$run_dbg"
+            echo "run_release_shards=$run_rel"
+            echo "run_e2e=$run_e2e"
+            echo "cell_backends=$backends"
+            echo "debug_matrix=$dbg"
+            echo "release_matrix=$rel"
+          } >> "$GITHUB_OUTPUT"
+          echo "selection: decision=$decision debug_shards=$run_dbg release_shards=$run_rel e2e=$run_e2e backends=[$backends] build_debug=$build_debug build_release=$build_release" >&2
+
   # Keep dependency freshness visible without letting it taint the authoritative
   # product-test job queried by merge-gate.
   reverie-pin:
@@ -119,6 +225,11 @@ jobs:
   # ------------------------------------------------------- preflight (no build)
   preflight:
     name: Preflight (fmt + abstraction + portability)
+    needs: select
+    # Selective runs still execute preflight (fmt + abstraction + portability):
+    # select-tests always pins these as always-on PREFLIGHT nodes. Only a
+    # proof-of-inert `skip` (e.g. docs-only) drops it.
+    if: needs.select.outputs.decision != 'skip'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -131,6 +242,8 @@ jobs:
   # ------------------------------------------------------------ build (debug)
   build-debug:
     name: Build debug workspace + guests once
+    needs: select
+    if: needs.select.outputs.build_debug != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -176,8 +289,25 @@ jobs:
           install -Dm755 "$runtime" target/debug/deps/libdetcore_dbi.so
       - name: Enumerate portable (mode x manifest block x backend) e2e cells
         id: cells
+        env:
+          # Space-separated backend allowlist from the selection job. "ALL" (or a
+          # full run) means no filtering; an empty string means no e2e cells were
+          # selected (e.g. a scoped change that touches only unit shards).
+          CELL_BACKENDS: ${{ needs.select.outputs.cell_backends }}
         run: |
           set -euo pipefail
+          # Single-dash default: an EMPTY CELL_BACKENDS is the deliberate "no e2e
+          # cells selected" signal and must stay empty; only a genuinely UNSET
+          # variable (which select never produces) falls back to the full set.
+          backends="${CELL_BACKENDS-ALL}"
+          if [[ -z "$backends" ]]; then
+            # No e2e cells selected: emit an empty matrix. The e2e/reduce-e2e jobs
+            # are gated off (run_e2e=false) and never consume it.
+            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            echo "No e2e cells selected; emitting empty cell matrix." >&2
+            exit 0
+          fi
           plan=$(./ci/test_harness.sh plan --lane portable --ci-only --format json)
           matrix=$(jq -c '
             [ .[] | {
@@ -192,11 +322,20 @@ jobs:
                 slug: (.category + "__" + .mode + "__" + .backend)
               }) }
           ' <<<"$plan")
+          if [[ "$backends" != "ALL" ]]; then
+            # Keep only cells whose backend is in the selected allowlist. "naked"
+            # (mode-only, no backend) cells stay whenever any backend is selected,
+            # because they exercise shared harness/CLI paths a scoped change hits.
+            matrix=$(jq -c --arg b "$backends" '
+              ($b | split(" ")) as $keep
+              | { include: [ .include[] | select((.backend == "naked") or (.backend as $x | $keep | index($x))) ] }
+            ' <<<"$matrix")
+          fi
           count=$(jq '.include | length' <<<"$matrix")
-          [[ "$count" -gt 0 ]] || { echo "empty portable cell matrix" >&2; exit 1; }
+          [[ "$count" -gt 0 ]] || { echo "empty portable cell matrix after backend filter ($backends)" >&2; exit 1; }
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "count=$count" >> "$GITHUB_OUTPUT"
-          echo "Fanning out $count portable e2e cells:" >&2
+          echo "Fanning out $count portable e2e cells (backends=$backends):" >&2
           jq -r '.include[] | "  - \(.mode) x \(.category) x \(.backend)"' <<<"$matrix" >&2
       - name: Pack debug prebuilt tree
         run: |
@@ -236,6 +375,8 @@ jobs:
   # carry the identical prebuilt tree, so downstream consumers are unchanged.
   build-release:
     name: Build release backends once (dbi + sabre + liteinst)
+    needs: select
+    if: needs.select.outputs.build_release != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -288,12 +429,23 @@ jobs:
   # ------------------------------------------------- test shards (debug-backed)
   test-debug:
     name: "test: ${{ matrix.slug }}"
-    needs: [plan, build-debug, build-release]
+    needs: [select, build-debug, build-release]
+    # build-release is legitimately SKIPPED when the selected debug shards need no
+    # DBI runtime (build.dbi=false). A bare custom `if` would still inherit the
+    # implicit success() over every need and skip this job; the explicit status
+    # checks let it run when build-release was skipped, while still skipping (and
+    # letting `regular` fail closed) if build-debug or a to-be-run build-release
+    # actually FAILED.
+    if: >-
+      !cancelled()
+      && needs.select.outputs.run_debug_shards != 'false'
+      && needs.build-debug.result == 'success'
+      && (needs.build-release.result == 'success' || needs.build-release.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.plan.outputs.debug_matrix) }}
+      matrix: ${{ fromJSON(needs.select.outputs.debug_matrix) }}
     steps:
       - uses: actions/checkout@v4
       - name: Initialize safe-ci-dag-runner submodule
@@ -318,21 +470,30 @@ jobs:
         with:
           name: ${{ env.DEBUG_ARTIFACT }}
           path: .
+      # The DBI runtime (drrun + libreverie_dbi_client.so) lives only in the
+      # release package. A selective run reaches this job with build-release
+      # skipped ONLY when the tool proved no selected debug shard needs DBI
+      # (build.dbi=false), so the package is downloaded and asserted only then.
       - name: Download dbi install package
+        if: needs.build-release.result == 'success'
         uses: actions/download-artifact@v4
         with:
           name: ${{ env.RELEASE_DBI_ARTIFACT }}
           path: .
-      - name: Unpack debug tree and dbi install package
+      - name: Unpack debug tree
         run: |
           set -euo pipefail
           tar --zstd -xf "$DEBUG_TARBALL"
           rm -f "$DEBUG_TARBALL"
-          tar --zstd -xf "$RELEASE_TARBALL"
-          rm -f "$RELEASE_TARBALL"
           test -x target/debug/hermit
           test -f target/debug/deps/libdetcore_dbi.so
           test -f target/install_pkg/rsrcs/libdetcore_dbi.so
+      - name: Unpack dbi install package
+        if: needs.build-release.result == 'success'
+        run: |
+          set -euo pipefail
+          tar --zstd -xf "$RELEASE_TARBALL"
+          rm -f "$RELEASE_TARBALL"
           test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun
           test -f target/install_pkg/rsrcs/libreverie_dbi_client.so
       - name: Run shard nodes (${{ matrix.slug }})
@@ -341,12 +502,13 @@ jobs:
   # ----------------------------------------------- test shards (release-backed)
   test-release:
     name: "test: ${{ matrix.slug }}"
-    needs: [plan, build-release]
+    needs: [select, build-release]
+    if: needs.select.outputs.run_release_shards != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.plan.outputs.release_matrix) }}
+      matrix: ${{ fromJSON(needs.select.outputs.release_matrix) }}
     steps:
       - uses: actions/checkout@v4
       - name: Initialize safe-ci-dag-runner submodule
@@ -382,7 +544,8 @@ jobs:
   # ------------------------------------------------------------- e2e cells
   e2e:
     name: "e2e: ${{ matrix.slug }}"
-    needs: [build-debug, build-release]
+    needs: [select, build-debug, build-release]
+    if: needs.select.outputs.run_e2e != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -487,7 +650,8 @@ jobs:
   # coordinator socket cannot survive guest exec.
   sabre_non_gated_parity:
     name: SaBRe non-gating exec diagnostics
-    needs: build-release
+    needs: [select, build-release]
+    if: needs.select.outputs.build_release != 'false'
     continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -551,8 +715,11 @@ jobs:
   # ------------------------------------------ reduce per-cell transport evidence
   reduce-e2e:
     name: Reduce e2e parity archives
-    needs: [build-debug, e2e]
-    if: always()
+    needs: [select, build-debug, e2e]
+    # Run whenever e2e cells were selected (even to collect evidence on failure);
+    # a run_e2e=false selection skips this job, and the required `regular` gate
+    # tolerates a skipped reduce-e2e.
+    if: always() && needs.select.outputs.run_e2e != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -616,6 +783,7 @@ jobs:
   regular:
     name: Regular tests (GitHub-managed portable)
     needs:
+      - select
       - plan
       - preflight
       - build-debug
@@ -628,13 +796,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Require every portable DAG job
+      - name: Require every portable DAG job to succeed or be deselected
         env:
           RESULTS: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail
           jq . <<< "$RESULTS"
-          jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
+          # A job is acceptable only if it SUCCEEDED or was intentionally
+          # deselected (skipped) by affected-test selection. A `failure` or
+          # `cancelled` in ANY required job still fails closed — selection can
+          # remove a job from the run, never mask a real failure. `select` itself
+          # is in this set: if it dies it reports `failure`, not `skipped`, so a
+          # broken selection job reds the gate instead of silently skipping tests.
+          jq -e 'all(.[]; .result == "success" or .result == "skipped")' <<< "$RESULTS"
 
   # ------------------------------------------------------------- cleanup
   cleanup:
