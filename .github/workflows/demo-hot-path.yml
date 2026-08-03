@@ -5,6 +5,18 @@ name: P0 Demo Gate (Hermit hot paths)
 # check out the current parent demo harness, then overlay the exact Hermit
 # commit that triggered this workflow. Keep this paths list synchronized with
 # the hot-path test in merge-gate.yml.
+#
+# tests/e2e/** and tests/backend-parity/** are deliberately subtracted (via the
+# trailing "!" negations under each "tests/**"): the demo job runs
+# `scripts/super-validate.sh --demos-only`, which builds the hermit binary and
+# executes ONLY the parent demo suite (demos 1-8) — it never runs the hermit e2e
+# corpus or the backend-parity fixtures. So a PR that only touches those trees
+# provably cannot affect a demo verdict; triggering a serial PMU demo run for it
+# just clogs the lane and (when cancelled) wedges the PR. Removing them here
+# means the workflow does not even fire for such PRs, mirroring the merge-gate
+# classifier's `grep -vE '^tests/(e2e|backend-parity)/'` subtraction so the
+# trigger and the requirement stay consistent. Hot-path gating is UNCHANGED for
+# detcore*/**, hermit-cli/**, tests/c/** (guest programs), and everything else.
 on:
   push:
     branches: [main]
@@ -21,6 +33,8 @@ on:
       - "hermit-resources/**"
       - "rust-toolchain.toml"
       - "tests/**"
+      - "!tests/e2e/**"
+      - "!tests/backend-parity/**"
   pull_request:
     branches: [main]
     paths:
@@ -36,6 +50,8 @@ on:
       - "hermit-resources/**"
       - "rust-toolchain.toml"
       - "tests/**"
+      - "!tests/e2e/**"
+      - "!tests/backend-parity/**"
   workflow_dispatch:
 
 concurrency:
