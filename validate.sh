@@ -2014,11 +2014,24 @@ fi
 #      only relabeled from "test failure" to "third-party build (environmental)".
 #      Only reverie-dbi's own build script matches, so a Hermit test that merely
 #      prints "panicked at .../build.rs" for a different crate cannot trip it.
+# The set of file-access errno strings a sandboxed build/link tool emits when the
+# FS enforcer denies one of its operations. EPERM ("operation not permitted") and
+# EACCES ("permission denied") are the classic open() denials; EBADF ("bad file
+# descriptor") is the same class seen at a different point -- the enforcer
+# invalidates a descriptor mid-operation, observed when objcopy strips
+# DynamoRIO's drconfig (`/usr/bin/objcopy: ../bin64/drconfig.debug: Bad file
+# descriptor`). Enumerated once and reused by every build-tool anchor below so a
+# new tool anchor cannot silently forget an errno. The pattern is a single
+# readonly so scripts/validate-env-block-test.sh exercises the EXACT shipped
+# regex rather than a drifting copy.
+readonly ENV_BLOCK_ERRNOS='operation not permitted|permission denied|bad file descriptor'
+readonly ENV_BLOCK_PATTERN="blocked on this server based on a security policy|\\bBpfJailer\\b|Enforcer: (FS|EXEC|NET), Reason:|fatal error: [^:]*:.*($ENV_BLOCK_ERRNOS)|CMake Error.*($ENV_BLOCK_ERRNOS)|(cannot open|error opening|failed to open|could not open)[^,]*: ($ENV_BLOCK_ERRNOS)|\\b(objcopy|strip|ld|ar|ranlib|as): [^:]+: ($ENV_BLOCK_ERRNOS)|failed to run custom build command for [^[:space:]]*reverie-dbi|panicked at [^[:space:]]*reverie-dbi/build\\.rs"
+
 function is_environmental_block {
     local output_start=$1
     tail -n "+$output_start" "$LOG_FILE" |
         sed $'s/\033\\[[0-9;]*[[:alpha:]]//g' |
-        grep -qiE 'blocked on this server based on a security policy|\bBpfJailer\b|Enforcer: (FS|EXEC|NET), Reason:|fatal error: [^:]*:.*(operation not permitted|permission denied)|CMake Error.*(operation not permitted|permission denied)|(cannot open|error opening|failed to open|could not open)[^,]*: (operation not permitted|permission denied)|failed to run custom build command for [^[:space:]]*reverie-dbi|panicked at [^[:space:]]*reverie-dbi/build\.rs'
+        grep -qiE "$ENV_BLOCK_PATTERN"
 }
 
 function failure_summary {
