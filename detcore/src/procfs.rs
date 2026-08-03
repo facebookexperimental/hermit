@@ -114,6 +114,7 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-883): Review module reference-count normalization.
     Modules,
+    ModuleRefcnt,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-958): Review host-global uevent sequence normalization.
     UeventSeqnum,
@@ -271,6 +272,21 @@ fn is_cpuidle_counter_path(path: &Path) -> bool {
         && !state_index.is_empty()
         && state_index.bytes().all(|byte| byte.is_ascii_digit())
         && matches!(counter, "time" | "usage" | "above" | "below" | "rejected")
+}
+
+fn is_module_refcnt_path(path: &Path) -> bool {
+    let Some(relative) = path.strip_prefix("/sys/module").ok() else {
+        return false;
+    };
+    let mut components = relative.iter();
+    let Some(module) = components.next().and_then(|part| part.to_str()) else {
+        return false;
+    };
+    matches!(
+        components.next().and_then(|part| part.to_str()),
+        Some("refcnt")
+    ) && components.next().is_none()
+        && !module.is_empty()
 }
 
 fn sysfs_rtc_kind(path: &Path) -> Option<ProcfsKind> {
@@ -450,6 +466,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-883): Review interrupt and module accounting snapshots.
             "/proc/interrupts" | "/proc/softirqs" => ProcfsKind::InterruptCounters,
             "/proc/modules" => ProcfsKind::Modules,
+            other if is_module_refcnt_path(Path::new(other)) => ProcfsKind::ModuleRefcnt,
             // AUTONOMOUS-BOT-IMPLEMENTED
             other if is_cpufreq_policy_value_path(Path::new(other)) => ProcfsKind::ScalingCurFreq,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -612,6 +629,7 @@ impl ProcfsFile {
             ProcfsKind::ThpCounter => sanitize_thp_counter(&contents),
             ProcfsKind::InterruptCounters => sanitize_interrupt_counters(&contents),
             ProcfsKind::Modules => sanitize_modules(&contents),
+            ProcfsKind::ModuleRefcnt => sanitize_module_refcnt(&contents),
             ProcfsKind::Mountinfo => sanitize_mountinfo(&contents),
             ProcfsKind::RandomUuid => sanitize_random_uuid(
                 &contents,
@@ -2610,6 +2628,20 @@ fn sanitize_modules(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
+fn sanitize_module_refcnt(contents: &[u8]) -> Vec<u8> {
+    let has_newline = contents.ends_with(b"\n");
+    let value = contents.strip_suffix(b"\n").unwrap_or(contents);
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return contents.to_vec();
+    }
+
+    if has_newline {
+        b"0\n".to_vec()
+    } else {
+        b"0".to_vec()
+    }
+}
+
 fn sanitize_schedstat(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
@@ -4156,7 +4188,16 @@ RAW: inuse 5\n"
                 .kind,
             ProcfsKind::Modules
         );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/sys/module/ipmi_si/refcnt"))
+                .unwrap()
+                .kind,
+            ProcfsKind::ModuleRefcnt
+        );
         assert!(ProcfsFile::from_path(Path::new("/proc/devices")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("/sys/module/ipmi_si/coresize")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("/sys/module/refcnt")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("/sys/module/ipmi_si/holders/refcnt")).is_none());
     }
 
     #[test]
@@ -4177,6 +4218,10 @@ RAW: inuse 5\n"
             sanitize_modules(modules),
             b"kvm_amd 212992 0 - Live 0x0\nkvm 1200128 1 kvm_amd, Live 0x0\nllc 20480 2 bridge,stp, Live 0x0\n"
         );
+        assert_eq!(sanitize_module_refcnt(b"7\n"), b"0\n");
+        assert_eq!(sanitize_module_refcnt(b"12"), b"0");
+        assert_eq!(sanitize_module_refcnt(b"not-a-count\n"), b"not-a-count\n");
+        assert!(sanitize_module_refcnt(b"").is_empty());
     }
 
     #[test]
