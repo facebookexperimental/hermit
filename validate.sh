@@ -91,9 +91,13 @@ function validation_slot_name {
 #                                            # first (ci/run-dag.sh <lane>).
 #   ./validate.sh --verbose                  # stream each gate's command, PID,
 #                                            # elapsed time, and subprocess output
-# Every foreground/background gate has a process-tree timeout. Override the
+# Every foreground/background gate has a process-tree WALL timeout. Override the
 # profile default with VALIDATE_GATE_TIMEOUT_SECONDS; tune TERM-to-KILL grace
-# with VALIDATE_TIMEOUT_KILL_GRACE_SECONDS.
+# with VALIDATE_TIMEOUT_KILL_GRACE_SECONDS. A gate may ALSO be given a
+# load-immune CPU-time budget with VALIDATE_GATE_CPU_TIMEOUT_SECONDS (0=off, the
+# default): the gate is killed once its process-tree CPU (user+sys) crosses the
+# budget, catching hangs that burn CPU (e.g. a reap/futex spin) regardless of
+# machine load, while the wall timeout remains the backstop for idle-stuck gates.
 # A fully-green full run labels the current PR `locally-validated` by default.
 # PR_NUMBER=N overrides branch-based PR detection. Use --no-label-pr or
 # VALIDATE_LABEL_PR=0 to disable the non-fatal GitHub update.
@@ -239,7 +243,8 @@ Other options:
 
 Environment:
   VALIDATE_LEVEL=quick|portable-only|full|super  Select the level.
-  VALIDATE_GATE_TIMEOUT_SECONDS=N                Override per-gate process-tree timeout.
+  VALIDATE_GATE_TIMEOUT_SECONDS=N                Override per-gate process-tree WALL timeout.
+  VALIDATE_GATE_CPU_TIMEOUT_SECONDS=N            Per-gate CPU-time budget (user+sys, whole tree); 0=off (default).
   VALIDATE_TIMEOUT_KILL_GRACE_SECONDS=N          TERM-to-KILL grace period.
   VALIDATE_LABEL_PR=0                            Disable PR labeling (same as --no-label-pr).
   VALIDATE_VERBOSE=1                             Same as --verbose.
@@ -323,10 +328,27 @@ fi
 GATE_TIMEOUT_SECONDS=${VALIDATE_GATE_TIMEOUT_SECONDS:-$default_gate_timeout_seconds}
 TIMEOUT_KILL_GRACE_SECONDS=${VALIDATE_TIMEOUT_KILL_GRACE_SECONDS:-5}
 VERBOSE_INTERVAL_SECONDS=${VALIDATE_VERBOSE_INTERVAL_SECONDS:-10}
+# Per-gate CPU-time budget (user+sys across the whole process tree), a load-immune
+# companion to the wall timeout above. Default 0 = disabled: no per-gate CPU
+# budget is HAND-WRITTEN here because there is no measured per-gate CPU history to
+# justify a specific value, and a fabricated constant is exactly the cost-blindness
+# this file avoids elsewhere. The mechanism ships enabled-by-opt-in; a data-derived
+# default (round(max_cpu*1.5), >=5 samples) can be set once the ledger accumulates
+# per-gate CPU history, mirroring the DAG-node cpu_timeout derivation.
+default_gate_cpu_timeout_seconds=0
+GATE_CPU_TIMEOUT_SECONDS=${VALIDATE_GATE_CPU_TIMEOUT_SECONDS:-$default_gate_cpu_timeout_seconds}
 if [[ ! $GATE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     echo "validate.sh: VALIDATE_GATE_TIMEOUT_SECONDS must be a positive integer" >&2
     exit 2
 fi
+if [[ ! $GATE_CPU_TIMEOUT_SECONDS =~ ^[0-9]+$ ]]; then
+    echo "validate.sh: VALIDATE_GATE_CPU_TIMEOUT_SECONDS must be a non-negative integer (0 disables)" >&2
+    exit 2
+fi
+# Clock ticks per second, needed to convert /proc/<pid>/stat utime+stime into
+# seconds. Cached once; falls back to the near-universal 100 if getconf is absent.
+CLK_TCK_CACHED=$(getconf CLK_TCK 2>/dev/null || echo 100)
+[[ $CLK_TCK_CACHED =~ ^[1-9][0-9]*$ ]] || CLK_TCK_CACHED=100
 if [[ ! $TIMEOUT_KILL_GRACE_SECONDS =~ ^[0-9]+$ ]]; then
     echo "validate.sh: VALIDATE_TIMEOUT_KILL_GRACE_SECONDS must be a non-negative integer" >&2
     exit 2
@@ -335,7 +357,8 @@ if [[ ! $VERBOSE_INTERVAL_SECONDS =~ ^[1-9][0-9]*$ ]]; then
     echo "validate.sh: VALIDATE_VERBOSE_INTERVAL_SECONDS must be a positive integer" >&2
     exit 2
 fi
-readonly VERBOSE GATE_TIMEOUT_SECONDS TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
+readonly VERBOSE GATE_TIMEOUT_SECONDS GATE_CPU_TIMEOUT_SECONDS CLK_TCK_CACHED
+readonly TIMEOUT_KILL_GRACE_SECONDS VERBOSE_INTERVAL_SECONDS
 readonly STRICT_COMPAT_ONLY PORTABLE_STRICT_COMPAT_ONLY RR_COMPAT_ONLY SABRE_COMPAT_ONLY
 readonly E9PATCH_COMPAT_ONLY LITEINST_COMPAT_ONLY QEMU_L2_ONLY PRIVILEGED_ONLY
 readonly VALIDATION_LEVEL VALIDATION_PROFILE
@@ -687,8 +710,13 @@ if ((VERBOSE == 1)); then
     printf "Verbose validation enabled\n"
     printf "  root: %s\n" "$ROOT_DIR"
     printf "  log: %s\n" "$LOG_FILE"
-    printf "  gate timeout: %ss (kill grace: %ss; heartbeat: %ss)\n" \
+    printf "  gate timeout: %ss wall (kill grace: %ss; heartbeat: %ss)\n" \
         "$GATE_TIMEOUT_SECONDS" "$TIMEOUT_KILL_GRACE_SECONDS" "$VERBOSE_INTERVAL_SECONDS"
+    if ((GATE_CPU_TIMEOUT_SECONDS > 0)); then
+        printf "  gate CPU budget: %ss CPU-time (user+sys, whole tree)\n" "$GATE_CPU_TIMEOUT_SECONDS"
+    else
+        printf "  gate CPU budget: off (set VALIDATE_GATE_CPU_TIMEOUT_SECONDS to enable)\n"
+    fi
 fi
 
 readonly NEXTEST_VERSION=0.9.100
@@ -877,6 +905,47 @@ readonly L4_REPS=${L4_REPS:-20}
 ENVELOPE_JSON=${ENVELOPE_JSON:-"$ROOT_DIR/envelope.json"}
 ENVELOPE_LAST_JSON=""
 
+# Aggregate CPU seconds (user+sys) consumed by the process tree rooted at $1,
+# summed from /proc/<pid>/stat over the root and all its descendants. This is
+# controller-free and host-portable: it does NOT need a delegated cgroup cpu
+# controller (often absent on the many-core dev hosts), unlike reading cpu.stat.
+# Prints an integer count of CPU-seconds, or 0 when /proc is unreadable or the
+# tree has already exited. The comm field (2) can contain spaces and parentheses,
+# so parsing splits on the LAST ")" and indexes the fixed fields after it.
+function tree_cpu_seconds {
+    local root=$1
+    cat /proc/[0-9]*/stat 2>/dev/null | awk -v root="$root" -v clk="$CLK_TCK_CACHED" '
+    {
+        rp = 0
+        for (i = length($0); i >= 1; i--) {
+            if (substr($0, i, 1) == ")") { rp = i; break }
+        }
+        if (rp == 0) next
+        pid = $1 + 0
+        n = split(substr($0, rp + 2), f, " ")
+        if (n < 13) next
+        ppid[pid] = f[2] + 0        # ppid: field 4 of stat = field 2 after comm
+        ticks[pid] = f[12] + f[13]  # utime (14) + stime (15) = fields 12,13 after comm
+        seen[pid] = 1
+    }
+    END {
+        intree[root] = 1
+        changed = 1
+        while (changed) {
+            changed = 0
+            for (p in seen) {
+                if (!intree[p] && (p in ppid) && intree[ppid[p]]) {
+                    intree[p] = 1
+                    changed = 1
+                }
+            }
+        }
+        total = 0
+        for (p in seen) if (intree[p]) total += ticks[p]
+        printf "%d", int(total / clk)
+    }'
+}
+
 function kill_process_tree {
     local pid=$1
     local signal=$2
@@ -887,6 +956,23 @@ function kill_process_tree {
         kill_process_tree "$child" "$signal"
     done < <(ps -o pid= --ppid "$pid" 2>/dev/null)
     kill "-$signal" "$pid" 2>/dev/null || true
+}
+
+# Send TERM to the process tree rooted at $1, wait out the kill grace, then
+# escalate to KILL if anything survives, and reap the root. Mirrors the wall
+# timeout's teardown so a CPU-budget kill leaves no stragglers behind.
+function terminate_gate_tree {
+    local pid=$1
+    local grace_deadline
+    kill_process_tree "$pid" TERM
+    grace_deadline=$((SECONDS + TIMEOUT_KILL_GRACE_SECONDS))
+    while kill -0 "$pid" 2>/dev/null && ((SECONDS < grace_deadline)); do
+        sleep 0.2
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill_process_tree "$pid" KILL
+    fi
+    wait "$pid" 2>/dev/null || true
 }
 
 function record_ledger_gate {
@@ -1175,6 +1261,8 @@ function run_timed_command {
     local status
     local elapsed
     local grace_deadline
+    local cpu_seconds
+    local cpu_next_sample=$((SECONDS + 1))
 
     (
         if ((VERBOSE == 1)); then
@@ -1210,6 +1298,23 @@ function run_timed_command {
             printf "⏱️  %s timed out after %ss (subprocess PID %s)\n" \
                 "$name" "$timeout_seconds" "$pid"
             return 124
+        fi
+
+        # Load-immune CPU-time budget: kill a gate that burns more CPU (user+sys,
+        # whole tree) than allowed, even while it is well under the wall timeout.
+        # Sampled ~1 Hz (cheaper than the 0.2s wall poll) to bound /proc overhead.
+        if ((GATE_CPU_TIMEOUT_SECONDS > 0 && SECONDS >= cpu_next_sample)); then
+            cpu_seconds=$(tree_cpu_seconds "$pid")
+            cpu_next_sample=$((SECONDS + 1))
+            if ((cpu_seconds >= GATE_CPU_TIMEOUT_SECONDS)); then
+                terminate_gate_tree "$pid"
+                active_check_pid=""
+                printf "Gate exceeded CPU budget: %ss CPU >= %ss budget (wall %ss, subprocess PID %s)\n" \
+                    "$cpu_seconds" "$GATE_CPU_TIMEOUT_SECONDS" "$elapsed" "$pid" >>"$log_file"
+                printf "🔥 %s exceeded CPU budget: %ss CPU-time >= %ss (wall %ss, subprocess PID %s)\n" \
+                    "$name" "$cpu_seconds" "$GATE_CPU_TIMEOUT_SECONDS" "$elapsed" "$pid"
+                return 125
+            fi
         fi
 
         if ((VERBOSE == 1 && elapsed >= next_report)); then
