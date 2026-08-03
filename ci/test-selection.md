@@ -1,14 +1,14 @@
 # Affected-Test Selection
 
 Two small, dependency-free tools decide **which** CI nodes a change needs and
-rank nodes by **cost vs. value**, so a limited-footprint change runs a subset of
-the suite instead of all of it, and provably CI-irrelevant changes skip CI
-entirely.
+rank nodes by **declared scheduling weight vs. measured selection frequency**,
+so a limited-footprint change runs a subset of the suite instead of all of it,
+and provably CI-irrelevant changes skip CI entirely.
 
 | Tool | Question it answers |
 | --- | --- |
 | `ci/select-tests.rs` | Given a change, which portable-DAG nodes can it affect? |
-| `ci/power-to-weight.rs` | Which nodes cost the most per unit of value delivered? |
+| `ci/power-to-weight.rs` | Which relatively heavy nodes are selected least often? |
 
 Both read `ci/dag/portable.json` as the single source of truth for the node
 universe, node commands, and build dependencies. `select-tests.rs` adds one
@@ -191,11 +191,13 @@ matrix.
 
 ## Power-to-weight
 
-`ci/power-to-weight.rs` joins each node's **cost** (`hint.est_duration_s`, which
-are **hand-estimated**, not measured — see `ci/dag/README`) with a **value**
-proxy: how often `select-tests.rs` would actually select the node across a sample
-of recent commits. Low selection-rate ÷ high cost = a candidate to move off the
-per-commit critical path onto a nightly lane.
+`ci/power-to-weight.rs` joins each node's declared scheduling **weight** with a
+**value** proxy: how often `select-tests.rs` would actually select the node
+across a stated sample of recent commits. The legacy DAG field is named
+`hint.est_duration_s`, but its values are **not measured durations**. The tool
+therefore displays them only as unitless, unmeasured ordinal weights. Low
+selection-rate divided by high weight is a candidate to review for moving off
+the per-commit critical path onto a nightly lane.
 
 ```bash
 ci/power-to-weight.rs --sample 200            # human table
@@ -204,13 +206,14 @@ ci/power-to-weight.rs --format csv > pw.csv    # artifact
 
 Two honesty caveats are built into the output:
 
-- Selection rate is measured on **past** commits; it predicts future value only
-  if the change mix stays similar. A recent window dominated by CI/infra changes
-  (which force full) inflates every node's rate.
+- Selection rate is measured on **past** commits, and the output states its
+  revision and sample size. It predicts future value only if the change mix
+  stays similar. A recent window dominated by CI/infra changes (which force
+  full) inflates every node's rate.
 - A low-power node is **ranked, not condemned**. Moving it to nightly trades
   per-commit latency for slower regression detection on a rarely-touched
-  subsystem. Confirm with the owning area, and prefer real durations from the
-  validate-run-ledger over the estimates once available.
+  subsystem. Confirm with the owning area, and replace the ordinal weights with
+  real durations from measured history before making a cost claim.
 
 ## Integration contract (validate-run-ledger)
 
@@ -229,5 +232,6 @@ commit SHA for the current slot**. The interface is intentionally minimal:
   its matrix on it. Wiring `ci-portable.yml` to skip/subset based on
   `--format github` is a follow-up to coordinate with the CI-DAG owner, and
   depends on the green-baseline blocker above for the local path.
-- **Measured durations.** power-to-weight uses hand estimates until the ledger
-  provides observed per-node durations.
+- **Measured durations.** power-to-weight has no duration data yet. It uses
+  explicitly unmeasured ordinal weights until the ledger provides observed
+  per-node durations; it does not report those weights as time.
