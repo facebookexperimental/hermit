@@ -1972,7 +1972,7 @@ fi
 # transiently deny a file open by a build or test subprocess for reasons
 # unrelated to the code under test.
 #
-# The denial surfaces in TWO forms, both of which we must catch:
+# The denial surfaces in the following forms, all of which we must catch:
 #
 #   1. The canonical BPFJailer banner ("blocked on this server based on a
 #      security policy", "BpfJailer", "Enforcer: FS, Reason: ..."). This is what
@@ -2014,6 +2014,20 @@ fi
 #      only relabeled from "test failure" to "third-party build (environmental)".
 #      Only reverie-dbi's own build script matches, so a Hermit test that merely
 #      prints "panicked at .../build.rs" for a different crate cannot trip it.
+#   4. A build/link tool reporting EBADF ("Bad file descriptor") on a file it is
+#      operating on -- the same FS-enforcer denial class as form 2, but the
+#      enforcer invalidates an already-open descriptor mid-operation instead of
+#      refusing the initial open(). Observed when objcopy strips DynamoRIO's
+#      drconfig (`/usr/bin/objcopy: ../bin64/drconfig.debug: Bad file
+#      descriptor`), which aborts gmake and bubbles up as the form-3 reverie-dbi
+#      build failure. It is caught in practice by the form-3 anchors, but we also
+#      match it directly on the binutils tool phrasing (see the binutils anchor
+#      in ENV_BLOCK_PATTERN) so detection does not depend on the reverie-dbi
+#      crate path -- a different third-party build hitting the same sandbox EBADF
+#      is still classified. Like form 2 the anchor is build-tool-specific
+#      (objcopy|strip|ld|ar|ranlib|as), so a GUEST test that legitimately prints
+#      "Bad file descriptor" / `Err(Errno(EBADF))` does not false-positive.
+#
 # The set of file-access errno strings a sandboxed build/link tool emits when the
 # FS enforcer denies one of its operations. EPERM ("operation not permitted") and
 # EACCES ("permission denied") are the classic open() denials; EBADF ("bad file
