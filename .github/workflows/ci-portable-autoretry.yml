@@ -1,0 +1,73 @@
+name: Portable auto-retry on cancellation
+
+# Companion to "CI (GitHub-managed portable)". When a PR's portable run is
+# CANCELLED — concurrency supersede (ci-portable.yml `cancel-in-progress` on a
+# new pull_request event) or a hosted-runner queue eviction under load — the
+# run's `if: always()` aggregators (`Reduce e2e parity archives` and
+# `Regular tests (GitHub-managed portable)`) still execute and fail closed on
+# the incomplete inputs, so the cancelled run is reported as a hard FAILURE.
+# With no completing successor for the current head, the PR stays permanently
+# red until a human re-fires it. This job re-runs such a run exactly once (up to
+# attempt 3) so the recurrence self-heals.
+#
+# GitHub's `concurrency:` block cannot express a retry, so this is implemented as
+# the standard workflow_run companion. Two guards keep it from storming the
+# scarce hosted-runner queue or re-running a stale head:
+#   * it fires ONLY on conclusion == cancelled (never on genuine failure or
+#     success), and only for pull_request-triggered runs; and
+#   * it re-runs ONLY when the cancelled run's head is still the PR's current
+#     head — if the head moved, a newer run already owns the PR and this exits.
+# run_attempt < 3 caps the retries so a pathologically re-cancelled run cannot
+# loop forever.
+on:
+  workflow_run:
+    workflows: ["CI (GitHub-managed portable)"]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+
+jobs:
+  retry:
+    name: Re-run cancelled portable run
+    if: >-
+      github.event.workflow_run.conclusion == 'cancelled' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.run_attempt < 3
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Re-run only if the cancelled head is still the PR head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_HEAD: ${{ github.event.workflow_run.head_sha }}
+          RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          PRS_JSON: ${{ toJSON(github.event.workflow_run.pull_requests) }}
+        run: |
+          set -euo pipefail
+
+          # workflow_run usually lists the associated PR(s); fall back to a
+          # head-branch lookup when the association is empty (can happen for
+          # cross-repo or timing edge cases).
+          num=$(jq -r '.[0].number // empty' <<<"$PRS_JSON")
+          if [[ -z "$num" ]]; then
+            num=$(gh pr list -R "$REPO" --head "$RUN_BRANCH" --state open \
+              --json number --jq '.[0].number // empty')
+          fi
+          if [[ -z "$num" ]]; then
+            echo "No open PR associated with cancelled run $RUN_ID; nothing to retry."
+            exit 0
+          fi
+
+          cur=$(gh api "repos/$REPO/pulls/$num" --jq '.head.sha')
+          if [[ "$cur" != "$RUN_HEAD" ]]; then
+            echo "PR #$num head moved ($RUN_HEAD -> $cur); a newer run owns it. Skip."
+            exit 0
+          fi
+
+          echo "PR #$num still at $RUN_HEAD; re-running cancelled portable run $RUN_ID."
+          gh run rerun "$RUN_ID" -R "$REPO"
