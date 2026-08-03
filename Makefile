@@ -14,7 +14,8 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 
 .DEFAULT_GOAL := build
 
-.PHONY: build install-deps release-core help checkout-all check-submodules validate lint \
+.PHONY: build install-deps release-core help checkout-all check-build-tools \
+	check-submodules validate lint \
 	validate-kvm validate-dbi validate-sabre validate-liteinst validate-e9patch
 
 build: install-deps ## Build the development Hermit binary with every backend
@@ -71,7 +72,35 @@ help: ## Show this help (the list of make targets)
 	@printf '  validate-e9patch   e9patch corpus        (needs HERMIT_E9PATCH_BACKEND) ~5-20 min\n'
 	@printf '\nThe full multi-backend suite is ./validate.sh (see ./validate.sh --help).\n'
 
-checkout-all: ## Initialize every pinned submodule before builds and validation
+# Fail fast when the native toolchain that the third-party backends need is
+# absent. The DBI backend (reverie-dbi) builds DynamoRIO from source with CMake
+# during `cargo build`, roughly 30s into the compile. When cmake or a C/C++
+# compiler is missing, that build.rs step fails to SPAWN cmake and panics with
+# the cryptic "failed to configure DynamoRIO: No such file or directory (os
+# error 2)" — an ENOENT on the cmake executable, not a missing source tree.
+# On a warm developer box these tools are already present, so this check is a
+# no-op; on a freshly provisioned host it converts that late, opaque failure
+# into an immediate, actionable message.
+check-build-tools: ## Verify the native build toolchain (cmake + C/C++ compiler) is present
+	@missing=; \
+		command -v cmake >/dev/null 2>&1 || missing="$$missing cmake"; \
+		{ command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 \
+			|| command -v clang >/dev/null 2>&1; } \
+			|| missing="$$missing C-compiler(cc/gcc/clang)"; \
+		{ command -v c++ >/dev/null 2>&1 || command -v g++ >/dev/null 2>&1 \
+			|| command -v clang++ >/dev/null 2>&1; } \
+			|| missing="$$missing C++-compiler(c++/g++/clang++)"; \
+		if [ -n "$$missing" ]; then \
+			echo "error: required native build tool(s) not found on PATH:$$missing" >&2; \
+			echo "  The DBI backend builds DynamoRIO from source with CMake; without" >&2; \
+			echo "  these the build fails ~30s in with a cryptic \"failed to configure" >&2; \
+			echo "  DynamoRIO: No such file or directory\". Install them, for example:" >&2; \
+			echo "    Debian/Ubuntu: sudo apt-get install -y cmake build-essential" >&2; \
+			echo "    Fedora/RHEL:   sudo dnf install -y cmake gcc gcc-c++ make" >&2; \
+			exit 1; \
+		fi
+
+checkout-all: check-build-tools ## Initialize every pinned submodule before builds and validation
 	@$(SUBMODULE_GIT) submodule update --init --recursive
 
 check-submodules: checkout-all ## Verify every pinned submodule is checked out at its recorded revision
