@@ -166,9 +166,12 @@ class Plan:
     enabled: list  # verify-mode enabled backends (always includes ptrace)
     disabled: dict = field(default_factory=dict)  # verify-mode backend -> reason
     fixture_content: str | None = None  # written when the fixture is not in-tree
+    note: str = ""  # non-fatal reviewer flag (e.g. name-mismatch pairing)
 
 
-def build_plan(row: MatrixRow, program: str, fixture_content: str | None) -> Plan:
+def build_plan(
+    row: MatrixRow, program: str, fixture_content: str | None, note: str = ""
+) -> Plan:
     slug = row.name.replace("_", "-")
     enabled = ["ptrace"]
     disabled: dict = {}
@@ -209,7 +212,7 @@ def build_plan(row: MatrixRow, program: str, fixture_content: str | None) -> Pla
     )
 
     lane = "privileged" if any(h in row.name.lower() for h in PRIVILEGED_HINTS) else "portable"
-    return Plan(row.name, slug, program, lane, enabled, disabled, fixture_content)
+    return Plan(row.name, slug, program, lane, enabled, disabled, fixture_content, note)
 
 
 def render_test_block(plan: Plan) -> str:
@@ -378,7 +381,9 @@ def plans_from_pr(pr: int) -> tuple:
         ["pr", "view", str(pr), "-R", REPO, "--json", "headRefName", "--jq", ".headRefName"]
     ).strip()
     rows = pr_added_matrix_rows(diff)
-    fixtures = {Path(p).stem: p for p in pr_added_fixtures(diff)}
+    added_fixtures = pr_added_fixtures(diff)
+    fixtures = {Path(p).stem: p for p in added_fixtures}
+    consumed = set()
     plans, skips = [], []
     for raw in rows:
         try:
@@ -388,6 +393,7 @@ def plans_from_pr(pr: int) -> tuple:
             continue
         program = fixtures.get(row.name)
         content = None
+        note = ""
         if program is None:
             # Fixture already in-tree on main (some rows reuse an existing guest).
             for candidate in (
@@ -398,11 +404,24 @@ def plans_from_pr(pr: int) -> tuple:
                     program = candidate
                     break
             if program is None:
-                skips.append(f"#{pr}: no fixture found for row '{row.name}'")
-                continue
-        else:
+                # Singleton fallback: authors sometimes name the matrix row and the
+                # fixture file differently (e.g. row 'eventfd_semantics' +
+                # 'eventfd_probe.c'). If the PR added exactly one fixture and it is
+                # still unclaimed, pair them -- unambiguous, and flagged for review.
+                unclaimed = [p for p in added_fixtures if p not in consumed]
+                if len(unclaimed) == 1:
+                    program = unclaimed[0]
+                    note = (
+                        f" [name-mismatch: row '{row.name}' paired with "
+                        f"{Path(program).name} by singleton fallback -- confirm]"
+                    )
+                else:
+                    skips.append(f"#{pr}: no fixture found for row '{row.name}'")
+                    continue
+        if program in fixtures.values():
             content = pr_file_content(head, program)
-        plans.append(build_plan(row, program, content))
+            consumed.add(program)
+        plans.append(build_plan(row, program, content, note))
     return plans, skips
 
 
@@ -444,7 +463,7 @@ def run(plans: list, apply: bool) -> int:
     for plan in converted:
         print(
             f"  CONVERT  {plan.name:32s} -> {BUCKET}/{plan.slug}  "
-            f"verify.enabled={plan.enabled}  lane={plan.lane}"
+            f"verify.enabled={plan.enabled}  lane={plan.lane}{plan.note}"
         )
     for slug in skipped_existing:
         print(f"  SKIP     already present: {BUCKET}/{slug}")
