@@ -236,10 +236,24 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      # run-node.sh now executes nodes THROUGH safe-ci-dag-runner (not a jq+bash
+      # shim), so the tracked runner submodule must be present in this job too.
+      - name: Initialize safe-ci-dag-runner submodule
+        run: git submodule update --init agent-utils
       - name: Rust components
         run: rustup component add rustfmt
       - name: Run preflight nodes
+        env:
+          RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
         run: ./ci/run-node.sh portable "$(jq -r '.preflight_nodes|join(",")' ci/portable-shards.json)"
+      - name: Upload preflight node performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-node-perf-preflight
+          path: ${{ runner.temp }}/run-node-perf
+          if-no-files-found: warn
+          retention-days: 14
 
   # ------------------------------------------------------------ build (debug)
   build-debug:
@@ -273,7 +287,17 @@ jobs:
       # e2e.metadata, setup.nextest, build.workspace, build.manifest_guests,
       # build.flaky_harnesses.
       - name: Run debug build nodes
+        env:
+          RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
         run: ./ci/run-node.sh portable "$(jq -r '.build_debug_nodes|join(",")' ci/portable-shards.json)"
+      - name: Upload debug-build node performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-node-perf-build-debug
+          path: ${{ runner.temp }}/run-node-perf
+          if-no-files-found: warn
+          retention-days: 14
       - name: Stage debug DBI runtime
         run: |
           set -euo pipefail
@@ -400,7 +424,17 @@ jobs:
       # Reproduce EXACTLY the release build nodes from portable.json (no drift):
       # build.dbi_release, build.sabre_release, build.liteinst_runtime_release.
       - name: Run release build nodes (dbi + sabre + liteinst)
+        env:
+          RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
         run: ./ci/run-node.sh portable "$(jq -r '(.build_dbi_nodes + .build_aux_nodes)|join(",")' ci/portable-shards.json)"
+      - name: Upload release-build node performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-node-perf-build-release
+          path: ${{ runner.temp }}/run-node-perf
+          if-no-files-found: warn
+          retention-days: 14
       - name: Pack full release prebuilt tree (dbi + sabre + liteinst)
         run: |
           set -euo pipefail
@@ -499,7 +533,17 @@ jobs:
           test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun
           test -f target/install_pkg/rsrcs/libreverie_dbi_client.so
       - name: Run shard nodes (${{ matrix.slug }})
+        env:
+          RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
         run: ./ci/run-node.sh portable "${{ matrix.nodes }}"
+      - name: Upload debug shard node performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-node-perf-test-debug-${{ matrix.slug }}
+          path: ${{ runner.temp }}/run-node-perf
+          if-no-files-found: warn
+          retention-days: 14
 
   # ----------------------------------------------- test shards (release-backed)
   test-release:
@@ -541,7 +585,17 @@ jobs:
           rm -f "$RELEASE_TARBALL"
           test -x target/release/hermit
       - name: Run shard nodes (${{ matrix.slug }})
+        env:
+          RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
         run: ./ci/run-node.sh portable "${{ matrix.nodes }}"
+      - name: Upload release shard node performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-node-perf-test-release-${{ matrix.slug }}
+          path: ${{ runner.temp }}/run-node-perf
+          if-no-files-found: warn
+          retention-days: 14
 
   # ------------------------------------------------------------- e2e cells
   e2e:
