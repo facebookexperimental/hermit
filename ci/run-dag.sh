@@ -61,23 +61,38 @@ else
     fi
 fi
 
-# Locate the runner. Prefer an explicit override, then the compiled Rust binary
-# (fast, dependency-free), then the Python entrypoint (reference behavior; the
-# only implementation with Linux cgroup boxing + perf logging in 0.1).
+# Locate the runner. Prefer an explicit override, then the TRACKED, source-invoked
+# engine resolver (agent-utils/common/bin/safe-ci-dag-runner -> engine-resolver),
+# then the tracked, source-invoked Python entrypoint. NEVER auto-select the
+# untracked prebuilt Rust binary (rs/bin): a compiled artifact can silently drift
+# from its source, which is exactly how a runner missing an enforcement guard (the
+# historical cpu_timeout gap) can run while we believe we are boxed.
+#
+# The staleness axis is SOURCE-INVOKED vs PREBUILT-BINARY, not Rust vs Python. The
+# resolver enforces that: it defaults to the source-invoked Python entrypoint,
+# selects the Rust engine ONLY on explicit SAFE_CI_DAG_RUNNER_ENGINE=rust (never a
+# silent fallback), and LOGS the winning engine + its exact path on every run. So
+# invoking it here keeps hermit's execution path deterministic, tracked, and
+# self-describing in the logs. Rust is reached the same way through the resolver
+# once it is invoked source-first (rust-script), not via a prebuilt-binary shortcut.
 find_runner() {
     if [[ -n ${SAFE_CI_DAG_RUNNER:-} ]]; then
         printf '%s\n' "$SAFE_CI_DAG_RUNNER"
         return 0
     fi
     local base="$ROOT_DIR/agent-utils"
-    if [[ -x "$base/rs/bin/safe-ci-dag-runner" ]]; then
-        printf '%s\n' "$base/rs/bin/safe-ci-dag-runner"
+    # Tracked, source-invoked resolver: deterministic engine selection that logs
+    # which engine won. Preferred over any prebuilt binary.
+    if [[ -x "$base/common/bin/safe-ci-dag-runner" ]]; then
+        printf '%s\n' "$base/common/bin/safe-ci-dag-runner"
         return 0
     fi
+    # Fallback: the tracked, source-invoked Python entrypoint directly.
     if [[ -x "$base/py/bin/safe-ci-dag-runner" ]]; then
         printf '%s\n' "$base/py/bin/safe-ci-dag-runner"
         return 0
     fi
+    # Last resort: a resolver/runner already on PATH.
     if command -v safe-ci-dag-runner >/dev/null 2>&1; then
         command -v safe-ci-dag-runner
         return 0
