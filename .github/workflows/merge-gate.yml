@@ -49,11 +49,22 @@ permissions:
   contents: read
   pull-requests: read
 
+# All merge-gate jobs run on the dedicated `gate` self-hosted runner pool rather
+# than `ubuntu-latest`. They are pure control-plane work — `gh api` reads, `jq`,
+# a shallow trusted-ref checkout, and one bash lint — with no Rust build, PMU, or
+# ptrace needs. On 2026-08-03 the public-repo GitHub-hosted concurrency cap left
+# ci-portable's ~34-min build flood saturating the hosted pool, so even this ~5s
+# stamp-check queued behind 40-min builds and NOTHING landed. Routing to
+# `[self-hosted, gate]` targets an always-idle lightweight runner
+# (`hermit-gate-newton`, gate-label only) that picks these jobs up in seconds;
+# the three PMU runners also carry the `gate` label as fallback, so a single-node
+# outage cannot block landing. Because the required-check context is the job name
+# (`merge-gate`), changing `runs-on` does not change the ruleset-required check.
 jobs:
   refire-on-ci-completion:
     name: refire-on-ci-completion
     if: github.repository == 'rrnewton/hermit' && github.event_name == 'workflow_run'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gate]
     timeout-minutes: 5
     permissions:
       actions: write
@@ -99,7 +110,7 @@ jobs:
       github.repository == 'rrnewton/hermit' &&
       github.event_name == 'pull_request' &&
       github.event.action == 'synchronize'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gate]
     timeout-minutes: 5
     permissions:
       contents: read
@@ -133,7 +144,7 @@ jobs:
     if: >-
       github.repository == 'rrnewton/hermit' &&
       github.event_name != 'workflow_run'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gate]
     timeout-minutes: 10
     permissions:
       contents: read
@@ -142,6 +153,14 @@ jobs:
       - name: Check out the review-protocol linter
         uses: actions/checkout@v4
         with:
+          # Pin to the trusted base branch, NOT the PR head. This job runs on a
+          # self-hosted runner, so checking out PR-controlled code and executing
+          # scripts/core-review-protocol-lint.sh from it would run arbitrary PR
+          # code on our infrastructure. The linter reads only environment inputs
+          # (PR_LABELS/PR_BODY/PR_IS_KVM/PR_NUMBER), so main's copy is the correct
+          # and safe version to run — and a PR cannot weaken its own gate by
+          # editing the lint script.
+          ref: main
           persist-credentials: false
       - name: Enforce the core-change review protocol
         env:
@@ -233,7 +252,7 @@ jobs:
       always() &&
       github.repository == 'rrnewton/hermit' &&
       github.event_name != 'workflow_run'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, gate]
     timeout-minutes: 10
     steps:
       - name: Require the core-change review protocol
