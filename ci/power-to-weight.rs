@@ -179,8 +179,8 @@ Flags relatively heavy, rarely-selected nodes as review candidates.
   --rev <ref>  History to sample from (default HEAD).
   --format     human (default) or csv.
 
-WEIGHT is explicitly NOT MEASURED (ci/dag/README); POWER states the sampled
-commit count and revision. Low power-to-weight means 'review for moving to
+WEIGHT is explicitly NOT MEASURED (ci/dag/README); POWER states the sample size
+and exact commit window. Low power-to-weight means 'review for moving to
 nightly', never 'safe to delete'.
 "
         );
