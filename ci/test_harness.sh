@@ -253,8 +253,12 @@ function assert_parallel_portable_workflow {
         die "GitHub portable debug shards must verify the installed DBI runtime"
     [[ $(grep -Fxc '          test -f target/debug/deps/libdetcore_dbi.so' "$workflow") == 2 ]] ||
         die "GitHub portable workflow must package and verify the debug DBI cdylib"
-    [[ $(grep -Fxc '    needs: [plan, build-debug, build-release]' "$workflow") == 1 ]] ||
-        die "GitHub portable debug shards must wait for the complete DBI install package"
+    # Both the debug test shards (run_dbi_* CLI tests) and the e2e backend cells
+    # consume the DBI install package built by build-release, so both must wait on
+    # [select, build-debug, build-release]. (select gates the affected-test matrix;
+    # dropping build-release from either would race the DBI runtime.)
+    [[ $(grep -Fxc '    needs: [select, build-debug, build-release]' "$workflow") == 2 ]] ||
+        die "GitHub portable debug and e2e shards must wait for the complete DBI install package"
     [[ $(grep -Fxc '          test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun' "$workflow") == 1 ]] ||
         die "GitHub portable debug shards must verify the DynamoRIO launcher"
     [[ $(grep -Fxc '          test -f target/install_pkg/rsrcs/libreverie_dbi_client.so' "$workflow") == 1 ]] ||

@@ -200,25 +200,23 @@ jobs:
           "$checker" "${args[@]}"
 
   # ---------------------------------------------------------------- plan (cheap)
+  # Fail-closed integrity guard over the shard map itself. Runs UNCONDITIONALLY
+  # (it has no `needs: select`) so a corrupt ci/portable-shards.json reds the
+  # required `regular` gate even on a skip/selective run. The shard MATRICES are
+  # now derived by the `select` job (full or affected-test-filtered); this job no
+  # longer emits them, it only verifies the map every downstream matrix is cut
+  # from is internally consistent and covers the DAG.
   plan:
-    name: Plan shards + verify coverage
+    name: Verify shard/DAG coverage
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    outputs:
-      debug_matrix: ${{ steps.shards.outputs.debug_matrix }}
-      release_matrix: ${{ steps.shards.outputs.release_matrix }}
     steps:
       - uses: actions/checkout@v4
       - name: Fail-closed shard/DAG coverage guard
         run: ./ci/check-shard-coverage.sh
-      - name: Derive shard matrices from the audited shard map
-        id: shards
+      - name: List audited shards (informational)
         run: |
           set -euo pipefail
-          dbg=$(jq -c '{include: [ .debug_shards[] | {slug, nodes: (.nodes|join(","))} ]}' ci/portable-shards.json)
-          rel=$(jq -c '{include: [ .release_shards[] | {slug, needs, nodes: (.nodes|join(","))} ]}' ci/portable-shards.json)
-          echo "debug_matrix=$dbg" >> "$GITHUB_OUTPUT"
-          echo "release_matrix=$rel" >> "$GITHUB_OUTPUT"
           echo "debug shards:";   jq -r '.debug_shards[]   | "  - \(.slug): \(.nodes|join(", "))"' ci/portable-shards.json
           echo "release shards:"; jq -r '.release_shards[] | "  - \(.slug) (needs \(.needs)): \(.nodes|join(", "))"' ci/portable-shards.json
 
