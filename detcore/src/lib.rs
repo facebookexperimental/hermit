@@ -1509,7 +1509,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // makes an authored partial order reproduce a known race deterministically
         // (see detcore-model `happens_before`). It requires sequentialized
         // threads (enforced by the CLI) so the scheduler owns ordering.
-        if config
+        if guest
+            .config()
             .happens_before
             .as_ref()
             .is_some_and(|p| p.has_syscall_count_anchors())
