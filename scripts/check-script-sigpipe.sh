@@ -53,3 +53,9 @@ if [[ $out != "line 0" ]]; then
 fi
 
 echo "check-script-sigpipe.sh: OK — SIGPIPE from an early consumer exits cleanly (0)"
+
+# rust-script's freshness check ignores #[path]-included modules, so a prelude
+# edit does not bust consumer caches unless each consumer's bytes also change.
+# The cache-key stamp enforces that; verify it is current here so a forgotten
+# restamp fails the same guard that protects the prelude's SIGPIPE contract.
+"$ROOT_DIR/scripts/lib/prelude-cache-key.sh" --check

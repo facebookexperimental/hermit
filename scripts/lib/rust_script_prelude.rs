@@ -1,4 +1,11 @@
 //! Process-wide conventions shared by Hermit's standalone Rust scripts.
+//!
+//! CACHE TRAP: rust-script decides a cached binary is fresh from the *main*
+//! script's mtime only; it never inspects `#[path]`-included modules like this
+//! one. Editing this file therefore does NOT rebuild the scripts that include
+//! it on warm-cache machines. After any edit here, run
+//! `scripts/lib/prelude-cache-key.sh --write` to restamp the consumers' cache
+//! keys (a `check-script-sigpipe.sh --check` guards against forgetting).
 
 /// Make a standalone script tolerate a downstream reader closing the pipe early
 /// (`prog | head`, `prog | grep -q`, …) by terminating cleanly on `SIGPIPE`.

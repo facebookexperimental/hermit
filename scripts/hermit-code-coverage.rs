@@ -14,7 +14,7 @@
 //! ```
 
 #[path = "lib/rust_script_prelude.rs"]
-mod rust_script_prelude;
+mod rust_script_prelude; // rust-script cache-key: 088ae17fa4a1 (regen: scripts/lib/prelude-cache-key.sh --write)
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
