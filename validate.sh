@@ -134,6 +134,8 @@ ONLY_LANE=""
 ONLY_NODES=""
 SELECTIVE_MODE=0
 SELECTIVE_BASELINE=""
+RUN_ON_DIRTY_TREE=0
+[[ ${VALIDATE_RUN_ON_DIRTY_TREE:-0} == 1 ]] && RUN_ON_DIRTY_TREE=1
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
 VERBOSE=0
@@ -181,6 +183,7 @@ while [[ $# -gt 0 ]]; do
                 exit 2
             fi
             ONLY_MODE=1; shift 3 ;;
+        --run-on-dirty-tree) RUN_ON_DIRTY_TREE=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
         --no-label-pr) LABEL_PR=0; shift ;;
@@ -223,6 +226,13 @@ Focused gates (run one matrix/lane and exit):
 
 Other options:
   --verbose        Stream each gate's command, PID, elapsed time, and output.
+  --run-on-dirty-tree  Escape hatch: run despite uncommitted changes. AGENTS SHOULD
+                   NOT USE THIS. By default a dirty working tree is a hard error,
+                   because a result validated against uncommitted changes describes
+                   a tree that exists nowhere in history and cannot be reproduced
+                   or compared. A run forced with this flag is recorded as
+                   NOT-commit-anchored (commit_anchored=false) and never applies
+                   the `locally-validated` label.
   --label-pr       Label the current PR `locally-validated` on a fully-green run (default).
   --no-label-pr    Disable the non-fatal GitHub label update.
   -h, --help       Show this help and exit.
@@ -233,6 +243,7 @@ Environment:
   VALIDATE_TIMEOUT_KILL_GRACE_SECONDS=N          TERM-to-KILL grace period.
   VALIDATE_LABEL_PR=0                            Disable PR labeling (same as --no-label-pr).
   VALIDATE_VERBOSE=1                             Same as --verbose.
+  VALIDATE_RUN_ON_DIRTY_TREE=1                   Same as --run-on-dirty-tree (agents: do not use).
   HERMIT_VALIDATE_LEDGER=FILE                    Override the parent JSONL ledger path.
   PR_NUMBER=N                                    Override branch-based PR detection.
 
@@ -347,9 +358,79 @@ if git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null; then
         git rev-list --left-right --count origin/main...HEAD 2>/dev/null || printf "0 0\n"
     )
 fi
+
+# Commit anchoring: VALIDATION_COMMIT faithfully names what ran only when the
+# tree exactly matches HEAD. Otherwise the record would be misattributed to a
+# HEAD that never actually ran, and selection baselines, green-time, and
+# speculative-land verification -- all of which join on the SHA -- would compare
+# against a tree that exists nowhere in history. Detect once, up front, before
+# any gate mutates build outputs (which live under gitignored target/, so they
+# do not themselves make the tree dirty).
+#
+# Two distinct notions, both recorded honestly:
+#   tree_dirty      = the tree differs from HEAD in ANY way (staged or not). This
+#                     is the porcelain-nonempty condition and drives anchoring.
+#   worktree_dirty  = the WORKING TREE proper carries changes that `git add`
+#                     would capture: unstaged edits to tracked files, or untracked
+#                     files. This drives the hard gate, because staging WIP (or
+#                     committing) is the caller's escape from it.
+# Outside a git repo VALIDATION_COMMIT is "unknown" and both probes are empty, so
+# the run is simply "not anchored" rather than "dirty".
+if [[ -n "$(git status --porcelain 2>/dev/null || printf "")" ]]; then
+    VALIDATION_TREE_DIRTY=1
+else
+    VALIDATION_TREE_DIRTY=0
+fi
+VALIDATION_WORKTREE_DIRTY=0
+if ! git diff --quiet 2>/dev/null; then
+    VALIDATION_WORKTREE_DIRTY=1
+elif [[ -n "$(git ls-files --others --exclude-standard 2>/dev/null || printf "")" ]]; then
+    VALIDATION_WORKTREE_DIRTY=1
+fi
+if [[ $VALIDATION_COMMIT != unknown ]] && ((VALIDATION_TREE_DIRTY == 0)); then
+    VALIDATION_COMMIT_ANCHORED=1
+else
+    VALIDATION_COMMIT_ANCHORED=0
+fi
+# Selection mode: whether this run validated the whole configured lane or only an
+# affected/explicit subset. Recorded separately from the profile so the ledger
+# distinguishes a partial run from a complete one (selection is only sound on a
+# complete commit, so a subset run must never masquerade as full coverage).
+if ((SELECTIVE_MODE == 1)); then
+    VALIDATION_SELECTION_MODE=selective
+elif ((ONLY_MODE == 1)); then
+    VALIDATION_SELECTION_MODE=only
+else
+    VALIDATION_SELECTION_MODE=full
+fi
 readonly VALIDATION_STARTED_AT VALIDATION_STARTED_EPOCH VALIDATION_HOST DEV_HERMIT_PARENT
 readonly VALIDATION_SLOT VALIDATION_LEDGER_FILE VALIDATION_COMMIT VALIDATION_GIT_DEPTH
 readonly VALIDATION_GIT_AHEAD VALIDATION_GIT_BEHIND
+readonly VALIDATION_TREE_DIRTY VALIDATION_WORKTREE_DIRTY
+readonly VALIDATION_COMMIT_ANCHORED VALIDATION_SELECTION_MODE
+
+# Refuse to run on a dirty working tree so no validation record is silently
+# misattributed to a HEAD that never ran. The caller's escapes are, in order of
+# preference: commit (fully anchored), stage the WIP with `git add` (captured and
+# runnable; the record is still commit_anchored=false because HEAD does not yet
+# contain it), or force with --run-on-dirty-tree / VALIDATE_RUN_ON_DIRTY_TREE=1
+# (agents must not). A forced run is likewise stamped commit_anchored=false. This
+# gate runs before the validation tmp dir and EXIT trap are established, so a
+# refused run leaves no partial state behind.
+if ((VALIDATION_WORKTREE_DIRTY == 1 && RUN_ON_DIRTY_TREE == 0)); then
+    {
+        printf "validate.sh: refusing to run on a dirty working tree.\n"
+        printf "  HEAD %s has uncommitted changes in the working tree, so a\n" "$VALIDATION_COMMIT"
+        printf "  validation record anchored to it would describe a tree that exists\n"
+        printf "  nowhere in history and cannot be reproduced or compared. Commit your\n"
+        printf "  changes (preferred), or at least stage the WIP with 'git add' so it\n"
+        printf "  is captured, then re-run. To force an explicitly unanchored run pass\n"
+        printf "  --run-on-dirty-tree (VALIDATE_RUN_ON_DIRTY_TREE=1) -- agents must not.\n"
+        printf "  Working-tree changes:\n"
+        git status --short 2>/dev/null | sed 's/^/    /'
+    } >&2
+    exit 2
+fi
 
 SUPER_REPETITIONS=${SUPER_REPETITIONS:-20}
 if [[ ! $SUPER_REPETITIONS =~ ^[1-9][0-9]*$ ]]; then
@@ -561,6 +642,15 @@ readonly LOG_FILE
 printf "Hermit validation log\nRoot: %s\nLevel: %s\nHost OS: %s\n\n" \
     "$ROOT_DIR" "$VALIDATION_PROFILE" "$HOST_OS" >"$LOG_FILE"
 printf "Validation level: %s (host OS: %s)\n" "$VALIDATION_PROFILE" "$HOST_OS"
+if ((VALIDATION_COMMIT_ANCHORED == 1)); then
+    printf "Commit: %s (clean tree, commit-anchored); selection: %s\n" \
+        "$VALIDATION_COMMIT" "$VALIDATION_SELECTION_MODE"
+else
+    printf "Commit: %s (⚠️  NOT commit-anchored: %s); selection: %s\n" \
+        "$VALIDATION_COMMIT" \
+        "$([[ $VALIDATION_COMMIT == unknown ]] && printf 'not a git checkout' || printf 'dirty tree')" \
+        "$VALIDATION_SELECTION_MODE"
+fi
 printf "Build cache: %s (target/ debug=%s release=%s)\n" \
     "$VALIDATION_CACHE_STATE" \
     "$([[ -x "$ROOT_DIR/target/debug/hermit" ]] && printf present || printf absent)" \
@@ -801,6 +891,7 @@ function append_validation_ledger {
     local exit_status=$1
     local wall_seconds=$2 cpu_user=$3 cpu_sys=$4
     local finished_at result gates_json gate_result line
+    local commit_anchored_json tree_dirty_json
     local i
 
     [[ -n $VALIDATION_LEDGER_FILE ]] || return 0
@@ -828,13 +919,22 @@ function append_validation_ledger {
     done
     gates_json+=']'
 
-    line="{\"schema_version\":2,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
+    if ((VALIDATION_COMMIT_ANCHORED == 1)); then commit_anchored_json=true; else commit_anchored_json=false; fi
+    if ((VALIDATION_TREE_DIRTY == 1)); then tree_dirty_json=true; else tree_dirty_json=false; fi
+
+    # schema_version 3 adds commit_anchored/tree_dirty/selection_mode. The fields
+    # are additive; the parent ledger aggregator reads via .get() and is
+    # unaffected until it is taught to surface them. (warm-vs-cold is already
+    # recorded as cache_state, so this does not duplicate it.)
+    line="{\"schema_version\":3,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
     line+="\"finished_at\":$(json_quote "$finished_at"),\"host\":$(json_quote "$VALIDATION_HOST"),"
     line+="\"slot\":$(json_quote "$VALIDATION_SLOT"),\"cwd\":$(json_quote "$ROOT_DIR"),"
     line+="\"profile\":$(json_quote "$VALIDATION_PROFILE"),"
+    line+="\"selection_mode\":$(json_quote "$VALIDATION_SELECTION_MODE"),"
     line+="\"cache_state\":$(json_quote "$VALIDATION_CACHE_STATE"),"
     line+="\"commit\":$(json_quote "$VALIDATION_COMMIT"),\"git_depth\":$VALIDATION_GIT_DEPTH,"
     line+="\"git_ahead\":$VALIDATION_GIT_AHEAD,\"git_behind\":$VALIDATION_GIT_BEHIND,"
+    line+="\"commit_anchored\":$commit_anchored_json,\"tree_dirty\":$tree_dirty_json,"
     line+="\"result\":\"$result\",\"exit_code\":$exit_status,"
     line+="\"checks\":$checks,\"failures\":$failures,"
     line+="\"real_seconds\":$wall_seconds,\"user_seconds\":$cpu_user,\"sys_seconds\":$cpu_sys,"
@@ -4059,7 +4159,12 @@ print_summary
 # On a fully-green full run, tag the PR unless explicitly disabled. GitHub
 # failures are warnings and never affect the final validation exit status.
 if [[ $VALIDATION_LEVEL == full ]] && ((failures == 0)) && ((LABEL_PR == 1)); then
-    apply_locally_validated_label
+    if ((VALIDATION_COMMIT_ANCHORED == 1)); then
+        apply_locally_validated_label
+    else
+        printf "⚠️  Skipping '%s' label: this run was NOT commit-anchored (dirty tree); the SHA it would claim is not what ran.\n" \
+            "$LOCALLY_VALIDATED_LABEL" >&2
+    fi
 fi
 
 ((failures == 0))
