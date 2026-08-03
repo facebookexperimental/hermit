@@ -395,18 +395,24 @@ jobs:
             fi
 
             # Keep this classifier synchronized with demo-hot-path.yml's paths.
-            # Match the hot-path globs, then subtract the two test-metadata
-            # trees the demo suite provably never reads (manifest/inventory
-            # selection metadata and the standalone backend-parity fixtures).
+            # Match the hot-path globs, then subtract the test trees the demo
+            # suite provably never executes. The demo job runs
+            # `scripts/super-validate.sh --demos-only` (parent demos 1-8 only)
+            # and never runs the Hermit e2e corpus, so nothing under
+            # `tests/e2e/**` can change a demo outcome; the standalone
+            # `tests/backend-parity/**` parity fixtures are likewise never read.
             # A PR whose only hot-path-matching files live under those trees is
             # NOT a demo hot path, so it does not require the serial P0 gate.
+            # Genuinely demo-affecting paths (detcore*/, hermit-cli/, other
+            # guest programs under tests/ such as tests/c/**, Cargo.*, and
+            # demo-hot-path.yml itself) are NOT subtracted and stay hot.
             files="$(
               gh api "repos/${REPO}/pulls/${pr_number}/files" \
                 --paginate --jq '.[].filename'
             )"
             hot_files="$(
               grep -E '^([.]github/workflows/demo-hot-path[.]yml|Cargo[.](lock|toml)|rust-toolchain[.]toml|common/|detcore[^/]*/|examples/|flaky-tests/|hermit-cli/|hermit-install/|hermit-resources/|tests/)' <<< "$files" \
-                | grep -vE '^tests/(e2e/manifests|backend-parity)/' || true
+                | grep -vE '^tests/(e2e|backend-parity)/' || true
             )"
             if [ -n "$hot_files" ]; then
               all_runs="$(
