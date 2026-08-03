@@ -32,7 +32,7 @@
     {
       "group": "build", "job": "workspace",
       "desc": "Build workspace (cargo build --workspace --features third-party-backends)",
-      "cmd": "CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-64} cargo build --workspace --features third-party-backends",
+      "cmd": "CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-$(nproc)} cargo build --workspace --features third-party-backends",
       "deps": ["e2e.metadata"],
       "timeout": 1200,
       "hint": {"est_duration_s": 360, "rss_baseline_bytes": 5368709120,
@@ -41,7 +41,7 @@
     {
       "group": "build", "job": "dbi_release",
       "desc": "Build release Hermit, the DBI plugin, and installed backend resources",
-      "cmd": "CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-64} HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-common cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbi -p hermit-install",
+      "cmd": "CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-$(nproc)} HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-common cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbi -p hermit-install",
       "deps": ["build.workspace"],
       "timeout": 1200,
       "hint": {"est_duration_s": 240, "rss_baseline_bytes": 5368709120,
@@ -50,7 +50,7 @@
     {
       "group": "build", "job": "sabre_release",
       "desc": "Build the release Detcore SaBRe plugin and restage the pinned loader",
-      "cmd": "CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-64} cargo build --release --locked -p detcore-sabre && CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-64} HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-sabre cargo build --release --locked -p hermit-install && sha256sum target/install_pkg/rsrcs/sabre && cat target/install_pkg/rsrcs/sabre.revision",
+      "cmd": "CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-$(nproc)} cargo build --release --locked -p detcore-sabre && CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-$(nproc)} HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-sabre cargo build --release --locked -p hermit-install && sha256sum target/install_pkg/rsrcs/sabre && cat target/install_pkg/rsrcs/sabre.revision",
       "deps": ["build.dbi_release"],
       "timeout": 1200,
       "hint": {"est_duration_s": 90, "rss_baseline_bytes": 3221225472,
