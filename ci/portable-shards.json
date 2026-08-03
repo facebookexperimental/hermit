@@ -11,6 +11,7 @@
   "preflight_nodes": [
     "check.backend_abstraction",
     "check.portability_paths",
+    "check.script_sigpipe",
     "lint.rustfmt"
   ],
   "build_debug_nodes": [
