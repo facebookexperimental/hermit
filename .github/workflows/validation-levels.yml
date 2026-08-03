@@ -132,7 +132,11 @@ jobs:
         # No flock: the PMU counter-exhaustion premise the lock guarded was
         # measured false (per-task counters; 32 concurrent runs, 0 failures).
         # In-DAG resource_caps still serialize genuinely exclusive resources.
-        run: env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
+        # --allow-cgroup-failure: at the advanced runner pin the runner skips its
+        # systemd --user scope under $GITHUB_ACTIONS (hosted AND self-hosted) and
+        # would otherwise fail-close (exit 3); opt out to best-effort UNBOXED
+        # (pre-pin behavior) so this self-hosted lane does not regress RED.
+        run: env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
       - name: Record/replay compatibility ratchet (139 programs)
         run: ./validate.sh --rr-compat-only --no-label-pr --verbose
       - name: Upload privileged DAG performance report

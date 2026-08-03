@@ -91,7 +91,13 @@ jobs:
     # PMU skid is an instruction-space hardware property independent of
     # concurrency, so no determinism argument justifies serializing PMU work.
     - name: PMU, CPUID-faulting, and KVM smoke DAG
-      run: timeout --foreground --kill-after=10s 270s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
+      # --allow-cgroup-failure: at the advanced runner pin, `run` boxes fail-closed
+      # (exit 3) by default, but GitHub Actions (hosted AND self-hosted) sets
+      # $GITHUB_ACTIONS, which makes the runner deliberately SKIP the systemd
+      # --user scope; without this flag the skipped-boxing path would fail-close
+      # this self-hosted lane. Opt out to best-effort UNBOXED (process-group
+      # teardown only) — the pre-pin behavior — rather than regress the lane RED.
+      run: timeout --foreground --kill-after=10s 270s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
     - name: Run non-gating occasional KVM probes
       id: kvm_occasional
       continue-on-error: true
