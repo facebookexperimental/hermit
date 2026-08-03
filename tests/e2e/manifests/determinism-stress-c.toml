@@ -122,6 +122,60 @@ sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
+id = "determinism-stress-c/mmap-fork-shared"
+description = "Strict verification for tests/e2e/determinism-stress/mmap_fork_shared.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/determinism-stress/mmap_fork_shared.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace", "sabre"]
+[test.modes.verify.backends_disabled]
+dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
 id = "determinism-stress-c/pid-tid"
 description = "Strict verification for tests/e2e/determinism-stress/guests/pid_tid.c"
 lane = "portable"
@@ -139,118 +193,6 @@ dbi = "This determinism cell calibrates the ptrace strict-verify baseline; quali
 kvm = "This determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately"
 sabre = "This determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately"
 liteinst = "This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately"
-
-[test.modes.naked]
-ci = false
-backends_enabled = []
-[test.modes.naked.backends_disabled]
-native = "This migration inventories strict verification; it does not assert native nondeterminism"
-
-[test.modes.replay]
-ci = false
-backends_enabled = []
-[test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
-kvm = "Record/replay is unsupported by KVM"
-sabre = "Record/replay is unsupported by SaBRe"
-liteinst = "Record/replay is unsupported by LiteInst"
-
-[test.modes.chaos]
-ci = false
-backends_enabled = []
-[test.modes.chaos.backends_disabled]
-ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
-kvm = "Chaos scheduling is unsupported by KVM"
-sabre = "Chaos scheduling is unsupported by SaBRe"
-liteinst = "Chaos scheduling is unsupported by LiteInst"
-
-[test.modes.custom]
-ci = false
-backends_enabled = []
-[test.modes.custom.backends_disabled]
-ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
-kvm = "No custom edge-case arguments have been calibrated for this C guest"
-sabre = "No custom edge-case arguments have been calibrated for this C guest"
-liteinst = "No custom edge-case arguments have been calibrated for this C guest"
-
-[[test]]
-id = "determinism-stress-c/signal-order"
-description = "Strict verification for tests/e2e/determinism-stress/guests/signal_order.c"
-lane = "portable"
-requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
-timeout_seconds = 90
-occasional = false
-program = "tests/e2e/determinism-stress/guests/signal_order.c"
-observation = { status = true, stdout = true, stderr = false, artifacts = [] }
-
-  [test.build]
-  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare"]
-
-[test.modes.verify]
-ci = true
-backends_enabled = ["ptrace"]
-[test.modes.verify.backends_disabled]
-dbi = "This determinism cell calibrates the ptrace strict-verify baseline; qualify DBI separately"
-kvm = "This determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately"
-sabre = "This determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately"
-liteinst = "This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately"
-
-[test.modes.naked]
-ci = false
-backends_enabled = []
-[test.modes.naked.backends_disabled]
-native = "This migration inventories strict verification; it does not assert native nondeterminism"
-
-[test.modes.replay]
-ci = false
-backends_enabled = []
-[test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
-kvm = "Record/replay is unsupported by KVM"
-sabre = "Record/replay is unsupported by SaBRe"
-liteinst = "Record/replay is unsupported by LiteInst"
-
-[test.modes.chaos]
-ci = false
-backends_enabled = []
-[test.modes.chaos.backends_disabled]
-ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
-kvm = "Chaos scheduling is unsupported by KVM"
-sabre = "Chaos scheduling is unsupported by SaBRe"
-liteinst = "Chaos scheduling is unsupported by LiteInst"
-
-[test.modes.custom]
-ci = false
-backends_enabled = []
-[test.modes.custom.backends_disabled]
-ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
-kvm = "No custom edge-case arguments have been calibrated for this C guest"
-sabre = "No custom edge-case arguments have been calibrated for this C guest"
-liteinst = "No custom edge-case arguments have been calibrated for this C guest"
-
-[[test]]
-id = "determinism-stress-c/mmap-fork-shared"
-description = "Strict verification for tests/e2e/determinism-stress/mmap_fork_shared.c"
-lane = "portable"
-requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
-timeout_seconds = 90
-occasional = false
-program = "tests/e2e/determinism-stress/mmap_fork_shared.c"
-observation = { status = true, stdout = true, stderr = false, artifacts = [] }
-
-[test.modes.verify]
-ci = false
-backends_enabled = ["ptrace", "sabre"]
-[test.modes.verify.backends_disabled]
-dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
-kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
 ci = false
@@ -351,6 +293,119 @@ timeout_seconds = 90
 occasional = false
 program = "tests/e2e/determinism-stress/pipe_prefill.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "This determinism cell calibrates the ptrace strict-verify baseline; qualify DBI separately"
+kvm = "This determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately"
+sabre = "This determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately"
+liteinst = "This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
+id = "determinism-stress-c/producer-consumer"
+description = "Multi-producer/multi-consumer bounded queue (mutex + not_full/not_empty condvars) repeats under strict verification"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/determinism-stress/producer_consumer.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify DBI separately"
+kvm = "This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately"
+sabre = "This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately"
+liteinst = "This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+runs = 5
+assert = { min_distinct = 2 }
+backends_enabled = ["native"]
+[test.modes.naked.backends_disabled]
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the strict-verification determinism cell"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbi = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+[[test]]
+id = "determinism-stress-c/signal-order"
+description = "Strict verification for tests/e2e/determinism-stress/guests/signal_order.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/determinism-stress/guests/signal_order.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+  [test.build]
+  cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare"]
 
 [test.modes.verify]
 ci = true
@@ -506,58 +561,3 @@ kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
-[[test]]
-id = "determinism-stress-c/producer-consumer"
-description = "Multi-producer/multi-consumer bounded queue (mutex + not_full/not_empty condvars) repeats under strict verification"
-lane = "portable"
-requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
-timeout_seconds = 90
-occasional = false
-program = "tests/e2e/determinism-stress/producer_consumer.c"
-observation = { status = true, stdout = true, stderr = false, artifacts = [] }
-
-[test.modes.verify]
-ci = true
-backends_enabled = ["ptrace"]
-[test.modes.verify.backends_disabled]
-dbi = "This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify DBI separately"
-kvm = "This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately"
-sabre = "This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately"
-liteinst = "This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately"
-
-[test.modes.naked]
-ci = false
-runs = 5
-assert = { min_distinct = 2 }
-backends_enabled = ["native"]
-[test.modes.naked.backends_disabled]
-
-[test.modes.replay]
-ci = false
-backends_enabled = []
-[test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from the strict-verification determinism cell"
-dbi = "Record/replay is unsupported by DBI"
-kvm = "Record/replay is unsupported by KVM"
-sabre = "Record/replay is unsupported by SaBRe"
-liteinst = "Record/replay is unsupported by LiteInst"
-
-[test.modes.chaos]
-ci = false
-backends_enabled = []
-[test.modes.chaos.backends_disabled]
-ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
-kvm = "Chaos scheduling is unsupported by KVM"
-sabre = "Chaos scheduling is unsupported by SaBRe"
-liteinst = "Chaos scheduling is unsupported by LiteInst"
-
-[test.modes.custom]
-ci = false
-backends_enabled = []
-[test.modes.custom.backends_disabled]
-ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
-kvm = "No custom edge-case arguments have been calibrated for this C guest"
-sabre = "No custom edge-case arguments have been calibrated for this C guest"
-liteinst = "No custom edge-case arguments have been calibrated for this C guest"
