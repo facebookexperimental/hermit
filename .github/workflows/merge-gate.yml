@@ -395,11 +395,20 @@ jobs:
             fi
 
             # Keep this classifier synchronized with demo-hot-path.yml's paths.
+            # Match the hot-path globs, then subtract the two test-metadata
+            # trees the demo suite provably never reads (manifest/inventory
+            # selection metadata and the standalone backend-parity fixtures).
+            # A PR whose only hot-path-matching files live under those trees is
+            # NOT a demo hot path, so it does not require the serial P0 gate.
             files="$(
               gh api "repos/${REPO}/pulls/${pr_number}/files" \
                 --paginate --jq '.[].filename'
             )"
-            if grep -Eq '^([.]github/workflows/demo-hot-path[.]yml|Cargo[.](lock|toml)|rust-toolchain[.]toml|common/|detcore[^/]*/|examples/|flaky-tests/|hermit-cli/|hermit-install/|hermit-resources/|tests/)' <<< "$files"; then
+            hot_files="$(
+              grep -E '^([.]github/workflows/demo-hot-path[.]yml|Cargo[.](lock|toml)|rust-toolchain[.]toml|common/|detcore[^/]*/|examples/|flaky-tests/|hermit-cli/|hermit-install/|hermit-resources/|tests/)' <<< "$files" \
+                | grep -vE '^tests/(e2e/manifests|backend-parity)/' || true
+            )"
+            if [ -n "$hot_files" ]; then
               all_runs="$(
                 gh api "repos/${REPO}/actions/runs?head_sha=${head_sha}&per_page=100"
               )"
