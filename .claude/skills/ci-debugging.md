@@ -97,6 +97,46 @@ env-only failure, and do not waste a 40-min cycle on a locally-reproducible one.
   A queued/stale/cancelled check is not green — and a single serialized PMU
   privileged runner means queueing is expected, not failure.
 
+## 6. Runner-queue contention vs a code regression
+
+The privileged/PMU lane runs on a **single serialized (flock'd) self-hosted
+runner**. During a landing burst, superseded runs are cancelled mid-build and
+concurrent builds stack on that one host, so wall-clock-sensitive buckets can
+**time out from contention, not correctness**. Before blaming the commit:
+
+- A **timeout** (not an assertion failure) on the single privileged runner during
+  a burst is a **load/queue artifact** until proven otherwise. Real example: the
+  KVM `applications` bucket ran 38s on a quiet runner and 120s (TIMEOUT) 27s later
+  on the same runner under a ~7-commit landing burst — the failing commit only
+  touched an unrelated proc-fd fixture.
+- Check for concurrent/cancelled runs and the **same bucket's baseline timing on a
+  quiet runner** before calling it a regression.
+- A timeout in a bucket **unrelated to the commit's changed category** is a strong
+  contention signal.
+- Fix-forward with `gh run rerun <id> --failed` on a quiet runner; escalate the
+  systemic wall to **load-relative timeouts** — never weaken the correctness
+  assertion to make a loaded runner green.
+- Structurally: **throttle** what fires at the serialized runner. Rebasing in
+  parallel is fine; firing CI at the single runner from N agents is the
+  mass-parallel-drain cancellation cascade.
+
+## 7. Common red cause vs per-PR rebase churn
+
+When main or many PRs are red, do **not** reflexively rebase/re-run every PR.
+First classify **shared-cause vs per-PR-cause**:
+
+- Count which PRs actually touch the failing surface: `gh pr list -R rrnewton/hermit`
+  plus a path grep. Example: across 224 open PRs, only 3 touched `.github/workflows/*`
+  and **0** touched `run-dag.sh`/`safe-ci-dag` — so a CI-DAG fix lands **once** and
+  ~222 product PRs inherit it on their normal rebase.
+- A stale-pin / freshness gate flaps **every** PR red from **one** cause; one
+  product pin-bump clears them all. Chasing it per-PR is O(N) waste for an O(1)
+  root fix.
+- Fix a shared infra/config cause **once at the root**; reserve individual rebases
+  for genuine per-PR content conflicts.
+- Land shared CI/infra refactors **before** a big landing sprint so the fleet
+  inherits them conflict-free.
+
 ## Related
 
 - [hermit-ci](hermit-ci.md) — the CI health & improvement role that uses this skill.

@@ -77,6 +77,35 @@ work as branches/draft PRs and reclaims idle slots to keep total worktree disk
 under the cap. Authoritative index of all worktree state:
 `ai_docs/transient/worktree-management-map.md`.
 
+## Coordination discipline (2026-08-02 retro)
+
+Standing rules distilled from repeated process blockers
+(`ai_docs/process-improvements-retro_20260802.md`):
+
+- **Cold-verify / measure-twice.** Treat warm checkouts and pre-fetch refs as
+  suspect. **Fetch first, then re-measure** before acting on ahead/behind/dirty
+  state; prove reachability (patch-id / ancestry) before any destructive
+  reconciliation; never `git clean`. Label a result "warm, not cold-verified" if
+  it wasn't. A 3-second "full build+test" is not physically plausible — suspect a
+  cache or skipped step.
+- **Execute, don't deliberate.** If the task or standing policy already authorizes
+  an action (close+respawn, land routine work, publish a draft PR), **do it** and
+  report — do not stall at an option menu. Reserve questions for genuinely
+  owner-only decisions.
+- **Don't manage healthy agents.** Suppress idle pings to an agent that is
+  actively producing (commits/PR/notes in the interval). Read its ground-truth
+  output; intervene only on a real stall, stream error, or blocker note.
+- **Interrogate blockers first-principles.** A blocker is a hypothesis until
+  reproduced with an exact error + exit status. Ask *what failed, why, and do we
+  even need it?* An `os error 2`/ENOENT from a build step is a **missing-tool**
+  hypothesis, not a missing input. Reject narratives with no exact error attached.
+- **Ground truth, not chatter.** Bind every status to a SHA/PR/run, never a branch
+  name or an agent's assertion. Close a task only after the merge commit is
+  reachable from `origin/main`. Health rollups read artifacts, not self-reports.
+
+For CI-specific discipline (single-shard iteration, runner-queue contention,
+common-cause-vs-per-PR), see [ci-debugging](ci-debugging.md).
+
 ## Related
 
 - Policy source: `AGENTS.md` / `CLAUDE.md`.
