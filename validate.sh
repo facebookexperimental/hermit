@@ -282,24 +282,12 @@ VALIDATION_PROFILE=$VALIDATION_LEVEL
 ((ONLY_MODE == 1)) && VALIDATION_PROFILE="only-$ONLY_LANE"
 ((SELECTIVE_MODE == 1)) && VALIDATION_PROFILE="selective"
 
-case "$VALIDATION_PROFILE" in
-    quick) VALIDATION_ESTIMATE="about 3 minutes" ;;
-    portable-only) VALIDATION_ESTIMATE="about 8 minutes" ;;
-    full) VALIDATION_ESTIMATE="about 20-70 minutes; R/R fails fast if its canary is broken" ;;
-    super) VALIDATION_ESTIMATE="about 30-90 minutes, depending on repetitions and backends" ;;
-    strict-compat-only) VALIDATION_ESTIMATE="about 5-15 minutes" ;;
-    portable-strict-compat-only) VALIDATION_ESTIMATE="about 5-15 minutes" ;;
-    rr-compat-only) VALIDATION_ESTIMATE="about 5-65 minutes when healthy; fails fast on canary failure" ;;
-    sabre-compat-only) VALIDATION_ESTIMATE="about 10-20 minutes" ;;
-    e9patch-compat-only) VALIDATION_ESTIMATE="about 5-20 minutes" ;;
-    liteinst-compat-only) VALIDATION_ESTIMATE="about 5-15 minutes" ;;
-    qemu-l2-only) VALIDATION_ESTIMATE="about 30-60 minutes" ;;
-    privileged-only) VALIDATION_ESTIMATE="about 60-180 minutes" ;;
-    envelope-only) VALIDATION_ESTIMATE="about 5 minutes" ;;
-    only-*) VALIDATION_ESTIMATE="one prebuilt DAG shard" ;;
-    selective) VALIDATION_ESTIMATE="a dependency-closed subset of the portable lane (full lane on any doubt)" ;;
-esac
-readonly VALIDATION_ESTIMATE
+# The runtime estimate is NOT a hand-written static guess anymore (a fabricated
+# range is exactly the cost-blindness we want to avoid). It is measured from this
+# machine's own validate-run history for the SAME profile and the SAME build-cache
+# state (warm/cold target/ dominates wall time), computed at banner time by
+# history_estimate below. When history is too thin the banner says so honestly
+# instead of printing an invented range.
 
 default_gate_timeout_seconds=600
 if ((QEMU_L2_ONLY == 1)); then
@@ -343,6 +331,7 @@ readonly VALIDATION_LEVEL VALIDATION_PROFILE
 
 VALIDATION_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 VALIDATION_STARTED_EPOCH=$(date +%s)
+VALIDATION_HOST=$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf "unknown")
 DEV_HERMIT_PARENT=$(find_dev_hermit_parent || true)
 VALIDATION_SLOT=$(validation_slot_name "$DEV_HERMIT_PARENT")
 VALIDATION_LEDGER_FILE=${HERMIT_VALIDATE_LEDGER:-}
@@ -358,7 +347,7 @@ if git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null; then
         git rev-list --left-right --count origin/main...HEAD 2>/dev/null || printf "0 0\n"
     )
 fi
-readonly VALIDATION_STARTED_AT VALIDATION_STARTED_EPOCH DEV_HERMIT_PARENT
+readonly VALIDATION_STARTED_AT VALIDATION_STARTED_EPOCH VALIDATION_HOST DEV_HERMIT_PARENT
 readonly VALIDATION_SLOT VALIDATION_LEDGER_FILE VALIDATION_COMMIT VALIDATION_GIT_DEPTH
 readonly VALIDATION_GIT_AHEAD VALIDATION_GIT_BEHIND
 
@@ -442,6 +431,127 @@ export XDG_CONFIG_HOME="$VALIDATION_TMP_DIR/xdg-config"
 mkdir -p "$XDG_CONFIG_HOME"
 readonly XDG_CONFIG_HOME
 
+# Classify the build-cache state BEFORE this run builds anything. A cold target/
+# forces a full rebuild of hermit + its dependency graph, which dominates wall
+# time; a warm target/ reuses it and the build becomes near-incremental. This is
+# the single biggest factor in how long a run takes, so the estimate and the
+# history ledger both record it. The presence of a compiled hermit binary is a
+# reliable proxy for "target/ has been populated by a prior build":
+#   warm    = both debug and release binaries present
+#   partial = exactly one present (the other profile still rebuilds cold)
+#   cold    = neither present (fresh target/, full rebuild ahead)
+function detect_cache_state {
+    local have_debug=0 have_release=0
+    [[ -x "$ROOT_DIR/target/debug/hermit" ]] && have_debug=1
+    [[ -x "$ROOT_DIR/target/release/hermit" ]] && have_release=1
+    if ((have_debug == 1 && have_release == 1)); then
+        printf "warm"
+    elif ((have_debug == 1 || have_release == 1)); then
+        printf "partial"
+    else
+        printf "cold"
+    fi
+}
+
+# Print a REAL runtime estimate derived from this machine's validate-run history,
+# or an honest "not enough history" message. It consumes the shared
+# validate-run-ledger schema (schema_version >= 1) that this script writes and
+# that ci-hub/validate/aggregate.py aggregates machine-wide -- we read the same
+# records rather than inventing a parallel store. Only successful (result=="pass")
+# runs of the SAME profile count, because a fast-failing or timed-out run is not a
+# representative completion time. The estimate is bucketed by cache state because
+# warm vs cold dominates wall time; it degrades through progressively broader
+# scopes and, when even the broadest is too thin, says so instead of fabricating.
+# Args: profile cache_state host ledger_file
+function history_estimate {
+    local profile=$1 cache=$2 host=$3 ledger=$4
+
+    if [[ -z $ledger || ! -f $ledger ]]; then
+        printf "no measured estimate yet (no run-history ledger; this run seeds it)"
+        return 0
+    fi
+
+    awk -v PROFILE="$profile" -v CACHE="$cache" -v HOST="$host" '
+        # POSIX-awk scalar extractors (no gawk match()-with-array extension).
+        # The ledger fields we read (profile/cache_state/host/result are simple
+        # token strings; real_seconds is a bare integer) never contain escaped
+        # quotes, so anchored regex extraction is safe.
+        function field(line, key,   re, s) {
+            re = "\"" key "\":\"[^\"]*\""
+            if (match(line, re)) {
+                s = substr(line, RSTART, RLENGTH)
+                sub("^\"" key "\":\"", "", s)
+                sub("\"$", "", s)
+                return s
+            }
+            return ""
+        }
+        function numfield(line, key,   re, s) {
+            re = "\"" key "\":[0-9]+"
+            if (match(line, re)) {
+                s = substr(line, RSTART, RLENGTH)
+                sub("^\"" key "\":", "", s)
+                return s + 0
+            }
+            return -1
+        }
+        function isort(a, n,   i, j, key) {
+            for (i = 1; i < n; i++) {
+                key = a[i]; j = i - 1
+                while (j >= 0 && a[j] > key) { a[j + 1] = a[j]; j-- }
+                a[j + 1] = key
+            }
+        }
+        function dur(s,   x, h, m, sec) {
+            x = int(s + 0.5)
+            h = int(x / 3600); m = int((x % 3600) / 60); sec = x % 60
+            if (h > 0) return sprintf("%dh%02dm%02ds", h, m, sec)
+            if (m > 0) return sprintf("%dm%02ds", m, sec)
+            return sprintf("%ds", sec)
+        }
+        function emit(a, n, scope,   md, lo, hi) {
+            isort(a, n)
+            lo = a[0]; hi = a[n - 1]
+            if (n % 2 == 1) md = a[int(n / 2)]
+            else md = (a[n / 2 - 1] + a[n / 2]) / 2
+            if (lo == hi)
+                printf "~%s (%s, n=%d)\n", dur(md), scope, n
+            else
+                printf "~%s (median; range %s-%s; %s, n=%d)\n", \
+                    dur(md), dur(lo), dur(hi), scope, n
+        }
+        BEGIN { n1 = 0; n2 = 0; n3 = 0; MIN = 3 }
+        {
+            if (field($0, "profile") != PROFILE) next
+            if (field($0, "result") != "pass") next
+            w = numfield($0, "real_seconds")
+            if (w <= 0) next
+            cs = field($0, "cache_state")
+            hs = field($0, "host")
+            t3[n3++] = w                                   # any cache, any host
+            if (cs == CACHE) {
+                t2[n2++] = w                               # same cache, any host
+                if (hs == HOST) t1[n1++] = w               # same cache, same host
+            }
+        }
+        END {
+            if (n1 >= MIN)
+                emit(t1, n1, CACHE " cache, " HOST ", this profile")
+            else if (n2 >= MIN)
+                emit(t2, n2, CACHE " cache, any host, this profile")
+            else if (n3 >= MIN)
+                emit(t3, n3, "MIXED warm/cold -- no " CACHE \
+                    "-specific history yet, treat as a wide prior; this profile")
+            else
+                printf "insufficient history to estimate (only %d prior successful %s run(s); need >=%d). Current cache: %s. This run seeds the estimate.\n", \
+                    n3, PROFILE, MIN, CACHE
+        }
+    ' "$ledger"
+}
+
+VALIDATION_CACHE_STATE=$(detect_cache_state)
+readonly VALIDATION_CACHE_STATE
+
 LOG_FILE=$(mktemp "${TMPDIR:-/tmp}/hermit-validate.XXXXXX.log")
 if [[ -z $LOG_FILE ]]; then
     echo "Unable to create validation log." >&2
@@ -451,7 +561,12 @@ readonly LOG_FILE
 printf "Hermit validation log\nRoot: %s\nLevel: %s\nHost OS: %s\n\n" \
     "$ROOT_DIR" "$VALIDATION_PROFILE" "$HOST_OS" >"$LOG_FILE"
 printf "Validation level: %s (host OS: %s)\n" "$VALIDATION_PROFILE" "$HOST_OS"
-printf "Estimated time: %s\n" "$VALIDATION_ESTIMATE"
+printf "Build cache: %s (target/ debug=%s release=%s)\n" \
+    "$VALIDATION_CACHE_STATE" \
+    "$([[ -x "$ROOT_DIR/target/debug/hermit" ]] && printf present || printf absent)" \
+    "$([[ -x "$ROOT_DIR/target/release/hermit" ]] && printf present || printf absent)"
+printf "Estimated time: %s\n" \
+    "$(history_estimate "$VALIDATION_PROFILE" "$VALIDATION_CACHE_STATE" "$VALIDATION_HOST" "$VALIDATION_LEDGER_FILE")"
 if [[ $VALIDATION_LEVEL == super ]]; then
     printf "Super stress: %s repetitions/probe, up to %s concurrent jobs (%s online CPUs)\n" \
         "$SUPER_REPETITIONS" "$SUPER_JOBS" "$host_cpus"
@@ -678,31 +793,19 @@ function json_quote {
     printf '"%s"' "$value"
 }
 
+# Append one JSONL record to the shared validate-run ledger. Wall and CPU seconds
+# are computed once by the caller (cleanup) in the top-level shell so they match
+# the human summary exactly and so the `times` builtin sees the accumulated child
+# CPU (a subshell would report only its own times). See print_wall_cpu_summary.
 function append_validation_ledger {
     local exit_status=$1
-    local finished_at finished_epoch wall_seconds cpu_times cpu_user cpu_sys
-    local result gates_json gate_result line host
+    local wall_seconds=$2 cpu_user=$3 cpu_sys=$4
+    local finished_at result gates_json gate_result line
     local i
 
     [[ -n $VALIDATION_LEDGER_FILE ]] || return 0
 
     finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    finished_epoch=$(date +%s)
-    wall_seconds=$((finished_epoch - VALIDATION_STARTED_EPOCH))
-    times >"$VALIDATION_TMP_DIR/cpu-times"
-    cpu_times=$(<"$VALIDATION_TMP_DIR/cpu-times")
-    read -r cpu_user cpu_sys < <(
-        awk '
-            function seconds(value, parts) {
-                split(value, parts, "m")
-                sub(/s$/, "", parts[2])
-                return parts[1] * 60 + parts[2]
-            }
-            NR == 1 { user += seconds($1); sys += seconds($2) }
-            NR == 2 { user += seconds($1); sys += seconds($2) }
-            END { printf "%.3f %.3f\n", user, sys }
-        ' <<<"$cpu_times"
-    )
 
     if ((exit_status == 0 && failures == 0)); then
         result=pass
@@ -725,11 +828,11 @@ function append_validation_ledger {
     done
     gates_json+=']'
 
-    host=$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf "unknown")
-    line="{\"schema_version\":1,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
-    line+="\"finished_at\":$(json_quote "$finished_at"),\"host\":$(json_quote "$host"),"
+    line="{\"schema_version\":2,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
+    line+="\"finished_at\":$(json_quote "$finished_at"),\"host\":$(json_quote "$VALIDATION_HOST"),"
     line+="\"slot\":$(json_quote "$VALIDATION_SLOT"),\"cwd\":$(json_quote "$ROOT_DIR"),"
     line+="\"profile\":$(json_quote "$VALIDATION_PROFILE"),"
+    line+="\"cache_state\":$(json_quote "$VALIDATION_CACHE_STATE"),"
     line+="\"commit\":$(json_quote "$VALIDATION_COMMIT"),\"git_depth\":$VALIDATION_GIT_DEPTH,"
     line+="\"git_ahead\":$VALIDATION_GIT_AHEAD,\"git_behind\":$VALIDATION_GIT_BEHIND,"
     line+="\"result\":\"$result\",\"exit_code\":$exit_status,"
@@ -756,6 +859,51 @@ function append_validation_ledger {
     fi
 }
 
+function human_duration {
+    awk -v t="$1" 'BEGIN {
+        x = int(t + 0.5)
+        h = int(x / 3600); m = int((x % 3600) / 60); s = x % 60
+        if (h > 0) printf "%dh%02dm%02ds", h, m, s
+        else if (m > 0) printf "%dm%02ds", m, s
+        else printf "%ds", s
+    }'
+}
+
+# Always-printed final line: wall AND CPU for the whole run. CPU (user+sys, whole
+# process tree) vs wall is what distinguishes a genuinely-busy run from one that
+# is blocked or spinning while merely appearing hung: CPU near zero against a
+# large wall means waiting/blocked, while ~1 core pinned across a multi-core host
+# can mean single-threaded work or a spin. Emitted on success, failure, timeout,
+# and interruption alike.
+function print_wall_cpu_summary {
+    local exit_status=$1 wall=$2 user=$3 sys=$4
+    local cpu ratio marker hint=""
+
+    cpu=$(awk -v u="$user" -v s="$sys" 'BEGIN { printf "%.1f", u + s }')
+    if ((wall > 0)); then
+        ratio=$(awk -v c="$cpu" -v w="$wall" 'BEGIN { printf "%.1f", c / w }')
+    else
+        ratio="n/a"
+    fi
+    if ((exit_status == 0 && failures == 0)); then
+        marker="✅"
+    else
+        marker="❌"
+    fi
+    if ((wall >= 30)); then
+        if awk -v c="$cpu" -v w="$wall" 'BEGIN { exit !(c < 0.10 * w) }'; then
+            hint="  (low CPU vs wall — mostly waiting/blocked, not compute-bound)"
+        elif ((host_cpus > 2)) && \
+            awk -v r="$ratio" 'BEGIN { exit !(r + 0 >= 0.8 && r + 0 <= 1.2) }'; then
+            hint="  (~1 core busy — single-threaded or possibly spinning)"
+        fi
+    fi
+    printf "%s Elapsed: wall %s | CPU %s (user %s, sys %s) | CPU/wall %sx across %s cores%s\n" \
+        "$marker" "$(human_duration "$wall")" "$(human_duration "$cpu")" \
+        "$(human_duration "$user")" "$(human_duration "$sys")" \
+        "$ratio" "$host_cpus" "$hint"
+}
+
 function cleanup {
     local exit_status=$?
     local pid
@@ -769,12 +917,37 @@ function cleanup {
         kill_process_tree "$pid" TERM
     done
     wait 2>/dev/null || true
+
+    # Wall + CPU for the whole run, computed ONCE here in the trap's top-level
+    # shell context (a subshell's `times` would miss the accumulated child CPU).
+    # The same numbers feed both the ledger and the always-printed summary.
+    local finished_epoch validation_wall validation_user="0" validation_sys="0"
+    finished_epoch=$(date +%s)
+    validation_wall=$((finished_epoch - VALIDATION_STARTED_EPOCH))
+    if times >"$VALIDATION_TMP_DIR/cpu-times" 2>/dev/null; then
+        read -r validation_user validation_sys < <(
+            awk '
+                function seconds(value, parts) {
+                    split(value, parts, "m")
+                    sub(/s$/, "", parts[2])
+                    return parts[1] * 60 + parts[2]
+                }
+                NR == 1 { user += seconds($1); sys += seconds($2) }
+                NR == 2 { user += seconds($1); sys += seconds($2) }
+                END { printf "%.3f %.3f\n", user, sys }
+            ' "$VALIDATION_TMP_DIR/cpu-times"
+        )
+    fi
+
     if declare -F print_compatibility_summary >/dev/null; then
         print_compatibility_summary
     fi
-    append_validation_ledger "$exit_status"
+    append_validation_ledger "$exit_status" \
+        "$validation_wall" "$validation_user" "$validation_sys"
     rm -rf "$VALIDATION_TMP_DIR"
     rm -rf "$REAL_COMPAT_FIXTURES"
+    print_wall_cpu_summary "$exit_status" \
+        "$validation_wall" "$validation_user" "$validation_sys"
     exit "$exit_status"
 }
 
