@@ -235,8 +235,8 @@ function assert_parallel_portable_workflow {
 
     ((run_dag_count == 0)) ||
         die "GitHub portable workflow must not retain the serial ci/run-dag.sh entrypoint"
-    ((run_node_count == 6)) ||
-        die "GitHub portable workflow must have six audited ci/run-node.sh entrypoints"
+    ((run_node_count == 5)) ||
+        die "GitHub portable workflow must have five audited ci/run-node.sh entrypoints"
     [[ $(grep -Fxc '        run: ./ci/check-shard-coverage.sh' "$workflow") == 1 ]] ||
         die "GitHub portable workflow must run the shard-coverage guard exactly once"
     # Match the literal command embedded in workflow YAML.
@@ -253,7 +253,7 @@ function assert_parallel_portable_workflow {
         die "GitHub portable debug shards must verify the installed DBI runtime"
     [[ $(grep -Fxc '          test -f target/debug/deps/libdetcore_dbi.so' "$workflow") == 2 ]] ||
         die "GitHub portable workflow must package and verify the debug DBI cdylib"
-    [[ $(grep -Fxc '    needs: [plan, build-debug, build-dbi]' "$workflow") == 1 ]] ||
+    [[ $(grep -Fxc '    needs: [plan, build-debug, build-release]' "$workflow") == 1 ]] ||
         die "GitHub portable debug shards must wait for the complete DBI install package"
     [[ $(grep -Fxc '          test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun' "$workflow") == 1 ]] ||
         die "GitHub portable debug shards must verify the DynamoRIO launcher"

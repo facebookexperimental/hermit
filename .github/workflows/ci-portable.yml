@@ -11,12 +11,19 @@ name: CI (GitHub-managed portable)
 # test.liteinst_strict 52s), so ~half the wall is left on the table
 # (benchmarks/ci-dag-portable_20260802). This workflow exploits that headroom.
 #
-# WHAT: build the workspace + backends ONCE, split so no single build job exceeds
-# ~10 min (build.dbi_release alone was 564s), publish short-lived artifacts, then
+# WHAT: build the workspace + backends ONCE, publish short-lived artifacts, then
 # fan every test/lint/doc block out to its own small runner that runs EXACTLY its
 # assigned DAG nodes via ci/run-node.sh against the prebuilt tree. Wall time
-# becomes max(build stage, slowest single shard) instead of the serial sum, and
-# every JOB targets <10 min for fast, GitHub-hosted-ceiling-safe feedback.
+# becomes max(build stage, slowest single shard) instead of the serial sum.
+#
+# The release backends compile in ONE build-release job (build.dbi_release +
+# build.sabre_release + build.liteinst_runtime_release). An earlier
+# build-dbi-cache -> build-dbi -> build-aux split chased a <10-min-per-build-job
+# target but was a net loss: it re-compiled detcore-dbi twice and shuttled
+# target/release through two extra artifact round-trips, turning one ~9.4-min node
+# into ~18 min across three serial jobs (benchmarks/ci-dag-portable_20260802).
+# build.dbi_release alone is ~10-12 min cold on a 4-core hosted runner, so the
+# per-job target is met by a warm cargo cache, not by fragmenting the compile.
 #
 # CORRESPONDENCE (fail-closed): ci/check-shard-coverage.sh asserts the shard map
 # (ci/portable-shards.json) assigns every non-e2e portable node to exactly one
@@ -49,10 +56,8 @@ env:
   DETCORE_TEST_RUST_LOG: "off"
   DEBUG_ARTIFACT: hermit-debug-${{ github.run_id }}
   DEBUG_TARBALL: hermit-portable-debug.tzst
-  RELEASE_DBI_CACHE_ARTIFACT: hermit-release-dbi-cache-${{ github.run_id }}
   RELEASE_DBI_ARTIFACT: hermit-release-dbi-${{ github.run_id }}
   RELEASE_ARTIFACT: hermit-release-${{ github.run_id }}
-  RELEASE_CACHE_TARBALL: hermit-portable-release-cache.tzst
   RELEASE_TARBALL: hermit-portable-release.tzst
 
 jobs:
@@ -217,11 +222,17 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # ------------------------- build (release: split the former 564s DBI long pole)
-  build-dbi-cache:
-    name: Compile dbi release cache (<10m)
+  # ---------------------- build (release: dbi + sabre + liteinst, ONE warm pass)
+  # Consolidated from the former build-dbi-cache -> build-dbi -> build-aux serial
+  # chain (see the WHAT note above). Runs every release build node in one
+  # cargo-warm job, packs target/ ONCE, and publishes both the DBI install package
+  # (RELEASE_DBI_ARTIFACT, consumed by the debug shards) and the full release tree
+  # (RELEASE_ARTIFACT, consumed by the release/e2e/sabre shards). Both artifacts
+  # carry the identical prebuilt tree, so downstream consumers are unchanged.
+  build-release:
+    name: Build release backends once (dbi + sabre + liteinst)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: Initialize safe-ci-dag-runner submodule
@@ -238,56 +249,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang cmake file g++ gcc git jq libelf-dev libunwind-dev liblzma-dev make pkg-config python3-full zlib1g-dev zstd
-      # Compile the Detcore DBI library separately. The next job receives Cargo's
-      # exact release fingerprints/build outputs, so the final Hermit/install
-      # staging command reuses this work instead of repeating the cold long pole.
-      - name: Compile Detcore DBI release library
-        run: CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-64} cargo build --release --locked -p detcore-dbi
-      - name: Pack dbi release compile cache
-        run: |
-          set -euo pipefail
-          tar --zstd -cf "$RELEASE_CACHE_TARBALL" \
-            --exclude='target/release/incremental' \
-            target/release
-          ls -lh "$RELEASE_CACHE_TARBALL"
-      - name: Upload dbi release compile cache
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.RELEASE_DBI_CACHE_ARTIFACT }}
-          path: ${{ env.RELEASE_CACHE_TARBALL }}
-          if-no-files-found: error
-          retention-days: 1
-
-  build-dbi:
-    name: Stage dbi release artifact (<10m)
-    needs: build-dbi-cache
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - name: Initialize safe-ci-dag-runner submodule
-        run: git submodule update --init agent-utils
-      - uses: actions/setup-go@v5
-        with:
-          go-version: stable
-          cache: false
-      - name: Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang cmake file g++ gcc git jq libelf-dev libunwind-dev liblzma-dev make pkg-config python3-full zlib1g-dev zstd
-      - name: Download dbi release compile cache
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.RELEASE_DBI_CACHE_ARTIFACT }}
-          path: .
-      - name: Unpack dbi release compile cache
-        run: |
-          set -euo pipefail
-          tar --zstd -xf "$RELEASE_CACHE_TARBALL"
-          rm -f "$RELEASE_CACHE_TARBALL"
-      - name: Run dbi release staging node
-        run: ./ci/run-node.sh portable "$(jq -r '.build_dbi_nodes|join(",")' ci/portable-shards.json)"
-      - name: Pack dbi release prebuilt tree
+      # Reproduce EXACTLY the release build nodes from portable.json (no drift):
+      # build.dbi_release, build.sabre_release, build.liteinst_runtime_release.
+      - name: Run release build nodes (dbi + sabre + liteinst)
+        run: ./ci/run-node.sh portable "$(jq -r '(.build_dbi_nodes + .build_aux_nodes)|join(",")' ci/portable-shards.json)"
+      - name: Pack full release prebuilt tree (dbi + sabre + liteinst)
         run: |
           set -euo pipefail
           tar --zstd -cf "$RELEASE_TARBALL" \
@@ -299,62 +265,14 @@ jobs:
             target/release \
             target/install_pkg
           ls -lh "$RELEASE_TARBALL"
-      - name: Upload dbi release prebuilt tree
+      - name: Upload DBI install package (debug shards)
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.RELEASE_DBI_ARTIFACT }}
           path: ${{ env.RELEASE_TARBALL }}
           if-no-files-found: error
           retention-days: 1
-
-  # --------------------------------- build (release: sabre + liteinst, warm cache)
-  build-aux:
-    name: Build sabre + liteinst release (warm)
-    needs: build-dbi
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - name: Initialize safe-ci-dag-runner submodule
-        run: git submodule update --init agent-utils
-      - uses: actions/setup-go@v5
-        with:
-          go-version: stable
-          cache: false
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: portable-parallel-release
-          save-if: false
-      - name: Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang cmake file g++ gcc git jq libelf-dev libunwind-dev liblzma-dev make pkg-config python3-full zlib1g-dev zstd
-      - name: Download dbi release prebuilt tree
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.RELEASE_DBI_ARTIFACT }}
-          path: .
-      - name: Unpack dbi release prebuilt tree
-        run: |
-          set -euo pipefail
-          tar --zstd -xf "$RELEASE_TARBALL"
-          rm -f "$RELEASE_TARBALL"
-          test -x target/release/hermit
-      - name: Run sabre + liteinst release build nodes
-        run: ./ci/run-node.sh portable "$(jq -r '.build_aux_nodes|join(",")' ci/portable-shards.json)"
-      - name: Repack full release prebuilt tree (dbi + sabre + liteinst)
-        run: |
-          set -euo pipefail
-          tar --zstd -cf "$RELEASE_TARBALL" \
-            --exclude='target/release/deps' \
-            --exclude='target/release/build' \
-            --exclude='target/release/incremental' \
-            --exclude='target/release/.fingerprint' \
-            --exclude='target/release/examples' \
-            target/release \
-            target/install_pkg
-          ls -lh "$RELEASE_TARBALL"
-      - name: Upload full release prebuilt tree
+      - name: Upload full release prebuilt tree (release + e2e + sabre)
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.RELEASE_ARTIFACT }}
@@ -365,7 +283,7 @@ jobs:
   # ------------------------------------------------- test shards (debug-backed)
   test-debug:
     name: "test: ${{ matrix.slug }}"
-    needs: [plan, build-debug, build-dbi]
+    needs: [plan, build-debug, build-release]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -418,7 +336,7 @@ jobs:
   # ----------------------------------------------- test shards (release-backed)
   test-release:
     name: "test: ${{ matrix.slug }}"
-    needs: [plan, build-dbi, build-aux]
+    needs: [plan, build-release]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -459,7 +377,7 @@ jobs:
   # ------------------------------------------------------------- e2e cells
   e2e:
     name: "e2e: ${{ matrix.slug }}"
-    needs: [build-debug, build-aux]
+    needs: [build-debug, build-release]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -564,7 +482,7 @@ jobs:
   # coordinator socket cannot survive guest exec.
   sabre_non_gated_parity:
     name: SaBRe non-gating exec diagnostics
-    needs: build-aux
+    needs: build-release
     continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -696,9 +614,7 @@ jobs:
       - plan
       - preflight
       - build-debug
-      - build-dbi-cache
-      - build-dbi
-      - build-aux
+      - build-release
       - test-debug
       - test-release
       - e2e
@@ -733,7 +649,6 @@ jobs:
           script: |
             const names = new Set([
               `hermit-debug-${context.runId}`,
-              `hermit-release-dbi-cache-${context.runId}`,
               `hermit-release-dbi-${context.runId}`,
               `hermit-release-${context.runId}`,
             ]);
