@@ -20,14 +20,18 @@ on:
         required: true
         type: string
 
-# This lightweight required check accepts an exact PR head after the repository
-# GitHub-managed portable CI job succeeds or after a fully green local validate.sh
-# run applies the locally-validated label. The independent Reverie-pin lint does
-# not taint this product-test result. Demo-relevant changes
-# additionally require the exact-SHA P0 demo gate; local validation never bypasses
-# that owner-mandated gate. Privileged CI is an independent bonus signal.
-# Merge-group checks inspect their constituent PR heads instead of trusting the
-# synthetic queue commit.
+# This required check is the SOLE required status check on main (branch ruleset
+# "main no-bypass gate", 2026-08-02): it accepts an exact PR head when EITHER a
+# fully green local validate.sh run applied the locally-validated label, OR the
+# GitHub-Actions leg is green -- and GitHub-Actions-green now means the portable
+# job AND the privileged job both succeeded, not the portable job alone. The
+# independent Reverie-pin lint does not taint this product-test result. Owner
+# rationale: GitHub CI flakiness must never block a locally-validated PR, so the
+# standalone "Regular tests (GitHub-managed portable)" requirement was folded
+# into this gate's GitHub-Actions leg and dropped from the ruleset. Demo-relevant
+# changes additionally require the exact-SHA P0 demo gate; local validation never
+# bypasses that owner-mandated gate. Merge-group checks inspect their constituent
+# PR heads instead of trusting the synthetic queue commit.
 #
 # The gate is fork-only because facebookexperimental/hermit has no access to the
 # fork privileged runners and fork pull requests receive a read-only token in
@@ -421,6 +425,45 @@ jobs:
                   echo "Authoritative portable job passed for PR #${pr_number} at $head_sha: ${job_url:-$url}"
                 else
                   echo "::error::Regular tests (GitHub-managed portable) for PR #${pr_number} at $head_sha is $job_status/${job_conclusion:-none}: ${job_url:-${url:-no run URL}}."
+                  failed=1
+                fi
+              fi
+
+              # Owner policy (2026-08-02): GitHub-Actions validation means the
+              # portable job AND the privileged job are both green. Only a
+              # locally-validated PR bypasses this leg entirely. The privileged
+              # job runs on the fork's self-hosted PMU runner (ci-privileged.yml)
+              # and is the KVM/PMU/E2E authority the portable lane cannot provide.
+              priv_runs="$(
+                gh api "repos/${REPO}/actions/workflows/ci-privileged.yml/runs?head_sha=${head_sha}&per_page=100"
+              )"
+              priv_run="$(jq --arg sha "$head_sha" '
+                [.workflow_runs[] | select(.head_sha == $sha)]
+                | sort_by(.created_at)
+                | last // {}
+              ' <<< "$priv_runs")"
+              priv_run_id="$(jq -r '.id // ""' <<< "$priv_run")"
+              priv_url="$(jq -r '.html_url // ""' <<< "$priv_run")"
+
+              if [ -z "$priv_run_id" ]; then
+                echo "::error::No ci-privileged.yml run for PR #${pr_number} at $head_sha; GitHub-Actions validation requires the privileged job green. Apply locally-validated to use the local-validation leg instead."
+                failed=1
+              else
+                priv_jobs="$(
+                  gh api "repos/${REPO}/actions/runs/${priv_run_id}/jobs?filter=latest&per_page=100"
+                )"
+                priv_job="$(jq '
+                  [.jobs[] | select(.name == "Privileged capability and E2E tests")]
+                  | last // {}
+                ' <<< "$priv_jobs")"
+                priv_status="$(jq -r '.status // "missing"' <<< "$priv_job")"
+                priv_conclusion="$(jq -r '.conclusion // ""' <<< "$priv_job")"
+                priv_job_url="$(jq -r '.html_url // ""' <<< "$priv_job")"
+
+                if [ "$priv_status:$priv_conclusion" = completed:success ]; then
+                  echo "Privileged job passed for PR #${pr_number} at $head_sha: ${priv_job_url:-$priv_url}"
+                else
+                  echo "::error::Privileged capability and E2E tests for PR #${pr_number} at $head_sha is $priv_status/${priv_conclusion:-none}: ${priv_job_url:-${priv_url:-no run URL}}."
                   failed=1
                 fi
               fi
