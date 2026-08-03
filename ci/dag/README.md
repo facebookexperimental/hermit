@@ -27,9 +27,10 @@ ci/run-dag.sh portable   ascii                   # visualize instead of run
 ## Status: active validation lanes
 
 `portable.json` drives the required `Regular tests (GitHub-managed portable)` job, and
-`privileged.json` drives both privileged PMU entrypoints. Existing job names,
-the merge-gate contract, and the outer PMU `flock` stay unchanged; only the
-internal scheduler changes. The DAG files are the load-bearing source of truth
+`privileged.json` drives both privileged PMU entrypoints. Existing job names and
+the merge-gate contract stay unchanged; only the internal scheduler changes (the
+former outer PMU `flock` was retired — see below). The DAG files are the
+load-bearing source of truth
 for individual gate commands; `validate.sh` delegates to them.
 
 The privileged DAG is limited to the focused build, CPUID faulting, PMU skid,
@@ -148,9 +149,16 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
   PMU host contend for the counter). Manifest buckets use disjoint cell trees
   and portable timing relaxations, so they use a separate
   `{"manifest_guest": 4}` pool after the shared build barrier. Non-guest gates
-  carry no scarce resource and parallelize freely. `privileged.json` uses
-  `{"pmu": 1}` the same way; the PMU is genuinely exclusive, so that lane is
-  essentially serial after the initial builds.
+  carry no scarce resource and parallelize freely. `privileged.json` caps only
+  `{"kvm": 1}`. The PMU is **not** a scarce resource and carries no cap: reverie
+  measures retired conditional branches with per-task (`cpu = -1`) counters that
+  the kernel context-switches, so only the running task's counters need be
+  resident; 32 concurrent `run --strict --verify` processes pinned to one core
+  all pass with zero `perf_event_open` failures (measured in the dev-hermit
+  parent, `experiments/pmu-concurrency-ceiling-measured_20260803`). PMU
+  exhaustion, if it ever occurred, fails **loudly** (`perf_event_open` error or
+  a `set_pinned(1)` panic), never as silent miscounting, so leaving PMU uncapped
+  cannot corrupt results invisibly.
 - `--max-mem SPEC` (or `-j N`) bounds total concurrency. With `--max-mem`, the
   runner picks the largest `-j` whose modeled worst-case footprint (summed
   `rss_baseline_bytes` of a schedulable set) fits the budget.
@@ -174,9 +182,16 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
 
 ## Conservatism and how to relax it
 
-The `hermit_guest: 1` / `pmu: 1` serialization faithfully reproduces
-`validate.sh`, which ran these gates strictly one-after-another. It is
-intentionally conservative: as individual guest gates are shown to be safe to
-co-run (e.g. distinct scratch directories, no shared fixture), drop their
-`resources` hint (or raise the cap) to unlock more parallelism. The DAG shape
-and dependencies stay the same.
+The `hermit_guest: 1` serialization faithfully reproduces `validate.sh`, which
+ran these gates strictly one-after-another. It is intentionally conservative: as
+individual guest gates are shown to be safe to co-run (e.g. distinct scratch
+directories, no shared fixture), drop their `resources` hint (or raise the cap)
+to unlock more parallelism. The DAG shape and dependencies stay the same.
+
+The former `pmu: 1` cap (and the matching `flock /tmp/hermit-privileged-pmu.lock`
+in the workflows, plus the `pmu-serial` runner label) were retired: they guarded
+a counter-exhaustion limit that measurement showed does not exist, and PMU skid
+is an instruction-space hardware property independent of concurrency, so no
+determinism argument justifies serializing PMU work. If uncapping ever surfaces
+a real ceiling it does so loudly (see above), which is a finding to record, not
+a reason to restore a silent serialization.

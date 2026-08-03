@@ -76,17 +76,27 @@ jobs:
           test -r /proc/sys/kernel/perf_event_paranoid
           test -r /dev/kvm -a -w /dev/kvm
           command -v cc
-          command -v flock
         '
+    # The privileged lane is NOT serialized by a PMU counter lock. Measurement
+    # (experiments/pmu-concurrency-ceiling-measured_20260803 in the dev-hermit
+    # parent) showed the counter-exhaustion premise is false: reverie's RCB
+    # counters are per-task (cpu=-1), so the kernel context-switches them and
+    # only the running task's 2 counters need be resident; 32 concurrent
+    # --strict --verify pinned to ONE core all pass with zero perf_event_open
+    # failures. The former `flock /tmp/hermit-privileged-pmu.lock` guarded that
+    # non-existent limit and had no other purpose (perf-dir is already keyed by
+    # $RUNNER_TEMP; kvm nodes are capped in-DAG by resource_caps.kvm), so it is
+    # removed. The `pmu-serial` runner label was retired for the same reason:
+    # PMU skid is an instruction-space hardware property independent of
+    # concurrency, so no determinism argument justifies serializing PMU work.
     - name: PMU, CPUID-faulting, and KVM smoke DAG
-      run: timeout --foreground --kill-after=10s 270s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner flock /tmp/hermit-privileged-pmu.lock ci/run-dag.sh privileged -j 2 --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
+      run: timeout --foreground --kill-after=10s 270s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
     - name: Run non-gating occasional KVM probes
       id: kvm_occasional
       continue-on-error: true
       run: |
         timeout --foreground --kill-after=10s 210s \
           env HERMIT_BIN="$PWD/target/debug/hermit" \
-          flock /tmp/hermit-privileged-pmu.lock \
           bash -euo pipefail -c '
             ./ci/test_harness.sh build --lane privileged --category applications \
               --ci-only --include-occasional

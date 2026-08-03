@@ -64,8 +64,9 @@ on:
         type: string
 
 concurrency:
-  # One serial pmu-serial runner hosts every demo run, so a burst of landings or
-  # PR pushes must never STACK on this lane. Collapse each ref to its newest run:
+  # A burst of landings or PR pushes must never STACK demo runs. Collapse each
+  # ref to its newest run (this is independent of runner provisioning and holds
+  # whether one or several PMU hosts serve the lane):
   #   * pull_request -> group per PR number: a new push to a PR cancels the
   #     superseded head (unchanged behavior; the head that lands re-runs).
   #   * push(main) -> group per github.ref, so all main pushes share ONE group
@@ -121,7 +122,14 @@ jobs:
         github.event_name != 'pull_request' ||
         github.event.pull_request.head.repo.full_name == github.repository
       )
-    runs-on: [Linux, X64, hermit, pmu, pmu-serial]
+    # No pmu-serial: demos are not counter-scarce and PMU skid is an
+    # instruction-space hardware property independent of concurrency, so there
+    # is no determinism reason to pin every demo to one serialized box. If a
+    # demo turns out to be load-sensitive once it can co-run, that is a real
+    # determinism finding to file, not a reason to restore serialization. The
+    # concurrency block below still collapses each ref to its newest run so
+    # bursts of landings do not stack.
+    runs-on: [Linux, X64, hermit, pmu]
     timeout-minutes: 360
     steps:
       - name: Remove stale checkout locks

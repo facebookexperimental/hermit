@@ -66,7 +66,14 @@ jobs:
   dag-privileged:
     name: DAG lane (privileged)
     if: ${{ inputs.lane == 'privileged' && github.repository == 'rrnewton/hermit' }}
-    runs-on: [Linux, X64, hermit, pmu, pmu-serial]
+    # No pmu-serial: `pmu` already selects a PMU+CPUID+/dev/kvm-capable host
+    # (docs/ci-validate-alignment.md). PMU counters are NOT scarce for concurrent
+    # hermit runs (measured: 32 concurrent --strict --verify on one core, 0
+    # failures; experiments/pmu-concurrency-ceiling-measured_20260803 in the
+    # dev-hermit parent) and PMU skid is an instruction-space hardware property
+    # independent of concurrency, so there is no determinism reason to pin this
+    # lane to a single serialized box.
+    runs-on: [Linux, X64, hermit, pmu]
     timeout-minutes: 240
     env:
       DETCORE_TEST_RUST_LOG: "off"
@@ -83,8 +90,10 @@ jobs:
         with:
           go-version: stable
           cache: false
-      # PMU access is a single serialized host resource; hold the same lock the
-      # validate.sh privileged lane uses. The DAG's own {"pmu": 1} cap keeps
-      # gates one-at-a-time within this run.
+      # No PMU counter lock: reverie's RCB counters are per-task and
+      # context-switched, so concurrent hermit runs do not exhaust the PMU
+      # (measured: 32 concurrent --strict --verify on one core, 0 failures).
+      # The DAG's in-run resource_caps still serialize genuine exclusive
+      # resources (kvm).
       - name: Run privileged lane as a DAG
-        run: flock /tmp/hermit-privileged-pmu.lock ci/run-dag.sh privileged -j 2 -v
+        run: ci/run-dag.sh privileged -j 2 -v
