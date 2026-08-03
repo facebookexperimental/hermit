@@ -187,15 +187,23 @@ jobs:
           # Ubuntu's /usr/bin/bpftool wrapper insists that its packaged kernel
           # version match uname. This runner uses an Ubuntu userspace on a
           # Fedora host kernel, but the real generic bpftool is kernel-agnostic
-          # for BTF decoding. Promote that binary ahead of the wrapper.
+          # for BTF decoding. Install it into a PATH dir promoted ahead of the
+          # wrapper (via $GITHUB_PATH) rather than a hardcoded system prefix, so
+          # this works on any runner. Override the destination with BPFTOOL_BIN_DIR.
           if ! bpftool version >/dev/null 2>&1; then
             # linux-tools ships bpftool under a hyphen/version-suffixed dir
             # (e.g. /usr/lib/linux-tools-6.8.0-136/), not a bare
             # /usr/lib/linux-tools, so search /usr/lib for any linux-tools* path.
             bpftool_bin=$(find /usr/lib -path '*linux-tools*' -name bpftool \
               -type f -perm -111 -print 2>/dev/null | sort -V | tail -n 1)
-            test -x "$bpftool_bin"
-            sudo install -m755 "$bpftool_bin" /usr/local/bin/bpftool
+            if [ -z "$bpftool_bin" ] || [ ! -x "$bpftool_bin" ]; then
+              echo "::error::no usable bpftool found under /usr/lib/*linux-tools*; install linux-tools-generic (Debian/Ubuntu) or the equivalent, or set BPFTOOL_BIN_DIR to a dir containing a working bpftool" >&2
+              exit 1
+            fi
+            bpftool_dir="${BPFTOOL_BIN_DIR:-$HOME/.local/bin}"
+            mkdir -p "$bpftool_dir"
+            install -m755 "$bpftool_bin" "$bpftool_dir/bpftool"
+            echo "$bpftool_dir" >>"$GITHUB_PATH"
           fi
 
           if ! command -v drgn >/dev/null 2>&1; then
