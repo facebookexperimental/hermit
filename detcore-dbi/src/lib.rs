@@ -174,6 +174,21 @@ fn emit_marker(emit: Emitter, message: &'static [u8]) {
     unsafe { emit(message.as_ptr(), message.len()) };
 }
 
+/// Emit a routine per-run lifecycle breadcrumb (`detcore-dbi: …`).
+///
+/// These progress markers narrate DBI backend startup and are useful when
+/// debugging the runtime, but they are noise for a normal `hermit run --backend
+/// dbi`. Gate them behind `HERMIT_LOG=info` (or `debug`/`trace`) so a default
+/// run is quiet. Genuine warnings and unsupported-syscall diagnostics do not go
+/// through this helper and stay unconditional. The decision is read once and
+/// cached, so hot callers pay only an atomic load.
+fn emit_lifecycle_marker(emit: Emitter, message: &'static [u8]) {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if *ENABLED.get_or_init(info_logging_enabled) {
+        emit_marker(emit, message);
+    }
+}
+
 fn info_logging_enabled() -> bool {
     matches!(
         std::env::var("HERMIT_LOG")
@@ -790,23 +805,23 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
     RUNTIME_SHUTDOWN.store(false, Ordering::Release);
     RUNTIME_PAUSE_REQUESTED.store(false, Ordering::Release);
     RUNTIME_PAUSED.store(false, Ordering::Release);
-    emit_marker(emit, b"detcore-dbi: background client thread entered\n");
+    emit_lifecycle_marker(emit, b"detcore-dbi: background client thread entered\n");
     let tracing_active = init_dbi_tracing(emit);
     let runtime = {
         let mut slot = RUNTIME.write().expect("Detcore DBI runtime lock poisoned");
         if slot.is_none() {
-            emit_marker(emit, b"detcore-dbi: constructing Detcore Config\n");
+            emit_lifecycle_marker(emit, b"detcore-dbi: constructing Detcore Config\n");
             let (mut config, source) = load_dbi_config();
             match source {
                 ConfigSource::Cli => {
-                    emit_marker(emit, b"detcore-dbi: using CLI-provided Detcore Config\n")
+                    emit_lifecycle_marker(emit, b"detcore-dbi: using CLI-provided Detcore Config\n")
                 }
                 ConfigSource::ParseFallback => emit_marker(
                     emit,
                     b"detcore-dbi: WARNING could not parse HERMIT_DBI_DETCONFIG; using strict default\n",
                 ),
                 ConfigSource::Default => {
-                    emit_marker(emit, b"detcore-dbi: using strict default Detcore Config\n")
+                    emit_lifecycle_marker(emit, b"detcore-dbi: using strict default Detcore Config\n")
                 }
             }
             // Fail-closed unsupported-syscall handling (PR #644): the rest of the
@@ -840,9 +855,9 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
                 report_fd_is_available().then_some(UNSUPPORTED_SYSCALL_REPORT_FD);
             config.validate();
 
-            emit_marker(emit, b"detcore-dbi: initializing Detcore GlobalState\n");
+            emit_lifecycle_marker(emit, b"detcore-dbi: initializing Detcore GlobalState\n");
             let global = GlobalState::init_for_external_scheduler(&config);
-            emit_marker(emit, b"detcore-dbi: GlobalState initialized\n");
+            emit_lifecycle_marker(emit, b"detcore-dbi: GlobalState initialized\n");
             *slot = Some(Arc::new(Runtime {
                 config,
                 global,
@@ -852,7 +867,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
         }
         Arc::clone(slot.as_ref().expect("Detcore DBI runtime was initialized"))
     };
-    emit_marker(emit, b"detcore-dbi: background scheduler ready\n");
+    emit_lifecycle_marker(emit, b"detcore-dbi: background scheduler ready\n");
     READY_IMAGE.store(image_generation, Ordering::SeqCst);
     let log_scheduler = info_logging_enabled() && !tracing_active;
     let observer = Arc::new(move |event: &'static str| {
@@ -865,7 +880,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
         runtime.global.run_external_scheduler(observer),
         callbacks.idle,
     );
-    emit_marker(emit, b"detcore-dbi: background scheduler completed\n");
+    emit_lifecycle_marker(emit, b"detcore-dbi: background scheduler completed\n");
 }
 
 /// Requests shutdown of the backend-owned scheduler at process exit.
@@ -1284,8 +1299,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
 ) -> i32 {
     let first_event = TOTAL_SYSCALLS.fetch_add(1, Ordering::Relaxed) == 0;
     if first_event {
-        let message = b"detcore-dbi: entered Rust syscall callback\n";
-        unsafe { emit(message.as_ptr(), message.len()) };
+        emit_lifecycle_marker(emit, b"detcore-dbi: entered Rust syscall callback\n");
     }
     let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
     let mut dispatch_args: [u64; 6] = raw_args.try_into().expect("six syscall arguments");
@@ -1379,21 +1393,18 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     );
 
     if first_event {
-        let message = b"detcore-dbi: initializing Detcore thread state\n";
-        unsafe { emit(message.as_ptr(), message.len()) };
+        emit_lifecycle_marker(emit, b"detcore-dbi: initializing Detcore thread state\n");
     }
     if scratch.runtime_state.is_null() {
         if first_event {
-            let message = b"detcore-dbi: constructing Detcore thread state\n";
-            unsafe { emit(message.as_ptr(), message.len()) };
+            emit_lifecycle_marker(emit, b"detcore-dbi: constructing Detcore thread state\n");
         }
         let mut state = tool.init_thread_state(Tid::from_raw(tid.into()), None);
         if scratch.virtual_tid > 0 {
             state.set_open_file_creator(DetTid::from_raw(scratch.virtual_tid));
         }
         if first_event {
-            let message = b"detcore-dbi: Detcore thread state constructed\n";
-            unsafe { emit(message.as_ptr(), message.len()) };
+            emit_lifecycle_marker(emit, b"detcore-dbi: Detcore thread state constructed\n");
         }
         scratch.runtime_state = Box::into_raw(Box::new(ThreadRuntime {
             tid,
@@ -1406,8 +1417,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     let det_tid = thread.tid;
     if !thread.initialized {
         if first_event {
-            let message = b"detcore-dbi: running Detcore thread-start hook\n";
-            unsafe { emit(message.as_ptr(), message.len()) };
+            emit_lifecycle_marker(emit, b"detcore-dbi: running Detcore thread-start hook\n");
         }
         if let Err(error) = reverie_dbi::run_tool_thread_start(
             tool,
@@ -1430,8 +1440,10 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     }
     if thread.post_exec_pending {
         if first_event {
-            let message = b"detcore-dbi: thread-start hook completed; running post-exec\n";
-            unsafe { emit(message.as_ptr(), message.len()) };
+            emit_lifecycle_marker(
+                emit,
+                b"detcore-dbi: thread-start hook completed; running post-exec\n",
+            );
         }
         if let Err(errno) = reverie_dbi::run_tool_post_exec(
             tool,
@@ -1451,15 +1463,16 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             return 1;
         }
         if first_event {
-            let message = b"detcore-dbi: post-exec hook completed\n";
-            unsafe { emit(message.as_ptr(), message.len()) };
+            emit_lifecycle_marker(emit, b"detcore-dbi: post-exec hook completed\n");
         }
         thread.post_exec_pending = false;
     }
 
     if first_event {
-        let message = b"detcore-dbi: dispatching first syscall through Detcore\n";
-        unsafe { emit(message.as_ptr(), message.len()) };
+        emit_lifecycle_marker(
+            emit,
+            b"detcore-dbi: dispatching first syscall through Detcore\n",
+        );
     }
     let getrandom_prng = getrandom_probe
         .filter(|probe| probe.writable < probe.requested)
