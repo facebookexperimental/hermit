@@ -44,7 +44,12 @@ on:
 
 concurrency:
   group: portable-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
-  cancel-in-progress: false
+  # Cancel a superseded PR build when a new commit is pushed: a stale 40-min
+  # portable run for an outdated head only wastes a scarce hosted runner and
+  # deepens the queue that stalls landing. merge_group runs (unique head_sha
+  # group) and main pushes (github.ref group, not pull_request) are never
+  # cancelled, so queue entries and post-land coverage stay intact.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read

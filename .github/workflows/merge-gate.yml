@@ -32,6 +32,18 @@ on:
 # The gate is fork-only because facebookexperimental/hermit has no access to the
 # fork privileged runners and fork pull requests receive a read-only token in
 # that repository. Upstream relies on the GitHub-managed portable Rust job instead.
+
+# Deduplicate superseded runs. Every push/label to a PR re-fires this workflow;
+# without cancellation those runs stack in the shared hosted-runner queue (they
+# ran ~40 deep on 2026-08-03), so even this ~5s stamp-check waits behind 40-min
+# builds and landing stalls. The check is idempotent (it re-reads the current PR
+# head state), so cancelling an in-flight PR run is always safe. Cancel ONLY
+# pull_request runs; merge_group, workflow_run, and workflow_dispatch runs each
+# get a unique group and are never cancelled. Mirrors demo-hot-path.yml.
+concurrency:
+  group: merge-gate-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.event.workflow_run.head_sha || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   actions: read
   contents: read
