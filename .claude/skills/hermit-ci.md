@@ -46,6 +46,9 @@ a PR — never edit a primary checkout. See
 
 ## Related
 
+- [ci-debugging](ci-debugging.md) — **read this before pushing a CI fix.** Tight
+  single-shard iteration (`ci/run-node.sh` / `validate.sh --only`) instead of
+  re-running the whole 40–50 min DAG per cycle; batch, don't cancel runs.
 - [post-facto-review](post-facto-review/SKILL.md) (landing discipline for own
   CI fixes), [hermit-lander](hermit-lander.md) (who lands feature PRs),
   [hermit-coord](hermit-coord.md), [progress-rubric](progress-rubric/SKILL.md),
