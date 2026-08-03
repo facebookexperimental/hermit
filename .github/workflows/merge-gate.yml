@@ -117,11 +117,23 @@ jobs:
       issues: write
       pull-requests: write
     steps:
+      - name: Check out the trusted label-strip evidence helper
+        uses: actions/checkout@v4
+        with:
+          # Pin to the trusted base branch, NOT the PR head. This job runs on a
+          # self-hosted runner, so executing scripts/label-strip-evidence.sh from
+          # PR-controlled code would run arbitrary PR code on our infrastructure.
+          # The helper only reads its arguments and calls the GitHub API, so
+          # main's copy is the correct and safe version to run.
+          ref: main
+          persist-credentials: false
       - name: Remove validation and stale approvals inherited from an older PR head
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.event.after }}
         run: |
           set -euo pipefail
           # A new push invalidates prior sign-off on the previous revision:
@@ -130,14 +142,34 @@ jobs:
           #     so their approval must be re-earned before the core-review-protocol
           #     job (below) will let a post-facto-human-review PR land again.
           labels="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name')"
+          cleared=()
+          locally_validated_cleared=0
           for stale in locally-validated passed-review-codex passed-review-claude; do
             if grep -Fxq "$stale" <<< "$labels"; then
               gh api --method DELETE \
                 "repos/${REPO}/issues/${PR_NUMBER}/labels/${stale}" \
                 --silent
               echo "Removed stale ${stale} label from PR #$PR_NUMBER."
+              cleared+=("$stale")
+              [ "$stale" = locally-validated ] && locally_validated_cleared=1
             fi
           done
+
+          # Preserve the validation record so stripping the label never silently
+          # erases WHAT was validated (commit, profile, durable log pointer). The
+          # helper is best-effort and always exits 0, so it can never fail this
+          # job — merge-gate requires invalidate-local-validation to succeed.
+          if [ "$locally_validated_cleared" = 1 ]; then
+            bash scripts/label-strip-evidence.sh \
+              --pr "$PR_NUMBER" \
+              --repo "$REPO" \
+              --validated-sha "$BEFORE_SHA" \
+              --new-sha "$AFTER_SHA" \
+              --labels "${cleared[*]}" \
+              --actor "invalidate-local-validation (push synchronize)" \
+              --reason "a new push advanced the PR head; local validation applied to the previous head" \
+              || echo "label-strip-evidence helper returned non-zero (ignored; best-effort)."
+          fi
 
   core-review-protocol:
     name: core-review-protocol

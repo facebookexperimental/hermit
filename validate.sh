@@ -3529,11 +3529,16 @@ function apply_locally_validated_label {
         timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ') || timestamp="unknown"
         passed_checks=$((checks - failures))
         # Single quotes keep the Markdown backticks literal in the comment body.
+        # The trailing HTML marker is machine-parseable: label-strip-evidence.sh
+        # locates this comment by `sha=<head>` when the label is later stripped,
+        # so the record of what was validated (commit, profile, durable log) is
+        # never lost. Keep the marker key names in sync with that script.
         # shellcheck disable=SC2016
         printf -v comment_body \
-            '[impl agent, validate.sh]\n\nLocal validation passed.\n\n- SHA: `%s`\n- Profile: `%s`\n- Results: %d checks passed, 0 failed\n- Hostname: `%s`\n- Timestamp (UTC): `%s`' \
-            "$local_head" "$VALIDATION_PROFILE" "$passed_checks" \
-            "$host_name" "$timestamp"
+            '[impl agent, validate.sh]\n\nLocal validation passed — `%s` label applied.\n\n- SHA: `%s`\n- Profile: `%s`\n- Results: %d checks passed, 0 failed\n- Hostname: `%s`\n- Log: `%s:%s`\n- Timestamp (UTC): `%s`\n\n<!-- locally-validated-evidence sha=%s profile=%s host=%s log=%s ts=%s -->' \
+            "$LOCALLY_VALIDATED_LABEL" "$local_head" "$VALIDATION_PROFILE" \
+            "$passed_checks" "$host_name" "$host_name" "$LOG_FILE" "$timestamp" \
+            "$local_head" "$VALIDATION_PROFILE" "$host_name" "$LOG_FILE" "$timestamp"
         if "${gh_cmd[@]}" pr comment "$pr" \
             --repo "$LOCALLY_VALIDATED_REPOSITORY" \
             --body "$comment_body" >>"$LOG_FILE" 2>&1; then
