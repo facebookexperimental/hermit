@@ -141,7 +141,59 @@ while [[ $# -gt 0 ]]; do
         --verbose) VERBOSE=1; shift ;;
         --no-label-pr) LABEL_PR=0; shift ;;
         -h|--help)
-            grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+            cat <<'USAGE'
+Usage: ./validate.sh [LEVEL] [OPTIONS]
+
+Run Hermit's local validation suite. With no LEVEL, runs the full suite and
+prints the working-envelope vector at the end.
+
+Levels:
+  quick            Core ptrace run/verify/record smoke tests; no alternate backends.
+  portable-only    Portable build, test, lint, format, and doc gates matching
+                   GitHub-managed portable CI; no PMU or namespace requirements.
+  full             quick plus the complete suite and DBI/KVM gates (default).
+  super            Repeat stress probes (20x by default) under moderate
+                   oversubscription; report a pass rate per probe.
+  --quick          Alias for the quick level.
+  --portable       Alias for the portable-only level.
+
+Focused gates (run one matrix/lane and exit):
+  --envelope-only               Measure and emit the working-envelope vector (JSON + human).
+  --envelope-compare FILE       Measure, then fail if any count regressed below FILE's baseline.
+  --strict-compat-only          Run the blocking L2 app matrix.
+  --portable-strict-compat-only Portable L2 matrix with bounded diagnostics.
+  --rr-compat-only              Gate the known-passing record/replay matrix.
+  --sabre-compat-only           Gate the measured SaBRe matrix (needs HERMIT_SABRE_BINARY).
+  --e9patch-compat-only         Gate core + installed e9patch L2 apps.
+  --liteinst-compat-only        Run the portable CI liteinst_strict test.
+  --qemu-l2-only                Run the heavyweight QEMU L2 boot.
+  --portable-only               No PMU/CPUID hardware required.
+  --privileged-only             PMU/CPUID-dependent tests only.
+  --only <lane> <group.job>[,...]  Run ONE DAG shard (no deps) against the already-built
+                                tree; build first with ci/run-dag.sh <lane>.
+
+Other options:
+  --verbose        Stream each gate's command, PID, elapsed time, and output.
+  --label-pr       Label the current PR `locally-validated` on a fully-green run (default).
+  --no-label-pr    Disable the non-fatal GitHub label update.
+  -h, --help       Show this help and exit.
+
+Environment:
+  VALIDATE_LEVEL=quick|portable-only|full|super  Select the level.
+  VALIDATE_GATE_TIMEOUT_SECONDS=N                Override per-gate process-tree timeout.
+  VALIDATE_TIMEOUT_KILL_GRACE_SECONDS=N          TERM-to-KILL grace period.
+  VALIDATE_LABEL_PR=0                            Disable PR labeling (same as --no-label-pr).
+  VALIDATE_VERBOSE=1                             Same as --verbose.
+  PR_NUMBER=N                                    Override branch-based PR detection.
+
+Examples:
+  ./validate.sh                    # full suite + working-envelope vector
+  ./validate.sh quick              # fast ptrace smoke tests
+  ./validate.sh --portable         # portable CI-equivalent gates
+  ./validate.sh --only portable test.sabre_examples
+  ./validate.sh --envelope-compare envelope.json
+USAGE
+            exit 0 ;;
         *) echo "validate.sh: unknown argument: $1 (try --help)" >&2; exit 2 ;;
     esac
 done
