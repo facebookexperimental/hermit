@@ -441,12 +441,34 @@ host_cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1
 if [[ ! $host_cpus =~ ^[1-9][0-9]*$ ]]; then
     host_cpus=1
 fi
+
+# Default scheduler width for the CI DAG lanes (`./ci/run-dag.sh -j N`).
+# SINGLE SOURCE OF TRUTH: every run-dag.sh invocation below reads
+# ${CI_DAG_JOBS:-$CI_DAG_JOBS_DEFAULT}; do not re-hardcode the fallback (it lived
+# in two places as `:-2` and drifted). Override per run with the CI_DAG_JOBS env var.
+#
+# HOST-ADAPTIVE, capped at 16. The cap is measurement-backed, not a guess: on the
+# 316-CPU dev box the portable DAG measured CPU/wall 2.6x at -j2 (the old flat
+# default) vs ~21.8x at -j16 (target/perf-width-sweep/run-j16.log), and it becomes
+# critical-path-bound near width 16 (longest node ~106s + serial build spine), so
+# wider buys little wall while raising peak demand. But the SAME validate.sh runs
+# on GitHub's ubuntu-latest portable job (~4 CPU / 16 GiB); a flat 16 there would
+# schedule many 5-8 GiB build/e2e nodes at once (the runner sets no --max-mem, so
+# -j is a hard cap, not memory-gated) and OOM a job that -j2 kept green. Scaling
+# with host_cpus keeps ubuntu-latest at 2 while the big box reaches the measured 16.
+# host_cpus/8: 316->16(cap), 128->16, 64->8, 32->4, <=16->2(floor). Concurrency
+# budget on the dev box: lander runs one validate per active worktree slot (cap 12)
+# concurrently; 12 x ~22 effective cores/validate = 264 <= 316, fits.
+CI_DAG_JOBS_DEFAULT=$((host_cpus / 8))
+((CI_DAG_JOBS_DEFAULT < 2)) && CI_DAG_JOBS_DEFAULT=2
+((CI_DAG_JOBS_DEFAULT > 16)) && CI_DAG_JOBS_DEFAULT=16
+
 SUPER_JOBS=${SUPER_JOBS:-$(((host_cpus * 3 + 1) / 2))}
 if [[ ! $SUPER_JOBS =~ ^[1-9][0-9]*$ ]]; then
     echo "validate.sh: SUPER_JOBS must be a positive integer" >&2
     exit 2
 fi
-readonly SUPER_REPETITIONS SUPER_JOBS host_cpus
+readonly SUPER_REPETITIONS SUPER_JOBS host_cpus CI_DAG_JOBS_DEFAULT
 
 HOST_OS=$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | head -n 1)
 HOST_OS=${HOST_OS#\"}
@@ -3657,7 +3679,7 @@ function run_hermit_targets_serial {
 function run_ci_manifest_lane {
     local lane=$1
     local timeout_seconds=${2:-7200}
-    local jobs=${CI_DAG_JOBS:-2}
+    local jobs=${CI_DAG_JOBS:-$CI_DAG_JOBS_DEFAULT}
 
     run_check "Centralized test manifest and inventory" ./ci/test_harness.sh validate
     run_check_with_timeout "$timeout_seconds" "$lane CI DAG manifest" \
@@ -3771,7 +3793,7 @@ function run_selective_suite {
             export RUN_DAG_FILE_OVERRIDE="$dag_override"
             run_check_with_timeout "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}" \
                 "portable CI DAG (selective subset)" \
-                ./ci/run-dag.sh portable -j "${CI_DAG_JOBS:-2}" -v
+                ./ci/run-dag.sh portable -j "${CI_DAG_JOBS:-$CI_DAG_JOBS_DEFAULT}" -v
             rc=$?
             unset RUN_DAG_FILE_OVERRIDE
             print_summary
