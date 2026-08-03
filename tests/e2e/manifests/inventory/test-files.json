@@ -200,6 +200,12 @@
       "why": "tests/backend-parity/matrix.tsv is owned by tests/backend-parity/run_matrix.py: matrix.tsv is the driver's declarative list of fixture/backend/expectation rows. The Python driver interprets the table; individual TSV rows are not standalone programs."
     },
     {
+      "path": "tests/backend-parity/retarget_to_manifest.py",
+      "disposition": "special-driver",
+      "runner": "backend-parity matrix.tsv -> schema-v2 manifest migration tool (manual)",
+      "why": "tests/backend-parity/retarget_to_manifest.py is owned by backend-parity matrix.tsv -> schema-v2 manifest migration tool (manual): Standalone migration driver that reads a source PR's added matrix.tsv rows and fixture .c files and rewrites them into the shared schema-v2 manifest -- appending a symmetric [[test]] block to tests/e2e/manifests/backend-parity-c.toml (ptrace front-door first, every backend x mode cell declared, DBI/KVM enabled only where the row's --verify L2 witness passed) and reclassifying the fixture from guest-fixture to manifest-test. It lives beside and reuses the Python parity harness (run_matrix.py / e9patch_corpus.py) and is run manually to migrate legacy PRs, so it stays a driver rather than a manifest-plan program."
+    },
+    {
       "path": "tests/backend-parity/run_matrix.py",
       "disposition": "special-driver",
       "runner": "portable and privileged backend-parity partitions",
