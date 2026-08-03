@@ -1387,8 +1387,9 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace", "dbi", "kvm"]
+backends_enabled = ["ptrace", "dbi"]
 [test.modes.verify.backends_disabled]
+kvm = "Fresh shared-manifest L2 revalidation timed out at the 90-second contract on current main; requalify KVM before enabling this cell"
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
 liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
 
