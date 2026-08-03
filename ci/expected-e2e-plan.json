@@ -1,61 +1,397 @@
 {
-  "schema": 1,
   "cells": [
-    {"test":"system-utils/mktemp-name","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"applications/timed-progress-bar","category":"applications","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"c-programs/add-key-enosys","category":"c-programs","lane":"portable","mode":"verify","backend":"dbi"},
-    {"test":"c-programs/add-key-enosys","category":"c-programs","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"c-programs/cachestat-enosys","category":"c-programs","lane":"portable","mode":"verify","backend":"dbi"},
-    {"test":"c-programs/cachestat-enosys","category":"c-programs","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"c-programs/futex-waitv-enosys","category":"c-programs","lane":"portable","mode":"verify","backend":"dbi"},
-    {"test":"c-programs/futex-waitv-enosys","category":"c-programs","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"c-programs/get-robust-list-self","category":"c-programs","lane":"portable","mode":"verify","backend":"dbi"},
-    {"test":"c-programs/get-robust-list-self","category":"c-programs","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"c-programs/get-robust-list-self","category":"c-programs","lane":"portable","mode":"verify","backend":"sabre"},
-    {"test":"c-programs/ioctl-fioclex","category":"c-programs","lane":"portable","mode":"verify","backend":"dbi"},
-    {"test":"c-programs/ioctl-fioclex","category":"c-programs","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"c-programs/ioctl-fioclex","category":"c-programs","lane":"portable","mode":"verify","backend":"sabre"},
-    {"test":"c-programs/kcmp-eperm","category":"c-programs","lane":"portable","mode":"verify","backend":"dbi"},
-    {"test":"c-programs/kcmp-eperm","category":"c-programs","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"c-programs/kcmp-eperm","category":"c-programs","lane":"portable","mode":"verify","backend":"sabre"},
-    {"test":"c-programs/keyctl-enosys","category":"c-programs","lane":"portable","mode":"verify","backend":"dbi"},
-    {"test":"c-programs/keyctl-enosys","category":"c-programs","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"c-programs/listmount-enosys","category":"c-programs","lane":"portable","mode":"verify","backend":"dbi"},
-    {"test":"c-programs/listmount-enosys","category":"c-programs","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"c-programs/random-sources","category":"c-programs","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"data-handling/archive-roundtrip","category":"data-handling","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"data-handling/shell-pipeline","category":"data-handling","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"data-handling/jq-json-transform","category":"data-handling","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"determinism-stress/order-violation","category":"determinism-stress","lane":"portable","mode":"chaos","backend":"ptrace"},
-    {"test":"determinism-stress/order-violation","category":"determinism-stress","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"determinism-stress/process-chains","category":"determinism-stress","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"determinism-stress/thread-contention","category":"determinism-stress","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"determinism-stress/thread-output","category":"determinism-stress","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"determinism-stress-c/lock-free","category":"determinism-stress-c","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"determinism-stress-c/pid-tid","category":"determinism-stress-c","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"determinism-stress-c/pipe-prefill","category":"determinism-stress-c","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"determinism-stress-c/producer-consumer","category":"determinism-stress-c","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"determinism-stress-c/signal-order","category":"determinism-stress-c","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"language-runtimes/bash-loop-pipe-time","category":"language-runtimes","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"language-runtimes/cpp-stl-determinism","category":"language-runtimes","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"language-runtimes/gawk-random","category":"language-runtimes","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"language-runtimes/perl-io-subprocess-time","category":"language-runtimes","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"language-runtimes/python-hash-determinism","category":"language-runtimes","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"language-runtimes/python-io-subprocess-time","category":"language-runtimes","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"language-runtimes/python-random","category":"language-runtimes","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"language-runtimes/rust-hashmap-iteration","category":"language-runtimes","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"system-utils/clock-determinism","category":"system-utils","lane":"portable","mode":"custom","backend":"liteinst"},
-    {"test":"system-utils/clock-determinism","category":"system-utils","lane":"portable","mode":"custom","backend":"ptrace"},
-    {"test":"system-utils/clock-determinism","category":"system-utils","lane":"portable","mode":"verify","backend":"liteinst"},
-    {"test":"system-utils/clock-determinism","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"system-utils/date-nanoseconds","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"system-utils/openssl-passwd","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"system-utils/openssl-rand","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"system-utils/openssl-x509","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"system-utils/proc-uptime","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"system-utils/random-device","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"},
-    {"test":"system-utils/record-getpid","category":"system-utils","lane":"portable","mode":"replay","backend":"ptrace"},
-    {"test":"system-utils/record-getpid","category":"system-utils","lane":"portable","mode":"verify","backend":"liteinst"},
-    {"test":"system-utils/record-getpid","category":"system-utils","lane":"portable","mode":"verify","backend":"ptrace"}
-  ]
+    {
+      "backend": "ptrace",
+      "category": "applications",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "applications/timed-progress-bar"
+    },
+    {
+      "backend": "dbi",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/add-key-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/add-key-enosys"
+    },
+    {
+      "backend": "dbi",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/cachestat-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/cachestat-enosys"
+    },
+    {
+      "backend": "dbi",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/futex-waitv-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/futex-waitv-enosys"
+    },
+    {
+      "backend": "dbi",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/get-robust-list-self"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/get-robust-list-self"
+    },
+    {
+      "backend": "sabre",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/get-robust-list-self"
+    },
+    {
+      "backend": "dbi",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/ioctl-fioclex"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/ioctl-fioclex"
+    },
+    {
+      "backend": "sabre",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/ioctl-fioclex"
+    },
+    {
+      "backend": "dbi",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/kcmp-eperm"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/kcmp-eperm"
+    },
+    {
+      "backend": "sabre",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/kcmp-eperm"
+    },
+    {
+      "backend": "dbi",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/keyctl-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/keyctl-enosys"
+    },
+    {
+      "backend": "dbi",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/listmount-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/listmount-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/random-sources"
+    },
+    {
+      "backend": "ptrace",
+      "category": "data-handling",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "data-handling/archive-roundtrip"
+    },
+    {
+      "backend": "ptrace",
+      "category": "data-handling",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "data-handling/jq-json-transform"
+    },
+    {
+      "backend": "ptrace",
+      "category": "data-handling",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "data-handling/shell-pipeline"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "chaos",
+      "test": "determinism-stress/order-violation"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/order-violation"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/process-chains"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/thread-contention"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/thread-output"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress-c/lock-free"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress-c/pid-tid"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress-c/pipe-prefill"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress-c/producer-consumer"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress-c/signal-order"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/bash-loop-pipe-time"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/cpp-stl-determinism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/gawk-random"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/perl-io-subprocess-time"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/python-hash-determinism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/python-io-subprocess-time"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/python-random"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/rust-hashmap-iteration"
+    },
+    {
+      "backend": "liteinst",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "custom",
+      "test": "system-utils/clock-determinism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "custom",
+      "test": "system-utils/clock-determinism"
+    },
+    {
+      "backend": "liteinst",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/clock-determinism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/clock-determinism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/date-nanoseconds"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/mktemp-name"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/openssl-passwd"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/openssl-rand"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/openssl-x509"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/proc-uptime"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/random-device"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/record-getpid"
+    },
+    {
+      "backend": "liteinst",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/record-getpid"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/record-getpid"
+    }
+  ],
+  "schema": 1
 }
