@@ -411,6 +411,13 @@
       "category": "system-utils",
       "lane": "portable",
       "mode": "verify",
+      "test": "system-utils/proc-random-uuid"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
       "test": "system-utils/proc-uptime"
     },
     {
