@@ -1825,6 +1825,12 @@
       "why": "tests/e2e/language-runtimes/m4-macro-mkstemp.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
+      "path": "tests/e2e/language-runtimes/perl-hash-order.sh",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
+      "why": "tests/e2e/language-runtimes/perl-hash-order.sh is owned by ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml: Perl's per-process randomized hash key iteration order varies natively and repeats under strict verification"
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/e2e/language-runtimes/perl-io-subprocess-time.sh",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/language-runtimes.toml",
