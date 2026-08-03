@@ -14,11 +14,11 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 
 .DEFAULT_GOAL := build
 
-.PHONY: build install-deps release-core help checkout-all check-build-tools \
+.PHONY: build install-deps release-core prune-stale-release help checkout-all check-build-tools \
 	install-build-tools check-submodules validate lint \
 	validate-kvm validate-dbi validate-sabre validate-liteinst validate-e9patch
 
-build: install-deps ## Build the development Hermit binary with every backend
+build: prune-stale-release install-deps ## Build the development Hermit binary with every backend
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --locked \
 		-p hermit --features third-party-backends
 
@@ -34,6 +34,32 @@ install-deps: check-submodules ## Build and stage all third-party backend runtim
 
 release-core: check-submodules ## Build the lean core-only release binary (ptrace/kvm/liteinst)
 	$(CARGO) build --release --locked -p hermit
+
+# `make build` produces target/debug/hermit but never rebuilds an existing
+# target/release/hermit. A release binary left over from an earlier
+# `make release-core` (or from a different commit) is then STALE: the documented
+# release smoke commands (README, docs/QEMU_BOOT.md, docs/SABRE_COMPATIBILITY.md)
+# run `./target/release/hermit`, which exits 0 while silently testing old code.
+# To make that impossible, `build` depends on this target, which REMOVES a stale
+# release binary (rebuild-or-remove: rebuild explicitly with `make release-core`).
+# "Current" means the embedded --version SHA equals HEAD's `git rev-parse
+# --short=12` on a clean worktree with no `-dirty` marker, matching how
+# hermit-cli/build.rs stamps the binary. A dirty worktree can't be verified, so
+# any existing release binary is treated as stale and removed.
+prune-stale-release: ## Remove target/release/hermit if stale (not built from current HEAD/worktree)
+	@bin=target/release/hermit; \
+	[ -x "$$bin" ] || exit 0; \
+	head=$$(git rev-parse --short=12 HEAD 2>/dev/null || true); \
+	ver=$$("$$bin" --version 2>/dev/null || true); \
+	if [ -n "$$(git status --porcelain 2>/dev/null)" ]; then \
+		reason="worktree has uncommitted changes"; \
+	elif [ -n "$$head" ] && printf '%s' "$$ver" | grep -q "$$head" && ! printf '%s' "$$ver" | grep -q -- '-dirty'; then \
+		exit 0; \
+	else \
+		reason="built from '$$ver', HEAD is g$$head"; \
+	fi; \
+	rm -f "$$bin"; \
+	echo "make: removed stale $$bin ($$reason); run 'make release-core' to rebuild it" >&2
 
 # NOTE: `validate` MUST stay a .PHONY target with an explicit recipe. Without it,
 # GNU Make's built-in implicit rule "%: %.sh" (cat $< >$@; chmod a+x $@) fires
