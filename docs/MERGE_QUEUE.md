@@ -4,7 +4,8 @@ Pull requests into `main` land through GitHub's merge queue. The queue creates
 a temporary commit against the current `main` tip, preventing a stale pull
 request head from bypassing changes that landed ahead of it.
 
-The required check is `merge-gate`. It passes when either:
+The required policy is `.github/workflows/merge-gate.yml` from `main`. Its
+`merge-gate` job passes when either:
 
 - the latest `.github/workflows/ci-portable.yml` run for the exact pull request
   head completed successfully; or
@@ -18,6 +19,12 @@ premature pending-CI failure converges without closing and reopening the pull
 request. Every strip records a durable evidence comment (see
 "Validation-evidence trail" below) so the record of what was validated is never
 lost.
+
+The ruleset pins the required workflow to `refs/heads/main`. A
+`workflow_dispatch` run from a pull request branch is diagnostic only: even if
+its identically named `merge-gate` job succeeds, it cannot satisfy the required
+workflow. This prevents an old pull request from authorizing itself with an
+older, weaker copy of the gate YAML.
 
 Add an approved pull request to the queue with:
 
@@ -102,9 +109,20 @@ workflow.
 The `main` branch ruleset must:
 
 1. require pull requests and linear history;
-2. require the `merge-gate` status check;
+2. require `.github/workflows/merge-gate.yml` from this repository at
+   `refs/heads/main` using GitHub's required-workflow rule, never a bare status
+   context named `merge-gate`;
 3. require GitHub's merge queue; and
 4. disallow force pushes and branch deletion.
+
+Verify the live rule without mutating it:
+
+```bash
+with-proxy scripts/configure-merge-gate-ruleset.sh --check
+```
+
+The coordinator may reconcile the live ruleset with `--apply`. The command
+refuses to discard any unexpected required status context.
 
 Enable auto-merge in the repository so `gh pr merge --auto --merge` can queue
 eligible pull requests. Do not require the host-dependent CI job separately;
