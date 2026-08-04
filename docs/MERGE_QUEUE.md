@@ -4,13 +4,55 @@ Pull requests into `main` land through GitHub's merge queue. The queue creates
 a temporary commit against the current `main` tip, preventing a stale pull
 request head from bypassing changes that landed ahead of it.
 
-The required status is `merge-gate-v3`. Its job passes when either:
+The required status is `merge-gate-v4`. Its job passes when either:
 
-- the latest `.github/workflows/ci-portable.yml` run for the exact pull request
-  head completed successfully; or
-- the pull request has the `locally-validated` label **and** an exact-head
-  comment that resolves to an immutable receipt containing a counted, clean,
-  full-pass ledger row and the validation log's SHA-256 digest.
+- the authoritative jobs in the latest `.github/workflows/ci-portable.yml` and
+  `.github/workflows/ci-privileged.yml` runs for the exact pull request head
+  both completed successfully; or
+- the pull request has the `locally-validated` label and an exact-head receipt
+  whose immutable content proves a counted, clean, full `./validate.sh` pass.
+
+Every check reader uses three outcomes:
+
+- **PASSED**: a terminal success result. This is the only hosted state that can
+  satisfy the gate.
+- **FAILED**: a terminal `failure`, `timed_out`, `error`, or `startup_failure`.
+  Exact-head local evidence cannot override it.
+- **NO_RESULT**: cancelled, skipped, neutral, stale, action-required, active,
+  absent, or unknown. It blocks landing without being counted as a failure. The
+  gate re-dispatches a terminal/absent workflow and records its own required
+  context as cancelled until a real result exists.
+
+An exact-head full local PASSED record is a separate admission leg, not a rule
+that converts hosted NO_RESULT into success. The P0 demo gate has no local
+substitute.
+
+## Status consumer inventory
+
+Parent `ci-hub/check_outcome.py` is the check-status authority. The gate fetches
+it at the exact parent authority commit, verifies its digest, and executes it. Hermit's shell,
+PR-status, lander/DAG, and pinned landing-planner entry points share one
+`agent-utils` adapter; it locates and digest-checks the same parent source rather
+than carrying a conclusion table.
+`scripts/check-merge-gate-policy.sh` rejects a duplicate jq table or a consumer
+that bypasses the parent authority. The state table is enforced at every
+decision surface:
+
+- `.github/workflows/merge-gate.yml` classifies portable, privileged, demo,
+  review-protocol, and validation-invalidation results before admission.
+- `scripts/pr_status.py` reports required-check rollups and main workflow
+  history without counting NO_RESULT as red or green.
+- `scripts/pr-dag-health.sh` and the pinned `agent-utils` landing planner use
+  the live required `merge-gate-v4` context; an absent context is never
+  `landable-now`.
+- Parent `ci-hub` uses its canonical `check_outcome.py` model in landing,
+  validate-status, health, remediation, and history consumers.
+
+Two consumers are intentionally not generic admission classifiers.
+`ci-portable.yml` accepts a skipped internal shard only after affected-test
+selection proves that shard deselected; a cancelled selected shard still fails
+the aggregate. `ci-portable-autoretry.yml` consumes cancellation as a trigger
+to create a new result and never treats it as pass or failure.
 
 The workflow removes `locally-validated` whenever the pull request head
 changes. It also re-runs the gate after CI completes and on label changes, so a
@@ -20,13 +62,13 @@ request. Every strip records a durable evidence comment (see
 lost.
 
 The job first verifies that its workflow file has the exact Git blob registered
-in the server-side `MERGE_GATE_V3_BLOB` variable. This rejects accidental drift
+in the server-side `MERGE_GATE_V4_BLOB` variable. This rejects accidental drift
 that retains the guard. The context name is versioned as well: every semantic
 gate tightening must bump it and move the ruleset, so an unmodified
 pre-tightening branch cannot emit the context currently required by `main`.
 
 This is not a cryptographic attestation of PR-owned YAML. A deliberate workflow
-edit can delete the blob-check step while retaining the v3 job name, and both
+edit can delete the blob-check step while retaining the v4 job name, and both
 runs use the same GitHub Actions integration. User-owned repositories cannot
 use GitHub's pinned required-workflow rule, so gate-policy PRs must remain an
 escalated adversarial-review class. A dedicated trusted GitHub App signer (or an
@@ -56,20 +98,27 @@ when a green run must not update GitHub.
 
 The label is an alternate merge admission signal, not a partial-test waiver.
 Apply it only through a full green validator run on the exact pull request head.
-The privileged workflow remains an independent bonus signal and is not a merge
-admission requirement.
+Without that local receipt, the hosted leg requires both the portable and
+privileged jobs to pass. A hosted failure is never overridden by local evidence.
 
 ## Validation-evidence trail
+
+The label is only a cache of a validation receipt; it cannot create evidence.
+Parent `ci-hub/validation/verify_receipt.sh` is the receipt authority used by
+the gate. The gate fetches it from the exact parent authority commit and verifies
+its digest rather than running PR-controlled verifier code. It resolves the marker's receipt
+commit, proves that commit belongs to the receipt branch, reads the exact path
+at that commit, recomputes SHA-256, and then validates the exact-head counted
+ledger row. A well-shaped comment without that backing receipt is refused.
 
 Stripping `locally-validated` must never silently erase the record of what was
 validated. Two symmetric comments preserve it:
 
-- **Add time.** `ci-hub apply-local-label` posts a comment ending in
-  `<!-- locally-validated-receipt commit=... path=... sha256=... -->`. The gate
-  dereferences that exact Git commit and path, verifies the content hash, and
-  requires the embedded ledger row to name the exact PR head, a clean full pass,
-  and a nonzero executed-test count. A perfect-looking marker pointing at no
-  receipt is refused.
+- **Add time.** The parent `ci-hub apply-local-label` authority requires a
+  qualifying local ledger row, preserves and hashes its log, publishes an
+  immutable receipt, comments with a machine-parseable
+  `<!-- locally-validated-receipt commit=... path=... sha256=... -->` marker,
+  and only then applies the label.
 - **Strip time.** `scripts/label-strip-evidence.sh` posts a comment recording
   the strip (validated SHA, new head, reason, timestamp) and quotes the matching
   add-time evidence comment. It is best-effort and always exits 0, so it can
@@ -87,8 +136,8 @@ Known strip paths — all must leave the trail:
    so the evidence is preserved. The `--remove` flag also strips the label.
 3. **Evidence mutation.** Editing or deleting a PR comment revalidates the
    current exact-head receipt. If no dereferenceable receipt remains, the
-   workflow first publishes failing `merge-gate-v3` and transitional
-   `merge-gate-v2` checks at the exact head, then removes `locally-validated`.
+   workflow first publishes failing `merge-gate-v4` and transitional
+   `merge-gate-v3` checks at the exact head, then removes `locally-validated`.
    Publishing both contexts keeps invalidation authoritative before and after
    the ruleset migration. Same-repository branches explicitly dispatch a new
    exact-head gate because label changes made with `GITHUB_TOKEN` do not
@@ -117,8 +166,8 @@ workflow.
 The `main` branch ruleset must:
 
 1. require pull requests and linear history;
-2. require the current versioned Merge Gate context (`merge-gate-v3`) from the
-   GitHub Actions integration, with `MERGE_GATE_V3_BLOB` equal to the workflow
+2. require the current versioned Merge Gate context (`merge-gate-v4`) from the
+   GitHub Actions integration, with `MERGE_GATE_V4_BLOB` equal to the workflow
    blob on `main` and `MERGE_GATE_LEGACY_CONTEXT=false`;
 3. require GitHub's merge queue; and
 4. disallow force pushes and branch deletion.
@@ -134,11 +183,11 @@ the bound main blob, and the disabled transition shim. It does not attest the
 repository's separate merge-queue or history-protection settings.
 
 Before landing a gate-version transition, run `--prepare <feature-ref>`. It
-enables the temporary legacy-context shim, adds v3 alongside the v2 required
-context, and only then binds the candidate blob. The overlap means a stale v2
-branch cannot land during the transition: both v2 and v3 must pass.
+enables the temporary legacy-context shim, adds v4 alongside the v3 required
+context, and only then binds the candidate blob. The overlap means a stale v3
+branch cannot land during the transition: both v3 and v4 must pass.
 After the workflow lands, the coordinator runs `--apply`; it binds the `main`
-blob, removes the v2 required context, disables the shim, and verifies the
+blob, removes the v3 required context, disables the shim, and verifies the
 full resulting ruleset plus all three server-side values. Each full-object PUT
 is preceded by a fresh equality check, which detects policy drift already
 visible before the write. GitHub exposes no conditional PUT for this endpoint,

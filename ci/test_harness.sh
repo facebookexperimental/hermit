@@ -393,7 +393,7 @@ function audit_ci_correspondence {
     local runner_body
     runner_body=$(function_body run_ci_manifest_lane "$ROOT_DIR/validate.sh")
     # shellcheck disable=SC2016
-    [[ $(grep -Fxc '        ./ci/run-dag.sh "$lane" -j "$jobs" -v' <<<"$runner_body") == 1 ]] ||
+    [[ $(grep -Fxc '        ./ci/run-dag.sh "$lane" -j "$VALIDATION_DAG_JOBS" -v' <<<"$runner_body") == 1 ]] ||
         die "validate.sh run_ci_manifest_lane must execute exactly one audited DAG"
 
     local privileged_critical_path

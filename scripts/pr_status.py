@@ -26,11 +26,14 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Sequence
-from urllib.parse import urlparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent-utils" / "py"))
+from ci_hub_check_outcome import classify_check, select_latest_checks  # noqa: E402
 
 DEFAULT_REPOS = ("rrnewton/hermit", "rrnewton/reverie")
 DEFAULT_WARN_THRESHOLD = 10
@@ -38,28 +41,12 @@ DEFAULT_MAIN_LIMIT = 10
 HUMAN_REVIEW_LABEL = "human-review"
 REGULAR_PORTABLE_CHECK = "Regular tests (GitHub-managed portable)"
 REQUIRED_CHECKS = {
-    "rrnewton/hermit": (REGULAR_PORTABLE_CHECK,),
-    "rrnewton/reverie": (
-        REGULAR_PORTABLE_CHECK,
-        "Host-dependent tests (privileged)",
-    ),
+    # Live repository policy (queried 2026-08-04): both main branches require
+    # the merge-gate context. Product jobs are inputs to that gate, not separate
+    # required contexts, so a status consumer must not substitute its own set.
+    "rrnewton/hermit": ("merge-gate-v4",),
+    "rrnewton/reverie": ("merge-gate",),
 }
-
-RED_CONCLUSIONS = frozenset(
-    (
-        "FAILURE",
-        "TIMED_OUT",
-        "CANCELLED",
-        "ERROR",
-        "ACTION_REQUIRED",
-        "STARTUP_FAILURE",
-        "STALE",
-    )
-)
-PENDING_STATES = frozenset(
-    ("PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED")
-)
-
 
 @dataclass(frozen=True)
 class PullRequest:
@@ -76,65 +63,55 @@ class PullRequest:
         return HUMAN_REVIEW_LABEL in self.labels
 
 
-def _check_sort_key(check: dict[object, object], index: int) -> tuple[int, str, int]:
-    details_url = str(check.get("detailsUrl") or "")
-    path_parts = [part for part in urlparse(details_url).path.split("/") if part]
-    try:
-        runs_index = path_parts.index("runs")
-        run_id = int(path_parts[runs_index + 1])
-    except (ValueError, IndexError):
-        run_id = -1
-    timestamp = str(
-        check.get("startedAt")
-        or check.get("createdAt")
-        or check.get("completedAt")
-        or ""
-    )
-    return run_id, timestamp, index
+def classify_check_outcome(conclusion: object, status: object) -> str:
+    """Return passed, failed, or no-result for one GitHub status.
+
+    GitHub CheckRun objects carry ``status=COMPLETED``. Legacy StatusContext
+    objects have a terminal ``state`` but no separate status, so empty status is
+    also terminal. Every other shape is NO-RESULT; unknown values fail closed
+    without being misreported as product failures.
+    """
+    return {
+        "PASSED": "passed",
+        "FAILED": "failed",
+        "NO_RESULT": "no-result",
+    }[classify_check(status, conclusion)]
 
 
-def classify_ci_rollup(repo: str, checks: object) -> str:
-    """Classify the latest authoritative checks as green, red, pending, or none.
+def classify_ci_rollup(repo: str, checks: object, *, head_sha: str = "") -> str:
+    """Classify the latest required checks as green, red, or no-result.
 
     GitHub retains older reruns and auxiliary checks in ``statusCheckRollup``.
-    In particular, Hermit's merge gate intentionally starts red and refires
-    after portable CI completes. Those historical placeholders must not turn a
-    portable-green pull request red in this operational report.
+    Only the newest instance of each live required context controls the result.
+    Missing, cancelled, skipped, neutral, stale, active, and unknown checks all
+    block as ``no-result`` without inflating the red count.
     """
-    if not isinstance(checks, list) or not checks:
-        return "none"
+    checks = select_latest_checks(checks, head_sha=head_sha)
+    if not checks:
+        return "no-result"
 
     required = REQUIRED_CHECKS.get(repo, (REGULAR_PORTABLE_CHECK,))
-    latest: dict[str, tuple[tuple[int, str, int], dict[object, object]]] = {}
-    for index, check in enumerate(checks):
-        if not isinstance(check, dict):
-            continue
+    latest: dict[str, dict[object, object]] = {}
+    for check in checks:
         name = str(check.get("name") or check.get("context") or "")
         if name not in required:
             continue
-        sort_key = _check_sort_key(check, index)
-        previous = latest.get(name)
-        if previous is None or sort_key > previous[0]:
-            latest[name] = (sort_key, check)
+        latest[name] = check
 
     if not latest:
-        return "none"
+        return "no-result"
 
-    saw_pending = len(latest) != len(required)
-    for _, check in latest.values():
+    saw_no_result = len(latest) != len(required)
+    for check in latest.values():
         conclusion = str(check.get("conclusion") or check.get("state") or "").upper()
         status = str(check.get("status") or "").upper()
-
-        if conclusion in RED_CONCLUSIONS:
+        outcome = classify_check_outcome(conclusion, status)
+        if outcome == "failed":
             return "red"
-        if (
-            conclusion in PENDING_STATES
-            or not conclusion
-            or (status and status != "COMPLETED")
-        ):
-            saw_pending = True
+        if outcome == "no-result":
+            saw_no_result = True
 
-    return "pending" if saw_pending else "green"
+    return "no-result" if saw_no_result else "green"
 
 
 def parse_pull_request(repo: str, raw: object) -> PullRequest:
@@ -162,7 +139,11 @@ def parse_pull_request(repo: str, raw: object) -> PullRequest:
         url=url,
         is_draft=raw.get("isDraft") is True,
         labels=labels,
-        ci_status=classify_ci_rollup(repo, raw.get("statusCheckRollup")),
+        ci_status=classify_ci_rollup(
+            repo,
+            raw.get("statusCheckRollup"),
+            head_sha=str(raw.get("headRefOid") or ""),
+        ),
     )
 
 
@@ -179,7 +160,7 @@ def fetch_open_prs(repo: str) -> list[PullRequest]:
         "--limit",
         "200",
         "--json",
-        "number,title,url,isDraft,labels,statusCheckRollup",
+        "number,title,url,isDraft,labels,headRefOid,statusCheckRollup",
     ]
     try:
         result = subprocess.run(command, capture_output=True, text=True, check=False)
@@ -296,23 +277,9 @@ def _format_run_time(created_at: object) -> str:
 
 
 def classify_run_conclusion(conclusion: object, status: object) -> str:
-    """Map a run's ``conclusion``/``status`` to pass/fail/pending/skipped/other.
-
-    A run with no conclusion yet (empty conclusion, or a non-completed status)
-    is ``pending``. ``RED_CONCLUSIONS`` (failure, timed out, cancelled, ...)
-    are ``fail`` so they can be highlighted; ``success`` is ``pass``.
-    """
-    concl = str(conclusion or "").upper()
-    stat = str(status or "").upper()
-    if concl == "SUCCESS":
-        return "pass"
-    if concl in RED_CONCLUSIONS:
-        return "fail"
-    if concl in ("SKIPPED", "NEUTRAL"):
-        return "skipped"
-    if not concl or (stat and stat != "COMPLETED"):
-        return "pending"
-    return "other"
+    """Map a workflow run to the same pass/fail/no-result model."""
+    outcome = classify_check_outcome(conclusion, status)
+    return {"passed": "pass", "failed": "fail", "no-result": "no-result"}[outcome]
 
 
 def parse_workflow_run(repo: str, raw: object) -> WorkflowRun:
@@ -369,9 +336,7 @@ def fetch_main_runs(repo: str, limit: int) -> list[WorkflowRun]:
 _STATE_MARKER = {
     "pass": "ok",
     "fail": "FAIL",
-    "pending": "...",
-    "skipped": "skip",
-    "other": "?",
+    "no-result": "NONE",
 }
 
 
@@ -395,8 +360,7 @@ def render_main_ci(runs: Sequence[WorkflowRun], repo: str, limit: int) -> str:
 
     passing = sum(run.state == "pass" for run in runs)
     failing = sum(run.state == "fail" for run in runs)
-    pending = sum(run.state == "pending" for run in runs)
-    skipped = sum(run.state == "skipped" for run in runs)
+    no_result = sum(run.state == "no-result" for run in runs)
     commits = len({run.head_sha for run in runs})
     lines.extend(
         (
@@ -405,8 +369,7 @@ def render_main_ci(runs: Sequence[WorkflowRun], repo: str, limit: int) -> str:
             f"  runs shown:  {len(runs)} across {commits} commits",
             f"  pass:        {passing}",
             f"  fail:        {failing}",
-            f"  pending:     {pending}",
-            f"  skipped:     {skipped}",
+            f"  no-result:   {no_result}",
         )
     )
 

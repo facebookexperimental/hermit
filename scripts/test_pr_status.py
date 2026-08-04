@@ -13,13 +13,17 @@ import pr_status
 
 class ClassifyCiRollupTest(unittest.TestCase):
     def test_empty_or_missing_is_none(self) -> None:
-        self.assertEqual(pr_status.classify_ci_rollup("rrnewton/hermit", []), "none")
-        self.assertEqual(pr_status.classify_ci_rollup("rrnewton/hermit", None), "none")
+        self.assertEqual(
+            pr_status.classify_ci_rollup("rrnewton/hermit", []), "no-result"
+        )
+        self.assertEqual(
+            pr_status.classify_ci_rollup("rrnewton/hermit", None), "no-result"
+        )
 
     def test_failure_conclusion_is_red(self) -> None:
         checks = [
             {
-                "name": pr_status.REGULAR_PORTABLE_CHECK,
+                "name": "merge-gate-v4",
                 "conclusion": "FAILURE",
                 "status": "COMPLETED",
             },
@@ -31,19 +35,19 @@ class ClassifyCiRollupTest(unittest.TestCase):
     def test_incomplete_status_is_pending(self) -> None:
         checks = [
             {
-                "name": pr_status.REGULAR_PORTABLE_CHECK,
+                "name": "merge-gate-v4",
                 "conclusion": "",
                 "status": "IN_PROGRESS",
             }
         ]
         self.assertEqual(
-            pr_status.classify_ci_rollup("rrnewton/hermit", checks), "pending"
+            pr_status.classify_ci_rollup("rrnewton/hermit", checks), "no-result"
         )
 
     def test_all_success_is_green(self) -> None:
         checks = [
             {
-                "name": pr_status.REGULAR_PORTABLE_CHECK,
+                "name": "merge-gate-v4",
                 "conclusion": "SUCCESS",
                 "status": "COMPLETED",
             }
@@ -52,16 +56,16 @@ class ClassifyCiRollupTest(unittest.TestCase):
             pr_status.classify_ci_rollup("rrnewton/hermit", checks), "green"
         )
 
-    def test_merge_gate_failure_is_ignored(self) -> None:
+    def test_nonrequired_portable_failure_is_ignored(self) -> None:
         checks = [
             {
-                "name": "merge-gate",
+                "name": pr_status.REGULAR_PORTABLE_CHECK,
                 "conclusion": "FAILURE",
                 "status": "COMPLETED",
                 "startedAt": "2026-07-26T12:00:00Z",
             },
             {
-                "name": pr_status.REGULAR_PORTABLE_CHECK,
+                "name": "merge-gate-v4",
                 "conclusion": "SUCCESS",
                 "status": "COMPLETED",
                 "startedAt": "2026-07-26T12:01:00Z",
@@ -74,13 +78,13 @@ class ClassifyCiRollupTest(unittest.TestCase):
     def test_latest_authoritative_rerun_wins(self) -> None:
         checks = [
             {
-                "name": pr_status.REGULAR_PORTABLE_CHECK,
+                "name": "merge-gate-v4",
                 "conclusion": "FAILURE",
                 "status": "COMPLETED",
                 "startedAt": "2026-07-26T12:00:00Z",
             },
             {
-                "name": pr_status.REGULAR_PORTABLE_CHECK,
+                "name": "merge-gate-v4",
                 "conclusion": "SUCCESS",
                 "status": "COMPLETED",
                 "startedAt": "2026-07-26T12:05:00Z",
@@ -93,14 +97,14 @@ class ClassifyCiRollupTest(unittest.TestCase):
     def test_newer_queued_run_wins_over_older_success(self) -> None:
         checks = [
             {
-                "name": pr_status.REGULAR_PORTABLE_CHECK,
+                "name": "merge-gate-v4",
                 "conclusion": "SUCCESS",
                 "status": "COMPLETED",
                 "startedAt": "2026-07-26T12:00:00Z",
                 "detailsUrl": "https://github.com/o/r/actions/runs/10/job/1",
             },
             {
-                "name": pr_status.REGULAR_PORTABLE_CHECK,
+                "name": "merge-gate-v4",
                 "conclusion": "",
                 "status": "QUEUED",
                 "startedAt": "0001-01-01T00:00:00Z",
@@ -108,13 +112,13 @@ class ClassifyCiRollupTest(unittest.TestCase):
             },
         ]
         self.assertEqual(
-            pr_status.classify_ci_rollup("rrnewton/hermit", checks), "pending"
+            pr_status.classify_ci_rollup("rrnewton/hermit", checks), "no-result"
         )
 
     def test_hermit_privileged_failure_is_nonblocking(self) -> None:
         checks = [
             {
-                "name": pr_status.REGULAR_PORTABLE_CHECK,
+                "name": "merge-gate-v4",
                 "conclusion": "SUCCESS",
                 "status": "COMPLETED",
             },
@@ -129,31 +133,75 @@ class ClassifyCiRollupTest(unittest.TestCase):
         )
 
     def test_reverie_requires_portable_and_host_dependent_checks(self) -> None:
-        portable = {
-            "name": pr_status.REGULAR_PORTABLE_CHECK,
+        merge_gate = {
+            "name": "merge-gate",
             "conclusion": "SUCCESS",
             "status": "COMPLETED",
         }
-        host_dependent = {
+        auxiliary = {
             "name": "Host-dependent tests (privileged)",
             "conclusion": "SUCCESS",
             "status": "COMPLETED",
         }
         self.assertEqual(
-            pr_status.classify_ci_rollup("rrnewton/reverie", [portable]), "pending"
+            pr_status.classify_ci_rollup("rrnewton/reverie", [merge_gate]), "green"
         )
         self.assertEqual(
             pr_status.classify_ci_rollup(
-                "rrnewton/reverie", [portable, host_dependent]
+                "rrnewton/reverie", [merge_gate, auxiliary]
             ),
             "green",
         )
 
-        failed = {**host_dependent, "conclusion": "FAILURE"}
+        failed = {**merge_gate, "conclusion": "FAILURE"}
         self.assertEqual(
-            pr_status.classify_ci_rollup("rrnewton/reverie", [portable, failed]),
+            pr_status.classify_ci_rollup("rrnewton/reverie", [failed, auxiliary]),
             "red",
         )
+
+    def test_cancelled_required_check_is_no_result_not_red_or_green(self) -> None:
+        checks = [
+            {
+                "name": "merge-gate-v4",
+                "conclusion": "CANCELLED",
+                "status": "COMPLETED",
+            }
+        ]
+        result = pr_status.classify_ci_rollup("rrnewton/hermit", checks)
+        self.assertEqual(result, "no-result")
+        self.assertNotEqual(result, "red")
+        self.assertNotEqual(result, "green")
+
+    def test_two_legitimate_pass_shapes_are_unchanged(self) -> None:
+        self.assertEqual(
+            pr_status.classify_check_outcome("success", "completed"), "passed"
+        )
+        self.assertEqual(pr_status.classify_check_outcome("success", ""), "passed")
+
+    def test_four_failures_and_twelve_no_results(self) -> None:
+        failures = ("failure", "timed_out", "error", "startup_failure")
+        for conclusion in failures:
+            self.assertEqual(
+                pr_status.classify_check_outcome(conclusion, "completed"), "failed"
+            )
+        no_results = (
+            ("cancelled", "completed"),
+            ("skipped", "completed"),
+            ("neutral", "completed"),
+            ("stale", "completed"),
+            ("action_required", "completed"),
+            ("", "queued"),
+            ("", "in_progress"),
+            ("", "waiting"),
+            ("", "requested"),
+            ("", "pending"),
+            ("", "missing"),
+            ("future_state", "completed"),
+        )
+        for conclusion, status in no_results:
+            self.assertEqual(
+                pr_status.classify_check_outcome(conclusion, status), "no-result"
+            )
 
 
 class ParsePullRequestTest(unittest.TestCase):
@@ -218,25 +266,28 @@ class ClassifyRunConclusionTest(unittest.TestCase):
         self.assertEqual(pr_status.classify_run_conclusion("SUCCESS", "COMPLETED"), "pass")
 
     def test_failure_family_is_fail(self) -> None:
-        for concl in ("failure", "timed_out", "cancelled", "startup_failure", "stale"):
+        for concl in ("failure", "timed_out", "error", "startup_failure"):
             self.assertEqual(
                 pr_status.classify_run_conclusion(concl, "completed"),
                 "fail",
                 msg=concl,
             )
 
-    def test_skipped_and_neutral(self) -> None:
-        self.assertEqual(pr_status.classify_run_conclusion("skipped", "completed"), "skipped")
-        self.assertEqual(pr_status.classify_run_conclusion("neutral", "completed"), "skipped")
+    def test_cancelled_skipped_neutral_and_stale_are_no_result(self) -> None:
+        for conclusion in ("cancelled", "skipped", "neutral", "stale"):
+            self.assertEqual(
+                pr_status.classify_run_conclusion(conclusion, "completed"),
+                "no-result",
+            )
 
     def test_no_conclusion_yet_is_pending(self) -> None:
-        self.assertEqual(pr_status.classify_run_conclusion("", "in_progress"), "pending")
-        self.assertEqual(pr_status.classify_run_conclusion(None, "queued"), "pending")
-        self.assertEqual(pr_status.classify_run_conclusion("", "completed"), "pending")
+        self.assertEqual(pr_status.classify_run_conclusion("", "in_progress"), "no-result")
+        self.assertEqual(pr_status.classify_run_conclusion(None, "queued"), "no-result")
+        self.assertEqual(pr_status.classify_run_conclusion("", "completed"), "no-result")
 
     def test_unknown_conclusion_is_other(self) -> None:
         self.assertEqual(
-            pr_status.classify_run_conclusion("something_new", "completed"), "other"
+            pr_status.classify_run_conclusion("something_new", "completed"), "no-result"
         )
 
 
@@ -306,12 +357,12 @@ class RenderMainCiTest(unittest.TestCase):
             self._run("cccccccc", "Docs", "", "2026-07-27T13:00:00Z"),
         ]
         report = pr_status.render_main_ci(runs, "rrnewton/hermit", 10)
-        # Newest first: the pending Docs run (13:00) precedes the failure (12:00).
+        # Newest first: the no-result Docs run (13:00) precedes the failure (12:00).
         self.assertLess(report.index("cccccccc"), report.index("bbbbbbbb"))
         self.assertLess(report.index("bbbbbbbb"), report.index("aaaaaaaa"))
         self.assertIn("pass:        1", report)
         self.assertIn("fail:        1", report)
-        self.assertIn("pending:     1", report)
+        self.assertIn("no-result:   1", report)
         self.assertIn("runs shown:  3 across 3 commits", report)
         self.assertIn("FAILURES (1)", report)
         self.assertIn("FAIL", report)
