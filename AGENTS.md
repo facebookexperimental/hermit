@@ -125,17 +125,22 @@ and the reason is documented.
 
 ## Workspace Map
 
-The root Cargo workspace has ten members:
+The root Cargo workspace has fourteen members:
 
 | Path | Role |
 | --- | --- |
 | `hermit-cli` | Main `hermit` CLI and `libhermit`; run, record, replay, log-diff, analyze, and container orchestration. |
 | `detcore` | Core determinism engine and Reverie tool; scheduler, virtual time, syscall handling, content digests, CPUID handling, and record/replay behavior. |
 | `detcore-model` | Shared deterministic state and model types, including PIDs, file descriptors, futexes, schedules, and logical time. |
+| `detcore-dbi` | Feature-gated DynamoRIO backend glue; private while the public DBT package boundary and name remain undecided. |
+| `detcore-sabre` | Feature-gated SaBRe backend glue; private while third-party backend packaging remains provisional. |
 | `detcore/tests/testutils` | Helpers used by Detcore integration tests. |
 | `hermit-verify` | Verification executable for stress, trace, schedule, and replay checks. |
 | `common/edit-distance` | Edit-distance utility used when comparing executions and logs. |
 | `common/test-allocator` | Test allocator and supporting test binary. |
+| `ci/manifest-plan` | Private generator and validator for the E2E manifest, test inventory, and test-selection artifacts. |
+| `hermit-install` | Private build helper that stages feature-gated third-party backend resources for tests and development. |
+| `hermit-resources` | Resource accounting and limit types shared by Hermit and Detcore. |
 | `tests` | Guest programs used by integration scenarios, including time, futex, network, pipe, scheduling, and RDTSC cases. |
 | `flaky-tests` | Intentionally racy guest programs used to demonstrate and test deterministic scheduling and chaos mode. |
 
