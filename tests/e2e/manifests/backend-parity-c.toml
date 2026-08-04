@@ -3293,6 +3293,9 @@ occasional = false
 program = "tests/backend-parity/fixtures/append_pwrite.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
+[test.build]
+cflags = ["-D_GNU_SOURCE"]
+
 [test.modes.verify]
 ci = false
 backends_enabled = ["ptrace"]
