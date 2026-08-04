@@ -74,7 +74,11 @@ Known strip paths — all must leave the trail:
    so the evidence is preserved. The `--remove` flag also strips the label.
 3. **Evidence mutation.** Editing or deleting a PR comment revalidates the
    current exact-head record. If no valid owner-authored record remains, the
-   workflow removes `locally-validated`; that label event re-runs the gate.
+   workflow removes `locally-validated` and explicitly dispatches a new
+   exact-head gate. The dispatch is required because label changes made with
+   `GITHUB_TOKEN` do not recursively trigger another workflow. This closes a
+   stale green check after the mutation is processed; there remains a narrow
+   race if a merge completes before the edit/delete event and follow-up run.
 
 The GitHub gate validates the evidence record, not the referenced host file:
 gate fallback runners cannot dereference a devbig014-local path. Shared

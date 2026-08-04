@@ -187,6 +187,7 @@ jobs:
     runs-on: [self-hosted, gate]
     timeout-minutes: 5
     permissions:
+      actions: write
       issues: write
       pull-requests: read
     steps:
@@ -201,6 +202,7 @@ jobs:
           pr="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")"
           state="$(jq -r '.state' <<< "$pr")"
           head_sha="$(jq -r '.head.sha' <<< "$pr")"
+          head_ref="$(jq -r '.head.ref' <<< "$pr")"
           if [ "$state" != open ]; then
             echo "PR #${PR_NUMBER} is ${state}; no live validation label to protect."
             exit 0
@@ -253,6 +255,15 @@ jobs:
           gh api --method POST "repos/${REPO}/issues/${PR_NUMBER}/comments" \
             -f body="$body" --silent
           echo "Removed locally-validated from PR #${PR_NUMBER}; evidence no longer validates head ${head_sha}."
+
+          # Events caused by GITHUB_TOKEN do not recursively start workflows.
+          # Explicitly dispatch after deleting the label so this exact PR head
+          # receives a fresh, failing merge-gate check.
+          gh workflow run merge-gate.yml \
+            --repo "$REPO" \
+            --ref "$head_ref" \
+            -f pr_number="$PR_NUMBER"
+          echo "Dispatched merge-gate for PR #${PR_NUMBER} at ${head_sha}."
 
   core-review-protocol:
     name: core-review-protocol
