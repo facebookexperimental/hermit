@@ -40,29 +40,32 @@
     {
       "group": "build", "job": "workspace",
       "desc": "Build workspace (cargo build --workspace --features third-party-backends)",
-      "cmd": "CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-$(nproc)} cargo build --workspace --features third-party-backends",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal in cmd (was ${THIRD_PARTY_BUILD_JOBS:-$(nproc)} -> on a large box the job count scaled with nproc while the cap stayed constant = OOM). rss_baseline=measured_peak@j8=6.0GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=COLD full-workspace (the one true cold peak in this sweep); hermit@0f891e43. per_worker: not decomposed (measured total peak at the pinned width directly). headroom ~+33% -> hard_mem_max_bytes=8.0GiB (kept at mem_cap_floor). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo build --workspace --features third-party-backends",
       "deps": ["e2e.metadata"],
       "timeout": 1200,
-      "hint": {"est_duration_s": 360, "rss_baseline_bytes": 5368709120,
+      "hint": {"est_duration_s": 360, "rss_baseline_bytes": 6442450944,
                "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
     },
     {
       "group": "build", "job": "dbi_release",
       "desc": "Build release Hermit, the DBI plugin, and installed backend resources",
-      "cmd": "CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-$(nproc)} HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-common cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbi -p hermit-install",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal in cmd. THIS IS THE NODE THAT OOMed EVERY FULL-VALIDATE PR: release C++ of drcachesim is LINEAR in jobs at per_worker~=522MiB/proc, so ${THIRD_PARTY_BUILD_JOBS:-$(nproc)} (32 third-party or nproc) x 522MiB >> old 8GiB cap = deterministic OOM. rss_baseline=measured_peak@j8=6.8GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=near-cold; hermit@0f891e43. peak@j8*1.25 = 8.16GiB, so the OLD 8GiB cap was already too tight even at j8 -> hard_mem_max_bytes RAISED to 8.5GiB. Independent prior proof: j8 from 522MiB/proc + 22.5% headroom PASSed 6.20GiB peak 47/47 (j12 had only 1.2% headroom). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-common cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbi -p hermit-install",
       "deps": ["build.workspace"],
       "timeout": 1200,
-      "hint": {"est_duration_s": 240, "rss_baseline_bytes": 5368709120,
-               "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
+      "hint": {"est_duration_s": 240, "rss_baseline_bytes": 7301444403,
+               "hard_mem_max_bytes": 9126805504, "classification": "cpu-bound"}
     },
     {
       "group": "build", "job": "sabre_release",
       "desc": "Build the release Detcore SaBRe plugin and restage the pinned loader",
-      "cmd": "CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-$(nproc)} cargo build --release --locked -p detcore-sabre && CARGO_BUILD_JOBS=${THIRD_PARTY_BUILD_JOBS:-$(nproc)} HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-sabre cargo build --release --locked -p hermit-install && sha256sum target/install_pkg/rsrcs/sabre && cat target/install_pkg/rsrcs/sabre.revision",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal in both cmd legs. rss_baseline=measured_peak@j8=944MiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm (depends on build.dbi_release which warms the shared target in the real DAG, so this warm peak is production-representative); hermit@0f891e43. headroom=+1.5GiB additive (single-sample + cold-vs-warm residual) -> hard_mem_max_bytes=2.5GiB (was 6GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo build --release --locked -p detcore-sabre && CARGO_BUILD_JOBS=8 HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-sabre cargo build --release --locked -p hermit-install && sha256sum target/install_pkg/rsrcs/sabre && cat target/install_pkg/rsrcs/sabre.revision",
       "deps": ["build.dbi_release"],
       "timeout": 1200,
-      "hint": {"est_duration_s": 90, "rss_baseline_bytes": 3221225472,
-               "hard_mem_max_bytes": 6442450944, "classification": "cpu-bound"}
+      "hint": {"est_duration_s": 90, "rss_baseline_bytes": 989855744,
+               "hard_mem_max_bytes": 2684354560, "classification": "cpu-bound"}
     },
     {
       "group": "build", "job": "liteinst_runtime_release",
@@ -254,66 +257,73 @@
     {
       "group": "lint", "job": "clippy",
       "desc": "Clippy (cargo clippy --workspace --all-targets -D warnings)",
-      "cmd": "cargo clippy --workspace --all-targets -- -D warnings",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> clippy's build phase defaulted to nproc). rss_baseline=measured_peak@j8=4.0GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=5.5GiB (was 8GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo clippy --workspace --all-targets -- -D warnings",
       "deps": ["build.workspace"],
       "timeout": 1200,
-      "hint": {"est_duration_s": 300, "rss_baseline_bytes": 6442450944,
-               "hard_mem_max_bytes": 8589934592, "classification": "cpu-bound"}
+      "hint": {"est_duration_s": 300, "rss_baseline_bytes": 4294967296,
+               "hard_mem_max_bytes": 5905580032, "classification": "cpu-bound"}
     },
     {
       "group": "doc", "job": "doctests",
       "desc": "Test workspace documentation (cargo test --workspace --features third-party-backends --doc)",
-      "cmd": "cargo test --workspace --features third-party-backends --doc",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> cargo defaulted the build phase to nproc). rss_baseline=measured_peak@j8=208MiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=2.0GiB (was 5GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo test --workspace --features third-party-backends --doc",
       "deps": ["build.workspace"],
       "timeout": 900,
-      "hint": {"est_duration_s": 180, "rss_baseline_bytes": 3221225472,
-               "hard_mem_max_bytes": 5368709120, "classification": "cpu-bound"}
+      "hint": {"est_duration_s": 180, "rss_baseline_bytes": 218103808,
+               "hard_mem_max_bytes": 2147483648, "classification": "cpu-bound"}
     },
     {
       "group": "doc", "job": "rustdoc",
       "desc": "Documentation (cargo doc --workspace --no-deps)",
-      "cmd": "cargo doc --workspace --no-deps",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> rustdoc's build phase defaulted to nproc; historical notes show this node has hit >5GiB uncapped/at-nproc, so pinning is the fix). rss_baseline=measured_peak@j8=1.1GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.9GiB additive -> hard_mem_max_bytes=3.0GiB (was 5GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo doc --workspace --no-deps",
       "deps": ["build.workspace"],
       "timeout": 900,
-      "hint": {"est_duration_s": 150, "rss_baseline_bytes": 3221225472,
-               "hard_mem_max_bytes": 5368709120, "classification": "cpu-bound"}
+      "hint": {"est_duration_s": 150, "rss_baseline_bytes": 1181116006,
+               "hard_mem_max_bytes": 3221225472, "classification": "cpu-bound"}
     },
     {
       "group": "test", "job": "regular_crates",
       "desc": "Test regular workspace crates (nextest, excludes detcore/hermit/flaky)",
-      "cmd": "cargo nextest run ${CI:+--profile ci} --workspace --exclude detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (build phase; nextest execution threads stay default). rss_baseline=measured_peak@j8=2.0GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); measured on a 316-core box with nextest's default (nproc) test-thread parallelism, so this peak already reflects full execution-thread fan-out; hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=3.5GiB (was 6GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo nextest run ${CI:+--profile ci} --workspace --exclude detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests",
       "deps": ["build.workspace", "setup.nextest"],
       "timeout": 900,
-      "hint": {"est_duration_s": 200, "rss_baseline_bytes": 4294967296,
-               "hard_mem_max_bytes": 6442450944, "classification": "cpu-bound"}
+      "hint": {"est_duration_s": 200, "rss_baseline_bytes": 2147483648,
+               "hard_mem_max_bytes": 3758096384, "classification": "cpu-bound"}
     },
     {
       "group": "build", "job": "flaky_harnesses",
       "desc": "Compile flaky guest test harnesses (--no-run)",
-      "cmd": "cargo test -p hermetic_infra_hermit_flaky-tests --no-run",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> build phase defaulted to nproc). rss_baseline=measured_peak@j8=143.8MiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.9GiB additive -> hard_mem_max_bytes=2.0GiB (was 5GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo test -p hermetic_infra_hermit_flaky-tests --no-run",
       "deps": ["build.workspace"],
       "timeout": 900,
-      "hint": {"est_duration_s": 120, "rss_baseline_bytes": 3221225472,
-               "hard_mem_max_bytes": 5368709120, "classification": "cpu-bound"}
+      "hint": {"est_duration_s": 120, "rss_baseline_bytes": 150798540,
+               "hard_mem_max_bytes": 2147483648, "classification": "cpu-bound"}
     },
     {
       "group": "test", "job": "hermit_unit",
       "desc": "Test Hermit unit and binary targets (-p hermit --lib --bins)",
-      "cmd": "cargo test -p hermit --features third-party-backends --lib --bins -- --test-threads=1",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (build phase; test execution already --test-threads=1). rss_baseline=measured_peak@j8=4.6GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. NOTE the old 5GiB cap left only ~0.4GiB over the warm peak -> it was too tight; headroom=+1.9GiB additive -> hard_mem_max_bytes RAISED to 6.5GiB. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --lib --bins -- --test-threads=1",
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
-               "rss_baseline_bytes": 3221225472, "hard_mem_max_bytes": 5368709120,
+               "rss_baseline_bytes": 4939212390, "hard_mem_max_bytes": 6979321856,
                "classification": "cpu-bound"}
     },
     {
       "group": "test", "job": "detcore_unit",
       "desc": "Test Detcore unit and binary targets (-p detcore --lib --bins)",
-      "cmd": "cargo test -p detcore --lib --bins",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> build phase defaulted to nproc). rss_baseline=measured_peak@j8=1.8GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.7GiB additive -> hard_mem_max_bytes=3.5GiB (was 5GiB). NOTE: cpu_timeout intentionally NOT set here or on the sibling test.detcore_misc node -- detcore_misc currently livelocks under load (reverie#355 is the established fix; a cpu_timeout derived from pre-355 hang behaviour would be wrong). cpu_timeout derivation is out of scope for this memory-cap change. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo test -p detcore --lib --bins",
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"est_duration_s": 120,
-               "rss_baseline_bytes": 3221225472, "hard_mem_max_bytes": 5368709120,
+               "rss_baseline_bytes": 1932735283, "hard_mem_max_bytes": 3758096384,
                "classification": "cpu-bound"}
     },
     {
