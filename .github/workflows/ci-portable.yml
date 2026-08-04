@@ -190,6 +190,9 @@ jobs:
         run: |
           set -euo pipefail
           checker="$RUNNER_TEMP/check-reverie-pin"
+          checker_tests="$RUNNER_TEMP/check-reverie-pin-tests"
+          RUSTUP_TOOLCHAIN=stable rustc --edition=2021 --test scripts/check-reverie-pin.rs -o "$checker_tests"
+          "$checker_tests"
           RUSTUP_TOOLCHAIN=stable rustc --edition=2021 scripts/check-reverie-pin.rs -o "$checker"
 
           reason="$({

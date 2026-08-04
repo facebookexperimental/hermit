@@ -14,7 +14,13 @@
 //! but it does NOT have to equal the very latest tip. A pin that is merely
 //! behind main is fine and passes; only a pin that is not on main's history at
 //! all — a typo, an orphaned SHA, or an unmerged/side-branch commit — is
-//! blocked. All Reverie `rev`s across the manifests must still be identical.
+//! blocked. All Reverie revisions across tracked Cargo dependency metadata must
+//! still be identical.
+//!
+//! Scope is derived with `git ls-files`: every tracked `Cargo.toml` and
+//! `Cargo.lock` is inspected, including tracked vendored paths. Untracked or
+//! generated files and files inside nested submodules are outside this check;
+//! their contents are not tracked by the Hermit repository.
 //!
 //! Local use on Meta hosts:
 //!
@@ -60,6 +66,11 @@ struct PinOccurrence {
     rev: String,
 }
 
+struct PinScan {
+    occurrences: Vec<PinOccurrence>,
+    tracked_files: Vec<PathBuf>,
+}
+
 fn usage() -> &'static str {
     "Usage: check-reverie-pin.rs [OPTIONS]\n\
      \n\
@@ -69,6 +80,9 @@ fn usage() -> &'static str {
        --reverie-main SHA                  Known main tip SHA (skips ls-remote; ancestry still fetched)\n\
        --allow-stale-reverie-pin REASON    Explicit reasoned override\n\
        -h, --help                          Show this help\n\
+     \n\
+     Scope: every tracked Cargo.toml and Cargo.lock from git ls-files.\n\
+     Excludes non-Cargo files, untracked/generated files, and nested submodule contents.\n\
      \n\
      Environment override: HERMIT_STALE_REVERIE_PIN_REASON=\"reason\""
 }
@@ -131,27 +145,36 @@ fn git_root() -> Result<PathBuf, String> {
     ))
 }
 
-fn collect_manifests(dir: &Path, manifests: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries =
-        fs::read_dir(dir).map_err(|error| format!("could not read {}: {error}", dir.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("could not read directory entry: {error}"))?;
-        let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
-        if file_type.is_dir() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if matches!(name.as_ref(), ".git" | "target" | "third-party" | "ignored") {
-                continue;
-            }
-            collect_manifests(&path, manifests)?;
-        } else if file_type.is_file() && entry.file_name() == "Cargo.toml" {
-            manifests.push(path);
-        }
+fn tracked_cargo_metadata(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let output = git_in(
+        root,
+        &[
+            "ls-files",
+            "-z",
+            "--",
+            "Cargo.toml",
+            "Cargo.lock",
+            ":(glob)**/Cargo.toml",
+            ":(glob)**/Cargo.lock",
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "git ls-files for Cargo dependency metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
-    Ok(())
+    let mut paths: Vec<PathBuf> = String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(|path| root.join(path))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    if paths.is_empty() {
+        return Err("git tracks no Cargo.toml or Cargo.lock files".to_string());
+    }
+    Ok(paths)
 }
 
 fn extract_rev(line: &str) -> Option<String> {
@@ -187,22 +210,39 @@ fn extract_rev(line: &str) -> Option<String> {
     None
 }
 
-fn read_pins(root: &Path) -> Result<Vec<PinOccurrence>, String> {
-    let mut manifests = Vec::new();
-    collect_manifests(root, &mut manifests)?;
-    manifests.sort();
+fn extract_lock_rev(line: &str) -> Option<String> {
+    let start = line.find("?rev=")? + "?rev=".len();
+    let rev: String = line[start..]
+        .chars()
+        .take_while(|character| character.is_ascii_hexdigit())
+        .collect();
+    (!rev.is_empty()).then_some(rev)
+}
+
+fn is_reverie_git_source(line: &str) -> bool {
+    line.contains("github.com/") && line.contains("/reverie.git")
+}
+
+fn read_pins(root: &Path) -> Result<PinScan, String> {
+    let tracked_files = tracked_cargo_metadata(root)?;
 
     let mut pins = Vec::new();
-    for path in manifests {
+    for path in &tracked_files {
         let contents = fs::read_to_string(&path)
             .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+        let file_name = path.file_name().and_then(|name| name.to_str());
         for (line_index, line) in contents.lines().enumerate() {
-            if !line.contains("github.com/") || !line.contains("/reverie.git") {
+            if !is_reverie_git_source(line) {
                 continue;
             }
-            let rev = extract_rev(line).ok_or_else(|| {
+            let rev = match file_name {
+                Some("Cargo.toml") => extract_rev(line),
+                Some("Cargo.lock") => extract_lock_rev(line),
+                _ => None,
+            }
+            .ok_or_else(|| {
                 format!(
-                    "{}:{} is a Reverie git dependency without a quoted rev",
+                    "{}:{} is a Reverie git dependency/source without a pinned rev",
                     path.display(),
                     line_index + 1
                 )
@@ -215,16 +255,22 @@ fn read_pins(root: &Path) -> Result<Vec<PinOccurrence>, String> {
                 ));
             }
             pins.push(PinOccurrence {
-                path: path.clone(),
+                path: path.to_path_buf(),
                 line: line_index + 1,
                 rev,
             });
         }
     }
     if pins.is_empty() {
-        return Err("no pinned GitHub Reverie dependencies found in Cargo.toml files".to_string());
+        return Err(
+            "no pinned GitHub Reverie dependencies found in tracked Cargo.toml/Cargo.lock files"
+                .to_string(),
+        );
     }
-    Ok(pins)
+    Ok(PinScan {
+        occurrences: pins,
+        tracked_files,
+    })
 }
 
 fn query_main(remote: &str) -> Result<String, String> {
@@ -384,13 +430,29 @@ fn blocked_instructions() {
     eprintln!("Preland CI reads: Stale-Reverie-Pin-Reason: <reason> from the PR body.");
 }
 
-fn run() -> Result<i32, String> {
-    let config = parse_args()?;
+fn run_with_config(config: Config) -> Result<i32, String> {
     let root = config.repo.clone().map_or_else(git_root, Ok)?;
-    let pins = read_pins(&root)?;
+    let scan = read_pins(&root)?;
+    let pins = &scan.occurrences;
+
+    let tracked_manifests = scan
+        .tracked_files
+        .iter()
+        .filter(|path| path.file_name().is_some_and(|name| name == "Cargo.toml"))
+        .count();
+    let tracked_locks = scan.tracked_files.len() - tracked_manifests;
+    let pinned_file_count: BTreeSet<&Path> = pins.iter().map(|item| item.path.as_path()).collect();
+    eprintln!(
+        "Scope: scanned {tracked_manifests} tracked Cargo.toml and {tracked_locks} tracked Cargo.lock files; {} files contain {} Reverie revision entries.",
+        pinned_file_count.len(),
+        pins.len()
+    );
+    eprintln!(
+        "Scope exclusions: non-Cargo tracked files, untracked/generated files, and nested submodule contents; tracked vendored Cargo metadata is included."
+    );
 
     let mut by_rev: BTreeMap<&str, Vec<&PinOccurrence>> = BTreeMap::new();
-    for pin in &pins {
+    for pin in pins {
         by_rev.entry(&pin.rev).or_default().push(pin);
     }
     if by_rev.len() != 1 {
@@ -432,9 +494,8 @@ fn run() -> Result<i32, String> {
         }
     };
 
-    let manifest_count: BTreeSet<&Path> = pins.iter().map(|item| item.path.as_path()).collect();
     let entries = pins.len();
-    let manifests = manifest_count.len();
+    let pin_files = pinned_file_count.len();
 
     let relation = match classify_pin(remote, pin, &main) {
         Ok(relation) => relation,
@@ -454,7 +515,7 @@ fn run() -> Result<i32, String> {
     match relation {
         PinRelation::Current => {
             println!(
-                "Reverie pin is current: {pin} ({entries} dependency entries across {manifests} manifests)"
+                "Reverie pin is current: {pin} ({entries} revision entries across {pin_files} tracked Cargo metadata files)"
             );
             Ok(0)
         }
@@ -465,7 +526,7 @@ fn run() -> Result<i32, String> {
                 None => "behind".to_string(),
             };
             println!(
-                "Reverie pin is consistent: {pin} is an ancestor of reverie main ({entries} dependency entries across {manifests} manifests)."
+                "Reverie pin is consistent: {pin} is an ancestor of reverie main ({entries} revision entries across {pin_files} tracked Cargo metadata files)."
             );
             println!("Latest main: {main} ({distance}). A bump is optional, not required.");
             Ok(0)
@@ -475,7 +536,7 @@ fn run() -> Result<i32, String> {
             eprintln!("Hermit pin:         {pin}");
             eprintln!("Latest main:        {main}");
             eprintln!("Remote:             {remote}");
-            eprintln!("Affected manifests: {manifests}");
+            eprintln!("Affected Cargo metadata files: {pin_files}");
             eprintln!("The pinned commit is NOT an ancestor of reverie main.");
             eprintln!("It may be a typo, an orphaned SHA, or an unmerged/side-branch commit.");
             eprintln!("Compare: https://github.com/rrnewton/reverie/compare/{pin}...{main}");
@@ -486,6 +547,10 @@ fn run() -> Result<i32, String> {
             Ok(1)
         }
     }
+}
+
+fn run() -> Result<i32, String> {
+    run_with_config(parse_args()?)
 }
 
 fn main() {
@@ -502,6 +567,9 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+
     use super::*;
 
     #[test]
@@ -524,5 +592,75 @@ mod tests {
         assert!(is_full_sha("0123456789abcdef0123456789abcdef01234567"));
         assert!(!is_full_sha("01234567"));
         assert!(!is_full_sha("z123456789abcdef0123456789abcdef01234567"));
+    }
+
+    #[test]
+    fn help_states_the_checker_scope() {
+        let help = usage();
+        assert!(help.contains("every tracked Cargo.toml and Cargo.lock"));
+        assert!(help.contains("Excludes non-Cargo files"));
+    }
+
+    #[test]
+    fn extracts_rev_from_lock_source() {
+        let line = r#"source = "git+https://github.com/rrnewton/reverie.git?rev=0123456789abcdef0123456789abcdef01234567#0123456789abcdef0123456789abcdef01234567""#;
+        assert_eq!(
+            extract_lock_rev(line).as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+    }
+
+    #[test]
+    fn tracked_stale_lockfile_fails_the_checker_path() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "check-reverie-pin-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let runtime = root.join("runtime");
+        fs::create_dir_all(&runtime).expect("create fixture directories");
+        let current = "0123456789abcdef0123456789abcdef01234567";
+        let stale = "89abcdef0123456789abcdef0123456789abcdef";
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{current}\" }}\n"
+            ),
+        )
+        .expect("write fixture manifest");
+        fs::write(
+            runtime.join("Cargo.lock"),
+            format!(
+                "[[package]]\nname = \"reverie-core\"\nsource = \"git+https://github.com/rrnewton/reverie.git?rev={stale}#{stale}\"\n"
+            ),
+        )
+        .expect("write planted stale lockfile");
+        assert!(git_in(&root, &["init", "-q"]).unwrap().status.success());
+        assert!(
+            git_in(&root, &["add", "Cargo.toml", "runtime/Cargo.lock"])
+                .unwrap()
+                .status
+                .success()
+        );
+
+        let scan = read_pins(&root).expect("scan tracked fixture metadata");
+        assert_eq!(scan.tracked_files.len(), 2);
+        assert!(
+            scan.occurrences
+                .iter()
+                .any(|pin| pin.path.ends_with("runtime/Cargo.lock") && pin.rev == stale)
+        );
+        let code = run_with_config(Config {
+            repo: Some(root.clone()),
+            main_sha: Some(current.to_string()),
+            ..Config::default()
+        })
+        .expect("checker should classify the planted inconsistency");
+        assert_eq!(code, 1, "a tracked stale Cargo.lock must fail closed");
+
+        fs::remove_dir_all(root).expect("remove fixture repository");
     }
 }
