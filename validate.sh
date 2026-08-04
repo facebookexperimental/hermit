@@ -3581,9 +3581,9 @@ function envelope_compare {
     return "$regressed"
 }
 
-# Auto-apply the `locally-validated` PR label after a fully-green full run, add
-# an audit comment with the validation results, then cancel the redundant
-# in-flight CI run for the exact validated commit.
+# Record exact-head validation evidence after a fully-green full run, apply the
+# `locally-validated` PR label only after that evidence is durable, then cancel
+# the redundant in-flight CI run for the exact validated commit.
 # Landing gate policy is: validate.sh passes locally -> PR carries the
 # `locally-validated` label. Label application and CI cancellation are
 # best-effort so GitHub or proxy failures never change the validation result.
@@ -3598,10 +3598,15 @@ function apply_locally_validated_label {
     local pr_head=""
     local local_head
     local comment_body=""
+    local durable_log=""
+    local evidence_dir=""
+    local evidence_run_id=""
     local host_name=""
+    local ledger_ref=""
     local passed_checks=0
-    local timestamp=""
     local run_id=""
+    local timestamp=""
+    local timestamp_slug=""
     local -a gh_cmd=(gh)
 
     if ! command -v gh >/dev/null 2>&1; then
@@ -3643,37 +3648,52 @@ function apply_locally_validated_label {
     "${gh_cmd[@]}" label create "$LOCALLY_VALIDATED_LABEL" \
         --repo "$LOCALLY_VALIDATED_REPOSITORY" \
         --color 1d76db \
-        --description "Full local validation passed for the current PR head" \
+        --description "Full local validation and exact-head evidence recorded" \
         --force >>"$LOG_FILE" 2>&1 || true
+
+    host_name=$(hostname -f 2>/dev/null) || \
+        host_name=$(hostname 2>/dev/null) || host_name="unknown"
+    timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ') || timestamp="unknown"
+    timestamp_slug=$(date -u +'%Y%m%dT%H%M%SZ') || timestamp_slug="unknown"
+    passed_checks=$((checks - failures))
+    ledger_ref=${VALIDATION_LEDGER_FILE:-none}
+    evidence_run_id="${local_head}@${VALIDATION_STARTED_AT}"
+    if [[ -n $DEV_HERMIT_PARENT ]]; then
+        evidence_dir="$DEV_HERMIT_PARENT/ignored/validation-evidence"
+    else
+        evidence_dir="$ROOT_DIR/target/validation/evidence"
+    fi
+    durable_log="$evidence_dir/${local_head}-${timestamp_slug}.log"
+    if ! mkdir -p "$evidence_dir" || ! cp "$LOG_FILE" "$durable_log"; then
+        printf "⚠️  failed to preserve validation log for PR #%s; refusing to apply '%s'\n" \
+            "$pr" "$LOCALLY_VALIDATED_LABEL" >&2
+        return 0
+    fi
+
+    # Evidence is written BEFORE the label. The gate rejects a label without a
+    # matching exact-head marker, so a comment/proxy failure cannot mint an
+    # unsupported landing signal. Keep marker keys in sync with merge-gate.yml
+    # and scripts/label-strip-evidence.sh.
+    # shellcheck disable=SC2016
+    printf -v comment_body \
+        '[impl agent, validate.sh]\n\nLocal validation passed — evidence recorded for `%s`.\n\n- SHA: `%s`\n- Profile: `%s`\n- Results: %d checks passed, 0 failed\n- Hostname: `%s`\n- Durable log: `%s:%s`\n- Ledger: `%s`\n- Run ID: `%s`\n- Timestamp (UTC): `%s`\n\n<!-- locally-validated-evidence sha=%s profile=%s host=%s log=%s ledger=%s run=%s ts=%s -->' \
+        "$LOCALLY_VALIDATED_LABEL" "$local_head" "$VALIDATION_PROFILE" \
+        "$passed_checks" "$host_name" "$host_name" "$durable_log" \
+        "$ledger_ref" "$evidence_run_id" "$timestamp" "$local_head" "$VALIDATION_PROFILE" \
+        "$host_name" "$durable_log" "$ledger_ref" "$evidence_run_id" "$timestamp"
+    if ! "${gh_cmd[@]}" pr comment "$pr" \
+        --repo "$LOCALLY_VALIDATED_REPOSITORY" \
+        --body "$comment_body" >>"$LOG_FILE" 2>&1; then
+        printf "⚠️  failed to record validation evidence on PR #%s; refusing to apply '%s' (full log: %s)\n" \
+            "$pr" "$LOCALLY_VALIDATED_LABEL" "$LOG_FILE" >&2
+        return 0
+    fi
+    printf "💬 Recorded exact-head local validation evidence on PR #%s\n" "$pr"
 
     if "${gh_cmd[@]}" pr edit "$pr" --add-label "$LOCALLY_VALIDATED_LABEL" \
         --repo "$LOCALLY_VALIDATED_REPOSITORY" \
         >>"$LOG_FILE" 2>&1; then
         printf "🏷️  Applied '%s' label to PR #%s\n" "$LOCALLY_VALIDATED_LABEL" "$pr"
-
-        host_name=$(hostname -f 2>/dev/null) || \
-            host_name=$(hostname 2>/dev/null) || host_name="unknown"
-        timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ') || timestamp="unknown"
-        passed_checks=$((checks - failures))
-        # Single quotes keep the Markdown backticks literal in the comment body.
-        # The trailing HTML marker is machine-parseable: label-strip-evidence.sh
-        # locates this comment by `sha=<head>` when the label is later stripped,
-        # so the record of what was validated (commit, profile, durable log) is
-        # never lost. Keep the marker key names in sync with that script.
-        # shellcheck disable=SC2016
-        printf -v comment_body \
-            '[impl agent, validate.sh]\n\nLocal validation passed — `%s` label applied.\n\n- SHA: `%s`\n- Profile: `%s`\n- Results: %d checks passed, 0 failed\n- Hostname: `%s`\n- Log: `%s:%s`\n- Timestamp (UTC): `%s`\n\n<!-- locally-validated-evidence sha=%s profile=%s host=%s log=%s ts=%s -->' \
-            "$LOCALLY_VALIDATED_LABEL" "$local_head" "$VALIDATION_PROFILE" \
-            "$passed_checks" "$host_name" "$host_name" "$LOG_FILE" "$timestamp" \
-            "$local_head" "$VALIDATION_PROFILE" "$host_name" "$LOG_FILE" "$timestamp"
-        if "${gh_cmd[@]}" pr comment "$pr" \
-            --repo "$LOCALLY_VALIDATED_REPOSITORY" \
-            --body "$comment_body" >>"$LOG_FILE" 2>&1; then
-            printf "💬 Added local validation results to PR #%s\n" "$pr"
-        else
-            printf "⚠️  failed to comment validation results on PR #%s (full log: %s)\n" \
-                "$pr" "$LOG_FILE" >&2
-        fi
 
         if ! run_id=$("${gh_cmd[@]}" api \
             "repos/${LOCALLY_VALIDATED_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${local_head}&per_page=100" \

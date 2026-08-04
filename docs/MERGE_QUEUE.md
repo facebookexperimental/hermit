@@ -8,8 +8,9 @@ The required check is `merge-gate`. It passes when either:
 
 - the latest `.github/workflows/ci-portable.yml` run for the exact pull request
   head completed successfully; or
-- the pull request has the `locally-validated` label from a fully green
-  `./validate.sh` run.
+- the pull request has the `locally-validated` label **and** an exact-head
+  `validate.sh` evidence comment carrying a machine-readable durable-log
+  reference from a fully green run.
 
 The workflow removes `locally-validated` whenever the pull request head
 changes. It also re-runs the gate after CI completes and on label changes, so a
@@ -28,7 +29,9 @@ Replace `REPOSITORY` with `hermit` or `reverie`.
 
 ## Local validation
 
-A full green `./validate.sh` run automatically creates and applies the
+A full green `./validate.sh` run first preserves its log under the parent
+`ignored/validation-evidence/` directory and posts an exact-head evidence
+comment. Only after that comment succeeds does it create and apply the
 `locally-validated` label to the current branch's pull request. Set
 `PR_NUMBER=<number>` when branch-based detection is unavailable. GitHub CLI,
 authentication, proxy, missing-PR, and label-edit failures are warnings and do
@@ -47,10 +50,12 @@ admission requirement.
 Stripping `locally-validated` must never silently erase the record of what was
 validated. Two symmetric comments preserve it:
 
-- **Add time.** A green `./validate.sh` posts an evidence comment (commit SHA,
-  profile, results, host, durable log path) ending in a machine-parseable marker
-  `<!-- locally-validated-evidence sha=... -->`. This is the safety net: it
-  survives even if a strip path forgets to comment.
+- **Add time.** A green `./validate.sh` preserves the log, then posts an evidence
+  comment (commit SHA, profile, results, host, durable log path, ledger path,
+  and run ID) ending in a machine-parseable marker
+  `<!-- locally-validated-evidence sha=... log=... -->`. Only then may it apply
+  the label. The merge gate fails closed when the label is present without a
+  matching exact-head marker and nonempty log reference.
 - **Strip time.** `scripts/label-strip-evidence.sh` posts a comment recording
   the strip (validated SHA, new head, reason, timestamp) and quotes the matching
   add-time evidence comment. It is best-effort and always exits 0, so it can

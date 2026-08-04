@@ -22,7 +22,8 @@ on:
 
 # This required check is the SOLE required status check on main (branch ruleset
 # "main no-bypass gate", 2026-08-02): it accepts an exact PR head when EITHER a
-# fully green local validate.sh run applied the locally-validated label, OR the
+# fully green local validate.sh run recorded exact-head evidence and then applied
+# the locally-validated label, OR the
 # GitHub-Actions leg is green -- and GitHub-Actions-green now means the portable
 # job AND the privileged job both succeeded, not the portable job alone. The
 # independent Reverie-pin lint does not taint this product-test result. Owner
@@ -390,7 +391,42 @@ jobs:
               continue
             fi
             if [ "$locally_validated" = true ]; then
-              echo "PR #${pr_number} is locally validated at $head_sha."
+              # A label is only a routing bit. Require the add-time evidence
+              # comment written by validate.sh, bound to this exact PR head and
+              # carrying a machine-readable durable-log reference. Restrict the
+              # match to the validate.sh comment prefix and an unquoted marker
+              # line so a later strip comment that quotes old evidence cannot
+              # accidentally authorize a re-added label.
+              if ! comments_json="$(
+                gh api --paginate --slurp \
+                  "repos/${REPO}/issues/${pr_number}/comments?per_page=100"
+              )"; then
+                echo "::error::Could not read validation evidence comments for PR #${pr_number}."
+                failed=1
+              else
+                evidence="$(jq -r --arg sha "$head_sha" '
+                  [ .[][]?
+                    | select((.body // "") | startswith("[impl agent, validate.sh]\n"))
+                    | .body as $body
+                    | select($body | contains("Local validation passed"))
+                    | select($body | contains("- SHA: `" + $sha + "`"))
+                    | select($body | test("- Profile: `full`"))
+                    | select($body | test("- Results: [1-9][0-9]* checks passed, 0 failed"))
+                    | $body
+                    | split("\n")[]
+                    | capture("^<!-- locally-validated-evidence sha=(?<sha>[0-9a-f]{40}) profile=(?<profile>[^ ]+) host=(?<host>[^ ]+) log=(?<log>[^ ]+)( ledger=(?<ledger>[^ ]+) run=(?<run>[^ ]+))? ts=(?<ts>[^ ]+) -->$")?
+                    | select(.sha == $sha)
+                    | select(.profile == "full")
+                    | select(.log != "" and .log != "none" and .log != "unknown")
+                  ] | last // empty | @json
+                ' <<< "$comments_json")"
+                if [ -z "$evidence" ]; then
+                  echo "::error::PR #${pr_number} has locally-validated but no validate.sh evidence comment for exact head $head_sha with a durable log reference."
+                  failed=1
+                else
+                  echo "PR #${pr_number} is locally validated at $head_sha with evidence: $evidence"
+                fi
+              fi
             else
               runs="$(
                 gh api "repos/${REPO}/actions/workflows/ci-portable.yml/runs?head_sha=${head_sha}&per_page=100"
