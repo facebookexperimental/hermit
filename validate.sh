@@ -1635,6 +1635,24 @@ function initialize_repository_submodules {
     }
 }
 
+# Independent enforcement of the Reverie dependency pin. `git commit --no-verify`
+# bypasses the pre-commit hook, so validate.sh (and therefore every CI profile
+# that runs it) must catch a drifted or orphaned pin on its own. The check is
+# cheap: check-reverie-pin.rs scans tracked Cargo.toml/Cargo.lock and confirms
+# the pin is a real commit on rrnewton/reverie:main history. When the nested
+# lockfile guard is present (lands separately as rrnewton/hermit#1609) it also
+# runs so liteinst-runtime-build/Cargo.lock cannot drift from the root pin.
+function validate_reverie_pin_consistency {
+    local -a proxy=()
+    if command -v with-proxy >/dev/null 2>&1; then
+        proxy=(with-proxy)
+    fi
+    "${proxy[@]}" ./scripts/check-reverie-pin.rs || return 1
+    if [[ -x ./scripts/check-nested-lockfiles.rs ]]; then
+        "${proxy[@]}" ./scripts/check-nested-lockfiles.rs || return 1
+    fi
+}
+
 function start_check {
     local name=$1
     shift
@@ -4203,6 +4221,9 @@ function run_super_suite {
 # This initializes Hermit's registered submodules; Cargo's pinned Reverie build
 # script separately materializes its nested DynamoRIO checkout.
 run_check "Initialize repository submodules" initialize_repository_submodules
+# Fail fast on Reverie pin drift before any heavy build/test work. Independent of
+# the pre-commit hook, which git commit --no-verify can bypass.
+run_check "Reverie pin consistency" validate_reverie_pin_consistency
 if ((failures != 0)); then
     print_summary
     exit 1

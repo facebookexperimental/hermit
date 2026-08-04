@@ -14,7 +14,7 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 
 .DEFAULT_GOAL := build
 
-.PHONY: build install-deps release-core prune-stale-release help checkout-all check-build-tools \
+.PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
 	install-build-tools check-submodules validate lint \
 	validate-kvm validate-dbi validate-sabre validate-liteinst validate-e9patch
 
@@ -28,9 +28,16 @@ build: prune-stale-release install-deps ## Build the development Hermit binary w
 # the transitive `check-build-tools` prereq sees this and installs before it
 # asserts. `validate`/`release-core` do NOT set it and therefore only assert.
 install-deps: INSTALL_BUILD_TOOLS := 1
-install-deps: check-submodules ## Build and stage all third-party backend runtimes and plugins
+install-deps: install-hooks check-submodules ## Build and stage all third-party backend runtimes and plugins
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --release --locked \
 		-p detcore-dbi -p detcore-sabre -p hermit-install
+
+# Install this clone's git pre-commit hooks (core.hooksPath -> .githooks) so a
+# fresh clone/worktree gets the BLOCKING Reverie pin-drift gate without a manual
+# step. core.hooksPath is per-repo local config (not tracked), so it must be set
+# once per checkout; wiring it into install-deps is that step.
+install-hooks: ## Install this checkout's git pre-commit hooks (Reverie pin gate)
+	@./scripts/setup-hooks.sh
 
 release-core: check-submodules ## Build the lean core-only release binary (ptrace/kvm/liteinst)
 	$(CARGO) build --release --locked -p hermit

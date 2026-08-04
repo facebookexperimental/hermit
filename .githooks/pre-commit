@@ -17,7 +17,19 @@ if [[ -n ${HERMIT_STALE_REVERIE_PIN_REASON:-} ]]; then
 fi
 
 cd "$root" || exit 1
+
+proxy=()
 if command -v with-proxy >/dev/null 2>&1; then
-  exec with-proxy "$checker" "${args[@]}"
+  proxy=(with-proxy)
 fi
-exec "$checker" "${args[@]}"
+
+"${proxy[@]}" "$checker" "${args[@]}" || exit 1
+
+# Also guard the nested-workspace lockfile against pin drift once its checker is
+# present (lands separately as rrnewton/hermit#1609). Until then this is a no-op.
+nested="$root/scripts/check-nested-lockfiles.rs"
+if [[ -x "$nested" ]]; then
+  "${proxy[@]}" "$nested" || exit 1
+fi
+
+exit 0
