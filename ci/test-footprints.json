@@ -47,7 +47,7 @@
       "_why": "@generated: Cargo package `edit-distance`; reverse-dependent closure: edit-distance, hermit, hermit-verify.",
       "e2e_all": true,
       "nodes": [
-        "build.dbi_release",
+        "build.runtime_release",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -93,8 +93,7 @@
       "_why": "@generated: Cargo package `test-allocator`; reverse-dependent closure: detcore, detcore-dbi, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-verify, test-allocator.",
       "e2e_all": true,
       "nodes": [
-        "build.dbi_release",
-        "build.sabre_release",
+        "build.runtime_release",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -142,8 +141,7 @@
       "_why": "@generated: Cargo package `detcore`; reverse-dependent closure: detcore, detcore-dbi, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-verify.",
       "e2e_all": true,
       "nodes": [
-        "build.dbi_release",
-        "build.sabre_release",
+        "build.runtime_release",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -194,7 +192,7 @@
         "dbi"
       ],
       "nodes": [
-        "build.dbi_release",
+        "build.runtime_release",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -224,8 +222,7 @@
       "_why": "@generated: Cargo package `detcore-model`; reverse-dependent closure: detcore, detcore-dbi, detcore-model, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-verify.",
       "e2e_all": true,
       "nodes": [
-        "build.dbi_release",
-        "build.sabre_release",
+        "build.runtime_release",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -275,7 +272,7 @@
         "sabre"
       ],
       "nodes": [
-        "build.sabre_release",
+        "build.runtime_release",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -293,8 +290,7 @@
       "_why": "@generated: Cargo package `detcore-testutils`; reverse-dependent closure: detcore, detcore-dbi, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-verify.",
       "e2e_all": true,
       "nodes": [
-        "build.dbi_release",
-        "build.sabre_release",
+        "build.runtime_release",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -342,7 +338,6 @@
       "_why": "@generated: Cargo package `hermetic_infra_hermit_flaky-tests`; reverse-dependent closure: hermetic_infra_hermit_flaky-tests.",
       "e2e_all": true,
       "nodes": [
-        "build.flaky_harnesses",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -362,7 +357,7 @@
       "_why": "@generated: Cargo package `hermit`; reverse-dependent closure: hermit.",
       "e2e_all": true,
       "nodes": [
-        "build.dbi_release",
+        "build.runtime_release",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -407,8 +402,7 @@
       "_why": "@generated: Cargo package `hermit-install`; reverse-dependent closure: hermit-install.",
       "e2e_all": true,
       "nodes": [
-        "build.dbi_release",
-        "build.sabre_release",
+        "build.runtime_release",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -454,7 +448,7 @@
       "_why": "@generated: Cargo package `hermit-resources`; reverse-dependent closure: detcore-dbi, hermit, hermit-resources.",
       "e2e_all": true,
       "nodes": [
-        "build.dbi_release",
+        "build.runtime_release",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",

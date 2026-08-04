@@ -159,7 +159,7 @@
       "_why": "Flaky guest binaries feed the chaos and determinism-stress manifest buckets.",
       "packages": ["hermetic_infra_hermit_flaky-tests"],
       "nodes": [
-        "build.flaky_harnesses",
+        "build.workspace",
         "e2e.manifest_chaos_c",
         "e2e.manifest_determinism_stress",
         "e2e.manifest_determinism_stress_c"

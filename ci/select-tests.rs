@@ -546,8 +546,8 @@ fn derive_run_plan(sel: &Selection, shards: &Shards, plan: &Plan) -> RunPlan {
     }
     for c in &cells {
         match c.backend.as_str() {
-            "dbi" => build_dbi = true,
-            "sabre" | "liteinst" => build_aux = true,
+            "dbi" | "sabre" => build_dbi = true,
+            "liteinst" => build_aux = true,
             _ => {}
         }
     }
@@ -1006,7 +1006,7 @@ fn self_test() {
     let dbi = select(&fp, &dag, &vec!["detcore-dbi/src/lib.rs".into()]);
     check("dbi-only ⇒ selective", dbi.decision == Decision::Selective);
     check("dbi-only runs dbi_parity", dbi.nodes.contains("test.dbi_parity"));
-    check("dbi-only pulls build.dbi_release", dbi.nodes.contains("build.dbi_release"));
+    check("dbi-only pulls build.runtime_release", dbi.nodes.contains("build.runtime_release"));
     check("dbi-only pulls build.workspace (dep)", dbi.nodes.contains("build.workspace"));
     check("dbi-only skips strict_compat", !dbi.nodes.contains("test.strict_compat"));
     check("dbi-only skips language_runtimes", !dbi.nodes.contains("e2e.manifest_language_runtimes"));
@@ -1059,7 +1059,7 @@ fn self_test() {
     let rp_sabre = derive_run_plan(&sabre, &shards, &plan);
     check("sabre ⇒ sabre shard", rp_sabre.shards.contains(&"sabre".to_string()));
     check("sabre ⇒ only sabre cells", !rp_sabre.cells.is_empty() && rp_sabre.cells.iter().all(|c| c.backend == "sabre"));
-    check("sabre ⇒ build_aux, not dbi", rp_sabre.build_aux && !rp_sabre.build_dbi);
+    check("sabre ⇒ build_dbi, not aux", rp_sabre.build_dbi && !rp_sabre.build_aux);
 
     // LiteInst runtime change: only liteinst cells + liteinst shard.
     let liteinst = select(&fp, &dag, &vec!["scripts/stage-liteinst-runtime.sh".into()]);
