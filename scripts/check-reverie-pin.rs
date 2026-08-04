@@ -430,6 +430,122 @@ fn blocked_instructions() {
     eprintln!("Preland CI reads: Stale-Reverie-Pin-Reason: <reason> from the PR body.");
 }
 
+/// Extract the short-SHA suffix of every LiteInst runtime cache-key token on a
+/// line: `liteinst-runtime-build-<hex>` and `liteinst-runtime-<hex>` (6..=40
+/// hex digits). Returns the captured short SHAs in order.
+///
+/// std-only on purpose: CI compiles this file with plain `rustc`
+/// (`.github/workflows/ci-portable.yml`), not rust-script/cargo, so no external
+/// crate (e.g. `regex`) is available. The nested-workspace path token
+/// `liteinst-runtime-build/…` is deliberately NOT matched (it is a directory
+/// name, not a revision key): after the optional `-build` the next byte must be
+/// `-`, and the hex run must be at least 6 digits, so `-build/…` and the single
+/// hex digit in `-build` are both rejected.
+fn extract_cache_key_shas(line: &str) -> Vec<String> {
+    const MARKER: &str = "liteinst-runtime";
+    let bytes = line.as_bytes();
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = line[from..].find(MARKER) {
+        let idx = from + rel;
+        let mut cursor = idx + MARKER.len();
+        from = cursor;
+        if line[cursor..].starts_with("-build") {
+            cursor += "-build".len();
+        }
+        if bytes.get(cursor) != Some(&b'-') {
+            continue;
+        }
+        cursor += 1;
+        let start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_hexdigit() {
+            cursor += 1;
+        }
+        let sha = &line[start..cursor];
+        if (6..=40).contains(&sha.len()) {
+            found.push(sha.to_string());
+        }
+    }
+    found
+}
+
+/// Bind every revision-keyed LiteInst runtime build/staging directory to the
+/// canonical Reverie pin.
+///
+/// These directories (`target/liteinst-runtime-build-<short>`,
+/// `build_root/liteinst-runtime-<short>`) embed a short prefix of the Reverie
+/// pin so the staged runtime cache busts when the pin moves. If a bump updates
+/// the Cargo manifests/locks but misses one of these string literals, the stale
+/// directory silently reuses a runtime built against the OLD Reverie —
+/// `hermit-install/build.rs` carried exactly this drift at `d973a85` after the
+/// pin had advanced to `79517704…`. Rather than compare these heterogeneous
+/// short forms to each other, bind each to the pin the manifests already agree
+/// on: its short SHA MUST be a prefix of the full 40-hex rev. That also makes
+/// them mutually consistent (all prefixes of one rev). Hard, offline (no
+/// network), and shared by all three enforcement paths (hook, validate.sh, CI)
+/// because every consumer already invokes this one checker.
+fn check_liteinst_cache_keys(root: &Path, pin: &str) -> Result<i32, String> {
+    // Exclude this checker's own source: it embeds deliberately-drifted example
+    // tokens in its docstring and test fixtures (a check must not scan the file
+    // that defines it). No real revision-keyed cache directory is named here.
+    let output = git_in(
+        root,
+        &[
+            "grep",
+            "-I",
+            "-n",
+            "-E",
+            "-e",
+            r"liteinst-runtime(-build)?-[0-9a-f]{6,40}",
+            "--",
+            ".",
+            ":(exclude,top)scripts/check-reverie-pin.rs",
+        ],
+    )?;
+    // git grep exit codes: 0 = matches, 1 = no matches (fine here), >1 = error.
+    match output.status.code() {
+        Some(0) | Some(1) => {}
+        _ => {
+            return Err(format!(
+                "git grep for LiteInst cache keys failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    let short = &pin[..7.min(pin.len())];
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut violations: Vec<(String, String)> = Vec::new();
+    let mut checked = 0usize;
+    for entry in stdout.lines() {
+        // `git grep -n` prints `path:line:content`.
+        let mut parts = entry.splitn(3, ':');
+        let path = parts.next().unwrap_or("");
+        let lineno = parts.next().unwrap_or("");
+        let content = parts.next().unwrap_or("");
+        for sha in extract_cache_key_shas(content) {
+            checked += 1;
+            if !pin.starts_with(&sha) {
+                violations.push((format!("{path}:{lineno}"), sha));
+            }
+        }
+    }
+    if !violations.is_empty() {
+        loud_header("LITEINST CACHE KEY DRIFT - BLOCKED");
+        eprintln!("Canonical Reverie pin: {pin}");
+        eprintln!("These revision-keyed LiteInst cache keys are NOT a prefix of the pin:");
+        for (location, sha) in &violations {
+            eprintln!("  {location}: ...liteinst-runtime[...]-{sha}");
+        }
+        eprintln!(
+            "Update each stale key to the pin's short prefix ({short}) so the staged runtime"
+        );
+        eprintln!("cache busts when the Reverie pin moves. See docs/updating-reverie.md.");
+        return Ok(1);
+    }
+    eprintln!("LiteInst cache keys: {checked} revision-keyed token(s) all track the pin ({short}).");
+    Ok(0)
+}
+
 fn run_with_config(config: Config) -> Result<i32, String> {
     let root = config.repo.clone().map_or_else(git_root, Ok)?;
     let scan = read_pins(&root)?;
@@ -471,6 +587,15 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     }
 
     let pin = pins[0].rev.as_str();
+
+    // Bind revision-keyed LiteInst runtime cache dirs to the pin. Offline and
+    // fast, so run it before the networked ancestry check: cache-key drift
+    // fails closed without waiting on the remote.
+    let cache_code = check_liteinst_cache_keys(&root, pin)?;
+    if cache_code != 0 {
+        return Ok(cache_code);
+    }
+
     let remote = config.remote.as_deref().unwrap_or(DEFAULT_REMOTE);
     let main_result = match config.main_sha {
         Some(sha) if is_full_sha(&sha) => Ok(sha),
@@ -660,6 +785,84 @@ mod tests {
         })
         .expect("checker should classify the planted inconsistency");
         assert_eq!(code, 1, "a tracked stale Cargo.lock must fail closed");
+
+        fs::remove_dir_all(root).expect("remove fixture repository");
+    }
+
+    #[test]
+    fn extract_cache_key_shas_handles_both_schemes() {
+        assert_eq!(
+            extract_cache_key_shas("$PWD/target/liteinst-runtime-build-7951770 arg"),
+            vec!["7951770".to_string()]
+        );
+        assert_eq!(
+            extract_cache_key_shas("build_root.join(\"liteinst-runtime-d973a85\")"),
+            vec!["d973a85".to_string()]
+        );
+        // Multiple keys on one line, both schemes.
+        assert_eq!(
+            extract_cache_key_shas("a/liteinst-runtime-build-7951770 b/liteinst-runtime-abcdef1"),
+            vec!["7951770".to_string(), "abcdef1".to_string()]
+        );
+        // The nested-workspace directory path is NOT a revision key.
+        assert!(extract_cache_key_shas("liteinst-runtime-build/Cargo.lock").is_empty());
+        // A too-short suffix (<6 hex) is not a revision key.
+        assert!(extract_cache_key_shas("liteinst-runtime-ab12").is_empty());
+    }
+
+    #[test]
+    fn cache_key_drift_fails_and_consistent_passes() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "check-reverie-pin-cachekey-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create fixture directory");
+        let pin = "0123456789abcdef0123456789abcdef01234567";
+        // Consistent: every cache key is a prefix of the pin.
+        fs::write(
+            root.join("portable.json"),
+            "cmd = target/liteinst-runtime-build-0123456\n",
+        )
+        .expect("write consistent cache key");
+        fs::write(
+            root.join("build.rs"),
+            "let t = build_root.join(\"liteinst-runtime-0123456789ab\");\n",
+        )
+        .expect("write consistent cache key");
+        assert!(git_in(&root, &["init", "-q"]).unwrap().status.success());
+        assert!(
+            git_in(&root, &["add", "portable.json", "build.rs"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert_eq!(
+            check_liteinst_cache_keys(&root, pin).expect("scan consistent tree"),
+            0,
+            "cache keys that are prefixes of the pin must pass"
+        );
+
+        // Drift: plant a key that is not a prefix of the pin.
+        fs::write(
+            root.join("portable.json"),
+            "cmd = target/liteinst-runtime-build-deadbee\n",
+        )
+        .expect("write drifted cache key");
+        assert!(
+            git_in(&root, &["add", "portable.json"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert_eq!(
+            check_liteinst_cache_keys(&root, pin).expect("scan drifted tree"),
+            1,
+            "a cache key that is not a prefix of the pin must fail closed"
+        );
 
         fs::remove_dir_all(root).expect("remove fixture repository");
     }
