@@ -464,6 +464,18 @@ jobs:
           echo 'e4d24084056b0080d94d99b48a4a9a0df65df372f5321f35b76781fc0ece1f79  '"$verifier" | sha256sum --check
           chmod +x "$verifier"
           echo "RECEIPT_VERIFIER=$verifier" >>"$GITHUB_ENV"
+      - name: Fetch the trusted check-outcome authority
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          authority="$RUNNER_TEMP/check_outcome.py"
+          gh api \
+            'repos/rrnewton/dev-hermit/contents/ci-hub/check_outcome.py?ref=8ea20e121073e7c1fc3ce7a131a4950d7574ce42' \
+            --jq .content | tr -d '\n' | base64 --decode >"$authority"
+          echo '88de3d5afa9df20ab9174afbd3281341b7fa1c029eef5102bc1a2f22c1a50235  '"$authority" | sha256sum --check
+          chmod +x "$authority"
+          echo "CHECK_OUTCOME_AUTHORITY=$authority" >>"$GITHUB_ENV"
       - name: Require the core-change review protocol
         env:
           PROTOCOL_RESULT: ${{ needs.core-review-protocol.result }}
@@ -591,11 +603,8 @@ jobs:
               runs="$(
                 gh api "repos/${REPO}/actions/workflows/ci-portable.yml/runs?head_sha=${head_sha}&per_page=100"
               )"
-              run="$(jq --arg sha "$head_sha" '
-                [.workflow_runs[] | select(.head_sha == $sha)]
-                | sort_by(.created_at)
-                | last // {}
-              ' <<< "$runs")"
+              run="$("$CHECK_OUTCOME_AUTHORITY" \
+                --select-latest-run --head-sha "$head_sha" <<<"$runs")"
               run_id="$(jq -r '.id // ""' <<< "$run")"
               url="$(jq -r '.html_url // ""' <<< "$run")"
 
@@ -609,10 +618,11 @@ jobs:
                 jobs="$(
                   gh api "repos/${REPO}/actions/runs/${run_id}/jobs?filter=latest&per_page=100"
                 )"
-                regular_job="$(jq '
-                  [.jobs[] | select(.name == "Regular tests (GitHub-managed portable)")]
-                  | last // {}
-                ' <<< "$jobs")"
+                regular_job="$(
+                  jq '.jobs' <<<"$jobs" \
+                    | "$CHECK_OUTCOME_AUTHORITY" --select-latest-rollup \
+                    | jq '[.[] | select(.name == "Regular tests (GitHub-managed portable)")] | first // {}'
+                )"
                 job_status="$(jq -r '.status // "missing"' <<< "$regular_job")"
                 job_conclusion="$(jq -r '.conclusion // ""' <<< "$regular_job")"
                 job_url="$(jq -r '.html_url // ""' <<< "$regular_job")"
@@ -633,11 +643,8 @@ jobs:
               priv_runs="$(
                 gh api "repos/${REPO}/actions/workflows/ci-privileged.yml/runs?head_sha=${head_sha}&per_page=100"
               )"
-              priv_run="$(jq --arg sha "$head_sha" '
-                [.workflow_runs[] | select(.head_sha == $sha)]
-                | sort_by(.created_at)
-                | last // {}
-              ' <<< "$priv_runs")"
+              priv_run="$("$CHECK_OUTCOME_AUTHORITY" \
+                --select-latest-run --head-sha "$head_sha" <<<"$priv_runs")"
               priv_run_id="$(jq -r '.id // ""' <<< "$priv_run")"
               priv_url="$(jq -r '.html_url // ""' <<< "$priv_run")"
 
@@ -648,10 +655,11 @@ jobs:
                 priv_jobs="$(
                   gh api "repos/${REPO}/actions/runs/${priv_run_id}/jobs?filter=latest&per_page=100"
                 )"
-                priv_job="$(jq '
-                  [.jobs[] | select(.name == "Privileged capability and E2E tests")]
-                  | last // {}
-                ' <<< "$priv_jobs")"
+                priv_job="$(
+                  jq '.jobs' <<<"$priv_jobs" \
+                    | "$CHECK_OUTCOME_AUTHORITY" --select-latest-rollup \
+                    | jq '[.[] | select(.name == "Privileged capability and E2E tests")] | first // {}'
+                )"
                 priv_status="$(jq -r '.status // "missing"' <<< "$priv_job")"
                 priv_conclusion="$(jq -r '.conclusion // ""' <<< "$priv_job")"
                 priv_job_url="$(jq -r '.html_url // ""' <<< "$priv_job")"
@@ -686,18 +694,11 @@ jobs:
                 | grep -vE '^tests/(e2e|backend-parity)/' || true
             )"
             if [ -n "$hot_files" ]; then
-              all_runs="$(
-                gh api "repos/${REPO}/actions/runs?head_sha=${head_sha}&per_page=100"
+              demo_runs="$(
+                gh api "repos/${REPO}/actions/workflows/demo-hot-path.yml/runs?head_sha=${head_sha}&per_page=100"
               )"
-              demo_run="$(jq --arg sha "$head_sha" '
-                [.workflow_runs[]
-                  | select(
-                      .head_sha == $sha
-                      and .name == "P0 Demo Gate (Hermit hot paths)"
-                    )]
-                | sort_by(.created_at)
-                | last // {}
-              ' <<< "$all_runs")"
+              demo_run="$("$CHECK_OUTCOME_AUTHORITY" \
+                --select-latest-run --head-sha "$head_sha" <<<"$demo_runs")"
               demo_status="$(jq -r '.status // "missing"' <<< "$demo_run")"
               demo_conclusion="$(jq -r '.conclusion // ""' <<< "$demo_run")"
               demo_url="$(jq -r '.html_url // ""' <<< "$demo_run")"
