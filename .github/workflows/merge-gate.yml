@@ -189,12 +189,21 @@ jobs:
     permissions:
       actions: write
       checks: write
-      contents: read
       issues: write
       pull-requests: read
     steps:
-      - name: Check out the receipt verifier
-        uses: actions/checkout@v4
+      - name: Fetch the trusted receipt verifier
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          verifier="$RUNNER_TEMP/verify-local-validation-receipt.sh"
+          gh api \
+            'repos/rrnewton/dev-hermit/contents/ci-hub/validation/verify_receipt.sh?ref=f9e61247e83bb07c11297541b591606de24a89a8' \
+            --jq .content | tr -d '\n' | base64 --decode >"$verifier"
+          echo 'e4d24084056b0080d94d99b48a4a9a0df65df372f5321f35b76781fc0ece1f79  '"$verifier" | sha256sum --check
+          chmod +x "$verifier"
+          echo "RECEIPT_VERIFIER=$verifier" >>"$GITHUB_ENV"
       - name: Remove local-validation label when its evidence is no longer valid
         env:
           GH_TOKEN: ${{ github.token }}
@@ -228,7 +237,7 @@ jobs:
           comments_file=$(mktemp)
           trap 'rm -f -- "$comments_file"' EXIT
           printf '%s\n' "$comments_json" >"$comments_file"
-          if evidence=$(bash scripts/verify-local-validation-receipt.sh \
+          if evidence=$("$RECEIPT_VERIFIER" \
               --repo "$REPO" --sha "$head_sha" --comments "$comments_file"); then
             echo "PR #${PR_NUMBER} still has a dereferenced exact-head receipt: ${evidence}"
             exit 0
@@ -395,8 +404,18 @@ jobs:
     runs-on: [self-hosted, gate]
     timeout-minutes: 10
     steps:
-      - name: Check out the receipt verifier
-        uses: actions/checkout@v4
+      - name: Fetch the trusted receipt verifier
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          verifier="$RUNNER_TEMP/verify-local-validation-receipt.sh"
+          gh api \
+            'repos/rrnewton/dev-hermit/contents/ci-hub/validation/verify_receipt.sh?ref=f9e61247e83bb07c11297541b591606de24a89a8' \
+            --jq .content | tr -d '\n' | base64 --decode >"$verifier"
+          echo 'e4d24084056b0080d94d99b48a4a9a0df65df372f5321f35b76781fc0ece1f79  '"$verifier" | sha256sum --check
+          chmod +x "$verifier"
+          echo "RECEIPT_VERIFIER=$verifier" >>"$GITHUB_ENV"
       - name: Require the core-change review protocol
         env:
           PROTOCOL_RESULT: ${{ needs.core-review-protocol.result }}
@@ -508,7 +527,7 @@ jobs:
               else
                 comments_file=$(mktemp)
                 printf '%s\n' "$comments_json" >"$comments_file"
-                if ! evidence=$(bash scripts/verify-local-validation-receipt.sh \
+                if ! evidence=$("$RECEIPT_VERIFIER" \
                     --repo "$REPO" --sha "$head_sha" --comments "$comments_file"); then
                   echo "::error::PR #${pr_number} has locally-validated but no immutable counted receipt for exact head $head_sha."
                   failed=1

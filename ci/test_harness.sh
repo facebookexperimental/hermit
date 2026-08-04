@@ -1178,7 +1178,6 @@ load_tests
 case "$subcommand" in
     validate)
         (($# == 0)) || true
-        "$ROOT_DIR/scripts/test-verify-local-validation-receipt.sh"
         audit_test_footprints
         audit_inventory
         audit_ci_correspondence

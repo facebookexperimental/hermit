@@ -85,11 +85,17 @@ Known strip paths — all must leave the trail:
 
 The receipt is remotely readable from every gate runner and immutable at its
 referenced commit, unlike a devbig014-local ledger path. The local applier reads
-the ledger and log before publication; the gate verifies the row and log digest
-but cannot reopen the host-local log. Shared `rrnewton` credentials still do not
+the ledger and log before publication; the gate verifies the receipt content
+digest, including the publisher's asserted log path and digest, but cannot
+reopen and re-hash the host-local log. Shared `rrnewton` credentials still do not
 provide individual signer identity, so a holder could deliberately publish a
 false receipt. This prevents accidental label/comment forgery; malicious-token
 resistance needs a dedicated signing identity.
+
+The gate fetches its verifier from immutable parent commit `f9e61247` and checks
+the script's SHA-256 before execution. It never executes a verifier from the PR
+under test; otherwise a PR could authorize itself without changing the gate
+workflow.
 
 ## Repository settings
 
