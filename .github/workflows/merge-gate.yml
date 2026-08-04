@@ -258,23 +258,26 @@ jobs:
             echo "::warning::Trusted receipt verifier is unavailable; failing closed."
           fi
 
-          # Invalidate the required context before mutating the label. The
-          # issue_comment job itself is not a required check, and a follow-up
-          # workflow dispatch can fail. Publishing this check first makes every
-          # later failure fail closed at the exact PR head.
+          # Invalidate both the steady-state v2 context and the transition-only
+          # legacy context before mutating the label. The issue_comment job
+          # itself is not required, and a follow-up dispatch can fail (fork
+          # heads cannot be dispatched at all). Publishing both failures keeps
+          # either ruleset version fail-closed at the exact PR head.
           summary="No immutable counted full-validation receipt remains for exact head ${head_sha}."
-          gh api --method POST \
-            -H "Accept: application/vnd.github+json" \
-            "repos/${REPO}/check-runs" \
-            -f name=merge-gate \
-            -f head_sha="$head_sha" \
-            -f status=completed \
-            -f conclusion=failure \
-            -f details_url="${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}" \
-            -f 'output[title]=Local validation evidence invalidated' \
-            -f "output[summary]=${summary}" \
-            --silent
-          echo "Published a failing merge-gate check for PR #${PR_NUMBER} at ${head_sha}."
+          for context in merge-gate-v2 merge-gate; do
+            gh api --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "repos/${REPO}/check-runs" \
+              -f name="$context" \
+              -f head_sha="$head_sha" \
+              -f status=completed \
+              -f conclusion=failure \
+              -f details_url="${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}" \
+              -f 'output[title]=Local validation evidence invalidated' \
+              -f "output[summary]=${summary}" \
+              --silent
+            echo "Published failing ${context} for PR #${PR_NUMBER} at ${head_sha}."
+          done
 
           gh api --method DELETE \
             "repos/${REPO}/issues/${PR_NUMBER}/labels/locally-validated" \

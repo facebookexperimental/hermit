@@ -87,14 +87,16 @@ Known strip paths — all must leave the trail:
    so the evidence is preserved. The `--remove` flag also strips the label.
 3. **Evidence mutation.** Editing or deleting a PR comment revalidates the
    current exact-head receipt. If no dereferenceable receipt remains, the
-   workflow first publishes a failing required `merge-gate` check at the exact
-   head, then removes `locally-validated`. Same-repository branches explicitly
-   dispatch a new exact-head gate because label changes made with `GITHUB_TOKEN`
-   do not recursively trigger another workflow. A dispatch failure therefore
-   remains blocked by the already-published failure. Fork heads cannot be used as
-   base-repository workflow-dispatch refs; their failing check remains until a
-   new receipt and label re-fire the pull-request gate. There remains a
-   narrow race if a merge completes before the edit/delete event is processed.
+   workflow first publishes failing `merge-gate-v2` and transitional
+   `merge-gate` checks at the exact head, then removes `locally-validated`.
+   Publishing both contexts keeps invalidation authoritative before and after
+   the ruleset migration. Same-repository branches explicitly dispatch a new
+   exact-head gate because label changes made with `GITHUB_TOKEN` do not
+   recursively trigger another workflow. A dispatch failure therefore remains
+   blocked by the already-published failures. Fork heads cannot be used as
+   base-repository workflow-dispatch refs; their failing checks remain until a
+   new receipt and label re-fire the pull-request gate. There remains a narrow
+   race if a merge completes before the edit/delete event is processed.
 
 The receipt is remotely readable from every gate runner and immutable at its
 referenced commit, unlike a devbig014-local ledger path. The local applier reads
@@ -131,16 +133,18 @@ That checker covers the versioned context, its GitHub Actions integration ID,
 the bound main blob, and the disabled transition shim. It does not attest the
 repository's separate merge-queue or history-protection settings.
 
-Before landing a gate-version transition, run `--prepare <feature-ref>` to bind
-the candidate blob and enable the temporary legacy-context shim. After the
-workflow lands, the coordinator runs `--apply`; it binds the `main` blob,
-changes only the legacy required context to v2, disables the shim, and verifies
-the full resulting ruleset plus all three server-side values. The full-object
-PUT is preceded by a fresh equality check, which detects policy drift already
+Before landing a gate-version transition, run `--prepare <feature-ref>`. It
+enables the temporary legacy-context shim, adds v2 alongside the legacy
+required context, and only then binds the candidate blob. The overlap means a
+stale v1 branch cannot land during the transition: both legacy and v2 must pass.
+After the workflow lands, the coordinator runs `--apply`; it binds the `main`
+blob, removes the legacy required context, disables the shim, and verifies the
+full resulting ruleset plus all three server-side values. Each full-object PUT
+is preceded by a fresh equality check, which detects policy drift already
 visible before the write. GitHub exposes no conditional PUT for this endpoint,
 so a narrow read-to-write TOCTOU window remains; the full post-state check
 detects the resulting mismatch but does not make the update atomic. The ordered
-transition is fail-safe, not a cross-resource transaction. GitHub
+overlap transition is fail-closed, not a cross-resource transaction. GitHub
 required-workflow rules would avoid this transition, but they are available
 only to organization/enterprise rulesets; `rrnewton/hermit` is user-owned.
 
