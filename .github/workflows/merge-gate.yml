@@ -205,6 +205,11 @@ jobs:
           chmod +x "$verifier"
           echo "RECEIPT_VERIFIER=$verifier" >>"$GITHUB_ENV"
       - name: Remove local-validation label when its evidence is no longer valid
+        # The verifier fetch is part of the authorization boundary. If that
+        # preceding step fails (API outage, missing commit, or digest mismatch),
+        # this step must still publish a failing exact-head check and clear the
+        # cache label instead of preserving an old green result.
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.issue.number }}
@@ -237,10 +242,14 @@ jobs:
           comments_file=$(mktemp)
           trap 'rm -f -- "$comments_file"' EXIT
           printf '%s\n' "$comments_json" >"$comments_file"
-          if evidence=$("$RECEIPT_VERIFIER" \
-              --repo "$REPO" --sha "$head_sha" --comments "$comments_file"); then
-            echo "PR #${PR_NUMBER} still has a dereferenced exact-head receipt: ${evidence}"
-            exit 0
+          if [ -n "${RECEIPT_VERIFIER:-}" ] && [ -x "$RECEIPT_VERIFIER" ]; then
+            if evidence=$("$RECEIPT_VERIFIER" \
+                --repo "$REPO" --sha "$head_sha" --comments "$comments_file"); then
+              echo "PR #${PR_NUMBER} still has a dereferenced exact-head receipt: ${evidence}"
+              exit 0
+            fi
+          else
+            echo "::warning::Trusted receipt verifier is unavailable; failing closed."
           fi
 
           # Invalidate the required context before mutating the label. The
