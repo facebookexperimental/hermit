@@ -7,6 +7,7 @@ version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"
+publish = false
 
 [dependencies]
 detcore = { version = "0.2.0", path = "../.." }
