@@ -21,7 +21,7 @@
       "deps": ["build.privileged_tests"],
       "timeout": 40,
       "hint": {"est_duration_s": 15,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "cpu-bound"}
     },
     {
@@ -31,7 +31,7 @@
       "deps": ["build.privileged_tests"],
       "timeout": 30,
       "hint": {"est_duration_s": 5,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "cpu-bound"}
     },
     {
@@ -61,7 +61,7 @@
       "deps": ["build.privileged_tests", "build.manifest_guests", "e2e.metadata"],
       "timeout": 130,
       "hint": {"resources": {"kvm": 1}, "est_duration_s": 90,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     },
     {
@@ -72,7 +72,7 @@
       "deps": ["build.privileged_tests", "build.manifest_guests", "e2e.metadata"],
       "timeout": 120,
       "hint": {"resources": {"kvm": 1}, "est_duration_s": 5,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     }
   ]

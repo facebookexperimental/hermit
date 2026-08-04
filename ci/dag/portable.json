@@ -73,8 +73,8 @@
       "cmd": "./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build-7951770",
       "deps": ["build.dbi_release"],
       "timeout": 900,
-      "hint": {"est_duration_s": 120, "rss_baseline_bytes": 2147483648,
-               "hard_mem_max_bytes": 4294967296, "classification": "cpu-bound"}
+      "hint": {"est_duration_s": 120, "rss_baseline_bytes": 8589934592,
+               "hard_mem_max_bytes": 17179869184, "classification": "cpu-bound"}
     },
     {
       "group": "e2e", "job": "metadata",
@@ -261,8 +261,8 @@
       "cmd": "CARGO_BUILD_JOBS=8 cargo clippy --workspace --all-targets -- -D warnings",
       "deps": ["build.workspace"],
       "timeout": 1200,
-      "hint": {"est_duration_s": 300, "rss_baseline_bytes": 4294967296,
-               "hard_mem_max_bytes": 5905580032, "classification": "cpu-bound"}
+      "hint": {"est_duration_s": 300, "rss_baseline_bytes": 8589934592,
+               "hard_mem_max_bytes": 17179869184, "classification": "cpu-bound"}
     },
     {
       "group": "doc", "job": "doctests",
@@ -312,7 +312,7 @@
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
-               "rss_baseline_bytes": 4939212390, "hard_mem_max_bytes": 6979321856,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "cpu-bound"}
     },
     {
@@ -333,7 +333,7 @@
       "deps": ["build.workspace"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "cpu-bound"}
     },
     {
@@ -343,7 +343,7 @@
       "deps": ["build.workspace"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "cpu-bound"}
     },
     {
@@ -353,7 +353,7 @@
       "deps": ["build.workspace"],
       "timeout": 1200,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 300,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     },
     {
@@ -363,7 +363,7 @@
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     },
     {
@@ -373,7 +373,7 @@
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     },
     {
@@ -403,7 +403,7 @@
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     },
     {
@@ -413,7 +413,7 @@
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     },
     {
@@ -423,7 +423,7 @@
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     },
     {
@@ -433,7 +433,7 @@
       "deps": ["build.workspace"],
       "timeout": 600,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     },
     {
@@ -452,7 +452,7 @@
       "deps": ["build.dbi_release"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     },
     {
@@ -462,7 +462,7 @@
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
-               "rss_baseline_bytes": 2147483648, "hard_mem_max_bytes": 4294967296,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
     },
     {
@@ -474,7 +474,7 @@
                "test.hermit_unit", "test.detcore_unit", "test.rr_suite_contract"],
       "timeout": 1800,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 600,
-               "rss_baseline_bytes": 3221225472, "hard_mem_max_bytes": 6442450944,
+               "rss_baseline_bytes": 12884901888, "hard_mem_max_bytes": 25769803776,
                "classification": "latency-bound"}
     }
   ]
