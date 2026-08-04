@@ -136,11 +136,13 @@ the candidate blob and enable the temporary legacy-context shim. After the
 workflow lands, the coordinator runs `--apply`; it binds the `main` blob,
 changes only the legacy required context to v2, disables the shim, and verifies
 the full resulting ruleset plus all three server-side values. The full-object
-PUT is preceded by a fresh equality check so a concurrent ruleset edit aborts
-instead of being silently dropped. The ordered transition is fail-safe, not a
-cross-resource transaction. GitHub required-workflow rules would avoid this
-transition, but they are available only to organization/enterprise rulesets;
-`rrnewton/hermit` is user-owned.
+PUT is preceded by a fresh equality check, which detects policy drift already
+visible before the write. GitHub exposes no conditional PUT for this endpoint,
+so a narrow read-to-write TOCTOU window remains; the full post-state check
+detects the resulting mismatch but does not make the update atomic. The ordered
+transition is fail-safe, not a cross-resource transaction. GitHub
+required-workflow rules would avoid this transition, but they are available
+only to organization/enterprise rulesets; `rrnewton/hermit` is user-owned.
 
 Enable auto-merge in the repository so `gh pr merge --auto --merge` can queue
 eligible pull requests. Do not require the host-dependent CI job separately;

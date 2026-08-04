@@ -212,8 +212,10 @@ desired=$(jq \
       }
     ' <<<"$current")
 
-# The ruleset API updates the full object. Re-read immediately before PUT and
-# abort if another writer changed any policy field after our snapshot.
+# The ruleset API updates the full object. Re-read immediately before PUT to
+# catch changes visible since our snapshot. GitHub exposes no conditional PUT
+# here, so a writer racing after this comparison remains a narrow TOCTOU window;
+# the full post-state check detects the result but cannot make the update atomic.
 latest=$(read_ruleset)
 if [[ $(normalized_policy <<<"$latest") != $(normalized_policy <<<"$current") ]]; then
     printf 'configure-merge-gate-ruleset: ruleset changed concurrently; refusing stale full-object PUT\n' >&2
