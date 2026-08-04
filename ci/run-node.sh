@@ -55,6 +55,9 @@ set -uo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR" || exit 2
 
+# shellcheck source=ci/configure-build-jobs.sh
+source "$ROOT_DIR/ci/configure-build-jobs.sh" || exit $?
+
 lane=${1:-}
 sel=${2:-}
 if [[ -z $lane || -z $sel ]]; then
@@ -122,5 +125,5 @@ if [[ -n ${GITHUB_ACTIONS:-} || -n ${CI:-} ]]; then
     acf=(--allow-cgroup-failure)
 fi
 
-echo "run-node.sh: lane=$lane runner=$runner nodes=$sel -j$jobs perf-dir=$perf_dir${acf+ (unboxed: ephemeral CI VM)}" >&2
+echo "run-node.sh: lane=$lane runner=$runner nodes=$sel -j$jobs cargo-jobs=$CARGO_BUILD_JOBS perf-dir=$perf_dir${acf+ (unboxed: ephemeral CI VM)}" >&2
 exec "$runner" run --dag "$dag" --only "$sel" -j "$jobs" --perf-dir "$perf_dir" "${acf[@]}" -v

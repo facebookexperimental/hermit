@@ -339,6 +339,27 @@ function emit_manifest_buckets {
 
 function audit_ci_correspondence {
     local lane dag
+
+    # Both DAG launch surfaces must inherit one explicit inner-build width. The
+    # mutation control proves a caller-selected K reaches Cargo and nested native
+    # builds; the invalid-value arm proves the guard is not an inert declaration.
+    # shellcheck disable=SC2016
+    [[ $(grep -Fxc 'source "$ROOT_DIR/ci/configure-build-jobs.sh" || exit $?' "$ROOT_DIR/ci/run-dag.sh") == 1 ]] ||
+        die "run-dag.sh must source the shared build-job configuration exactly once"
+    # shellcheck disable=SC2016
+    [[ $(grep -Fxc 'source "$ROOT_DIR/ci/configure-build-jobs.sh" || exit $?' "$ROOT_DIR/ci/run-node.sh") == 1 ]] ||
+        die "run-node.sh must source the shared build-job configuration exactly once"
+    local configured_jobs
+    configured_jobs=$(
+        CI_DAG_BUILD_JOBS=5 bash -c 'source "$1"; printf "%s %s\n" "$CARGO_BUILD_JOBS" "$THIRD_PARTY_BUILD_JOBS"' \
+            _ "$ROOT_DIR/ci/configure-build-jobs.sh"
+    )
+    [[ $configured_jobs == "5 5" ]] ||
+        die "shared build-job configuration did not propagate mutation K=5: $configured_jobs"
+    if CI_DAG_BUILD_JOBS=0 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+        die "shared build-job configuration accepted an invalid zero width"
+    fi
+
     for lane in portable privileged; do
         dag="$DAG_ROOT/$lane.json"
         jq -e '
