@@ -1,30 +1,40 @@
 #!/usr/bin/env bash
-# Reconcile Hermit's main-branch gate with GitHub's pinned required-workflow
-# primitive. A required status context named `merge-gate` is insufficient:
-# workflow_dispatch can emit that context from an old PR branch using old YAML.
+# Migrate Hermit's personal-repository ruleset to a versioned Merge Gate status
+# context and bind that context to one server-side expected workflow blob.
+#
+# GitHub's stronger required-workflow rule is organization/enterprise-only.
+# For this user-owned repository, a versioned context prevents an old branch
+# from satisfying a tightened gate, while MERGE_GATE_V2_BLOB makes a modified
+# v2 workflow fail before it can evaluate landing policy.
 
 set -euo pipefail
 
 readonly DEFAULT_REPO="rrnewton/hermit"
 readonly DEFAULT_RULESET_NAME="main check gating (admin-bypassable)"
 readonly GATE_PATH=".github/workflows/merge-gate.yml"
-readonly GATE_REF="refs/heads/main"
+readonly REQUIRED_CONTEXT="merge-gate-v2"
+readonly LEGACY_CONTEXT="merge-gate"
+readonly EXPECTED_BLOB_VARIABLE="MERGE_GATE_V2_BLOB"
+readonly LEGACY_SHIM_VARIABLE="MERGE_GATE_LEGACY_CONTEXT"
 
 repo=$DEFAULT_REPO
 ruleset_name=$DEFAULT_RULESET_NAME
 mode=check
+prepare_ref=""
 
 usage() {
     cat <<'EOF'
-Usage: scripts/configure-merge-gate-ruleset.sh [--check|--apply] [options]
+Usage: scripts/configure-merge-gate-ruleset.sh MODE [options]
 
-Replace the spoofable `merge-gate` required-status context with a required
-workflow pinned to `.github/workflows/merge-gate.yml@refs/heads/main`.
+Modes:
+  --check          Verify the live v2 context, main-workflow blob, and disabled
+                   transition shim without changing GitHub (default).
+  --prepare REF    Before landing v2, bind its branch workflow blob and enable
+                   the temporary legacy context shim. Does not change ruleset.
+  --apply          After v2 lands on main, bind main's blob, replace the legacy
+                   required context with merge-gate-v2, and disable the shim.
 
 Options:
-  --check          Verify the pinned workflow rule without changing GitHub
-                   (default).
-  --apply          Reconcile the named ruleset, then verify it.
   --repo R         Repository (default: rrnewton/hermit).
   --ruleset-name N Ruleset to reconcile.
   -h, --help       Show this help.
@@ -34,6 +44,7 @@ EOF
 while (($# > 0)); do
     case "$1" in
         --check) mode=check; shift ;;
+        --prepare) mode=prepare; prepare_ref=${2:?--prepare requires a ref}; shift 2 ;;
         --apply) mode=apply; shift ;;
         --repo) repo=${2:?--repo requires OWNER/NAME}; shift 2 ;;
         --ruleset-name) ruleset_name=${2:?--ruleset-name requires a value}; shift 2 ;;
@@ -54,7 +65,24 @@ if command -v with-proxy >/dev/null 2>&1; then
     gh_cmd=(with-proxy gh)
 fi
 
-repo_id=$("${gh_cmd[@]}" api "repos/$repo" --jq .id)
+read_variable() {
+    "${gh_cmd[@]}" variable get "$1" --repo "$repo" --json value -q .value 2>/dev/null || true
+}
+
+set_variable() {
+    "${gh_cmd[@]}" variable set "$1" --repo "$repo" --body "$2" >/dev/null
+}
+
+gate_blob() {
+    "${gh_cmd[@]}" api --method GET "repos/$repo/contents/$GATE_PATH" \
+        -f ref="$1" --jq .sha
+}
+
+gate_source() {
+    "${gh_cmd[@]}" api --method GET "repos/$repo/contents/$GATE_PATH" \
+        -f ref="$1" --jq .content | tr -d '\n' | base64 -d
+}
+
 rulesets=$("${gh_cmd[@]}" api --paginate "repos/$repo/rulesets")
 matches=$(jq --arg name "$ruleset_name" '[.[] | select(.name == $name)]' <<<"$rulesets")
 match_count=$(jq 'length' <<<"$matches")
@@ -69,84 +97,115 @@ read_ruleset() {
     "${gh_cmd[@]}" api "repos/$repo/rulesets/$ruleset_id"
 }
 
-is_reconciled() {
-    jq -e \
-        --arg path "$GATE_PATH" \
-        --arg ref "$GATE_REF" \
-        --argjson repo_id "$repo_id" '
-          ([.rules[]
-            | select(.type == "workflows")
-            | .parameters.workflows[]?
-            | select(.path == $path and .ref == $ref and .repository_id == $repo_id)
-           ] | length) == 1
-          and
-          ([.rules[]
-            | select(.type == "required_status_checks")
-            | .parameters.required_status_checks[]?
-            | select(.context == "merge-gate")
-           ] | length) == 0
-        ' >/dev/null
+required_context_count() {
+    local context=$1
+    jq --arg context "$context" '[.rules[]
+      | select(.type == "required_status_checks")
+      | .parameters.required_status_checks[]?
+      | select(.context == $context)] | length'
 }
 
-current=$(read_ruleset)
-if is_reconciled <<<"$current"; then
-    printf 'PASS: ruleset %s requires %s@%s from repository %s (%s).\n' \
-        "$ruleset_id" "$GATE_PATH" "$GATE_REF" "$repo" "$repo_id"
+if [[ $mode == prepare ]]; then
+    blob=$(gate_blob "$prepare_ref")
+    source=$(gate_source "$prepare_ref")
+    if ! grep -Fq "name: $REQUIRED_CONTEXT" <<<"$source" ||
+       ! grep -Fq "$EXPECTED_BLOB_VARIABLE" <<<"$source"; then
+        printf 'configure-merge-gate-ruleset: %s does not define the bound %s context\n' \
+            "$prepare_ref" "$REQUIRED_CONTEXT" >&2
+        exit 1
+    fi
+    set_variable "$EXPECTED_BLOB_VARIABLE" "$blob"
+    set_variable "$LEGACY_SHIM_VARIABLE" true
+    if [[ $(read_variable "$EXPECTED_BLOB_VARIABLE") != "$blob" ]] ||
+       [[ $(read_variable "$LEGACY_SHIM_VARIABLE") != true ]]; then
+        printf 'configure-merge-gate-ruleset: transition variable verification failed\n' >&2
+        exit 1
+    fi
+    printf 'PREPARED: %s=%s for %s; legacy context shim enabled.\n' \
+        "$EXPECTED_BLOB_VARIABLE" "$blob" "$prepare_ref"
     exit 0
 fi
 
+current=$(read_ruleset)
+main_blob=$(gate_blob refs/heads/main)
+expected_blob=$(read_variable "$EXPECTED_BLOB_VARIABLE")
+legacy_shim=$(read_variable "$LEGACY_SHIM_VARIABLE")
+v2_count=$(required_context_count "$REQUIRED_CONTEXT" <<<"$current")
+legacy_count=$(required_context_count "$LEGACY_CONTEXT" <<<"$current")
+
 if [[ $mode == check ]]; then
-    printf 'FAIL: ruleset %s does not require %s@%s, or still trusts the bare merge-gate status context.\n' \
-        "$ruleset_id" "$GATE_PATH" "$GATE_REF" >&2
+    failed=0
+    if [[ $v2_count != 1 || $legacy_count != 0 ]]; then
+        printf 'FAIL: ruleset %s requires %s v2 contexts and %s legacy contexts.\n' \
+            "$ruleset_id" "$v2_count" "$legacy_count" >&2
+        failed=1
+    fi
+    if [[ $expected_blob != "$main_blob" ]]; then
+        printf 'FAIL: %s=%s, main workflow blob=%s.\n' \
+            "$EXPECTED_BLOB_VARIABLE" "${expected_blob:-unset}" "$main_blob" >&2
+        failed=1
+    fi
+    if [[ $legacy_shim != false ]]; then
+        printf 'FAIL: %s=%s, expected false.\n' \
+            "$LEGACY_SHIM_VARIABLE" "${legacy_shim:-unset}" >&2
+        failed=1
+    fi
+    if ((failed != 0)); then
+        exit 1
+    fi
+    printf 'PASS: ruleset %s requires %s; main blob %s is bound; legacy shim is disabled.\n' \
+        "$ruleset_id" "$REQUIRED_CONTEXT" "$main_blob"
+    exit 0
+fi
+
+source=$(gate_source refs/heads/main)
+if ! grep -Fq "name: $REQUIRED_CONTEXT" <<<"$source" ||
+   ! grep -Fq "$EXPECTED_BLOB_VARIABLE" <<<"$source"; then
+    printf 'configure-merge-gate-ruleset: main does not yet define the bound %s context\n' \
+        "$REQUIRED_CONTEXT" >&2
+    exit 1
+fi
+if [[ $legacy_count != 1 && $v2_count != 1 ]]; then
+    printf 'configure-merge-gate-ruleset: expected one %s or one %s required context\n' \
+        "$LEGACY_CONTEXT" "$REQUIRED_CONTEXT" >&2
     exit 1
 fi
 
-# Do not silently discard a second required context. This migration knows how
-# to replace only the legacy `merge-gate` context; anything else needs a human
-# policy decision.
-unexpected_contexts=$(jq -r '
-  [.rules[]
-   | select(.type == "required_status_checks")
-   | .parameters.required_status_checks[]?
-   | select(.context != "merge-gate")
-   | .context] | unique | join(",")
-' <<<"$current")
-if [[ -n $unexpected_contexts ]]; then
-    printf 'configure-merge-gate-ruleset: refusing to drop unexpected required contexts: %s\n' \
-        "$unexpected_contexts" >&2
-    exit 1
-fi
-
+# Bind main before switching the ruleset so the new context can never start in
+# an unbound state. Keep every unrelated required context and rule unchanged.
+set_variable "$EXPECTED_BLOB_VARIABLE" "$main_blob"
 desired=$(jq \
-    --arg path "$GATE_PATH" \
-    --arg ref "$GATE_REF" \
-    --argjson repo_id "$repo_id" '
+    --arg old "$LEGACY_CONTEXT" \
+    --arg new "$REQUIRED_CONTEXT" '
       {
         name,
         target,
         enforcement,
         conditions,
-        rules: (
-          [.rules[] | select(.type != "required_status_checks" and .type != "workflows")]
-          + [{
-              type: "workflows",
-              parameters: {
-                workflows: [{path: $path, ref: $ref, repository_id: $repo_id}]
-              }
-            }]
-        ),
+        rules: [.rules[] |
+          if .type == "required_status_checks" then
+            .parameters.required_status_checks |= map(
+              if .context == $old then .context = $new else . end
+            )
+          else . end],
         bypass_actors
       }
     ' <<<"$current")
 
 printf '%s\n' "$desired" | "${gh_cmd[@]}" api \
     --method PUT "repos/$repo/rulesets/$ruleset_id" --input - >/dev/null
+set_variable "$LEGACY_SHIM_VARIABLE" false
 
+# Re-read every server-side input rather than trusting the PUT response.
 updated=$(read_ruleset)
-if ! is_reconciled <<<"$updated"; then
-    printf 'configure-merge-gate-ruleset: GitHub accepted the update but verification failed\n' >&2
+updated_v2_count=$(required_context_count "$REQUIRED_CONTEXT" <<<"$updated")
+updated_legacy_count=$(required_context_count "$LEGACY_CONTEXT" <<<"$updated")
+if [[ $updated_v2_count != 1 || $updated_legacy_count != 0 ]] ||
+   [[ $(read_variable "$EXPECTED_BLOB_VARIABLE") != "$main_blob" ]] ||
+   [[ $(read_variable "$LEGACY_SHIM_VARIABLE") != false ]]; then
+    printf 'configure-merge-gate-ruleset: GitHub accepted migration but verification failed\n' >&2
     exit 1
 fi
 
-printf 'APPLIED: ruleset %s now requires %s@%s from repository %s (%s).\n' \
-    "$ruleset_id" "$GATE_PATH" "$GATE_REF" "$repo" "$repo_id"
+printf 'APPLIED: ruleset %s now requires %s; main blob %s is bound; legacy shim disabled.\n' \
+    "$ruleset_id" "$REQUIRED_CONTEXT" "$main_blob"

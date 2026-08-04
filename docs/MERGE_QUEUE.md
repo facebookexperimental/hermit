@@ -4,8 +4,7 @@ Pull requests into `main` land through GitHub's merge queue. The queue creates
 a temporary commit against the current `main` tip, preventing a stale pull
 request head from bypassing changes that landed ahead of it.
 
-The required policy is `.github/workflows/merge-gate.yml` from `main`. Its
-`merge-gate` job passes when either:
+The required status is `merge-gate-v2`. Its job passes when either:
 
 - the latest `.github/workflows/ci-portable.yml` run for the exact pull request
   head completed successfully; or
@@ -20,11 +19,12 @@ request. Every strip records a durable evidence comment (see
 "Validation-evidence trail" below) so the record of what was validated is never
 lost.
 
-The ruleset pins the required workflow to `refs/heads/main`. A
-`workflow_dispatch` run from a pull request branch is diagnostic only: even if
-its identically named `merge-gate` job succeeds, it cannot satisfy the required
-workflow. This prevents an old pull request from authorizing itself with an
-older, weaker copy of the gate YAML.
+The job first verifies that its workflow file has the exact Git blob registered
+in the server-side `MERGE_GATE_V2_BLOB` variable. A `workflow_dispatch` run
+from an old or modified pull request branch therefore fails before evaluating
+landing policy. The context name is versioned as well: every semantic gate
+tightening must bump it and move the ruleset, so a pre-tightening branch cannot
+emit the context currently required by `main`.
 
 Add an approved pull request to the queue with:
 
@@ -109,9 +109,9 @@ workflow.
 The `main` branch ruleset must:
 
 1. require pull requests and linear history;
-2. require `.github/workflows/merge-gate.yml` from this repository at
-   `refs/heads/main` using GitHub's required-workflow rule, never a bare status
-   context named `merge-gate`;
+2. require the current versioned Merge Gate context (`merge-gate-v2`) from the
+   GitHub Actions integration, with `MERGE_GATE_V2_BLOB` equal to the workflow
+   blob on `main` and `MERGE_GATE_LEGACY_CONTEXT=false`;
 3. require GitHub's merge queue; and
 4. disallow force pushes and branch deletion.
 
@@ -121,8 +121,13 @@ Verify the live rule without mutating it:
 with-proxy scripts/configure-merge-gate-ruleset.sh --check
 ```
 
-The coordinator may reconcile the live ruleset with `--apply`. The command
-refuses to discard any unexpected required status context.
+Before landing a gate-version transition, run `--prepare <feature-ref>` to bind
+the candidate blob and enable the temporary legacy-context shim. After the
+workflow lands, the coordinator runs `--apply`; it binds the `main` blob,
+changes only the legacy required context to v2, disables the shim, and verifies
+all three server-side values. GitHub required-workflow rules would avoid this
+transition, but they are available only to organization/enterprise rulesets;
+`rrnewton/hermit` is user-owned.
 
 Enable auto-merge in the repository so `gh pr merge --auto --merge` can queue
 eligible pull requests. Do not require the host-dependent CI job separately;
