@@ -445,7 +445,7 @@ impl FromStr for VerifyAllow {
 }
 
 impl VerifyAllow {
-    fn satisfies(&self, status: ExitStatus) -> bool {
+    pub(crate) fn satisfies(&self, status: ExitStatus) -> bool {
         match self {
             VerifyAllow::Success => status == ExitStatus::SUCCESS,
             VerifyAllow::Failure => status != ExitStatus::SUCCESS,
@@ -1826,6 +1826,7 @@ impl RunOpts {
                     &self.program,
                     &self.args,
                     self.verify,
+                    self.verify_allow,
                     self.summary,
                     global.log,
                     &self.effective_det_config(),

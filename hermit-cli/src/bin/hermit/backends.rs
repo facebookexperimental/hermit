@@ -56,6 +56,8 @@ use hermit::ExitStatus;
 use reverie_dbi::DbiRunner;
 use tracing::metadata::LevelFilter;
 
+use super::run::VerifyAllow;
+
 #[derive(Debug)]
 #[cfg(feature = "dbi")]
 struct DbiSummary {
@@ -366,14 +368,21 @@ impl<R: Read, W: Write> Read for TeeReader<R, W> {
 /// flags such as `--strict`, `--seed`, and the time/CPUID virtualization
 /// switches actually reach the in-guest Detcore Tool instead of being ignored.
 ///
-/// When `verify` is true, the guest is executed twice. Both runs must succeed,
-/// produce byte-identical stdout, report `tool=Detcore`, and produce the same
-/// observed guest-memory hash from the native DBI runtime.
+/// When `verify` is true, the guest is executed twice. Both runs must exit in a
+/// way `verify_allow` permits (by default success; `--verify-allow {failure,both}`
+/// admits a deliberate non-zero exit), agree on their exit status, produce
+/// byte-identical stdout, report `tool=Detcore`, and produce the same observed
+/// guest-memory hash from the native DBI runtime.
+// This mirrors the option surface of `hermit run`, so its parameters track the
+// CLI run flags rather than a cohesive value object; bundling them would not
+// clarify the dispatch shim.
+#[allow(clippy::too_many_arguments)]
 #[cfg(feature = "dbi")]
 pub(super) fn run_dbi(
     program: &Path,
     args: &[String],
     verify: bool,
+    verify_allow: VerifyAllow,
     summary: bool,
     log: Option<LevelFilter>,
     config: &Config,
@@ -487,7 +496,13 @@ pub(super) fn run_dbi(
         }
         None => run_once_with_terminal_input(&runner, &guest, &drrun)?,
     };
-    if !first.status.success() {
+    if !verify_allow.satisfies(process_status(first.status)) {
+        // The first run exited in a way `--verify-allow` does not permit, so a
+        // second run cannot establish determinism for the intended contract.
+        // This mirrors the ptrace `--verify` path (see `verify` in run.rs).
+        // With `--verify-allow {failure,both}` a deliberate non-zero exit *is*
+        // permitted, so the double-run comparison below still executes — that is
+        // what lets the `exit_status` backend-parity contract reach L2 on DBI.
         write_output(&first)?;
         return Ok(output_status(&first));
     }
@@ -508,11 +523,23 @@ pub(super) fn run_dbi(
         }
         None => run_once_with_terminal_input(&runner, &guest, &drrun)?,
     };
-    if !second.status.success() {
+    if !verify_allow.satisfies(process_status(second.status)) {
         write_output(&second)?;
         return Ok(output_status(&second));
     }
     let second_summary = detcore_summary(&second)?;
+
+    // Determinism requires both runs to agree on their exit status, not merely
+    // that each is permitted by `--verify-allow`. This guards the non-zero-exit
+    // contract (e.g. a guest that must exit 23 on both runs); without it, two
+    // differing permitted failures would be accepted as "deterministic".
+    if first.status != second.status {
+        write_output(&first)?;
+        return Err(Error::msg(format!(
+            "DBI verification failed: guest exit status differed between runs ({:?} != {:?})",
+            first.status, second.status
+        )));
+    }
 
     if first.stdout != second.stdout {
         return Err(Error::msg(dbi_stdout_mismatch(
@@ -542,14 +569,23 @@ pub(super) fn run_dbi(
     if summary {
         eprint!("{}", format_dbi_stats(&first_summary));
     }
-    Ok(ExitStatus::Exited(0))
+    // Propagate the guest's own (verified-identical) exit status rather than a
+    // hardcoded 0. Before `--verify-allow` was threaded through, this line was
+    // only reachable when both runs exited 0, so `Exited(0)` was equivalent; now
+    // a deliberately non-zero guest (e.g. the `exit_status` parity contract with
+    // `--verify-allow both`) can verify deterministically, and the DBI backend
+    // must surface that status to match the ptrace `--verify` path
+    // (`compare_two_runs` returns `out2.status`).
+    Ok(output_status(&first))
 }
 
+#[allow(clippy::too_many_arguments)]
 #[cfg(not(feature = "dbi"))]
 pub(super) fn run_dbi(
     _program: &Path,
     _args: &[String],
     _verify: bool,
+    _verify_allow: VerifyAllow,
     _summary: bool,
     _log: Option<LevelFilter>,
     _config: &Config,

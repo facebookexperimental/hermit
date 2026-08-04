@@ -105,7 +105,7 @@ is not reached.
 | `hello_stdout` | pass / detlog | pass / detlog | pass / guest |
 | `argument_forwarding` | pass / detlog | pass / detlog | pass / guest |
 | `exit_zero` | pass / detlog | pass / detlog | pass / guest |
-| `exit_status` | pass / detlog | pass / **gap** | pass / guest |
+| `exit_status` | pass / detlog | pass / detlog | pass / guest |
 | `file_read` | pass / detlog | pass / detlog | pass / guest |
 | `file_mutation` | pass / detlog | pass / detlog | pass / guest |
 | `file_metadata` | pass / detlog | pass / detlog | pass / guest |
@@ -166,13 +166,9 @@ witnesses: `Determinism verified` (DETLOG-bitwise, ptrace and DBI) and
 `guest output and exit status matched` (KVM guest-visible). A DETLOG result
 satisfies a `guest` contract because it is strictly stronger; the reverse fails.
 
-Two contracts hold at L1 but not L2, and both are recorded as L2 `gap`s with
-reasons in `matrix.tsv`:
+One contract holds at L1 but not L2 and is recorded as an L2 `gap` with its
+reason in `matrix.tsv`:
 
-- **`exit_status` on DBI.** With `--verify-allow both`, hermit runs the DBI
-  guest only once when the first run exits non-zero — it never performs the
-  second run — so the double-run DETLOG comparison never executes for this
-  non-zero-exit contract. ptrace performs both runs and reaches `detlog` here.
 - **`process_wait_accounting` on KVM.** The `--verify` concurrent double-run
   races child reaping: `waitid` on the already-reaped child returns `ECHILD`
   (`No child processes`), so the second run exits non-zero and verification
