@@ -449,6 +449,7 @@ jobs:
             --exclude='target/release/.fingerprint' \
             --exclude='target/release/examples' \
             target/release \
+            target/ci \
             target/install_pkg
           ls -lh "$RELEASE_TARBALL"
       - name: Upload DBI install package (debug shards)
