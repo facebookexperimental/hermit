@@ -12,21 +12,22 @@
 # Commandment (see detcore/Cargo.toml and detcore/src/lib.rs):
 #
 #   The detcore core library depends ONLY on the abstract Reverie interface
-#   crate (`reverie`). It MUST NEVER depend on a concrete Reverie backend
-#   (`reverie-ptrace`, `reverie-dbi`, `reverie-kvm`). Backends are selected and
-#   instantiated EXCLUSIVELY by the `hermit-cli` package, which constructs a
-#   detcore tool and runs it against a chosen backend. There are no
-#   backend-specific hacks in detcore.
+#   crate (`reverie`, whose package is `reverie-core`). It MUST NEVER depend on
+#   another `reverie-*` crate. Backends are selected and instantiated
+#   EXCLUSIVELY by the `hermit-cli` package, which constructs a detcore tool and
+#   runs it against a chosen backend. There are no backend-specific hacks in
+#   detcore.
 #
 # Why: Hermit follows Reverie's abstract instrumentation model. A backend
 # dependency in detcore would couple the determinism engine to one tracing
-# mechanism (ptrace/dbi/kvm) and break the clean abstraction boundary.
+# mechanism and break the clean abstraction boundary.
 #
 # What this lint checks:
-#   1. detcore/Cargo.toml: no backend crate appears in any NON-test dependency
-#      table ([dependencies], [build-dependencies], [target.*.dependencies]).
-#   2. detcore/src/**: no backend crate is imported or referenced from the
-#      library source (use / extern crate / path `reverie_ptrace::` etc.).
+#   1. detcore/Cargo.toml: no non-core Reverie crate appears in any NON-test
+#      dependency table ([dependencies], [build-dependencies],
+#      [target.*.dependencies]).
+#   2. detcore/src/**: no non-core Reverie crate is imported or referenced from
+#      the library source (use / extern crate / path `reverie_ptrace::` etc.).
 #
 # What this lint intentionally ALLOWS:
 #   - Backend crates under [dev-dependencies] and in detcore/tests/**. Detcore's
@@ -41,11 +42,32 @@
 
 set -uo pipefail
 
-# Concrete Reverie backends detcore must never depend on. Extend this list if a
-# new backend crate is added to the workspace.
-readonly BACKEND_CRATES=(reverie-ptrace reverie-dbi reverie-kvm)
-# Module-path forms (Cargo normalizes '-' to '_' for the crate identifier).
-readonly BACKEND_MODS_RE='reverie_ptrace|reverie_dbi|reverie_kvm'
+repo_root_override=""
+skip_negative_control=false
+while (($# > 0)); do
+    case "$1" in
+        --repo-root)
+            if (($# < 2)); then
+                echo "error: --repo-root requires a path" >&2
+                exit 2
+            fi
+            repo_root_override=$2
+            shift 2
+            ;;
+        --skip-negative-control)
+            skip_negative_control=true
+            shift
+            ;;
+        -h|--help)
+            echo "usage: $0 [--repo-root PATH] [--skip-negative-control]"
+            exit 0
+            ;;
+        *)
+            echo "error: unknown argument: $1" >&2
+            exit 2
+            ;;
+    esac
+done
 
 # --- output helpers ----------------------------------------------------------
 
@@ -62,7 +84,11 @@ err()  { echo "${C_RED}error:${C_RST} $*" >&2; }
 # --- locate the repo and detcore ---------------------------------------------
 
 script_dir() { cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd; }
-REPO_ROOT="$(cd -- "$(script_dir)/.." && pwd)"
+if [[ -n $repo_root_override ]]; then
+    REPO_ROOT="$(cd -- "$repo_root_override" && pwd)"
+else
+    REPO_ROOT="$(cd -- "$(script_dir)/.." && pwd)"
+fi
 
 readonly DETCORE_MANIFEST="$REPO_ROOT/detcore/Cargo.toml"
 readonly DETCORE_SRC="$REPO_ROOT/detcore/src"
@@ -75,6 +101,85 @@ if [[ ! -d $DETCORE_SRC ]]; then
     err "detcore source directory not found: $DETCORE_SRC"
     exit 2
 fi
+
+# Derive every non-core Reverie crate named by a workspace member. This set is
+# intentionally broader than today's execution backends: the commandment says
+# detcore depends only on reverie-core, so a direct dependency on any other
+# Reverie implementation/support crate is a boundary violation. A new
+# reverie-* dependency automatically joins the prohibited set without editing
+# this lint.
+backend_output="$(python3 - "$REPO_ROOT" <<'PY'
+import glob
+import sys
+import tomllib
+from pathlib import Path
+
+root = Path(sys.argv[1])
+
+def load(path: Path):
+    with path.open("rb") as source:
+        return tomllib.load(source)
+
+root_manifest = load(root / "Cargo.toml")
+members = root_manifest.get("workspace", {}).get("members", [])
+manifest_paths = {root / "Cargo.toml"}
+for pattern in members:
+    for candidate_name in glob.glob(str(root / pattern)):
+        candidate = Path(candidate_name)
+        manifest = candidate if candidate.name == "Cargo.toml" else candidate / "Cargo.toml"
+        if manifest.is_file():
+            manifest_paths.add(manifest)
+
+def dependency_tables(document):
+    for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+        table = document.get(key)
+        if isinstance(table, dict):
+            yield table
+    workspace = document.get("workspace")
+    if isinstance(workspace, dict):
+        table = workspace.get("dependencies")
+        if isinstance(table, dict):
+            yield table
+    target = document.get("target")
+    if isinstance(target, dict):
+        for target_table in target.values():
+            if not isinstance(target_table, dict):
+                continue
+            for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+                table = target_table.get(key)
+                if isinstance(table, dict):
+                    yield table
+
+crates = set()
+for manifest in manifest_paths:
+    document = load(manifest)
+    for table in dependency_tables(document):
+        for dependency_key, specification in table.items():
+            package = dependency_key
+            if isinstance(specification, dict):
+                package = specification.get("package", dependency_key)
+            if package.startswith("reverie-") and package != "reverie-core":
+                crates.add(package)
+
+print("\n".join(sorted(crates)))
+PY
+)" || {
+    err "failed to derive non-core Reverie crates from workspace Cargo manifests"
+    exit 2
+}
+
+if [[ -z $backend_output ]]; then
+    err "workspace declares no non-core reverie-* crates; refusing a vacuous abstraction check"
+    exit 2
+fi
+mapfile -t BACKEND_CRATES <<< "$backend_output"
+BACKEND_MODS_RE=""
+for backend in "${BACKEND_CRATES[@]}"; do
+    module=${backend//-/_}
+    BACKEND_MODS_RE+="${BACKEND_MODS_RE:+|}${module}"
+done
+readonly BACKEND_MODS_RE
+info "derived prohibited Reverie crates from workspace: ${BACKEND_CRATES[*]}"
 
 violations=0
 
@@ -119,12 +224,12 @@ manifest_hits="$(
 )"
 
 if [[ -n $manifest_hits ]]; then
-    err "detcore/Cargo.toml declares a concrete Reverie backend in a non-test dependency table:"
+    err "detcore/Cargo.toml declares a non-core Reverie crate in a non-test dependency table:"
     printf '%s\n' "$manifest_hits" >&2
     err "detcore must depend only on the abstract 'reverie' crate. Move backend wiring to hermit-cli."
     ((violations++))
 else
-    ok "detcore/Cargo.toml: no backend crate in [dependencies]/[build-dependencies]/[target.*]"
+    ok "detcore/Cargo.toml: no non-core Reverie crate in runtime/build dependency tables"
 fi
 
 # --- 2. library source: no backend imports -----------------------------------
@@ -133,13 +238,61 @@ src_hits="$(grep -rnE "(^|[^A-Za-z0-9_])(${BACKEND_MODS_RE})([^A-Za-z0-9_]|$)" \
     "$DETCORE_SRC" 2>/dev/null | grep -vE '^\s*[^:]+:[0-9]+:\s*//' || true)"
 
 if [[ -n $src_hits ]]; then
-    err "detcore/src references a concrete Reverie backend module:"
+    err "detcore/src references a non-core Reverie crate module:"
     printf '%s\n' "$src_hits" >&2
     err "detcore library code must use only the abstract 'reverie' interfaces."
     ((violations++))
 else
-    ok "detcore/src: no backend module imports (reverie_ptrace/dbi/kvm)"
+    ok "detcore/src: no imports from derived non-core Reverie crates"
 fi
+
+# Exercise the real checker against scratch detcore copies. This is a negative
+# control, not a mock: each recursive invocation re-derives its prohibited set
+# from the scratch workspace after the planted dependency is added.
+run_negative_controls() {
+    local scratch backend output status
+    local -a control_crates=("${BACKEND_CRATES[@]}")
+
+    # e9patch is not currently declared by a workspace member, so it cannot be
+    # part of the derived set yet. Keep it as a sentinel until it is declared;
+    # once present, the derived list supplies it and this append is skipped.
+    if [[ " ${control_crates[*]} " != *" reverie-e9patch "* ]]; then
+        control_crates+=(reverie-e9patch)
+    fi
+
+    for backend in "${control_crates[@]}"; do
+        if ! scratch=$(mktemp -d); then
+            err "negative control could not create a scratch directory"
+            return 1
+        fi
+        if ! cp -a "$REPO_ROOT/detcore" "$scratch/detcore" ||
+           ! printf '[workspace]\nmembers = ["detcore"]\nresolver = "2"\n' \
+                > "$scratch/Cargo.toml" ||
+           ! printf '\n[target.'"'"'cfg(any())'"'"'.dependencies]\n%s = "0.2.0"\n' \
+                "$backend" >> "$scratch/detcore/Cargo.toml"; then
+            err "negative control could not prepare the $backend scratch copy"
+            rm -rf -- "$scratch"
+            return 1
+        fi
+
+        output="$("${BASH_SOURCE[0]}" --repo-root "$scratch" \
+            --skip-negative-control 2>&1)"
+        status=$?
+        rm -rf -- "$scratch"
+
+        if ((status != 1)); then
+            err "negative control for $backend returned $status, expected 1"
+            printf '%s\n' "$output" >&2
+            return 1
+        fi
+        if ! grep -Fq "$backend" <<< "$output"; then
+            err "negative control failed without identifying $backend"
+            printf '%s\n' "$output" >&2
+            return 1
+        fi
+        ok "negative control: planted $backend dependency was rejected"
+    done
+}
 
 # --- summary -----------------------------------------------------------------
 
@@ -148,6 +301,10 @@ if ((violations > 0)); then
     err "backend-abstraction commandment VIOLATED ($violations check(s) failed)."
     err "See detcore/src/lib.rs and detcore/Cargo.toml for the commandment."
     exit 1
+fi
+if ! $skip_negative_control && ! run_negative_controls; then
+    err "backend-abstraction negative control FAILED; the lint is not trustworthy."
+    exit 2
 fi
 ok "backend-abstraction commandment intact: detcore depends only on abstract 'reverie'."
 exit 0

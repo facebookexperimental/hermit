@@ -14,12 +14,12 @@
 //! interface (the `reverie` crate). It depends only on those traits and types
 //! and is deliberately ignorant of how a guest is actually traced.
 //!
-//! Detcore MUST NEVER depend on or import a concrete Reverie backend --
-//! `reverie-ptrace`, `reverie-dbi`, or `reverie-kvm`. Choosing and
-//! instantiating a backend, and running a detcore tool against it, is the sole
-//! responsibility of the `hermit-cli` package. There are no backend-specific
-//! hacks in detcore: any tracing-mechanism-specific behavior belongs behind the
-//! Reverie abstraction, not here.
+//! Detcore MUST NEVER depend on or import a concrete Reverie backend or support
+//! crate -- any `reverie-*` crate other than the abstract `reverie-core`
+//! interface. Choosing and instantiating a backend, and running a detcore tool
+//! against it, is the sole responsibility of the `hermit-cli` package. There
+//! are no backend-specific hacks in detcore: any tracing-mechanism-specific
+//! behavior belongs behind the Reverie abstraction, not here.
 //!
 //! Why: Hermit follows Reverie's abstract model. A backend dependency in
 //! detcore would couple the determinism engine to one tracing mechanism and

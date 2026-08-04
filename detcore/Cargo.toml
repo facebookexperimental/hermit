@@ -5,7 +5,8 @@
 # ===========================================================================
 # detcore is a Reverie *tool*. Its library depends ONLY on the abstract Reverie
 # interface crate (`reverie`, in [dependencies] below). It MUST NEVER declare a
-# concrete Reverie backend -- reverie-ptrace, reverie-dbi, or reverie-kvm -- in
+# concrete Reverie backend or support crate -- any `reverie-*` package other
+# than the abstract `reverie-core` interface -- in
 # [dependencies], [build-dependencies], or any [target.*.dependencies] table.
 # Backends are selected and instantiated EXCLUSIVELY by the `hermit-cli`
 # package, which constructs a detcore tool and runs it against a chosen backend.
