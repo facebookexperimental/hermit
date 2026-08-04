@@ -54,8 +54,9 @@ validated. Two symmetric comments preserve it:
   comment (commit SHA, profile, results, host, durable log path, ledger path,
   and run ID) ending in a machine-parseable marker
   `<!-- locally-validated-evidence sha=... log=... -->`. Only then may it apply
-  the label. The merge gate fails closed when the label is present without a
-  matching exact-head marker and nonempty log reference.
+  the label. The merge gate accepts only an owner-authored marker with an exact
+  head, full profile, absolute log and ledger references, and a run ID prefixed
+  by that head. It fails closed when any field is absent or malformed.
 - **Strip time.** `scripts/label-strip-evidence.sh` posts a comment recording
   the strip (validated SHA, new head, reason, timestamp) and quotes the matching
   add-time evidence comment. It is best-effort and always exits 0, so it can
@@ -71,6 +72,16 @@ Known strip paths — all must leave the trail:
    .../labels/locally-validated`, or a remove+add re-fire toggle) must run
    `scripts/label-strip-evidence.sh --pr <n> --validated-sha <sha> [--remove]`
    so the evidence is preserved. The `--remove` flag also strips the label.
+3. **Evidence mutation.** Editing or deleting a PR comment revalidates the
+   current exact-head record. If no valid owner-authored record remains, the
+   workflow removes `locally-validated`; that label event re-runs the gate.
+
+The GitHub gate validates the evidence record, not the referenced host file:
+gate fallback runners cannot dereference a devbig014-local path. Shared
+`rrnewton` credentials also mean author identity does not distinguish agents.
+The log, ledger, and run tuple is therefore durable provenance for audit, not a
+cryptographic attestation. A trusted external signer or shared artifact service
+would be required to make forged records mechanically impossible.
 
 ## Repository settings
 

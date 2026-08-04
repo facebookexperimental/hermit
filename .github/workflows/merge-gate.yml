@@ -11,6 +11,8 @@ on:
       - "CI (GitHub-managed portable)"
       - "P0 Demo Gate (Hermit hot paths)"
     types: [completed]
+  issue_comment:
+    types: [edited, deleted]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -176,11 +178,88 @@ jobs:
               || echo "label-strip-evidence helper returned non-zero (ignored; best-effort)."
           fi
 
+  invalidate-mutated-validation-evidence:
+    name: invalidate-mutated-validation-evidence
+    if: >-
+      github.repository == 'rrnewton/hermit' &&
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request != null
+    runs-on: [self-hosted, gate]
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Remove local-validation label when its evidence is no longer valid
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          pr="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")"
+          state="$(jq -r '.state' <<< "$pr")"
+          head_sha="$(jq -r '.head.sha' <<< "$pr")"
+          if [ "$state" != open ]; then
+            echo "PR #${PR_NUMBER} is ${state}; no live validation label to protect."
+            exit 0
+          fi
+          if ! jq -e 'any(.labels[]?; .name == "locally-validated")' \
+              <<< "$pr" >/dev/null; then
+            echo "PR #${PR_NUMBER} has no locally-validated label."
+            exit 0
+          fi
+
+          owner="${REPO%%/*}"
+          if ! comments_json="$(
+            gh api --paginate --slurp \
+              "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100"
+          )"; then
+            echo "::warning::Could not re-read evidence comments; failing closed by removing the label."
+            comments_json='[]'
+          fi
+          evidence="$(jq -r --arg sha "$head_sha" --arg owner "$owner" '
+            [ .[][]?
+              | select(.user.login == $owner)
+              | select((.body // "") | startswith("[impl agent, validate.sh]\n"))
+              | .body as $body
+              | select($body | contains("Local validation passed"))
+              | select($body | contains("- SHA: `" + $sha + "`"))
+              | select($body | test("- Profile: `full`"))
+              | select($body | test("- Results: [1-9][0-9]* checks passed, 0 failed"))
+              | $body
+              | split("\n")[]
+              | capture("^<!-- locally-validated-evidence sha=(?<sha>[0-9a-f]{40}) profile=(?<profile>[^ ]+) host=(?<host>[^ ]+) log=(?<log>[^ ]+) ledger=(?<ledger>[^ ]+) run=(?<run>[^ ]+) ts=(?<ts>[^ ]+) -->$")?
+              | select(.sha == $sha and .profile == "full")
+              | select(.host != "" and .host != "unknown")
+              | select(.log | startswith("/"))
+              | select(.ledger | startswith("/"))
+              | select(.run | startswith($sha + "@"))
+              | select(.ts | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))
+            ] | last // empty | @json
+          ' <<< "$comments_json")"
+          if [ -n "$evidence" ]; then
+            echo "PR #${PR_NUMBER} still has valid exact-head evidence: ${evidence}"
+            exit 0
+          fi
+
+          gh api --method DELETE \
+            "repos/${REPO}/issues/${PR_NUMBER}/labels/locally-validated" \
+            --silent
+          body="[coordinator, github-actions]
+
+          Removed \`locally-validated\`: an evidence comment was edited or deleted, and no owner-authored full-validation record with an exact-head log, ledger, and run reference remains for \`${head_sha}\`."
+          gh api --method POST "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            -f body="$body" --silent
+          echo "Removed locally-validated from PR #${PR_NUMBER}; evidence no longer validates head ${head_sha}."
+
   core-review-protocol:
     name: core-review-protocol
     if: >-
       github.repository == 'rrnewton/hermit' &&
-      github.event_name != 'workflow_run'
+      github.event_name != 'workflow_run' &&
+      github.event_name != 'issue_comment'
     runs-on: [self-hosted, gate]
     timeout-minutes: 10
     permissions:
@@ -288,7 +367,8 @@ jobs:
     if: >-
       always() &&
       github.repository == 'rrnewton/hermit' &&
-      github.event_name != 'workflow_run'
+      github.event_name != 'workflow_run' &&
+      github.event_name != 'issue_comment'
     runs-on: [self-hosted, gate]
     timeout-minutes: 10
     steps:
@@ -404,8 +484,10 @@ jobs:
                 echo "::error::Could not read validation evidence comments for PR #${pr_number}."
                 failed=1
               else
-                evidence="$(jq -r --arg sha "$head_sha" '
+                owner="${REPO%%/*}"
+                evidence="$(jq -r --arg sha "$head_sha" --arg owner "$owner" '
                   [ .[][]?
+                    | select(.user.login == $owner)
                     | select((.body // "") | startswith("[impl agent, validate.sh]\n"))
                     | .body as $body
                     | select($body | contains("Local validation passed"))
@@ -414,14 +496,17 @@ jobs:
                     | select($body | test("- Results: [1-9][0-9]* checks passed, 0 failed"))
                     | $body
                     | split("\n")[]
-                    | capture("^<!-- locally-validated-evidence sha=(?<sha>[0-9a-f]{40}) profile=(?<profile>[^ ]+) host=(?<host>[^ ]+) log=(?<log>[^ ]+)( ledger=(?<ledger>[^ ]+) run=(?<run>[^ ]+))? ts=(?<ts>[^ ]+) -->$")?
-                    | select(.sha == $sha)
-                    | select(.profile == "full")
-                    | select(.log != "" and .log != "none" and .log != "unknown")
+                    | capture("^<!-- locally-validated-evidence sha=(?<sha>[0-9a-f]{40}) profile=(?<profile>[^ ]+) host=(?<host>[^ ]+) log=(?<log>[^ ]+) ledger=(?<ledger>[^ ]+) run=(?<run>[^ ]+) ts=(?<ts>[^ ]+) -->$")?
+                    | select(.sha == $sha and .profile == "full")
+                    | select(.host != "" and .host != "unknown")
+                    | select(.log | startswith("/"))
+                    | select(.ledger | startswith("/"))
+                    | select(.run | startswith($sha + "@"))
+                    | select(.ts | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))
                   ] | last // empty | @json
                 ' <<< "$comments_json")"
                 if [ -z "$evidence" ]; then
-                  echo "::error::PR #${pr_number} has locally-validated but no validate.sh evidence comment for exact head $head_sha with a durable log reference."
+                  echo "::error::PR #${pr_number} has locally-validated but no owner-authored validate.sh evidence for exact head $head_sha with log, ledger, and run references."
                   failed=1
                 else
                   echo "PR #${pr_number} is locally validated at $head_sha with evidence: $evidence"
