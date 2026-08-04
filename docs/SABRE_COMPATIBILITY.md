@@ -1,9 +1,12 @@
 # SaBRe backend compatibility
 
-SaBRe is an experimental Linux x86-64 execution backend for Hermit `run`. It
-loads the shared Detcore implementation into a SaBRe plugin while a Hermit
-coordinator owns Detcore's global state. It is useful for measured workloads,
-but it is not a drop-in replacement for the ptrace backend.
+[SaBRe](https://github.com/srg-imperial/SaBRe) is a load-time selective binary
+rewriter that intercepts a program's system calls from inside the process,
+rather than through the kernel-mediated tracing that `ptrace` uses. Hermit can
+use it as an experimental execution backend for `run`: it loads the shared
+Detcore determinism engine into a SaBRe plugin while a Hermit coordinator owns
+Detcore's global state. It is useful for measured workloads, but it is not a
+drop-in replacement for the ptrace backend.
 
 This document describes the post-0.2 work-ahead envelope. The executable test
 manifests are the source of truth: a SaBRe entry in `backends_enabled` means the

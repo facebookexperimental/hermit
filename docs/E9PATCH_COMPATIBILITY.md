@@ -1,8 +1,11 @@
 # e9patch Compatibility
 
-The e9patch selection is a cached main-ELF preprocessor followed by Hermit's
-ptrace Detcore runtime. This report describes the measured application envelope;
-it is not a claim that e9patch is a standalone instrumentation runtime.
+[e9patch](https://github.com/GJDuck/e9patch) is a static binary rewriter that
+inserts trampolines into an x86-64 executable ahead of time, without recompiling
+it. Hermit uses it as a preprocessing step: it rewrites the main ELF, then runs
+the result under Hermit's ordinary ptrace backend. This report describes the
+measured application envelope of that combination; it is not a claim that
+e9patch is a standalone instrumentation runtime.
 
 ## Reproduce the matrix
 
