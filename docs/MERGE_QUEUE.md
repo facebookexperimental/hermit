@@ -74,11 +74,14 @@ Known strip paths — all must leave the trail:
    so the evidence is preserved. The `--remove` flag also strips the label.
 3. **Evidence mutation.** Editing or deleting a PR comment revalidates the
    current exact-head record. If no valid owner-authored record remains, the
-   workflow removes `locally-validated` and explicitly dispatches a new
-   exact-head gate. The dispatch is required because label changes made with
-   `GITHUB_TOKEN` do not recursively trigger another workflow. This closes a
-   stale green check after the mutation is processed; there remains a narrow
-   race if a merge completes before the edit/delete event and follow-up run.
+   workflow first publishes a failing required `merge-gate` check at the exact
+   head, then removes `locally-validated`. Same-repository branches explicitly
+   dispatch a new exact-head gate because label changes made with `GITHUB_TOKEN`
+   do not recursively trigger another workflow. A dispatch failure therefore
+   remains blocked by the already-published failure. Fork heads cannot be used as
+   base-repository workflow-dispatch refs; their failing check remains until a
+   new evidence record and label re-fire the pull-request gate. There remains a
+   narrow race if a merge completes before the edit/delete event is processed.
 
 The GitHub gate validates the evidence record, not the referenced host file:
 gate fallback runners cannot dereference a devbig014-local path. Shared

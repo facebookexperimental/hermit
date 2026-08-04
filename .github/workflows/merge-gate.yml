@@ -188,6 +188,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       actions: write
+      checks: write
       issues: write
       pull-requests: read
     steps:
@@ -203,6 +204,7 @@ jobs:
           state="$(jq -r '.state' <<< "$pr")"
           head_sha="$(jq -r '.head.sha' <<< "$pr")"
           head_ref="$(jq -r '.head.ref' <<< "$pr")"
+          head_repo="$(jq -r '.head.repo.full_name // empty' <<< "$pr")"
           if [ "$state" != open ]; then
             echo "PR #${PR_NUMBER} is ${state}; no live validation label to protect."
             exit 0
@@ -246,6 +248,24 @@ jobs:
             exit 0
           fi
 
+          # Invalidate the required context before mutating the label. The
+          # issue_comment job itself is not a required check, and a follow-up
+          # workflow dispatch can fail. Publishing this check first makes every
+          # later failure fail closed at the exact PR head.
+          summary="No owner-authored full-validation record with an exact-head log, ledger, and run reference remains for ${head_sha}."
+          gh api --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${REPO}/check-runs" \
+            -f name=merge-gate \
+            -f head_sha="$head_sha" \
+            -f status=completed \
+            -f conclusion=failure \
+            -f details_url="${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}" \
+            -f 'output[title]=Local validation evidence invalidated' \
+            -f "output[summary]=${summary}" \
+            --silent
+          echo "Published a failing merge-gate check for PR #${PR_NUMBER} at ${head_sha}."
+
           gh api --method DELETE \
             "repos/${REPO}/issues/${PR_NUMBER}/labels/locally-validated" \
             --silent
@@ -257,13 +277,19 @@ jobs:
           echo "Removed locally-validated from PR #${PR_NUMBER}; evidence no longer validates head ${head_sha}."
 
           # Events caused by GITHUB_TOKEN do not recursively start workflows.
-          # Explicitly dispatch after deleting the label so this exact PR head
-          # receives a fresh, failing merge-gate check.
-          gh workflow run merge-gate.yml \
-            --repo "$REPO" \
-            --ref "$head_ref" \
-            -f pr_number="$PR_NUMBER"
-          echo "Dispatched merge-gate for PR #${PR_NUMBER} at ${head_sha}."
+          # Same-repository refs can run the normal gate immediately. Fork refs
+          # cannot be passed to workflow_dispatch in the base repository, so the
+          # failing check above remains authoritative until a new validation
+          # record and label re-fire the pull_request gate.
+          if [ "$head_repo" = "$REPO" ]; then
+            gh workflow run merge-gate.yml \
+              --repo "$REPO" \
+              --ref "$head_ref" \
+              -f pr_number="$PR_NUMBER"
+            echo "Dispatched merge-gate for PR #${PR_NUMBER} at ${head_sha}."
+          else
+            echo "PR #${PR_NUMBER} head is in ${head_repo:-an unknown fork}; retaining the failing check until revalidation."
+          fi
 
   core-review-protocol:
     name: core-review-protocol
