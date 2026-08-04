@@ -20,11 +20,17 @@ request. Every strip records a durable evidence comment (see
 lost.
 
 The job first verifies that its workflow file has the exact Git blob registered
-in the server-side `MERGE_GATE_V2_BLOB` variable. A `workflow_dispatch` run
-from an old or modified pull request branch therefore fails before evaluating
-landing policy. The context name is versioned as well: every semantic gate
-tightening must bump it and move the ruleset, so a pre-tightening branch cannot
-emit the context currently required by `main`.
+in the server-side `MERGE_GATE_V2_BLOB` variable. This rejects accidental drift
+that retains the guard. The context name is versioned as well: every semantic
+gate tightening must bump it and move the ruleset, so an unmodified
+pre-tightening branch cannot emit the context currently required by `main`.
+
+This is not a cryptographic attestation of PR-owned YAML. A deliberate workflow
+edit can delete the blob-check step while retaining the v2 job name, and both
+runs use the same GitHub Actions integration. User-owned repositories cannot
+use GitHub's pinned required-workflow rule, so gate-policy PRs must remain an
+escalated adversarial-review class. A dedicated trusted GitHub App signer (or an
+organization-owned required workflow) is needed to close that stronger threat.
 
 Add an approved pull request to the queue with:
 
@@ -121,11 +127,18 @@ Verify the live rule without mutating it:
 with-proxy scripts/configure-merge-gate-ruleset.sh --check
 ```
 
+That checker covers the versioned context, its GitHub Actions integration ID,
+the bound main blob, and the disabled transition shim. It does not attest the
+repository's separate merge-queue or history-protection settings.
+
 Before landing a gate-version transition, run `--prepare <feature-ref>` to bind
 the candidate blob and enable the temporary legacy-context shim. After the
 workflow lands, the coordinator runs `--apply`; it binds the `main` blob,
 changes only the legacy required context to v2, disables the shim, and verifies
-all three server-side values. GitHub required-workflow rules would avoid this
+the full resulting ruleset plus all three server-side values. The full-object
+PUT is preceded by a fresh equality check so a concurrent ruleset edit aborts
+instead of being silently dropped. The ordered transition is fail-safe, not a
+cross-resource transaction. GitHub required-workflow rules would avoid this
 transition, but they are available only to organization/enterprise rulesets;
 `rrnewton/hermit` is user-owned.
 

@@ -23,8 +23,10 @@ on:
         type: string
 
 # Gate semantics version: v2. The required status context is `merge-gate-v2`.
-# `MERGE_GATE_V2_BLOB` binds that context to the exact workflow definition, so
-# a modified or stale branch copy fails before it evaluates landing policy.
+# `MERGE_GATE_V2_BLOB` catches accidental v2 drift that retains the guard, and
+# the versioned context means an unmodified stale v1 branch cannot satisfy v2.
+# The guard itself remains PR-owned YAML: a deliberate gate-policy edit can
+# remove it, so gate-policy PRs still require escalated adversarial review.
 #
 # This required check is the SOLE required status check on main (branch ruleset
 # "main no-bypass gate", 2026-08-02): it accepts an exact PR head when EITHER a
@@ -328,6 +330,7 @@ jobs:
           BASE_REF: ${{ github.event.merge_group.base_ref }}
           EVENT_NAME: ${{ github.event_name }}
           GH_TOKEN: ${{ github.token }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
@@ -341,8 +344,16 @@ jobs:
               echo "::error::workflow_dispatch requires a pr_number input."
               exit 1
             fi
+            expected_head="$SHA"
+            [ "$EVENT_NAME" = pull_request ] && expected_head="$PR_HEAD_SHA"
             pr_numbers="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" |
-              jq -r 'select(.base.ref == "main") | .number')"
+              jq -r --arg sha "$expected_head" '
+                select(.base.ref == "main" and .state == "open" and .head.sha == $sha)
+                | .number')"
+            if [ -z "$pr_numbers" ]; then
+              echo "::error::PR #${PR_NUMBER} is not an open main PR at dispatched head ${expected_head}."
+              exit 1
+            fi
           else
             owner="${REPO%%/*}"
             name="${REPO#*/}"
@@ -474,6 +485,7 @@ jobs:
           INVALIDATION_RESULT: ${{ needs.invalidate-local-validation.result }}
           PR_ACTION: ${{ github.event.action }}
           GH_TOKEN: ${{ github.token }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
@@ -491,8 +503,10 @@ jobs:
               echo "::error::workflow_dispatch requires a pr_number input."
               exit 1
             fi
-            pull_requests="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" | jq -c '
-              [select(.base.ref == "main") | {
+            expected_head="$SHA"
+            [ "$EVENT_NAME" = pull_request ] && expected_head="$PR_HEAD_SHA"
+            pull_requests="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" | jq -c --arg sha "$expected_head" '
+              [select(.base.ref == "main" and .state == "open" and .head.sha == $sha) | {
                 number,
                 head: {sha: .head.sha},
                 labels
