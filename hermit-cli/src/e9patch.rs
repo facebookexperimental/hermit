@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
-use digest::Digest;
+use detcore::Digest;
 use serde::Deserialize;
 use serde::Serialize;
 

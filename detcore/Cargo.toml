@@ -52,8 +52,8 @@ bitflags = { version = "2.13.1", features = ["serde"], default-features = false 
 chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 detcore-model = { version = "0.2.0", path = "../detcore-model" }
-digest = { version = "0.2.0", path = "../common/digest" }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
+hex = { version = "0.4.3", features = ["alloc"] }
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 pretty = "0.12.5"
@@ -69,6 +69,7 @@ regex = "1.13.1"
 reverie = { package = "reverie-core", version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "d973a85b328610c14c41c39fa57495b9f77c3c90" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
+sha2 = "0.10.6"
 tempfile = "3.27.0"
 tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }

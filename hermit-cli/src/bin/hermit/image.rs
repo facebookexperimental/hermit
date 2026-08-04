@@ -32,7 +32,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
 
-use digest::Digest;
+use detcore::Digest;
 use hermit::Context;
 use hermit::Error;
 

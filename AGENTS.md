@@ -130,11 +130,10 @@ The root Cargo workspace has ten members:
 | Path | Role |
 | --- | --- |
 | `hermit-cli` | Main `hermit` CLI and `libhermit`; run, record, replay, log-diff, analyze, and container orchestration. |
-| `detcore` | Core determinism engine and Reverie tool; scheduler, virtual time, syscall handling, CPUID handling, and record/replay behavior. |
+| `detcore` | Core determinism engine and Reverie tool; scheduler, virtual time, syscall handling, content digests, CPUID handling, and record/replay behavior. |
 | `detcore-model` | Shared deterministic state and model types, including PIDs, file descriptors, futexes, schedules, and logical time. |
 | `detcore/tests/testutils` | Helpers used by Detcore integration tests. |
 | `hermit-verify` | Verification executable for stress, trace, schedule, and replay checks. |
-| `common/digest` | Digest utility shared by the workspace. |
 | `common/edit-distance` | Edit-distance utility used when comparing executions and logs. |
 | `common/test-allocator` | Test allocator and supporting test binary. |
 | `tests` | Guest programs used by integration scenarios, including time, futex, network, pipe, scheduling, and RDTSC cases. |

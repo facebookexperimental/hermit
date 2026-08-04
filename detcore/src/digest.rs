@@ -24,10 +24,9 @@ use serde::ser::Serializer;
 use sha2::Digest as _;
 use sha2::Sha256;
 
-// Number of bytes the digest takes up.
 const DIGEST_LENGTH: usize = 32;
 
-/// A SHA-256 hash digest.
+/// A SHA-256 content digest.
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Default)]
 pub struct Digest([u8; DIGEST_LENGTH]);
 
@@ -44,12 +43,10 @@ impl Digest {
 
         loop {
             let n = reader.read(&mut buf)?;
-
             if n == 0 {
                 break;
             }
-
-            hasher.update(&buf[0..n]);
+            hasher.update(&buf[..n]);
         }
 
         Ok(Digest(hasher.finalize().into()))
@@ -57,7 +54,6 @@ impl Digest {
 
     /// Computes the digest by reading the file at the given path.
     pub fn digest_path<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        // No need to buffer the stream since from_reader reads in large chunks.
         Self::digest_reader(fs::File::open(path)?)
     }
 }
@@ -65,9 +61,8 @@ impl Digest {
 impl fmt::LowerHex for Digest {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         for byte in &self.0 {
-            write!(f, "{:02x}", byte)?;
+            write!(f, "{byte:02x}")?;
         }
-
         Ok(())
     }
 }
@@ -75,9 +70,8 @@ impl fmt::LowerHex for Digest {
 impl fmt::UpperHex for Digest {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         for byte in &self.0 {
-            write!(f, "{:02X}", byte)?;
+            write!(f, "{byte:02X}")?;
         }
-
         Ok(())
     }
 }
@@ -108,10 +102,8 @@ impl Serialize for Digest {
         S: Serializer,
     {
         if serializer.is_human_readable() {
-            // Serialize as a hex string.
             serializer.serialize_str(&self.to_string())
         } else {
-            // Serialize as a byte array with known length.
             serializer.serialize_bytes(self.0.as_ref())
         }
     }
@@ -147,7 +139,6 @@ impl<'de> Deserialize<'de> for Digest {
                         E::invalid_length(v.len(), &"hex string with an even length")
                     }
                 })?;
-
                 Ok(Digest(v))
             }
 
@@ -158,10 +149,8 @@ impl<'de> Deserialize<'de> for Digest {
                 if v.len() != DIGEST_LENGTH {
                     return Err(E::invalid_length(v.len(), &"32 bytes"));
                 }
-
-                let mut inner = <[u8; DIGEST_LENGTH]>::default();
+                let mut inner = [0; DIGEST_LENGTH];
                 inner.copy_from_slice(v);
-
                 Ok(Digest(inner))
             }
         }

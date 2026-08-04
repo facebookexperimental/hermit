@@ -509,8 +509,8 @@ dependencies = [
  "clap",
  "detcore-model",
  "detcore-testutils",
- "digest 0.2.0",
  "futures 0.3.33",
+ "hex",
  "libc",
  "nix 0.30.1",
  "pretty",
@@ -525,6 +525,7 @@ dependencies = [
  "reverie-ptrace",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "test-allocator",
  "test-case",
@@ -598,15 +599,6 @@ name = "diff"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
-
-[[package]]
-name = "digest"
-version = "0.2.0"
-dependencies = [
- "hex",
- "serde",
- "sha2",
-]
 
 [[package]]
 name = "digest"
@@ -1003,7 +995,6 @@ dependencies = [
  "detcore-dbi",
  "detcore-model",
  "diff",
- "digest 0.2.0",
  "dirs",
  "edit-distance",
  "fbinit",
@@ -2094,7 +2085,7 @@ checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
- "digest 0.10.7",
+ "digest",
 ]
 
 [[package]]

@@ -52,7 +52,6 @@
         "detcore",
         "detcore-model",
         "detcore-testutils",
-        "digest",
         "edit-distance",
         "hermit",
         "hermit-resources",

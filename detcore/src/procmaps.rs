@@ -6,7 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use digest::Digest;
 pub use procfs::process::MMapPath;
 pub use procfs::process::MemoryMap;
 use reverie::Guest;
@@ -14,6 +13,8 @@ use reverie::Pid;
 use reverie::Tool;
 use reverie::syscalls::Addr;
 use reverie::syscalls::MemoryAccess;
+
+use crate::Digest;
 
 fn display_pathname(p: &MMapPath) -> String {
     match p {

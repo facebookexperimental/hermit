@@ -39,6 +39,7 @@
 mod config;
 mod consts;
 mod cpuid;
+mod digest;
 mod dirents;
 mod fd;
 #[allow(unused)]
@@ -78,6 +79,7 @@ pub use config::SchedHeuristic;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1120): Review the public canonical Detcore root identity.
 pub use consts::ROOT_DETPID;
+pub use digest::Digest;
 use rand::RngExt as _;
 use raw_cpuid::CpuIdResult;
 use raw_cpuid::cpuid;
