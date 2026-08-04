@@ -11,6 +11,11 @@ pr-dag-health.json
 # The committed baseline lives in envelope-baseline.json; this is the fresh run.
 envelope.json
 
+# validate.rs checkout-local validation ledger (used when neither
+# HERMIT_VALIDATE_LEDGER nor DEV_HERMIT_PARENT is set). Disposable per-checkout
+# receipts, regenerated on every run.
+.hermit-validate-ledger.jsonl
+
 # Local backup and Python cache files.
 *.orig
 **/__pycache__/
