@@ -702,7 +702,8 @@ jobs:
                 gh api "repos/${REPO}/actions/workflows/demo-hot-path.yml/runs?head_sha=${head_sha}&per_page=100"
               )"
               demo_run="$("$CHECK_OUTCOME_AUTHORITY" \
-                --select-latest-run --head-sha "$head_sha" <<<"$demo_runs")"
+                --select-latest-run --head-sha "$head_sha" \
+                --event pull_request <<<"$demo_runs")"
               demo_status="$(jq -r '.status // "missing"' <<< "$demo_run")"
               demo_conclusion="$(jq -r '.conclusion // ""' <<< "$demo_run")"
               demo_url="$(jq -r '.html_url // ""' <<< "$demo_run")"
