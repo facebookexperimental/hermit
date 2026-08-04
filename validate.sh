@@ -141,6 +141,8 @@ SELECTIVE_MODE=0
 SELECTIVE_BASELINE=""
 RUN_ON_DIRTY_TREE=0
 [[ ${VALIDATE_RUN_ON_DIRTY_TREE:-0} == 1 ]] && RUN_ON_DIRTY_TREE=1
+IGNORE_CACHE=0
+[[ ${VALIDATE_IGNORE_CACHE:-0} == 1 ]] && IGNORE_CACHE=1
 LABEL_PR=1
 [[ ${VALIDATE_LABEL_PR:-1} == 0 ]] && LABEL_PR=0
 VERBOSE=0
@@ -189,6 +191,7 @@ while [[ $# -gt 0 ]]; do
             fi
             ONLY_MODE=1; shift 3 ;;
         --run-on-dirty-tree) RUN_ON_DIRTY_TREE=1; shift ;;
+        --ignore-cache) IGNORE_CACHE=1; shift ;;
         --label-pr) LABEL_PR=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
         --no-label-pr) LABEL_PR=0; shift ;;
@@ -240,6 +243,12 @@ Other options:
                    the `locally-validated` label.
   --label-pr       Publish a receipt and label the PR after a full green (default).
   --no-label-pr    Disable the non-fatal receipt publication and label update.
+  --ignore-cache   Force a real run even when the run-ledger already holds a clean
+                   PASS for this exact TREE (commit content, submodule pins) on
+                   this host+toolchain. By default such a run is announced as a
+                   CACHE HIT and skipped -- the fastest validate is the one you do
+                   not run. The key is the tree, not the commit SHA, so a rebase
+                   or amend that leaves file content identical still hits.
   -h, --help       Show this help and exit.
 
 Environment:
@@ -251,6 +260,7 @@ Environment:
   CI_HUB_APPLY_LOCAL_LABEL=PATH                  Override the parent ci-hub receipt publisher.
   VALIDATE_VERBOSE=1                             Same as --verbose.
   VALIDATE_RUN_ON_DIRTY_TREE=1                   Same as --run-on-dirty-tree (agents: do not use).
+  VALIDATE_IGNORE_CACHE=1                        Same as --ignore-cache (force a real run).
   HERMIT_VALIDATE_LEDGER=FILE                    Override the parent JSONL ledger path.
   PR_NUMBER=N                                    Override branch-based PR detection.
 
@@ -375,6 +385,20 @@ if [[ -z $VALIDATION_LEDGER_FILE && -n $DEV_HERMIT_PARENT ]]; then
     VALIDATION_LEDGER_FILE="$DEV_HERMIT_PARENT/ignored/validate-run-ledger.jsonl"
 fi
 VALIDATION_COMMIT=$(git rev-parse HEAD 2>/dev/null || printf "unknown")
+# Content-addressed identity of exactly what validate builds and tests: the root
+# tree object. It hashes the tracked file content AND the submodule gitlink SHAs
+# (gitlinks are tree entries), so a reverie/liteinst2 pin change still changes the
+# tree. It does NOT vary with commit metadata (message, author/committer,
+# timestamp, parent), so a rebase or amend that leaves file content byte-identical
+# yields the SAME tree. This -- not the commit SHA -- is the result-cache key,
+# because a SHA key would miss exactly during a drain when the lander re-anchors
+# or rebases a commit whose tree never changed. The commit is still recorded (the
+# lander's landing predicate joins on it), but the cache dereferences the tree.
+VALIDATION_TREE=$(git rev-parse "HEAD^{tree}" 2>/dev/null || printf "unknown")
+# Record the Rust toolchain so a cache hit keyed on the TREE can also require a
+# matching build environment. The tree pins source and submodules, but not the
+# compiler; a result produced by a different rustc is not safely reusable.
+VALIDATION_TOOLCHAIN=$(rustc --version 2>/dev/null || printf "unknown")
 VALIDATION_GIT_DEPTH=$(git rev-list --count HEAD 2>/dev/null || printf "0")
 VALIDATION_GIT_AHEAD=0
 VALIDATION_GIT_BEHIND=0
@@ -429,7 +453,8 @@ else
     VALIDATION_SELECTION_MODE=full
 fi
 readonly VALIDATION_STARTED_AT VALIDATION_STARTED_EPOCH VALIDATION_HOST DEV_HERMIT_PARENT
-readonly VALIDATION_SLOT VALIDATION_LEDGER_FILE VALIDATION_COMMIT VALIDATION_GIT_DEPTH
+readonly VALIDATION_SLOT VALIDATION_LEDGER_FILE VALIDATION_COMMIT VALIDATION_TREE
+readonly VALIDATION_TOOLCHAIN VALIDATION_GIT_DEPTH
 readonly VALIDATION_GIT_AHEAD VALIDATION_GIT_BEHIND
 readonly VALIDATION_TREE_DIRTY VALIDATION_WORKTREE_DIRTY
 readonly VALIDATION_COMMIT_ANCHORED VALIDATION_SELECTION_MODE
@@ -455,6 +480,122 @@ if ((VALIDATION_WORKTREE_DIRTY == 1 && RUN_ON_DIRTY_TREE == 0)); then
         git status --short 2>/dev/null | sed 's/^/    /'
     } >&2
     exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# Tree-keyed result cache. The run-ledger written by append_validation_ledger is
+# the single source of truth: this reads exactly what validate writes and what
+# the lander consumes -- one store, never a second. A clean, commit-anchored,
+# FULL run whose exact TREE already has a PASS record on THIS host+toolchain is
+# reused -- announced LOUDLY (never a silent skip that could be mistaken for a
+# fresh pass) and exited 0 without running a single gate. --ignore-cache /
+# VALIDATE_IGNORE_CACHE=1 forces a real run.
+#
+# Why the key is the TREE, not the commit SHA:
+#   The tree is the content-addressed identity of what actually gets built and
+#   tested (tracked files + submodule gitlink SHAs). The commit SHA additionally
+#   varies with metadata that does not affect the build -- committer timestamp,
+#   message, parent. During a drain the lander re-anchors/rebases commits whose
+#   tree never changed; a SHA key would MISS on byte-identical content and pay a
+#   full run, which is exactly when caching matters most. A tree key hits.
+#
+# Why a hit is SOUND (each condition is checked against the stored record, not
+# assumed -- this is what the first cut of this feature got wrong: it reused a
+# bare PASS without confirming the run had actually executed anything):
+#   tree match            -> the built+tested content is identical.
+#   commit_anchored,
+#     tree not dirty      -> the record described a real HEAD, not a WIP tree.
+#   result == pass,
+#     failures == 0       -> nothing failed.
+#   executed_tests > 0    -> a green must carry a NONZERO executed-test count; a
+#                            "test result: ok" with zero executed tests is a
+#                            no-result and must never satisfy a run.
+#   gates_run >=
+#     gates_expected      -> full gate coverage, not a partial run.
+#   selection_mode == full-> a selective/only record covered only a subset.
+#   host + toolchain      -> the tree pins neither the compiler nor the box.
+# Because old (pre-tree) records carry no `tree` field they can never hit, so the
+# cache warms forward and never serves a result from an unverifiable environment.
+# A prior FAIL for the tree does NOT skip: it may be flaky/environmental, and only
+# a PASS satisfies the landing predicate, so we note it and run. This gate runs
+# before the tmp dir and EXIT trap (like the dirty-tree gate above), so a hit
+# leaves no partial state and appends no derived record.
+function human_hms {
+    local s=$1 h m
+    [[ $s =~ ^[0-9]+$ ]] || s=0
+    h=$((s / 3600)); m=$(((s % 3600) / 60))
+    if ((h > 0)); then printf '%dh%02dm%02ds' "$h" "$m" "$((s % 60))"
+    else printf '%dm%02ds' "$m" "$((s % 60))"; fi
+}
+
+# Emit the newest fully-qualifying ledger record with result==$1 for the current
+# TREE/profile/host/toolchain as TSV
+# "finished_at<TAB>real_seconds<TAB>cpu_seconds<TAB>executed_tests<TAB>commit",
+# or nothing. Bounded by a pre-grep on the tree hash so the whole ledger is not
+# slurped. Fail-open (prints nothing) when jq or the ledger is unavailable, so a
+# missing tool can never manufacture a false hit. For a pass, every reuse
+# condition -- including a nonzero executed-test count and full gate coverage --
+# is verified here; a record that does not carry them is not a hit.
+function cache_lookup_record {
+    local want_result=$1 ledger=$VALIDATION_LEDGER_FILE
+    [[ -n $ledger && -f $ledger ]] || return 0
+    [[ $VALIDATION_TREE != unknown ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    grep -F "\"tree\":\"$VALIDATION_TREE\"" "$ledger" 2>/dev/null \
+        | jq -rs --arg tree "$VALIDATION_TREE" --arg prof "$VALIDATION_PROFILE" \
+              --arg host "$VALIDATION_HOST" --arg tc "$VALIDATION_TOOLCHAIN" \
+              --arg res "$want_result" '
+            map(select(
+                (.tree // "") == $tree
+                and .commit_anchored == true and (.tree_dirty | not)
+                and .result == $res and .profile == $prof
+                and .selection_mode == "full"
+                and .host == $host and (.toolchain // "") == $tc
+                and (
+                    $res != "pass"
+                    or (
+                        (.failures == 0)
+                        and (.executed_tests != null) and (.executed_tests > 0)
+                        and (.gates_expected == null
+                             or (.gates_run != null and .gates_run >= .gates_expected))
+                    )
+                )))
+            | sort_by(.finished_at) | last
+            | if . == null then empty
+              else [ .finished_at,
+                     (.real_seconds // 0 | tostring),
+                     ((.user_seconds // 0) + (.sys_seconds // 0) | tostring),
+                     (.executed_tests // 0 | tostring),
+                     (.commit // "unknown")
+                   ] | @tsv
+              end' 2>/dev/null
+}
+
+if ((IGNORE_CACHE == 0)) && ((VALIDATION_COMMIT_ANCHORED == 1)) \
+   && [[ $VALIDATION_SELECTION_MODE == full && $VALIDATION_TREE != unknown ]]; then
+    cache_hit_tsv=$(cache_lookup_record pass)
+    if [[ -n $cache_hit_tsv ]]; then
+        IFS=$'\t' read -r hit_when hit_wall hit_cpu hit_tests hit_commit <<<"$cache_hit_tsv"
+        printf '# ============================================================\n'
+        printf '# validate CACHE HIT for tree %s\n' "$VALIDATION_TREE"
+        printf '#   (commit %s)\n' "$VALIDATION_COMMIT"
+        printf '#   passed %s (wall %s, CPU %s, %s tests executed)\n' \
+            "$hit_when" "$(human_hms "${hit_wall:-0}")" "$(human_hms "${hit_cpu:-0}")" "${hit_tests:-0}"
+        printf '#   from a run of commit %s -- use --ignore-cache to force a real run\n' "${hit_commit:-unknown}"
+        printf '#   profile=%s host=%s toolchain=%s\n' \
+            "$VALIDATION_PROFILE" "$VALIDATION_HOST" "$VALIDATION_TOOLCHAIN"
+        printf '#   NO gates ran this invocation; reused a clean, commit-anchored\n'
+        printf '#   passing record (>0 executed tests, full gate coverage) from the\n'
+        printf '#   run-ledger (%s).\n' "$VALIDATION_LEDGER_FILE"
+        printf '# ============================================================\n'
+        exit 0
+    fi
+    cache_fail_tsv=$(cache_lookup_record fail)
+    if [[ -n $cache_fail_tsv ]]; then
+        IFS=$'\t' read -r fail_when _ _ _ _ <<<"$cache_fail_tsv"
+        printf '# validate: tree %s has a prior FAIL record (%s) on this host+toolchain; running anyway (a fail may be flaky/environmental). Only a PASS satisfies the landing predicate.\n' \
+            "$VALIDATION_TREE" "$fail_when" >&2
+    fi
 fi
 
 SUPER_REPETITIONS=${SUPER_REPETITIONS:-20}
@@ -1165,17 +1306,21 @@ function append_validation_ledger {
         [[ $filtered_tests_json =~ ^(null|[0-9]+)$ ]] || filtered_tests_json=null
     fi
 
-    # schema_version 3 adds commit_anchored/tree_dirty/selection_mode. The fields
-    # are additive; the parent ledger aggregator reads via .get() and is
+    # schema_version 3 adds commit_anchored/tree_dirty/selection_mode; schema_version
+    # 4 adds `tree` (the content-addressed build+test identity, the result-cache
+    # key) and `toolchain` (the rustc build environment the cache must match). The
+    # fields are additive; the parent ledger aggregator reads via .get() and is
     # unaffected until it is taught to surface them. (warm-vs-cold is already
     # recorded as cache_state, so this does not duplicate it.)
-    line="{\"schema_version\":3,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
+    line="{\"schema_version\":4,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
     line+="\"finished_at\":$(json_quote "$finished_at"),\"host\":$(json_quote "$VALIDATION_HOST"),"
+    line+="\"toolchain\":$(json_quote "$VALIDATION_TOOLCHAIN"),"
     line+="\"slot\":$(json_quote "$VALIDATION_SLOT"),\"cwd\":$(json_quote "$ROOT_DIR"),"
     line+="\"profile\":$(json_quote "$VALIDATION_PROFILE"),"
     line+="\"selection_mode\":$(json_quote "$VALIDATION_SELECTION_MODE"),"
     line+="\"cache_state\":$(json_quote "$VALIDATION_CACHE_STATE"),"
-    line+="\"commit\":$(json_quote "$VALIDATION_COMMIT"),\"git_depth\":$VALIDATION_GIT_DEPTH,"
+    line+="\"commit\":$(json_quote "$VALIDATION_COMMIT"),\"tree\":$(json_quote "$VALIDATION_TREE"),"
+    line+="\"git_depth\":$VALIDATION_GIT_DEPTH,"
     line+="\"git_ahead\":$VALIDATION_GIT_AHEAD,\"git_behind\":$VALIDATION_GIT_BEHIND,"
     line+="\"commit_anchored\":$commit_anchored_json,\"tree_dirty\":$tree_dirty_json,"
     line+="\"result\":\"$result\",\"exit_code\":$exit_status,"
