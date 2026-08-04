@@ -535,6 +535,7 @@ jobs:
           set -euo pipefail
           tar --zstd -xf "$RELEASE_TARBALL"
           rm -f "$RELEASE_TARBALL"
+          test -x target/ci/hermit-strict
           test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun
           test -f target/install_pkg/rsrcs/libreverie_dbi_client.so
       - name: Run shard nodes (${{ matrix.slug }})
