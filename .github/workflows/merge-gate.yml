@@ -471,9 +471,9 @@ jobs:
           set -euo pipefail
           authority="$RUNNER_TEMP/check_outcome.py"
           gh api \
-            'repos/rrnewton/dev-hermit/contents/ci-hub/check_outcome.py?ref=8ea20e121073e7c1fc3ce7a131a4950d7574ce42' \
+            'repos/rrnewton/dev-hermit/contents/ci-hub/check_outcome.py?ref=4b78d727f35bc8612ac460a6e270dda5f5df304c' \
             --jq .content | tr -d '\n' | base64 --decode >"$authority"
-          echo '88de3d5afa9df20ab9174afbd3281341b7fa1c029eef5102bc1a2f22c1a50235  '"$authority" | sha256sum --check
+          echo '2f1c61d5ec9d98b9697317fd9e66b705161defb69b808d23e6d83384e1e2a1e8  '"$authority" | sha256sum --check
           chmod +x "$authority"
           echo "CHECK_OUTCOME_AUTHORITY=$authority" >>"$GITHUB_ENV"
       - name: Require the core-change review protocol
@@ -626,11 +626,13 @@ jobs:
                 job_status="$(jq -r '.status // "missing"' <<< "$regular_job")"
                 job_conclusion="$(jq -r '.conclusion // ""' <<< "$regular_job")"
                 job_url="$(jq -r '.html_url // ""' <<< "$regular_job")"
+                job_outcome="$("$CHECK_OUTCOME_AUTHORITY" \
+                  --status "$job_status" --conclusion "$job_conclusion")"
 
-                if [ "$job_status:$job_conclusion" = completed:success ]; then
+                if [ "$job_outcome" = PASSED ]; then
                   echo "Authoritative portable job passed for PR #${pr_number} at $head_sha: ${job_url:-$url}"
                 else
-                  echo "::error::Regular tests (GitHub-managed portable) for PR #${pr_number} at $head_sha is $job_status/${job_conclusion:-none}: ${job_url:-${url:-no run URL}}."
+                  echo "::error::Regular tests (GitHub-managed portable) for PR #${pr_number} at $head_sha is $job_outcome ($job_status/${job_conclusion:-none}): ${job_url:-${url:-no run URL}}."
                   failed=1
                 fi
               fi
@@ -663,11 +665,13 @@ jobs:
                 priv_status="$(jq -r '.status // "missing"' <<< "$priv_job")"
                 priv_conclusion="$(jq -r '.conclusion // ""' <<< "$priv_job")"
                 priv_job_url="$(jq -r '.html_url // ""' <<< "$priv_job")"
+                priv_outcome="$("$CHECK_OUTCOME_AUTHORITY" \
+                  --status "$priv_status" --conclusion "$priv_conclusion")"
 
-                if [ "$priv_status:$priv_conclusion" = completed:success ]; then
+                if [ "$priv_outcome" = PASSED ]; then
                   echo "Privileged job passed for PR #${pr_number} at $head_sha: ${priv_job_url:-$priv_url}"
                 else
-                  echo "::error::Privileged capability and E2E tests for PR #${pr_number} at $head_sha is $priv_status/${priv_conclusion:-none}: ${priv_job_url:-${priv_url:-no run URL}}."
+                  echo "::error::Privileged capability and E2E tests for PR #${pr_number} at $head_sha is $priv_outcome ($priv_status/${priv_conclusion:-none}): ${priv_job_url:-${priv_url:-no run URL}}."
                   failed=1
                 fi
               fi
@@ -702,11 +706,13 @@ jobs:
               demo_status="$(jq -r '.status // "missing"' <<< "$demo_run")"
               demo_conclusion="$(jq -r '.conclusion // ""' <<< "$demo_run")"
               demo_url="$(jq -r '.html_url // ""' <<< "$demo_run")"
+              demo_outcome="$("$CHECK_OUTCOME_AUTHORITY" \
+                --status "$demo_status" --conclusion "$demo_conclusion")"
 
-              if [ "$demo_status:$demo_conclusion" = completed:success ]; then
+              if [ "$demo_outcome" = PASSED ]; then
                 echo "P0 demo gate passed for hot-path PR #${pr_number} at $head_sha: $demo_url"
               else
-                echo "::error::P0 demo gate for hot-path PR #${pr_number} at $head_sha is $demo_status/${demo_conclusion:-none}: ${demo_url:-no run URL}. Every demo red is P0 and blocks landing."
+                echo "::error::P0 demo gate for hot-path PR #${pr_number} at $head_sha is $demo_outcome ($demo_status/${demo_conclusion:-none}): ${demo_url:-no run URL}. Every demo red is P0 and blocks landing."
                 failed=1
               fi
             else
