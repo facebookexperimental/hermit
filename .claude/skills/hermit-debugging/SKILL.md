@@ -149,7 +149,7 @@ Useful `log-diff` flags (`detcore/src/logdiff.rs`):
 
 | Flag | Effect |
 | --- | --- |
-| `--strip-lines` | Normalize numbers and tmp paths before comparing — tolerates limited nondeterminism to find the *structural* divergence. |
+| `--unsafe-strip-lines` | **Non-parity diagnostic only.** Erases timestamps and syscall values; using it to make a failing parity diff pass is cheating. |
 | `--syscall-history <N>` | Print the N completed syscalls *before* each divergence — the context that tells you what led up to it. |
 | `--ignore-lines <substr>` | Drop lines containing a substring before comparing (repeatable). |
 | `--skip-commit` / `--skip-detlog` | Compare only DETLOG, or only COMMIT, to tell a *scheduling* divergence from a *syscall/data* divergence. |

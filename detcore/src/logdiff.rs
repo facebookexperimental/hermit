@@ -36,9 +36,12 @@ pub enum LogComparisonMode {
 /// Options for calling `log_diff`.
 #[derive(Debug, Parser)]
 pub struct LogDiffOpts {
-    /// Strip numerical information and tmp paths from log lines. This allows comparison even in the
-    /// presence of (limited) nondeterminism.
-    #[clap(long)]
+    /// UNSAFE: strips numbers and temporary paths before comparison.
+    ///
+    /// This erases timestamps and syscall values that bitwise parity exists to
+    /// compare. Never use this option to make a failing parity diff pass; doing
+    /// so is cheating. It is only for non-parity diagnostic localization.
+    #[clap(long = "unsafe-strip-lines")]
     pub strip_lines: bool,
 
     /// The internal message set to compare.
@@ -682,9 +685,31 @@ fn log_diff_from_strs(
 
 #[cfg(test)]
 mod test {
+    use clap::CommandFactory;
+    use clap::Parser;
     use pretty_assertions::assert_eq;
 
     use crate::logdiff::DetLogFilter;
+
+    #[test]
+    fn unsafe_strip_lines_cli_name_and_warning_are_explicit() {
+        let options = super::LogDiffOpts::try_parse_from(["log-diff", "--unsafe-strip-lines"])
+            .expect("the explicitly unsafe spelling should parse");
+        assert!(options.strip_lines);
+
+        assert!(super::LogDiffOpts::try_parse_from(["log-diff", "--strip-lines"]).is_err());
+
+        let mut help = Vec::new();
+        super::LogDiffOpts::command()
+            .write_long_help(&mut help)
+            .expect("write clap help");
+        let help = String::from_utf8(help).expect("help is UTF-8");
+        assert!(help.contains("--unsafe-strip-lines"));
+        assert!(help.contains("erases timestamps and syscall values"));
+        assert!(help.contains("make a failing parity diff pass"));
+        assert!(help.contains("doing so is cheating"));
+        assert!(!help.contains("--strip-lines"));
+    }
 
     #[test]
     fn test_compare_with_no_color() {

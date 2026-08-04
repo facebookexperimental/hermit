@@ -69,10 +69,14 @@ point they part.
 <broken-hermit> --log info run -- <repro>  2>/tmp/broken.log
 wc -l /tmp/good.log /tmp/broken.log
 
-# Prefer the built-in comparator — it normalizes known noise (pointers, tmp
-# paths, /proc/<pid>, elapsed time) and reports the FIRST divergence:
-hermit log-diff --strip-lines --syscall-history 5 /tmp/good.log /tmp/broken.log
+# Prefer the built-in comparator without normalization so timestamps and
+# syscall values remain evidence, and report the FIRST divergence:
+hermit log-diff --syscall-history 5 /tmp/good.log /tmp/broken.log
 ```
+
+`--unsafe-strip-lines` is only a non-parity localization aid. It erases the
+timestamps and syscall values that bitwise parity exists to compare; using it
+to make a failing parity diff pass is cheating.
 
 When the two logs come from different binaries/versions and `log-diff` can't
 pair them, fall back to canonicalizing (strip timestamps/PIDs/pointers) and
