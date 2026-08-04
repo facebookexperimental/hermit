@@ -1001,6 +1001,7 @@ function append_validation_ledger {
     local exit_status=$1
     local wall_seconds=$2 cpu_user=$3 cpu_sys=$4
     local finished_at result gates_json gate_result line
+    local count_helper counts executed_tests_json=null filtered_tests_json=null
     local commit_anchored_json tree_dirty_json
     local i
 
@@ -1032,6 +1033,18 @@ function append_validation_ledger {
     if ((VALIDATION_COMMIT_ANCHORED == 1)); then commit_anchored_json=true; else commit_anchored_json=false; fi
     if ((VALIDATION_TREE_DIRTY == 1)); then tree_dirty_json=true; else tree_dirty_json=false; fi
 
+    # Use the parent's single-sourced libtest-banner parser. Unknown stays null;
+    # the receipt publisher fails closed rather than turning missing evidence
+    # into zero or a pass. The fields are additive to schema 3 during the
+    # coverage-schema transition.
+    count_helper="$DEV_HERMIT_PARENT/ci-hub/remediation/nonzero_result.py"
+    if [[ -n $DEV_HERMIT_PARENT && -r $count_helper ]] && command -v python3 >/dev/null 2>&1; then
+        counts=$(python3 "$count_helper" --ledger-fields "$LOG_FILE" 2>/dev/null) || counts="null null"
+        read -r executed_tests_json filtered_tests_json <<<"$counts"
+        [[ $executed_tests_json =~ ^(null|[0-9]+)$ ]] || executed_tests_json=null
+        [[ $filtered_tests_json =~ ^(null|[0-9]+)$ ]] || filtered_tests_json=null
+    fi
+
     # schema_version 3 adds commit_anchored/tree_dirty/selection_mode. The fields
     # are additive; the parent ledger aggregator reads via .get() and is
     # unaffected until it is taught to surface them. (warm-vs-cold is already
@@ -1047,6 +1060,7 @@ function append_validation_ledger {
     line+="\"commit_anchored\":$commit_anchored_json,\"tree_dirty\":$tree_dirty_json,"
     line+="\"result\":\"$result\",\"exit_code\":$exit_status,"
     line+="\"checks\":$checks,\"failures\":$failures,"
+    line+="\"executed_tests\":$executed_tests_json,\"filtered_tests\":$filtered_tests_json,"
     line+="\"real_seconds\":$wall_seconds,\"user_seconds\":$cpu_user,\"sys_seconds\":$cpu_sys,"
     line+="\"log_file\":$(json_quote "$LOG_FILE"),\"gates\":$gates_json}"
 
