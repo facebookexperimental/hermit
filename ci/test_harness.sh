@@ -274,7 +274,7 @@ function assert_parallel_portable_workflow {
         die "GitHub portable debug, release, e2e, and SaBRe diagnostics must enable user namespaces"
     [[ $(grep -Fxc '            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0' "$workflow") == 4 ]] ||
         die "GitHub portable test shards must lift AppArmor's user-namespace restriction"
-    [[ $(grep -Fxc '    needs: [test-debug, test-release, e2e, sabre_non_gated_parity, reduce-e2e, regular]' "$workflow") == 1 ]] ||
+    [[ $(grep -Fxc '    needs: [test-debug, test-release, e2e, sabre_non_gated_parity, regular]' "$workflow") == 1 ]] ||
         die "GitHub portable artifact cleanup must wait for every test consumer"
     [[ $(grep -Fxc '  sabre_non_gated_parity:' "$workflow") == 1 ]] ||
         die "GitHub portable workflow must retain the SaBRe non-gating diagnostic job"

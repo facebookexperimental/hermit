@@ -327,8 +327,9 @@ jobs:
           # variable (which select never produces) falls back to the full set.
           backends="${CELL_BACKENDS-ALL}"
           if [[ -z "$backends" ]]; then
-            # No e2e cells selected: emit an empty matrix. The e2e/reduce-e2e jobs
-            # are gated off (run_e2e=false) and never consume it.
+            # No e2e cells selected: emit an empty matrix. The e2e job and the
+            # regular gate's folded-in reduction are gated off (run_e2e=false)
+            # and never consume it.
             echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
             echo "count=0" >> "$GITHUB_OUTPUT"
             echo "No e2e cells selected; emitting empty cell matrix." >&2
@@ -768,24 +769,45 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # ------------------------------------------ reduce per-cell transport evidence
-  reduce-e2e:
-    name: Reduce e2e parity archives
-    needs: [select, build-debug, e2e]
-    # Run whenever e2e cells were selected (even to collect evidence on failure);
-    # a run_e2e=false selection skips this job, and the required `regular` gate
-    # tolerates a skipped reduce-e2e.
-    if: always() && needs.select.outputs.run_e2e != 'false'
+  # ------------------------------------- gate + reduce per-cell transport evidence
+  # Stable required-check name. This job fails closed over the complete parallel
+  # graph and is the only portable result merge-gate needs to query. It also
+  # folds in the former reduce-e2e reduction to keep the gate critical path one
+  # queued stage shorter.
+  regular:
+    name: Regular tests (GitHub-managed portable)
+    needs:
+      - select
+      - plan
+      - preflight
+      - build-debug
+      - build-release
+      - test-debug
+      - test-release
+      - e2e
+    if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # 10m absorbs the folded-in e2e parity reduction (former reduce-e2e job,
+    # itself 5m-capped) plus the gate jq.
+    timeout-minutes: 10
     steps:
+      # Folded in from the former standalone `reduce-e2e` job so the portable
+      # gate critical path is one queued stage shorter (select -> build -> e2e
+      # -> reduce-e2e -> regular  becomes  select -> build -> e2e -> regular).
+      # This is a STAGE MERGE, not an edge cut: the DATA edge to e2e is
+      # preserved (regular already `needs: e2e`), and the fail-closed integrity
+      # check now reds `regular` inline instead of via a separate job. Guarded
+      # by run_e2e so a no-e2e selection skips reduction cleanly while the gate
+      # jq below still runs.
       - name: Download all parity transport archives
+        if: needs.select.outputs.run_e2e != 'false'
         uses: actions/download-artifact@v4
         with:
           pattern: parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-*
           path: transport
           merge-multiple: true
       - name: Verify completeness, checksums, and archive paths
+        if: needs.select.outputs.run_e2e != 'false'
         env:
           EXPECTED: ${{ needs.build-debug.outputs.e2e_count }}
         run: |
@@ -823,7 +845,7 @@ jobs:
           done < <(find reduced/expanded -path '*/parity-v1/junit.xml' \
             -type f -print0 | sort -z)
       - name: Upload reduced e2e diagnostics
-        if: always()
+        if: always() && needs.select.outputs.run_e2e != 'false'
         uses: actions/upload-artifact@v4
         with:
           name: e2e-results-portable-${{ github.run_id }}-${{ github.run_attempt }}
@@ -833,26 +855,8 @@ jobs:
             reduced/*.junit.xml
           if-no-files-found: error
           retention-days: 14
-
-  # Stable required-check name. This job fails closed over the complete parallel
-  # graph and is the only portable result merge-gate needs to query.
-  regular:
-    name: Regular tests (GitHub-managed portable)
-    needs:
-      - select
-      - plan
-      - preflight
-      - build-debug
-      - build-release
-      - test-debug
-      - test-release
-      - e2e
-      - reduce-e2e
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
       - name: Require every portable DAG job to succeed or be deselected
+        if: always()
         env:
           RESULTS: ${{ toJSON(needs) }}
         run: |
@@ -871,7 +875,7 @@ jobs:
     name: Delete prebuilt build artifacts
     # Name every artifact consumer directly. In particular, test-debug is a
     # matrix job whose integration shard owns test.cli and the run_dbi_* tests.
-    needs: [test-debug, test-release, e2e, sabre_non_gated_parity, reduce-e2e, regular]
+    needs: [test-debug, test-release, e2e, sabre_non_gated_parity, regular]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
