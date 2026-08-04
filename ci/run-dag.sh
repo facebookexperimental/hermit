@@ -16,7 +16,7 @@
 #   ci/run-dag.sh <lane> [runner-args...]
 #     <lane>            portable | privileged  (selects ci/dag/<lane>.json)
 #     runner-args       forwarded verbatim to `safe-ci-dag-runner run`
-#                       (e.g. -j 8, --max-mem 32G, --perf-dir ./perf, --cgroups,
+#                       (e.g. -j 8, --max-mem 32G, --perf-dir ./perf,
 #                        -k/--keep-going, -v, -q)
 #
 # Examples:
