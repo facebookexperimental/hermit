@@ -1787,14 +1787,43 @@ function initialize_repository_submodules {
 # the pin is a real commit on rrnewton/reverie:main history. When the nested
 # lockfile guard is present (lands separately as rrnewton/hermit#1609) it also
 # runs so liteinst-runtime-build/Cargo.lock cannot drift from the root pin.
-function validate_reverie_pin_consistency {
+#
+# Run one of those checkers WITHOUT requiring the `rust-script` interpreter on
+# PATH. CI's portable shard runners install the Rust toolchain but not
+# rust-script, so invoking the checker through its `#!/usr/bin/env rust-script`
+# shebang aborts with "/usr/bin/env: 'rust-script': No such file or directory"
+# before the gate can execute at all — the gate reports FAILED having verified
+# nothing, which is a no-result masquerading as a result. Both checkers are
+# single-file, dependency-free programs whose only module is a `#[path]` include
+# under scripts/lib, so plain rustc compiles them; that is exactly what the
+# `reverie-pin` job in .github/workflows/ci-portable.yml already does for these
+# same two files. Prefer the interpreter when it is installed (the normal
+# developer path), else compile once into VALIDATION_TMP_DIR and reuse.
+function run_repo_rust_script {
+    local script=$1
+    shift
     local -a proxy=()
     if command -v with-proxy >/dev/null 2>&1; then
         proxy=(with-proxy)
     fi
-    "${proxy[@]}" ./scripts/check-reverie-pin.rs || return 1
+    if command -v rust-script >/dev/null 2>&1; then
+        "${proxy[@]}" "$script" "$@"
+        return
+    fi
+    local name binary
+    name=$(basename -- "$script" .rs)
+    binary="$VALIDATION_TMP_DIR/rust-script-$name"
+    if [[ ! -x $binary ]]; then
+        printf 'rust-script is not on PATH; compiling %s with rustc instead.\n' "$script"
+        rustc --edition=2021 "$script" -o "$binary" || return 1
+    fi
+    "${proxy[@]}" "$binary" "$@"
+}
+
+function validate_reverie_pin_consistency {
+    run_repo_rust_script ./scripts/check-reverie-pin.rs || return 1
     if [[ -x ./scripts/check-nested-lockfiles.rs ]]; then
-        "${proxy[@]}" ./scripts/check-nested-lockfiles.rs || return 1
+        run_repo_rust_script ./scripts/check-nested-lockfiles.rs || return 1
     fi
 }
 
