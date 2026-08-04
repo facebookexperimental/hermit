@@ -78,7 +78,7 @@ validate: check-submodules ## Run the full multi-backend validation suite (pass 
 # current main (0/122 tracked scripts fail at error level) while 24 still carry
 # warning/style findings. Ratchet the severity down (warning -> style) as that
 # debt is retired rather than blocking the target on it today.
-lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, reverie pin)
+lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, reverie pin, nested lockfiles)
 	./scripts/test-required-check-outcomes.sh
 	./scripts/test-check-status-outcome.sh
 	./scripts/check-merge-gate-policy.sh
@@ -96,6 +96,7 @@ lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, c
 	@git diff --check
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 	$(SUBMODULE_PROXY) ./scripts/check-reverie-pin.rs
+	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
 
 help: ## Show this help (the list of make targets)
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)

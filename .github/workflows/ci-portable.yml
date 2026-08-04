@@ -205,6 +205,15 @@ jobs:
             args+=(--allow-stale-reverie-pin "$reason")
           fi
           "$checker" "${args[@]}"
+      - name: Reject a stale nested-workspace Cargo.lock before the opaque --locked build failure
+        run: |
+          set -euo pipefail
+          checker="$RUNNER_TEMP/check-nested-lockfiles"
+          checker_tests="$RUNNER_TEMP/check-nested-lockfiles-tests"
+          RUSTUP_TOOLCHAIN=stable rustc --edition=2021 --test scripts/check-nested-lockfiles.rs -o "$checker_tests"
+          "$checker_tests"
+          RUSTUP_TOOLCHAIN=stable rustc --edition=2021 scripts/check-nested-lockfiles.rs -o "$checker"
+          "$checker"
 
   # ---------------------------------------------------------------- plan (cheap)
   # Fail-closed integrity guard over the shard map itself. Runs UNCONDITIONALLY
