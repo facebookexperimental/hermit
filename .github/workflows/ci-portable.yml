@@ -34,22 +34,26 @@ name: CI (GitHub-managed portable)
 # and the partial per-cell workflow were retired when this lane was promoted.
 
 on:
+  # NO `pull_request` trigger (owner directive 2026-08-03). This is the ONLY lane
+  # on GitHub's shared public hosted-runner pool (runs-on: ubuntu-latest); auto-
+  # firing its ~34-min build on every PR push flooded that pool and throttled our
+  # own queue (runs sat queued for hours). PRs are validated via local validate.sh
+  # (the `locally-validated` label -> merge-gate), NOT a hosted PR build. Run a
+  # hosted build on a PR MANUALLY via `workflow_dispatch` when actually needed.
+  # The self-hosted privileged/demo lanes are handled separately.
   push:
     branches: [main]
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
-  pull_request:
-    # Keep stacked pull requests covered before they are retargeted to main.
 
 concurrency:
-  group: portable-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
-  # Cancel a superseded PR build when a new commit is pushed: a stale 40-min
-  # portable run for an outdated head only wastes a scarce hosted runner and
-  # deepens the queue that stalls landing. merge_group runs (unique head_sha
-  # group) and main pushes (github.ref group, not pull_request) are never
-  # cancelled, so queue entries and post-land coverage stay intact.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # QUEUE-DEPTH-1 on main: all main pushes share one group (github.ref) and
+  # cancel-in-progress:false lets the RUNNING job finish while a newer main push
+  # supersedes only the older PENDING run. merge_group runs get a unique head_sha
+  # group. NOTHING here cancels an in-progress run.
+  group: portable-${{ github.event.merge_group.head_sha || github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read

@@ -1,19 +1,20 @@
 name: CI (privileged)
 
 on:
+  # NO `pull_request` trigger (owner directive 2026-08-03): don't auto-fire the
+  # scarce self-hosted privileged PMU lane on PRs. It is a bonus signal, NOT a
+  # required merge-gate check, so removing its PR trigger cannot block landing.
+  # Run it on a PR MANUALLY via `workflow_dispatch` when a privileged smoke is
+  # actually needed.
   push:
     branches: [ "main" ]
-  # Keep stacked pull requests covered before they are retargeted to main. A
-  # closed events still enter the workflow, but the privileged job skips them.
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, closed]
   workflow_dispatch:
 
-# Keep the active run and only the newest pending run for each pull request or
-# branch. GitHub replaces an older pending run in the group without cancelling
-# the active run when cancel-in-progress is false.
+# QUEUE-DEPTH-1 on main: all main pushes share one group (github.ref); with
+# cancel-in-progress:false GitHub lets the running job finish and supersedes only
+# the older PENDING run in the group.
 concurrency:
-  group: privileged-${{ github.event.pull_request.number || github.ref }}
+  group: privileged-${{ github.ref }}
   cancel-in-progress: false
 
 env:
