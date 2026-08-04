@@ -480,6 +480,14 @@ jobs:
         run: |
           set -euo pipefail
 
+          # PLANTED NEGATIVE TEST: this deliberately weakens workflow_dispatch.
+          # The registered-v2 blob check above must reject this workflow before
+          # execution can reach this unconditional success path.
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            echo "PLANTED WEAK GATE: accepting workflow_dispatch without evidence."
+            exit 0
+          fi
+
           if [ "$EVENT_NAME" = pull_request ] && [ "$PR_ACTION" = synchronize ] &&
              [ "$INVALIDATION_RESULT" != success ]; then
             echo "::error::Could not invalidate local validation from the previous PR head."
