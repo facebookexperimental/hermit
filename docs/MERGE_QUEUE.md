@@ -4,7 +4,7 @@ Pull requests into `main` land through GitHub's merge queue. The queue creates
 a temporary commit against the current `main` tip, preventing a stale pull
 request head from bypassing changes that landed ahead of it.
 
-The required status is `merge-gate-v2`. Its job passes when either:
+The required status is `merge-gate-v3`. Its job passes when either:
 
 - the latest `.github/workflows/ci-portable.yml` run for the exact pull request
   head completed successfully; or
@@ -20,13 +20,13 @@ request. Every strip records a durable evidence comment (see
 lost.
 
 The job first verifies that its workflow file has the exact Git blob registered
-in the server-side `MERGE_GATE_V2_BLOB` variable. This rejects accidental drift
+in the server-side `MERGE_GATE_V3_BLOB` variable. This rejects accidental drift
 that retains the guard. The context name is versioned as well: every semantic
 gate tightening must bump it and move the ruleset, so an unmodified
 pre-tightening branch cannot emit the context currently required by `main`.
 
 This is not a cryptographic attestation of PR-owned YAML. A deliberate workflow
-edit can delete the blob-check step while retaining the v2 job name, and both
+edit can delete the blob-check step while retaining the v3 job name, and both
 runs use the same GitHub Actions integration. User-owned repositories cannot
 use GitHub's pinned required-workflow rule, so gate-policy PRs must remain an
 escalated adversarial-review class. A dedicated trusted GitHub App signer (or an
@@ -87,8 +87,8 @@ Known strip paths — all must leave the trail:
    so the evidence is preserved. The `--remove` flag also strips the label.
 3. **Evidence mutation.** Editing or deleting a PR comment revalidates the
    current exact-head receipt. If no dereferenceable receipt remains, the
-   workflow first publishes failing `merge-gate-v2` and transitional
-   `merge-gate` checks at the exact head, then removes `locally-validated`.
+   workflow first publishes failing `merge-gate-v3` and transitional
+   `merge-gate-v2` checks at the exact head, then removes `locally-validated`.
    Publishing both contexts keeps invalidation authoritative before and after
    the ruleset migration. Same-repository branches explicitly dispatch a new
    exact-head gate because label changes made with `GITHUB_TOKEN` do not
@@ -117,8 +117,8 @@ workflow.
 The `main` branch ruleset must:
 
 1. require pull requests and linear history;
-2. require the current versioned Merge Gate context (`merge-gate-v2`) from the
-   GitHub Actions integration, with `MERGE_GATE_V2_BLOB` equal to the workflow
+2. require the current versioned Merge Gate context (`merge-gate-v3`) from the
+   GitHub Actions integration, with `MERGE_GATE_V3_BLOB` equal to the workflow
    blob on `main` and `MERGE_GATE_LEGACY_CONTEXT=false`;
 3. require GitHub's merge queue; and
 4. disallow force pushes and branch deletion.
@@ -134,11 +134,11 @@ the bound main blob, and the disabled transition shim. It does not attest the
 repository's separate merge-queue or history-protection settings.
 
 Before landing a gate-version transition, run `--prepare <feature-ref>`. It
-enables the temporary legacy-context shim, adds v2 alongside the legacy
-required context, and only then binds the candidate blob. The overlap means a
-stale v1 branch cannot land during the transition: both legacy and v2 must pass.
+enables the temporary legacy-context shim, adds v3 alongside the v2 required
+context, and only then binds the candidate blob. The overlap means a stale v2
+branch cannot land during the transition: both v2 and v3 must pass.
 After the workflow lands, the coordinator runs `--apply`; it binds the `main`
-blob, removes the legacy required context, disables the shim, and verifies the
+blob, removes the v2 required context, disables the shim, and verifies the
 full resulting ruleset plus all three server-side values. Each full-object PUT
 is preceded by a fresh equality check, which detects policy drift already
 visible before the write. GitHub exposes no conditional PUT for this endpoint,
