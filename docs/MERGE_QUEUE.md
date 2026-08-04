@@ -9,8 +9,8 @@ The required check is `merge-gate`. It passes when either:
 - the latest `.github/workflows/ci-portable.yml` run for the exact pull request
   head completed successfully; or
 - the pull request has the `locally-validated` label **and** an exact-head
-  `validate.sh` evidence comment carrying a machine-readable durable-log
-  reference from a fully green run.
+  comment that resolves to an immutable receipt containing a counted, clean,
+  full-pass ledger row and the validation log's SHA-256 digest.
 
 The workflow removes `locally-validated` whenever the pull request head
 changes. It also re-runs the gate after CI completes and on label changes, so a
@@ -29,13 +29,14 @@ Replace `REPOSITORY` with `hermit` or `reverie`.
 
 ## Local validation
 
-A full green `./validate.sh` run first preserves its log under the parent
-`ignored/validation-evidence/` directory and posts an exact-head evidence
-comment. Only after that comment succeeds does it create and apply the
-`locally-validated` label to the current branch's pull request. Set
-`PR_NUMBER=<number>` when branch-based detection is unavailable. GitHub CLI,
-authentication, proxy, missing-PR, and label-edit failures are warnings and do
-not change validation's exit status.
+A full green `./validate.sh` run writes its local ledger row on exit and then
+delegates to the parent `ci-hub apply-local-label`. The applier requires that
+exact head to have a clean, commit-anchored, full-selection PASS with a nonzero
+executed-test count, hashes the referenced log, and publishes the selected row
+on `rrnewton/dev-hermit:validation-receipts`. Only after that immutable receipt
+exists does it post the binding comment and apply `locally-validated`.
+Publication or GitHub failures fail closed; the command can be run manually to
+backfill a validated head.
 
 Use `./validate.sh --no-label-pr` or `VALIDATE_LABEL_PR=0 ./validate.sh`
 when a green run must not update GitHub.
@@ -50,13 +51,12 @@ admission requirement.
 Stripping `locally-validated` must never silently erase the record of what was
 validated. Two symmetric comments preserve it:
 
-- **Add time.** A green `./validate.sh` preserves the log, then posts an evidence
-  comment (commit SHA, profile, results, host, durable log path, ledger path,
-  and run ID) ending in a machine-parseable marker
-  `<!-- locally-validated-evidence sha=... log=... -->`. Only then may it apply
-  the label. The merge gate accepts only an owner-authored marker with an exact
-  head, full profile, absolute log and ledger references, and a run ID prefixed
-  by that head. It fails closed when any field is absent or malformed.
+- **Add time.** `ci-hub apply-local-label` posts a comment ending in
+  `<!-- locally-validated-receipt commit=... path=... sha256=... -->`. The gate
+  dereferences that exact Git commit and path, verifies the content hash, and
+  requires the embedded ledger row to name the exact PR head, a clean full pass,
+  and a nonzero executed-test count. A perfect-looking marker pointing at no
+  receipt is refused.
 - **Strip time.** `scripts/label-strip-evidence.sh` posts a comment recording
   the strip (validated SHA, new head, reason, timestamp) and quotes the matching
   add-time evidence comment. It is best-effort and always exits 0, so it can
@@ -73,22 +73,23 @@ Known strip paths — all must leave the trail:
    `scripts/label-strip-evidence.sh --pr <n> --validated-sha <sha> [--remove]`
    so the evidence is preserved. The `--remove` flag also strips the label.
 3. **Evidence mutation.** Editing or deleting a PR comment revalidates the
-   current exact-head record. If no valid owner-authored record remains, the
+   current exact-head receipt. If no dereferenceable receipt remains, the
    workflow first publishes a failing required `merge-gate` check at the exact
    head, then removes `locally-validated`. Same-repository branches explicitly
    dispatch a new exact-head gate because label changes made with `GITHUB_TOKEN`
    do not recursively trigger another workflow. A dispatch failure therefore
    remains blocked by the already-published failure. Fork heads cannot be used as
    base-repository workflow-dispatch refs; their failing check remains until a
-   new evidence record and label re-fire the pull-request gate. There remains a
+   new receipt and label re-fire the pull-request gate. There remains a
    narrow race if a merge completes before the edit/delete event is processed.
 
-The GitHub gate validates the evidence record, not the referenced host file:
-gate fallback runners cannot dereference a devbig014-local path. Shared
-`rrnewton` credentials also mean author identity does not distinguish agents.
-The log, ledger, and run tuple is therefore durable provenance for audit, not a
-cryptographic attestation. A trusted external signer or shared artifact service
-would be required to make forged records mechanically impossible.
+The receipt is remotely readable from every gate runner and immutable at its
+referenced commit, unlike a devbig014-local ledger path. The local applier reads
+the ledger and log before publication; the gate verifies the row and log digest
+but cannot reopen the host-local log. Shared `rrnewton` credentials still do not
+provide individual signer identity, so a holder could deliberately publish a
+false receipt. This prevents accidental label/comment forgery; malicious-token
+resistance needs a dedicated signing identity.
 
 ## Repository settings
 

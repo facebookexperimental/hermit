@@ -61,11 +61,12 @@ Protocol for every PR:
    owning CI workflow in the same PR so they stay in lockstep, and update the
    mapping table in `docs/ci-validate-alignment.md`. See the "Reconciliation
    checklist for test-adding PRs" in that document.
-3. Let a full green `validate.sh` run record its exact-head evidence and apply
-   the **`locally-validated`** label. Do not add the label by hand: the merge
-   gate requires the validator's machine-readable evidence comment and durable
-   log reference for the same revision. Re-run `validate.sh` after any
-   subsequent push; the push invalidates both the prior approval and label.
+3. A full green `validate.sh` delegates to `ci-hub apply-local-label` after its
+   ledger row is written. Do not add **`locally-validated`** by hand: the applier
+   re-reads the counted exact-head row, hashes its log, publishes an immutable
+   receipt, and only then comments and labels. The command can also be run
+   manually to backfill a validated head. Re-run validation after any subsequent
+   push; the push invalidates both the prior receipt and label.
 
 A PR that changes code but is missing the `locally-validated` label — or whose
 description does not account for any check that could not run locally — is not

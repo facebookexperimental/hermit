@@ -189,9 +189,12 @@ jobs:
     permissions:
       actions: write
       checks: write
+      contents: read
       issues: write
       pull-requests: read
     steps:
+      - name: Check out the receipt verifier
+        uses: actions/checkout@v4
       - name: Remove local-validation label when its evidence is no longer valid
         env:
           GH_TOKEN: ${{ github.token }}
@@ -215,7 +218,6 @@ jobs:
             exit 0
           fi
 
-          owner="${REPO%%/*}"
           if ! comments_json="$(
             gh api --paginate --slurp \
               "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100"
@@ -223,28 +225,12 @@ jobs:
             echo "::warning::Could not re-read evidence comments; failing closed by removing the label."
             comments_json='[]'
           fi
-          evidence="$(jq -r --arg sha "$head_sha" --arg owner "$owner" '
-            [ .[][]?
-              | select(.user.login == $owner)
-              | select((.body // "") | startswith("[impl agent, validate.sh]\n"))
-              | .body as $body
-              | select($body | contains("Local validation passed"))
-              | select($body | contains("- SHA: `" + $sha + "`"))
-              | select($body | test("- Profile: `full`"))
-              | select($body | test("- Results: [1-9][0-9]* checks passed, 0 failed"))
-              | $body
-              | split("\n")[]
-              | capture("^<!-- locally-validated-evidence sha=(?<sha>[0-9a-f]{40}) profile=(?<profile>[^ ]+) host=(?<host>[^ ]+) log=(?<log>[^ ]+) ledger=(?<ledger>[^ ]+) run=(?<run>[^ ]+) ts=(?<ts>[^ ]+) -->$")?
-              | select(.sha == $sha and .profile == "full")
-              | select(.host != "" and .host != "unknown")
-              | select(.log | startswith("/"))
-              | select(.ledger | startswith("/"))
-              | select(.run | startswith($sha + "@"))
-              | select(.ts | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))
-            ] | last // empty | @json
-          ' <<< "$comments_json")"
-          if [ -n "$evidence" ]; then
-            echo "PR #${PR_NUMBER} still has valid exact-head evidence: ${evidence}"
+          comments_file=$(mktemp)
+          trap 'rm -f -- "$comments_file"' EXIT
+          printf '%s\n' "$comments_json" >"$comments_file"
+          if evidence=$(bash scripts/verify-local-validation-receipt.sh \
+              --repo "$REPO" --sha "$head_sha" --comments "$comments_file"); then
+            echo "PR #${PR_NUMBER} still has a dereferenced exact-head receipt: ${evidence}"
             exit 0
           fi
 
@@ -252,7 +238,7 @@ jobs:
           # issue_comment job itself is not a required check, and a follow-up
           # workflow dispatch can fail. Publishing this check first makes every
           # later failure fail closed at the exact PR head.
-          summary="No owner-authored full-validation record with an exact-head log, ledger, and run reference remains for ${head_sha}."
+          summary="No immutable counted full-validation receipt remains for exact head ${head_sha}."
           gh api --method POST \
             -H "Accept: application/vnd.github+json" \
             "repos/${REPO}/check-runs" \
@@ -271,7 +257,7 @@ jobs:
             --silent
           body="[coordinator, github-actions]
 
-          Removed \`locally-validated\`: an evidence comment was edited or deleted, and no owner-authored full-validation record with an exact-head log, ledger, and run reference remains for \`${head_sha}\`."
+          Removed \`locally-validated\`: no remotely readable counted validation receipt remains for exact head \`${head_sha}\`."
           gh api --method POST "repos/${REPO}/issues/${PR_NUMBER}/comments" \
             -f body="$body" --silent
           echo "Removed locally-validated from PR #${PR_NUMBER}; evidence no longer validates head ${head_sha}."
@@ -409,6 +395,8 @@ jobs:
     runs-on: [self-hosted, gate]
     timeout-minutes: 10
     steps:
+      - name: Check out the receipt verifier
+        uses: actions/checkout@v4
       - name: Require the core-change review protocol
         env:
           PROTOCOL_RESULT: ${{ needs.core-review-protocol.result }}
@@ -508,12 +496,9 @@ jobs:
               continue
             fi
             if [ "$locally_validated" = true ]; then
-              # A label is only a routing bit. Require the add-time evidence
-              # comment written by validate.sh, bound to this exact PR head and
-              # carrying a machine-readable durable-log reference. Restrict the
-              # match to the validate.sh comment prefix and an unquoted marker
-              # line so a later strip comment that quotes old evidence cannot
-              # accidentally authorize a re-added label.
+              # A label is only a routing bit. The comment must resolve to an
+              # immutable receipt whose ledger row proves a counted, clean,
+              # exact-head full pass. Shape alone never authorizes a merge.
               if ! comments_json="$(
                 gh api --paginate --slurp \
                   "repos/${REPO}/issues/${pr_number}/comments?per_page=100"
@@ -521,33 +506,16 @@ jobs:
                 echo "::error::Could not read validation evidence comments for PR #${pr_number}."
                 failed=1
               else
-                owner="${REPO%%/*}"
-                evidence="$(jq -r --arg sha "$head_sha" --arg owner "$owner" '
-                  [ .[][]?
-                    | select(.user.login == $owner)
-                    | select((.body // "") | startswith("[impl agent, validate.sh]\n"))
-                    | .body as $body
-                    | select($body | contains("Local validation passed"))
-                    | select($body | contains("- SHA: `" + $sha + "`"))
-                    | select($body | test("- Profile: `full`"))
-                    | select($body | test("- Results: [1-9][0-9]* checks passed, 0 failed"))
-                    | $body
-                    | split("\n")[]
-                    | capture("^<!-- locally-validated-evidence sha=(?<sha>[0-9a-f]{40}) profile=(?<profile>[^ ]+) host=(?<host>[^ ]+) log=(?<log>[^ ]+) ledger=(?<ledger>[^ ]+) run=(?<run>[^ ]+) ts=(?<ts>[^ ]+) -->$")?
-                    | select(.sha == $sha and .profile == "full")
-                    | select(.host != "" and .host != "unknown")
-                    | select(.log | startswith("/"))
-                    | select(.ledger | startswith("/"))
-                    | select(.run | startswith($sha + "@"))
-                    | select(.ts | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))
-                  ] | last // empty | @json
-                ' <<< "$comments_json")"
-                if [ -z "$evidence" ]; then
-                  echo "::error::PR #${pr_number} has locally-validated but no owner-authored validate.sh evidence for exact head $head_sha with log, ledger, and run references."
+                comments_file=$(mktemp)
+                printf '%s\n' "$comments_json" >"$comments_file"
+                if ! evidence=$(bash scripts/verify-local-validation-receipt.sh \
+                    --repo "$REPO" --sha "$head_sha" --comments "$comments_file"); then
+                  echo "::error::PR #${pr_number} has locally-validated but no immutable counted receipt for exact head $head_sha."
                   failed=1
                 else
-                  echo "PR #${pr_number} is locally validated at $head_sha with evidence: $evidence"
+                  echo "PR #${pr_number} is locally validated at $head_sha with dereferenced evidence: $evidence"
                 fi
+                rm -f -- "$comments_file"
               fi
             else
               runs="$(

@@ -9,7 +9,7 @@
 # Each strip silently erased the record of which commit was validated, with what
 # profile, and where the durable log lives. This helper posts a durable comment
 # at strip time that preserves that evidence, quoting the original add-time
-# evidence comment that `validate.sh` leaves when it applies the label.
+# receipt comment that `ci-hub apply-local-label` leaves when it applies the label.
 #
 # Design contract: this is BEST-EFFORT observability. It ALWAYS exits 0 so it can
 # never fail the invalidate job (whose success merge-gate requires) and can never
@@ -20,8 +20,8 @@
 #   * agents/tooling doing a MANUAL strip — run this BEFORE removing the label,
 #     or pass --remove to have it strip the label after commenting.
 #
-# The add-time evidence comment (written by validate.sh) carries a machine
-# marker `<!-- locally-validated-evidence sha=... profile=... host=... ts=... -->`
+# The add-time receipt comment carries a machine marker
+# `<!-- locally-validated-receipt commit=... path=... sha256=... -->`
 # so this helper can locate and quote it even across many PR comments.
 
 set -uo pipefail
@@ -105,14 +105,14 @@ if [[ -n $comments_json ]]; then
     if [[ -n $VALIDATED_SHA ]]; then
         prior_evidence="$(jq -r --arg sha "$VALIDATED_SHA" '
             [.[] | select(.body != null)
-                 | select(.body | contains("locally-validated-evidence"))
-                 | select(.body | contains("sha=" + $sha))]
+                 | select(.body | contains("locally-validated-receipt"))
+                 | select(.body | contains("/" + $sha + "/"))]
             | last // {} | .body // ""' <<<"$comments_json" 2>/dev/null || true)"
     fi
     if [[ -z $prior_evidence ]]; then
         prior_evidence="$(jq -r '
             [.[] | select(.body != null)
-                 | select(.body | contains("locally-validated-evidence"))]
+                 | select(.body | contains("locally-validated-receipt"))]
             | last // {} | .body // ""' <<<"$comments_json" 2>/dev/null || true)"
     fi
 fi

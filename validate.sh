@@ -98,9 +98,10 @@ function validation_slot_name {
 # default): the gate is killed once its process-tree CPU (user+sys) crosses the
 # budget, catching hangs that burn CPU (e.g. a reap/futex spin) regardless of
 # machine load, while the wall timeout remains the backstop for idle-stuck gates.
-# A fully-green full run labels the current PR `locally-validated` by default.
-# PR_NUMBER=N overrides branch-based PR detection. Use --no-label-pr or
-# VALIDATE_LABEL_PR=0 to disable the non-fatal GitHub update.
+# After a fully-green full run writes its counted ledger row, the parent ci-hub
+# publisher binds `locally-validated` to an immutable receipt. PR_NUMBER=N
+# overrides branch-based PR detection. Use --no-label-pr or VALIDATE_LABEL_PR=0
+# to disable that non-fatal publication.
 ENVELOPE_MODE="full"          # full | only
 ENVELOPE_BASELINE=""
 VALIDATION_LEVEL=${VALIDATE_LEVEL:-full} # quick | portable-only | full | super
@@ -237,8 +238,8 @@ Other options:
                    or compared. A run forced with this flag is recorded as
                    NOT-commit-anchored (commit_anchored=false) and never applies
                    the `locally-validated` label.
-  --label-pr       Label the current PR `locally-validated` on a fully-green run (default).
-  --no-label-pr    Disable the non-fatal GitHub label update.
+  --label-pr       Publish a receipt and label the PR after a full green (default).
+  --no-label-pr    Disable the non-fatal receipt publication and label update.
   -h, --help       Show this help and exit.
 
 Environment:
@@ -246,7 +247,8 @@ Environment:
   VALIDATE_GATE_TIMEOUT_SECONDS=N                Override per-gate process-tree WALL timeout.
   VALIDATE_GATE_CPU_TIMEOUT_SECONDS=N            Per-gate CPU-time budget (user+sys, whole tree); 0=off (default).
   VALIDATE_TIMEOUT_KILL_GRACE_SECONDS=N          TERM-to-KILL grace period.
-  VALIDATE_LABEL_PR=0                            Disable PR labeling (same as --no-label-pr).
+  VALIDATE_LABEL_PR=0                            Disable receipt publication/labeling.
+  CI_HUB_APPLY_LOCAL_LABEL=PATH                  Override the parent ci-hub receipt publisher.
   VALIDATE_VERBOSE=1                             Same as --verbose.
   VALIDATE_RUN_ON_DIRTY_TREE=1                   Same as --run-on-dirty-tree (agents: do not use).
   HERMIT_VALIDATE_LEDGER=FILE                    Override the parent JSONL ledger path.
@@ -1112,6 +1114,36 @@ function print_wall_cpu_summary {
         "$ratio" "$host_cpus" "$hint"
 }
 
+function publish_receipt_backed_label {
+    local pr=${PR_NUMBER:-}
+    local ci_hub=${CI_HUB_APPLY_LOCAL_LABEL:-}
+    local -a gh_cmd=(gh)
+
+    if [[ -z $ci_hub && -n $DEV_HERMIT_PARENT ]]; then
+        ci_hub="$DEV_HERMIT_PARENT/ci-hub/ci-hub"
+    fi
+    if [[ -z $ci_hub || ! -x $ci_hub ]]; then
+        printf "⚠️  counted validation recorded, but the ci-hub receipt publisher is unavailable; not applying locally-validated\n" >&2
+        return 0
+    fi
+    if [[ -z $pr ]] && command -v gh >/dev/null 2>&1; then
+        if command -v with-proxy >/dev/null 2>&1; then
+            gh_cmd=(with-proxy gh)
+        fi
+        pr=$("${gh_cmd[@]}" pr view --repo rrnewton/hermit \
+            --json number -q .number 2>/dev/null) || true
+    fi
+    if [[ -z $pr ]]; then
+        printf "⚠️  counted validation recorded, but no PR was found; not applying locally-validated\n" >&2
+        return 0
+    fi
+    if ! "$ci_hub" apply-local-label --pr "$pr" --repo rrnewton/hermit \
+        --ledger "$VALIDATION_LEDGER_FILE"; then
+        printf "⚠️  receipt publication failed for PR #%s; locally-validated was not authorized\n" \
+            "$pr" >&2
+    fi
+}
+
 function cleanup {
     local exit_status=$?
     local pid
@@ -1152,6 +1184,11 @@ function cleanup {
     fi
     append_validation_ledger "$exit_status" \
         "$validation_wall" "$validation_user" "$validation_sys"
+    if ((exit_status == 0 && failures == 0 && LABEL_PR == 1 && \
+        VALIDATION_COMMIT_ANCHORED == 1 && VALIDATION_TREE_DIRTY == 0)) && \
+       [[ $VALIDATION_LEVEL == full ]]; then
+        publish_receipt_backed_label
+    fi
     rm -rf "$VALIDATION_TMP_DIR"
     rm -rf "$REAL_COMPAT_FIXTURES"
     print_wall_cpu_summary "$exit_status" \
@@ -3581,144 +3618,6 @@ function envelope_compare {
     return "$regressed"
 }
 
-# Record exact-head validation evidence after a fully-green full run, apply the
-# `locally-validated` PR label only after that evidence is durable, then cancel
-# the redundant in-flight CI run for the exact validated commit.
-# Landing gate policy is: validate.sh passes locally -> PR carries the
-# `locally-validated` label. Label application and CI cancellation are
-# best-effort so GitHub or proxy failures never change the validation result.
-# The PR is taken from $PR_NUMBER when set, else detected from the current branch
-# via `gh pr view`. Missing gh, no PR, or a failed edit is a warning only and
-# never changes validation's exit status.
-readonly LOCALLY_VALIDATED_REPOSITORY="rrnewton/hermit"
-readonly LOCALLY_VALIDATED_LABEL="locally-validated"
-
-function apply_locally_validated_label {
-    local pr=$PR_NUMBER
-    local pr_head=""
-    local local_head
-    local comment_body=""
-    local durable_log=""
-    local evidence_dir=""
-    local evidence_run_id=""
-    local host_name=""
-    local ledger_ref=""
-    local passed_checks=0
-    local run_id=""
-    local timestamp=""
-    local timestamp_slug=""
-    local -a gh_cmd=(gh)
-
-    if ! command -v gh >/dev/null 2>&1; then
-        printf "⚠️  gh CLI not found; skipping '%s' label\n" \
-            "$LOCALLY_VALIDATED_LABEL" >&2
-        return 0
-    fi
-    # gh on Meta devservers needs the forward proxy; mirror ensure_cargo_nextest.
-    if command -v with-proxy >/dev/null 2>&1; then
-        gh_cmd=(with-proxy gh)
-    fi
-
-    if [[ -z $pr ]]; then
-        pr=$("${gh_cmd[@]}" pr view --repo "$LOCALLY_VALIDATED_REPOSITORY" \
-            --json number -q .number 2>/dev/null) || true
-    fi
-    if [[ -z $pr ]]; then
-        printf "⚠️  no PR found for the current branch; skipping '%s' label\n" \
-            "$LOCALLY_VALIDATED_LABEL" >&2
-        return 0
-    fi
-    pr_head=$("${gh_cmd[@]}" pr view "$pr" \
-        --repo "$LOCALLY_VALIDATED_REPOSITORY" \
-        --json headRefOid -q .headRefOid 2>/dev/null) || true
-    if [[ -z $pr_head ]]; then
-        printf "⚠️  could not read PR #%s head; skipping '%s' label\n" \
-            "$pr" "$LOCALLY_VALIDATED_LABEL" >&2
-        return 0
-    fi
-    local_head=$(git rev-parse HEAD)
-    if [[ $pr_head != "$local_head" ]]; then
-        printf "⚠️  PR #%s advanced from %s to %s; skipping '%s' label\n" \
-            "$pr" "$local_head" "$pr_head" "$LOCALLY_VALIDATED_LABEL" >&2
-        return 0
-    fi
-
-    # Ensure a fresh repository can accept the label. Failure is harmless here:
-    # the edit below reports the actionable warning and validation remains green.
-    "${gh_cmd[@]}" label create "$LOCALLY_VALIDATED_LABEL" \
-        --repo "$LOCALLY_VALIDATED_REPOSITORY" \
-        --color 1d76db \
-        --description "Full local validation and exact-head evidence recorded" \
-        --force >>"$LOG_FILE" 2>&1 || true
-
-    host_name=$(hostname -f 2>/dev/null) || \
-        host_name=$(hostname 2>/dev/null) || host_name="unknown"
-    timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ') || timestamp="unknown"
-    timestamp_slug=$(date -u +'%Y%m%dT%H%M%SZ') || timestamp_slug="unknown"
-    passed_checks=$((checks - failures))
-    ledger_ref=${VALIDATION_LEDGER_FILE:-none}
-    evidence_run_id="${local_head}@${VALIDATION_STARTED_AT}"
-    if [[ -n $DEV_HERMIT_PARENT ]]; then
-        evidence_dir="$DEV_HERMIT_PARENT/ignored/validation-evidence"
-    else
-        evidence_dir="$ROOT_DIR/target/validation/evidence"
-    fi
-    durable_log="$evidence_dir/${local_head}-${timestamp_slug}.log"
-    if ! mkdir -p "$evidence_dir" || ! cp "$LOG_FILE" "$durable_log"; then
-        printf "⚠️  failed to preserve validation log for PR #%s; refusing to apply '%s'\n" \
-            "$pr" "$LOCALLY_VALIDATED_LABEL" >&2
-        return 0
-    fi
-
-    # Evidence is written BEFORE the label. The gate rejects a label without a
-    # matching exact-head marker, so a comment/proxy failure cannot mint an
-    # unsupported landing signal. Keep marker keys in sync with merge-gate.yml
-    # and scripts/label-strip-evidence.sh.
-    # shellcheck disable=SC2016
-    printf -v comment_body \
-        '[impl agent, validate.sh]\n\nLocal validation passed — evidence recorded for `%s`.\n\n- SHA: `%s`\n- Profile: `%s`\n- Results: %d checks passed, 0 failed\n- Hostname: `%s`\n- Durable log: `%s:%s`\n- Ledger: `%s`\n- Run ID: `%s`\n- Timestamp (UTC): `%s`\n\n<!-- locally-validated-evidence sha=%s profile=%s host=%s log=%s ledger=%s run=%s ts=%s -->' \
-        "$LOCALLY_VALIDATED_LABEL" "$local_head" "$VALIDATION_PROFILE" \
-        "$passed_checks" "$host_name" "$host_name" "$durable_log" \
-        "$ledger_ref" "$evidence_run_id" "$timestamp" "$local_head" "$VALIDATION_PROFILE" \
-        "$host_name" "$durable_log" "$ledger_ref" "$evidence_run_id" "$timestamp"
-    if ! "${gh_cmd[@]}" pr comment "$pr" \
-        --repo "$LOCALLY_VALIDATED_REPOSITORY" \
-        --body "$comment_body" >>"$LOG_FILE" 2>&1; then
-        printf "⚠️  failed to record validation evidence on PR #%s; refusing to apply '%s' (full log: %s)\n" \
-            "$pr" "$LOCALLY_VALIDATED_LABEL" "$LOG_FILE" >&2
-        return 0
-    fi
-    printf "💬 Recorded exact-head local validation evidence on PR #%s\n" "$pr"
-
-    if "${gh_cmd[@]}" pr edit "$pr" --add-label "$LOCALLY_VALIDATED_LABEL" \
-        --repo "$LOCALLY_VALIDATED_REPOSITORY" \
-        >>"$LOG_FILE" 2>&1; then
-        printf "🏷️  Applied '%s' label to PR #%s\n" "$LOCALLY_VALIDATED_LABEL" "$pr"
-
-        if ! run_id=$("${gh_cmd[@]}" api \
-            "repos/${LOCALLY_VALIDATED_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${local_head}&per_page=100" \
-            --jq '.workflow_runs | map(select(.status != "completed")) | first | .id // empty' \
-            2>>"$LOG_FILE"); then
-            printf "⚠️  failed to query CI runs for %s (full log: %s)\n" \
-                "$local_head" "$LOG_FILE" >&2
-            return 0
-        fi
-        if [[ -z $run_id ]]; then
-            printf "ℹ️  No in-flight CI run found for %s\n" "$local_head"
-        elif "${gh_cmd[@]}" api --method POST \
-            "repos/${LOCALLY_VALIDATED_REPOSITORY}/actions/runs/${run_id}/cancel" \
-            >>"$LOG_FILE" 2>&1; then
-            printf "🛑 Cancelled CI run %s for %s\n" "$run_id" "$local_head"
-        else
-            printf "⚠️  failed to cancel CI run %s for %s (full log: %s)\n" \
-                "$run_id" "$local_head" "$LOG_FILE" >&2
-        fi
-    else
-        printf "⚠️  failed to add '%s' label to PR #%s (full log: %s)\n" \
-            "$LOCALLY_VALIDATED_LABEL" "$pr" "$LOG_FILE" >&2
-    fi
-}
-
 # fbsource import lints require the Meta copyright header on every imported Rust
 # source file. `head -n 8` permits a rust-script shebang first.
 function check_copyright_headers {
@@ -4307,16 +4206,5 @@ case "$VALIDATION_LEVEL" in
 esac
 
 print_summary
-
-# On a fully-green full run, tag the PR unless explicitly disabled. GitHub
-# failures are warnings and never affect the final validation exit status.
-if [[ $VALIDATION_LEVEL == full ]] && ((failures == 0)) && ((LABEL_PR == 1)); then
-    if ((VALIDATION_COMMIT_ANCHORED == 1)); then
-        apply_locally_validated_label
-    else
-        printf "⚠️  Skipping '%s' label: this run was NOT commit-anchored (dirty tree); the SHA it would claim is not what ran.\n" \
-            "$LOCALLY_VALIDATED_LABEL" >&2
-    fi
-fi
 
 ((failures == 0))
