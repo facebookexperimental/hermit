@@ -18,7 +18,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde::Serialize;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ProcfsKind {
     Stat,
     Status,
@@ -114,7 +114,10 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-883): Review module reference-count normalization.
     Modules,
-    ModuleRefcnt,
+    /// `/sys/module/<name>/refcnt`. Carries the module name so the value can be
+    /// derived from the SAME deterministic holder cardinality that
+    /// `sanitize_modules` publishes for `/proc/modules`.
+    ModuleRefcnt(String),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-958): Review host-global uevent sequence normalization.
     UeventSeqnum,
@@ -274,19 +277,54 @@ fn is_cpuidle_counter_path(path: &Path) -> bool {
         && matches!(counter, "time" | "usage" | "above" | "below" | "rejected")
 }
 
-fn is_module_refcnt_path(path: &Path) -> bool {
-    let Some(relative) = path.strip_prefix("/sys/module").ok() else {
-        return false;
-    };
+/// The module name for `/sys/module/<name>/refcnt`, or `None` for any other
+/// shape. Returning the name (rather than a bare bool) is what lets the sysfs
+/// value be derived from the same module's `/proc/modules` row.
+fn module_refcnt_name(path: &Path) -> Option<String> {
+    let relative = path.strip_prefix("/sys/module").ok()?;
     let mut components = relative.iter();
-    let Some(module) = components.next().and_then(|part| part.to_str()) else {
-        return false;
-    };
-    matches!(
-        components.next().and_then(|part| part.to_str()),
-        Some("refcnt")
-    ) && components.next().is_none()
-        && !module.is_empty()
+    let module = components.next().and_then(|part| part.to_str())?;
+    if module.is_empty() || components.next().and_then(|part| part.to_str()) != Some("refcnt") {
+        return None;
+    }
+    components.next().is_none().then(|| module.to_owned())
+}
+
+/// The host `/proc/modules` text, or empty when it cannot be read. An empty
+/// source yields a holder count of zero, which is the same conservative value
+/// the pre-existing behaviour emitted -- so an unreadable source degrades to
+/// the old answer instead of leaking the native counter.
+fn read_host_modules() -> String {
+    std::fs::read_to_string("/proc/modules").unwrap_or_default()
+}
+
+/// The deterministic holder cardinality `sanitize_modules` publishes for
+/// `module` in `/proc/modules`: the number of comma-separated holder names in
+/// the fourth field, or zero when that field is `-`.
+///
+/// This is the SAME derivation `sanitize_modules` applies, so the two surfaces
+/// cannot disagree. Linux exposes structural dependency holds in both the
+/// `/proc/modules` use count and `/sys/module/<name>/refcnt`; publishing a
+/// normalized 1 in one place and a hard 0 in the other is not a coherent
+/// module view.
+fn deterministic_module_holder_count(modules: &str, module: &str) -> u64 {
+    modules
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next()? == module).then_some(fields)
+        })
+        .and_then(|mut fields| {
+            fields.next()?; // size
+            fields.next()?; // use count (volatile; recomputed below)
+            let holders = fields.next()?;
+            Some(if holders == "-" {
+                0
+            } else {
+                holders.split(',').filter(|h| !h.is_empty()).count() as u64
+            })
+        })
+        .unwrap_or(0)
 }
 
 fn sysfs_rtc_kind(path: &Path) -> Option<ProcfsKind> {
@@ -466,7 +504,9 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-883): Review interrupt and module accounting snapshots.
             "/proc/interrupts" | "/proc/softirqs" => ProcfsKind::InterruptCounters,
             "/proc/modules" => ProcfsKind::Modules,
-            other if is_module_refcnt_path(Path::new(other)) => ProcfsKind::ModuleRefcnt,
+            other if let Some(module) = module_refcnt_name(Path::new(other)) => {
+                ProcfsKind::ModuleRefcnt(module)
+            }
             // AUTONOMOUS-BOT-IMPLEMENTED
             other if is_cpufreq_policy_value_path(Path::new(other)) => ProcfsKind::ScalingCurFreq,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -547,7 +587,7 @@ impl ProcfsFile {
             fdinfo_identity,
             random_uuid,
         } = context;
-        self.contents = Some(match self.kind {
+        self.contents = Some(match &self.kind {
             ProcfsKind::Stat => sanitize_stat(&contents, Some((virtual_pid, virtual_ppid))),
             ProcfsKind::Status => {
                 sanitize_status(&contents, Some((virtual_pid, virtual_pid, virtual_ppid)))
@@ -624,12 +664,14 @@ impl ProcfsFile {
             ProcfsKind::UnixSockets => sanitize_unix_sockets(&contents),
             ProcfsKind::BtrfsCommitStats => sanitize_btrfs_commit_stats(&contents),
             ProcfsKind::SysfsRtcDate | ProcfsKind::SysfsRtcTime | ProcfsKind::SysfsRtcEpoch => {
-                sanitize_sysfs_rtc_attribute(&contents, self.kind, virtual_realtime_seconds)
+                sanitize_sysfs_rtc_attribute(&contents, self.kind.clone(), virtual_realtime_seconds)
             }
             ProcfsKind::ThpCounter => sanitize_thp_counter(&contents),
             ProcfsKind::InterruptCounters => sanitize_interrupt_counters(&contents),
             ProcfsKind::Modules => sanitize_modules(&contents),
-            ProcfsKind::ModuleRefcnt => sanitize_module_refcnt(&contents),
+            ProcfsKind::ModuleRefcnt(module) => {
+                sanitize_module_refcnt(&contents, module.as_str(), &read_host_modules())
+            }
             ProcfsKind::Mountinfo => sanitize_mountinfo(&contents),
             ProcfsKind::RandomUuid => sanitize_random_uuid(
                 &contents,
@@ -2628,18 +2670,23 @@ fn sanitize_modules(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
-fn sanitize_module_refcnt(contents: &[u8]) -> Vec<u8> {
+fn sanitize_module_refcnt(contents: &[u8], module: &str, modules: &str) -> Vec<u8> {
     let has_newline = contents.ends_with(b"\n");
     let value = contents.strip_suffix(b"\n").unwrap_or(contents);
     if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
         return contents.to_vec();
     }
 
+    // Publish the same deterministic count the guest sees in /proc/modules.
+    // Volatile transient references (open fds, in-flight calls) are dropped;
+    // structural dependency holds are kept, because they are reproducible and
+    // are part of what Linux reports here.
+    let count = deterministic_module_holder_count(modules, module);
+    let mut normalized = count.to_string().into_bytes();
     if has_newline {
-        b"0\n".to_vec()
-    } else {
-        b"0".to_vec()
+        normalized.push(b'\n');
     }
+    normalized
 }
 
 fn sanitize_schedstat(contents: &[u8]) -> Vec<u8> {
@@ -4192,7 +4239,7 @@ RAW: inuse 5\n"
             ProcfsFile::from_path(Path::new("/sys/module/ipmi_si/refcnt"))
                 .unwrap()
                 .kind,
-            ProcfsKind::ModuleRefcnt
+            ProcfsKind::ModuleRefcnt("ipmi_si".to_owned())
         );
         assert!(ProcfsFile::from_path(Path::new("/proc/devices")).is_none());
         assert!(ProcfsFile::from_path(Path::new("/sys/module/ipmi_si/coresize")).is_none());
@@ -4218,10 +4265,24 @@ RAW: inuse 5\n"
             sanitize_modules(modules),
             b"kvm_amd 212992 0 - Live 0x0\nkvm 1200128 1 kvm_amd, Live 0x0\nllc 20480 2 bridge,stp, Live 0x0\n"
         );
-        assert_eq!(sanitize_module_refcnt(b"7\n"), b"0\n");
-        assert_eq!(sanitize_module_refcnt(b"12"), b"0");
-        assert_eq!(sanitize_module_refcnt(b"not-a-count\n"), b"not-a-count\n");
-        assert!(sanitize_module_refcnt(b"").is_empty());
+        // A module with no holders normalizes to 0, as before.
+        let source = std::str::from_utf8(modules).unwrap();
+        assert_eq!(sanitize_module_refcnt(b"7\n", "kvm_amd", source), b"0\n");
+        assert_eq!(sanitize_module_refcnt(b"12", "kvm_amd", source), b"0");
+        // CROSS-SURFACE COHERENCE (the #1558 defect): kvm is held by kvm_amd,
+        // so /proc/modules publishes 1 and sysfs must publish 1 too -- not 0.
+        assert_eq!(sanitize_module_refcnt(b"7\n", "kvm", source), b"1\n");
+        assert_eq!(sanitize_module_refcnt(b"9", "llc", source), b"2");
+        // Malformed contents still pass through untouched (fail open, unchanged).
+        assert_eq!(
+            sanitize_module_refcnt(b"not-a-count\n", "kvm", source),
+            b"not-a-count\n"
+        );
+        assert!(sanitize_module_refcnt(b"", "kvm", source).is_empty());
+        // An unknown module or unreadable source degrades to 0, the old answer,
+        // rather than leaking the native counter.
+        assert_eq!(sanitize_module_refcnt(b"7\n", "absent", source), b"0\n");
+        assert_eq!(sanitize_module_refcnt(b"7\n", "kvm", ""), b"0\n");
     }
 
     #[test]
@@ -4788,5 +4849,103 @@ total_commit_ms 0\n"
         assert_eq!(file.position().0, 2, "pread must not move the cursor");
         file.set_offset(0);
         assert_eq!(file.take(128).unwrap(), b"0\t0\t9223372036854775807\n");
+    }
+
+    /// Two-sided coverage for the #1558 fix-forward, counted on both sides.
+    ///
+    /// POSITIVE: every spelling that names the SAME kernel object classifies as
+    /// ModuleRefcnt for the same module. NEGATIVE: shapes that are not that
+    /// object are refused. The pathname the guest typed is a proxy; the opened
+    /// object is the authority, so `handle_openat` resolves `/proc/<pid>/fd/<fd>`
+    /// before calling `from_path` -- these cases pin the classifier that sits
+    /// under that resolution.
+    #[test]
+    fn module_refcnt_classification_is_two_sided_over_path_shapes() {
+        // POSITIVE: absolute, and the lexically-equivalent spellings a resolved
+        // AT_FDCWD or dirfd open collapses to.
+        let accepted = [
+            "/sys/module/kvm/refcnt",
+            "/sys/module/./kvm/refcnt",
+            "/sys/module/kvm/../kvm/refcnt",
+            "/sys/module/nvme/refcnt",
+        ];
+        let mut accepted_count = 0;
+        for path in accepted {
+            let kind = ProcfsFile::from_path(Path::new(path))
+                .unwrap_or_else(|| panic!("{path} names a module refcnt object"))
+                .kind;
+            let expected = if path.contains("nvme") { "nvme" } else { "kvm" };
+            assert_eq!(
+                kind,
+                ProcfsKind::ModuleRefcnt(expected.to_owned()),
+                "{path} must classify as {expected}'s refcnt"
+            );
+            accepted_count += 1;
+        }
+        assert_eq!(
+            accepted_count, 4,
+            "all four accepted spellings were checked"
+        );
+
+        // NEGATIVE: not this object. An UNRESOLVED relative spelling is included
+        // deliberately -- the classifier must NOT guess at it; correctness comes
+        // from resolving before classification, not from pattern-matching a
+        // relative path.
+        let refused = [
+            "refcnt",
+            "kvm/refcnt",
+            "sys/module/kvm/refcnt",
+            "/sys/module/kvm/coresize",
+            "/sys/module/refcnt",
+            "/sys/module/kvm/holders/refcnt",
+            "/sys/module//refcnt",
+            "/sys/modulefoo/kvm/refcnt",
+        ];
+        let mut refused_count = 0;
+        for path in refused {
+            assert!(
+                !matches!(
+                    ProcfsFile::from_path(Path::new(path)).map(|file| file.kind),
+                    Some(ProcfsKind::ModuleRefcnt(_))
+                ),
+                "{path} must not be classified as a module refcnt"
+            );
+            refused_count += 1;
+        }
+        assert_eq!(refused_count, 8, "all eight refused shapes were checked");
+    }
+
+    /// CROSS-SURFACE: the two module surfaces must agree. `/proc/modules` field
+    /// 3 and `/sys/module/<name>/refcnt` are both derived from the holder list,
+    /// so for every module in the table the sysfs value equals the use count
+    /// `sanitize_modules` publishes. #1558 emitted a hard 0 in sysfs while
+    /// /proc/modules kept the holder cardinality; that pair is what this pins.
+    #[test]
+    fn sysfs_refcnt_agrees_with_proc_modules_use_count() {
+        let modules = "kvm_amd 212992 95 - Live 0x0\n\
+                       kvm 1200128 1 kvm_amd, Live 0x0\n\
+                       llc 20480 2 bridge,stp, Live 0x0\n";
+        let normalized = sanitize_modules(modules.as_bytes());
+        let normalized = std::str::from_utf8(&normalized).unwrap();
+
+        let mut compared = 0;
+        for line in normalized.lines() {
+            let mut fields = line.split_whitespace();
+            let module = fields.next().unwrap();
+            fields.next().unwrap();
+            let proc_use_count: u64 = fields.next().unwrap().parse().unwrap();
+
+            let sysfs = sanitize_module_refcnt(b"999\n", module, modules);
+            let sysfs: u64 = std::str::from_utf8(&sysfs).unwrap().trim().parse().unwrap();
+
+            assert_eq!(
+                sysfs, proc_use_count,
+                "{module}: /proc/modules says {proc_use_count} but sysfs says {sysfs}"
+            );
+            compared += 1;
+        }
+        assert_eq!(compared, 3, "all three modules were cross-checked");
+        // And the specific pair codex named: kvm is held by kvm_amd.
+        assert_eq!(sanitize_module_refcnt(b"1\n", "kvm", modules), b"1\n");
     }
 }
