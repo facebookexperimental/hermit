@@ -350,7 +350,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 ci = false
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
-dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+dbi = "DBI virtualizes getpgid but getpgrp still exposes the host process group; cross-call equality is not established"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
 sabre = "SaBRe does not virtualize CPUID; this oracle requires Hermit's synthetic CPU identity"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
@@ -1770,7 +1770,7 @@ program = "tests/backend-parity/fixtures/pid_probe.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
+ci = true
 backends_enabled = ["ptrace", "sabre", "liteinst"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"

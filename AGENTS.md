@@ -185,10 +185,12 @@ flags. For preprocessing and prototype results, say what executed underneath;
 for example, "e9patch preprocessing with the ptrace backend" rather than
 "e9patch backend".
 
-A feature is **done** only when the exact test produces bitwise-identical output
-across **all backends**. A pass on one backend is evidence for that backend
-only, not a project-wide completion claim. If a backend cannot run the test,
-report that gap explicitly instead of weakening the definition of done.
+A feature is **done** only when the exact test meets its declared assurance
+level across **all in-scope backends**. A pass on one backend is evidence for
+that backend only, not a project-wide completion claim. KVM currently compares
+only exit status/stdout/stderr during `--verify`; it cannot claim full L2 INFO
+parity until internal log comparison exists. Report that gap explicitly instead
+of weakening the definition of done.
 
 Start investigations in these locations:
 
@@ -214,8 +216,8 @@ presupposes the ones below it:
 | --- | --- | --- |
 | L0 | Builds and unit/integration tests pass | `cargo test` exits 0 |
 | L1 | Runs deterministically under strict mode | `hermit run --strict` |
-| L2 | Bitwise-identical repeat run | `hermit run --strict --verify` |
-| L3 | Memory determinism | `hermit run --strict --verify --detlog-heap --detlog-stack` |
+| L2 | Canonical full-observation repeat parity (non-KVM) | `hermit run --strict --verify --verify-strict --verify-json <path> -- ...` and require JSON `bitwise_parity: true` |
+| L3 | Memory determinism | Add `--detlog-heap --detlog-stack` to the L2 command |
 | L4 | Stress-hardened | L2/L3 repeated 20x with no divergence |
 
 A claim that a run "passes" is meaningless without a level. Write, for example,
@@ -228,6 +230,16 @@ A claim that a run "passes" is meaningless without a level. Write, for example,
   none. A non-strict result is not a determinism guarantee; label the relaxation
   and do not present it as one.
 
+Default `--verify` uses the lossy `Stripped` comparator and cannot establish
+L2. `--verify-strict` compares exit status/stdout/stderr byte-for-byte and INFO
+events under the repository's `BitwiseInfoV1` policy: it removes only the real
+wall-clock prefix, ordinalizes host addresses while preserving identity/order/
+aliasing, and compares the full remainder exactly. Virtual time,
+retired-branch counts, syscall values, sizes, flags, and other numeric payloads
+must not be stripped. State this canonical envelope rather than calling the raw
+log files literally byte-identical. KVM's output-only fallback reports
+`bitwise_parity: false` and is not L2.
+
 ## Debugging
 
 Diagnose determinism problems with Hermit's own logging and comparison tooling
@@ -236,9 +248,11 @@ before reading source:
 - Raise the log level to see the event stream and Detcore's decisions:
   `hermit --log info run -- <program>` (or `debug` / `trace` for more detail).
   The `DETLOG` lines record syscalls, scheduling, and virtualized time.
-- Reproduce nondeterminism with `hermit run --strict --verify`, which runs the
-  guest twice and reports the first divergence.
-- For record/replay problems use `hermit record start --verify -- <program>`,
+- Reproduce nondeterminism with `hermit run --strict --verify --verify-strict`,
+  which runs the guest twice under the L2 comparison policy and reports the
+  first divergence.
+- For record/replay problems use
+  `hermit record start --verify --verify-strict -- <program>`,
   which records then replays and diffs the two logs; a divergence names the
   thread and syscall event where the runs parted.
 - Use `hermit-verify` for stress, trace, schedule, and replay checks, and the
@@ -275,9 +289,10 @@ limitations, not necessarily product bugs.
 build config, and minimal curated documentation only. Experiments, bulk AI
 research notes, binaries, and vendored clones do **not** belong here — they live
 in the `dev-hermit` parent workspace. The `repo-cleanliness` skill
-(`.claude/skills/repo-cleanliness.md`, also surfaced via `.llms/skills` and
-`.agents/skills`) is the full standing rule; this section is the mandatory
-pre-commit gate.
+(`.claude/skills/repo-cleanliness/SKILL.md`, also surfaced to Claude via
+`.llms/skills` and to stock Codex via
+`.agents/skills/repo-cleanliness/SKILL.md`) is the full standing rule; this
+section is the mandatory pre-commit gate.
 
 Before every commit, audit exactly what you are about to stage and fix any
 misplaced file *before* committing — never "commit now, clean up later":
@@ -326,6 +341,15 @@ Typical flow for a change:
   relaxations.
 - Push the branch and open a pull request against fork `main`. Keep fork `main`
   green; repair a regression before landing more work.
+- The PR author owns the branch through landing: resolve review findings,
+  rebase when needed, rerun validation at the new exact head, and verify the
+  landed commit on freshly fetched `main`.
+
+When this repository is coordinated through the `dev-hermit` parent, landing
+authorization is the parent's exact-head local receipt queried through
+`ci-hub validate-status`. A label or copied status is only a cache, and delayed
+GitHub workflows are useful supplemental evidence rather than the admission
+gate. Never reuse a receipt from an earlier SHA.
 
 Follow `CONTRIBUTING.md`, update documentation for user-visible changes, and
 never publish security vulnerabilities as ordinary issues.
@@ -375,36 +399,38 @@ are mandatory for every implementation and review agent.
    for the coordinator, who does it only after confirming the work is on
    `main`. An agent that closes its own task is asserting a landing it cannot
    witness.
-2. **When your work is complete, set the task to `IMPLEMENTED` and post the PR
-   link.** "Complete" means the feature branch is pushed and a pull request is
-   open against `rrnewton/hermit:main`. Record the transition and evidence:
+2. **When your work is complete, add the `implemented` tag and post the PR
+   link.** `IMPLEMENTED` is a tag, not a TaskGraph status. The task remains
+   `in_progress`. "Complete" means the feature branch is pushed and a pull
+   request is open against `rrnewton/hermit:main`. Preserve the task's existing
+   tags when recording the transition and evidence:
 
    ```bash
-   tg update <task> --status implemented
-   tg note <task> "Implemented: https://github.com/rrnewton/hermit/pull/<n> \
+   tg note <task> "IMPLEMENTED: https://github.com/rrnewton/hermit/pull/<n> \
      | branch <feature-branch> @ <40-hex SHA> | base origin/main <SHA> \
      | validation: <exact commands + results, assurance level, backend>"
+   tg update <task> --tags <existing-tags>,implemented
    ```
 
    The PR link and the exact tested SHA are required, not optional. A branch
    name alone is not evidence.
-3. **Adversarial review confirms the work exists in the PR.** Before a task is
-   trusted as `IMPLEMENTED`, a reviewer independently verifies that the claimed
+3. **Adversarial review confirms the work exists in the PR.** Before a task's
+   `implemented` tag is trusted, a reviewer independently verifies that the claimed
    change is actually present in the pull request diff, that the cited tests
    exist and were run at the PR head SHA, and that the reported assurance level
    (L0–L4), backend, and relaxations match reality. A claim that does not
-   survive this check is not `IMPLEMENTED`.
-4. **The task stays `IMPLEMENTED` until the PR lands on `main`.** Open,
-   in-review, CI-red, awaiting-merge, and blocked-on-a-dependency PRs are all
-   still `IMPLEMENTED`, never `closed`. If the branch stops fast-forwarding, or
-   CI goes red, or a required check is not green at the PR head, the task
-   remains `IMPLEMENTED` (or moves back to `in_progress`) — it does not advance.
-5. **Only the coordinator closes tasks, after landing confirmation.** The
-   coordinator closes a task only after verifying the PR is merged into
-   `rrnewton/hermit:main` (both required checks green at the merged head, the
-   commit reachable from `main`), and, when relevant, that the parent gitlink
-   was updated. Landing confirmation is a merge commit on `main`, not a green
-   local run.
+   survive this check must lose the `implemented` tag.
+4. **The task stays `in_progress` + `implemented` until the PR lands on
+   `main`.** Open, in-review, validation-red, awaiting-merge, and
+   blocked-on-a-dependency PRs are never `closed`. If the published artifact
+   disappears or the implementation claim proves false, remove the tag; do not
+   invent a status that TaskGraph does not have.
+5. **Only the coordinator closes tasks, through the verified gateway.** After
+   freshly verifying that the landed commit is reachable from the target
+   `main`, the coordinator uses the dev-hermit parent's
+   `./ci-hub/bin/close-task` with the PR or full SHA. Never use raw
+   `tg update --status closed`. A local green run, a GitHub state field, or a
+   label is not landing evidence.
 
 ### Done vs. Not Done
 
@@ -414,21 +440,21 @@ the lower status and say why in a task note.
 **Done (coordinator may close):**
 
 - PR #### is merged into `rrnewton/hermit:main`; the merge commit is on `main`
-  and both required checks were green at that head.
+  and the verified closure gateway accepts its freshly fetched ancestry.
 - A coordinated Hermit/Reverie change: both PRs merged, the parent gitlink(s)
   updated to the exact landed SHAs, and the pair revalidated.
 
-**`IMPLEMENTED` (agent's terminal state — do NOT close):**
+**`in_progress` + `implemented` (agent's terminal state — do NOT close):**
 
-- Branch pushed, PR open, CI green, awaiting coordinator merge.
-- PR open but CI red, or a required check missing/queued/stale — still
-  `IMPLEMENTED`; report the exact failure, do not close.
+- Branch pushed, PR open, exact-head validation green, awaiting merge.
+- PR open but validation red, or an exact-head receipt missing/stale — still
+  `in_progress` + `implemented`; report the exact failure, do not close.
 - Work committed and pushed but blocked on another PR or a reverie pin bump —
-  `IMPLEMENTED` with the blocker and dependency SHAs named.
+  `in_progress` + `implemented` with the blocker and dependency SHAs named.
 
-**Not done (stays `in_progress`, never `IMPLEMENTED` or `closed`):**
+**Not done (stays `in_progress`, never tagged `implemented` or closed):**
 
-- Code written but uncommitted, stashed, or not pushed.
+- Code written but uncommitted or not pushed. Do not use a stash as a handoff.
 - "It builds/tests pass locally" with no pushed branch and no open PR.
 - A green local `cargo test` presented as project completion — a local run is
   not a landing, and one backend passing is not "done" across all backends.

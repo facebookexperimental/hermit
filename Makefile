@@ -15,7 +15,7 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 .DEFAULT_GOAL := build
 
 .PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
-	install-build-tools check-submodules validate lint \
+	install-build-tools check-submodules check-skill-discovery validate lint \
 	validate-kvm validate-dbi validate-sabre validate-liteinst validate-e9patch
 
 build: prune-stale-release install-deps ## Build the development Hermit binary with every backend
@@ -75,6 +75,9 @@ prune-stale-release: ## Remove target/release/hermit if stale (not built from cu
 validate: check-submodules ## Run the full multi-backend validation suite (pass extra flags via ARGS="--help")
 	./validate.sh $(ARGS)
 
+check-skill-discovery: ## Verify Claude and stock Codex discover the same product skills
+	./scripts/check-skill-discovery.rs
+
 # `make lint` mirrors the lint gate CI's merge-gate enforces, so a developer can
 # reproduce every lint failure locally before pushing. Cheap checks run first for
 # fast feedback; the compile-heavy clippy pass and the networked Reverie-pin
@@ -86,6 +89,7 @@ validate: check-submodules ## Run the full multi-backend validation suite (pass 
 # warning/style findings. Ratchet the severity down (warning -> style) as that
 # debt is retired rather than blocking the target on it today.
 lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, reverie pin, nested lockfiles)
+	./scripts/check-skill-discovery.rs
 	./scripts/test-required-check-outcomes.sh
 	./scripts/test-check-status-outcome.sh
 	./scripts/check-merge-gate-policy.sh

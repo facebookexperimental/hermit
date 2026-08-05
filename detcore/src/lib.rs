@@ -98,6 +98,7 @@ use reverie::Tid;
 use reverie::TimerSchedule;
 use reverie::Tool;
 pub use reverie::process::Namespace;
+use reverie::syscalls::Addr;
 use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::EpollCreate1;
@@ -253,6 +254,22 @@ fn choose_rcb_timer(
         }
     }
     (max_rcbs_remaining, true)
+}
+
+/// Order-independent summary of a guest's environment, used to make
+/// cross-backend environment differences a one-line comparison in DETLOG.
+struct GuestEnvDigest {
+    /// Number of environment variables.
+    count: usize,
+    /// SHA-256 over the sorted `VAR=VALUE` entries (captures value differences).
+    hash: digest::Digest,
+    /// SHA-256 over just the sorted variable names, so a key-set difference is
+    /// still visible even when it would otherwise be masked by a value change.
+    keys_hash: digest::Digest,
+    /// Sorted, comma-joined variable names. Values are excluded because they may
+    /// be secrets or host-specific paths; the names alone answer "which vars
+    /// differ".
+    keys: String,
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -763,6 +780,138 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
         }
         Ok(())
+    }
+
+    /// Emit a one-shot DETLOG line summarizing the guest's environment at exec:
+    /// the variable count, an order-independent SHA-256 of the full
+    /// `VAR=VALUE` set, a separate SHA-256 of just the variable names, and the
+    /// sorted name list itself. A cross-backend environment difference (for
+    /// example KVM vs. ptrace) then surfaces as a single differing line instead
+    /// of an eyeballed syscall stream, and the name list makes "they differ in
+    /// TMPDIR and HOSTNAME" a one-line comparison rather than a full diff.
+    /// Callers must gate this on active INFO logging; it is read-only and never
+    /// feeds guest-visible state, so it cannot affect determinism.
+    async fn detlog_guest_env<G: Guest<Self>>(&self, guest: &mut G) {
+        let dettid = guest.thread_state().dettid;
+        // Some backends do not expose the initial process stack at this hook
+        // (see `Config::initial_stack_unavailable_at_post_exec`). Reading
+        // argv/envp from `%rsp` there would fault under the in-process memory
+        // accessor or hash unrelated stack contents, so report the environment
+        // as unavailable rather than attempting the read.
+        if self.cfg.initial_stack_unavailable_at_post_exec {
+            detlog!(
+                "[env, dtid {}] unavailable (backend cannot read initial stack)",
+                dettid
+            );
+            return;
+        }
+        match Self::hash_guest_env(guest).await {
+            Ok(env) => detlog!(
+                "[env, dtid {}] count={} hash={} keys_hash={} keys={}",
+                dettid,
+                env.count,
+                env.hash,
+                env.keys_hash,
+                env.keys
+            ),
+            // A backend may legitimately be unable to read the initial stack
+            // (e.g. an out-of-process guest at an unexpected stop). Report it on
+            // the same line rather than propagating an error that would abort
+            // the guest.
+            Err(errno) => detlog!("[env, dtid {}] unavailable ({:?})", dettid, errno),
+        }
+    }
+
+    /// Read the guest's environment strings from its initial process stack and
+    /// summarize them. This reads through `guest.memory()` so it behaves
+    /// identically across backends (ptrace/KVM/DBI/e9patch); reading
+    /// `/proc/<pid>/environ` would be wrong under KVM, where `guest.pid()` is
+    /// the host VMM process rather than the guest.
+    ///
+    /// The hashes are **order-independent**: the entries are sorted before
+    /// hashing, so a backend that enumerates `environ` in a different order does
+    /// not produce a spurious difference (which would be worse than no hash at
+    /// all). Values are excluded from the key view because they may be secrets
+    /// or host-specific paths.
+    async fn hash_guest_env<G: Guest<Self>>(guest: &mut G) -> Result<GuestEnvDigest, Errno> {
+        // System V x86-64 process-entry stack layout, in ascending addresses:
+        //   [ argc:u64 ][ argv[0..argc]:*const u8 ][ NULL ]
+        //   [ envp[0..]:*const u8 ][ NULL ][ auxv... ]
+        // At the post-exec stop the guest has not executed any instruction yet,
+        // so %rsp still points at `argc`.
+        let sp = guest.regs().await.rsp;
+        let memory = guest.memory();
+
+        let read_word = |addr: u64| -> Result<u64, Errno> {
+            let addr = Addr::<u64>::from_raw(addr as usize).ok_or(Errno::EFAULT)?;
+            memory.read_value(addr)
+        };
+
+        let argc = read_word(sp)?;
+        // envp begins after `argc` (1 word), the `argc` argv pointers, and the
+        // NULL word that terminates argv.
+        let skip_words = argc.checked_add(2).ok_or(Errno::EFAULT)?;
+        let mut cursor = sp
+            .checked_add(skip_words.checked_mul(8).ok_or(Errno::EFAULT)?)
+            .ok_or(Errno::EFAULT)?;
+
+        // Bound the scan so a corrupt or unexpected stack cannot loop or
+        // allocate without limit.
+        const MAX_ENTRIES: usize = 1 << 16;
+        const MAX_BYTES: usize = 1 << 20;
+        let mut entries: Vec<Vec<u8>> = Vec::new();
+        let mut total_bytes: usize = 0;
+        while entries.len() < MAX_ENTRIES && total_bytes < MAX_BYTES {
+            let ptr = read_word(cursor)?;
+            if ptr == 0 {
+                break; // NULL terminator ends the envp array.
+            }
+            let str_addr = Addr::<u8>::from_raw(ptr as usize).ok_or(Errno::EFAULT)?;
+            let bytes = memory.read_cstring(str_addr)?.into_bytes();
+            total_bytes += bytes.len();
+            entries.push(bytes);
+            cursor = cursor.checked_add(8).ok_or(Errno::EFAULT)?;
+        }
+        let count = entries.len();
+
+        // Order-independence: sort the raw entries so backend iteration order
+        // cannot change the hash.
+        entries.sort_unstable();
+
+        // Full hash over the sorted "VAR=VALUE" entries, each NUL-terminated so
+        // that e.g. {"A=", "B"} and {"A", "=B"} hash differently.
+        let mut all: Vec<u8> = Vec::with_capacity(total_bytes + count);
+        // Variable names only (the bytes before the first '='; the whole entry
+        // if there is no '='), sorted independently.
+        let mut keys: Vec<&[u8]> = Vec::with_capacity(count);
+        for entry in &entries {
+            all.extend_from_slice(entry);
+            all.push(0);
+            let key = match entry.iter().position(|&b| b == b'=') {
+                Some(i) => &entry[..i],
+                None => &entry[..],
+            };
+            keys.push(key);
+        }
+        keys.sort_unstable();
+
+        let mut key_buf: Vec<u8> = Vec::new();
+        for key in &keys {
+            key_buf.extend_from_slice(key);
+            key_buf.push(0);
+        }
+        // Human-readable sorted name list (values excluded).
+        let key_names: Vec<String> = keys
+            .iter()
+            .map(|k| String::from_utf8_lossy(k).into_owned())
+            .collect();
+
+        Ok(GuestEnvDigest {
+            count,
+            hash: digest::Digest::new(&all),
+            keys_hash: digest::Digest::new(&key_buf),
+            keys: key_names.join(","),
+        })
     }
 
     fn display_syscall_finished<'a, M: MemoryAccess>(
@@ -1352,6 +1501,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             );
             let ptr = unsafe { ptr.into_mut() };
             guest.memory().write_value(ptr, &bytes)?;
+        }
+
+        // Emit an order-independent hash of the guest's environment for
+        // cross-backend diffing. The read + hash runs only when INFO logging
+        // (and thus DETLOG) is active, so a normal run pays nothing.
+        if tracing::enabled!(tracing::Level::INFO) {
+            self.detlog_guest_env(guest).await;
         }
 
         self.post_handler_hook(guest).await;

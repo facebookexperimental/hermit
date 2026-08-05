@@ -14,8 +14,11 @@ leading mode to trailing modes**.
 
 1. Measure one exact `origin/main` SHA in a clean checkout. If main moves and
    product code changed, update and rerun affected measurements.
-2. Run the same app probes through `--strict --verify`, record/replay, DBI, and
-   KVM. Do not substitute old task notes for live results.
+2. Run the same app probes through non-KVM
+   `--strict --verify --verify-strict --verify-json`, record/replay, DBI, and
+   KVM. Require `bitwise_parity: true` for every L2 cell. KVM's current
+   output/status-only verification is a separate, lower-assurance cell. Do not
+   substitute old task notes for live results.
 3. Use only code and artifacts available from main. Unlanded work belongs in a
    final footnote, never in the coverage totals.
 4. Mark unavailable or interrupted measurements honestly. `BLOCKED`, `NOT RUN`,
@@ -73,11 +76,14 @@ minimum is:
 For each probe, run:
 
 ```bash
-./target/debug/hermit run --strict --verify -- PROGRAM ARGS...
-./target/debug/hermit record start --verify --record-timeout 90 \
+./target/debug/hermit run --strict --verify --verify-strict \
+  --verify-json /tmp/progress-verify.json -- PROGRAM ARGS...
+./target/debug/hermit record start --verify --verify-strict --record-timeout 90 \
   --data-dir "$(mktemp -d /tmp/hermit-report-rr.XXXXXX)" -- PROGRAM ARGS...
-./target/debug/hermit run --backend dbi -- PROGRAM ARGS...
-./target/debug/hermit run --backend kvm -- PROGRAM ARGS...
+./target/debug/hermit run --backend dbi --strict --verify --verify-strict \
+  --verify-json /tmp/progress-dbi-verify.json -- PROGRAM ARGS...
+./target/debug/hermit run --backend kvm --strict --verify \
+  --verify-json /tmp/progress-kvm-output.json -- PROGRAM ARGS...
 ```
 
 If DBI or KVM has a backend-wide preflight failure, run one representative
@@ -104,7 +110,10 @@ ignored counts separately.
 
 ## Cell vocabulary
 
-- `PASS L2`: strict verify completed and reported deterministic output.
+- `PASS L2`: non-KVM strict verification completed and its exact-SHA JSON
+  verdict reports `bitwise_parity: true` with nonzero compared INFO messages.
+- `PASS OUTPUT`: KVM repeat execution matched exit status/stdout/stderr; internal
+  logs were not compared. Never report this as L2.
 - `PASS R/R`: record completed, replay completed, and outputs/logs matched.
 - `FAIL`: the mode ran the guest and produced a mismatch, divergence, crash, or
   nonzero result attributable to that workload.

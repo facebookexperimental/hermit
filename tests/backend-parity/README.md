@@ -228,6 +228,39 @@ HERMIT_E9TOOL=<path>/e9tool HERMIT_E9PATCH_BACKEND=<path>/e9patch \
 
 Use `--check` to validate the corpus contract without prerequisites.
 
+## Splitting asymmetric backlog PRs
+
+PRs that predate the shared-manifest symmetry guard may combine useful code
+with additions to this backend-private corpus. Do not hand-edit those patches.
+Plan a lossless split first:
+
+```bash
+tests/backend-parity/split_asymmetric_pr.py --pr <number>
+```
+
+The dry run assigns every changed path and hunk to code or deferred tests,
+replays both partitions, and requires their union to reproduce the source PR's
+Git tree exactly. It fails instead of guessing on mixed inventory edits,
+private-test deletions, unknown asymmetry shapes, or code replay conflicts.
+
+Publishing is a separate explicit operation:
+
+```bash
+tests/backend-parity/split_asymmetric_pr.py --pr <number> --publish \
+  --role-tag '[impl agent, MODEL]'
+```
+
+A mixed PR becomes a code-only draft against fresh `main` and a test-only draft
+against the source PR's original base. The latter is labeled
+`matrix-asymmetric-tests-deferred` and carries a required next-action checklist:
+promote through the shared ptrace front door, minimize then promote, or reject
+with evidence. The welded source closes only after both replacements exist. A
+test-only source stays open as the labeled deferred PR; the tool does not create
+an empty code PR.
+
+The open PR count can rise after a mixed split. That is intentional: one
+unlandable PR becomes landable code plus explicit, queryable test debt.
+
 ## Running
 
 Validate the case catalog and known-gap invariants without backend prerequisites:

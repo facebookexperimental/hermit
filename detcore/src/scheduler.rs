@@ -442,6 +442,17 @@ pub struct Scheduler {
     /// overtaking a child exit that is not physically waitable yet.
     pending_physical_process_exits: BTreeSet<DetPid>,
 
+    /// Process leaders (`DetPid`) for which a deterministic child-exit `SIGCHLD`
+    /// has already been armed for the reaping parent. A voluntary `exit_group`
+    /// arms it at the scheduler-ordered `Exit` grant; a process that leaves the
+    /// run set WITHOUT that grant (e.g. SIGKILL after `execve`) is armed instead
+    /// from `logically_kill_thread`. This set is the single-arm guard shared by
+    /// both paths: whichever fires first arms, and the other (including the
+    /// idempotent second call to `logically_kill_thread`) is a no-op, so the
+    /// parent's `wait4`/`waitid` poll loop is woken exactly once. Entries are
+    /// never removed (mirroring `process_parent`; a run never reuses a `DetPid`).
+    child_exit_armed: HashSet<DetPid>,
+
     /// Whether the backend defers spawning a vfork child until after the parent posts its
     /// continuation, so an unfulfilled vfork barrier at parent continuation means the child is
     /// still on its way rather than that the clone failed. See
@@ -1108,6 +1119,7 @@ impl Scheduler {
             deregistration_accounted: Default::default(),
             backend_reports_physical_process_exits: cfg.backend_reports_physical_process_exits,
             pending_physical_process_exits: Default::default(),
+            child_exit_armed: Default::default(),
             backend_defers_vfork_child_registration: cfg.backend_defers_vfork_child_registration,
             resources: Default::default(),
             started_up: Default::default(),
@@ -1443,6 +1455,24 @@ impl Scheduler {
         if !live_process_thread {
             let _ = self.begin_physical_process_exit(*detpid);
             self.blocked.timed_waiters.remove_process_timers(*detpid);
+            // Arm a deterministic child-exit `SIGCHLD` for the reaping parent of a
+            // process that left the run set WITHOUT a voluntary `Exit` grant (e.g.
+            // SIGKILL after `execve`): such a process is torn down by the host
+            // kernel, never requests `Exit`, and so never reaches the arm above.
+            // Without this, the parent's `wait4`/`waitid` nonblock-poll loop is
+            // never woken and spins burning a core (the `vfork` residual). The
+            // `child_exit_armed` guard makes this a no-op when the voluntary path
+            // already armed, and when this idempotent function is called twice.
+            // `remove_process_timers` above only clears `signal_timers`-backed
+            // alarms/POSIX timers, never a `ChildExit` event, so ordering is safe.
+            if let Some(parent) = self.thread_tree.parent_process(detpid)
+                && self.child_exit_armed.insert(*detpid)
+            {
+                let deadline = self.committed_time + LogicalTime::from_nanos(1);
+                self.blocked
+                    .timed_waiters
+                    .insert_child_exit(deadline, *detpid, parent, parent);
+            }
         }
     }
 
@@ -2551,10 +2581,16 @@ impl Scheduler {
             // host-async kernel `SIGCHLD` whose arrival time is host-timed (the
             // `make -jN` / redis `--strict --verify` nondeterminism source).
             ResourceID::Exit { group, process, .. } => {
-                if *group && let Some(parent) = self.thread_tree.parent_process(process) {
+                if *group
+                    && let Some(parent) = self.thread_tree.parent_process(process)
+                    && self.child_exit_armed.insert(*process)
+                {
                     // Fire strictly after the current committed time so the event
                     // is dispatched on a subsequent scheduler pass (DetTid == DetPid
                     // for a group leader, so `parent` is also the parent thread id).
+                    // The `child_exit_armed` guard makes this the single arm for
+                    // this child, so a subsequent involuntary teardown in
+                    // `logically_kill_thread` does not double-signal the parent.
                     let deadline = self.committed_time + LogicalTime::from_nanos(1);
                     self.blocked
                         .timed_waiters

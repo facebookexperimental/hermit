@@ -1322,6 +1322,7 @@ case "$subcommand" in
         (($# == 0)) || true
         audit_sabre_path_evidence_contract
         audit_test_footprints
+        python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
         audit_inventory
         audit_ci_correspondence
         echo "PASS: ${#TESTS[@]} E2E tests have valid syntax and centralized schema-v2 manifests"

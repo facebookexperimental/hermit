@@ -230,6 +230,17 @@
     },
     {
       "_why": "Standalone checks map to their own portable DAG node.",
+      "paths": [
+        ".agents/**",
+        ".claude/**",
+        ".llms/**",
+        "CLAUDE.md",
+        "scripts/check-skill-discovery.rs"
+      ],
+      "nodes": ["check.skill_discovery"]
+    },
+    {
+      "_why": "Standalone checks map to their own portable DAG node.",
       "paths": ["scripts/check-detcore-backend-abstraction.sh"],
       "nodes": ["check.backend_abstraction"]
     },

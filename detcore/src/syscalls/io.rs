@@ -24,6 +24,8 @@ use reverie::syscalls;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::PollFd;
+use reverie::syscalls::PollFlags;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Timespec;
@@ -31,6 +33,7 @@ use tracing::debug;
 use tracing::trace;
 
 use crate::config::SchedHeuristic;
+use crate::fd::EpollInterest;
 use crate::fd::FdType;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
@@ -41,7 +44,6 @@ use crate::scheduler::runqueue::FIRST_PRIORITY;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
 use crate::syscalls::helpers::record_retry_event;
-use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::tool_global::*;
 use crate::tool_local::Detcore;
 use crate::types::DetTid;
@@ -92,6 +94,31 @@ fn connect_result_allows_peer_classification(result: &Result<i64, Error>) -> boo
 
 const KERNEL_SIGSET_SIZE: usize = std::mem::size_of::<u64>();
 const PSELECT6_INTERNAL_MAX_NFDS: i32 = (std::mem::size_of::<libc::c_ulong>() * 8) as i32;
+const TIMERFD_POLL_EVENTS: PollFlags = PollFlags::from_bits_retain(libc::POLLIN | libc::POLLRDNORM);
+const EPOLL_HOST_TOKEN_PREFIX: u64 = 0x4845_524d_0000_0000;
+
+fn epoll_host_token(fd: RawFd) -> u64 {
+    EPOLL_HOST_TOKEN_PREFIX | u64::from(fd as u32)
+}
+
+fn epoll_event_fields(event: &libc::epoll_event) -> (u32, u64) {
+    // libc uses the kernel's packed epoll_event layout on x86_64.
+    unsafe {
+        (
+            std::ptr::addr_of!(event.events).read_unaligned(),
+            std::ptr::addr_of!(event.u64).read_unaligned(),
+        )
+    }
+}
+
+fn epoll_event(events: u32, data: u64) -> libc::epoll_event {
+    let mut event = libc::epoll_event { events: 0, u64: 0 };
+    unsafe {
+        std::ptr::addr_of_mut!(event.events).write_unaligned(events);
+        std::ptr::addr_of_mut!(event.u64).write_unaligned(data);
+    }
+    event
+}
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -377,6 +404,153 @@ fn sanitize_ppoll_signal_mask(mask: u64) -> u64 {
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    fn virtual_timerfd_ready<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        fd: RawFd,
+        now: LogicalTime,
+    ) -> Option<bool> {
+        if !self.timerfd_virtualized() {
+            return None;
+        }
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| {
+                detfd
+                    .timerfd_state()
+                    .map(|state| state.deadline.is_some_and(|deadline| now >= deadline))
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// Replace host-timed timerfd poll bits with readiness derived from virtual
+    /// time, then recount every ready descriptor from the merged result array.
+    fn merge_virtual_timerfd_poll_readiness<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Poll,
+        now: LogicalTime,
+    ) -> Result<i64, Error> {
+        self.merge_virtual_timerfd_pollfds(
+            guest,
+            call.fds().map(|address| address.cast()),
+            call.nfds(),
+            now,
+        )
+    }
+
+    fn merge_virtual_timerfd_ppoll_readiness<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Ppoll,
+        now: LogicalTime,
+    ) -> Result<i64, Error> {
+        self.merge_virtual_timerfd_pollfds(
+            guest,
+            call.fds().map(|address| address.cast()),
+            call.nfds(),
+            now,
+        )
+    }
+
+    fn merge_virtual_timerfd_pollfds<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fds: Option<AddrMut<'_, PollFd>>,
+        nfds: libc::nfds_t,
+        now: LogicalTime,
+    ) -> Result<i64, Error> {
+        let Some(fds) = fds else {
+            return Ok(0);
+        };
+        let mut ready = 0_i64;
+        for index in 0..nfds {
+            let address = unsafe { fds.offset(index as isize) };
+            let mut pollfd: PollFd = guest.memory().read_value(address)?;
+            if let Some(timer_ready) = self.virtual_timerfd_ready(guest, pollfd.fd, now) {
+                // A mirrored host timer may become readable before or after the
+                // virtual deadline. Remove that host observation unconditionally.
+                pollfd.revents.remove(TIMERFD_POLL_EVENTS);
+                if timer_ready {
+                    pollfd.revents |= pollfd.events & TIMERFD_POLL_EVENTS;
+                }
+                guest.memory().write_value(address, &pollfd)?;
+            }
+            if !pollfd.revents.is_empty() {
+                ready += 1;
+            }
+        }
+        Ok(ready)
+    }
+
+    fn epoll_interest_snapshot<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        epfd: RawFd,
+    ) -> Result<Vec<EpollInterest>, Error> {
+        Ok(guest
+            .thread_state()
+            .with_detfd(epfd, |detfd| detfd.epoll_interests())?)
+    }
+
+    /// Translate Detcore's host epoll tokens back to guest payloads and replace
+    /// host-timed timerfd events with virtual-time readiness.
+    fn merge_virtual_timerfd_epoll_readiness<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::EpollWait,
+        host_count: i64,
+        now: LogicalTime,
+    ) -> Result<i64, Error> {
+        let interests = self.epoll_interest_snapshot(guest, call.epfd())?;
+        if interests.is_empty() {
+            return Ok(host_count);
+        }
+        let Some(events_address) = call.events() else {
+            return Ok(host_count);
+        };
+
+        let mut output = Vec::with_capacity(call.maxevents().max(0) as usize);
+        for index in 0..host_count.max(0) as usize {
+            let address = unsafe { events_address.offset(index as isize) };
+            let event: libc::epoll_event = guest.memory().read_value(address)?;
+            let (events, data) = epoll_event_fields(&event);
+            if let Some(interest) = interests
+                .iter()
+                .find(|interest| interest.host_token == data)
+            {
+                if self
+                    .virtual_timerfd_ready(guest, interest.fd, now)
+                    .is_some()
+                {
+                    // The kernel's host-timed timer event is never authoritative.
+                    continue;
+                }
+                output.push(epoll_event(events, interest.data));
+            } else {
+                output.push(event);
+            }
+        }
+
+        for interest in &interests {
+            if output.len() >= call.maxevents().max(0) as usize {
+                break;
+            }
+            if self.virtual_timerfd_ready(guest, interest.fd, now) == Some(true)
+                && interest.events & libc::EPOLLIN as u32 != 0
+            {
+                output.push(epoll_event(libc::EPOLLIN as u32, interest.data));
+            }
+        }
+
+        for (index, event) in output.iter().enumerate() {
+            let address = unsafe { events_address.offset(index as isize) };
+            guest.memory().write_value(address, event)?;
+        }
+        Ok(output.len() as i64)
+    }
+
     /// poll syscall (MAYHANG)
     // TODO-HUMAN-REVIEW(PR-1023): Review zero-timeout poll scheduling across backends.
     pub async fn handle_poll<G: Guest<Self>>(
@@ -398,7 +572,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             if self.cfg.recordreplay_modes {
                 Ok(self.record_or_replay(guest, call).await?)
             } else {
-                Ok(guest.inject(call).await?)
+                guest.inject(call).await?;
+                let now = thread_observe_time(guest).await;
+                self.merge_virtual_timerfd_poll_readiness(guest, call, now)
             }
         } else if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
             // In replay mode, we cannot assume the existence of FILES during replay.
@@ -835,7 +1011,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             let result = if self.cfg.recordreplay_modes {
                 Ok(self.record_or_replay(guest, probe).await?)
             } else {
-                Ok(guest.inject_with_retry(probe).await?)
+                guest.inject_with_retry(probe).await?;
+                let now = thread_observe_time(guest).await;
+                self.merge_virtual_timerfd_ppoll_readiness(guest, probe, now)
             };
             if let Some(timeout_address) = timeout_address {
                 guest
@@ -926,7 +1104,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             let (probe, _probe_guard) = self.prepare_ppoll_probe(guest, call).await?;
             let result = guest.inject_with_retry(probe).await;
             if probe.syscall_would_have_blocked(result) {
-                return Err(Errno::ENOSYS.into());
+                let now = thread_observe_time(guest).await;
+                let ready = self.merge_virtual_timerfd_ppoll_readiness(guest, probe, now)?;
+                if ready == 0 {
+                    return Err(Errno::ENOSYS.into());
+                }
+                return Ok(ready);
             }
             let result = result.map_err(Into::into);
             if let (Some(timeout_address), Some(timeout), Some(started_at)) =
@@ -941,7 +1124,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut rsrc = Resources::new(guest.thread_state().dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("ppoll");
-        let result = retry_nonblocking_syscall_with_timeout(guest, call, rsrc, deadline).await;
+        let (probe, _probe_guard) = self.prepare_ppoll_probe(guest, call).await?;
+        let result = loop {
+            if resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled {
+                break Err(Errno::EINTR.into());
+            }
+            let host_result = guest.inject_with_retry(probe).await;
+            if let Err(error) = host_result {
+                break Err(error.into());
+            }
+            let now = thread_observe_time(guest).await;
+            let ready = self.merge_virtual_timerfd_ppoll_readiness(guest, probe, now)?;
+            if ready != 0 {
+                break Ok(ready);
+            }
+            rsrc.poll_attempt += 1;
+            if deadline.is_some_and(|timeout| now >= timeout) {
+                break Ok(0);
+            }
+            record_retry_event(guest, probe).await;
+        };
         if let (Some(timeout_address), Some(timeout), Some(started_at)) =
             (timeout_address, timeout, started_at)
         {
@@ -986,13 +1188,31 @@ impl<T: RecordOrReplay> Detcore<T> {
                 zero_timeout_poll_request(guest.thread_state().dettid, yield_to_peer),
             )
             .await;
-            Ok(guest.inject(call).await?) // Already non-blocking.
+            guest.inject(call).await?;
+            let now = thread_observe_time(guest).await;
+            self.merge_virtual_timerfd_poll_readiness(guest, call, now)
         } else {
             let maybe_timeout_ns = millis_duration_to_absolute_timeout(guest, timeout_millis).await;
             let mut rsrc = Resources::new(guest.thread_state().dettid);
             rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
             rsrc.fyi("poll");
-            retry_nonblocking_syscall_with_timeout(guest, call, rsrc, maybe_timeout_ns).await
+            let probe = call.with_timeout(0);
+            loop {
+                if resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled {
+                    return Err(Errno::EINTR.into());
+                }
+                guest.inject_with_retry(probe).await?;
+                let now = thread_observe_time(guest).await;
+                let ready = self.merge_virtual_timerfd_poll_readiness(guest, probe, now)?;
+                if ready != 0 {
+                    return Ok(ready);
+                }
+                rsrc.poll_attempt += 1;
+                if maybe_timeout_ns.is_some_and(|timeout| now >= timeout) {
+                    return Ok(0);
+                }
+                record_retry_event(guest, probe).await;
+            }
         }
     }
 
@@ -1058,7 +1278,58 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         resource_request(guest, Resources::new(dettid)).await; // empty request
-        Ok(self.record_or_replay(guest, call).await?)
+        if !self.timerfd_virtualized() {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+
+        let target_is_virtual_timer = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.timerfd_state().is_some())
+            .unwrap_or(false);
+        let mut interest = None;
+        let mut stack_guard = None;
+        let host_call = if target_is_virtual_timer
+            && matches!(call.op(), libc::EPOLL_CTL_ADD | libc::EPOLL_CTL_MOD)
+        {
+            let event_address = call.event().ok_or(Errno::EFAULT)?;
+            let event: libc::epoll_event = guest.memory().read_value(event_address)?;
+            let (events, data) = epoll_event_fields(&event);
+            let host_token = epoll_host_token(call.fd());
+            interest = Some(EpollInterest {
+                fd: call.fd(),
+                events,
+                data,
+                host_token,
+            });
+
+            // The host payload is an internal token, never the guest's possibly
+            // duplicated data value. This lets epoll_wait identify and replace a
+            // host-timed timerfd event without guessing which registration fired.
+            let mut stack = guest.stack().await;
+            let host_event = stack.push(epoll_event(events, host_token));
+            let host_event = unsafe { host_event.into_mut() };
+            stack_guard = Some(stack.commit()?);
+            call.with_event(Some(host_event))
+        } else {
+            call
+        };
+
+        let result = self.record_or_replay(guest, host_call).await?;
+        match call.op() {
+            libc::EPOLL_CTL_ADD | libc::EPOLL_CTL_MOD if interest.is_some() => {
+                guest.thread_state().with_detfd(call.epfd(), |detfd| {
+                    detfd.set_epoll_interest(interest.expect("interest prepared"));
+                })?;
+            }
+            libc::EPOLL_CTL_DEL => {
+                guest
+                    .thread_state()
+                    .with_detfd(call.epfd(), |detfd| detfd.remove_epoll_interest(call.fd()))?;
+            }
+            _ => {}
+        }
+        drop(stack_guard);
+        Ok(result)
     }
 
     /// epoll_pwait syscall (MAYHANG)
@@ -1121,13 +1392,32 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let timeout_millis = call.timeout();
         if timeout_millis == 0 {
-            Ok(guest.inject(call).await?) // Already non-blocking.
+            let host_count = guest.inject(call).await?;
+            let now = thread_observe_time(guest).await;
+            self.merge_virtual_timerfd_epoll_readiness(guest, call, host_count, now)
         } else {
             let maybe_timeout_ns = millis_duration_to_absolute_timeout(guest, timeout_millis).await;
             let mut rsrc = Resources::new(guest.thread_state().dettid);
             rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
             rsrc.fyi("epoll_wait");
-            retry_nonblocking_syscall_with_timeout(guest, call, rsrc, maybe_timeout_ns).await
+            let probe = call.with_timeout(0);
+            loop {
+                if resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled {
+                    return Err(Errno::EINTR.into());
+                }
+                let host_count = guest.inject_with_retry(probe).await?;
+                let now = thread_observe_time(guest).await;
+                let ready =
+                    self.merge_virtual_timerfd_epoll_readiness(guest, probe, host_count, now)?;
+                if ready != 0 {
+                    return Ok(ready);
+                }
+                rsrc.poll_attempt += 1;
+                if maybe_timeout_ns.is_some_and(|timeout| now >= timeout) {
+                    return Ok(0);
+                }
+                record_retry_event(guest, probe).await;
+            }
         }
     }
 

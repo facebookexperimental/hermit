@@ -113,10 +113,26 @@ fn numa_maps_consumers_are_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();
     let numa_maps = read_numa_maps();
     assert!(!numa_maps.is_empty(), "numa_maps should contain mappings");
+    const HOST_PAGE_COUNTERS: &[&str] = &[
+        "active=",
+        "anon=",
+        "dirty=",
+        "mapped=",
+        "mapmax=",
+        "swapcache=",
+        "writeback=",
+    ];
     assert!(
-        !numa_maps
-            .split_whitespace()
-            .any(|field| field.starts_with("active=") || field.starts_with("mapmax=")),
+        !numa_maps.split_whitespace().any(|field| {
+            HOST_PAGE_COUNTERS
+                .iter()
+                .any(|prefix| field.starts_with(prefix))
+                || field.split_once('=').is_some_and(|(name, _)| {
+                    name.strip_prefix('N').is_some_and(|node| {
+                        !node.is_empty() && node.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                })
+        }),
         "numa_maps retained host observation fields:\n{numa_maps}"
     );
 

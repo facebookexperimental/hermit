@@ -2304,6 +2304,18 @@ fn sanitize_fdinfo(contents: &[u8], identity: Option<(u64, i32, u64)>) -> Vec<u8
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-934): Review the /proc/self/numa_maps field policy.
 fn sanitize_numa_maps(contents: &[u8]) -> Vec<u8> {
+    fn page_accounting_value(field: &str) -> Option<&str> {
+        let (name, value) = field.split_once('=')?;
+        let fixed_counter = matches!(
+            name,
+            "active" | "anon" | "dirty" | "mapped" | "mapmax" | "swapcache" | "writeback"
+        );
+        let node_counter = name
+            .strip_prefix('N')
+            .is_some_and(|node| !node.is_empty() && node.bytes().all(|byte| byte.is_ascii_digit()));
+        (fixed_counter || node_counter).then_some(value)
+    }
+
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
     };
@@ -2320,10 +2332,7 @@ fn sanitize_numa_maps(contents: &[u8]) -> Vec<u8> {
 
         let mut kept = Vec::with_capacity(fields.len());
         for field in fields {
-            if let Some(value) = field
-                .strip_prefix("active=")
-                .or_else(|| field.strip_prefix("mapmax="))
-            {
+            if let Some(value) = page_accounting_value(field) {
                 if value.parse::<u64>().is_err() {
                     return contents.to_vec();
                 }
@@ -2738,11 +2747,28 @@ fn sanitize_mountinfo(contents: &[u8]) -> Vec<u8> {
         suffix.len() == 6 && suffix.iter().all(u8::is_ascii_alphanumeric)
     }
 
+    fn is_host_user_runtime_mount(mountpoint: &[u8]) -> bool {
+        let Some(suffix) = mountpoint.strip_prefix(b"/run/user/") else {
+            return false;
+        };
+        let uid = suffix
+            .split(|byte| *byte == b'/')
+            .next()
+            .unwrap_or_default();
+        !uid.is_empty() && uid.iter().all(u8::is_ascii_digit)
+    }
+
     let mut normalized = Vec::with_capacity(contents.len());
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
         let has_newline = line.last() == Some(&b'\n');
         let body = line.strip_suffix(b"\n").unwrap_or(line);
         let fields = body.split(|byte| *byte == b' ').collect::<Vec<_>>();
+
+        // Host login sessions can appear or disappear between verified runs.
+        // They are unrelated to the guest and must not change its mount table.
+        if fields.len() >= 5 && is_host_user_runtime_mount(fields[4]) {
+            continue;
+        }
 
         if fields.len() >= 5 && is_private_temp_root(fields[3]) {
             for (index, field) in fields.iter().enumerate() {
@@ -3571,6 +3597,21 @@ mod tests {
         assert_eq!(
             sanitize_mountinfo(input),
             b"37 29 0:31 /tmpvol/.hermit/tmp /tmp rw - btrfs /dev/md0 rw\n38 29 0:31 /host/data /data ro - btrfs /dev/md0 ro\n39 29 0:31 /tmpvol/.hermit/etc/group /etc/group ro - btrfs /dev/md0 ro\n"
+        );
+    }
+
+    #[test]
+    fn host_user_runtime_mounts_are_hidden() {
+        let input = b"37 29 0:31 / /run rw - tmpfs tmpfs rw\n\
+38 37 0:42 / /run/user/30015 rw - tmpfs tmpfs rw\n\
+39 38 0:43 / /run/user/30015/doc rw - fuse.portal portal rw\n\
+40 37 0:44 / /run/user/30015-session rw - tmpfs tmpfs rw\n\
+41 37 0:45 / /run/user/shared rw - tmpfs tmpfs rw\n";
+        assert_eq!(
+            sanitize_mountinfo(input),
+            b"37 29 0:31 / /run rw - tmpfs tmpfs rw\n\
+40 37 0:44 / /run/user/30015-session rw - tmpfs tmpfs rw\n\
+41 37 0:45 / /run/user/shared rw - tmpfs tmpfs rw\n"
         );
     }
 
@@ -4482,14 +4523,14 @@ THPeligible:    0\n"
     }
 
     #[test]
-    fn numa_maps_hides_host_page_aging_and_sharing_maxima() {
-        let contents = b"71000000 default anon=1 dirty=1 active=0 N0=1 kernelpagesize_kB=4\n\
-7ffff7c00000 default file=/usr/lib64/libc.so.6 mapped=41 mapmax=443 N0=41 kernelpagesize_kB=4\n";
+    fn numa_maps_hides_host_page_accounting() {
+        let contents = b"71000000 default heap anon=1 dirty=1 active=0 N12=1 kernelpagesize_kB=4\n\
+7ffff7c00000 default file=/usr/lib64/libc.so.6 mapped=41 mapmax=443 N0=41 swapcache=2 writeback=3 kernelpagesize_kB=4\n";
 
         assert_eq!(
             sanitize_numa_maps(contents),
-            b"71000000 default anon=1 dirty=1 N0=1 kernelpagesize_kB=4\n\
-7ffff7c00000 default file=/usr/lib64/libc.so.6 mapped=41 N0=41 kernelpagesize_kB=4\n"
+            b"71000000 default heap kernelpagesize_kB=4\n\
+7ffff7c00000 default file=/usr/lib64/libc.so.6 kernelpagesize_kB=4\n"
         );
     }
 

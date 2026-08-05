@@ -1248,11 +1248,12 @@ pub async fn millis_duration_to_absolute_timeout<G: Guest<Detcore<T>>, T: Record
     guest: &mut G,
     timeout_millis: i32,
 ) -> Option<LogicalTime> {
-    if timeout_millis > 0 {
-        nanos_duration_to_absolute_timeout(guest, (timeout_millis as u128) * 1000).await
-    } else {
-        None
-    }
+    let timeout_nanos = positive_millis_as_nanos(timeout_millis)?;
+    nanos_duration_to_absolute_timeout(guest, timeout_nanos).await
+}
+
+fn positive_millis_as_nanos(timeout_millis: i32) -> Option<u128> {
+    (timeout_millis > 0).then(|| (timeout_millis as u128) * 1_000_000)
 }
 
 // Convert to absolute logical time point for the timeout.
@@ -1274,6 +1275,14 @@ pub async fn nanos_duration_to_absolute_timeout<G: Guest<Detcore<T>>, T: RecordO
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poll_milliseconds_convert_to_nanoseconds() {
+        assert_eq!(positive_millis_as_nanos(-1), None);
+        assert_eq!(positive_millis_as_nanos(0), None);
+        assert_eq!(positive_millis_as_nanos(1), Some(1_000_000));
+        assert_eq!(positive_millis_as_nanos(1_000), Some(1_000_000_000));
+    }
 
     #[test]
     fn connect_nonblocking_results() {

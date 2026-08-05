@@ -1,6 +1,6 @@
 ---
 name: backend-reality-reviewer
-description: Audit Hermit backend completion claims against real CLI execution, Reverie Backend implementation, Detcore Tool integration, arbitrary-program support, and hermit-cli linkage. Use whenever a backend agent reports progress or completion, or when hermit-coord evaluates whether a backend claim is real.
+description: "Audit Hermit backend completion claims against real CLI execution, Reverie Backend implementation, Detcore Tool integration, arbitrary-program support, and hermit-cli linkage. Use whenever a backend agent reports progress or completion, or when hermit-coord evaluates whether a backend claim is real."
 ---
 
 # Backend Reality Reviewer
@@ -52,6 +52,31 @@ time-virtualization change) must pass **dual independent adversarial review — 
 `claude` agent and one `codex` agent — before landing**, per
 [post-facto-review](../post-facto-review/SKILL.md).
 
+## Backend-specific operational facts
+
+These are product constraints, not fleet-role policy. Reconfirm them against
+the current source when changing the owning backend, and preserve them in tests
+or backend documentation rather than copying coordinator charters into this
+repository:
+
+- **DBI/DynamoRIO:** build the client in release mode; debug frames can overflow
+  DynamoRIO's roughly 56 KiB client stack. A Rust panic in a handler aborts the
+  process, so `catch_unwind` is not a recovery path. DynamoRIO follows
+  fork/exec children by default (`-follow_children`). The selected Reverie
+  `Tool` is compiled into `client.so`; there is no runtime tool-selection path,
+  so a different tool requires a different client build.
+- **KVM:** the hypercall return register is only 32 bits; obtain full-width
+  results from the shared frame rather than trusting the truncated return
+  register.
+- **LiteInst preload:** random instrumentation applies to dynamically linked
+  ELF guests. Fully static binaries, including typical Go binaries, are outside
+  that preload path and must be reported as unsupported rather than a false
+  runtime regression. Preserve callback isolation across process lifecycle
+  transitions: instrumentation callback state must not leak across `fork` or
+  `exec`.
+- **SaBRe:** preserve example-tool selection across `fork`; losing the selected
+  tool in children is a known regression class.
+
 ## Milestone Completion Gate
 
 **A milestone is NOT DONE until the code is on main.**
@@ -78,7 +103,11 @@ Record exact `file:line -> symbol -> symbol` paths, commands, and literal output
 
 A backend is REAL if and only if:
 
-1. **`hermit run --backend X --strict --verify -- echo hello` exits 0 on main branch**
+1. **The real CLI runs an arbitrary guest on main.** For non-KVM backends use
+   `hermit run --backend X --strict --verify --verify-strict --verify-json
+   <path> -- echo hello` and require `bitwise_parity: true`.
+   KVM currently provides exact exit/stdout/stderr repeat parity only; its
+   internal logs are not compared, so never score that result as L2.
    - If --backend flag doesn't exist on main: NOT a real backend yet
    - If it exists but ignores the program (canned output): FAKE
 
@@ -92,7 +121,8 @@ A backend is REAL if and only if:
 
 4. **Arbitrary programs run**: test at least 3 real programs (echo, true, cat)
    - All must produce correct output
-   - All must pass --verify (determinism check)
+   - Non-KVM L2 claims require strict JSON `bitwise_parity: true`; KVM results
+     stay explicitly output/status-only
 
 5. **hermit-cli links the backend**: check Cargo.toml dependencies
    - If hermit-cli doesn't depend on reverie-xxx: not wired in
@@ -134,15 +164,22 @@ rg -n 'run_kvm|run_dbi|detcore::Config|Detcore<' hermit-cli/src/ detcore/src/
 rg -n 'syscall|intercept|passthrough|forward' hermit-cli/src/ detcore/src/ reverie-*/src/
 
 # 7. Try running real programs (if --backend exists)
-target/release/hermit run --backend X --strict --verify -- echo hello 2>&1
-target/release/hermit run --backend X --strict --verify -- /bin/true 2>&1
-target/release/hermit run --backend X --strict --verify -- cat /dev/null 2>&1
+target/release/hermit run --backend X --strict --verify --verify-strict \
+  --verify-json /tmp/backend-X-echo.json -- echo hello 2>&1
+target/release/hermit run --backend X --strict --verify --verify-strict \
+  --verify-json /tmp/backend-X-true.json -- /bin/true 2>&1
+target/release/hermit run --backend X --strict --verify --verify-strict \
+  --verify-json /tmp/backend-X-cat.json -- cat /dev/null 2>&1
 
 # 8. Capture and compare INFO-level syscall handling with ptrace
-target/release/hermit --log info run --strict --verify -- echo hello > /tmp/hermit-ptrace.out 2> /tmp/hermit-ptrace.info
-target/release/hermit --log info run --backend X --strict --verify -- echo hello > /tmp/hermit-backend-X.out 2> /tmp/hermit-backend-X.info
+target/release/hermit --log info run --strict --verify --verify-strict -- echo hello > /tmp/hermit-ptrace.out 2> /tmp/hermit-ptrace.info
+target/release/hermit --log info run --backend X --strict --verify --verify-strict -- echo hello > /tmp/hermit-backend-X.out 2> /tmp/hermit-backend-X.info
 diff -u /tmp/hermit-ptrace.info /tmp/hermit-backend-X.info
 ```
+
+For KVM, omit `--verify-strict` only to measure its supported output/status
+repeat path and mark the INFO comparison unavailable. Do not reinterpret the
+output-only JSON verdict as full parity.
 
 ## Report Format
 

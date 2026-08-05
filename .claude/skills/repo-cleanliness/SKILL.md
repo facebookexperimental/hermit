@@ -30,8 +30,9 @@ something a maintainer would knowingly keep.
 - Build and lint configuration (`Cargo.toml`, `Cargo.lock`, CI workflows, etc.).
 - **Curated, minimal** reference documentation: `AGENTS.md`, `README.md`,
   `CONTRIBUTING.md`, `docs/` that a new contributor actually needs.
-- Agent skills under `.claude/skills/` (surfaced via the `.llms/skills` and
-  `.agents/skills` directory symlinks — see "DRY skill layout" below).
+- Product skills under `.claude/skills/`, surfaced to Claude through
+  `.llms/skills` and to stock Codex through structured `.agents/skills`
+  entrypoints (see "Cross-client skill layout" below).
 
 ## What does NOT belong here
 
@@ -73,19 +74,23 @@ An experiment is durable only when another engineer can repeat it: record the
 question, method, exact command, repo SHAs, host facts, seed, and text/CSV/JSON
 results. Reference external code by URL + commit SHA — never by vendoring it.
 
-## DRY skill layout
+## Cross-client skill layout
 
-Skills are written **once** as real files and shared via directory symlinks, so
-there is a single source of truth:
+Skills are written **once** as real packages and shared via directory symlinks,
+so there is a single source of truth:
 
-- `.claude/skills/` holds the **real** skill files (a flat `<name>.md`, or a
-  `<name>/SKILL.md` directory for larger skills).
-- `.llms/skills` and `.agents/skills` are **directory symlinks** to
-  `../.claude/skills`. Do not duplicate a skill file into them.
+- `.claude/skills/<name>/` holds each **real** skill package, including its
+  canonical `SKILL.md` and any package-local resources.
+- `.llms/skills` is a directory symlink to `../.claude/skills` for the existing
+  Claude/LLMS hook.
+- `.agents/skills/<name>` is a whole-package symlink to the matching canonical
+  directory. Stock Codex discovers the shared `SKILL.md` through that link.
 - `CLAUDE.md` is a symlink to `AGENTS.md` for the same reason.
 
-To add a skill, create one file under `.claude/skills/` — it appears
-automatically under `.llms/` and `.agents/`. Never copy-paste a second copy.
+Keep instruction bodies canonical under `.claude/skills/`; never copy the body
+into an adapter or link only the `SKILL.md` file. Run
+`scripts/check-skill-discovery.rs` after changes. Parent coordinator roles
+belong in dev-hermit, not this product repository.
 
 ## Pre-commit protocol
 

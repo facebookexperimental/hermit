@@ -139,6 +139,16 @@ ONLY_LANE=""
 ONLY_NODES=""
 SELECTIVE_MODE=0
 SELECTIVE_BASELINE=""
+# --shallow-select: force the selective baseline to HEAD~1 (footprint of the most
+# recent commit only, trusting the parent as green). Additive over --selective.
+SHALLOW_SELECT=0
+# --all / --full-run / VALIDATE_FORCE_FULL=1: assert the COMPLETE suite. A no-op
+# on top of the default full level today (plain ./validate.sh is already full),
+# but an explicit, recordable force-everything intent that refuses to be combined
+# with any focused/selective mode — and a forward guard should the default ever
+# flip to smart selection.
+FORCE_FULL=0
+[[ ${VALIDATE_FORCE_FULL:-0} == 1 ]] && FORCE_FULL=1
 RUN_ON_DIRTY_TREE=0
 [[ ${VALIDATE_RUN_ON_DIRTY_TREE:-0} == 1 ]] && RUN_ON_DIRTY_TREE=1
 IGNORE_CACHE=0
@@ -178,6 +188,8 @@ while [[ $# -gt 0 ]]; do
         --qemu-l2-only) QEMU_L2_ONLY=1; shift ;;
         --privileged-only) PRIVILEGED_ONLY=1; shift ;;
         --selective|--since-green) SELECTIVE_MODE=1; shift ;;
+        --shallow-select) SELECTIVE_MODE=1; SHALLOW_SELECT=1; shift ;;
+        --all|--full-run) FORCE_FULL=1; shift ;;
         --baseline)
             SELECTIVE_BASELINE=${2:-}
             [[ -n $SELECTIVE_BASELINE ]] || { echo "validate.sh: --baseline needs a SHA" >&2; exit 2; }
@@ -229,8 +241,16 @@ Focused gates (run one matrix/lane and exit):
   --selective, --since-green    Run only the portable DAG nodes affected by changes
                                 since the last known-green baseline (fail-safe: any
                                 doubt or no trustworthy baseline runs the full lane).
+  --shallow-select              Like --selective but pin the baseline to HEAD~1:
+                                validate only the footprint of the most recent
+                                commit, trusting its parent as green. Upper-bound
+                                reduction; still fail-safe (unknown path/no HEAD~1
+                                runs the full lane). Cannot be combined with --baseline.
   --baseline <sha>              Known-green baseline commit for --selective (else
                                 $HERMIT_LAST_GREEN_SHA, else the ledger's last green).
+  --all, --full-run             Assert the COMPLETE suite explicitly. Refuses to be
+                                combined with any focused/selective mode. (Equivalent
+                                to VALIDATE_FORCE_FULL=1.)
 
 Other options:
   --verbose        Stream each gate's command, PID, elapsed time, and output.
@@ -295,6 +315,14 @@ if ((only_modes > 1)); then
 fi
 if ((VALIDATION_LEVEL_EXPLICIT == 1 && only_modes > 0)); then
     echo "validate.sh: validation levels cannot be combined with focused validation modes" >&2
+    exit 2
+fi
+if ((FORCE_FULL == 1 && only_modes > 0)); then
+    echo "validate.sh: --all/--full-run forces the complete suite and cannot be combined with a focused or selective mode" >&2
+    exit 2
+fi
+if ((SHALLOW_SELECT == 1)) && [[ -n $SELECTIVE_BASELINE ]]; then
+    echo "validate.sh: --shallow-select forces a HEAD~1 baseline; do not also pass --baseline" >&2
     exit 2
 fi
 VALIDATION_PROFILE=$VALIDATION_LEVEL
@@ -979,7 +1007,7 @@ readonly STRICT_COMPAT_TOTAL=191
 # The R/R ratchet asserts exactly the programs measured to pass record/replay.
 # History: PR #729 established a 131-row set (incl. ruby/dc/tcl) and PR #662 added
 # descriptor-state and writable-filesystem rows, reaching 144. A measured sweep
-# (see RR_COMPAT_KNOWN_FAILURES below) then found five gcc/binutils toolchain
+# (see record_replay_xfail_strict.rs) then found five gcc/binutils toolchain
 # programs -- g++, ar, strip, gprof, gcov -- that diverge on replay, so the honest
 # passing set is 139, not 144. Do NOT raise this number without a fresh sweep
 # proving the added rows pass R/R: an aspirational count is a phantom ratchet that
@@ -1041,23 +1069,11 @@ declare -ar COMPAT_SUMMARY_CATEGORIES=(
     other
 )
 
-# Programs owned by the strict corpus that are measured to FAIL record/replay and
-# are therefore excluded from the R/R passing ratchet below. Each records cleanly
-# but diverges on replay at hermit-cli/src/replayer/mod.rs:776 (the two runs part
-# on a specific thread/syscall event) -- a deeper multi-threaded compile/link/
-# analyze desync, distinct from the regular-file lseek(SEEK_CUR) divergence fixed
-# alongside this ratchet. They remain probed under strict/sabre modes; this list
-# documents why rr mode does not gate on them (the gcc/binutils toolchain R/R gap).
-declare -Ar RR_COMPAT_KNOWN_FAILURES=(
-    [g++]="replay diverges (thread 13, ~event 132): C++ front-end header/.gch path resolution (readlink vs newfstatat) desyncs the event stream"
-    [ar]="replay diverges (thread 11, ~event 3): archive workload teardown (execveat rm -rf) reorders against the recorded stream"
-    [strip]="replay diverges at replayer/mod.rs:776 after a clean record"
-    [gprof]="replay diverges at replayer/mod.rs:776 after a clean record"
-    [gcov]="replay diverges at replayer/mod.rs:776 after a clean record"
-)
 # Commands remain owned by the strict corpus below; this exact set only selects
-# rows measured to pass R/R. The five RR_COMPAT_KNOWN_FAILURES toolchain programs
-# (g++, ar, strip, gprof, gcov) are intentionally absent.
+# rows measured to pass R/R. The five toolchain divergences (g++, ar, strip,
+# gprof, gcov) are intentionally absent here and are exercised by the product's
+# xfail-strict record_replay_xfail_strict integration test. That test fails when
+# a listed divergence passes or changes to an unrecognized failure shape.
 declare -Ar RR_COMPAT_PASSING_LABELS=(
     [echo]=1 [seq]=1 [cat]=1 [wc]=1 [head]=1 [base64]=1 [id]=1
     [lua]=1 [perl]=1 [awk]=1 [bc]=1 [sqlite3]=1 [bash]=1
@@ -1287,6 +1303,7 @@ function append_validation_ledger {
     local evidence_helper evidence_json failed_substeps_json='[]' flaky_failed_substeps_json='[]'
     local known_flaky_failure_json=null solo_rerun_confirmation_json=false
     local solo_rerun_of_json=null
+    local first_error_line_json=null failed_substep_classes_json='[]'
     local evidence_available=0 failure_origin_json gate_substeps_json
     local interruption_signal_json=null
     local i
@@ -1334,6 +1351,14 @@ function append_validation_ledger {
             known_flaky_failure_json=$(jq -r '.known_flaky_failure' <<<"$evidence_json")
             solo_rerun_confirmation_json=$(jq -r '.solo_rerun_confirmation' <<<"$evidence_json")
             solo_rerun_of_json=$(jq -c '.solo_rerun_of' <<<"$evidence_json")
+            # DURABLE ATTRIBUTION: the per-node fault verdict and the verbatim
+            # headline fault line are computed by failure_evidence.py; inline them
+            # into the row so a red is attributable to WHICH bug (infra vs code,
+            # first_error_line) from the row ALONE — after the /tmp log is evicted.
+            # The read side (ci-hub/validate/attribute_reds.py) prefers these
+            # row-carried classes over dereferencing the ephemeral log_file.
+            first_error_line_json=$(jq -c '.first_error_line' <<<"$evidence_json")
+            failed_substep_classes_json=$(jq -c '.failed_substep_classes' <<<"$evidence_json")
             evidence_available=1
         fi
     fi
@@ -1423,6 +1448,8 @@ function append_validation_ledger {
     line+="\"dag_jobs\":$VALIDATION_DAG_JOBS,\"concurrent_validates\":$concurrent_validates_json,"
     line+="\"concurrency_proof\":$concurrency_proof_json,"
     line+="\"known_flaky_failure\":$known_flaky_failure_json,"
+    line+="\"first_error_line\":$first_error_line_json,"
+    line+="\"failed_substep_classes\":$failed_substep_classes_json,"
     line+="\"flaky_failed_substeps\":$flaky_failed_substeps_json,"
     line+="\"solo_rerun_confirmation\":$solo_rerun_confirmation_json,"
     line+="\"solo_rerun_of\":$solo_rerun_of_json,"
@@ -2098,31 +2125,12 @@ function hermit_run_smoke {
     fi
 }
 
-function hermit_determinism_check {
-    local first_output
-    local second_output
-    local status
-
-    first_output=$(hermit_echo)
-    status=$?
-    if ((status != 0)); then
-        return "$status"
-    fi
-
-    second_output=$(hermit_echo)
-    status=$?
-    if ((status != 0)); then
-        return "$status"
-    fi
-
-    if [[ "$first_output" != "$second_output" ]]; then
-        echo "Hermit stdout differed between identical runs:" >&2
-        diff -u \
-            <(printf "%s\n" "$first_output") \
-            <(printf "%s\n" "$second_output") >&2 || true
-        return 1
-    fi
-}
+# NOTE: a former `hermit_determinism_check` reimplemented determinism checking in
+# bash (run the guest twice, string-compare stdout). That duplicated the shipped
+# `hermit run --verify` path and only compared stdout, so it could pass while the
+# product's own verifier (which also compares stderr, the DETLOG event stream, and
+# exit status) diverged. It was removed; `hermit_verify_smoke` below is the
+# product-backed determinism check for the same echo workload.
 
 function hermit_verify_smoke {
     timeout "$HERMIT_SMOKE_TIMEOUT" \
@@ -2131,21 +2139,14 @@ function hermit_verify_smoke {
 }
 
 function hermit_record_replay_smoke {
-    local case_dir="$VALIDATION_TMP_DIR/record-smoke"
-    local data_dir="$case_dir/recording"
-    local record_stdout="$case_dir/record.stdout"
-    local replay_stdout="$case_dir/replay.stdout"
-
-    rm -rf "$case_dir"
-    mkdir -p "$case_dir"
+    # Delegate to the shipped record/replay verifier instead of reimplementing it
+    # in bash. `record start --verify` records the guest, replays the recording,
+    # and diffs stdout, stderr, the DETLOG event stream, and exit status, failing
+    # nonzero on any divergence. The former bash version only recorded (without
+    # --verify), replayed with --autopilot, and `cmp`-ed stdout, so it exercised a
+    # strictly weaker check than the product actually ships.
     timeout "$HERMIT_SMOKE_TIMEOUT" \
-        "$HERMIT_BIN" record start --data-dir "$data_dir" -- \
-        /bin/echo "$SMOKE_MARKER" >"$record_stdout" || return
-    timeout "$HERMIT_SMOKE_TIMEOUT" \
-        "$HERMIT_BIN" replay --autopilot --data-dir "$data_dir" \
-        >"$replay_stdout" || return
-    grep -Fxq "$SMOKE_MARKER" "$record_stdout" &&
-        cmp -s "$record_stdout" "$replay_stdout"
+        "$HERMIT_BIN" record start --verify -- /bin/echo "$SMOKE_MARKER"
 }
 
 function kvm_backend_available {
@@ -2644,22 +2645,18 @@ function rr_compatibility_probe {
     fi
 
     local case_dir="$VALIDATION_TMP_DIR/rr-$label"
-    local data_dir="$case_dir/recording"
     local started_at=$SECONDS
     local output_start
-    local record_status
-    local replay_status=125
-    local stdout_equal=no
+    local verify_status
     local summary
 
     RR_COMPAT_TOTAL=$((RR_COMPAT_TOTAL + 1))
     mkdir -p "$case_dir"
     {
         printf "=== R/R compatibility: %s ===\n" "$label"
-        printf "Record:"
-        printf " %q" "$STRICT_COMPAT_HERMIT_BIN" record start --data-dir "$data_dir" -- "$@"
-        printf "\nReplay: %q replay --autopilot --data-dir %q\n" \
-            "$STRICT_COMPAT_HERMIT_BIN" "$data_dir"
+        printf "Verify:"
+        printf " %q" "$STRICT_COMPAT_HERMIT_BIN" record start --verify -- "$@"
+        printf "\n"
     } >>"$LOG_FILE"
     output_start=$(($(wc -l <"$LOG_FILE") + 1))
 
@@ -2667,25 +2664,23 @@ function rr_compatibility_probe {
         printf "  R/R compatibility probe: %s\n" "$label"
     fi
 
-    run_rr_compatibility_phase "$case_dir/record.stdout" "$case_dir/record.stderr" \
-        "$STRICT_COMPAT_HERMIT_BIN" record start --data-dir "$data_dir" -- "$@"
-    record_status=$?
-    if ((record_status == 0)); then
-        run_rr_compatibility_phase "$case_dir/replay.stdout" "$case_dir/replay.stderr" \
-            "$STRICT_COMPAT_HERMIT_BIN" replay --autopilot --data-dir "$data_dir"
-        replay_status=$?
-        if cmp -s "$case_dir/record.stdout" "$case_dir/replay.stdout"; then
-            stdout_equal=yes
-        else
-            diff -u "$case_dir/record.stdout" "$case_dir/replay.stdout" \
-                >"$case_dir/stdout.diff" || true
-        fi
-    fi
+    # Use the shipped record/replay verifier as the single source of truth for
+    # this probe. `record start --verify` records the guest, replays the
+    # recording, and diffs stdout, stderr, the DETLOG event stream, and exit
+    # status; a nonzero exit means any of those diverged. The previous bash logic
+    # recorded WITHOUT --verify, replayed with --autopilot, and only `cmp`-ed
+    # stdout, so it exercised a strictly weaker check than Hermit ships and could
+    # report R/R "PASS" while stderr, the DETLOG event stream, or the exit status
+    # actually diverged. Delegating here keeps the ratchet honest against the
+    # product's own verifier.
+    run_rr_compatibility_phase "$case_dir/verify.stdout" "$case_dir/verify.stderr" \
+        "$STRICT_COMPAT_HERMIT_BIN" record start --verify -- "$@"
+    verify_status=$?
 
-    if ((record_status == 0 && replay_status == 0)) && [[ $stdout_equal == yes ]]; then
+    if ((verify_status == 0)); then
         RR_COMPAT_PASSED=$((RR_COMPAT_PASSED + 1))
         printf "  ✅ %-12s PASS R/R (%ss)\n" "$label" "$((SECONDS - started_at))"
-        printf "Record exit: 0\nReplay exit: 0\nStdout equal: yes\n\n" >>"$LOG_FILE"
+        printf "Verify exit: 0\n\n" >>"$LOG_FILE"
         rm -rf "$case_dir"
         return 0
     fi
@@ -2697,25 +2692,20 @@ function rr_compatibility_probe {
         printf "  ⚠️  R/R canary %s failed; skipping the remaining selected probes\n" "$label"
     fi
     {
-        printf "Record exit: %s\nReplay exit: %s\nStdout equal: %s\n" \
-            "$record_status" "$replay_status" "$stdout_equal"
-        if [[ -s $case_dir/record.stderr ]]; then
-            printf '%s\n' "--- record stderr ---"
-            tail -n 120 "$case_dir/record.stderr"
+        printf "Verify exit: %s\n" "$verify_status"
+        if [[ -s $case_dir/verify.stdout ]]; then
+            printf '%s\n' "--- verify stdout ---"
+            tail -n 120 "$case_dir/verify.stdout"
         fi
-        if [[ -s $case_dir/replay.stderr ]]; then
-            printf '%s\n' "--- replay stderr ---"
-            tail -n 120 "$case_dir/replay.stderr"
-        fi
-        if [[ -s $case_dir/stdout.diff ]]; then
-            printf '%s\n' "--- stdout diff ---"
-            sed -n '1,120p' "$case_dir/stdout.diff"
+        if [[ -s $case_dir/verify.stderr ]]; then
+            printf '%s\n' "--- verify stderr ---"
+            tail -n 120 "$case_dir/verify.stderr"
         fi
         printf "\n"
     } >>"$LOG_FILE"
     summary=$(failure_summary "$output_start")
-    printf "  ❌ %-12s FAIL R/R (record %s, replay %s, stdout %s: %s)\n" \
-        "$label" "$record_status" "$replay_status" "$stdout_equal" "$summary"
+    printf "  ❌ %-12s FAIL R/R (verify %s: %s)\n" \
+        "$label" "$verify_status" "$summary"
     return 0
 }
 
@@ -4193,6 +4183,14 @@ function run_portable_only_suite {
 # the full lane. Never fail-open on a stale or missing baseline.
 function resolve_selective_baseline {
     local sha=""
+    # --shallow-select pins the baseline to HEAD~1 (footprint of the newest commit
+    # only). If HEAD has no parent (root commit) we emit nothing, so selection
+    # fails safe to the full lane.
+    if ((SHALLOW_SELECT == 1)); then
+        sha=$(git rev-parse --verify HEAD~1 2>/dev/null) || return 0
+        [[ -n $sha ]] && printf '%s\n' "$sha"
+        return 0
+    fi
     if [[ -n ${SELECTIVE_BASELINE:-} ]]; then
         sha=$SELECTIVE_BASELINE
     elif [[ -n ${HERMIT_LAST_GREEN_SHA:-} ]]; then
@@ -4258,6 +4256,24 @@ function run_selective_suite {
     fi
     decision=$(printf '%s' "$sel_json" | jq -r '.decision // "full"' 2>/dev/null || echo full)
     total=$(jq '.steps | length' "$ROOT_DIR/ci/dag/portable.json")
+
+    # Transparent coverage report: select-tests.rs --format human enumerates the
+    # baseline/evidence, every changed path, the selector reason, and every
+    # SKIPPED portable node / test shard / e2e cell. Inability to produce that
+    # report is treated as doubt and runs the FULL lane — a subset must never run
+    # without a human-auditable account of what it dropped and why.
+    local -a human_args=(--since-green --format human)
+    [[ -n $baseline ]] && human_args=(--since-green --baseline "$baseline" --format human)
+    local coverage_report
+    if ! coverage_report=$("$ROOT_DIR/ci/select-tests.rs" "${human_args[@]}" 2>>"$LOG_FILE") \
+        || [[ -z $coverage_report ]]; then
+        printf "Selective validation: could not produce the coverage report; running the FULL portable lane.\n"
+        run_portable_only_suite
+        return $?
+    fi
+    printf -- '----- selective coverage report (skipped nodes/shards/e2e cells + reasons) -----\n'
+    printf '%s\n' "$coverage_report"
+    printf -- '-------------------------------------------------------------------------------\n'
 
     case "$decision" in
         skip)
@@ -4391,7 +4407,6 @@ function run_quick_suite {
         ./ci/test_harness.sh run --lane portable --mode verify --backend ptrace --ci-only
     run_check "Detcore core unit tests" cargo test -p detcore --lib
     run_check "Hermit run smoke test" hermit_run_smoke
-    run_check "Hermit output determinism" hermit_determinism_check
     run_check "Hermit verify-mode smoke test" hermit_verify_smoke
     run_check "Hermit record/replay smoke test" hermit_record_replay_smoke
 }
@@ -4642,6 +4657,10 @@ if ((RR_COMPAT_ONLY == 1)); then
     if ((failures == 0)); then
         run_check "Record/replay compatibility baseline ($RR_COMPAT_EXPECTED programs)" \
             run_rr_compatibility_envelope
+    fi
+    if ((failures == 0)); then
+        run_check_with_timeout 900 "Record/replay expected-divergence ratchet (xfail-strict)" \
+            cargo test -p hermit --test record_replay_xfail_strict -- --test-threads=1
     fi
     print_summary
     ((failures == 0))

@@ -249,8 +249,10 @@ impl Dag {
 
 // Always-on cheap safety gates for any selective run.
 const PREFLIGHT: &[&str] = &[
+    "check.skill_discovery",
     "check.backend_abstraction",
     "check.portability_paths",
+    "check.script_sigpipe",
     "lint.rustfmt",
 ];
 
@@ -1002,6 +1004,17 @@ fn self_test() {
 
     let ci = select(&fp, &dag, &vec!["ci/dag/portable.json".into()]);
     check("ci/** ⇒ full", ci.decision == Decision::Full);
+
+    let skill = select(&fp, &dag, &vec![".claude/skills/benchmark/SKILL.md".into()]);
+    check("skill change ⇒ selective", skill.decision == Decision::Selective);
+    check(
+        "skill change runs discovery check",
+        skill.nodes.contains("check.skill_discovery"),
+    );
+    check(
+        "skill change runs rust-script SIGPIPE/cache guard",
+        skill.nodes.contains("check.script_sigpipe"),
+    );
 
     let dbi = select(&fp, &dag, &vec!["detcore-dbi/src/lib.rs".into()]);
     check("dbi-only ⇒ selective", dbi.decision == Decision::Selective);

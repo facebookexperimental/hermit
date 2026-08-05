@@ -3992,7 +3992,7 @@ program = "tests/c/pidfd_open_self.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
+ci = true
 backends_enabled = ["ptrace", "sabre"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
@@ -6178,7 +6178,7 @@ program = "tests/c/scheduler_policy_queries.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
+ci = true
 backends_enabled = ["ptrace", "sabre"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
@@ -7328,7 +7328,7 @@ program = "tests/c/syscall_file_metadata.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
+ci = true
 backends_enabled = ["ptrace", "sabre"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"

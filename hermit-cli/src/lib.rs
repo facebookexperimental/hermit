@@ -1491,6 +1491,10 @@ fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig 
     config.backend_serializes_fork_children = false;
     config.backend_dispatches_thread_tools = true;
     config.backend_requires_thread_directed_process_signals = backend == Backend::Dbi;
+    // Under DBI the post-exec hook fires from the first syscall event (after
+    // libc startup), so %rsp is no longer the entry-point argc pointer and the
+    // env-hash initial-stack read cannot be performed safely.
+    config.initial_stack_unavailable_at_post_exec = backend == Backend::Dbi;
     config.backend_virtualizes_capability_prctls = backend == Backend::Kvm;
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1152): KVM defers the vfork child spawn, so the child

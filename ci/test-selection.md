@@ -62,8 +62,9 @@ The outcome is one of three decisions:
 
 - **skip** — *every* changed file is ci_irrelevant. Run nothing.
 - **selective** — files map to a subset. Run that subset, closed over the DAG's
-  build `deps`, plus a small always-on preflight (`lint.rustfmt`,
-  `check.backend_abstraction`, `check.portability_paths`).
+  build `deps`, plus a small always-on preflight (`check.skill_discovery`,
+  `check.script_sigpipe`, `lint.rustfmt`, `check.backend_abstraction`,
+  `check.portability_paths`).
 - **full** — a force_full or unknown file appeared, or no baseline is trusted.
 
 ### Fail-safe by construction

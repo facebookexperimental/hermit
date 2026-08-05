@@ -9,18 +9,26 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/xattr.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef SYS_fchmodat2
 #define SYS_fchmodat2 452
+#endif
+
+#ifndef SYS_faccessat2
+#define SYS_faccessat2 439
 #endif
 
 #ifndef SYNC_FILE_RANGE_WRITE
@@ -86,6 +94,81 @@ static void require_xattr_list(ssize_t result, const char *call_name,
   }
 }
 
+static void check_metadata_agreement(const char *path, int fd) {
+  struct statx extended;
+  struct stat legacy;
+  memset(&extended, 0, sizeof(extended));
+  memset(&legacy, 0, sizeof(legacy));
+  require_zero(statx(AT_FDCWD, path, 0, STATX_TYPE | STATX_MODE, &extended),
+               "statx");
+  require_zero(syscall(SYS_newfstatat, AT_FDCWD, path, &legacy, 0),
+               "newfstatat");
+  if ((extended.stx_mode & (S_IFMT | 07777)) !=
+      (legacy.st_mode & (S_IFMT | 07777))) {
+    fprintf(stderr, "statx/newfstatat mode mismatch: %o/%o\n",
+            extended.stx_mode, legacy.st_mode);
+    exit(1);
+  }
+
+  struct statfs by_path;
+  struct statfs by_fd;
+  require_zero(statfs(path, &by_path), "statfs");
+  require_zero(fstatfs(fd, &by_fd), "fstatfs");
+  if (by_path.f_type != by_fd.f_type) {
+    fprintf(stderr, "statfs/fstatfs type mismatch: %lx/%lx\n",
+            (unsigned long)by_path.f_type, (unsigned long)by_fd.f_type);
+    exit(1);
+  }
+
+  require_zero(syscall(SYS_faccessat2, AT_FDCWD, path, R_OK, 0), "faccessat2");
+  errno = 0;
+  long invalid_access =
+      syscall(SYS_faccessat2, AT_FDCWD, path, R_OK, 0x40000000U);
+  if (invalid_access != -1 || errno != EINVAL) {
+    fprintf(stderr, "faccessat2 invalid flags returned %ld/%d\n",
+            invalid_access, errno);
+    exit(1);
+  }
+
+  const struct timespec timestamps[2] = {
+      {.tv_sec = 123, .tv_nsec = 456000000},
+      {.tv_sec = 789, .tv_nsec = 123000000},
+  };
+  require_zero(utimensat(AT_FDCWD, path, timestamps, 0), "utimensat");
+  /* Stat timestamps are virtualized; both entry points must expose one value.
+   */
+  memset(&extended, 0, sizeof(extended));
+  memset(&legacy, 0, sizeof(legacy));
+  require_zero(statx(AT_FDCWD, path, 0, STATX_MTIME, &extended),
+               "statx after utimensat");
+  require_zero(syscall(SYS_newfstatat, AT_FDCWD, path, &legacy, 0),
+               "newfstatat after utimensat");
+  if ((extended.stx_mask & STATX_MTIME) == 0 ||
+      extended.stx_mtime.tv_sec != legacy.st_mtim.tv_sec ||
+      extended.stx_mtime.tv_nsec != (uint32_t)legacy.st_mtim.tv_nsec ||
+      extended.stx_mtime.tv_nsec >= 1000000000U) {
+    fprintf(
+        stderr,
+        "utimensat metadata views disagree: statx=%lld.%09u stat=%lld.%09ld\n",
+        (long long)extended.stx_mtime.tv_sec, extended.stx_mtime.tv_nsec,
+        (long long)legacy.st_mtim.tv_sec, legacy.st_mtim.tv_nsec);
+    exit(1);
+  }
+
+  require_zero(flock(fd, LOCK_EX), "flock parent lock");
+  /* Hermit's serialized flock policy is deterministic no-op success. */
+  int contender_fd = open(path, O_RDWR);
+  if (contender_fd < 0) {
+    perror("open flock contender");
+    exit(1);
+  }
+  require_zero(flock(contender_fd, LOCK_EX | LOCK_NB),
+               "flock contender virtual no-op");
+  require_zero(flock(contender_fd, LOCK_UN), "flock contender unlock");
+  require_zero(close(contender_fd), "close flock contender");
+  require_zero(flock(fd, LOCK_UN), "flock parent unlock");
+}
+
 int main(void) {
   char path[128];
   char hardlink_path[128];
@@ -138,6 +221,8 @@ int main(void) {
     perror("fchmodat2");
     return 1;
   }
+
+  check_metadata_agreement(path, fd);
 
   require_zero(link(path, hardlink_path), "link");
   require_zero(symlink(path, symlink_path), "symlink");

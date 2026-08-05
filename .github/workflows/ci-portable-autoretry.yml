@@ -11,14 +11,28 @@ name: Portable auto-retry on cancellation
 # attempt 3) so the recurrence self-heals.
 #
 # GitHub's `concurrency:` block cannot express a retry, so this is implemented as
-# the standard workflow_run companion. Two guards keep it from storming the
-# scarce hosted-runner queue or re-running a stale head:
+# the standard workflow_run companion. Several guards keep it from storming the
+# scarce hosted-runner queue, re-running a stale head, or fighting a deliberate
+# local-validation fallback:
 #   * it fires ONLY on conclusion == cancelled (never on genuine failure or
 #     success), and only for pull_request-triggered runs; and
 #   * it re-runs ONLY when the cancelled run's head is still the PR's current
 #     head — if the head moved, a newer run already owns the PR and this exits.
 # run_attempt < 3 caps the retries so a pathologically re-cancelled run cannot
 # loop forever.
+#
+# Two further guards protect the "cancel CI and validate locally" fallback. When
+# hosted capacity is scarce, that fallback DELIBERATELY cancels a run that has
+# waited too long to start and validates the PR on a local runner instead. Auto-
+# retrying such a run would re-queue it, let it wait, cancel it again, and loop —
+# so the auto-retry must stand down whenever a local fallback is in effect:
+#   * repository variable CI_MODE: when set to 'constrained', the whole job is
+#     skipped, disabling auto-retry fleet-wide while capacity is short. CI_MODE
+#     is normally unset (empty), which is `!= 'constrained'`, so this guard is a
+#     no-op under normal operation.
+#   * per-PR label ci-local-fallback: when a PR carries this label its run was
+#     cancelled on purpose for local validation, so this job exits without a
+#     rerun. A PR without the label is unaffected.
 on:
   workflow_run:
     workflows: ["CI (GitHub-managed portable)"]
@@ -35,7 +49,8 @@ jobs:
     if: >-
       github.event.workflow_run.conclusion == 'cancelled' &&
       github.event.workflow_run.event == 'pull_request' &&
-      github.event.workflow_run.run_attempt < 3
+      github.event.workflow_run.run_attempt < 3 &&
+      vars.CI_MODE != 'constrained'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -60,6 +75,12 @@ jobs:
           fi
           if [[ -z "$num" ]]; then
             echo "No open PR associated with cancelled run $RUN_ID; nothing to retry."
+            exit 0
+          fi
+
+          labels=$(gh api "repos/$REPO/pulls/$num" --jq '[.labels[].name] | join(",")')
+          if grep -qw 'ci-local-fallback' <<<"$labels"; then
+            echo "PR #$num is in ci-hub local-validate fallback (label ci-local-fallback); not re-running cancelled run $RUN_ID."
             exit 0
           fi
 

@@ -75,13 +75,18 @@ hermit log-diff --syscall-history 5 /tmp/good.log /tmp/broken.log
 ```
 
 `--unsafe-strip-lines` is only a non-parity localization aid. It erases the
-timestamps and syscall values that bitwise parity exists to compare; using it
+virtual-time and syscall values that strict parity exists to compare; using it
 to make a failing parity diff pass is cheating.
 
 When the two logs come from different binaries/versions and `log-diff` can't
 pair them, fall back to canonicalizing (strip timestamps/PIDs/pointers) and
 plain `diff`, then read **only the first divergence** — everything after it is
-downstream noise. Anchor on the last matching `COMMIT turn`/`inbound syscall`
+downstream noise. This more aggressively canonicalized comparison is only a
+localization aid, never verification or parity evidence. The eventual non-KVM
+fix must pass `--verify --verify-strict --verify-json` with
+`bitwise_parity: true`: exact exit/stdout/stderr plus INFO events under the
+declared `BitwiseInfoV1` wall-clock/address envelope.
+Anchor on the last matching `COMMIT turn`/`inbound syscall`
 and the first line that differs: a diverging `(turn, dettid)` is a *schedule*
 divergence; matching COMMITs with a differing DETLOG value is an *unvirtualized
 source*. This is exactly how the demo5 boot wedge was localized — a good boot
@@ -165,7 +170,7 @@ relaxations) bound to the fixed SHA — see the ladder in
   reading, `log-diff`, assurance ladder (the mechanics this skill builds on).
 - [`continuous-virtual-time-is-sacred`](../continuous-virtual-time-is-sacred/SKILL.md)
   — the full sacred-time anti-pattern catalogue and reviewer checklist.
-- [`deadlock-debugging`](../deadlock-debugging.md) — when the regression is a
+- [`deadlock-debugging`](../deadlock-debugging/SKILL.md) — when the regression is a
   hang/wedge rather than a value divergence.
 - Case study: `ai_docs/demo5-good-vs-broken-trace-diff-divergence_20260731.md`
   (in the `dev-hermit` parent) — the demo5 boot-wedge trace-diff that localized

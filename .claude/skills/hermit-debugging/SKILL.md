@@ -133,11 +133,14 @@ grep -oE 'detcore[a-z_:]*'      /tmp/h.log | sort | uniq -c | sort -rn    # subs
 
 ## 2. Finding a nondeterminism / divergence point
 
-When `hermit run --strict --verify` reports "nondeterministic", hermit already
-ran twice and compared the deterministic trace. To localize the divergence
-yourself, capture two runs and use the **built-in log differ** — it is far
-smarter than plain `diff` because it normalizes known-nondeterministic noise
-(hex pointers, tmp paths, `/proc/<pid>/`, elapsed-time fields).
+When `hermit run --strict --verify --verify-strict` reports
+"nondeterministic", Hermit already ran twice and compared exact
+exit/stdout/stderr plus INFO events under `BitwiseInfoV1`. To localize the
+divergence yourself, capture two runs and use the **built-in log differ**. Its
+more aggressive normalization of hex pointers, tmp paths, `/proc/<pid>/`, and
+elapsed-time fields makes it a diagnostic aid only. The final non-KVM fix must
+produce `bitwise_parity: true` through `--verify-json`; KVM's output-only
+fallback is not full L2 INFO parity.
 
 ```bash
 hermit --log info run -- <program> 2>/tmp/a.log
@@ -208,8 +211,10 @@ Per `AGENTS.md`, never say "works". State the level, backend, log level, and
 relaxations:
 
 - **L1** deterministic: `hermit run --strict` completes.
-- **L2** bitwise-identical repeat: `hermit run --strict --verify`.
-- **L3** memory determinism: add `--detlog-heap --detlog-stack`.
+- **L2** non-KVM canonical full-observation parity:
+  `hermit run --strict --verify --verify-strict --verify-json <path> -- ...`,
+  with JSON `bitwise_parity: true`.
+- **L3** memory determinism: add `--detlog-heap --detlog-stack` to L2.
 - **L4** stress-hardened: L2/L3 repeated ~20x with no divergence.
 
 Example of a correct report: "passes at L2 (ptrace backend, `--log` default,

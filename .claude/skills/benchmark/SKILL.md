@@ -6,7 +6,7 @@ description: "Run and publish focused, reproducible Hermit benchmarks with cgrou
 # Benchmark
 
 Use this protocol for performance work. Also load
-[presenting-quantitative-data](presenting-quantitative-data.md) and apply its
+[presenting-quantitative-data](../presenting-quantitative-data/SKILL.md) and apply its
 ratio, precision, source-linking, and reader-audit rules.
 
 ## Experimental Shape
@@ -35,6 +35,17 @@ ratio, precision, source-linking, and reader-audit rules.
   different hosts or materially different workload configurations.
 - Report absolute time before or beside normalized slowdown, using defensible
   significant figures.
+
+## Historical orientation is not a baseline
+
+Old exploratory work reported roughly 40 microseconds per ptrace trap versus
+roughly 1 microsecond for SaBRe, gVisor-KVM, and DBI; it also reported a
+strict-mode fixed startup cost around 18–30 ms, about 87x CPU-bound overhead
+under single-step execution, and throughput that varied approximately linearly
+with `--preemption-timeout`. Preserve these only as hypotheses that motivate a
+new experiment. Never quote them as current results, combine them with a new
+run, or infer determinism from the fixed-timeout claim. Re-measure every value
+on the same host/workload/current full SHAs under the protocol below.
 
 ## Separate Slowdown Sources
 
