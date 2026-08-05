@@ -4948,4 +4948,75 @@ total_commit_ms 0\n"
         // And the specific pair codex named: kvm is held by kvm_amd.
         assert_eq!(sanitize_module_refcnt(b"1\n", "kvm", modules), b"1\n");
     }
+
+    /// ROUND-2 REGRESSION GUARD for the scoped fd-resolution fallback.
+    ///
+    /// The first version of this fix resolved EVERY open through
+    /// `/proc/<pid>/fd/<fd>`, which silently reclassified the spelling-defined
+    /// kinds: `/proc/self/stat` resolves to `/proc/<pid>/stat`, a DIFFERENT
+    /// kind with a different sanitizer, and the `thread-self` aliases resolve
+    /// away entirely. The call site now classifies the spelling first and only
+    /// consults the resolved path when the spelling yields nothing, so the
+    /// fallback is MONOTONE.
+    ///
+    /// This test pins both halves of that property at the classifier level:
+    /// the spelling-defined kinds keep their own classification (so resolution
+    /// must never be consulted for them), and the AT_FDCWD/alias shapes have
+    /// none (so resolution is the only thing that can classify them).
+    #[test]
+    fn spelling_defined_kinds_classify_without_resolution() {
+        // REGRESSION GUARD: each of these classifies from the SPELLING. If any
+        // stopped classifying, the call site would fall through to the resolved
+        // numeric path and silently change the sanitizer applied.
+        let spelling_defined = [
+            ("/proc/self/stat", ProcfsKind::Stat),
+            ("/proc/self/status", ProcfsKind::Status),
+            ("/proc/thread-self/stat", ProcfsKind::ThreadStat),
+            ("/proc/thread-self/status", ProcfsKind::ThreadStatus),
+            ("/proc/self/statm", ProcfsKind::Statm),
+            ("/proc/thread-self/statm", ProcfsKind::Statm),
+            ("/proc/self/mountinfo", ProcfsKind::Mountinfo),
+        ];
+        let mut guarded = 0;
+        for (path, expected) in spelling_defined {
+            let kind = ProcfsFile::from_path(Path::new(path))
+                .unwrap_or_else(|| panic!("{path} must classify from its spelling alone"))
+                .kind;
+            assert_eq!(kind, expected, "{path} must keep its spelling-defined kind");
+            guarded += 1;
+        }
+        assert_eq!(guarded, 7, "all seven spelling-defined kinds were guarded");
+
+        // And the numeric form these would resolve TO is a DIFFERENT answer --
+        // which is exactly why unconditional resolution was a regression.
+        let numeric = ProcfsFile::from_path(Path::new("/proc/1234/stat"))
+            .expect("numeric process stat still classifies")
+            .kind;
+        assert_ne!(
+            numeric,
+            ProcfsKind::Stat,
+            "/proc/<pid>/stat is a different kind from /proc/self/stat; \
+             resolving the latter into the former is the regression this guards"
+        );
+
+        // POSITIVE (the gap the fallback exists to close): the AT_FDCWD/alias
+        // spellings classify as NOTHING on their own, so the resolved path is
+        // the only thing that can classify them -- and it does.
+        let mut unresolved = 0;
+        for path in ["refcnt", "kvm/refcnt", "sys/module/kvm/refcnt"] {
+            assert!(
+                ProcfsFile::from_path(Path::new(path)).is_none(),
+                "{path} must not classify lexically; only resolution can"
+            );
+            unresolved += 1;
+        }
+        assert_eq!(unresolved, 3, "all three relative spellings were checked");
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/sys/module/kvm/refcnt"))
+                .expect("the resolved form classifies")
+                .kind,
+            ProcfsKind::ModuleRefcnt("kvm".to_owned()),
+            "resolution turns the unclassifiable spelling into the real kind"
+        );
+    }
 }

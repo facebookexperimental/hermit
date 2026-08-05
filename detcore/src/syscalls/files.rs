@@ -111,9 +111,13 @@ const DETERMINISTIC_NETLINK_PORT_ID_BASE: u32 = 0x4000_0000;
 /// object was opened": it is produced by the kernel from the descriptor itself,
 /// so it is independent of the pathname spelling the guest used.
 ///
+/// Used ONLY as a fallback for a pathname that does not classify on its own
+/// (see the call site): a spelling that already classifies must keep its own
+/// classification, because `/proc/self/...` and `/proc/thread-self/...` are
+/// defined by the spelling and resolve to a different numeric path.
+///
 /// `None` when the link cannot be read (the descriptor is gone, or procfs is
-/// unavailable); callers fall back to the lexical path, which preserves the
-/// previous behaviour rather than degrading it.
+/// unavailable), in which case the lexical result stands unchanged.
 fn resolved_open_path(pid: i32, fd: RawFd) -> Option<PathBuf> {
     let link = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?;
     // A deleted or anonymous target is not a stable object name.
@@ -236,15 +240,25 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                 });
                 self.add_fd(guest, fd, call.flags(), fd_type).await?;
-                // Bind classification to the OPENED OBJECT, not to the spelling
-                // the guest used. `/proc/<pid>/fd/<fd>` is the kernel's own
-                // answer to "what did this open actually name", so every alias
-                // -- AT_FDCWD-relative, dirfd-relative, or a symlink -- lands on
-                // one classification. Falls back to the lexical path when the
-                // link cannot be read, which is never worse than before.
-                let resolved_path = resolved_open_path(guest.pid().as_raw(), fd)
-                    .unwrap_or_else(|| observed_path.clone());
-                let mut procfs = ProcfsFile::from_path(&resolved_path);
+                // Classify the spelling the guest used FIRST. Several kinds are
+                // defined by that spelling and MUST keep it: `/proc/self/...`,
+                // `/proc/thread-self/...` and the mountinfo aliases all resolve
+                // through `/proc/<pid>/fd/<fd>` to a numeric `/proc/<pid>/...`
+                // path, which is a DIFFERENT (or absent) classification. So
+                // resolution must never overwrite a spelling that already
+                // classifies.
+                //
+                // Only when the spelling yields nothing do we ask the kernel
+                // what the descriptor actually names. That is exactly the
+                // AT_FDCWD/alias gap -- `chdir("/sys/module/kvm"); open("refcnt")`
+                // classifies as nothing lexically -- and scoping it this way
+                // makes the fallback MONOTONE: it can only add a classification
+                // where there was none, never change one that already existed.
+                let mut procfs = ProcfsFile::from_path(&observed_path).or_else(|| {
+                    resolved_open_path(guest.pid().as_raw(), fd)
+                        .filter(|resolved| resolved != &observed_path)
+                        .and_then(|resolved| ProcfsFile::from_path(&resolved))
+                });
                 if procfs
                     .as_ref()
                     .is_some_and(ProcfsFile::needs_bound_thread_identity)
