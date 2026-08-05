@@ -924,7 +924,7 @@ function audit_ci_correspondence {
     # This is a literal workflow expression, not a local expansion.
     # shellcheck disable=SC2016
     assert_workflow_entrypoint privileged "$ROOT_DIR/.github/workflows/ci-privileged.yml" \
-        'timeout --foreground --kill-after=10s 270s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
+        'timeout --foreground --kill-after=10s 360s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
     assert_privileged_diagnostics "$ROOT_DIR/.github/workflows/ci-privileged.yml"
     # shellcheck disable=SC2016
     assert_validate_entrypoint portable run_portable_only_suite \
@@ -945,12 +945,37 @@ function audit_ci_correspondence {
     [[ $(grep -Fxc '        ./ci/run-dag.sh "$lane" -j "$VALIDATION_DAG_JOBS" -v' <<<"$runner_body") == 1 ]] ||
         die "validate.sh run_ci_manifest_lane must execute exactly one audited DAG"
 
-    local privileged_critical_path
+    # This validation command contains real concurrent rustc probes. Keep both
+    # lane copies on the measured 30s workload class and the same 60s cap so a
+    # shorter privileged proxy cannot reject work that passed the portable gate.
+    for lane in portable privileged; do
+        jq -e '
+            [.steps[] | select(
+                .group == "e2e"
+                and .job == "metadata"
+                and .cmd == "./ci/test_harness.sh validate"
+                and .timeout == 60
+                and .hint.est_duration_s == 30
+                and .hint.hard_mem_max_bytes == 1073741824
+            )] | length == 1
+        ' "$DAG_ROOT/$lane.json" >/dev/null ||
+            die "$lane e2e.metadata must carry the measured validation workload and 60s/1GiB bounds"
+    done
+
+    local privileged_critical_path privileged_job_timeout_minutes
+    local privileged_inner_timeout_seconds=360
+    local privileged_runner_overhead_seconds=30
     privileged_critical_path=$(dag_critical_path_seconds "$DAG_ROOT/privileged.json")
+    privileged_job_timeout_minutes=$(workflow_job_timeout_minutes \
+        "$ROOT_DIR/.github/workflows/ci-privileged.yml" privileged)
     [[ $privileged_critical_path =~ ^[0-9]+$ ]] ||
         die "privileged DAG critical path is not an integer: $privileged_critical_path"
-    ((privileged_critical_path <= 270)) ||
-        die "privileged DAG timeout path ${privileged_critical_path}s exceeds workflow bound 270s"
+    [[ $privileged_job_timeout_minutes =~ ^[1-9][0-9]*$ ]] ||
+        die "privileged workflow has no numeric outer job timeout"
+    ((privileged_inner_timeout_seconds > privileged_critical_path + privileged_runner_overhead_seconds)) ||
+        die "privileged DAG launcher must exceed ${privileged_critical_path}s critical path plus ${privileged_runner_overhead_seconds}s runner overhead"
+    ((privileged_job_timeout_minutes * 60 > privileged_inner_timeout_seconds + 180)) ||
+        die "privileged job timeout must exceed ${privileged_inner_timeout_seconds}s DAG launcher plus 180s workflow overhead"
 
     [[ -f $EXPECTED_PLAN ]] || die "missing E2E denominator ratchet: ${EXPECTED_PLAN#"$ROOT_DIR/"}"
     jq -e '.schema == 1 and (.cells | type == "array" and length > 0)' "$EXPECTED_PLAN" >/dev/null ||

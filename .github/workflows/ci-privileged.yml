@@ -25,7 +25,7 @@ env:
 
 jobs:
   # GitHub Actions supports timeout-minutes on jobs, not at workflow scope.
-  # This workflow has one independent eight-minute job, so its job timeout is
+  # This workflow has one independent ten-minute job, so its job timeout is
   # also stronger than the requested 60-minute workflow ceiling.
   # This scarce lane is a sub-five-minute privileged capability smoke only:
   #   * retired-conditional-branch PMU timer delivery,
@@ -51,7 +51,7 @@ jobs:
         )
       }}
     runs-on: [Linux, X64, hermit, pmu]
-    timeout-minutes: 8
+    timeout-minutes: 10
     env:
       DETCORE_TEST_RUST_LOG: "off"
 
@@ -97,7 +97,7 @@ jobs:
       # --user scope; without this flag the skipped-boxing path would fail-close
       # this self-hosted lane. Opt out to best-effort UNBOXED (process-group
       # teardown only) — the pre-pin behavior — rather than regress the lane RED.
-      run: timeout --foreground --kill-after=10s 270s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
+      run: timeout --foreground --kill-after=10s 360s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
     - name: Run non-gating occasional KVM probes
       id: kvm_occasional
       continue-on-error: true
