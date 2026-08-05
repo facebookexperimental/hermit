@@ -24,3 +24,6 @@ envelope.json
 # Generated validation/e2e output. Everything under ignored/ is disposable and
 # must not taint source provenance or the version string.
 /ignored/
+
+# Backend-parity observations belong to the outer dev-hermit compat scorecard.
+/tests/backend-parity/matrix.tsv

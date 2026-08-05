@@ -1,10 +1,11 @@
-# Hermit backend parity matrix
+# Hermit backend parity runner
 
 This directory tracks executable parity contracts across Hermit's ptrace,
-DynamoRIO (DBI), and KVM backends. `matrix.tsv` is the ratchet: changing a pair
-from `gap` to `pass` (L1) or from `gap` to `detlog`/`guest` (L2) makes
-`run_matrix.py` enforce it on every subsequent run. A `gap` must have a concrete
-implementation reason.
+DynamoRIO (DBI), and KVM backends. The case catalog and its small set of known
+gaps live in `run_matrix.py`; new cases are green contracts by default. Live
+results are compatibility measurement state, so when Hermit is checked out
+inside dev-hermit the runner appends them to the outer
+`compat-envelope/scorecard.csv` instead of maintaining a generated TSV here.
 
 ## Current ratchet
 
@@ -102,7 +103,7 @@ canonical zero CPU accounting and complete reaping. The remaining process-wait
 lifecycle gap is guest SIGCHLD handler delivery: the KVM personality records the
 exit but does not yet synthesize an x86-64 signal frame to run the handler.
 
-## Matrix
+## Cases
 
 Each cell shows the L1 status and, after `/`, the L2 status: `detlog` for
 DETLOG-bitwise L2, `guest` for KVM guest-visible L2, and `gap` where the level
@@ -148,9 +149,9 @@ as a deterministic no-op because it replaces the Linux scheduler with its own,
 so the guest observes an identical, host-independent result across ptrace, DBI,
 and KVM and across the `--verify` double run.
 
-The authoritative reasons live in `matrix.tsv`, next to the status they
-justify. The runner executes each passing pair three times and checks exit
-status, stdout, and (for determinism cases) byte-identical repeated output.
+The authoritative exceptions and their reasons live in `L1_GAPS` and
+`L2_GAPS` in the runner. The runner executes each passing pair three times and
+checks exit status, stdout, and (for determinism cases) byte-identical repeated output.
 Passing `--strict` adds `hermit run --strict` to every probe; the hosted DBI
 gate uses this mode.
 The DBI random-source contract also compares the root thread's post-fault
@@ -169,13 +170,13 @@ guest twice and asserts a bitwise-identical result. Because `--verify` diverts
 the guest's own stdout into per-run temporary logs, the L2 path cannot re-check
 stdout the way the L1 path does; instead it enforces that the guest exit status
 matches and that hermit's double-run comparison succeeded at *at least* the
-assurance kind recorded in `matrix.tsv`. The runner keys on two distinct stderr
+assurance kind expected for the backend. The runner keys on two distinct stderr
 witnesses: `Determinism verified` (DETLOG-bitwise, ptrace and DBI) and
 `guest output and exit status matched` (KVM guest-visible). A DETLOG result
 satisfies a `guest` contract because it is strictly stronger; the reverse fails.
 
 One contract holds at L1 but not L2 and is recorded as an L2 `gap` with its
-reason in `matrix.tsv`:
+reason in the runner:
 
 - **`process_wait_accounting` on KVM.** The `--verify` concurrent double-run
   races child reaping: `waitid` on the already-reaped child returns `ECHILD`
@@ -229,7 +230,7 @@ Use `--check` to validate the corpus contract without prerequisites.
 
 ## Running
 
-Validate the checked-in matrix without backend prerequisites:
+Validate the case catalog and known-gap invariants without backend prerequisites:
 
 ```bash
 python3 tests/backend-parity/run_matrix.py --check
@@ -269,6 +270,9 @@ python3 tests/backend-parity/run_matrix.py --backend kvm --verify --require-back
 
 Use `--probe-gaps` to execute documented gaps and report `XPASS` candidates
 (in `--verify` mode the probe reports which L2 kind a gap actually reached).
-Use `--output /tmp/backend-parity.tsv` to retain machine-readable observations.
-`BLOCKED` means a required host capability or runtime artifact was absent; it
-does not change the checked-in pass/gap claim.
+Every non-check run auto-discovers an outer dev-hermit checkout and appends
+scorecard rows to `compat-envelope/scorecard.csv`. Use `--parent-scorecard PATH`
+to select another outer scorecard, `--no-parent-scorecard` for a deliberately
+side-effect-free run, or `--output /tmp/backend-parity.tsv` for the legacy
+standalone observation TSV. `BLOCKED` means a required host capability or
+runtime artifact was absent; it does not change the known-gap contract.

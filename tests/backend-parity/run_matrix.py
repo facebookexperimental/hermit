@@ -17,9 +17,34 @@ import time
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPOSITORY = SCRIPT_DIR.parent.parent
-MATRIX_PATH = SCRIPT_DIR / "matrix.tsv"
 BACKENDS = ("ptrace", "dbi", "kvm")
 RUNS = 3
+
+# The compatibility scorecard is measurement state, not Hermit source.  When
+# this checkout is nested in dev-hermit, live observations are appended to the
+# outer workspace's canonical scorecard.  Standalone Hermit clones simply skip
+# that side effect unless --parent-scorecard is supplied.
+SCORECARD_HEADER = (
+    "run_id",
+    "run_utc",
+    "hermit_sha",
+    "reverie_sha",
+    "dirty",
+    "run_mode",
+    "lane",
+    "bucket",
+    "test_id",
+    "test_mode",
+    "backend",
+    "cell_state",
+    "outcome",
+    "deterministic",
+    "parity",
+    "output_hash",
+    "duration_ms",
+    "max_rss_kb",
+    "reason",
+)
 
 # L2 (--verify) assurance kinds, ordered weakest to strongest. "gap" means the
 # contract cannot currently be verified at L2 on that backend. "guest" is
@@ -37,70 +62,7 @@ L2_ALLOWED = {
 
 
 class MatrixError(Exception):
-    """An invalid matrix or failed regression contract."""
-
-
-def read_matrix() -> list[dict[str, str]]:
-    with MATRIX_PATH.open(newline="", encoding="utf-8") as matrix_file:
-        rows = list(csv.DictReader(matrix_file, delimiter="\t"))
-
-    required = {
-        "test_name",
-        "ptrace",
-        "dbi",
-        "kvm",
-        "dbi_reason",
-        "kvm_reason",
-        "ptrace_l2",
-        "dbi_l2",
-        "kvm_l2",
-        "dbi_l2_reason",
-        "kvm_l2_reason",
-    }
-    if not rows or set(rows[0]) != required:
-        raise MatrixError(f"{MATRIX_PATH} must contain columns {sorted(required)}")
-
-    names: set[str] = set()
-    for row in rows:
-        name = row["test_name"]
-        if not name or name in names:
-            raise MatrixError(f"duplicate or empty test name: {name!r}")
-        names.add(name)
-        if row["ptrace"] != "pass":
-            raise MatrixError(f"{name}: ptrace is the baseline and must be pass")
-        if row["ptrace_l2"] != "detlog":
-            raise MatrixError(f"{name}: ptrace_l2 baseline must be detlog")
-        for backend in BACKENDS:
-            if row[backend] not in {"pass", "gap"}:
-                raise MatrixError(f"{name}/{backend}: expected pass or gap")
-            l2 = row[f"{backend}_l2"]
-            if l2 not in L2_ALLOWED[backend]:
-                raise MatrixError(
-                    f"{name}/{backend}_l2: expected one of "
-                    f"{sorted(L2_ALLOWED[backend])}, got {l2!r}"
-                )
-            # An L1 gap cannot be verified at L2, and an L2 assurance cannot
-            # exceed the L1 result it presupposes.
-            if row[backend] == "gap" and l2 != "gap":
-                raise MatrixError(
-                    f"{name}/{backend}: an L1 gap must record an L2 gap too"
-                )
-            if backend != "ptrace":
-                reason = row[f"{backend}_reason"]
-                if row[backend] == "gap" and reason in {"", "-"}:
-                    raise MatrixError(f"{name}/{backend}: gap needs a reason")
-                if row[backend] == "pass" and reason != "-":
-                    raise MatrixError(
-                        f"{name}/{backend}: passing pair reason must be -"
-                    )
-                l2_reason = row[f"{backend}_l2_reason"]
-                if l2 == "gap" and l2_reason in {"", "-"}:
-                    raise MatrixError(f"{name}/{backend}_l2: gap needs a reason")
-                if l2 != "gap" and l2_reason != "-":
-                    raise MatrixError(
-                        f"{name}/{backend}_l2: non-gap L2 reason must be -"
-                    )
-    return rows
+    """An invalid case catalog or failed regression contract."""
 
 
 def compile_fixture(source: Path, output: Path, *flags: str) -> Path:
@@ -214,9 +176,16 @@ class Fixtures:
         return binary
 
 
-def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes | None]:
+class CatalogFixtures:
+    def binary(self, name: str) -> Path:
+        return Path("/backend-parity-catalog") / name
+
+
+def case_catalog(
+    fixtures: Fixtures | CatalogFixtures,
+) -> dict[str, tuple[list[str], int, bytes | None]]:
     fixture_input = SCRIPT_DIR / "fixtures/input.txt"
-    cases: dict[str, tuple[list[str], int, bytes | None]] = {
+    return {
         "hello_stdout": (["/bin/echo", "hello world"], 0, b"hello world\n"),
         "argument_forwarding": (
             ["/usr/bin/printf", "%s|%s\n", "alpha", "two words"],
@@ -330,10 +299,86 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             b"sigaltstack ok=4\n",
         ),
     }
+
+
+# New cases are green contracts by default.  Only stable, diagnosed exceptions
+# belong here; live pass/fail evidence is written to the outer scorecard.
+L1_GAPS = {
+    ("dbi", "file_metadata"): (
+        "PR #1549 determinizes credential queries (getuid/getgid/getresuid/"
+        "getresgid) to virtual-root identity 0; DBI forwards fchown(fd,0,0) to "
+        "the real kernel with no CLONE_NEWUSER uid map, so the guest performs an "
+        "unprivileged chown-to-root and gets EPERM, whereas ptrace remaps it "
+        "through the user namespace. fchown is not correctly implemented under "
+        "DBI, and an assertion against a half-implemented syscall could pass by "
+        "accident and prove nothing; declared a gap until DBI determinizes "
+        "fchown (see the determinize_fchown_under_dbi TODO)"
+    ),
+    ("dbi", "pthread_lifecycle"): (
+        "Portable release DynamoRIO can stall or exit during native pthread "
+        "startup before Detcore readiness"
+    ),
+    ("kvm", "process_wait_lifecycle"): (
+        "KVM records serialized child exits and implements wait4/waitid, but "
+        "does not synthesize guest SIGCHLD handler delivery"
+    ),
+}
+L2_GAPS = {
+    ("dbi", "file_metadata"): (
+        "Inherited from the L1 DBI file_metadata gap: the fchown EPERM aborts "
+        "the guest before any --verify double-run, so no L2 determinism witness "
+        "can be produced"
+    ),
+    ("dbi", "exit_status"): (
+        "hermit --verify runs the DBI guest only once when the first run exits "
+        "non-zero (--verify-allow both), so the double-run DETLOG comparison "
+        "never executes for this non-zero-exit contract"
+    ),
+    ("dbi", "pthread_lifecycle"): ("DynamoRIO startup stall prevents an L2 verify run"),
+    ("kvm", "process_wait_accounting"): (
+        "under --verify the concurrent double-run races child reaping: waitid "
+        "on the already-reaped child returns ECHILD"
+    ),
+    ("kvm", "process_wait_lifecycle"): (
+        "no guest SIGCHLD frame synthesis, so there is no L2 run to verify"
+    ),
+}
+
+
+def validate_catalog() -> list[str]:
+    cases = case_catalog(CatalogFixtures())
+    if not cases:
+        raise MatrixError("backend-parity case catalog is empty")
+    for gaps in (L1_GAPS, L2_GAPS):
+        for (backend, name), reason in gaps.items():
+            if backend not in BACKENDS or backend == "ptrace":
+                raise MatrixError(f"invalid known-gap backend: {backend!r}")
+            if name not in cases:
+                raise MatrixError(f"known gap has no case implementation: {name!r}")
+            if not reason:
+                raise MatrixError(f"{name}/{backend}: known gap needs a reason")
+    for backend, name in L1_GAPS:
+        if (backend, name) not in L2_GAPS:
+            raise MatrixError(f"{name}/{backend}: an L1 gap must also be an L2 gap")
+    return list(cases)
+
+
+def expectation(backend: str, name: str, verify: bool) -> tuple[str, str]:
+    gaps = L2_GAPS if verify else L1_GAPS
+    reason = gaps.get((backend, name))
+    if reason is not None:
+        return "gap", reason
+    if not verify:
+        return "pass", "-"
+    return ("guest" if backend == "kvm" else "detlog"), "-"
+
+
+def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes | None]:
+    cases = case_catalog(fixtures)
     try:
         return cases[name]
     except KeyError as error:
-        raise MatrixError(f"matrix has no implementation for {name}") from error
+        raise MatrixError(f"case catalog has no implementation for {name}") from error
 
 
 def backend_block(backend: str, hermit: Path, strict: bool) -> str | None:
@@ -653,7 +698,10 @@ def run_case(
                     f"run {iteration + 1} output differed from run 1",
                     time.monotonic() - started,
                 )
-            if ptrace_random is not None and root_random_output(result.stdout) != ptrace_random:
+            if (
+                ptrace_random is not None
+                and root_random_output(result.stdout) != ptrace_random
+            ):
                 return (
                     "FAIL",
                     f"run {iteration + 1} root random stream differed from ptrace",
@@ -681,6 +729,114 @@ def write_results(path: Path, results: list[dict[str, str]]) -> None:
         writer.writerows(results)
 
 
+def discover_parent_scorecard() -> Path | None:
+    configured = os.environ.get("DEV_HERMIT_ROOT") or os.environ.get("DEV_HERMIT")
+    roots = [Path(configured)] if configured else []
+    roots.extend((REPOSITORY, *REPOSITORY.parents))
+    for root in roots:
+        compat_dir = root / "compat-envelope"
+        if compat_dir.is_dir():
+            return compat_dir / "scorecard.csv"
+    return None
+
+
+def git_output(*args: str) -> str | None:
+    result = subprocess.run(
+        ["git", "-C", str(REPOSITORY), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def append_parent_scorecard(
+    path: Path,
+    results: list[dict[str, str]],
+    *,
+    strict: bool,
+    verify: bool,
+    probe_gaps: bool,
+) -> None:
+    # Multiple worktrees can validate concurrently against one outer workspace.
+    # Serialize whole-row appends so the shared measurement log remains valid.
+    import fcntl
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    hermit_sha = git_output("rev-parse", "HEAD") or "unknown"
+    dirty = bool(git_output("status", "--porcelain"))
+    epoch = int(time.time())
+    run_id = f"backend-parity-{hermit_sha[:12]}-{epoch}-{os.getpid()}"
+    mode = "verify" if verify else "strict" if strict else "repeat"
+    rows: list[dict[str, str]] = []
+    for result in results:
+        status = result["result"]
+        passed = status in {"PASS", "XPASS"}
+        outcome = {
+            "PASS": "pass",
+            "XPASS": "pass",
+            "FAIL": "fail",
+            "GAP": "gap",
+            "BLOCKED": "skip",
+        }[status]
+        parity = "1" if passed else "0" if status == "FAIL" else ""
+        detail = result["detail"]
+        if verify and result["backend"] == "kvm" and passed:
+            detail = (
+                "L2 guest-visible only (stdout+exit compared; internal trace not "
+                f"compared): {detail}"
+            )
+        rows.append(
+            {
+                "run_id": run_id,
+                "run_utc": f"@{epoch}",
+                "hermit_sha": hermit_sha,
+                "reverie_sha": "unknown",
+                "dirty": str(dirty).lower(),
+                "run_mode": "expansion" if probe_gaps else "regression",
+                "lane": "privileged" if result["backend"] == "kvm" else "portable",
+                "bucket": "backend-parity",
+                "test_id": f"backend-parity/{result['test_name']}",
+                "test_mode": mode,
+                "backend": result["backend"],
+                "cell_state": (
+                    "disabled" if result["expectation"] == "gap" else "enabled"
+                ),
+                "outcome": outcome,
+                "deterministic": "1" if passed and strict else "",
+                "parity": parity,
+                "output_hash": "",
+                "duration_ms": str(round(float(result["seconds"]) * 1000)),
+                "max_rss_kb": "",
+                "reason": detail,
+            }
+        )
+
+    with path.open("a+", newline="", encoding="utf-8") as scorecard:
+        fcntl.flock(scorecard.fileno(), fcntl.LOCK_EX)
+        scorecard.seek(0)
+        first_line = scorecard.readline()
+        if first_line:
+            actual_header = next(csv.reader([first_line]))
+            if tuple(actual_header) != SCORECARD_HEADER:
+                raise MatrixError(f"outer scorecard {path} has an incompatible header")
+        else:
+            writer = csv.DictWriter(
+                scorecard, fieldnames=SCORECARD_HEADER, lineterminator="\n"
+            )
+            writer.writeheader()
+        scorecard.seek(0, os.SEEK_END)
+        writer = csv.DictWriter(
+            scorecard, fieldnames=SCORECARD_HEADER, lineterminator="\n"
+        )
+        writer.writerows(rows)
+        scorecard.flush()
+        fcntl.flock(scorecard.fileno(), fcntl.LOCK_UN)
+    print(f"TRACKING: appended {len(rows)} rows to outer scorecard {path}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -693,7 +849,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="validate the matrix and print ratchet rates without running guests",
+        help="validate the case catalog and print expected rates without running guests",
     )
     parser.add_argument(
         "--hermit",
@@ -702,6 +858,19 @@ def parse_args() -> argparse.Namespace:
         help="Hermit executable",
     )
     parser.add_argument("--output", type=Path, help="write observed result TSV")
+    parser.add_argument(
+        "--parent-scorecard",
+        type=Path,
+        help=(
+            "append observations to this outer dev-hermit scorecard (default: "
+            "auto-detect compat-envelope/scorecard.csv)"
+        ),
+    )
+    parser.add_argument(
+        "--no-parent-scorecard",
+        action="store_true",
+        help="disable the outer dev-hermit scorecard side effect",
+    )
     parser.add_argument(
         "--probe-gaps",
         action="store_true",
@@ -732,7 +901,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    rows = read_matrix()
+    names = validate_catalog()
     backends = args.backends or list(BACKENDS)
     # --verify is the L2 lift and presupposes strict mode (L2 = --strict
     # --verify); enable strict implicitly so callers can ask for L2 with one flag.
@@ -743,16 +912,16 @@ def main() -> int:
         print("MODE: L1 (--strict), byte-identical stdout across 3 runs")
     else:
         print("MODE: compatibility (repeat-run), byte-identical stdout across 3 runs")
-    baseline = sum(row["ptrace"] == "pass" for row in rows)
+    baseline = len(names)
     for backend in BACKENDS:
-        passing = sum(row[backend] == "pass" for row in rows)
+        passing = baseline - sum(gap_backend == backend for gap_backend, _ in L1_GAPS)
         print(f"RATCHET {backend}: {passing}/{baseline} ({passing / baseline:.1%})")
     # L2 ratchet: how many contracts each backend verifies under --verify, split
     # by assurance kind so DETLOG-bitwise L2 is never conflated with guest-visible.
     for backend in BACKENDS:
-        detlog = sum(row[f"{backend}_l2"] == "detlog" for row in rows)
-        guest = sum(row[f"{backend}_l2"] == "guest" for row in rows)
-        verified = detlog + guest
+        verified = baseline - sum(gap_backend == backend for gap_backend, _ in L2_GAPS)
+        detlog = verified if backend != "kvm" else 0
+        guest = verified if backend == "kvm" else 0
         print(
             f"RATCHET-L2 {backend}: {verified}/{baseline} "
             f"({verified / baseline:.1%}) [detlog={detlog} guest-visible={guest}]"
@@ -776,34 +945,25 @@ def main() -> int:
                     failures += 1
                 continue
 
-            for row in rows:
-                name = row["test_name"]
-                # In L2 mode the ratcheted contract is the *_l2 column (with its
-                # own reason); otherwise it is the L1 pass/gap column.
-                if args.verify:
-                    expectation = row[f"{backend}_l2"]
-                    reason_key = f"{backend}_l2_reason"
-                else:
-                    expectation = row[backend]
-                    reason_key = f"{backend}_reason"
-                is_gap = expectation == "gap"
+            for name in names:
+                expected, gap_reason = expectation(backend, name, args.verify)
+                is_gap = expected == "gap"
                 if is_gap and not args.probe_gaps:
-                    reason = row[reason_key]
-                    print(f"GAP {backend}/{name}: {reason}")
+                    print(f"GAP {backend}/{name}: {gap_reason}")
                     results.append(
                         {
                             "test_name": name,
                             "backend": backend,
-                            "expectation": expectation,
+                            "expectation": expected,
                             "result": "GAP",
                             "seconds": "0.000",
-                            "detail": reason,
+                            "detail": gap_reason,
                         }
                     )
                     continue
 
                 status, detail, duration = run_case(
-                    hermit, backend, name, fixtures, strict, args.verify, expectation
+                    hermit, backend, name, fixtures, strict, args.verify, expected
                 )
                 if is_gap and status == "PASS":
                     status = "XPASS"
@@ -813,7 +973,7 @@ def main() -> int:
                     {
                         "test_name": name,
                         "backend": backend,
-                        "expectation": expectation,
+                        "expectation": expected,
                         "result": status,
                         "seconds": f"{duration:.3f}",
                         "detail": detail,
@@ -824,6 +984,25 @@ def main() -> int:
 
     if args.output:
         write_results(args.output, results)
+    if args.parent_scorecard and args.no_parent_scorecard:
+        raise MatrixError(
+            "--parent-scorecard and --no-parent-scorecard cannot be used together"
+        )
+    if not args.no_parent_scorecard and results:
+        parent_scorecard = args.parent_scorecard or discover_parent_scorecard()
+        if parent_scorecard is None:
+            print(
+                "TRACKING: outer dev-hermit scorecard not found; "
+                "use --parent-scorecard to select one"
+            )
+        else:
+            append_parent_scorecard(
+                parent_scorecard,
+                results,
+                strict=strict,
+                verify=args.verify,
+                probe_gaps=args.probe_gaps,
+            )
     return 1 if failures else 0
 
 
