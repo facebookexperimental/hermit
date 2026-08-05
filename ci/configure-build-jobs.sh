@@ -66,11 +66,11 @@ if [[ -v CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS ]]; then
     return 2
 fi
 
-# The calibration below is valid only for Reverie 025d378. The portable wrapper
+# The calibration below is valid only for Reverie 9470712. The portable wrapper
 # obtains the repository's recorded pin through the canonical checker and
 # carries it here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 025d37800d347c32711038bd0a3889e8e4774c2b ]]; then
-    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 025d37800d347c32711038bd0a3889e8e4774c2b" >&2
+if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 9470712afa9b421c72850ab7955fb335692e43a0 ]]; then
+    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 9470712afa9b421c72850ab7955fb335692e43a0" >&2
     return 2
 fi
 
@@ -103,7 +103,7 @@ if [[ ! $REVERIE_DBI_EFFECTIVE_CPUS =~ ^[1-9][0-9]*$ ]]; then
     return 2
 fi
 
-# Reverie 025d378's DynamoRIO build.rs clamps Cargo NUM_JOBS to 16 before
+# Reverie 9470712's DynamoRIO build.rs clamps Cargo NUM_JOBS to 16 before
 # passing it to `cmake --parallel`. Carry the calibrated threshold together with
 # every condition used to convert it into elapsed seconds:
 #
@@ -118,6 +118,32 @@ fi
 # observations; applying that policy and rounding up gives 1050
 # effective-job-seconds. The concurrent release builds embody contention;
 # replace this calibration when >=5 clean Hermit-lane samples support it.
+#
+# CARRY TO 9470712 (2026-08-05). The threshold above was measured at 025d378
+# and is reused here, so the reuse is evidenced rather than assumed. The budget
+# governs exactly one quantity: the elapsed time reverie-dbi/build.rs reports
+# for a DynamoRIO content-key MISS. That build's inputs are hashed by
+# source_recipe_key() over {reverie-dbi/vendor/dynamorio, reverie-dbi/build.rs,
+# $CMAKE, $CMAKE_GENERATOR} -- host-invariant while CMAKE/CMAKE_GENERATOR are
+# unset -- and six cold builds (three per pin, interleaved on one host,
+# taskset 4 CPUs, CARGO_BUILD_JOBS=4) all printed the SAME recipe key
+# sha256:19123c88d87a4cd9e8b0efdda7265c7682e8907fe6bbf8e0bd6fcb92fbfa85e4.
+# Elapsed at 9470712: 39.80s / 39.23s / 39.52s (159.20 / 156.92 / 158.08
+# effective-job-seconds); at 025d378: 38.10s / 39.58s / 41.01s (152.40 /
+# 158.32 / 164.04). The new pin's slowest sample is 3% faster than the old
+# pin's slowest and the whole set spans 7.1%, so the pin move causes no
+# throughput change. Corroborating Git evidence: 025d378..9470712 touches only
+# reverie-ptrace/src/{error,task,tracer}.rs; the reverie-dbi subtree
+# (c38c979057f9fe3e4d46772c1fddd05a71db4bf9) and third-party/
+# (fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a) are identical at both pins, and
+# MAX_PARALLEL_JOBS is still 16.
+#
+# Those 2026-08-05 samples deliberately do NOT replace 1050. They come from a
+# development host whose cores finish the identical work ~3.3x faster than the
+# GitHub portable runner this budget governs; 2x their slowest would give 319
+# effective-job-seconds and would fail the portable lane on its first genuine
+# cold miss. The replacement bar stated above -- >=5 clean Hermit-lane samples
+# -- is unchanged and still unmet.
 REVERIE_DBI_MAX_PARALLEL_JOBS=16
 REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS=1050
 REVERIE_DBI_EFFECTIVE_BUILD_JOBS=$REVERIE_DBI_RAW_BUILD_JOBS
