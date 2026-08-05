@@ -461,39 +461,83 @@ function audit_ci_correspondence {
     # shellcheck disable=SC2016
     [[ $(grep -Fxc 'source "$ROOT_DIR/ci/configure-build-jobs.sh" || exit $?' "$ROOT_DIR/ci/run-node.sh") == 1 ]] ||
         die "run-node.sh must source the shared build-job configuration exactly once"
-    local budget_record='reverie-dbi-budget={requested-jobs:$CARGO_BUILD_JOBS,effective-cpus:$CI_DAG_EFFECTIVE_CPUS,job-seconds:$CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBI_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3}'
+    # shellcheck disable=SC2016
+    local budget_record='reverie-dbi-budget={requested-jobs:$CARGO_BUILD_JOBS,effective-cpus:$CI_DAG_EFFECTIVE_CPUS,reverie-max-jobs:$CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBI_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBI_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4}'
     [[ $(grep -Fc "$budget_record" "$ROOT_DIR/ci/run-dag.sh") == 1 ]] ||
         die "run-dag.sh must log the DBI threshold together with its requested-job condition"
     [[ $(grep -Fc "$budget_record" "$ROOT_DIR/ci/run-node.sh") == 1 ]] ||
         die "run-node.sh must log the DBI threshold together with its requested-job condition"
-    local configured_jobs default_jobs mutated_budget
-    default_jobs=$(
-        bash -c 'unset CI_DAG_BUILD_JOBS CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS REVERIE_DBI_MAX_BUILD_SECONDS; source "$1"; printf "%s %s %s\n" "$CARGO_BUILD_JOBS" "$THIRD_PARTY_BUILD_JOBS" "$REVERIE_DBI_MAX_BUILD_SECONDS"' \
+    local budget_probe budget_tuple clamp_boundaries cpu_boundaries mutated_budget
+    # shellcheck disable=SC2016
+    budget_probe='source "$1"; printf "%s %s %s %s %s %s\n" "$CARGO_BUILD_JOBS" "$THIRD_PARTY_BUILD_JOBS" "$CI_DAG_EFFECTIVE_CPUS" "$CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS" "$REVERIE_DBI_EFFECTIVE_BUILD_JOBS" "$REVERIE_DBI_MAX_BUILD_SECONDS"'
+    budget_tuple=$(
+        CI_DAG_EFFECTIVE_CPUS=4 bash -c 'unset CI_DAG_BUILD_JOBS CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS; source "$1"; printf "%s %s %s %s %s %s\n" "$CARGO_BUILD_JOBS" "$THIRD_PARTY_BUILD_JOBS" "$CI_DAG_EFFECTIVE_CPUS" "$CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS" "$REVERIE_DBI_EFFECTIVE_BUILD_JOBS" "$REVERIE_DBI_MAX_BUILD_SECONDS"' \
             _ "$ROOT_DIR/ci/configure-build-jobs.sh"
     )
-    [[ $default_jobs == "8 8 263" ]] ||
-        die "shared build-job configuration did not bind the default j8 width to ceil(2100/8)=263s: $default_jobs"
-    configured_jobs=$(
-        CI_DAG_BUILD_JOBS=5 bash -c 'unset REVERIE_DBI_MAX_BUILD_SECONDS; source "$1"; printf "%s %s %s\n" "$CARGO_BUILD_JOBS" "$THIRD_PARTY_BUILD_JOBS" "$REVERIE_DBI_MAX_BUILD_SECONDS"' \
-            _ "$ROOT_DIR/ci/configure-build-jobs.sh"
+    [[ $budget_tuple == "8 8 4 16 4 263" ]] ||
+        die "default j8/CPU4 DBI budget did not derive W=4 and ceil(1050/4)=263s: $budget_tuple"
+
+    budget_tuple=$(CI_DAG_BUILD_JOBS=4 CI_DAG_EFFECTIVE_CPUS=4 bash -c "$budget_probe" _ "$ROOT_DIR/ci/configure-build-jobs.sh")
+    [[ $budget_tuple == "4 4 4 16 4 263" ]] ||
+        die "K=4/CPU4 DBI budget did not preserve W=4 and 263s: $budget_tuple"
+    budget_tuple=$(CI_DAG_BUILD_JOBS=1 CI_DAG_EFFECTIVE_CPUS=4 bash -c "$budget_probe" _ "$ROOT_DIR/ci/configure-build-jobs.sh")
+    [[ $budget_tuple == "1 1 4 16 1 1050" ]] ||
+        die "K=1/CPU4 DBI budget did not derive W=1 and 1050s: $budget_tuple"
+
+    clamp_boundaries=$(
+        for requested in 15 16 17 64; do
+            CI_DAG_BUILD_JOBS=$requested CI_DAG_EFFECTIVE_CPUS=64 \
+                bash -c "$budget_probe" _ "$ROOT_DIR/ci/configure-build-jobs.sh"
+        done
     )
-    [[ $configured_jobs == "5 5 420" ]] ||
-        die "shared build-job configuration did not propagate mutation K=5 with ceil(2100/5)=420s: $configured_jobs"
+    [[ $clamp_boundaries == $'15 15 64 16 15 70\n16 16 64 16 16 66\n17 17 64 16 16 66\n64 64 64 16 16 66' ]] ||
+        die "Reverie K>16 clamp boundary did not hold W at 16: $clamp_boundaries"
+
+    cpu_boundaries=$(
+        CI_DAG_BUILD_JOBS=17 CI_DAG_EFFECTIVE_CPUS=4 bash -c "$budget_probe" _ "$ROOT_DIR/ci/configure-build-jobs.sh"
+        CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=2 bash -c "$budget_probe" _ "$ROOT_DIR/ci/configure-build-jobs.sh"
+    )
+    [[ $cpu_boundaries == $'17 17 4 16 4 263\n8 8 2 16 2 525' ]] ||
+        die "effective-CPU boundary did not cap native width before elapsed derivation: $cpu_boundaries"
+
     mutated_budget=$(
-        CI_DAG_BUILD_JOBS=8 CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS=2105 \
+        CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=4 \
+            CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS=1052 \
+            bash -c 'source "$1"; printf "%s\n" "$REVERIE_DBI_MAX_BUILD_SECONDS"' \
+            _ "$ROOT_DIR/ci/configure-build-jobs.sh"
+        CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=4 \
+            CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS=1053 \
             bash -c 'source "$1"; printf "%s\n" "$REVERIE_DBI_MAX_BUILD_SECONDS"' \
             _ "$ROOT_DIR/ci/configure-build-jobs.sh"
     )
-    [[ $mutated_budget == 264 ]] ||
-        die "shared build-job configuration did not cross the ceil boundary for mutated 2105/8=264s: $mutated_budget"
+    [[ $mutated_budget == $'263\n264' ]] ||
+        die "effective-job-second mutation did not cross the W=4 ceil boundary: $mutated_budget"
     if CI_DAG_BUILD_JOBS=0 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
         die "shared build-job configuration accepted an invalid zero width"
     fi
-    if CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS=0 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
-        die "shared build-job configuration accepted an invalid zero DBI job-second threshold"
+    if CI_DAG_BUILD_JOBS=not-a-number bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+        die "shared build-job configuration accepted a noninteger width"
+    fi
+    if CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS=0 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+        die "shared build-job configuration accepted an invalid zero DBI effective-job-second threshold"
+    fi
+    if CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS=not-a-number bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+        die "shared build-job configuration accepted a noninteger DBI effective-job-second threshold"
     fi
     if CI_DAG_EFFECTIVE_CPUS=0 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
         die "shared build-job configuration accepted an invalid zero effective-CPU observation"
+    fi
+    if CI_DAG_EFFECTIVE_CPUS=not-a-number bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+        die "shared build-job configuration accepted a noninteger effective-CPU observation"
+    fi
+    if CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS=0 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+        die "shared build-job configuration accepted a zero Reverie clamp"
+    fi
+    if CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS=not-a-number bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+        die "shared build-job configuration accepted a noninteger Reverie clamp"
+    fi
+    if CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS=17 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+        die "shared build-job configuration accepted drift from the pinned Reverie clamp"
     fi
 
     for lane in portable privileged; do
