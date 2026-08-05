@@ -705,6 +705,55 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
+    /// getresuid under Hermit. Detcore presents a fixed virtual-root identity, so
+    /// the real, effective, and saved user IDs are all the constant 0. Under the
+    /// ptrace backend the guest runs inside a CLONE_NEWUSER namespace that already
+    /// maps the host uid to 0; emulating the same constant here makes in-process
+    /// backends (DBI) agree with that golden reference instead of leaking the host
+    /// uid, and the fully emulated result is bitwise-identical across --verify and
+    /// record/replay.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1549)
+    pub async fn handle_getresuid<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Getresuid,
+    ) -> Result<i64, Error> {
+        if let Some(ruid) = call.ruid() {
+            guest.memory().write_value(ruid, &0)?;
+        }
+        if let Some(euid) = call.euid() {
+            guest.memory().write_value(euid, &0)?;
+        }
+        if let Some(suid) = call.suid() {
+            guest.memory().write_value(suid, &0)?;
+        }
+        Ok(0)
+    }
+
+    /// getresgid under Hermit. The group-ID counterpart of `handle_getresuid`:
+    /// the real, effective, and saved group IDs are all the fixed virtual-root
+    /// constant 0, matching the ptrace CLONE_NEWUSER identity and deterministic
+    /// across --verify and record/replay.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1549)
+    pub async fn handle_getresgid<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Getresgid,
+    ) -> Result<i64, Error> {
+        if let Some(rgid) = call.rgid() {
+            guest.memory().write_value(rgid, &0)?;
+        }
+        if let Some(egid) = call.egid() {
+            guest.memory().write_value(egid, &0)?;
+        }
+        if let Some(sgid) = call.sgid() {
+            guest.memory().write_value(sgid, &0)?;
+        }
+        Ok(0)
+    }
+
     /// get_mempolicy under Hermit. The container exposes a single virtual NUMA
     /// node, so the effective policy is always the default and every address
     /// resolves to node 0. The result is fully emulated (never injected), so it

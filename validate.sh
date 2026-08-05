@@ -769,6 +769,30 @@ function detect_cache_state {
     fi
 }
 
+# Artifact-integrity pre-flight. A compiler/archiver killed mid-write leaves a
+# TRUNCATED zero-length *.o in a build tree -- classically the OOM-killer firing
+# on a NEIGHBOUR's step cgroup with memory.oom.group=1, so make never runs its
+# .DELETE_ON_ERROR cleanup. cmake/make key incremental freshness on TIMESTAMP not
+# CONTENT, so they trust the empty object forever and link it, producing an
+# "undefined reference" that reads as a source defect and never self-corrects.
+# Scan before we trust the tree and delete any such object so the build rebuilds
+# it. This is a CONTENT FACT, not a heuristic: it removes ONLY genuinely-corrupt
+# (0-byte) objects, so healthy artifacts -- and thus incremental skipping and the
+# warm cache -- are preserved (a blanket "clean rebuild after any failure" would
+# not be: cold rebuilds cost +232s and fail more). Covers DynamoRIO (reverie-dbi),
+# SaBRe + e9patch (hermit-install); rustc's target/deps self-heal via fingerprints.
+# Catches corruption from a kill we did not observe, which the per-crate build.rs
+# guard cannot: cargo re-runs a build script only on input change or prior failure,
+# so a neighbour that truncates an already-built object is otherwise linked as-is.
+function purge_zero_byte_objects {
+    local root=$1 removed=0 f
+    [[ -d $root ]] || { printf 0; return 0; }
+    while IFS= read -r -d '' f; do
+        rm -f -- "$f" && removed=$((removed + 1))
+    done < <(find "$root" -type f -name '*.o' -size 0 -print0 2>/dev/null)
+    printf '%s' "$removed"
+}
+
 # Print a REAL runtime estimate derived from this machine's validate-run history,
 # or an honest "not enough history" message. It consumes the shared
 # validate-run-ledger schema (schema_version >= 1) that this script writes and
@@ -890,6 +914,14 @@ printf "Build cache: %s (target/ debug=%s release=%s)\n" \
     "$VALIDATION_CACHE_STATE" \
     "$([[ -x "$ROOT_DIR/target/debug/hermit" ]] && printf present || printf absent)" \
     "$([[ -x "$ROOT_DIR/target/release/hermit" ]] && printf present || printf absent)"
+VALIDATION_ZERO_BYTE_PURGED=$(purge_zero_byte_objects "$ROOT_DIR/target")
+readonly VALIDATION_ZERO_BYTE_PURGED
+if ((VALIDATION_ZERO_BYTE_PURGED > 0)); then
+    printf "🧹 Artifact-integrity: purged %s zero-byte object(s) from target/ before build (killed/OOM-truncated; would otherwise link as 'undefined reference'). Rebuild will regenerate them.\n" \
+        "$VALIDATION_ZERO_BYTE_PURGED"
+    printf "validate.sh: purged %s zero-byte object(s) from target/ pre-build\n" \
+        "$VALIDATION_ZERO_BYTE_PURGED" >>"$LOG_FILE"
+fi
 printf "Estimated time: %s\n" \
     "$(history_estimate "$VALIDATION_PROFILE" "$VALIDATION_CACHE_STATE" "$VALIDATION_HOST" "$VALIDATION_LEDGER_FILE")"
 if [[ $VALIDATION_LEVEL == super ]]; then
@@ -1381,6 +1413,7 @@ function append_validation_ledger {
     line+="\"profile\":$(json_quote "$VALIDATION_PROFILE"),"
     line+="\"selection_mode\":$(json_quote "$VALIDATION_SELECTION_MODE"),"
     line+="\"cache_state\":$(json_quote "$VALIDATION_CACHE_STATE"),"
+    line+="\"zero_byte_purged\":${VALIDATION_ZERO_BYTE_PURGED:-0},"
     line+="\"commit\":$(json_quote "$VALIDATION_COMMIT"),\"tree\":$(json_quote "$VALIDATION_TREE"),"
     line+="\"git_depth\":$VALIDATION_GIT_DEPTH,"
     line+="\"git_ahead\":$VALIDATION_GIT_AHEAD,\"git_behind\":$VALIDATION_GIT_BEHIND,"

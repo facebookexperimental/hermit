@@ -2188,6 +2188,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Execveat(s) => self.handle_execveat(guest, s).await,
 
                 Syscall::Getcpu(s) => self.handle_getcpu(guest, s).await,
+
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#1549): Credential-query
+                // family emulated to the fixed virtual-root identity (0). See
+                // syscall_classification.rs for the determinism rationale.
+                // getuid/geteuid/getgid/getegid return the constant directly;
+                // getresuid/getresgid write the constant to each provided result
+                // pointer. Never forwarded to the host, so the answer no longer
+                // depends on whether the backend runs the guest in a
+                // CLONE_NEWUSER namespace.
+                Syscall::Getuid(_)
+                | Syscall::Geteuid(_)
+                | Syscall::Getgid(_)
+                | Syscall::Getegid(_) => Ok(0),
+                Syscall::Getresuid(s) => self.handle_getresuid(guest, s).await,
+                Syscall::Getresgid(s) => self.handle_getresgid(guest, s).await,
                 Syscall::RtSigprocmask(s) => self.handle_rt_sigprocmask(guest, s).await,
                 Syscall::RtSigaction(s) => self.handle_rt_sigaction(guest, s).await,
                 Syscall::Alarm(s) => self.handle_alarm(guest, s).await,

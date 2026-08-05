@@ -621,7 +621,26 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::setregid
         | Sysno::setgroups
         | Sysno::setfsuid
-        | Sysno::setfsgid => SyscallClassification::Determinized,
+        | Sysno::setfsgid
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#1549): Determinize the credential
+        // *query* family so it actually implements the fixed virtual-root
+        // identity the setuid no-ops above already assume. Previously
+        // getuid/geteuid/getgid/getegid/getresuid/getresgid were pass-through
+        // and returned 0 only because the ptrace backend runs the guest inside a
+        // CLONE_NEWUSER namespace (hermit-cli/src/lib.rs) that maps the real uid
+        // to 0. In-process backends (DBI) have no such namespace, so pass-through
+        // leaked the host uid/gid and contradicted the credential model.
+        // Emulating the query side to the constant virtual-root identity (0)
+        // makes the result backend-independent, matches the ptrace golden
+        // reference, and is never forwarded to the host, so it is
+        // bitwise-identical across --verify and record/replay.
+        | Sysno::getuid
+        | Sysno::geteuid
+        | Sysno::getgid
+        | Sysno::getegid
+        | Sysno::getresuid
+        | Sysno::getresgid => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
         // These existing and triaged passthroughs are conditionally repeatable under
@@ -634,9 +653,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(#663)
         | Sysno::chown
         | Sysno::getcwd
-        | Sysno::getegid
-        | Sysno::geteuid
-        | Sysno::getgid
         | Sysno::getpid
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#663)
@@ -645,7 +661,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getppid
         | Sysno::getsid
         | Sysno::gettid
-        | Sysno::getuid
         | Sysno::mprotect
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-889): Review process-local robust-list
@@ -695,10 +710,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(PR-654): Verify deterministic passthrough assumptions.
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::fsync
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::getresgid
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::getresuid
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::munlock
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1277,7 +1288,12 @@ mod tests {
         // pidfd_send_signal and pidfd_getfd moved from Unsupported to Determinized
         // (see handle_pidfd_send_signal / handle_pidfd_getfd), leaving only
         // restart_syscall Unsupported.
-        assert_eq!(counts, [283, 89, 1]);
+        //
+        // #1549 moved the six credential-query syscalls (getuid, geteuid,
+        // getgid, getegid, getresuid, getresgid) from PassThrough to
+        // Determinized, so the census shifts 6 from column 1 to column 0
+        // (283/89 -> 289/83). The total is unchanged and is re-asserted below.
+        assert_eq!(counts, [289, 83, 1]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1445,8 +1461,6 @@ mod tests {
             Sysno::fsetxattr,
             Sysno::ftruncate,
             Sysno::fsync,
-            Sysno::getresgid,
-            Sysno::getresuid,
             Sysno::munlock,
             Sysno::munlockall,
             Sysno::rename,
@@ -1684,6 +1698,35 @@ mod tests {
             assert!(
                 is_credential_identity_noop_syscall(sysno),
                 "{sysno:?} should be in the credential no-op helper set"
+            );
+        }
+        // The credential *query* family is the other half of the same fixed
+        // virtual-root identity: the setters above are no-ops precisely because
+        // the getters answer a constant 0. Determinizing the queries is what
+        // makes that identity backend-independent — under ptrace the guest
+        // already saw 0 via the container's CLONE_NEWUSER uid map
+        // (`map_root()`), but an in-process backend has no such namespace, so a
+        // pass-through leaked the host uid. These are asserted here, not folded
+        // into `credentials`, because they are emulated reads rather than no-op
+        // writes and so must stay outside `is_credential_identity_noop_syscall`
+        // (the exclusivity check below would otherwise reject them).
+        let credential_queries = [
+            Sysno::getuid,
+            Sysno::geteuid,
+            Sysno::getgid,
+            Sysno::getegid,
+            Sysno::getresuid,
+            Sysno::getresgid,
+        ];
+        for sysno in credential_queries {
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Determinized,
+                "{sysno:?} should be Determinized (emulated virtual-root identity)"
+            );
+            assert!(
+                !is_credential_identity_noop_syscall(sysno),
+                "{sysno:?} is a credential query, not a credential-setting no-op"
             );
         }
         // The credential helper must not claim any syscall outside the set, and

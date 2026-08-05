@@ -311,6 +311,24 @@ jobs:
           path: ${{ runner.temp }}/run-node-perf
           if-no-files-found: warn
           retention-days: 14
+      # test.regular_crates declares deps [build.workspace, setup.nextest], but
+      # only the first of those crosses the job boundary reliably: build.workspace
+      # ships in the prebuilt tarball below, while setup.nextest installs
+      # cargo-nextest into ~/.cargo/bin, which the tarball does NOT carry. The
+      # shard's only other source was a Swatinem/rust-cache restore hit, so a
+      # miss (eviction, or a nightly roll changing the rust-environment hash)
+      # left the shard with no `cargo nextest` at all: run 30966924323 job
+      # 92185676939 logged "Restoring cache ... No cache found." and then
+      # "error: no such command: `nextest`", failing in 0.1s having run zero
+      # tests. Stage the binary this job just proved it has into the tarball so
+      # the declared dependency travels on the channel that already works.
+      # Version stays single-sourced from setup.nextest in ci/dag/portable.json.
+      - name: Stage cargo-nextest for the debug shards
+        run: |
+          set -euo pipefail
+          nextest=$(command -v cargo-nextest)
+          install -Dm755 "$nextest" target/ci/bin/cargo-nextest
+          target/ci/bin/cargo-nextest --version
       - name: Stage debug DBI runtime
         run: |
           set -euo pipefail
@@ -392,10 +410,12 @@ jobs:
           # not depend on that mutable Cargo output directory.
           install -Dm755 target/debug/deps/libdetcore_dbi.so \
             target/install_pkg/rsrcs/libdetcore_dbi.so
+          test -x target/ci/bin/cargo-nextest
           tar --zstd -cf "$DEBUG_TARBALL" \
             target/debug/hermit \
             target/debug/deps/libdetcore_dbi.so \
             target/install_pkg/rsrcs/libdetcore_dbi.so \
+            target/ci/bin/cargo-nextest \
             ignored/e2e/build
           ls -lh "$DEBUG_TARBALL"
       - name: Upload debug prebuilt tree
@@ -544,6 +564,23 @@ jobs:
           test -x target/debug/hermit
           test -f target/debug/deps/libdetcore_dbi.so
           test -f target/install_pkg/rsrcs/libdetcore_dbi.so
+          test -x target/ci/bin/cargo-nextest
+      # Install into CARGO_HOME/bin rather than adding target/ci/bin to PATH:
+      # cargo searches $CARGO_HOME/bin BEFORE PATH when resolving
+      # `cargo-<subcommand>`, so a PATH entry loses to whatever the rust-cache
+      # restored and would silently run a stale cached cargo-nextest on a cache
+      # HIT. Installing here covers both cases with one rule — on a miss the
+      # directory holds no cargo-nextest at all (the bug this fixes), and on a
+      # hit this overwrites the cached copy with the exact binary build-debug
+      # validated. `cargo nextest --version` then asserts resolution up front,
+      # so a provisioning problem fails here, named, instead of surfacing later
+      # as an opaque node error.
+      - name: Install the prebuilt cargo-nextest
+        run: |
+          set -euo pipefail
+          install -Dm755 target/ci/bin/cargo-nextest \
+            "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-nextest"
+          cargo nextest --version
       - name: Unpack dbi install package
         if: needs.build-release.result == 'success'
         run: |

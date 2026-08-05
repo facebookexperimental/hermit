@@ -17,7 +17,7 @@ L1 (`hermit run --strict`):
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
 | ptrace | 28/28 | 100% |
-| DBI | 27/28 | 96% |
+| DBI | 26/28 | 93% |
 | KVM | 23/28 | 82% |
 
 L2 (`hermit run --strict --verify`):
@@ -42,8 +42,9 @@ measures the backend's own Reverie suite. The 23/24 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
-file-mutation and file-metadata contracts, plus deterministic memory-advice and
-memory-layout behavior. It also deterministically refuses io_uring and listmount,
+file-mutation contracts, plus deterministic memory-advice and
+memory-layout behavior. It is an explicit gap on the file-metadata row (see
+below). It also deterministically refuses io_uring and listmount,
 verifies that epoll remains available as a fallback, and refuses process-memory
 reads and writes with deterministic `EPERM`. The wait contract covers deterministic
 `wait4`/`waitid` results, at least one SIGCHLD handler delivery (standard signals
@@ -67,7 +68,14 @@ links, reads, and removes temporary files without exposing backend-specific meta
 The file-metadata row checks positional I/O, ownership and access operations,
 hard and symbolic links, path/fd/symlink extended attributes, a shared file
 mapping, readahead, and range synchronization. It permits documented filesystem
-policy failures for extended attributes but not an unimplemented syscall.
+policy failures for extended attributes but not an unimplemented syscall. DBI is
+an explicit gap on this row: it forwards `fchown` to the real kernel, so once
+credential queries are determinized to virtual-root identity `0` (PR #1549) the
+guest's `fchown(fd, 0, 0)` becomes an unprivileged chown-to-root and returns
+`EPERM`, while ptrace remaps it through the user namespace. `fchown` is not
+correctly implemented under DBI, and asserting against a half-implemented syscall
+could pass by accident and prove nothing, so the DBI cell is a declared gap until
+DBI determinizes `fchown`.
 The io_uring fallback row requires all three io_uring entry points to return
 deterministic `ENOSYS`, then checks that `epoll_create1` still succeeds.
 The listmount row requires deterministic `ENOSYS` even when the host kernel
@@ -108,7 +116,7 @@ is not reached.
 | `exit_status` | pass / detlog | pass / detlog | pass / guest |
 | `file_read` | pass / detlog | pass / detlog | pass / guest |
 | `file_mutation` | pass / detlog | pass / detlog | pass / guest |
-| `file_metadata` | pass / detlog | pass / detlog | pass / guest |
+| `file_metadata` | pass / detlog | gap / gap | pass / guest |
 | `io_uring_fallback` | pass / detlog | pass / detlog | pass / guest |
 | `listmount_unavailable` | pass / detlog | pass / detlog | pass / guest |
 | `process_vm_readv_refusal` | pass / detlog | pass / detlog | pass / guest |

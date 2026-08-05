@@ -51,7 +51,7 @@ create a second determinism engine.
 
 ## Measured strict-verify envelope
 
-Snapshot:
+Baseline sweep provenance:
 
 - Runtime implementation base: Hermit
   `0ca0dec256fd484e238b475a031a5c2d482eeba8` (version 0.2.0), Reverie dependency
@@ -68,26 +68,45 @@ Snapshot:
 - Log level: INFO for verification. Every cell was bounded by its manifest
   timeout. `race.sh` was not run.
 
+The incremental `arch-prctl-determinism` qualification uses Hermit feature
+base `1ece0654e39c67fa0555dfde645a8da61eb2f059`, Reverie candidate
+`8a3a15e01b5678715fdc9dcb316f1f411f44d0e3`, and SaBRe candidate
+`2a54b65f6d83d6e26606f8402a9dfb2a9cf82e5e`. The staged release loader
+SHA-256 is `22b68605cd2f01922f3f566fc05dc76ba916639aa654054a46fdccf5e2e41744`;
+the Hermit binary is
+`48d79ea85d92933a7bb607f56a62eaadc71a1921ca6d2f832193d5f0e2955997`
+and `libdetcore_sabre.so` is
+`a9a3bcfd435ca350f3f2c8a0bb0ee9fadeec4737bcb373e4b47e883a71bbe9fc`.
+The cell passed SaBRe L2 with 9/9 DETLOG/scheduler-COMMIT messages matching;
+its ptrace and SaBRe guest output was byte-identical (SHA-256
+`8504ad2cf53c948ffdd59e277fe87ecf21f65ffa4fb543989366ec9cb40272fd`).
+
+This isolated cell does not change the separate 212-program compatibility
+corpus measurement. Its latest valid canonical run remains 207/212 (97.64%,
+B3) at Hermit `c4b7b1a6dc4c1bfe1f03b68ec5d2efa991d9256b`; `gcc`, `g++`, and `cpp`
+timed out, `java` had a substantive DETLOG mismatch, and `timeout` failed its
+first run. Those five gaps preclude B4 or a parity claim.
+
 The initial post-0.2 ptrace strict-verify plan had 194 cells. Before that
 ratchet, SaBRe was enabled for 22 (11.3%). This ratchet evaluates 157
 previously disabled C candidates:
 
 | Result | Cells | Meaning |
 | --- | ---: | --- |
-| SaBRe L2 and ptrace exit/stdout parity | 109 | Enabled by this ratchet |
+| SaBRe L2 and ptrace exit/stdout parity | 110 | Enabled by this ratchet |
 | SaBRe L2, but ptrace output differs | 18 | Remains disabled |
-| SaBRe L2 failed or timed out | 30 | Remains disabled |
+| SaBRe L2 failed or timed out | 29 | Remains disabled |
 
-The resulting plan enables SaBRe for 131/194 cells (67.5%): seven blocking CI
-cells and 124 manual cells. This meets the B3 corpus-count threshold (at least
+The resulting plan enables SaBRe for 132/194 cells (68.0%): seven blocking CI
+cells and 125 manual cells. This meets the B3 corpus-count threshold (at least
 50% of the ptrace strict-verify corpus). It does not establish B4, L3 memory
 determinism, L4 stress hardening, or support for every workload in a subsystem.
 
-The 109 newly enabled cells are grouped as follows:
+The 110 newly enabled cells are grouped as follows:
 
 | Manifest bucket | New cells |
 | --- | ---: |
-| `c-programs` | 99 |
+| `c-programs` | 100 |
 | `determinism-stress-c` | 7 |
 | `backend-parity-c` | 1 |
 | `bin-c` | 1 |
@@ -168,13 +187,12 @@ Separately, the same full scorecard found the already-enabled
 `stdout_parity=false`. That regression is outside the historical 18-cell set
 and requires independent requalification; it is not counted as progress here.
 
-The following 28 candidates fail SaBRe strict verification or its timeout and
+The following 27 candidates fail SaBRe strict verification or its timeout and
 remain disabled:
 
 ```text
 backend-parity-c/cpuid-probe
 bin-c/robust-futex-test
-c-programs/arch-prctl-determinism
 c-programs/clone
 c-programs/dbi-unsupported-syscall
 c-programs/fp-reduction-nondeterminism

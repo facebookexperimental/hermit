@@ -5,7 +5,7 @@ exit_zero	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 exit_status	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 file_read	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 file_mutation	pass	pass	pass	-	-	detlog	detlog	guest	-	-
-file_metadata	pass	pass	pass	-	-	detlog	detlog	guest	-	-
+file_metadata	pass	gap	pass	PR #1549 determinizes credential queries (getuid/getgid/getresuid/getresgid) to virtual-root identity 0; DBI forwards fchown(fd,0,0) to the real kernel with no CLONE_NEWUSER uid map, so the guest performs an unprivileged chown-to-root and gets EPERM, whereas ptrace remaps it through the user namespace. fchown is not correctly implemented under DBI, and an assertion against a half-implemented syscall could pass by accident and prove nothing; declared a gap until DBI determinizes fchown (see TODO task).	-	detlog	gap	guest	Inherited from the L1 DBI file_metadata gap: the fchown EPERM aborts the guest before any --verify double-run, so no L2 determinism witness can be produced.	-
 io_uring_fallback	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 listmount_unavailable	pass	pass	pass	-	-	detlog	detlog	guest	-	-
 process_vm_readv_refusal	pass	pass	pass	-	-	detlog	detlog	guest	-	-
