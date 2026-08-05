@@ -476,18 +476,32 @@ pub fn write_pending_verification_json(path: &Path) -> Result<(), Error> {
 
 /// Write `report` to `path` atomically: a reader concurrent with the write sees
 /// either the old contents or the complete new record, never a truncated one.
+/// The directory to stage the temporary record in: always the one the target
+/// lives in, so `persist` is a same-filesystem rename.
+///
+/// `Path::parent` returns an EMPTY path for a bare filename, not `"."`. Falling
+/// back to the system temp directory for that case (as this did) puts the
+/// staged file on a different filesystem than the target whenever `TMPDIR` and
+/// the working directory differ -- the common case, e.g. tmpfs `/tmp` beside a
+/// btrfs checkout. `persist` then fails with `EXDEV` and the caller returns an
+/// error, leaving whatever the file previously held: a stale
+/// `{verified:true}` survives precisely the invocation that was supposed to
+/// overwrite it. A bare filename means the working directory, so say so.
+fn staging_directory(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
 fn write_report_json(path: &Path, report: &VerificationReport) -> Result<(), Error> {
     use std::io::Write as _;
 
     let json = serde_json::to_string(report)?;
-    let directory = path.parent().filter(|p| !p.as_os_str().is_empty());
     // Same directory as the target so the rename below stays within one
     // filesystem and is therefore atomic.
-    let mut temp = match directory {
-        Some(dir) => NamedTempFile::new_in(dir),
-        None => NamedTempFile::new(),
-    }
-    .with_context(|| format!("creating a temporary file beside {}", path.display()))?;
+    let mut temp = NamedTempFile::new_in(staging_directory(path))
+        .with_context(|| format!("creating a temporary file beside {}", path.display()))?;
     writeln!(temp, "{json}")
         .with_context(|| format!("writing verification verdict for {}", path.display()))?;
     temp.flush()
@@ -1075,6 +1089,108 @@ mod tests {
     /// FINDING 1. Every early exit must leave an invocation-bound record: the
     /// pending stamp overwrites a previous invocation's green, so a stale
     /// `{verified:true}` can never be read as this run's result.
+    /// Plant a previous invocation's GREEN verdict, the way a caller reusing one
+    /// `--verify-json` path across runs leaves it.
+    fn plant_previous_green(path: &Path) {
+        fs::write(
+            path,
+            "{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\"}\n",
+        )
+        .unwrap();
+    }
+
+    fn read_verdict(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// The staging directory must always be the TARGET's directory, never the
+    /// system temp directory.
+    ///
+    /// `Path::parent` yields an EMPTY path for a bare filename, and the earlier
+    /// code treated that as "no directory" and staged in `TMPDIR`. `persist`
+    /// then renames across filesystems whenever `TMPDIR` and the working
+    /// directory differ -- tmpfs `/tmp` beside a btrfs checkout is the ordinary
+    /// case here -- which fails `EXDEV`, so the record is never written and the
+    /// PREVIOUS invocation's `{verified:true}` survives. Exactly the stale green
+    /// this whole change exists to remove, reachable with
+    /// `--verify-json=verdict.json`.
+    #[test]
+    fn a_bare_filename_stages_beside_its_target_not_in_the_system_temp_dir() {
+        // The regression: a bare filename resolves to the working directory.
+        assert_eq!(
+            staging_directory(Path::new("verdict.json")),
+            Path::new("."),
+            "a bare filename must stage in the working directory; staging in \
+             TMPDIR makes persist() a cross-filesystem rename"
+        );
+        assert_eq!(
+            staging_directory(Path::new("./verdict.json")),
+            Path::new(".")
+        );
+
+        // The control: a path that DOES name a directory still uses it, so the
+        // fix is a corrected fallback rather than a blanket redirect to `.`.
+        assert_eq!(
+            staging_directory(Path::new("/tmp/run/verdict.json")),
+            Path::new("/tmp/run")
+        );
+        assert_eq!(
+            staging_directory(Path::new("sub/verdict.json")),
+            Path::new("sub")
+        );
+
+        // Whatever it returns must never be empty: NamedTempFile::new_in("")
+        // fails, which would turn every write into an error.
+        for candidate in ["verdict.json", "./v.json", "/tmp/run/v.json", "sub/v.json"] {
+            assert!(
+                !staging_directory(Path::new(candidate))
+                    .as_os_str()
+                    .is_empty(),
+                "{candidate}: staging directory must be usable"
+            );
+        }
+    }
+
+    /// End-to-end for the same defect: a BARE filename target, with a previous
+    /// green already at it, must be replaced by the no-result stamp.
+    ///
+    /// Runs from a temporary working directory so the target really is a bare
+    /// relative name. Under the old code this failed on any host where the
+    /// working directory and `TMPDIR` are on different filesystems.
+    #[test]
+    fn a_bare_filename_target_is_overwritten_not_left_stale() {
+        // `set_current_dir` is process-global; serialize against any other test
+        // that touches it.
+        static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = CWD.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Root the working directory in the SOURCE TREE, not in TMPDIR. A
+        // plain `tempdir()` lands beside the staged file and the cross-
+        // filesystem rename never happens, so the test would pass against the
+        // defect -- measured: it did. On this host the checkout and /tmp are
+        // distinct btrfs subvolumes (st_dev 46 vs 47), and cross-subvolume
+        // rename(2) is EXDEV, which is what makes this end-to-end rather than
+        // decorative.
+        let dir = tempfile::Builder::new()
+            .prefix("verify-json-bare-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let outcome = (|| {
+            let bare = Path::new("verdict.json");
+            plant_previous_green(bare);
+            write_pending_verification_json(bare)?;
+            Ok::<_, Error>(read_verdict(bare))
+        })();
+
+        std::env::set_current_dir(previous).unwrap();
+        let now = outcome.expect("staging beside a bare filename must succeed");
+        assert_eq!(now["verdict"], serde_json::json!("no_result"));
+        assert_eq!(now["verified"], serde_json::json!(false));
+    }
+
     #[test]
     fn pending_stamp_overwrites_a_previous_green_verdict() {
         let file = NamedTempFile::new().unwrap();
