@@ -55,9 +55,12 @@ use super::global_opts::GlobalOpts;
 use super::tracing::init_file_tracing;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
+use super::verify::LogCompareStrictness;
 use super::verify::compare_two_runs;
 use super::verify::temp_log_files;
 use super::verify::validate_log_level;
+use super::verify::write_pending_verification_json;
+use super::verify::write_verification_json;
 
 const TMP_DIR: &str = "/tmp";
 const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
@@ -308,9 +311,26 @@ pub struct RunOpts {
 
     /// Compare complete, unnormalized TRACE logs and show detailed differences.
     /// This detects internal timing and other trace-only divergence at the cost
-    /// of substantially larger logs and stricter comparison.
+    /// of substantially larger logs and stricter comparison. Implies the strict,
+    /// bitwise comparison of --verify-strict, and additionally raises the diff
+    /// verbosity (larger logs, more syscall history).
     #[clap(long, requires = "verify")]
     verify_verbose: bool,
+
+    /// Compare the internal logs under the CANONICAL parity policy: strip only
+    /// the real wall-clock timestamp prefix (genuinely irreproducible),
+    /// canonicalize host memory addresses to first-appearance ordinals (so an
+    /// ASLR shift is tolerated but allocation-order and aliasing changes still
+    /// diverge), and compare everything else — virtual-time timestamps, raw
+    /// syscall argument/result values, counts, sizes, flags — exactly. Without
+    /// this (and without --verify-verbose) the default `--verify` normalizes away
+    /// numbers, addresses, tmp paths, and timestamps before comparing, so a
+    /// "verified" result asserts only stripped parity, not bitwise identity.
+    /// Unlike --verify-verbose this stays quiet: it changes only the comparison,
+    /// not the diff output volume, so a determinism ratchet can require parity
+    /// without drowning in trace logs.
+    #[clap(long, requires = "verify")]
+    verify_strict: bool,
 
     /// If --verify is specified, indicates what guest exit status is required for
     /// hermit to consider the verification successful.  Both runs must satisfy this criteria,
@@ -325,6 +345,26 @@ pub struct RunOpts {
     /// performing the two-run determinism check.
     #[clap(long, requires = "verify")]
     verify_logs: bool,
+
+    /// With --verify, write the verification verdict as a single JSON line to
+    /// this path: `{"verified":bool,"bitwise_parity":bool,
+    /// "verdict":"matched"|"diverged","comparison":{"strictness":
+    /// "stripped"|"canonical","compare_logs":bool,"strip_lines":bool,
+    /// "canonicalize_addresses":bool,"full_trace":bool,"exact_remainder":bool,
+    /// "stripped_prefixes":[str],"canonicalizations":[str],"ignore_lines":bool,
+    /// "skip_commit":bool,"skip_detlog":bool},"guest_exit_code":int|null,
+    /// "guest_signal":int|null}`. This is the exit-code-independent verdict
+    /// channel: `verified` reflects whether the two runs matched, regardless of
+    /// what the guest exited with, so a caller need not (and must not) infer the
+    /// verdict from the process exit code. A determinism / record-replay parity
+    /// ratchet must key on `bitwise_parity`, NOT `verified`: `bitwise_parity` is
+    /// true only under the `canonical` (`BitwiseInfoV1`) policy — a full-INFO
+    /// comparison that strips only the real wall-clock prefix, canonicalizes host
+    /// addresses to first-appearance ordinals, and compares everything else
+    /// exactly (see --verify-strict) — so it cannot be silently weakened to a
+    /// stripped compare.
+    #[clap(long, requires = "verify", value_name = "PATH")]
+    verify_json: Option<PathBuf>,
 
     /// Print a summary of the process tree's execution to stderr before exiting.
     #[clap(long, short = 'u')]
@@ -560,6 +600,13 @@ impl fmt::Display for RunOpts {
         }
         if self.verify_verbose {
             write!(f, " --verify-verbose")?;
+        }
+        if self.verify_strict {
+            write!(f, " --verify-strict")?;
+        }
+        if let Some(p) = &self.verify_json {
+            let s = p.to_str().expect("valid unicode path");
+            write!(f, " --verify-json={}", shell_words::quote(s))?;
         }
         if let Some(p) = &self.tmp {
             let s = p.to_str().expect("valid unicode path");
@@ -2637,6 +2684,15 @@ impl RunOpts {
 
     // Execution mode corresponding to `run --verify`:
     fn verify(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        // Stamp an explicit no-result BEFORE any fallible work. Several exits
+        // below (a run that fails to start, a rejected first-run status, a SaBRe
+        // capture with zero DETLOG) return early without ever reaching
+        // `write_verification_json`; without this, reusing a --verify-json path
+        // would leave the PREVIOUS invocation's record -- possibly a green -- to
+        // be read as this invocation's result.
+        if let Some(path) = &self.verify_json {
+            write_pending_verification_json(path)?;
+        }
         let (log1, log2) =
             temp_log_files("run1", "run2").context("Failed to create temporary log files")?;
 
@@ -2691,7 +2747,7 @@ impl RunOpts {
         }
 
         let kvm_output_only = self.selected_backend() == Backend::Kvm;
-        let status = compare_two_runs(
+        let outcome = compare_two_runs(
             ComparedRun {
                 output: &out1,
                 log: log1_path,
@@ -2708,9 +2764,33 @@ impl RunOpts {
                 },
                 failure_message: "Failure: nondeterministic.",
                 verbose: self.verify_verbose,
+                // --verify-verbose historically implied a bitwise compare (it
+                // flipped strip_lines off + FullTrace on); preserve that, and let
+                // --verify-strict select the same bitwise comparison quietly.
+                strictness: if self.verify_verbose || self.verify_strict {
+                    LogCompareStrictness::Canonical
+                } else {
+                    LogCompareStrictness::Stripped
+                },
                 compare_logs: !kvm_output_only,
             },
         )?;
+
+        // Emit the machine-readable verdict (if requested) before collapsing the
+        // outcome to the historical exit-code convention. The verdict is recorded
+        // whether or not the runs matched, and independent of the guest's own
+        // exit status.
+        if let Some(path) = &self.verify_json {
+            write_verification_json(path, &outcome)?;
+        }
+
+        // On divergence, preserve the historical behavior: return the error
+        // (nonzero process exit) without emitting the guest's output or backend
+        // banner.
+        if !outcome.verified() {
+            return outcome.into_exit_status();
+        }
+        let status = outcome.guest_status;
 
         let backend_banner = match self.selected_backend() {
             Backend::Kvm => Some("KVM (reverie-kvm KvmGuest<Detcore>)"),

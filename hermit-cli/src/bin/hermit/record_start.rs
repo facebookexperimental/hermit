@@ -43,9 +43,12 @@ use super::run::is_elf_file;
 use super::run::path_resolution_visits_prefix;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
+use super::verify::LogCompareStrictness;
 use super::verify::compare_two_runs;
 use super::verify::setup_double_run;
 use super::verify::validate_log_level;
+use super::verify::write_pending_verification_json;
+use super::verify::write_verification_json;
 
 #[derive(Debug)]
 struct E9patchRecordOverlay {
@@ -194,6 +197,39 @@ pub struct StartOpts {
     /// The recording is deleted if the replay was successful.
     #[clap(long)]
     verify: bool,
+
+    /// With --verify, write the verification verdict as a single JSON line to
+    /// this path: `{"verified":bool,"bitwise_parity":bool,
+    /// "verdict":"matched"|"diverged","comparison":{"strictness":
+    /// "stripped"|"canonical","compare_logs":bool,"strip_lines":bool,
+    /// "canonicalize_addresses":bool,"full_trace":bool,"exact_remainder":bool,
+    /// "stripped_prefixes":[str],"canonicalizations":[str],"ignore_lines":bool,
+    /// "skip_commit":bool,"skip_detlog":bool},"guest_exit_code":int|null,
+    /// "guest_signal":int|null}`. This is the exit-code-independent verdict
+    /// channel: `verified` reflects whether the record and replay runs matched,
+    /// regardless of what the guest exited with, so a caller need not (and must
+    /// not) infer the verdict from the process exit code. A record/replay parity
+    /// ratchet must key on `bitwise_parity`, NOT `verified`: `bitwise_parity` is
+    /// true only under the `canonical` (`BitwiseInfoV1`) policy — a full-INFO
+    /// comparison that strips only the real wall-clock prefix, canonicalizes host
+    /// addresses to first-appearance ordinals, and compares everything else
+    /// exactly (see --verify-strict) — rather than a stripped match.
+    #[clap(long, requires = "verify", value_name = "PATH")]
+    verify_json: Option<PathBuf>,
+
+    /// With --verify, compare the record and replay logs under the CANONICAL
+    /// parity policy: strip only the real wall-clock timestamp prefix, canonicalize
+    /// host memory addresses to first-appearance ordinals (tolerating an ASLR
+    /// shift while still diverging on allocation-order or aliasing changes), and
+    /// compare everything else — virtual-time timestamps, raw syscall
+    /// argument/result values, counts, sizes, flags — exactly. Without this the
+    /// default `--verify` normalizes away numbers, addresses, tmp paths, and
+    /// timestamps before comparing, so a "verified" result asserts only stripped
+    /// parity, not bitwise identity. A record/replay determinism ratchet keying on
+    /// the verdict should set this so it cannot be silently weakened to a stripped
+    /// comparison.
+    #[clap(long, requires = "verify")]
+    verify_strict: bool,
 
     /// After recording, immediately replays the command to verify that it works
     /// With provided gdb command (passed by `-ex`).
@@ -361,6 +397,13 @@ impl StartOpts {
 
     /// This is called when `--verify` is passed to the command line.
     fn record_verify(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        // Stamp an explicit no-result BEFORE any fallible work: the record and
+        // replay steps below can fail long before a verdict exists, and a reused
+        // --verify-json path must never keep showing a previous invocation's
+        // green as though it described this one.
+        if let Some(path) = &self.verify_json {
+            write_pending_verification_json(path)?;
+        }
         let ((global1, log1), (global2, log2)) = setup_double_run(global, "record", "replay");
 
         let (mut recording_container, _record_identity_guard) = self.recording_container(global)?;
@@ -399,7 +442,7 @@ impl StartOpts {
             })
             .context("Container exited unexpectedly")??;
 
-        compare_two_runs(
+        let outcome = compare_two_runs(
             ComparedRun {
                 output: &recording,
                 log: log1.into_temp_path(),
@@ -412,9 +455,24 @@ impl StartOpts {
                 success_message: "Success: replay matched recording.",
                 failure_message: "Recording output did not match replay output!",
                 verbose: false,
+                strictness: if self.verify_strict {
+                    LogCompareStrictness::Canonical
+                } else {
+                    LogCompareStrictness::Stripped
+                },
                 compare_logs: true,
             },
-        )
+        )?;
+
+        // Emit the machine-readable verdict (if requested) before collapsing the
+        // outcome to the historical exit-code convention, so the verdict is
+        // recorded whether or not the runs matched and independent of the guest's
+        // own exit status.
+        if let Some(path) = &self.verify_json {
+            write_verification_json(path, &outcome)?;
+        }
+
+        outcome.into_exit_status()
     }
     /// This is called when `--verify-with-gdbex` is passed to the command line.
     fn record_verify_debug(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
@@ -547,6 +605,8 @@ mod tests {
             data_dir: None,
             record_timeout: None,
             verify: false,
+            verify_json: None,
+            verify_strict: false,
             gdbex: Vec::new(),
         };
         let error = options.resolve_e9patch_record_target().unwrap_err();
