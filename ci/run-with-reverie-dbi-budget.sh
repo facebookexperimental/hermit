@@ -22,6 +22,8 @@ if (($# == 0)); then
 fi
 
 # shellcheck source=ci/configure-build-jobs.sh
+REVERIE_DBI_BUDGET_CHILD=1
+export REVERIE_DBI_BUDGET_CHILD
 source "$ROOT_DIR/ci/configure-build-jobs.sh"
 
 echo "run-with-reverie-dbi-budget.sh: reverie-dbi-budget={source:$REVERIE_DBI_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBI_RAW_BUILD_JOBS,effective-cpus:$CI_DAG_EFFECTIVE_CPUS,reverie-max-jobs:$CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBI_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBI_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4}" >&2

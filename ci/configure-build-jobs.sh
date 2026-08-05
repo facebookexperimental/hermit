@@ -15,16 +15,39 @@ if [[ ! $CI_DAG_BUILD_JOBS =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 # The safe DAG runner writes its cap-derived CARGO_BUILD_JOBS inside each boxed
-# child, after the launch script has run. Preserve that post-wrapper value when
-# present; CI_DAG_BUILD_JOBS is only the unboxed/ambient fallback. The DBI budget
-# wrapper re-sources this file inside the child so the timeout and Cargo's actual
-# NUM_JOBS input are bound to the same raw value.
-if [[ -n ${CARGO_BUILD_JOBS:-} ]]; then
-    REVERIE_DBI_BUILD_JOBS_SOURCE=cargo-build-jobs
-    REVERIE_DBI_RAW_BUILD_JOBS=$CARGO_BUILD_JOBS
+# child, after the launch script has run. Record the first-source origin so a
+# hosted child that merely inherits the launch fallback is not mislabeled as a
+# runner override when the DBI wrapper re-sources this file. SAFE_CI_IN_SCOPE is
+# the runner's observable boxed-scope marker; a changed child width is also
+# authoritative when an alternate wrapper supplies one.
+if [[ ${CI_DAG_LAUNCH_WIDTH_BOUND:-0} == 1 ]]; then
+    if [[ ! ${CI_DAG_LAUNCH_RAW_BUILD_JOBS:-} =~ ^[1-9][0-9]*$ ]] ||
+        [[ -z ${CI_DAG_LAUNCH_BUILD_JOBS_SOURCE:-} ]]; then
+        echo "configure-build-jobs.sh: incomplete launch-width provenance" >&2
+        return 2
+    fi
+    if [[ ${SAFE_CI_IN_SCOPE:-} == 1 && -n ${CARGO_BUILD_JOBS:-} ]]; then
+        REVERIE_DBI_BUILD_JOBS_SOURCE=runner-child-cargo-build-jobs
+        REVERIE_DBI_RAW_BUILD_JOBS=$CARGO_BUILD_JOBS
+    elif [[ -n ${CARGO_BUILD_JOBS:-} &&
+        $CARGO_BUILD_JOBS != "$CI_DAG_LAUNCH_RAW_BUILD_JOBS" ]]; then
+        REVERIE_DBI_BUILD_JOBS_SOURCE=child-cargo-build-jobs
+        REVERIE_DBI_RAW_BUILD_JOBS=$CARGO_BUILD_JOBS
+    else
+        REVERIE_DBI_BUILD_JOBS_SOURCE=$CI_DAG_LAUNCH_BUILD_JOBS_SOURCE
+        REVERIE_DBI_RAW_BUILD_JOBS=${CARGO_BUILD_JOBS:-$CI_DAG_LAUNCH_RAW_BUILD_JOBS}
+    fi
 else
-    REVERIE_DBI_BUILD_JOBS_SOURCE=ci-dag-build-jobs-fallback
-    REVERIE_DBI_RAW_BUILD_JOBS=$CI_DAG_BUILD_JOBS
+    if [[ -n ${CARGO_BUILD_JOBS:-} ]]; then
+        REVERIE_DBI_BUILD_JOBS_SOURCE=ambient-cargo-build-jobs
+        REVERIE_DBI_RAW_BUILD_JOBS=$CARGO_BUILD_JOBS
+    else
+        REVERIE_DBI_BUILD_JOBS_SOURCE=ci-dag-build-jobs-fallback
+        REVERIE_DBI_RAW_BUILD_JOBS=$CI_DAG_BUILD_JOBS
+    fi
+    CI_DAG_LAUNCH_WIDTH_BOUND=1
+    CI_DAG_LAUNCH_BUILD_JOBS_SOURCE=$REVERIE_DBI_BUILD_JOBS_SOURCE
+    CI_DAG_LAUNCH_RAW_BUILD_JOBS=$REVERIE_DBI_RAW_BUILD_JOBS
 fi
 if [[ ! $REVERIE_DBI_RAW_BUILD_JOBS =~ ^[1-9][0-9]*$ ]]; then
     echo "configure-build-jobs.sh: selected raw build width must be a positive integer" >&2
@@ -90,10 +113,20 @@ REVERIE_DBI_MAX_BUILD_SECONDS=$((
 # nested native-build knob identical so validate.sh cannot widen the pool again.
 export CARGO_BUILD_JOBS=$REVERIE_DBI_RAW_BUILD_JOBS
 export THIRD_PARTY_BUILD_JOBS=$REVERIE_DBI_RAW_BUILD_JOBS
+export CI_DAG_LAUNCH_WIDTH_BOUND
+export CI_DAG_LAUNCH_BUILD_JOBS_SOURCE
+export CI_DAG_LAUNCH_RAW_BUILD_JOBS
 export REVERIE_DBI_BUILD_JOBS_SOURCE
 export REVERIE_DBI_RAW_BUILD_JOBS
 export CI_DAG_EFFECTIVE_CPUS
 export CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS
 export REVERIE_DBI_EFFECTIVE_BUILD_JOBS
 export CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS
-export REVERIE_DBI_MAX_BUILD_SECONDS
+if [[ ${REVERIE_DBI_BUDGET_CHILD:-0} == 1 ]]; then
+    export REVERIE_DBI_MAX_BUILD_SECONDS
+else
+    # The downstream override is portable-build-specific. Keep the derived value
+    # available to launcher diagnostics/tests without leaking it into unrelated
+    # DAG children such as the tightly bounded privileged smoke lane.
+    export -n REVERIE_DBI_MAX_BUILD_SECONDS
+fi
