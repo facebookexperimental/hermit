@@ -38,7 +38,7 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR" || exit 2
 
 # shellcheck source=ci/configure-build-jobs.sh
-source "$ROOT_DIR/ci/configure-build-jobs.sh" || exit $?
+source "$ROOT_DIR/ci/configure-build-jobs.sh" launcher || exit $?
 
 if (($# < 1)); then
     echo "usage: ci/run-dag.sh <portable|privileged> [runner-args...]" >&2
@@ -117,5 +117,5 @@ if (($# > 0)) && [[ $1 == list || $1 == ascii || $1 == dot || $1 == json ]]; the
     shift
 fi
 
-echo "run-dag.sh: lane=$lane runner=$runner verb=$verb cargo-jobs=$CARGO_BUILD_JOBS reverie-dbi-budget=deferred-to-build-child launch-width={source:$REVERIE_DBI_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBI_RAW_BUILD_JOBS}" >&2
+echo "run-dag.sh: lane=$lane runner=$runner verb=$verb cargo-jobs=$CARGO_BUILD_JOBS reverie-dbi-budget=portable-build-child-only" >&2
 exec "$runner" "$verb" --dag "$dag" "$@"

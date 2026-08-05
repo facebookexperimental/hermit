@@ -21,11 +21,24 @@ if (($# == 0)); then
     exit 2
 fi
 
-# shellcheck source=ci/configure-build-jobs.sh
-REVERIE_DBI_BUDGET_CHILD=1
-export REVERIE_DBI_BUDGET_CHILD
-source "$ROOT_DIR/ci/configure-build-jobs.sh"
+# Bind the calibration to the exact local Reverie revision before applying it.
+# --print-pin is deliberately offline: the separate latest-main gate owns the
+# network authority, while this check prevents a pin bump from silently reusing
+# 025d378's clamp and measured threshold.
+expected_pin=025d37800d347c32711038bd0a3889e8e4774c2b
+recorded_pin=$(
+    "$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR" --print-pin
+)
+if [[ $recorded_pin != "$expected_pin" ]]; then
+    echo "run-with-reverie-dbi-budget.sh: no calibrated budget for Reverie pin $recorded_pin (expected $expected_pin)" >&2
+    exit 2
+fi
+REVERIE_DBI_BUDGET_BOUND_PIN=$recorded_pin
+export REVERIE_DBI_BUDGET_BOUND_PIN
 
-echo "run-with-reverie-dbi-budget.sh: reverie-dbi-budget={source:$REVERIE_DBI_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBI_RAW_BUILD_JOBS,effective-cpus:$CI_DAG_EFFECTIVE_CPUS,reverie-max-jobs:$CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBI_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBI_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4}" >&2
+# shellcheck source=ci/configure-build-jobs.sh
+source "$ROOT_DIR/ci/configure-build-jobs.sh" reverie-dbi-budget-child
+
+echo "run-with-reverie-dbi-budget.sh: reverie-dbi-budget={pin:$REVERIE_DBI_BUDGET_BOUND_PIN,source:$REVERIE_DBI_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBI_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBI_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBI_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBI_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBI_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBI_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4}" >&2
 
 exec "$@"

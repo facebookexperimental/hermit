@@ -258,7 +258,9 @@ jobs:
     needs: select
     if: needs.select.outputs.build_debug != 'false'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The wrapped DBI node allows 1050s for the native build plus 150s of node
+    # overhead. Keep the hosted job strictly outside that 1200s inner bound.
+    timeout-minutes: 25
     outputs:
       e2e_matrix: ${{ steps.cells.outputs.matrix }}
       e2e_count: ${{ steps.cells.outputs.count }}

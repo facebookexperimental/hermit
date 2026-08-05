@@ -7,6 +7,12 @@
 # 2026-08-04 the pre-collapse build.dbi_release and rr_suite_contract nodes both
 # completed at j8 under their cgroup-recorded memory caps. The collapsed fat-build
 # nodes declare their independently measured higher width in the DAG manifest.
+#
+# This file has two explicit source modes. `launcher` preserves the historical
+# shared Cargo widths and strips every portable DBI-budget variable before the
+# DAG runner starts. `reverie-dbi-budget-child` is called only by the portable
+# DBI wrapper, after safe-ci has entered the child and selected any child-local
+# Cargo width.
 
 CI_DAG_BUILD_JOBS=${CI_DAG_BUILD_JOBS:-8}
 if [[ ! $CI_DAG_BUILD_JOBS =~ ^[1-9][0-9]*$ ]]; then
@@ -14,119 +20,117 @@ if [[ ! $CI_DAG_BUILD_JOBS =~ ^[1-9][0-9]*$ ]]; then
     return 2
 fi
 
-# The safe DAG runner writes its cap-derived CARGO_BUILD_JOBS inside each boxed
-# child, after the launch script has run. Record the first-source origin so a
-# hosted child that merely inherits the launch fallback is not mislabeled as a
-# runner override when the DBI wrapper re-sources this file. SAFE_CI_IN_SCOPE is
-# the runner's observable boxed-scope marker; a changed child width is also
-# authoritative when an alternate wrapper supplies one.
-if [[ ${CI_DAG_LAUNCH_WIDTH_BOUND:-0} == 1 ]]; then
-    if [[ ! ${CI_DAG_LAUNCH_RAW_BUILD_JOBS:-} =~ ^[1-9][0-9]*$ ]] ||
-        [[ -z ${CI_DAG_LAUNCH_BUILD_JOBS_SOURCE:-} ]]; then
-        echo "configure-build-jobs.sh: incomplete launch-width provenance" >&2
-        return 2
-    fi
-    if [[ ${SAFE_CI_IN_SCOPE:-} == 1 && -n ${CARGO_BUILD_JOBS:-} ]]; then
+build_job_context=${1:-}
+if [[ $build_job_context == launcher ]]; then
+    # These variables are meaningful only in the two portable DBI build
+    # children. Remove even planted ambient values so the privileged runner's
+    # environment remains identical to the pre-budget launcher contract.
+    unset REVERIE_DBI_BUDGET_BOUND_PIN
+    unset REVERIE_DBI_BUILD_JOBS_SOURCE
+    unset REVERIE_DBI_RAW_BUILD_JOBS
+    unset REVERIE_DBI_EFFECTIVE_CPUS_SOURCE
+    unset REVERIE_DBI_EFFECTIVE_CPUS
+    unset REVERIE_DBI_MAX_PARALLEL_JOBS
+    unset REVERIE_DBI_EFFECTIVE_BUILD_JOBS
+    unset REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS
+    unset REVERIE_DBI_MAX_BUILD_SECONDS
+
+    # Retire the previous launcher-carried derivation names fail-closed too.
+    unset CI_DAG_LAUNCH_WIDTH_BOUND
+    unset CI_DAG_LAUNCH_BUILD_JOBS_SOURCE
+    unset CI_DAG_LAUNCH_RAW_BUILD_JOBS
+    unset CI_DAG_EFFECTIVE_CPUS
+    unset CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS
+    unset CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS
+    unset REVERIE_DBI_BUDGET_CHILD
+
+    # Cargo converts this explicit pool width into build-script NUM_JOBS. Keep
+    # the nested native-build knob identical so validate.sh cannot widen it.
+    export CARGO_BUILD_JOBS=$CI_DAG_BUILD_JOBS
+    export THIRD_PARTY_BUILD_JOBS=$CI_DAG_BUILD_JOBS
+    return 0
+fi
+
+if [[ $build_job_context != reverie-dbi-budget-child ]]; then
+    echo "configure-build-jobs.sh: expected source mode launcher or reverie-dbi-budget-child" >&2
+    return 2
+fi
+
+# The calibration below is valid only for Reverie 025d378. The portable wrapper
+# obtains the repository's recorded pin through the canonical checker and
+# carries it here; a pin bump cannot silently retain the old clamp or threshold.
+if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 025d37800d347c32711038bd0a3889e8e4774c2b ]]; then
+    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 025d37800d347c32711038bd0a3889e8e4774c2b" >&2
+    return 2
+fi
+
+if [[ -n ${CARGO_BUILD_JOBS:-} ]]; then
+    REVERIE_DBI_RAW_BUILD_JOBS=$CARGO_BUILD_JOBS
+    if [[ ${SAFE_CI_IN_SCOPE:-} == 1 ]]; then
         REVERIE_DBI_BUILD_JOBS_SOURCE=runner-child-cargo-build-jobs
-        REVERIE_DBI_RAW_BUILD_JOBS=$CARGO_BUILD_JOBS
-    elif [[ -n ${CARGO_BUILD_JOBS:-} &&
-        $CARGO_BUILD_JOBS != "$CI_DAG_LAUNCH_RAW_BUILD_JOBS" ]]; then
-        REVERIE_DBI_BUILD_JOBS_SOURCE=child-cargo-build-jobs
-        REVERIE_DBI_RAW_BUILD_JOBS=$CARGO_BUILD_JOBS
     else
-        REVERIE_DBI_BUILD_JOBS_SOURCE=$CI_DAG_LAUNCH_BUILD_JOBS_SOURCE
-        REVERIE_DBI_RAW_BUILD_JOBS=${CARGO_BUILD_JOBS:-$CI_DAG_LAUNCH_RAW_BUILD_JOBS}
+        REVERIE_DBI_BUILD_JOBS_SOURCE=inherited-launch-cargo-build-jobs
     fi
 else
-    if [[ -n ${CARGO_BUILD_JOBS:-} ]]; then
-        REVERIE_DBI_BUILD_JOBS_SOURCE=ambient-cargo-build-jobs
-        REVERIE_DBI_RAW_BUILD_JOBS=$CARGO_BUILD_JOBS
-    else
-        REVERIE_DBI_BUILD_JOBS_SOURCE=ci-dag-build-jobs-fallback
-        REVERIE_DBI_RAW_BUILD_JOBS=$CI_DAG_BUILD_JOBS
-    fi
-    CI_DAG_LAUNCH_WIDTH_BOUND=1
-    CI_DAG_LAUNCH_BUILD_JOBS_SOURCE=$REVERIE_DBI_BUILD_JOBS_SOURCE
-    CI_DAG_LAUNCH_RAW_BUILD_JOBS=$REVERIE_DBI_RAW_BUILD_JOBS
+    REVERIE_DBI_RAW_BUILD_JOBS=$CI_DAG_BUILD_JOBS
+    REVERIE_DBI_BUILD_JOBS_SOURCE=ci-dag-build-jobs-fallback
 fi
 if [[ ! $REVERIE_DBI_RAW_BUILD_JOBS =~ ^[1-9][0-9]*$ ]]; then
     echo "configure-build-jobs.sh: selected raw build width must be a positive integer" >&2
     return 2
 fi
 
-# Reverie 025d378's DynamoRIO source-build ratchet accepts an elapsed-seconds
-# override. Its build.rs clamps Cargo's NUM_JOBS to 16 before passing it to
-# `cmake --parallel`; the operating system cannot execute more jobs at once than
-# the process affinity exposes. Carry every condition with the threshold by
-# deriving the nominal effective native width first:
+# Observe affinity/cpuset visibility in this child, after safe-ci has applied
+# its containment. A launcher observation would be only a correlated proxy for
+# the CPUs available to the native build.
+if ! REVERIE_DBI_EFFECTIVE_CPUS=$(nproc); then
+    echo "configure-build-jobs.sh: child nproc observation failed" >&2
+    return 2
+fi
+REVERIE_DBI_EFFECTIVE_CPUS_SOURCE=child-nproc
+if [[ ! $REVERIE_DBI_EFFECTIVE_CPUS =~ ^[1-9][0-9]*$ ]]; then
+    echo "configure-build-jobs.sh: child nproc must return a positive integer" >&2
+    return 2
+fi
+
+# Reverie 025d378's DynamoRIO build.rs clamps Cargo NUM_JOBS to 16 before
+# passing it to `cmake --parallel`. Carry the calibrated threshold together with
+# every condition used to convert it into elapsed seconds:
 #
-#   effective native jobs = min(requested jobs, effective CPUs, Reverie clamp)
+#   effective native jobs = min(requested jobs, child CPUs, Reverie clamp)
 #   max elapsed seconds = ceil(effective-job-second threshold / effective jobs)
 #
 # PROVENANCE (GitHub portable run 31008044311 at Hermit f21b22ed, requested
 # jobs=8, runner affinity=4): three content-key misses measured 115.82s,
 # 128.27s, and 131.21s -- one debug build and two concurrent release builds --
-# i.e. 463.28, 513.08, and 524.84 effective-job-seconds at min(8, 4,
-# 16)=4. Reverie's original ratchet policy used 2x the slowest of n=3 clean
-# observations; applying that emergency-remediation policy and rounding up gives
-# 1050 effective-job-seconds. The concurrent release builds embody contention;
-# nproc reports affinity/cpuset visibility, not a guaranteed per-build CPU share.
-# This is not a DAG cpu_timeout declaration or a topology-independent estimate;
-# replace it when >=5 clean Hermit-lane samples support broader calibration.
-CI_DAG_EFFECTIVE_CPUS=${CI_DAG_EFFECTIVE_CPUS:-$(nproc)}
-if [[ ! $CI_DAG_EFFECTIVE_CPUS =~ ^[1-9][0-9]*$ ]]; then
-    echo "configure-build-jobs.sh: CI_DAG_EFFECTIVE_CPUS must be a positive integer" >&2
-    return 2
-fi
-
-# This duplicated condition is deliberately fail-closed against the exact
-# Reverie 025d378 build.rs contract. A pin that changes MAX_PARALLEL_JOBS must
-# update this binding and its brackets together.
-REVERIE_DBI_PINNED_MAX_PARALLEL_JOBS=16
-CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS=${CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS:-$REVERIE_DBI_PINNED_MAX_PARALLEL_JOBS}
-if [[ ! $CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS =~ ^[1-9][0-9]*$ ]] ||
-    ((CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS != REVERIE_DBI_PINNED_MAX_PARALLEL_JOBS)); then
-    echo "configure-build-jobs.sh: CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS must match pinned Reverie clamp 16" >&2
-    return 2
-fi
-
+# i.e. 463.28, 513.08, and 524.84 effective-job-seconds at min(8, 4, 16)=4.
+# Reverie's original ratchet policy used 2x the slowest of n=3 clean
+# observations; applying that policy and rounding up gives 1050
+# effective-job-seconds. The concurrent release builds embody contention;
+# replace this calibration when >=5 clean Hermit-lane samples support it.
+REVERIE_DBI_MAX_PARALLEL_JOBS=16
+REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS=1050
 REVERIE_DBI_EFFECTIVE_BUILD_JOBS=$REVERIE_DBI_RAW_BUILD_JOBS
-if ((CI_DAG_EFFECTIVE_CPUS < REVERIE_DBI_EFFECTIVE_BUILD_JOBS)); then
-    REVERIE_DBI_EFFECTIVE_BUILD_JOBS=$CI_DAG_EFFECTIVE_CPUS
+if ((REVERIE_DBI_EFFECTIVE_CPUS < REVERIE_DBI_EFFECTIVE_BUILD_JOBS)); then
+    REVERIE_DBI_EFFECTIVE_BUILD_JOBS=$REVERIE_DBI_EFFECTIVE_CPUS
 fi
-if ((CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS < REVERIE_DBI_EFFECTIVE_BUILD_JOBS)); then
-    REVERIE_DBI_EFFECTIVE_BUILD_JOBS=$CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS
-fi
-
-CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS=${CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS:-1050}
-if [[ ! $CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS =~ ^[1-9][0-9]*$ ]]; then
-    echo "configure-build-jobs.sh: CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS must be a positive integer" >&2
-    return 2
+if ((REVERIE_DBI_MAX_PARALLEL_JOBS < REVERIE_DBI_EFFECTIVE_BUILD_JOBS)); then
+    REVERIE_DBI_EFFECTIVE_BUILD_JOBS=$REVERIE_DBI_MAX_PARALLEL_JOBS
 fi
 REVERIE_DBI_MAX_BUILD_SECONDS=$((
-    (CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS +
+    (REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS +
         REVERIE_DBI_EFFECTIVE_BUILD_JOBS - 1) /
         REVERIE_DBI_EFFECTIVE_BUILD_JOBS
 ))
 
-# Cargo converts this explicit pool width into build-script NUM_JOBS. Keep the
-# nested native-build knob identical so validate.sh cannot widen the pool again.
 export CARGO_BUILD_JOBS=$REVERIE_DBI_RAW_BUILD_JOBS
 export THIRD_PARTY_BUILD_JOBS=$REVERIE_DBI_RAW_BUILD_JOBS
-export CI_DAG_LAUNCH_WIDTH_BOUND
-export CI_DAG_LAUNCH_BUILD_JOBS_SOURCE
-export CI_DAG_LAUNCH_RAW_BUILD_JOBS
+export REVERIE_DBI_BUDGET_BOUND_PIN
 export REVERIE_DBI_BUILD_JOBS_SOURCE
 export REVERIE_DBI_RAW_BUILD_JOBS
-export CI_DAG_EFFECTIVE_CPUS
-export CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS
+export REVERIE_DBI_EFFECTIVE_CPUS_SOURCE
+export REVERIE_DBI_EFFECTIVE_CPUS
+export REVERIE_DBI_MAX_PARALLEL_JOBS
 export REVERIE_DBI_EFFECTIVE_BUILD_JOBS
-export CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS
-if [[ ${REVERIE_DBI_BUDGET_CHILD:-0} == 1 ]]; then
-    export REVERIE_DBI_MAX_BUILD_SECONDS
-else
-    # The downstream override is portable-build-specific. Keep the derived value
-    # available to launcher diagnostics/tests without leaking it into unrelated
-    # DAG children such as the tightly bounded privileged smoke lane.
-    export -n REVERIE_DBI_MAX_BUILD_SECONDS
-fi
+export REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS
+export REVERIE_DBI_MAX_BUILD_SECONDS

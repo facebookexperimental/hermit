@@ -23,16 +23,16 @@ if [[ ${1:-} == --self-test ]]; then
 fi
 
 mkdir -p target/ci
+checker=$(mktemp "$ROOT_DIR/target/ci/check-reverie-pin.XXXXXX")
+trap 'rm -f -- "$checker"' EXIT
 if [[ $mode == test ]]; then
     if (($# != 0)); then
         echo "usage: ci/run-reverie-pin-check.sh --self-test" >&2
         exit 2
     fi
-    checker=target/ci/check-reverie-pin-tests
     RUSTUP_TOOLCHAIN=stable rustc --edition=2021 --test \
         scripts/check-reverie-pin.rs -o "$checker"
 else
-    checker=target/ci/check-reverie-pin
     RUSTUP_TOOLCHAIN=stable rustc --edition=2021 \
         scripts/check-reverie-pin.rs -o "$checker"
 fi
