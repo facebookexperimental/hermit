@@ -63,6 +63,8 @@ use crate::resources::ChaosEpochTransition;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::scheduler::AdmitIntent;
+use crate::scheduler::AdmitSide;
 use crate::scheduler::ConsumeResult;
 use crate::scheduler::DEFAULT_PRIORITY;
 use crate::scheduler::ExecReconnect;
@@ -1280,19 +1282,32 @@ impl GlobalState {
                 pr.register_thread(child_dettid, initial_priority);
             }
 
-            let child_first = self.cfg.sequentialize_threads
-                && !parent_is_kernel_blocked
-                && sched.child_runs_first_post_fork(self.cfg.runs_post_fork);
-            let pos = if child_first {
-                sched.runqueue_push_front(child_dettid)
+            // Describe *how* the admission side is chosen, but do not resolve it
+            // (and in particular do not draw the post-fork PRNG) here: this
+            // handler runs on whichever backend worker fielded the RPC, so on an
+            // asynchronous backend (e.g. DBI, where the child self-registers
+            // outside a scheduler turn) resolving the side now would consume the
+            // PRNG draw in host RPC order. `admit_to_run_queue` resolves the
+            // intent at the step2 drain -- which under ptrace is post-commit, in
+            // schedule order, unchanged. Read its "What this does and does not
+            // make deterministic" section before relying on that word: the drain
+            // is a deterministic *point* and resolution within one drain is
+            // `DetTid`-ordered, but on an asynchronous backend which drain a
+            // given admission lands in is not itself schedule-determined unless
+            // that admission is anchored (ordinary clone is, via the parent's
+            // `ParentContinue`; vfork is, via `step2a`'s barrier). When threads
+            // are not sequentialized, or the
+            // parent is already kernel-blocked (vfork), the child takes the tail
+            // and no PRNG is consumed.
+            let intent = if self.cfg.sequentialize_threads && !parent_is_kernel_blocked {
+                AdmitIntent::PostFork(self.cfg.runs_post_fork)
             } else {
-                sched.runqueue_push_back(child_dettid)
+                AdmitIntent::Fixed(AdmitSide::Back)
             };
+            sched.admit_to_run_queue(child_dettid, intent);
             debug!(
-                "[detcore] CreateChildThread with dtid {}: Added child to {} of priority band, position {}.",
-                child_dettid,
-                if child_first { "front" } else { "back" },
-                pos,
+                "[detcore] CreateChildThread with dtid {}: admit child via {:?}.",
+                child_dettid, intent,
             );
             sched.started_up.try_put(());
         }
@@ -3049,7 +3064,7 @@ mod tests {
         assert_eq!(duplicate_create, (None, GlobalResponse::ThreadExited));
 
         {
-            let mut scheduler = state.sched.lock().unwrap();
+            let scheduler = state.sched.lock().unwrap();
             assert!(!scheduler.thread_is_logically_killed(leader));
             assert!(scheduler.thread_is_logically_killed(worker));
             assert!(scheduler.thread_is_logically_killed(sibling));
@@ -3065,10 +3080,19 @@ mod tests {
                 scheduler
                     .child_tid_was_cleared(FutexID::private(old_mm, 0x5678), sibling.as_raw(),)
             );
-            scheduler.next_turns.get_mut(&leader).unwrap().resp =
-                Ivar::full(SchedResponse::Go(None));
         }
 
+        // Drive the real daemon through step2 rather than manually pre-filling
+        // the replacement's response. This drains the destroyed leader's
+        // physical removal and the same-raw-TID replacement admission before
+        // StartNewThread supplies the fresh image's first request.
+        let turn_sched = state.sched.clone();
+        let turn_time = state.global_time.clone();
+        let turn = tokio::spawn(async move {
+            let last: Result<Resources, crate::scheduler::SkipTurn> =
+                Err(crate::scheduler::SkipTurn);
+            crate::scheduler::do_a_turn_blocking(turn_sched, turn_time, &last).await
+        });
         let start_response = state
             .receive_rpc(
                 reverie::Tid::from_raw(leader.as_raw()),
@@ -3079,6 +3103,12 @@ mod tests {
                 ),
             )
             .await;
+        assert!(
+            turn.await
+                .expect("replacement scheduler turn panicked")
+                .is_ok(),
+            "replacement leader did not survive the first step2 drain"
+        );
         assert_eq!(
             start_response,
             (
@@ -3086,6 +3116,19 @@ mod tests {
                 GlobalResponse::StartNewThread(None)
             )
         );
+        {
+            let scheduler = state.sched.lock().unwrap();
+            assert_eq!(
+                scheduler
+                    .run_queue
+                    .tids()
+                    .filter(|dettid| **dettid == leader)
+                    .count(),
+                1
+            );
+            assert!(!scheduler.run_queue.contains_tid(worker));
+            assert!(!scheduler.run_queue.contains_tid(sibling));
+        }
         {
             let global_time = state.global_time.lock().unwrap();
             assert_eq!(global_time.as_nanos(), total_before);

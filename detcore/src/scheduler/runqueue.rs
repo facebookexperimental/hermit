@@ -250,6 +250,18 @@ impl RunQueue {
             .any(|(k, v)| v.tid != exclude && k.priority < LAST_PRIORITY)
     }
 
+    /// True while a `tentative_pop`/commit transaction is underway, i.e. the
+    /// daemon has peeked a selection and may have released the scheduler lock
+    /// across an await. Test-only observability: production code never branches
+    /// on this. Run-queue admissions and removals are *always* buffered and
+    /// applied at the deterministic `step2` drain (window guaranteed closed), so
+    /// a handler never needs to ask whether a window is live — see
+    /// `Scheduler::admit_to_run_queue` / `deschedule_or_defer`. Read-only.
+    #[cfg(test)]
+    pub fn tentative_pop_in_progress(&self) -> bool {
+        self.tentative_selection.is_some()
+    }
+
     /// Push a thread to the back of the specified priority. Return the
     /// resulting overall position in the queue.
     ///
@@ -391,6 +403,13 @@ impl RunQueue {
         });
         if self.yielded_skip == Some(tid) {
             self.yielded_skip = None;
+        }
+        // A successful nonleader exec can remove one thread incarnation and
+        // admit its replacement under the same raw TID in a single scheduler
+        // drain. Do not let the replacement inherit the destroyed leader's
+        // sticky-random selection.
+        if self.sticky_random_selection == Some(tid) {
+            self.sticky_random_selection = None;
         }
         !kept_all
     }
@@ -687,6 +706,57 @@ mod tests {
         assert_eq!(queue.yielded_skip, Some(yielding));
         assert_eq!(queue.tentative_pop_next(), Some(peer));
         assert_eq!(queue.commit_tentative_pop_completed_turn(), peer);
+        assert_eq!(queue.yielded_skip, None);
+    }
+
+    #[test]
+    fn tentative_pop_in_progress_tracks_the_transaction() {
+        let a = DetTid::from_raw(1);
+        let b = DetTid::from_raw(2);
+        let mut queue = RunQueue::default();
+
+        // No selection: safe to push.
+        assert!(!queue.tentative_pop_in_progress());
+        queue.push_back(a, DEFAULT_PRIORITY);
+        queue.push_back(b, DEFAULT_PRIORITY);
+        assert!(!queue.tentative_pop_in_progress());
+
+        // Peeking a tentative selection opens the transaction; this is exactly
+        // the window in which a concurrent handler must defer its admission
+        // rather than push (a push here trips the tentative-selection guard).
+        assert_eq!(queue.tentative_pop_next(), Some(a));
+        assert!(queue.tentative_pop_in_progress());
+
+        // Committing closes it again.
+        assert_eq!(queue.commit_tentative_pop(), a);
+        assert!(!queue.tentative_pop_in_progress());
+
+        // The exact-selection form and undo path behave the same way.
+        assert_eq!(queue.tentative_pop_tid(b), Some(b));
+        assert!(queue.tentative_pop_in_progress());
+        queue.undo_tentative_pop();
+        assert!(!queue.tentative_pop_in_progress());
+    }
+
+    #[test]
+    fn removal_clears_per_incarnation_selection_state_before_tid_reuse() {
+        let tid = DetTid::from_raw(7);
+        let mut queue = RunQueue::new(SchedHeuristic::StickyRandom, 0x5107, 1.0);
+        queue.push_back(tid, DEFAULT_PRIORITY);
+
+        assert_eq!(queue.tentative_pop_next(), Some(tid));
+        queue.undo_tentative_pop();
+        assert_eq!(queue.sticky_random_selection, Some(tid));
+        // Model an earlier explicit yield by the old incarnation. Both caches
+        // are keyed only by raw TID and therefore must be cleared together.
+        queue.yielded_skip = Some(tid);
+
+        assert!(queue.remove_tid(tid));
+        assert_eq!(queue.sticky_random_selection, None);
+        assert_eq!(queue.yielded_skip, None);
+
+        queue.push_back(tid, DEFAULT_PRIORITY);
+        assert_eq!(queue.sticky_random_selection, None);
         assert_eq!(queue.yielded_skip, None);
     }
 }

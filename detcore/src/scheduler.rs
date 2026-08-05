@@ -381,6 +381,46 @@ impl HbRuntime {
     }
 }
 
+/// Which end of a thread's priority band a run-queue admission targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmitSide {
+    /// Run before an equal-priority peer (`runqueue_push_front`).
+    Front,
+    /// Ordinary tail admission (`runqueue_push_back`).
+    Back,
+}
+
+/// How a run-queue admission's side is determined.
+///
+/// The side is *resolved* — not merely applied — at the deterministic drain
+/// ([`Scheduler::drain_pending_run_queue_admissions`]). Buffering the *intent*
+/// rather than an already-chosen `AdmitSide` is what keeps the admission a pure
+/// function of deterministic scheduler state: any PRNG draw that picks the side
+/// (`RunsPostFork::Random`) is consumed at the drain, in canonical `DetTid`
+/// order, instead of in host RPC / lock-acquisition order at the handler. See
+/// [`Scheduler::admit_to_run_queue`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmitIntent {
+    /// The side is fixed regardless of scheduler state; consumes no PRNG.
+    Fixed(AdmitSide),
+    /// The side follows the post-fork policy; `RunsPostFork::Random` draws from
+    /// the scheduler PRNG at resolution time.
+    PostFork(RunsPostFork),
+}
+
+/// Why a raw TID must be removed from the physical run queue at the next
+/// deterministic drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemovalDisposition {
+    /// The current thread incarnation is gone. Any admission recorded for the
+    /// same raw TID is stale and must be cancelled.
+    Retire,
+    /// Linux nonleader exec destroyed the old process leader and reassigned
+    /// its raw TID to the caller's replacement image. Remove the old physical
+    /// queue slot, but preserve the one causally paired replacement admission.
+    ReplaceThenAdmit,
+}
+
 /// The state for the deterministic scheduler.
 #[derive(Debug)]
 pub struct Scheduler {
@@ -416,6 +456,39 @@ pub struct Scheduler {
 
     /// Kernel-blocked vfork parents and their children, once registered.
     vfork_barriers: BTreeMap<DetTid, Option<DetTid>>,
+
+    /// Threads whose run-queue admission was recorded by a global-request
+    /// handler while a `tentative_pop` transaction was live, deferred to the
+    /// next deterministic drain point (`step2`) so it cannot mutate the run
+    /// queue underneath the daemon's tentative selection. Keyed by `DetTid`
+    /// so the drain order among co-pending admissions is canonical rather than
+    /// lock-acquisition dependent. The stored value is the *unresolved*
+    /// [`AdmitIntent`], so any side-selecting PRNG draw is deferred to the
+    /// `DetTid`-ordered drain rather than performed in host RPC order. See
+    /// [`Scheduler::admit_to_run_queue`] and
+    /// [`Scheduler::drain_pending_run_queue_admissions`].
+    pending_run_queue_admissions: BTreeMap<DetTid, AdmitIntent>,
+
+    /// Run-queue *removals* requested by a global-request handler
+    /// (`reconnect_after_exec` -> `logically_kill_thread`), deferred to the same
+    /// deterministic drain point (`step2`). `RunQueue::remove_tid` carries the same
+    /// `tentative_selection.is_none()` guard as the push operations, so a
+    /// multi-threaded exec that reconnects on an asynchronous backend (DBI)
+    /// inside the daemon's tentative window would otherwise trip it, poison the
+    /// scheduler mutex, and hang the run.
+    ///
+    /// A `Retire` target is already logically dead (its `next_turns` entry is
+    /// gone and its request is `ThreadExited`). `ReplaceThenAdmit` is the one
+    /// Linux exception: a nonleader exec has installed a fresh registration at
+    /// the destroyed leader's raw TID, but the old incarnation's physical queue
+    /// slot must still be removed. Both are filtered from
+    /// [`Scheduler::are_all_quiesced`] until this drain establishes the intended
+    /// physical queue state.
+    ///
+    /// The map is drained before admissions. Ordinary retirement cancels a
+    /// buffered admission for the same raw TID; the explicitly classified exec
+    /// replacement preserves exactly one causally paired admission.
+    pending_run_queue_removals: BTreeMap<DetTid, RemovalDisposition>,
 
     /// Child-TID futexes whose kernel clear may still be racing a guest join.
     cleared_child_tids: HashMap<FutexID, DetTid>,
@@ -861,6 +934,8 @@ async fn sched_loop_inner(
             if sched.run_queue.is_empty()
                 && sched.blocked.is_empty()
                 && sched.pending_physical_process_exits.is_empty()
+                && sched.pending_run_queue_admissions.is_empty()
+                && sched.pending_run_queue_removals.is_empty()
             {
                 info!("[scheduler] run queue empty, exiting sched_loop.");
                 if let Some(observer) = &observer {
@@ -950,7 +1025,17 @@ pub async fn do_a_turn_blocking(
                 "[sched-daemon] woke up on request {}, but fizzling because next thread, {}, exited.",
                 &req, &next_dtid
             );
-            // TODO: check status of next_dtid -- in runqueue (or not)?
+            // The selected thread died while we awaited its request, so this turn
+            // is skipped without reaching step4-6. `step3_peek` opened a
+            // tentative_pop for `next_dtid`; close it here (undo, since the turn
+            // did not commit) before returning. Otherwise the tentative selection
+            // outlives the turn, and the next pass's step2 removal drain calls
+            // `remove_tid` while `tentative_selection` is still `Some`, tripping
+            // the run queue's transaction guard -- the "reconnect panic moved one
+            // pass" defect. The dead thread's buffered removal drains
+            // deterministically on the next pass, once this undo has closed the
+            // window.
+            sched.lock().unwrap().run_queue.undo_tentative_pop();
             return Err(SkipTurn);
         }
         Ok(r) => r,
@@ -960,22 +1045,16 @@ pub async fn do_a_turn_blocking(
     // Since the scheduler is asynchronous, we need to check our assumptions.  Polling is
     // sufficient here because the thread cannot be racing with us to exit since we know
     // it is *already* parked.
-    if !sched.lock().unwrap().next_turns.contains_key(&next_dtid) {
-        info!(
-            "[sched-daemon] thread {} exited, skipping over...",
-            &next_dtid
-        );
-    } else {
-        let mut mg = sched.lock().unwrap();
+    let mut mg = sched.lock().unwrap();
+    mg.abort_turn_if_thread_vanished(next_dtid)?;
 
-        // The logical COMMIT point for the turn is during step4:
-        mg.step4_resource_block(next_dtid, &rsrcs, &resp)?;
-        mg.step5_guest_unblock(next_dtid, &rsrcs, &resp)?;
-        let sched_yield = rsrcs.resources.contains_key(&ResourceID::SchedYield);
-        mg.step6_reenquue(next_dtid, sched_yield);
-        if let Some(call) = rsrcs.as_exit_syscall() {
-            mg.step7_simulate_exit_posthook(next_dtid, call, &global_time);
-        }
+    // The logical COMMIT point for the turn is during step4:
+    mg.step4_resource_block(next_dtid, &rsrcs, &resp)?;
+    mg.step5_guest_unblock(next_dtid, &rsrcs, &resp)?;
+    let sched_yield = rsrcs.resources.contains_key(&ResourceID::SchedYield);
+    mg.step6_reenquue(next_dtid, sched_yield);
+    if let Some(call) = rsrcs.as_exit_syscall() {
+        mg.step7_simulate_exit_posthook(next_dtid, call, &global_time);
     }
     Ok(rsrcs)
 }
@@ -1101,6 +1180,8 @@ impl Scheduler {
             committed_time: Default::default(),
             blocked: Default::default(),
             vfork_barriers: Default::default(),
+            pending_run_queue_admissions: Default::default(),
+            pending_run_queue_removals: Default::default(),
             cleared_child_tids: Default::default(),
             cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
             logically_killed_threads: Default::default(),
@@ -1286,7 +1367,15 @@ impl Scheduler {
 
     /// Returns None if all are parked, otherwise the unfilled request of the next we're waiting on.
     fn are_all_quiesced(&self) -> Option<Ivar<SchedRequest>> {
-        self.run_queue.tids().find_map(|dt| self.check_request(dt))
+        // Skip raw TIDs whose old run-queue incarnation is pending removal.
+        // `Retire` targets have no `next_turns` entry, while
+        // `ReplaceThenAdmit` targets have a fresh registration that must not be
+        // waited on until the drain removes the old physical slot and admits
+        // that replacement.
+        self.run_queue
+            .tids()
+            .filter(|dt| !self.pending_run_queue_removals.contains_key(dt))
+            .find_map(|dt| self.check_request(dt))
     }
 
     /// Try to pop the next event from the sorted list of stacktrace_events, if it matches the given
@@ -1396,8 +1485,11 @@ impl Scheduler {
         if self.cancel_killed_thread_rpcs {
             self.logically_killed_threads.insert(*dtid);
         }
-        // Remove from runnable queue:
-        let _ = self.run_queue.remove_tid(*dtid);
+        // Remove from the runnable queue at the next deterministic drain. This
+        // is safe even if an asynchronous exec reconnect races a live
+        // tentative_pop: the handler never reaches the run queue's mutation
+        // guard and cannot poison the scheduler mutex.
+        self.deschedule_or_defer(*dtid);
         // Remove from all non-runnable pools:
         self.remove_blocking_entries(dtid);
 
@@ -1517,7 +1609,32 @@ impl Scheduler {
         if let Some(writer) = &mut self.preemption_writer {
             writer.set_current(new_leader, survivor_priority);
         }
-        self.runqueue_push_back(new_leader);
+        // Post-exec reconnection can arrive asynchronously on backends whose
+        // exec-child self-bootstraps outside a scheduler turn (DBI), so route
+        // the new leader's admission (a run-queue *push*) through the
+        // tentative-safe buffer rather than pushing directly.
+        //
+        // The exec caller's fresh next-turn request is the causal anchor. Step5
+        // installed that empty Ivar before the caller began executing exec, so
+        // the daemon cannot pass step1 while the successful exec is in flight.
+        // This handler records the complete old-leader removal/replacement
+        // admission pair before `logically_kill_thread(caller)` resolves that
+        // request. The scheduler mutex then prevents step2 from observing only
+        // half of the handoff. Host delay can move the handler relative to the
+        // daemon's wait, but cannot change first-drain membership.
+        //
+        // The *removals* in this handler (`logically_kill_thread` ->
+        // `run_queue.remove_tid`, for the exec caller and its siblings, above
+        // and below) are likewise tentative-safe: `logically_kill_thread` now
+        // routes the run-queue removal through `deschedule_or_defer`, which
+        // buffers it to the same deterministic `step2` drain. The old leader's
+        // removal is explicitly classified as `ReplaceThenAdmit`, so the drain
+        // removes its physical queue slot without cancelling the new
+        // incarnation. `are_all_quiesced` filters every pending removal key;
+        // ordinary targets are logically dead, while the replacement key is not
+        // runnable until that old slot has been removed and its admission
+        // applied. No handler mutates the queue inside a tentative window.
+        self.replace_retired_run_queue_incarnation(new_leader, AdmitIntent::Fixed(AdmitSide::Back));
         self.started_up.try_put(());
 
         self.logically_kill_thread(&caller, &detpid, pre_exec_mm);
@@ -1604,6 +1721,7 @@ impl Scheduler {
         self.blocked.timed_out_futex_waiters.remove(dtid);
         self.blocked.sigchld_deferred.remove(dtid);
         self.blocked.sigchld_ready.remove(dtid);
+        self.pending_run_queue_admissions.remove(dtid);
         let _ = self.remove_futex_waiter(dtid);
     }
 
@@ -1782,6 +1900,13 @@ impl Scheduler {
         &mut self,
         global_time: &Arc<Mutex<GlobalTime>>,
     ) -> Result<(), SkipTurn> {
+        // Apply run-queue mutations deferred by asynchronous global-request
+        // handlers first, at this fixed deterministic point, before any early
+        // return below and before step3 opens a tentative-pop window. Removals
+        // drain before admissions so a thread killed while an admission was
+        // still buffered is not re-enqueued.
+        self.drain_pending_run_queue_removals();
+        self.drain_pending_run_queue_admissions();
         self.step2a_wait_for_vfork_barrier()?;
         self.step2b_process_timed(); // May populate run_queue.
         self.step2c_process_io_blockers()?;
@@ -2376,6 +2501,38 @@ impl Scheduler {
             dettid, &self.run_queue
         );
         self.skip_turn()
+    }
+
+    /// Post-await re-check: the selected thread parked (its request resolved
+    /// `Ok`), but did its `next_turns` entry survive until the daemon got the
+    /// lock back? If not, the turn must be abandoned.
+    ///
+    /// Returns `Err(SkipTurn)` for the abandoned case, after closing the
+    /// tentative window `step3_peek` opened. Two things hang on that `Err`:
+    ///
+    /// * The tentative pop is undone rather than committed, so the selection
+    ///   does not outlive the turn and the next pass's step2 removal drain does
+    ///   not call `remove_tid` against a live `tentative_selection` (the same
+    ///   hygiene the `Err(ThreadExited)` arm needs).
+    /// * The caller reports a SKIP, not a completed turn. This branch bypasses
+    ///   steps 4-7, so nothing is blocked, unblocked or re-enqueued -- yet
+    ///   `bump_global_time` suppresses its advance only on `last_turn.is_err()`
+    ///   ("if the last turn was a skip, it shouldn't really have time-bumped").
+    ///   Reporting `Ok` here therefore added a DETLOG-visible virtual-time tick
+    ///   for work that never happened, and whether this branch is reached at all
+    ///   depends on whether teardown cleared `next_turns` inside the host-timed
+    ///   gap between the await resolving and the re-lock -- so the same logical
+    ///   execution could gain that tick in one run and not the next.
+    fn abort_turn_if_thread_vanished(&mut self, next_dtid: DetTid) -> Result<(), SkipTurn> {
+        if self.next_turns.contains_key(&next_dtid) {
+            return Ok(());
+        }
+        info!(
+            "[sched-daemon] thread {} exited, skipping over...",
+            &next_dtid
+        );
+        self.run_queue.undo_tentative_pop();
+        Err(SkipTurn)
     }
 
     /// Simply advance the turn. This does NOT remove any threads from the
@@ -3036,6 +3193,244 @@ impl Scheduler {
         self.run_queue.push_front(dettid, priority)
     }
 
+    /// Record an intent to admit `dtid` to the run queue, applied by the daemon
+    /// at the next deterministic drain point ([`step2`](Self::step2_process_blocked)).
+    ///
+    /// Global-request handlers (`recv_create_child_thread`,
+    /// `reconnect_after_exec`) hold the scheduler lock but run on whichever
+    /// backend worker fielded the RPC, not on the scheduler daemon's turn. The
+    /// point in the daemon's loop at which such a handler acquires the lock is
+    /// host-timing-dependent on asynchronous backends (e.g. DBI): it may land
+    /// inside the tentative-pop window (between `step3_peek` and `step4`'s
+    /// commit, where the lock is released across `req.get().await`) *or* outside
+    /// it (during the quiescence-wait / backoff awaits at the top of
+    /// `do_a_turn_blocking`, where `tentative_selection` is `None`). A design
+    /// that pushed directly whenever the window happened to be closed would make
+    /// the *admission order* — and, under `RunsPostFork::Random`, the PRNG draw
+    /// order — a function of that host timing: two equal-priority admissions
+    /// could enter the queue in either relative order across otherwise-identical
+    /// runs, and a fixed seed could explore different schedules.
+    ///
+    /// So admission is *always* deferred, never applied directly here. Handlers
+    /// only record the unresolved [`AdmitIntent`]; the daemon resolves the side
+    /// (drawing any `RunsPostFork::Random` value) and pushes the run queue at the
+    /// single `step2` drain, in canonical `DetTid` order, before `step3` opens a
+    /// tentative window. Draining is also the only place `remove_tid`'s tentative
+    /// guard is guaranteed to hold.
+    ///
+    /// # What this does and does not make deterministic
+    ///
+    /// **Synchronous backends (ptrace): fully deterministic, and byte-identical
+    /// to the pre-deferral behavior.** Handlers run post-commit, one per turn, so
+    /// at most one admission is buffered per turn and it drains at the next
+    /// `step2` — before that turn's `step3` selection — yielding the same
+    /// selection sequence and the same one-draw-per-fork PRNG order as an
+    /// immediate push.
+    ///
+    /// **Asynchronous backends: every production admission site has a causal or
+    /// explicit barrier that fixes its drain, and order within that drain is
+    /// canonical.** A bare off-turn handler would still be insufficient: a
+    /// `BTreeMap` only canonicalizes items already in one snapshot. The current
+    /// sites additionally bind snapshot membership to deterministic scheduler
+    /// state:
+    ///
+    /// * **Ordinary clone — anchored, causally.** `CreateChildThread` issues the
+    ///   parent's `ParentContinue` request only *after* buffering the child's
+    ///   admission, so no thread can run between the two and the admission
+    ///   cannot straddle a drain boundary.
+    /// * **`vfork` — anchored, by barrier.** `vfork_barriers` /
+    ///   [`Scheduler::step2a_wait_for_vfork_barrier`] hold the parent until the
+    ///   child has registered, which fixes the drain.
+    /// * **Multi-threaded exec reconnect — anchored, causally.** Step5 installs
+    ///   the caller's empty next-turn request before it executes exec. The
+    ///   reconnect handler atomically buffers the old-leader removal and new
+    ///   incarnation admission, then retires the caller and resolves that
+    ///   request. Step1 therefore cannot release step2 before the complete pair
+    ///   exists. [`Scheduler::replace_retired_run_queue_incarnation`] binds the
+    ///   same-raw-TID handoff explicitly.
+    ///
+    /// Thus both membership and within-drain resolution are functions of
+    /// deterministic state for all current sites. The exec regression test
+    /// forces the daemon to wait before reconnect, varies host yields, and
+    /// compares the exact first-drain queue plus the next post-fork PRNG draw.
+    pub(crate) fn admit_to_run_queue(&mut self, dtid: DetTid, intent: AdmitIntent) {
+        let prev = self.pending_run_queue_admissions.insert(dtid, intent);
+        debug_assert!(
+            prev.is_none(),
+            "thread {:?} recorded for run-queue admission twice before draining",
+            dtid
+        );
+    }
+
+    /// Atomically classify a same-raw-TID exec handoff and record its fresh
+    /// admission. The scheduler mutex serializes this method with `step2`, so a
+    /// drain can never observe only one half of the handoff.
+    fn replace_retired_run_queue_incarnation(&mut self, dtid: DetTid, intent: AdmitIntent) {
+        let disposition = self
+            .pending_run_queue_removals
+            .get_mut(&dtid)
+            .unwrap_or_else(|| {
+                panic!(
+                    "exec replacement {:?} has no retired run-queue incarnation",
+                    dtid
+                )
+            });
+        assert_eq!(
+            *disposition,
+            RemovalDisposition::Retire,
+            "exec replacement {:?} was classified more than once",
+            dtid
+        );
+        *disposition = RemovalDisposition::ReplaceThenAdmit;
+        assert!(
+            self.pending_run_queue_admissions
+                .insert(dtid, intent)
+                .is_none(),
+            "exec replacement {:?} already had a pending admission",
+            dtid
+        );
+    }
+
+    /// Resolve an [`AdmitIntent`] to a concrete [`AdmitSide`], consuming the
+    /// post-fork PRNG draw for `RunsPostFork::Random`.
+    ///
+    /// Called at the drain rather than in the handler, so the draw is never
+    /// consumed in host *RPC arrival* order, and the draws taken within one
+    /// drain follow canonical `DetTid` order. This function only canonicalizes
+    /// draws within a fixed drain; each admission site must separately bind its
+    /// drain membership to deterministic scheduler state. See
+    /// [`Scheduler::admit_to_run_queue`] for the causal and explicit barriers
+    /// that provide that binding for all current production sites.
+    fn resolve_admit_intent(&mut self, intent: AdmitIntent) -> AdmitSide {
+        match intent {
+            AdmitIntent::Fixed(side) => side,
+            AdmitIntent::PostFork(mode) => {
+                if self.child_runs_first_post_fork(mode) {
+                    AdmitSide::Front
+                } else {
+                    AdmitSide::Back
+                }
+            }
+        }
+    }
+
+    /// Record an intent to remove `dtid` from the run queue, applied by the
+    /// daemon at the next deterministic drain point ([`step2`](Self::step2_process_blocked)).
+    ///
+    /// The mirror of [`Scheduler::admit_to_run_queue`] for the removal side, and
+    /// deferred for the same reason: a global-request handler
+    /// (`reconnect_after_exec` -> `logically_kill_thread`) runs on a backend
+    /// worker and may hold the lock inside the daemon's tentative-pop window,
+    /// where `RunQueue::remove_tid`'s `tentative_selection.is_none()` assert
+    /// would trip and poison the scheduler mutex. Recording the removal and
+    /// applying it at `step2` (window closed, guard holds) avoids that. The
+    /// caller has already made the thread logically dead (cleared `next_turns`,
+    /// resolved its request to `ThreadExited`), so leaving its stale run-queue
+    /// entry in place until the drain is inert: the daemon skips it for any
+    /// intervening turn (`step3`'s pick is validated against `next_turns`) and
+    /// `are_all_quiesced` filters it out. On ptrace the drain runs at the next
+    /// `step2`, before that turn's `step3` selection, so the removal is
+    /// observationally immediate — the dead thread is never selected.
+    fn deschedule_or_defer(&mut self, dtid: DetTid) {
+        // A later logical death of a not-yet-drained exec replacement must
+        // override `ReplaceThenAdmit`: `remove_blocking_entries` clears its
+        // admission and this `Retire` disposition prevents resurrection.
+        self.pending_run_queue_removals
+            .insert(dtid, RemovalDisposition::Retire);
+    }
+
+    /// Drain removals deferred by [`Scheduler::deschedule_or_defer`] at the same
+    /// deterministic `step2` point as admissions, and *before* them, so a thread
+    /// killed while an admission was still buffered is not re-enqueued. The
+    /// window is closed here (`tentative_selection` is `None`), so
+    /// `remove_tid`'s guard holds. The `BTreeMap` makes removal order canonical;
+    /// each disposition determines whether a same-raw-TID admission is stale or
+    /// is the explicitly paired exec replacement.
+    fn drain_pending_run_queue_removals(&mut self) {
+        if self.pending_run_queue_removals.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_run_queue_removals);
+        for (dtid, disposition) in pending {
+            match disposition {
+                RemovalDisposition::Retire => {
+                    // Ordinary logical death cancels a buffered admission for
+                    // the same thread incarnation.
+                    self.pending_run_queue_admissions.remove(&dtid);
+                }
+                RemovalDisposition::ReplaceThenAdmit => {
+                    assert!(
+                        self.next_turns.contains_key(&dtid),
+                        "exec replacement {:?} lost its scheduler registration",
+                        dtid
+                    );
+                    assert!(
+                        self.pending_run_queue_admissions.contains_key(&dtid),
+                        "exec replacement {:?} lost its paired admission",
+                        dtid
+                    );
+                    assert!(
+                        !self.thread_is_logically_killed(dtid),
+                        "logically dead exec replacement {:?} reached the drain",
+                        dtid
+                    );
+                }
+            }
+            // Always remove the old physical queue slot before a replacement
+            // admission is applied. This prevents the new image from inheriting
+            // the destroyed leader's round-robin position.
+            let _ = self.run_queue.remove_tid(dtid);
+        }
+    }
+
+    /// Push `dtid` onto the run queue immediately, idempotently: a thread
+    /// already queued is left in place rather than enqueued twice.
+    fn admit_now(&mut self, dtid: DetTid, side: AdmitSide) {
+        if self.run_queue.contains_tid(dtid) {
+            return;
+        }
+        match side {
+            AdmitSide::Front => {
+                let _ = self.runqueue_push_front(dtid);
+            }
+            AdmitSide::Back => {
+                let _ = self.runqueue_push_back(dtid);
+            }
+        }
+    }
+
+    /// Drain admissions deferred by [`Scheduler::admit_to_run_queue`] into the
+    /// run queue at a single deterministic point: the very start of `step2`,
+    /// before `step3_peek` opens a tentative window (so `tentative_selection` is
+    /// guaranteed `None` here). Draining a `BTreeMap` visits `DetTid`s in sorted
+    /// order, so the resulting run-queue state is a pure function of the
+    /// deterministic schedule rather than of RPC/lock-acquisition timing.
+    fn drain_pending_run_queue_admissions(&mut self) {
+        if self.pending_run_queue_admissions.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_run_queue_admissions);
+        // `pending` is a `BTreeMap`, so iteration visits `DetTid`s in sorted
+        // order. Resolving each intent here (rather than at the racing handler)
+        // means any `RunsPostFork::Random` PRNG draw is consumed in this
+        // canonical order, so both the admission order *and* the chosen side are
+        // pure functions of deterministic state.
+        for (dtid, intent) in pending {
+            // A thread retired (exec/kill) between record and drain is skipped.
+            // `remove_blocking_entries` also clears the buffer on teardown, so
+            // this guard is defensive against any teardown path that does not.
+            if !self.next_turns.contains_key(&dtid) {
+                trace!(
+                    "[step2] skipping deferred admission of retired thread {:?}",
+                    dtid
+                );
+                continue;
+            }
+            let side = self.resolve_admit_intent(intent);
+            self.admit_now(dtid, side);
+        }
+    }
+
     /// Decide which side gets the first post-fork turn for an ordinary clone.
     pub(crate) fn child_runs_first_post_fork(&mut self, mode: RunsPostFork) -> bool {
         match mode {
@@ -3406,6 +3801,784 @@ mod test {
         assert_eq!(first_sequence, second_sequence);
         assert!(first_sequence.contains(&true));
         assert!(first_sequence.contains(&false));
+    }
+
+    /// Register `tid` as a known, prioritized thread with an (empty) pending
+    /// request, without enqueuing it. Mirrors the state a global-request handler
+    /// leaves behind for a freshly created child.
+    #[cfg(test)]
+    fn register_known_thread(sched: &mut Scheduler, tid: DetTid) {
+        sched.priorities.insert(tid, DEFAULT_PRIORITY);
+        sched.next_turns.insert(
+            tid,
+            ThreadNextTurn {
+                dettid: tid,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+            },
+        );
+    }
+
+    fn install_runnable_exec_group(
+        sched: &mut Scheduler,
+        leader: DetTid,
+        caller: DetTid,
+    ) -> (DetPid, MmId, Ivar<SchedRequest>) {
+        let detpid = DetPid::from_raw(leader.as_raw());
+        let pre_exec_mm = MmId::initial(detpid);
+        sched.thread_tree.add_child(leader, leader, true);
+        sched.thread_tree.add_child(leader, caller, false);
+        register_known_thread(sched, leader);
+        register_known_thread(sched, caller);
+        sched.runqueue_push_back(leader);
+        sched.runqueue_push_back(caller);
+        let old_leader_request = sched.next_turns.get(&leader).unwrap().req.clone();
+        (detpid, pre_exec_mm, old_leader_request)
+    }
+
+    fn reconnect_nonleader_exec(
+        sched: &mut Scheduler,
+        leader: DetTid,
+        caller: DetTid,
+        detpid: DetPid,
+        pre_exec_mm: MmId,
+    ) -> Vec<DetTid> {
+        sched.reconnect_after_exec(ExecReconnect {
+            caller,
+            new_leader: leader,
+            detpid,
+            pre_exec_mm,
+            post_exec_mm: pre_exec_mm.for_exec(detpid),
+            child_tid_addr: 0,
+            reconnect_priority: Some(DEFAULT_PRIORITY),
+        })
+    }
+
+    /// F1/F2: an admission deferred while a tentative_pop window is live must
+    /// resolve its side -- including the `RunsPostFork::Random` PRNG draw -- at
+    /// the `DetTid`-ordered drain, so the drained run queue is a pure function of
+    /// deterministic state, independent of the order in which racing handlers
+    /// buffered the admissions.
+    #[test]
+    fn deferred_admission_side_is_arrival_order_independent() {
+        let config = Config {
+            sched_seed: Some(0xABCD),
+            runs_post_fork: RunsPostFork::Random,
+            ..Default::default()
+        };
+        let lower = DetTid::from_raw(21);
+        let higher = DetTid::from_raw(23);
+
+        // Buffer the two children in `order`, optionally while a tentative
+        // window is live, then drain. Return the drained relative order of the
+        // two children (the anchor is filtered out because it is consumed by the
+        // window in the `open_window` case but not otherwise -- what must be
+        // deterministic is the children's order and chosen sides).
+        let drained_order = |order: [DetTid; 2], open_window: bool| -> Vec<DetTid> {
+            let mut sched = Scheduler::new(&config);
+            let anchor = DetTid::from_raw(5);
+            register_known_thread(&mut sched, anchor);
+            sched.runqueue_push_back(anchor);
+            register_known_thread(&mut sched, lower);
+            register_known_thread(&mut sched, higher);
+
+            if open_window {
+                assert_eq!(sched.run_queue.tentative_pop_next(), Some(anchor));
+                assert!(sched.run_queue.tentative_pop_in_progress());
+            }
+            for tid in order {
+                sched.admit_to_run_queue(tid, AdmitIntent::PostFork(RunsPostFork::Random));
+            }
+            // Admission ALWAYS defers -- window or not -- so nothing is pushed or
+            // resolved (no side chosen, no PRNG drawn) until the drain.
+            assert!(sched.pending_run_queue_admissions.contains_key(&lower));
+            assert!(sched.pending_run_queue_admissions.contains_key(&higher));
+            assert!(!sched.run_queue.contains_tid(lower));
+            assert!(!sched.run_queue.contains_tid(higher));
+
+            if open_window {
+                let _ = sched.run_queue.commit_tentative_pop();
+            }
+            sched.drain_pending_run_queue_admissions();
+            sched
+                .run_queue
+                .tids()
+                .copied()
+                .filter(|t| *t == lower || *t == higher)
+                .collect()
+        };
+
+        // The drained order/side is independent of BOTH host-timing inputs the
+        // old immediate path was sensitive to: the arrival (buffering) order of
+        // the racing handlers, and whether a tentative window happened to be
+        // live when each handler ran.
+        let baseline = drained_order([lower, higher], true);
+        assert_eq!(
+            baseline,
+            drained_order([higher, lower], true),
+            "arrival order"
+        );
+        assert_eq!(
+            baseline,
+            drained_order([lower, higher], false),
+            "window state"
+        );
+        assert_eq!(baseline, drained_order([higher, lower], false), "both");
+        assert!(baseline.contains(&lower) && baseline.contains(&higher));
+    }
+
+    /// F3: a run-queue removal requested while a tentative_pop window is live
+    /// (an asynchronous exec reconnect racing the daemon) must be deferred, not
+    /// applied through `remove_tid`'s `tentative_selection.is_none()` guard, and
+    /// a pending-removal thread whose `next_turns` entry is already gone must not
+    /// crash `are_all_quiesced`. The removal lands at the next drain.
+    #[test]
+    fn deferred_removal_survives_tentative_window_and_drains() {
+        let mut sched = Scheduler::new(&Config::default());
+        let anchor = DetTid::from_raw(5);
+        let victim = DetTid::from_raw(9);
+        register_known_thread(&mut sched, anchor);
+        register_known_thread(&mut sched, victim);
+        sched.runqueue_push_back(anchor);
+        sched.runqueue_push_back(victim);
+
+        // Daemon peeks the anchor and releases the lock (window open).
+        assert_eq!(sched.run_queue.tentative_pop_next(), Some(anchor));
+        assert!(sched.run_queue.tentative_pop_in_progress());
+
+        // A racing handler descheduling the victim must buffer, not panic.
+        sched.deschedule_or_defer(victim);
+        assert!(sched.pending_run_queue_removals.contains_key(&victim));
+        assert!(
+            sched.run_queue.contains_tid(victim),
+            "removal is deferred, so the stale entry lingers until the drain"
+        );
+
+        // The handler has also made the victim logically dead: its next_turns
+        // entry is gone. Iterating quiescence must SKIP the victim (filtered by
+        // pending_run_queue_removals) rather than panic in check_request on the
+        // missing next_turns entry -- without the filter this call panics.
+        sched.next_turns.remove(&victim);
+        let _ = sched.are_all_quiesced();
+
+        // Close the window and drain: the victim is gone, the anchor remains.
+        let _ = sched.run_queue.commit_tentative_pop();
+        sched.drain_pending_run_queue_removals();
+        assert!(sched.pending_run_queue_removals.is_empty());
+        assert!(!sched.run_queue.contains_tid(victim));
+    }
+
+    /// Always-defer invariant (codex finding 1/2): even with NO tentative window
+    /// live, a global-request handler NEVER pushes or pops the run queue
+    /// directly -- both admission and removal are buffered and take effect only
+    /// at the deterministic step2 drain. This removes the host-timing-dependent
+    /// immediate path: whichever daemon phase a handler happened to race, it only
+    /// records intent, so the run-queue mutation is applied at one fixed point in
+    /// DetTid order regardless of host arrival timing.
+    #[test]
+    fn run_queue_mutations_always_defer_to_the_drain() {
+        let mut sched = Scheduler::new(&Config::default());
+        let keep = DetTid::from_raw(7);
+        let victim = DetTid::from_raw(9);
+        register_known_thread(&mut sched, keep);
+        register_known_thread(&mut sched, victim);
+        sched.runqueue_push_back(victim); // already queued; to be removed
+        assert!(!sched.run_queue.tentative_pop_in_progress());
+
+        // No window live, yet both mutations buffer rather than apply.
+        sched.admit_to_run_queue(keep, AdmitIntent::Fixed(AdmitSide::Back));
+        sched.deschedule_or_defer(victim);
+        assert!(sched.pending_run_queue_admissions.contains_key(&keep));
+        assert!(sched.pending_run_queue_removals.contains_key(&victim));
+        assert!(!sched.run_queue.contains_tid(keep), "admission deferred");
+        assert!(sched.run_queue.contains_tid(victim), "removal deferred");
+
+        // The daemon applies them at the drain (removals first, then admissions).
+        sched.drain_pending_run_queue_removals();
+        sched.drain_pending_run_queue_admissions();
+        assert!(sched.run_queue.contains_tid(keep));
+        assert!(!sched.run_queue.contains_tid(victim));
+        assert!(sched.pending_run_queue_admissions.is_empty());
+        assert!(sched.pending_run_queue_removals.is_empty());
+    }
+
+    /// A thread admitted and then killed before the drain must end up neither
+    /// queued nor pending: removals drain first and the retired-thread skip in
+    /// the admission drain drops the buffered admission for a thread with no
+    /// next_turns entry.
+    #[test]
+    fn buffered_admission_cancelled_by_buffered_removal() {
+        let mut sched = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw(11);
+        register_known_thread(&mut sched, tid);
+
+        sched.admit_to_run_queue(tid, AdmitIntent::Fixed(AdmitSide::Back));
+        sched.deschedule_or_defer(tid);
+
+        // The thread is retired before the drain: its next_turns entry is gone.
+        sched.next_turns.remove(&tid);
+        sched.drain_pending_run_queue_removals();
+        sched.drain_pending_run_queue_admissions();
+
+        assert!(!sched.run_queue.contains_tid(tid));
+        assert!(sched.pending_run_queue_admissions.is_empty());
+        assert!(sched.pending_run_queue_removals.is_empty());
+    }
+
+    /// A successful nonleader exec retires the old process leader and reuses
+    /// its raw TID for the caller's replacement image.  The old-leader removal
+    /// and replacement-leader admission therefore share a `DetTid`, but they do
+    /// not name the same thread incarnation: the drain must remove the former
+    /// without cancelling the latter.
+    #[test]
+    fn nonleader_exec_removal_preserves_replacement_admission() {
+        let config = Config {
+            cancel_killed_thread_rpcs: true,
+            ..Config::default()
+        };
+        let mut sched = Scheduler::new(&config);
+        let leader = DetTid::from_raw(17);
+        let caller = DetTid::from_raw(18);
+        let detpid = DetPid::from_raw(leader.as_raw());
+        let pre_exec_mm = MmId::initial(detpid);
+
+        sched.thread_tree.add_child(leader, leader, true);
+        sched.thread_tree.add_child(leader, caller, false);
+        register_known_thread(&mut sched, leader);
+        register_known_thread(&mut sched, caller);
+        sched.runqueue_push_back(leader);
+        sched.runqueue_push_back(caller);
+
+        let old_leader_request = sched.next_turns.get(&leader).unwrap().req.clone();
+        let retired = sched.reconnect_after_exec(ExecReconnect {
+            caller,
+            new_leader: leader,
+            detpid,
+            pre_exec_mm,
+            post_exec_mm: pre_exec_mm.for_exec(detpid),
+            child_tid_addr: 0,
+            reconnect_priority: Some(DEFAULT_PRIORITY),
+        });
+
+        assert_eq!(retired, vec![leader, caller]);
+        assert!(matches!(old_leader_request.try_read(), Some(Err(_))));
+        assert!(sched.pending_run_queue_removals.contains_key(&leader));
+        assert!(sched.pending_run_queue_admissions.contains_key(&leader));
+
+        sched.drain_pending_run_queue_removals();
+        sched.drain_pending_run_queue_admissions();
+
+        assert_eq!(
+            sched
+                .run_queue
+                .tids()
+                .filter(|dettid| **dettid == leader)
+                .count(),
+            1,
+            "the first eligible drain must contain exactly one replacement leader"
+        );
+        assert!(!sched.run_queue.contains_tid(caller));
+        assert!(sched.next_turns.contains_key(&leader));
+        assert!(sched.pending_run_queue_admissions.is_empty());
+        assert!(sched.pending_run_queue_removals.is_empty());
+    }
+
+    #[test]
+    fn exec_replacement_killed_before_drain_is_not_resurrected() {
+        let config = Config {
+            cancel_killed_thread_rpcs: true,
+            ..Config::default()
+        };
+        let mut sched = Scheduler::new(&config);
+        let leader = DetTid::from_raw(17);
+        let caller = DetTid::from_raw(18);
+        let (detpid, pre_exec_mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
+
+        reconnect_nonleader_exec(&mut sched, leader, caller, detpid, pre_exec_mm);
+        assert_eq!(
+            sched.pending_run_queue_removals.get(&leader),
+            Some(&RemovalDisposition::ReplaceThenAdmit)
+        );
+
+        sched.logically_kill_thread(&leader, &detpid, pre_exec_mm.for_exec(detpid));
+        assert_eq!(
+            sched.pending_run_queue_removals.get(&leader),
+            Some(&RemovalDisposition::Retire)
+        );
+        assert!(!sched.pending_run_queue_admissions.contains_key(&leader));
+
+        sched.drain_pending_run_queue_removals();
+        sched.drain_pending_run_queue_admissions();
+
+        assert!(!sched.run_queue.contains_tid(leader));
+        assert!(!sched.next_turns.contains_key(&leader));
+        assert!(sched.pending_run_queue_admissions.is_empty());
+        assert!(sched.pending_run_queue_removals.is_empty());
+    }
+
+    #[test]
+    fn exec_reconnect_only_buffers_while_tentative_selection_is_live() {
+        let config = Config {
+            cancel_killed_thread_rpcs: true,
+            ..Config::default()
+        };
+        let mut sched = Scheduler::new(&config);
+        let anchor = DetTid::from_raw(3);
+        let leader = DetTid::from_raw(17);
+        let caller = DetTid::from_raw(18);
+        register_known_thread(&mut sched, anchor);
+        sched.runqueue_push_back(anchor);
+        let (detpid, pre_exec_mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
+
+        assert_eq!(sched.run_queue.tentative_pop_next(), Some(anchor));
+        let queue_during_window = sched.run_queue.tids().copied().collect::<Vec<_>>();
+
+        reconnect_nonleader_exec(&mut sched, leader, caller, detpid, pre_exec_mm);
+
+        assert!(sched.run_queue.tentative_pop_in_progress());
+        assert_eq!(
+            sched.run_queue.tids().copied().collect::<Vec<_>>(),
+            queue_during_window,
+            "the reconnect handler must not mutate a tentatively selected queue"
+        );
+        assert_eq!(
+            sched.pending_run_queue_removals.get(&leader),
+            Some(&RemovalDisposition::ReplaceThenAdmit)
+        );
+
+        sched.run_queue.undo_tentative_pop();
+        sched.drain_pending_run_queue_removals();
+        sched.drain_pending_run_queue_admissions();
+
+        assert_eq!(
+            sched
+                .run_queue
+                .tids()
+                .filter(|dettid| **dettid == leader)
+                .count(),
+            1
+        );
+        assert!(sched.run_queue.contains_tid(anchor));
+        assert!(!sched.run_queue.contains_tid(caller));
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum ExecReconnectTiming {
+        BeforeDaemon,
+        AfterCallerWait { yields: usize },
+        CallerResolvedBeforeReconnect,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ExecDrainObservation {
+        queue: Vec<DetTid>,
+        next_post_fork_draw: bool,
+        turn: u64,
+        old_leader_registration_survived: bool,
+    }
+
+    async fn observe_exec_reconnect_drain(timing: ExecReconnectTiming) -> ExecDrainObservation {
+        let config = Config {
+            sched_seed: Some(0x5107),
+            runs_post_fork: RunsPostFork::Random,
+            cancel_killed_thread_rpcs: true,
+            ..Config::default()
+        };
+        let sched = Arc::new(Mutex::new(Scheduler::new(&config)));
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let leader = DetTid::from_raw(17);
+        let caller = DetTid::from_raw(18);
+        let lower = DetTid::from_raw(31);
+        let higher = DetTid::from_raw(37);
+        let barrier_parent = DetTid::from_raw(99);
+        let detpid = DetPid::from_raw(leader.as_raw());
+        let pre_exec_mm = MmId::initial(detpid);
+
+        let (caller_request, old_leader_request) = {
+            let mut s = sched.lock().unwrap();
+            s.thread_tree.add_child(leader, leader, true);
+            s.thread_tree.add_child(leader, caller, false);
+            register_known_thread(&mut s, leader);
+            register_known_thread(&mut s, caller);
+            // Give the destroyed leader a visibly different queue band. The
+            // replacement must use the caller's priority at the ordinary tail.
+            s.priorities.insert(leader, runqueue::FIRST_PRIORITY);
+            s.runqueue_push_back(leader);
+            s.runqueue_push_back(caller);
+            s.next_turns
+                .get(&leader)
+                .unwrap()
+                .req
+                .put(Ok(Resources::new(leader)));
+
+            register_known_thread(&mut s, lower);
+            register_known_thread(&mut s, higher);
+            s.admit_to_run_queue(lower, AdmitIntent::PostFork(RunsPostFork::Random));
+            s.admit_to_run_queue(higher, AdmitIntent::PostFork(RunsPostFork::Random));
+            // `step2` drains first, then this unresolved barrier returns
+            // `SkipTurn`, exposing the exact first-drain queue before step3 can
+            // tentatively select or rotate it.
+            s.vfork_barriers.insert(barrier_parent, None);
+            (
+                s.next_turns.get(&caller).unwrap().req.clone(),
+                s.next_turns.get(&leader).unwrap().req.clone(),
+            )
+        };
+
+        if matches!(timing, ExecReconnectTiming::BeforeDaemon) {
+            reconnect_nonleader_exec(
+                &mut sched.lock().unwrap(),
+                leader,
+                caller,
+                detpid,
+                pre_exec_mm,
+            );
+        } else if matches!(timing, ExecReconnectTiming::CallerResolvedBeforeReconnect) {
+            caller_request.put(Ok(Resources::new(caller)));
+        }
+
+        let turn_sched = sched.clone();
+        let turn_time = global_time.clone();
+        let turn = tokio::spawn(async move {
+            let last: Result<Resources, SkipTurn> = Err(SkipTurn);
+            do_a_turn_blocking(turn_sched, turn_time, &last).await
+        });
+
+        if let ExecReconnectTiming::AfterCallerWait { yields } = timing {
+            let mut saw_waiter = false;
+            for _ in 0..1_000 {
+                if caller_request.to_string() == "<ivar HasWaiter>" {
+                    saw_waiter = true;
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(saw_waiter, "daemon never waited on the exec caller request");
+            for _ in 0..yields {
+                tokio::task::yield_now().await;
+            }
+            reconnect_nonleader_exec(
+                &mut sched.lock().unwrap(),
+                leader,
+                caller,
+                detpid,
+                pre_exec_mm,
+            );
+        }
+
+        assert!(turn.await.expect("scheduler task panicked").is_err());
+        let mut s = sched.lock().unwrap();
+        let observation = ExecDrainObservation {
+            queue: s.run_queue.tids().copied().collect(),
+            next_post_fork_draw: s.child_runs_first_post_fork(RunsPostFork::Random),
+            turn: s.turn,
+            old_leader_registration_survived: s
+                .next_turns
+                .get(&leader)
+                .is_some_and(|turn| turn.req == old_leader_request),
+        };
+        if !matches!(timing, ExecReconnectTiming::CallerResolvedBeforeReconnect) {
+            assert_eq!(
+                observation
+                    .queue
+                    .iter()
+                    .filter(|tid| **tid == leader)
+                    .count(),
+                1
+            );
+            assert!(!observation.queue.contains(&caller));
+            assert!(!observation.old_leader_registration_survived);
+            assert!(s.pending_run_queue_admissions.is_empty());
+            assert!(s.pending_run_queue_removals.is_empty());
+        }
+        observation
+    }
+
+    #[tokio::test]
+    async fn exec_reconnect_caller_gate_fixes_first_drain_membership_and_prng() {
+        let canonical = observe_exec_reconnect_drain(ExecReconnectTiming::BeforeDaemon).await;
+        for yields in [0, 1, 64] {
+            assert_eq!(
+                canonical,
+                observe_exec_reconnect_drain(ExecReconnectTiming::AfterCallerWait { yields }).await,
+                "host delay of {yields} yields changed the first eligible drain"
+            );
+        }
+
+        let broken =
+            observe_exec_reconnect_drain(ExecReconnectTiming::CallerResolvedBeforeReconnect).await;
+        assert!(broken.old_leader_registration_survived);
+        assert_ne!(
+            canonical.queue, broken.queue,
+            "the deliberate caller-gate violation was inert"
+        );
+    }
+
+    /// F6 (real-path regression): when the thread `step3_peek` tentatively
+    /// selected dies while the daemon awaits its request, `do_a_turn_blocking`
+    /// takes the `Err(ThreadExited)` fizzle arm. That arm MUST undo the tentative
+    /// pop so the selection does not outlive the turn; otherwise the next pass's
+    /// step2 removal drain calls `remove_tid` while `tentative_selection` is
+    /// still `Some`, tripping the run queue's transaction guard -- the "reconnect
+    /// panic moved one pass" defect (reachable in NORMAL async-DBI operation, not
+    /// just the reviewed edge case: any thread that exits during the await window
+    /// races here). This drives the ACTUAL async daemon function end to end
+    /// rather than poking `RunQueue` directly, which is the coverage gap the
+    /// pre-existing tests left. Positive control: after the fizzle the window is
+    /// closed and the following real step2 removal drain does not panic.
+    #[tokio::test]
+    async fn reconnect_fizzle_closes_window_so_next_removal_drain_is_safe() {
+        let config = Config::default();
+        let sched = Arc::new(Mutex::new(Scheduler::new(&config)));
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let dead = DetTid::from_raw(7);
+        {
+            let mut s = sched.lock().unwrap();
+            s.priorities.insert(dead, DEFAULT_PRIORITY);
+            s.next_turns.insert(
+                dead,
+                ThreadNextTurn {
+                    dettid: dead,
+                    child_tid_addr: 0,
+                    // Request already resolved to `ThreadExited`: the daemon will
+                    // observe the thread died the moment it awaits `req.get()`.
+                    req: Ivar::full(Err(ThreadExited)),
+                    resp: Ivar::new(),
+                },
+            );
+            s.runqueue_push_back(dead);
+        }
+        let last: Result<Resources, SkipTurn> = Err(SkipTurn);
+
+        // Pass 1: step1 sees a filled request (quiescent), step3 tentatively
+        // pops `dead`, then `req.get().await` yields `Err(ThreadExited)`. The
+        // fizzle arm returns `SkipTurn` and undoes the tentative pop.
+        let first = do_a_turn_blocking(sched.clone(), global_time.clone(), &last).await;
+        assert!(first.is_err(), "fizzled reconnect turn skips");
+        assert!(
+            !sched.lock().unwrap().run_queue.tentative_pop_in_progress(),
+            "the ThreadExited arm must undo the tentative pop"
+        );
+
+        // Pass 2: the dead thread's run-queue removal is now buffered, exactly
+        // as a reconnect/kill handler would leave it. Because pass 1 closed the
+        // window, the real step2 removal drain calls `remove_tid` with
+        // `tentative_selection == None` and does NOT trip the guard. Pre-fix
+        // (window left open) this call panicked.
+        {
+            let mut s = sched.lock().unwrap();
+            s.deschedule_or_defer(dead);
+            s.next_turns.remove(&dead);
+            let _ = s.step2_process_blocked(&global_time);
+            assert!(!s.run_queue.contains_tid(dead), "dead thread drained out");
+            assert!(s.pending_run_queue_removals.is_empty());
+        }
+    }
+
+    /// F8 (non-committing fizzle), part 1: the branch itself, both ways.
+    ///
+    /// NEGATIVE -- the defect. A selected thread whose `next_turns` entry
+    /// vanished during the daemon's post-await window must abandon the turn:
+    /// report `SkipTurn` (it commits nothing -- steps 4-7 are bypassed) AND
+    /// close the tentative window `step3_peek` opened. Before the fix this
+    /// branch fell through to `Ok(rsrcs)`, which `bump_global_time` reads as a
+    /// completed turn and answers with a virtual-time advance.
+    /// POSITIVE -- not inert. A thread that is still registered proceeds: `Ok`,
+    /// with its tentative selection left open for step4 to commit. Without this
+    /// side an `abort_turn_if_thread_vanished` that simply always skipped would
+    /// pass the negative and silently stall the scheduler.
+    #[test]
+    fn a_vanished_thread_aborts_its_turn_and_a_live_one_does_not() {
+        let config = Config::default();
+        let vanishing = DetTid::from_raw(11);
+        let live = DetTid::from_raw(13);
+
+        let mut sched = Scheduler::new(&config);
+        register_known_thread(&mut sched, vanishing);
+        register_known_thread(&mut sched, live);
+        sched.runqueue_push_back(vanishing);
+        sched.runqueue_push_back(live);
+
+        // NEGATIVE: retire `vanishing` after its selection was tentatively
+        // popped, exactly as teardown does inside the post-await window.
+        assert_eq!(
+            sched.run_queue.tentative_pop_tid(vanishing),
+            Some(vanishing)
+        );
+        assert!(sched.run_queue.tentative_pop_in_progress());
+        sched.next_turns.remove(&vanishing);
+        assert!(
+            sched.abort_turn_if_thread_vanished(vanishing).is_err(),
+            "a turn that bypasses steps 4-7 must report SkipTurn, never success: \
+             reporting Ok lets bump_global_time advance virtual time for a turn \
+             that committed nothing"
+        );
+        assert!(
+            !sched.run_queue.tentative_pop_in_progress(),
+            "the abandoned turn must also close its tentative window"
+        );
+
+        // POSITIVE: a still-registered thread is untouched and proceeds to
+        // step4 with its selection still open to commit.
+        assert_eq!(sched.run_queue.tentative_pop_tid(live), Some(live));
+        assert!(sched.run_queue.tentative_pop_in_progress());
+        assert!(
+            sched.abort_turn_if_thread_vanished(live).is_ok(),
+            "a live thread's turn must proceed"
+        );
+        assert!(
+            sched.run_queue.tentative_pop_in_progress(),
+            "a proceeding turn must keep its tentative selection open for step4"
+        );
+    }
+
+    /// F8 (non-committing fizzle must not advance virtual time): both sides of
+    /// the consequence, stated directly against `bump_global_time` -- the code
+    /// that turns a turn's returned `Result` into a virtual-time decision.
+    ///
+    /// The defect: the fizzle arm where `req.get()` resolved `Ok` but the
+    /// thread's `next_turns` entry vanished before the daemon re-acquired the
+    /// lock skips steps 4-7, commits nothing, and used to fall through to
+    /// `Ok(rsrcs)` -- landing in the advancing branch below and adding a
+    /// DETLOG-visible tick for work that never happened. It now reports
+    /// `Err(SkipTurn)` like its `ThreadExited` sibling, so this pair of
+    /// assertions is what that fix buys.
+    ///
+    /// Deliberately NOT an end-to-end test of that arm. Reaching it requires
+    /// teardown to clear `next_turns` inside the host-scheduling gap between the
+    /// await resolving and the re-lock, and that gap is not constructible from a
+    /// test: `step1_check_quiescence` only proceeds once every thread's request
+    /// is already filled, so `req.get()` never suspends and there is no window a
+    /// test can hold open. An attempt to win the lock in that gap is a genuine
+    /// race that would usually lose (and deadlocks outright on a current-thread
+    /// runtime, where the daemon's blocking `sched.lock()` stalls the whole
+    /// executor). F6's `reconnect_fizzle_closes_window_so_next_removal_drain_is_
+    /// safe` does drive the real `do_a_turn_blocking` for the sibling arm.
+    ///
+    /// NEGATIVE: a skipped turn leaves virtual time exactly where it was. That is
+    /// what the F8 fix buys; before it, the non-committing arm reported `Ok` and
+    /// landed in the advancing branch.
+    /// POSITIVE: a committed, non-internal turn *does* advance it. Without this
+    /// side the negative would pass vacuously for a `bump_global_time` that had
+    /// simply stopped advancing time at all.
+    #[test]
+    fn virtual_time_advances_for_a_committed_turn_and_not_for_a_skipped_one() {
+        let config = Config::default();
+        let runnable = DetTid::from_raw(13);
+
+        // A non-empty run queue keeps the "only waiting on external events"
+        // guard from suppressing the advance for an unrelated reason.
+        let mut advancing = Scheduler::new(&config);
+        advancing.priorities.insert(runnable, DEFAULT_PRIORITY);
+        advancing.runqueue_push_back(runnable);
+        let advancing_time = Mutex::new(GlobalTime::new(&config));
+        let before_commit = advancing_time.lock().unwrap().as_nanos();
+        advancing.bump_global_time(&advancing_time, &Ok(Resources::new(runnable)));
+        let after_commit = advancing_time.lock().unwrap().as_nanos();
+        assert!(
+            after_commit > before_commit,
+            "a committed turn must advance virtual time ({before_commit:?} -> {after_commit:?})"
+        );
+
+        let mut skipping = Scheduler::new(&config);
+        skipping.priorities.insert(runnable, DEFAULT_PRIORITY);
+        skipping.runqueue_push_back(runnable);
+        let skipping_time = Mutex::new(GlobalTime::new(&config));
+        let before_skip = skipping_time.lock().unwrap().as_nanos();
+        skipping.bump_global_time(&skipping_time, &Err(SkipTurn));
+        let after_skip = skipping_time.lock().unwrap().as_nanos();
+        assert_eq!(
+            after_skip, before_skip,
+            "a skipped turn must not advance virtual time"
+        );
+    }
+
+    /// Liveness (negative control) for the F6 fix above: proves the guard the
+    /// fizzle arm protects is real, so the positive test is not vacuous. If a
+    /// fizzled turn does NOT undo its tentative pop (the pre-fix behavior), the
+    /// next pass's step2 removal drain calls `remove_tid` while
+    /// `tentative_selection` is `Some`, and the run queue's transaction guard
+    /// panics. This is precisely the panic `undo_tentative_pop` prevents.
+    #[test]
+    #[should_panic(expected = "tentative_selection.is_none()")]
+    fn removal_drain_panics_if_tentative_window_left_open() {
+        let mut sched = Scheduler::new(&Config::default());
+        let dead = DetTid::from_raw(7);
+        register_known_thread(&mut sched, dead);
+        sched.runqueue_push_back(dead);
+
+        // Simulate step3_peek selecting `dead` with the turn neither committing
+        // nor undoing -- i.e., the fizzle arm WITHOUT its undo.
+        assert_eq!(sched.run_queue.tentative_pop_next(), Some(dead));
+        assert!(sched.run_queue.tentative_pop_in_progress());
+
+        // Next pass buffers the removal and drains: remove_tid trips the guard.
+        sched.deschedule_or_defer(dead);
+        sched.next_turns.remove(&dead);
+        sched.drain_pending_run_queue_removals();
+    }
+
+    /// F7 (adjacent-snapshot sensitivity): this fixture directly places two
+    /// admissions in adjacent step2 drains; it does not model a production
+    /// handler protocol. Every current asynchronous admission site separately
+    /// fixes snapshot membership: ordinary clone buffers before the parent's
+    /// `ParentContinue`, `vfork` uses its registration barrier, and exec
+    /// reconnect buffers before retiring and resolving the caller request. See
+    /// [`Scheduler::admit_to_run_queue`] for those causal bindings.
+    ///
+    /// The synthetic split remains a negative/sensitivity bracket for that
+    /// requirement. Replaying one fixed split at one seed is reproducible, but
+    /// swapping which child occupies the first drain changes the resolved queue
+    /// order. Thus a future unanchored admission site would make host-selected
+    /// membership observable; this test must not be read as evidence that any
+    /// current production site is unanchored.
+    #[test]
+    fn deferred_admission_binds_to_snapshot_membership_across_adjacent_drains() {
+        let config = Config {
+            sched_seed: Some(0x5107),
+            runs_post_fork: RunsPostFork::Random,
+            ..Default::default()
+        };
+        let anchor = DetTid::from_raw(3);
+        let a = DetTid::from_raw(31);
+        let b = DetTid::from_raw(37);
+
+        // Admit `first` in drain 1 and `second` in drain 2 (two adjacent step2
+        // drains) and return the final run-queue order relative to a fixed
+        // anchor, which encodes each child's resolved front/back side.
+        let split = |first: DetTid, second: DetTid| -> Vec<DetTid> {
+            let mut sched = Scheduler::new(&config);
+            register_known_thread(&mut sched, anchor);
+            register_known_thread(&mut sched, a);
+            register_known_thread(&mut sched, b);
+            sched.runqueue_push_back(anchor);
+
+            sched.admit_to_run_queue(first, AdmitIntent::PostFork(RunsPostFork::Random));
+            sched.drain_pending_run_queue_admissions(); // drain 1
+            sched.admit_to_run_queue(second, AdmitIntent::PostFork(RunsPostFork::Random));
+            sched.drain_pending_run_queue_admissions(); // drain 2 (adjacent)
+
+            sched.run_queue.tids().copied().collect()
+        };
+
+        // Fixed synthetic membership is deterministic across identical replays.
+        let canonical = split(a, b);
+        assert_eq!(
+            canonical,
+            split(a, b),
+            "identical schedule -> identical result"
+        );
+        assert!(canonical.contains(&a) && canonical.contains(&b) && canonical.contains(&anchor));
+
+        // Sensitivity control: changing synthetic snapshot membership changes
+        // the outcome for this seed, so a missing production anchor would be
+        // observable rather than inert.
+        assert_ne!(
+            split(a, b),
+            split(b, a),
+            "swapping snapshot membership changes the resolved order"
+        );
     }
 
     #[test]
