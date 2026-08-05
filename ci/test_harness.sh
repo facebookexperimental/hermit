@@ -245,8 +245,9 @@ function workflow_job_timeout_minutes {
 
 function assert_parallel_portable_workflow {
     local workflow=$1
-    local run_dag_count run_node_count inner_build_timeout
+    local run_dag_count run_node_count debug_inner_path release_inner_path
     local debug_outer_minutes release_outer_minutes
+    local hosted_job_overhead_seconds=300
     run_dag_count=$(grep -Ec '^[[:space:]]+run: .*ci/run-dag[.]sh portable([[:space:]]|$)' "$workflow" || true)
     run_node_count=$(grep -Ec '^[[:space:]]+run: .*ci/run-node[.]sh portable([[:space:]]|$)' "$workflow" || true)
 
@@ -255,27 +256,44 @@ function assert_parallel_portable_workflow {
     ((run_node_count == 5)) ||
         die "GitHub portable workflow must have five audited ci/run-node.sh entrypoints"
 
-    # The hosted job is the outer kill boundary. It must sit strictly outside
-    # the largest wrapped DBI node timeout (1050s budget + 150s node overhead),
-    # or Actions can kill a qualifying build before the audited inner bound.
-    inner_build_timeout=$(jq '
-        [.steps[]
-         | select(.cmd | contains("./ci/run-with-reverie-dbi-budget.sh cargo build"))
-         | .timeout]
-        | max
+    # The hosted job is the outer kill boundary. Compute the critical path for
+    # each exact run-node selection, retaining dependencies among selected nodes
+    # just as safe-ci --only does. A max-single-node proxy misses release's
+    # runtime_release -> liteinst_runtime_release chain.
+    debug_inner_path=$(jq --slurpfile shards "$ROOT_DIR/ci/portable-shards.json" '
+        ($shards[0].build_debug_nodes) as $selected
+        | (.steps | map({key:(.group + "." + .job), value:.}) | from_entries) as $steps
+        | def critical($id):
+            $steps[$id] as $step
+            | ($step.timeout + ([($step.deps // [])[] as $dep
+                | select($selected | index($dep) != null)
+                | critical($dep)] | max // 0));
+          [$selected[] | critical(.)] | max
+    ' "$DAG_ROOT/portable.json")
+    release_inner_path=$(jq --slurpfile shards "$ROOT_DIR/ci/portable-shards.json" '
+        ($shards[0].build_dbi_nodes + $shards[0].build_aux_nodes) as $selected
+        | (.steps | map({key:(.group + "." + .job), value:.}) | from_entries) as $steps
+        | def critical($id):
+            $steps[$id] as $step
+            | ($step.timeout + ([($step.deps // [])[] as $dep
+                | select($selected | index($dep) != null)
+                | critical($dep)] | max // 0));
+          [$selected[] | critical(.)] | max
     ' "$DAG_ROOT/portable.json")
     debug_outer_minutes=$(workflow_job_timeout_minutes "$workflow" build-debug)
     release_outer_minutes=$(workflow_job_timeout_minutes "$workflow" build-release)
-    [[ $inner_build_timeout =~ ^[1-9][0-9]*$ ]] ||
-        die "portable DBI nodes have no numeric timeout"
+    [[ $debug_inner_path =~ ^[1-9][0-9]*$ ]] ||
+        die "portable debug selection has no numeric critical path"
+    [[ $release_inner_path =~ ^[1-9][0-9]*$ ]] ||
+        die "portable release selection has no numeric critical path"
     [[ $debug_outer_minutes =~ ^[1-9][0-9]*$ ]] ||
         die "GitHub debug build has no numeric outer timeout"
     [[ $release_outer_minutes =~ ^[1-9][0-9]*$ ]] ||
         die "GitHub release build has no numeric outer timeout"
-    ((debug_outer_minutes * 60 > inner_build_timeout)) ||
-        die "GitHub debug outer timeout must exceed DBI node timeout $inner_build_timeout"
-    ((release_outer_minutes * 60 > inner_build_timeout)) ||
-        die "GitHub release outer timeout must exceed DBI node timeout $inner_build_timeout"
+    ((debug_outer_minutes * 60 > debug_inner_path + hosted_job_overhead_seconds)) ||
+        die "GitHub debug outer timeout must exceed ${debug_inner_path}s selected path plus ${hosted_job_overhead_seconds}s overhead"
+    ((release_outer_minutes * 60 > release_inner_path + hosted_job_overhead_seconds)) ||
+        die "GitHub release outer timeout must exceed ${release_inner_path}s selected path plus ${hosted_job_overhead_seconds}s overhead"
     [[ $(grep -Fxc '        run: ./ci/check-shard-coverage.sh' "$workflow") == 1 ]] ||
         die "GitHub portable workflow must run the shard-coverage guard exactly once"
     # Match the literal command embedded in workflow YAML.
@@ -424,6 +442,8 @@ $direct_references"
     (
         local scratch isolated_path fixture real_git current stale status
         local fake_cargo staged_runtime direct_status
+        local parallel_index parallel_failures
+        local -a checker_pids
         scratch=$(mktemp -d)
         trap 'rm -rf -- "$scratch"' EXIT
         isolated_path="$scratch/bin"
@@ -437,6 +457,26 @@ $direct_references"
             die "rust-script unexpectedly present in isolated checker PATH"
         fi
         PATH="$isolated_path:/usr/bin:/bin" "$runner" --self-test >/dev/null
+
+        # The pin gate and both DBI build children may compile the checker at
+        # once in one worktree. Stress that exact topology: unique output files
+        # are insufficient because rustc also writes crate-named intermediates
+        # beside the output, so each invocation needs its own directory.
+        checker_pids=()
+        for parallel_index in $(seq 1 12); do
+            "$runner" --self-test >"$scratch/parallel-checker-$parallel_index.log" 2>&1 &
+            checker_pids+=("$!")
+        done
+        parallel_failures=0
+        for parallel_index in "${!checker_pids[@]}"; do
+            if ! wait "${checker_pids[$parallel_index]}"; then
+                cat "$scratch/parallel-checker-$((parallel_index + 1)).log" >&2
+                parallel_failures=$((parallel_failures + 1))
+            fi
+        done
+        ((parallel_failures == 0)) ||
+            die "$parallel_failures of 12 concurrent Reverie-pin checker builds failed"
+
         cat >"$isolated_path/git" <<EOF
 #!/usr/bin/env bash
 if [[ \${1:-} == ls-remote ]]; then
@@ -626,6 +666,7 @@ function audit_ci_correspondence {
             CI_DAG_EFFECTIVE_CPUS
             CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS
             CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS
+            REVERIE_DBI_PINNED_MAX_PARALLEL_JOBS
             REVERIE_DBI_BUDGET_CHILD
         )
         clean_budget_env=(env -u CARGO_BUILD_JOBS -u THIRD_PARTY_BUILD_JOBS -u SAFE_CI_IN_SCOPE)

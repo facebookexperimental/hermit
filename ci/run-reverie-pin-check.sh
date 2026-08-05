@@ -23,8 +23,9 @@ if [[ ${1:-} == --self-test ]]; then
 fi
 
 mkdir -p target/ci
-checker=$(mktemp "$ROOT_DIR/target/ci/check-reverie-pin.XXXXXX")
-trap 'rm -f -- "$checker"' EXIT
+compile_dir=$(mktemp -d "$ROOT_DIR/target/ci/check-reverie-pin.XXXXXX")
+checker="$compile_dir/checker"
+trap 'rm -rf -- "$compile_dir"' EXIT
 if [[ $mode == test ]]; then
     if (($# != 0)); then
         echo "usage: ci/run-reverie-pin-check.sh --self-test" >&2

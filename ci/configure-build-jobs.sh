@@ -42,6 +42,7 @@ if [[ $build_job_context == launcher ]]; then
     unset CI_DAG_EFFECTIVE_CPUS
     unset CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS
     unset CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS
+    unset REVERIE_DBI_PINNED_MAX_PARALLEL_JOBS
     unset REVERIE_DBI_BUDGET_CHILD
 
     # Cargo converts this explicit pool width into build-script NUM_JOBS. Keep
