@@ -56,10 +56,13 @@
 //! period or a forced fleet-wide rebase, because only version-awareness survives
 //! a THIRD tightening). Its contract, which any future bump MUST preserve:
 //!
-//!   1. THE WRITER STAMPS A SCHEMA VERSION and ALWAYS emits the required
-//!      selection-accounting fields (`schema_version` + `executed_tests` +
-//!      `filtered_tests` + `profile`) with REAL values on every run. A record is
-//!      never emitted with these fields omitted or zero-filled.
+//!   1. THE WRITER STAMPS A SCHEMA VERSION and ALWAYS emits its
+//!      selection-accounting fields (`schema_version` + `executed_nodes` +
+//!      `skipped_nodes` + `profile`) with REAL values on every run. A record is
+//!      never emitted with these fields omitted or zero-filled. Crucially the
+//!      NODE-count fields are NOT named `executed_tests`/`filtered_tests`: those
+//!      libtest-count names are reserved for a real per-test count, so a
+//!      schema<5 consumer never reads a DAG-node count as a test count.
 //!   2. THE READER ACCEPTS OLDER VALID VERSIONS instead of hard-rejecting them:
 //!      it dispatches on `schema_version`, reads every field via a
 //!      get-with-default, and treats an older-but-valid record as valid.
@@ -71,26 +74,28 @@
 //!      therefore disallowed.
 //!
 //! Concretely: this producer writes `schema_version: 3` and ALWAYS emits the
-//! three selection-accounting fields `profile`, `executed_tests`, and
-//! `filtered_tests` (plus `commit`/`commit_anchored`/`tree_dirty` for commit
-//! anchoring). Because the qualification travels WITH the value (all three
-//! written at the single ledger-write point below), a downstream reader can never
-//! pair a bare `pass` with inferred coverage.
+//! selection-accounting fields `profile`, `executed_nodes`, and `skipped_nodes`
+//! (plus `commit`/`commit_anchored`/`tree_dirty` for commit anchoring). Because
+//! the qualification travels WITH the value (all written at the single
+//! ledger-write point below), a downstream reader can never pair a bare `pass`
+//! with inferred coverage.
 //!
-//! ## What `executed_tests` / `filtered_tests` MEAN for a DAG-lane run
+//! ## What `executed_nodes` / `skipped_nodes` MEAN for a DAG-lane run
 //!
 //! The unit of execution in a DAG lane is the NODE (gate) — each node runs one
 //! command (a build, a `cargo test` target, a harness). The typed `RunResult`
 //! exposes NODE outcomes and resource metrics, not individual cargo-test-case
 //! counts (the runner surfaces only the last output line as `summary`, not a
-//! parsed per-test count). So, consistent with how `validate.sh` itself counts
-//! gates rather than test cases, this producer binds:
-//!   * `executed_tests`  = number of gates that actually RAN (`outcomes.len()`),
-//!   * `filtered_tests`  = number of gates SKIPPED because a dependency failed
-//!                         (`skipped.len()`; a full green run has zero).
-//! These are genuine counts from typed fields, never fabricated or zero-filled.
-//! A run that executed zero gates, or that skipped gates (incomplete coverage),
-//! yields a record the consumer correctly declines to treat as a full green.
+//! parsed per-test count). So this producer binds:
+//!   * `executed_nodes` = number of gates that actually RAN (`outcomes.len()`),
+//!   * `skipped_nodes`  = number of gates SKIPPED because a dependency failed
+//!                        (`skipped.len()`; a full green run has zero).
+//! These are genuine NODE counts from typed fields, never fabricated or
+//! zero-filled. They are DELIBERATELY NOT named `executed_tests`/`filtered_tests`
+//! (the libtest-count field names a schema<5 consumer keys `is_clean_full_pass`
+//! on): a validate.rs receipt must NEVER be mistakable for a qualifying full-TEST
+//! pass just because it ran ~47 DAG nodes. Real libtest-count parsing is Phase 2;
+//! the counted+coverage receipt is minted by `finalize_receipt.py --scan`.
 //!
 //! # Usage
 //!
@@ -133,6 +138,19 @@ use safe_ci_dag_runner::scheduler::BoxedCgroups;
 
 /// Ledger schema this producer emits. See the schema-transition constraint in
 /// the module doc comment before changing this.
+///
+/// Kept at 3 DELIBERATELY. validate.rs emits NODE-granularity fields
+/// (`executed_nodes`/`skipped_nodes`) and NOT the libtest-count fields
+/// (`executed_tests`/`filtered_tests`), precisely so a schema<5 consumer's
+/// `counts_present` branch (`is_clean_full_pass`) can never mistake a
+/// validate.rs receipt for a qualifying full-TEST pass — the DAG-node count
+/// (~47) would otherwise be read as "47 tests executed". The authoritative
+/// counted+coverage receipt is minted by `finalize_receipt.py --scan` off the
+/// durable log; Phase 2 will add real libtest-count parsing here.
+///
+/// Bumping to schema 5 would be WRONG: schema>=5 triggers a per-node coverage
+/// contract this Phase-1 wrapper cannot satisfy. The `producer:"validate.rs"`
+/// field already disambiguates this row for a version-aware reader.
 const LEDGER_SCHEMA_VERSION: i64 = 3;
 
 /// Producer identity recorded in each ledger row, so a backward-tolerant reader
@@ -276,11 +294,43 @@ fn parse_args() -> Result<Args, u8> {
 
 // --------------------------------------------------------------------------- jobs default
 
-/// SINGLE SOURCE OF TRUTH for the default scheduler width. Host-adaptive:
-/// `host_cpus/8`, floored at 2, capped at 16 — the exact rule validate.sh uses
-/// (validate.sh:485-487). Called from exactly one site (main), only when `-j`
-/// was not supplied.
+/// Default scheduler width, honoring the SAME shared runtime authority
+/// validate.sh uses so both producers pick identical widths on the same host.
+///
+/// Precedence mirrors validate.sh:606-635 (the `VALIDATION_DAG_JOBS`
+/// derivation), which is the shared spec:
+///   * `${CI_DAG_JOBS:-$CI_DAG_JOBS_DEFAULT}` — an explicitly-set `CI_DAG_JOBS`
+///     env var is the override and is used EXACTLY, with NO clamp (validate.sh
+///     clamps only the *default*, never the override; it only requires the
+///     override be a positive integer, else it exits 2).
+///   * otherwise the host-adaptive default `CI_DAG_JOBS_DEFAULT = host_cpus/8`,
+///     floored at 2 and capped at 16 (validate.sh:628-630).
+///
+/// Called from exactly one site (main), only when `-j` was not supplied — so an
+/// explicit `-j` (also unclamped, like the env override) still wins over both.
+///
+/// FOLLOW-UP: fully extracting this width rule into safe-ci-dag-runner so the
+/// three consumers (validate.sh, run-dag.sh, validate.rs) call one function is
+/// Phase 2; for now this reads the same `CI_DAG_JOBS` runtime authority.
 fn default_jobs() -> i64 {
+    // CI_DAG_JOBS override: used EXACTLY (no clamp), matching validate.sh's
+    // `${CI_DAG_JOBS:-...}`. An empty value is treated as unset (the `:-` form).
+    // validate.sh rejects a set-but-invalid value with exit 2; here we can only
+    // return an i64, so an unparseable/non-positive value falls back to the
+    // default (deviation noted in the commit message).
+    if let Ok(v) = std::env::var("CI_DAG_JOBS") {
+        if !v.is_empty() {
+            if let Ok(n) = v.parse::<i64>() {
+                if n > 0 {
+                    return n;
+                }
+            }
+            eprintln!(
+                "validate.rs: warning: CI_DAG_JOBS={v:?} is not a positive integer; \
+                 falling back to the host-adaptive default (validate.sh would exit 2)."
+            );
+        }
+    }
     let host_cpus = std::thread::available_parallelism()
         .map(|n| n.get() as i64)
         .unwrap_or(1);
@@ -418,8 +468,8 @@ fn utc_now() -> String {
     }
 }
 
-/// Write one JSONL ledger record. Every qualification (profile/executed_tests/
-/// filtered_tests, commit anchoring, per-gate reason) is written HERE, at the
+/// Write one JSONL ledger record. Every qualification (profile/executed_nodes/
+/// skipped_nodes, commit anchoring, per-gate reason) is written HERE, at the
 /// single ledger-write point, so no downstream reader can pair a bare `pass`
 /// with inferred coverage.
 #[allow(clippy::too_many_arguments)]
@@ -434,11 +484,14 @@ fn write_ledger_record(
     tree_is_dirty: bool,
     selection_mode: &str,
 ) {
-    // DAG-lane semantics: the gate (node) is the unit of execution. See the
-    // module doc comment. executed_tests = gates that ran; filtered_tests = gates
-    // skipped because a dependency failed. Both are genuine typed counts.
-    let executed_tests = result.outcomes.len();
-    let filtered_tests = result.skipped.len();
+    // DAG-lane semantics: the gate (NODE) is the unit of execution, NOT a libtest
+    // test case. See the module doc comment. These are DAG-node counts:
+    //   executed_nodes = DAG nodes (gates) that actually RAN;
+    //   skipped_nodes  = DAG nodes skipped because a dependency failed.
+    // They are deliberately NOT named executed_tests/filtered_tests, so a
+    // schema<5 consumer never mistakes a node count for a libtest test count.
+    let executed_nodes = result.outcomes.len();
+    let skipped_nodes = result.skipped.len();
     // Genuine, non-aborted failures — the honest failure count.
     let failures = result
         .outcomes
@@ -482,13 +535,23 @@ fn write_ledger_record(
         "started_at": started_at,
         "finished_at": finished_at,
         "host": host,
-        // Selection accounting — the three fields that must travel WITH the value.
-        // ALWAYS emitted with real values so a version-aware consumer never has to
-        // reject this record for a missing/zero-filled count (see doc comment).
+        // Selection accounting. These are NODE-granularity counts, deliberately
+        // NOT named executed_tests/filtered_tests: emitting node values under the
+        // libtest-count field names would let a schema<5 consumer's counts_present
+        // branch (is_clean_full_pass) read a ~47-NODE DAG run as a 47-TEST full
+        // pass. Fail-closed: no libtest-count-named field is written here. The
+        // authoritative counted+coverage receipt is minted by
+        // finalize_receipt.py --scan off the durable log; producer="validate.rs"
+        // already disambiguates this row.
         "profile": profile,
-        "executed_tests": executed_tests,
-        "filtered_tests": filtered_tests,
+        "executed_nodes": executed_nodes,
+        "skipped_nodes": skipped_nodes,
         "selection_mode": selection_mode,
+        // Self-describing partialness (Blocker 4): a single-profile Phase-1
+        // DAG-lane run is never the full multi-lane validate; a full-coverage
+        // landing receipt requires both portable and privileged lanes plus the
+        // non-DAG gates that validate.sh still owns. So this is always false here.
+        "full_coverage": false,
         // Commit anchoring.
         "commit": commit,
         "commit_anchored": commit_anchored,
@@ -496,7 +559,6 @@ fn write_ledger_record(
         // Verdict.
         "result": overall,
         "exit_code": exit_code,
-        "checks": executed_tests,
         "failures": failures,
         "real_seconds": result.wall_s,
         "gates": gates,
