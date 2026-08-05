@@ -533,41 +533,6 @@
       "test": "system-utils/uuidgen-random"
     },
     {
-      "backend": "liteinst",
-      "category": "backend-parity-c",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "backend-parity-c/pid-probe"
-    },
-    {
-      "backend": "ptrace",
-      "category": "backend-parity-c",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "backend-parity-c/pid-probe"
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/pidfd-open-self"
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/scheduler-policy-queries"
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/syscall-file-metadata"
-    },
-    {
       "backend": "ptrace",
       "category": "data-handling",
       "lane": "portable",
@@ -594,34 +559,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "language-runtimes/tcl-rand-clock"
-    },
-    {
-      "backend": "sabre",
-      "category": "backend-parity-c",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "backend-parity-c/pid-probe"
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/pidfd-open-self"
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/scheduler-policy-queries"
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/syscall-file-metadata"
     }
   ],
   "schema": 1

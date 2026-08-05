@@ -287,12 +287,9 @@ fn build_liteinst_runtime(
     profile_dir: &Path,
     resources: &Path,
 ) {
-    // The short SHA in this cache-key directory MUST track the Reverie pin so
-    // the staged runtime rebuilds when the pin moves. Keep it a prefix of the
-    // canonical Reverie rev; drift here is caught by scripts/check-reverie-pin.rs
-    // (hook + validate.sh + CI). This was stale at `d973a85` after the pin
-    // advanced to 79517704….
-    let target = build_root.join("liteinst-runtime-7951770");
+    // stage-liteinst-runtime.sh appends the canonical Reverie pin to this stable
+    // root, so cache invalidation has the same source of truth as the pin gate.
+    let target = build_root.join("liteinst-runtime");
     let runtime = profile_dir.join("libreverie_liteinst.so");
     run(
         Command::new(repository.join("scripts/stage-liteinst-runtime.sh"))

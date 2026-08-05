@@ -6,16 +6,13 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-//! Block Hermit changes whose Reverie dependency pin is inconsistent with
+//! Block Hermit testing when its Reverie dependency pin is not exactly
 //! `rrnewton/reverie:main`.
 //!
-//! This is a *consistency* check, not a *currency* check: the pin must be an
-//! ancestor of the current `main` tip (i.e. a real commit on main's history),
-//! but it does NOT have to equal the very latest tip. A pin that is merely
-//! behind main is fine and passes; only a pin that is not on main's history at
-//! all — a typo, an orphaned SHA, or an unmerged/side-branch commit — is
-//! blocked. All Reverie revisions across tracked Cargo dependency metadata must
-//! still be identical.
+//! The recorded SHA makes historical Hermit builds reproducible. It is not
+//! permission to test against an old Reverie: every testing path requires the
+//! recorded SHA to equal the live `main` tip. All Reverie revisions across
+//! tracked Cargo dependency metadata must also be identical.
 //!
 //! Scope is derived with `git ls-files`: every tracked `Cargo.toml` and
 //! `Cargo.lock` is inspected, including tracked vendored paths. Untracked or
@@ -28,12 +25,10 @@
 //! with-proxy ./scripts/check-reverie-pin.rs
 //! ```
 //!
-//! A deliberate exception (e.g. deliberately pinning an unmerged commit) must
-//! carry a substantive rationale:
+//! Repair every derived manifest and lockfile site with one command:
 //!
 //! ```text
-//! with-proxy ./scripts/check-reverie-pin.rs \
-//!   --allow-stale-reverie-pin "Depends on unmerged Reverie PR #123 for testing"
+//! with-proxy ./scripts/check-reverie-pin.rs --update-to-latest
 //! ```
 
 #[path = "lib/rust_script_prelude.rs"]
@@ -49,14 +44,13 @@ use std::process::Command;
 
 const DEFAULT_REMOTE: &str = "https://github.com/rrnewton/reverie.git";
 const MAIN_REF: &str = "refs/heads/main";
-const OVERRIDE_ENV: &str = "HERMIT_STALE_REVERIE_PIN_REASON";
-
 #[derive(Default)]
 struct Config {
     repo: Option<PathBuf>,
+    #[cfg(test)]
     remote: Option<String>,
-    main_sha: Option<String>,
-    override_reason: Option<String>,
+    print_pin: bool,
+    update_to_latest: bool,
 }
 
 #[derive(Debug)]
@@ -76,15 +70,12 @@ fn usage() -> &'static str {
      \n\
      Options:\n\
        --repo PATH                         Hermit checkout (default: git root)\n\
-       --reverie-remote URL                Reverie remote to query\n\
-       --reverie-main SHA                  Known main tip SHA (skips ls-remote; ancestry still fetched)\n\
-       --allow-stale-reverie-pin REASON    Explicit reasoned override\n\
+       --print-pin                         Print the single locally recorded pin; no network\n\
+       --update-to-latest                  Update every derived Cargo pin site to latest main\n\
        -h, --help                          Show this help\n\
      \n\
      Scope: every tracked Cargo.toml and Cargo.lock from git ls-files.\n\
-     Excludes non-Cargo files, untracked/generated files, and nested submodule contents.\n\
-     \n\
-     Environment override: HERMIT_STALE_REVERIE_PIN_REASON=\"reason\""
+     Excludes non-Cargo files, untracked/generated files, and nested submodule contents."
 }
 
 fn take_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
@@ -101,16 +92,8 @@ fn parse_args() -> Result<Config, String> {
     while i < args.len() {
         match args[i].as_str() {
             "--repo" => config.repo = Some(PathBuf::from(take_value(&args, &mut i, "--repo")?)),
-            "--reverie-remote" => {
-                config.remote = Some(take_value(&args, &mut i, "--reverie-remote")?)
-            }
-            "--reverie-main" => {
-                config.main_sha = Some(take_value(&args, &mut i, "--reverie-main")?)
-            }
-            "--allow-stale-reverie-pin" => {
-                config.override_reason =
-                    Some(take_value(&args, &mut i, "--allow-stale-reverie-pin")?)
-            }
+            "--print-pin" => config.print_pin = true,
+            "--update-to-latest" => config.update_to_latest = true,
             "-h" | "--help" => {
                 println!("{}", usage());
                 std::process::exit(0);
@@ -119,8 +102,8 @@ fn parse_args() -> Result<Config, String> {
         }
         i += 1;
     }
-    if config.override_reason.is_none() {
-        config.override_reason = env::var(OVERRIDE_ENV).ok();
+    if config.print_pin && config.update_to_latest {
+        return Err("--print-pin and --update-to-latest are mutually exclusive".to_string());
     }
     Ok(config)
 }
@@ -295,18 +278,6 @@ fn query_main(remote: &str) -> Result<String, String> {
     Ok(sha)
 }
 
-/// Relationship of the Hermit pin to the current `reverie:main` tip.
-enum PinRelation {
-    /// Pin equals the main tip.
-    Current,
-    /// Pin is an ancestor of main (behind, but on main's history). `behind` is
-    /// the commit distance when it could be computed.
-    BehindConsistent { behind: Option<u64> },
-    /// Pin is NOT reachable from main: a typo, orphaned SHA, or an
-    /// unmerged/side-branch commit.
-    Diverged,
-}
-
 fn git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
     Command::new("git")
         .arg("-C")
@@ -316,84 +287,125 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
         .map_err(|error| format!("could not run git {}: {error}", args.join(" ")))
 }
 
-/// Determine the pin's relationship to `main` using a cheap treeless
-/// (`--filter=tree:0`) fetch of main's commit graph into a scratch repo — no
-/// file contents are transferred, only the commit objects needed for an
-/// ancestry test.
-fn classify_pin(remote: &str, pin: &str, main: &str) -> Result<PinRelation, String> {
-    if pin == main {
-        return Ok(PinRelation::Current);
+fn unique_pin(scan: &PinScan) -> Result<&str, String> {
+    let pins: BTreeSet<&str> = scan
+        .occurrences
+        .iter()
+        .map(|occurrence| occurrence.rev.as_str())
+        .collect();
+    if pins.len() != 1 {
+        return Err(format!(
+            "Reverie dependency metadata contains {} distinct revisions: {}",
+            pins.len(),
+            pins.into_iter().collect::<Vec<_>>().join(", ")
+        ));
     }
-    let dir = env::temp_dir().join(format!("reverie-pin-check-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir)
-        .map_err(|error| format!("could not create scratch dir {}: {error}", dir.display()))?;
-    let result = classify_in_dir(&dir, remote, pin, main);
-    let _ = fs::remove_dir_all(&dir);
-    result
+    Ok(scan.occurrences[0].rev.as_str())
 }
 
-fn classify_in_dir(dir: &Path, remote: &str, pin: &str, main: &str) -> Result<PinRelation, String> {
-    let init = git_in(dir, &["init", "-q"])?;
-    if !init.status.success() {
-        return Err(format!(
-            "git init failed: {}",
-            String::from_utf8_lossy(&init.stderr).trim()
-        ));
+fn run_cargo_update(root: &Path, args: &[&str]) -> Result<(), String> {
+    let status = Command::new("cargo")
+        .current_dir(root)
+        .args(args)
+        .status()
+        .map_err(|error| format!("could not run cargo {}: {error}", args.join(" ")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "cargo {} failed with {status}; the manifest edits remain visible for repair",
+            args.join(" ")
+        ))
     }
-    let fetch = git_in(
-        dir,
-        &[
-            "fetch",
-            "--quiet",
-            "--filter=tree:0",
-            "--no-tags",
-            remote,
-            main,
-        ],
-    )?;
-    if !fetch.status.success() {
-        return Err(format!(
-            "git fetch {remote} {main} (commit graph) failed: {}",
-            String::from_utf8_lossy(&fetch.stderr).trim()
-        ));
+}
+
+fn rewrite_manifest_pins(scan: &PinScan, main: &str) -> Result<(usize, usize), String> {
+    let old_revisions: BTreeSet<&str> = scan
+        .occurrences
+        .iter()
+        .map(|occurrence| occurrence.rev.as_str())
+        .filter(|revision| *revision != main)
+        .collect();
+    if old_revisions.is_empty() {
+        return Ok((0, 0));
     }
-    // The pin's commit object is present iff it is reachable from main.
-    let pin_commit = format!("{pin}^{{commit}}");
-    let present = git_in(dir, &["cat-file", "-e", &pin_commit])?
-        .status
-        .success();
-    if !present {
-        return Ok(PinRelation::Diverged);
+
+    let manifest_paths: BTreeSet<&Path> = scan
+        .occurrences
+        .iter()
+        .filter(|occurrence| {
+            occurrence
+                .path
+                .file_name()
+                .is_some_and(|name| name == "Cargo.toml")
+        })
+        .map(|occurrence| occurrence.path.as_path())
+        .collect();
+    let mut changed_files = 0;
+    let mut changed_entries = 0;
+    for path in manifest_paths {
+        let original = fs::read_to_string(path)
+            .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+        let mut updated = original.clone();
+        for old in &old_revisions {
+            let occurrences = updated.matches(*old).count();
+            changed_entries += occurrences;
+            updated = updated.replace(*old, main);
+        }
+        if updated != original {
+            fs::write(path, updated)
+                .map_err(|error| format!("could not update {}: {error}", path.display()))?;
+            changed_files += 1;
+        }
     }
-    // Defensive: confirm ancestry explicitly (true whenever the object is
-    // reachable from main, but keeps the intent legible).
-    if !git_in(dir, &["merge-base", "--is-ancestor", pin, main])?
-        .status
-        .success()
+    Ok((changed_files, changed_entries))
+}
+
+fn update_to_latest(root: &Path, scan: &PinScan, main: &str) -> Result<(), String> {
+    if scan
+        .occurrences
+        .iter()
+        .all(|occurrence| occurrence.rev == main)
     {
-        return Ok(PinRelation::Diverged);
+        println!("Reverie pin is already current: {main}");
+        return Ok(());
     }
-    let behind = git_in(dir, &["rev-list", "--count", &format!("{pin}..{main}")])
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .parse::<u64>()
-                .ok()
-        });
-    Ok(PinRelation::BehindConsistent { behind })
-}
 
-fn validate_reason(reason: &str) -> Result<&str, String> {
-    let reason = reason.trim();
-    if reason.len() < 20 || reason.split_whitespace().count() < 3 {
-        return Err(
-            "override rationale must be at least 20 characters and three words".to_string(),
-        );
+    let (changed_files, changed_entries) = rewrite_manifest_pins(scan, main)?;
+
+    println!(
+        "Updated {changed_entries} manifest revision entries in {changed_files} files; resolving tracked lockfiles."
+    );
+    run_cargo_update(root, &["update", "-p", "reverie-core"])?;
+    let liteinst_manifest = root.join("liteinst-runtime-build/Cargo.toml");
+    if liteinst_manifest.is_file() {
+        let manifest = liteinst_manifest
+            .to_str()
+            .ok_or_else(|| format!("non-UTF-8 manifest path: {}", liteinst_manifest.display()))?;
+        run_cargo_update(
+            root,
+            &[
+                "update",
+                "--manifest-path",
+                manifest,
+                "-p",
+                "reverie-liteinst",
+            ],
+        )?;
     }
-    Ok(reason)
+
+    let updated = read_pins(root)?;
+    let pin = unique_pin(&updated)?;
+    if pin != main {
+        return Err(format!(
+            "update completed but derived Cargo metadata records {pin}, expected {main}"
+        ));
+    }
+    println!(
+        "Reverie pin updated to latest main {main} across {} derived revision entries.",
+        updated.occurrences.len()
+    );
+    Ok(())
 }
 
 fn loud_header(title: &str) {
@@ -402,32 +414,12 @@ fn loud_header(title: &str) {
     eprintln!("======================================================================");
 }
 
-fn accept_override(reason: Option<&str>) -> bool {
-    let Some(reason) = reason else {
-        return false;
-    };
-    let reason = match validate_reason(reason) {
-        Ok(reason) => reason,
-        Err(error) => {
-            eprintln!();
-            eprintln!("OVERRIDE REJECTED: {error}");
-            return false;
-        }
-    };
-    eprintln!();
-    eprintln!("EXPLICIT OVERRIDE ACCEPTED");
-    eprintln!("Reason: {reason}");
-    eprintln!("This exception is auditable and does not make the pin current.");
-    true
-}
-
 fn blocked_instructions() {
     eprintln!();
-    eprintln!("BLOCKED. Update the pin via docs/updating-reverie.md.");
-    eprintln!("A deliberate temporary exception requires a substantive reason:");
-    eprintln!("  {OVERRIDE_ENV}=\"why latest main cannot be used\" git commit ...");
-    eprintln!("  check-reverie-pin.rs --allow-stale-reverie-pin \"reason\"");
-    eprintln!("Preland CI reads: Stale-Reverie-Pin-Reason: <reason> from the PR body.");
+    eprintln!("BLOCKED. Testing must use the latest rrnewton/reverie:main.");
+    eprintln!("Update every derived manifest and lockfile site with:");
+    eprintln!("  with-proxy ./scripts/check-reverie-pin.rs --update-to-latest");
+    eprintln!("Policy and recovery details: docs/updating-reverie.md");
 }
 
 /// Extract the short-SHA suffix of every LiteInst runtime cache-key token on a
@@ -551,6 +543,11 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     let scan = read_pins(&root)?;
     let pins = &scan.occurrences;
 
+    if config.print_pin {
+        println!("{}", unique_pin(&scan)?);
+        return Ok(0);
+    }
+
     let tracked_manifests = scan
         .tracked_files
         .iter()
@@ -571,7 +568,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     for pin in pins {
         by_rev.entry(&pin.rev).or_default().push(pin);
     }
-    if by_rev.len() != 1 {
+    if by_rev.len() != 1 && !config.update_to_latest {
         loud_header("INCONSISTENT HERMIT REVERIE REVISIONS - BLOCKED");
         for (rev, occurrences) in by_rev {
             eprintln!("  {rev}");
@@ -586,91 +583,62 @@ fn run_with_config(config: Config) -> Result<i32, String> {
         return Ok(1);
     }
 
-    let pin = pins[0].rev.as_str();
-
-    // Bind revision-keyed LiteInst runtime cache dirs to the pin. Offline and
-    // fast, so run it before the networked ancestry check: cache-key drift
-    // fails closed without waiting on the remote.
-    let cache_code = check_liteinst_cache_keys(&root, pin)?;
-    if cache_code != 0 {
-        return Ok(cache_code);
-    }
-
+    // Production has no CLI/env/recorded-value override for the authority.
+    // Tests substitute only the remote transport, then exercise this same
+    // refs/heads/main dereference rather than injecting a well-shaped SHA.
+    #[cfg(not(test))]
+    let remote = DEFAULT_REMOTE;
+    #[cfg(test)]
     let remote = config.remote.as_deref().unwrap_or(DEFAULT_REMOTE);
-    let main_result = match config.main_sha {
-        Some(sha) if is_full_sha(&sha) => Ok(sha),
-        Some(sha) => Err(format!(
-            "--reverie-main must be 40 hex characters, got {sha:?}"
-        )),
-        None => query_main(remote),
-    };
+    let main_result = query_main(remote);
 
     let main = match main_result {
         Ok(main) => main,
         Err(error) => {
             loud_header("COULD NOT VERIFY LATEST REVERIE MAIN - BLOCKED");
-            eprintln!("Hermit pin: {pin}");
-            eprintln!("Lookup error: {error}");
-            if accept_override(config.override_reason.as_deref()) {
-                return Ok(0);
+            if let Ok(pin) = unique_pin(&scan) {
+                eprintln!("Hermit pin: {pin}");
             }
+            eprintln!("Lookup error: {error}");
             blocked_instructions();
             return Ok(1);
         }
     };
+
+    if config.update_to_latest {
+        update_to_latest(&root, &scan, &main)?;
+        let updated = read_pins(&root)?;
+        let updated_pin = unique_pin(&updated)?;
+        let cache_code = check_liteinst_cache_keys(&root, updated_pin)?;
+        if cache_code != 0 {
+            return Ok(cache_code);
+        }
+        return Ok(0);
+    }
+
+    let pin = unique_pin(&scan)?;
+    let cache_code = check_liteinst_cache_keys(&root, pin)?;
+    if cache_code != 0 {
+        return Ok(cache_code);
+    }
 
     let entries = pins.len();
     let pin_files = pinned_file_count.len();
 
-    let relation = match classify_pin(remote, pin, &main) {
-        Ok(relation) => relation,
-        Err(error) => {
-            loud_header("COULD NOT VERIFY REVERIE MAIN RELATIONSHIP - BLOCKED");
-            eprintln!("Hermit pin: {pin}");
-            eprintln!("Latest main: {main}");
-            eprintln!("Lookup error: {error}");
-            if accept_override(config.override_reason.as_deref()) {
-                return Ok(0);
-            }
-            blocked_instructions();
-            return Ok(1);
-        }
-    };
-
-    match relation {
-        PinRelation::Current => {
-            println!(
-                "Reverie pin is current: {pin} ({entries} revision entries across {pin_files} tracked Cargo metadata files)"
-            );
-            Ok(0)
-        }
-        PinRelation::BehindConsistent { behind } => {
-            let distance = match behind {
-                Some(1) => "1 commit behind".to_string(),
-                Some(n) => format!("{n} commits behind"),
-                None => "behind".to_string(),
-            };
-            println!(
-                "Reverie pin is consistent: {pin} is an ancestor of reverie main ({entries} revision entries across {pin_files} tracked Cargo metadata files)."
-            );
-            println!("Latest main: {main} ({distance}). A bump is optional, not required.");
-            Ok(0)
-        }
-        PinRelation::Diverged => {
-            loud_header("REVERIE PIN NOT ON MAIN HISTORY - BLOCKED");
-            eprintln!("Hermit pin:         {pin}");
-            eprintln!("Latest main:        {main}");
-            eprintln!("Remote:             {remote}");
-            eprintln!("Affected Cargo metadata files: {pin_files}");
-            eprintln!("The pinned commit is NOT an ancestor of reverie main.");
-            eprintln!("It may be a typo, an orphaned SHA, or an unmerged/side-branch commit.");
-            eprintln!("Compare: https://github.com/rrnewton/reverie/compare/{pin}...{main}");
-            if accept_override(config.override_reason.as_deref()) {
-                return Ok(0);
-            }
-            blocked_instructions();
-            Ok(1)
-        }
+    if pin == main {
+        println!(
+            "Reverie pin is current: {pin} ({entries} revision entries across {pin_files} tracked Cargo metadata files)"
+        );
+        Ok(0)
+    } else {
+        loud_header("REVERIE PIN DOES NOT EQUAL LATEST MAIN - BLOCKED");
+        eprintln!("Hermit pin:  {pin}");
+        eprintln!("Latest main: {main}");
+        eprintln!(
+            "Affected metadata: {entries} revision entries across {pin_files} tracked Cargo files."
+        );
+        blocked_instructions();
+        Ok(1)
     }
 }
 
@@ -707,12 +675,6 @@ mod tests {
     }
 
     #[test]
-    fn override_requires_substantive_reason() {
-        assert!(validate_reason("temporary").is_err());
-        assert!(validate_reason("Waiting for Reverie PR #123 to merge first").is_ok());
-    }
-
-    #[test]
     fn validates_full_sha() {
         assert!(is_full_sha("0123456789abcdef0123456789abcdef01234567"));
         assert!(!is_full_sha("01234567"));
@@ -735,19 +697,217 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tracked_stale_lockfile_fails_the_checker_path() {
+    fn temp_path(label: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before epoch")
             .as_nanos();
-        let root = env::temp_dir().join(format!(
-            "check-reverie-pin-test-{}-{nonce}",
+        env::temp_dir().join(format!(
+            "check-reverie-pin-{label}-{}-{nonce}",
             std::process::id()
-        ));
+        ))
+    }
+
+    fn init_fixture_repo(root: &Path) {
+        fs::create_dir_all(root).expect("create fixture repository");
+        assert!(git_in(root, &["init", "-q"]).unwrap().status.success());
+        assert!(
+            git_in(root, &["config", "user.email", "pin-test@example.com"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            git_in(root, &["config", "user.name", "Reverie Pin Test"])
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+
+    #[test]
+    fn exact_latest_pin_passes() {
+        let root = temp_path("current");
+        let remote = temp_path("current-reverie");
+        init_fixture_repo(&root);
+        init_fixture_repo(&remote);
+        fs::write(remote.join("revision"), "current\n").expect("write Reverie fixture");
+        assert!(
+            git_in(&remote, &["add", "revision"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            git_in(&remote, &["commit", "-qm", "current"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            git_in(&remote, &["branch", "-M", "main"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let current =
+            String::from_utf8_lossy(&git_in(&remote, &["rev-parse", "HEAD"]).unwrap().stdout)
+                .trim()
+                .to_string();
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{current}\" }}\n"
+            ),
+        )
+        .expect("write fixture manifest");
+        assert!(
+            git_in(&root, &["add", "Cargo.toml"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let code = run_with_config(Config {
+            repo: Some(root.clone()),
+            remote: Some(remote.to_string_lossy().into_owned()),
+            ..Config::default()
+        })
+        .expect("current pin should be classified");
+        assert_eq!(code, 0, "an exact latest-main pin must pass");
+        fs::remove_dir_all(root).expect("remove fixture repository");
+        fs::remove_dir_all(remote).expect("remove Reverie fixture repository");
+    }
+
+    #[test]
+    fn ancestor_behind_latest_fails() {
+        let root = temp_path("behind-hermit");
+        let remote = temp_path("behind-reverie");
+        init_fixture_repo(&root);
+        init_fixture_repo(&remote);
+
+        fs::write(remote.join("revision"), "old\n").expect("write old Reverie fixture");
+        assert!(
+            git_in(&remote, &["add", "revision"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            git_in(&remote, &["commit", "-qm", "old"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let old = String::from_utf8_lossy(&git_in(&remote, &["rev-parse", "HEAD"]).unwrap().stdout)
+            .trim()
+            .to_string();
+        fs::write(remote.join("revision"), "latest\n").expect("write latest Reverie fixture");
+        assert!(
+            git_in(&remote, &["add", "revision"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            git_in(&remote, &["commit", "-qm", "latest"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let latest =
+            String::from_utf8_lossy(&git_in(&remote, &["rev-parse", "HEAD"]).unwrap().stdout)
+                .trim()
+                .to_string();
+        assert_ne!(old, latest);
+        assert!(
+            git_in(&remote, &["branch", "-M", "main"])
+                .unwrap()
+                .status
+                .success()
+        );
+
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{old}\" }}\n"
+            ),
+        )
+        .expect("write stale Hermit fixture");
+        assert!(
+            git_in(&root, &["add", "Cargo.toml"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let code = run_with_config(Config {
+            repo: Some(root.clone()),
+            remote: Some(remote.to_string_lossy().into_owned()),
+            ..Config::default()
+        })
+        .expect("behind pin should be classified");
+        assert_eq!(code, 1, "an ancestor behind latest main must fail closed");
+
+        fs::remove_dir_all(root).expect("remove Hermit fixture repository");
+        fs::remove_dir_all(remote).expect("remove Reverie fixture repository");
+    }
+
+    #[test]
+    fn mechanical_update_rewrites_derived_manifest_sites() {
+        let root = temp_path("update");
+        init_fixture_repo(&root);
+        let old = "0123456789abcdef0123456789abcdef01234567";
+        let latest = "89abcdef0123456789abcdef0123456789abcdef";
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{old}\" }}\n"
+            ),
+        )
+        .expect("write stale fixture manifest");
+        assert!(
+            git_in(&root, &["add", "Cargo.toml"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let scan = read_pins(&root).expect("scan fixture manifest");
+        assert_eq!(rewrite_manifest_pins(&scan, latest).unwrap(), (1, 1));
+        let updated = read_pins(&root).expect("rescan updated fixture manifest");
+        assert_eq!(unique_pin(&updated).unwrap(), latest);
+        fs::remove_dir_all(root).expect("remove fixture repository");
+    }
+
+    #[test]
+    fn tracked_stale_lockfile_fails_the_checker_path() {
+        let root = temp_path("stale-lock");
+        let remote = temp_path("stale-lock-reverie");
         let runtime = root.join("runtime");
+        init_fixture_repo(&root);
+        init_fixture_repo(&remote);
         fs::create_dir_all(&runtime).expect("create fixture directories");
-        let current = "0123456789abcdef0123456789abcdef01234567";
+        fs::write(remote.join("revision"), "current\n").expect("write Reverie fixture");
+        assert!(
+            git_in(&remote, &["add", "revision"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            git_in(&remote, &["commit", "-qm", "current"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            git_in(&remote, &["branch", "-M", "main"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let current =
+            String::from_utf8_lossy(&git_in(&remote, &["rev-parse", "HEAD"]).unwrap().stdout)
+                .trim()
+                .to_string();
         let stale = "89abcdef0123456789abcdef0123456789abcdef";
         fs::write(
             root.join("Cargo.toml"),
@@ -763,7 +923,6 @@ mod tests {
             ),
         )
         .expect("write planted stale lockfile");
-        assert!(git_in(&root, &["init", "-q"]).unwrap().status.success());
         assert!(
             git_in(&root, &["add", "Cargo.toml", "runtime/Cargo.lock"])
                 .unwrap()
@@ -780,13 +939,14 @@ mod tests {
         );
         let code = run_with_config(Config {
             repo: Some(root.clone()),
-            main_sha: Some(current.to_string()),
+            remote: Some(remote.to_string_lossy().into_owned()),
             ..Config::default()
         })
         .expect("checker should classify the planted inconsistency");
         assert_eq!(code, 1, "a tracked stale Cargo.lock must fail closed");
 
         fs::remove_dir_all(root).expect("remove fixture repository");
+        fs::remove_dir_all(remote).expect("remove Reverie fixture repository");
     }
 
     #[test]

@@ -7,13 +7,15 @@
 set -euo pipefail
 
 if (( $# != 3 )); then
-    echo "Usage: $0 <cargo-profile> <stable-runtime-path> <runtime-target-dir>" >&2
+    echo "Usage: $0 <cargo-profile> <stable-runtime-path> <runtime-target-root>" >&2
     exit 2
 fi
 
+root_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 liteinst_profile=$1
 liteinst_stable_input=$2
-liteinst_target_dir=$(realpath -m -- "$3")
+reverie_pin=$("$root_dir/scripts/check-reverie-pin.rs" --print-pin)
+liteinst_target_dir=$(realpath -m -- "$3-${reverie_pin:0:8}")
 liteinst_stage_dir=$(dirname -- "$liteinst_stable_input")
 liteinst_stage_name=$(basename -- "$liteinst_stable_input")
 

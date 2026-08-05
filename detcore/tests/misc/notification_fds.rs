@@ -10,7 +10,6 @@ use std::ffi::CStr;
 use std::ffi::CString;
 use std::mem::MaybeUninit;
 use std::ptr;
-use std::thread;
 
 use detcore::Config;
 use detcore::Detcore;
@@ -20,10 +19,6 @@ const RUNS: usize = 5;
 const MAX_ATTEMPTS: usize = 100_000;
 
 fn run_five_times(guest: fn()) {
-    run_five_times_with_expected_stdout_prefix(guest, None);
-}
-
-fn run_five_times_with_expected_stdout_prefix(guest: fn(), required_prefix: Option<&[u8]>) {
     let config = Config {
         sequentialize_threads: true,
         max_timeslice: None,
@@ -31,12 +26,7 @@ fn run_five_times_with_expected_stdout_prefix(guest: fn(), required_prefix: Opti
     };
     let mut expected = None;
 
-    // The first `test_fn_with_config` invocation initializes process-global
-    // runner state. Validate its readiness result, but compare timestamps only
-    // across the following independently executed guests, which all start from
-    // the same initialized harness state.
-    let first_run = usize::from(required_prefix.is_none());
-    for run in first_run..=RUNS {
+    for run in 1..=RUNS {
         let (output, _state) =
             detcore_testutils::test_fn_with_config::<Detcore, _>(guest, config.clone(), true)
                 .unwrap_or_else(|error| panic!("notification guest run {run} failed: {error:#}"));
@@ -50,22 +40,6 @@ fn run_five_times_with_expected_stdout_prefix(guest: fn(), required_prefix: Opti
             "guest run {run} wrote stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        if let Some(required_prefix) = required_prefix {
-            assert!(
-                output.stdout.starts_with(required_prefix),
-                "notification guest run {run} observed the wrong readiness"
-            );
-            let timestamp = std::str::from_utf8(&output.stdout[required_prefix.len()..])
-                .expect("virtual timestamp should be UTF-8")
-                .trim()
-                .parse::<u128>()
-                .expect("virtual timestamp should be an integer nanosecond value");
-            assert!(timestamp > 0, "virtual timestamp should be positive");
-        }
-
-        if run == 0 {
-            continue;
-        }
 
         if let Some(expected) = &expected {
             assert_eq!(
@@ -75,13 +49,6 @@ fn run_five_times_with_expected_stdout_prefix(guest: fn(), required_prefix: Opti
         } else {
             expected = Some(output.stdout);
         }
-    }
-
-    if required_prefix.is_some() {
-        println!(
-            "stable guest output across {RUNS} runs: {}",
-            String::from_utf8_lossy(expected.as_deref().expect("at least one guest run"))
-        );
     }
 }
 
@@ -332,103 +299,6 @@ fn mixed_epoll_guest() {
     clean_directory(&directory, &files);
 }
 
-#[derive(Clone, Copy)]
-enum TimerWaitApi {
-    Poll,
-    Epoll,
-}
-
-fn cross_thread_virtual_timer_guest(api: TimerWaitApi) {
-    let timer = unsafe {
-        libc::timerfd_create(
-            libc::CLOCK_MONOTONIC,
-            libc::TFD_CLOEXEC | libc::TFD_NONBLOCK,
-        )
-    };
-    assert!(timer >= 0, "timerfd_create failed: {}", errno());
-    let epfd = match api {
-        TimerWaitApi::Poll => -1,
-        TimerWaitApi::Epoll => {
-            let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-            assert!(epfd >= 0, "epoll_create1 failed: {}", errno());
-            epoll_add(epfd, timer, 1);
-            epfd
-        }
-    };
-
-    let value = libc::itimerspec {
-        it_interval: libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        },
-        it_value: libc::timespec {
-            tv_sec: 1,
-            tv_nsec: 0,
-        },
-    };
-    assert_eq!(
-        unsafe { libc::timerfd_settime(timer, 0, &value, ptr::null_mut()) },
-        0,
-        "timerfd_settime failed: {}",
-        errno()
-    );
-
-    // Advance virtual time past the timer deadline without waiting
-    // one host second. Host-backed readiness therefore remains false when the
-    // parent checks the cross-thread arming state.
-    let duration = libc::timespec {
-        tv_sec: 2,
-        tv_nsec: 0,
-    };
-    assert_eq!(unsafe { libc::nanosleep(&duration, ptr::null_mut()) }, 0);
-
-    let observed = thread::spawn(move || {
-        let readiness = match api {
-            TimerWaitApi::Poll => {
-                let mut fds = [libc::pollfd {
-                    fd: timer,
-                    events: libc::POLLIN,
-                    revents: 0,
-                }];
-                let count = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, 0) };
-                format!("poll={count}:{}", fds[0].revents & libc::POLLIN)
-            }
-            TimerWaitApi::Epoll => {
-                let mut events = [libc::epoll_event { events: 0, u64: 0 }; 1];
-                let count = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1, 0) };
-                let data = unsafe { ptr::addr_of!(events[0].u64).read_unaligned() };
-                let ready = unsafe { ptr::addr_of!(events[0].events).read_unaligned() };
-                format!("epoll={count}:{data}:{}", ready & libc::EPOLLIN as u32)
-            }
-        };
-        let mut observed_at = MaybeUninit::<libc::timespec>::uninit();
-        assert_eq!(
-            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, observed_at.as_mut_ptr()) },
-            0
-        );
-        let observed_at = unsafe { observed_at.assume_init() };
-        let observed_at_ns =
-            (observed_at.tv_sec as u128) * 1_000_000_000 + observed_at.tv_nsec as u128;
-        format!("{readiness} time={observed_at_ns}")
-    })
-    .join()
-    .expect("cross-thread virtual timer waiter failed");
-    println!("{observed}");
-
-    if epfd >= 0 {
-        close(epfd);
-    }
-    close(timer);
-}
-
-fn cross_thread_poll_timer_guest() {
-    cross_thread_virtual_timer_guest(TimerWaitApi::Poll);
-}
-
-fn cross_thread_epoll_timer_guest() {
-    cross_thread_virtual_timer_guest(TimerWaitApi::Epoll);
-}
-
 fn errno() -> libc::c_int {
     unsafe { *libc::__errno_location() }
 }
@@ -451,20 +321,4 @@ fn inotify_order_is_deterministic() {
 #[test]
 fn mixed_epoll_sources_are_deterministic() {
     run_five_times(mixed_epoll_guest);
-}
-
-#[test]
-fn poll_timerfd_readiness_uses_virtual_time_across_threads() {
-    run_five_times_with_expected_stdout_prefix(
-        cross_thread_poll_timer_guest,
-        Some(b"poll=1:1 time="),
-    );
-}
-
-#[test]
-fn epoll_timerfd_readiness_uses_virtual_time_across_threads() {
-    run_five_times_with_expected_stdout_prefix(
-        cross_thread_epoll_timer_guest,
-        Some(b"epoll=1:1:1 time="),
-    );
 }

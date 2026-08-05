@@ -455,6 +455,24 @@ def _commit_tree(
     )
 
 
+def _assert_lossless_replay(
+    repo: Path,
+    source_base: str,
+    source_tree: str,
+    code_patch: bytes,
+    test_patch: bytes,
+) -> str:
+    replayed_tree = _tree_after_patches(
+        repo, source_base, (code_patch, test_patch), three_way=False
+    )
+    if replayed_tree != source_tree:
+        raise SplitError(
+            "losslessness check failed: code + test patches do not reproduce "
+            f"source tree ({replayed_tree} != {source_tree})"
+        )
+    return replayed_tree
+
+
 def build_split_objects(
     repo: Path,
     pr: PullRequest,
@@ -468,15 +486,10 @@ def build_split_objects(
     test_patch = _path_patch(
         repo, source_base, pr.head_oid, (c.path for c in partition.tests)
     )
-    replayed_tree = _tree_after_patches(
-        repo, source_base, (code_patch, test_patch), three_way=False
-    )
     source_tree = _git_text(repo, "rev-parse", f"{pr.head_oid}^{{tree}}")
-    if replayed_tree != source_tree:
-        raise SplitError(
-            "losslessness check failed: code + test patches do not reproduce "
-            f"source tree ({replayed_tree} != {source_tree})"
-        )
+    replayed_tree = _assert_lossless_replay(
+        repo, source_base, source_tree, code_patch, test_patch
+    )
 
     authors = _authors(repo, source_base, pr.head_oid)
     primary = authors[0]
@@ -858,6 +871,31 @@ def self_test() -> int:
         )
         objects = build_split_objects(repo, fake_pr, base, base, partition)
         assert objects.source_tree == objects.replayed_tree
+
+        # Corrupt an otherwise applicable generated patch and exercise the same
+        # consumer used by build_split_objects. The patch still applies, but its
+        # replay tree must be refused because it no longer reproduces the source.
+        code_patch = _path_patch(
+            repo, base, head, (change.path for change in partition.code)
+        )
+        test_patch = _path_patch(
+            repo, base, head, (change.path for change in partition.tests)
+        )
+        corrupt_code_patch = code_patch.replace(b"{ 2 }", b"{ 3 }", 1)
+        assert corrupt_code_patch != code_patch
+        try:
+            _assert_lossless_replay(
+                repo,
+                base,
+                objects.source_tree,
+                corrupt_code_patch,
+                test_patch,
+            )
+        except SplitError as error:
+            assert "losslessness check failed" in str(error)
+        else:
+            raise AssertionError("corrupt generated patch passed losslessness check")
+
         assert set(
             _git_text(
                 repo, "diff", "--name-only", base, objects.code_commit

@@ -1,936 +1,482 @@
 {
-  "default_step_timeout": 600,
+  "resource_caps": {"hermit_guest": 1, "manifest_guest": 4},
   "mem_cap_factor": 1.25,
   "mem_cap_floor_bytes": 8589934592,
   "outer_mem_safety_factor": 1.0,
-  "resource_caps": {
-    "hermit_guest": 1,
-    "manifest_guest": 4
-  },
+  "default_step_timeout": 600,
   "steps": [
     {
-      "group": "check",
-      "job": "backend_abstraction",
-      "desc": "Detcore backend-abstraction check",
-      "cmd": "./scripts/check-detcore-backend-abstraction.sh",
+      "group": "check", "job": "reverie_pin",
+      "desc": "Require Hermit's recorded Reverie revision to equal latest rrnewton/reverie:main",
+      "cmd": "./scripts/check-reverie-pin.rs",
       "timeout": 120,
-      "hint": {
-        "est_duration_s": 20,
-        "rss_baseline_bytes": 268435456,
-        "hard_mem_max_bytes": 1073741824,
-        "classification": "light"
-      }
+      "hint": {"est_duration_s": 5, "rss_baseline_bytes": 67108864,
+               "hard_mem_max_bytes": 536870912, "classification": "light"}
     },
     {
-      "group": "check",
-      "job": "portability_paths",
-      "desc": "Reject developer-specific paths in build/run files",
-      "cmd": "./scripts/check-portable-paths.sh",
-      "timeout": 60,
-      "hint": {
-        "est_duration_s": 2,
-        "rss_baseline_bytes": 67108864,
-        "hard_mem_max_bytes": 536870912,
-        "classification": "light"
-      }
-    },
-    {
-      "group": "check",
-      "job": "script_sigpipe",
-      "desc": "Standalone scripts exit cleanly on downstream SIGPIPE (prog | head)",
-      "cmd": "./scripts/check-script-sigpipe.sh",
-      "timeout": 60,
-      "hint": {
-        "est_duration_s": 3,
-        "rss_baseline_bytes": 67108864,
-        "hard_mem_max_bytes": 536870912,
-        "classification": "light"
-      }
-    },
-    {
-      "group": "setup",
-      "job": "nextest",
-      "desc": "cargo-nextest available",
-      "cmd": "cargo nextest show-config version >/dev/null 2>&1 || if command -v with-proxy >/dev/null 2>&1; then with-proxy cargo install cargo-nextest --locked --version 0.9.100; else cargo install cargo-nextest --locked --version 0.9.100; fi",
-      "timeout": 600,
-      "hint": {
-        "est_duration_s": 30,
-        "rss_baseline_bytes": 536870912,
-        "hard_mem_max_bytes": 2147483648,
-        "classification": "light"
-      }
-    },
-    {
-      "group": "build",
-      "job": "workspace",
-      "desc": "Build all debug workspace targets in one Cargo invocation",
-      "description": "ONE-FAT-BUILD 2026-08-04 (task collapse-separate-build-nodes-into-one-fat-cargo-invocation): one cargo build owns the complete debug workspace graph, including test targets and the flaky harness. This removes the redundant flaky-harness build node. preferred_inner_jobs=32 is measured on a cold empty target at hermit@846baeca: 130.35s, cgroup-recorded peak=11663998976 bytes. The generous 64GiB cap deliberately prioritizes throughput over cap tightness. Release artifacts remain a separate profile because Cargo cannot emit dev and release profiles in one invocation; the privileged lane is a separate DAG and is unchanged.",
-      "cmd": "cargo build --all-targets",
-      "deps": [
-        "e2e.metadata"
-      ],
-      "timeout": 1200,
-      "jobs_flag": "",
-      "hint": {
-        "est_duration_s": 130,
-        "rss_baseline_bytes": 11663998976,
-        "hard_mem_max_bytes": 68719476736,
-        "classification": "cpu-bound",
-        "preferred_inner_jobs": 32
-      }
-    },
-    {
-      "group": "build",
-      "job": "runtime_release",
-      "desc": "Build release Hermit and all runtime backend artifacts in one Cargo invocation",
-      "description": "ONE-FAT-BUILD 2026-08-04: this is the dependency-driven exception to the debug fat build. DBI, SaBRe, and LiteInst tests require target/release/hermit and release plugins, while ordinary tests consume debug targets. One release Cargo invocation now sees hermit, detcore-dbi, detcore-sabre, and hermit-install together; the former serial dbi_release+sabre_release invocations are gone. preferred_inner_jobs=32 is measured on a cold empty target at hermit@846baeca: 185.423s, cgroup-recorded peak=9006452736 bytes. The copied binary lets the strict-compat DAG node use validate.sh's existing explicit-prebuilt contract rather than rebuilding the same release profile.",
-      "cmd": "HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-runtime cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbi -p detcore-sabre -p hermit-install && mkdir -p target/ci && install -m 755 target/release/hermit target/ci/hermit-strict && sha256sum target/install_pkg/rsrcs/sabre && cat target/install_pkg/rsrcs/sabre.revision",
-      "deps": [
-        "e2e.metadata"
-      ],
-      "timeout": 1200,
-      "jobs_flag": "",
-      "hint": {
-        "est_duration_s": 185,
-        "rss_baseline_bytes": 9006452736,
-        "hard_mem_max_bytes": 68719476736,
-        "classification": "cpu-bound",
-        "preferred_inner_jobs": 32
-      }
-    },
-    {
-      "group": "build",
-      "job": "liteinst_runtime_release",
-      "desc": "Build and stage the release LiteInst runtime",
-      "cmd": "./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build-7951770",
-      "deps": [
-        "build.runtime_release"
-      ],
-      "timeout": 900,
-      "hint": {
-        "est_duration_s": 120,
-        "rss_baseline_bytes": 8589934592,
-        "hard_mem_max_bytes": 17179869184,
-        "classification": "cpu-bound"
-      }
-    },
-    {
-      "group": "e2e",
-      "job": "metadata",
-      "desc": "Validate E2E metadata, generated test footprints, and required-cell plan",
-      "cmd": "./ci/test_harness.sh validate",
-      "timeout": 60,
-      "hint": {
-        "est_duration_s": 5,
-        "rss_baseline_bytes": 268435456,
-        "hard_mem_max_bytes": 1073741824,
-        "classification": "light"
-      }
-    },
-    {
-      "group": "build",
-      "job": "manifest_guests",
-      "desc": "Prepare every CI-enabled portable manifest guest",
-      "cmd": "./ci/test_harness.sh build --lane portable --ci-only --allow-empty",
-      "deps": [
-        "e2e.metadata"
-      ],
-      "timeout": 600,
-      "hint": {
-        "est_duration_s": 90,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
-        "classification": "cpu-bound"
-      }
-    },
-    {
-      "group": "e2e",
-      "job": "manifest_applications",
-      "desc": "Portable manifest bucket: applications",
-      "manifest": {
-        "lane": "portable",
-        "category": "applications"
-      },
-      "cmd": "./ci/test_harness.sh run --lane portable --category applications --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/applications/results.jsonl --junit ignored/e2e/portable/applications/junit.xml",
-      "deps": [
-        "build.workspace",
-        "build.manifest_guests",
-        "build.runtime_release",
-        "e2e.metadata"
-      ],
-      "timeout": 600,
-      "hint": {
-        "resources": {
-          "manifest_guest": 1
-        },
-        "est_duration_s": 120,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "e2e",
-      "job": "manifest_backend_parity_c",
-      "desc": "Portable manifest bucket: backend-parity-c",
-      "manifest": {
-        "lane": "portable",
-        "category": "backend-parity-c"
-      },
-      "cmd": "./ci/test_harness.sh run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/backend-parity-c/results.jsonl --junit ignored/e2e/portable/backend-parity-c/junit.xml",
-      "deps": [
-        "build.third_party",
-        "build.manifest_guests",
-        "e2e.metadata"
-      ],
-      "timeout": 600,
-      "hint": {
-        "resources": {
-          "manifest_guest": 1
-        },
-        "est_duration_s": 5,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "e2e",
-      "job": "manifest_bin_c",
-      "desc": "Portable manifest bucket: bin-c",
-      "manifest": {
-        "lane": "portable",
-        "category": "bin-c"
-      },
-      "cmd": "./ci/test_harness.sh run --lane portable --category bin-c --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/bin-c/results.jsonl --junit ignored/e2e/portable/bin-c/junit.xml",
-      "deps": [
-        "build.workspace",
-        "build.manifest_guests",
-        "e2e.metadata"
-      ],
-      "timeout": 600,
-      "hint": {
-        "resources": {
-          "manifest_guest": 1
-        },
-        "est_duration_s": 5,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "e2e",
-      "job": "manifest_c_programs",
-      "desc": "Portable manifest bucket: c-programs",
-      "manifest": {
-        "lane": "portable",
-        "category": "c-programs"
-      },
-      "cmd": "./ci/test_harness.sh run --lane portable --category c-programs --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/c-programs/results.jsonl --junit ignored/e2e/portable/c-programs/junit.xml",
-      "deps": [
-        "build.workspace",
-        "build.manifest_guests",
-        "build.runtime_release",
-        "e2e.metadata"
-      ],
-      "timeout": 600,
-      "hint": {
-        "resources": {
-          "manifest_guest": 1
-        },
-        "est_duration_s": 5,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "e2e",
-      "job": "manifest_chaos_c",
-      "desc": "Portable manifest bucket: chaos-c",
-      "manifest": {
-        "lane": "portable",
-        "category": "chaos-c"
-      },
-      "cmd": "./ci/test_harness.sh run --lane portable --category chaos-c --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/chaos-c/results.jsonl --junit ignored/e2e/portable/chaos-c/junit.xml",
-      "deps": [
-        "build.workspace",
-        "build.manifest_guests",
-        "e2e.metadata"
-      ],
-      "timeout": 600,
-      "hint": {
-        "resources": {
-          "manifest_guest": 1
-        },
-        "est_duration_s": 5,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "e2e",
-      "job": "manifest_data_handling",
-      "desc": "Portable manifest bucket: data-handling",
-      "manifest": {
-        "lane": "portable",
-        "category": "data-handling"
-      },
-      "cmd": "./ci/test_harness.sh run --lane portable --category data-handling --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/data-handling/results.jsonl --junit ignored/e2e/portable/data-handling/junit.xml",
-      "deps": [
-        "build.workspace",
-        "build.manifest_guests",
-        "build.runtime_release",
-        "e2e.metadata"
-      ],
-      "timeout": 600,
-      "hint": {
-        "resources": {
-          "manifest_guest": 1
-        },
-        "est_duration_s": 90,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "e2e",
-      "job": "manifest_debugger_c",
-      "desc": "Portable manifest bucket: debugger-c",
-      "manifest": {
-        "lane": "portable",
-        "category": "debugger-c"
-      },
-      "cmd": "./ci/test_harness.sh run --lane portable --category debugger-c --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/debugger-c/results.jsonl --junit ignored/e2e/portable/debugger-c/junit.xml",
-      "deps": [
-        "build.workspace",
-        "build.manifest_guests",
-        "e2e.metadata"
-      ],
-      "timeout": 600,
-      "hint": {
-        "resources": {
-          "manifest_guest": 1
-        },
-        "est_duration_s": 5,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "e2e",
-      "job": "manifest_determinism_stress_c",
-      "desc": "Portable manifest bucket: determinism-stress-c",
-      "manifest": {
-        "lane": "portable",
-        "category": "determinism-stress-c"
-      },
-      "cmd": "./ci/test_harness.sh run --lane portable --category determinism-stress-c --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/determinism-stress-c/results.jsonl --junit ignored/e2e/portable/determinism-stress-c/junit.xml",
-      "deps": [
-        "build.workspace",
-        "build.manifest_guests",
-        "e2e.metadata"
-      ],
-      "timeout": 600,
-      "hint": {
-        "resources": {
-          "manifest_guest": 1
-        },
-        "est_duration_s": 5,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "e2e",
-      "job": "manifest_determinism_stress",
-      "desc": "Portable manifest bucket: determinism-stress",
-      "manifest": {
-        "lane": "portable",
-        "category": "determinism-stress"
-      },
-      "cmd": "./ci/test_harness.sh run --lane portable --category determinism-stress --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/determinism-stress/results.jsonl --junit ignored/e2e/portable/determinism-stress/junit.xml",
-      "deps": [
-        "build.workspace",
-        "build.manifest_guests",
-        "e2e.metadata"
-      ],
-      "timeout": 600,
-      "hint": {
-        "resources": {
-          "manifest_guest": 1
-        },
-        "est_duration_s": 150,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "e2e",
-      "job": "manifest_language_runtimes",
-      "desc": "Portable manifest bucket: language-runtimes",
-      "manifest": {
-        "lane": "portable",
-        "category": "language-runtimes"
-      },
-      "cmd": "./ci/test_harness.sh run --lane portable --category language-runtimes --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/language-runtimes/results.jsonl --junit ignored/e2e/portable/language-runtimes/junit.xml",
-      "deps": [
-        "build.workspace",
-        "build.manifest_guests",
-        "e2e.metadata"
-      ],
-      "timeout": 600,
-      "hint": {
-        "resources": {
-          "manifest_guest": 1
-        },
-        "est_duration_s": 120,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "e2e",
-      "job": "manifest_shared_futex_c",
-      "desc": "Portable manifest bucket: shared-futex-c",
-      "manifest": {
-        "lane": "portable",
-        "category": "shared-futex-c"
-      },
-      "cmd": "./ci/test_harness.sh run --lane portable --category shared-futex-c --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/shared-futex-c/results.jsonl --junit ignored/e2e/portable/shared-futex-c/junit.xml",
-      "deps": [
-        "build.workspace",
-        "build.manifest_guests",
-        "e2e.metadata"
-      ],
-      "timeout": 600,
-      "hint": {
-        "resources": {
-          "manifest_guest": 1
-        },
-        "est_duration_s": 5,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "e2e",
-      "job": "manifest_system_utils",
-      "desc": "Portable manifest bucket: system-utils",
-      "manifest": {
-        "lane": "portable",
-        "category": "system-utils"
-      },
-      "cmd": "./ci/test_harness.sh run --lane portable --category system-utils --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/system-utils/results.jsonl --junit ignored/e2e/portable/system-utils/junit.xml",
-      "deps": [
-        "build.workspace",
-        "build.manifest_guests",
-        "build.runtime_release",
-        "e2e.metadata"
-      ],
-      "timeout": 600,
-      "hint": {
-        "resources": {
-          "manifest_guest": 1
-        },
-        "est_duration_s": 120,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "e2e",
-      "job": "manifest_util_c",
-      "desc": "Portable manifest bucket: util-c",
-      "manifest": {
-        "lane": "portable",
-        "category": "util-c"
-      },
-      "cmd": "./ci/test_harness.sh run --lane portable --category util-c --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/util-c/results.jsonl --junit ignored/e2e/portable/util-c/junit.xml",
-      "deps": [
-        "build.workspace",
-        "build.manifest_guests",
-        "e2e.metadata"
-      ],
-      "timeout": 600,
-      "hint": {
-        "resources": {
-          "manifest_guest": 1
-        },
-        "est_duration_s": 5,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "test",
-      "job": "applications_e2e",
-      "desc": "Run application end-to-end strict verification",
-      "cmd": "./tests/e2e/lib/applications/run_all.sh",
-      "deps": [
-        "build.workspace"
-      ],
-      "timeout": 300,
-      "hint": {
-        "resources": {
-          "hermit_guest": 1
-        },
-        "est_duration_s": 30,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "lint",
-      "job": "rustfmt",
-      "desc": "Rustfmt (cargo fmt --all -- --check)",
-      "cmd": "cargo fmt --all -- --check",
-      "timeout": 120,
-      "hint": {
-        "est_duration_s": 20,
-        "rss_baseline_bytes": 268435456,
-        "hard_mem_max_bytes": 1073741824,
-        "classification": "light"
-      }
-    },
-    {
-      "group": "lint",
-      "job": "clippy",
-      "desc": "Clippy (cargo clippy --workspace --all-targets -D warnings)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> clippy's build phase defaulted to nproc). rss_baseline=measured_peak@j8=4.0GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=5.5GiB (was 8GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
-      "cmd": "CARGO_BUILD_JOBS=8 cargo clippy --workspace --all-targets --exclude detcore-dbi --exclude detcore-sabre --exclude hermit-install -- -D warnings",
-      "deps": [
-        "build.workspace"
-      ],
-      "timeout": 1200,
-      "hint": {
-        "est_duration_s": 300,
-        "rss_baseline_bytes": 8589934592,
-        "hard_mem_max_bytes": 17179869184,
-        "classification": "cpu-bound"
-      }
-    },
-    {
-      "group": "doc",
-      "job": "doctests",
-      "desc": "Test workspace documentation (cargo test --workspace --features third-party-backends --doc)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> cargo defaulted the build phase to nproc). rss_baseline=measured_peak@j8=208MiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=2.0GiB (was 5GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
-      "cmd": "CARGO_BUILD_JOBS=8 cargo test --workspace --features third-party-backends --doc",
-      "deps": [
-        "build.third_party"
-      ],
-      "timeout": 900,
-      "hint": {
-        "est_duration_s": 180,
-        "rss_baseline_bytes": 218103808,
-        "hard_mem_max_bytes": 2147483648,
-        "classification": "cpu-bound"
-      }
-    },
-    {
-      "group": "doc",
-      "job": "rustdoc",
-      "desc": "Documentation (cargo doc --workspace --no-deps)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> rustdoc's build phase defaulted to nproc; historical notes show this node has hit >5GiB uncapped/at-nproc, so pinning is the fix). rss_baseline=measured_peak@j8=1.1GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.9GiB additive -> hard_mem_max_bytes=3.0GiB (was 5GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
-      "cmd": "CARGO_BUILD_JOBS=8 cargo doc --workspace --no-deps --exclude detcore-dbi --exclude detcore-sabre --exclude hermit-install",
-      "deps": [
-        "build.workspace"
-      ],
-      "timeout": 900,
-      "hint": {
-        "est_duration_s": 150,
-        "rss_baseline_bytes": 1181116006,
-        "hard_mem_max_bytes": 3221225472,
-        "classification": "cpu-bound"
-      }
-    },
-    {
-      "group": "test",
-      "job": "regular_crates",
-      "desc": "Test regular workspace crates (nextest, excludes detcore/hermit/flaky)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (build phase; nextest execution threads stay default). rss_baseline=measured_peak@j8=2.0GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); measured on a 316-core box with nextest's default (nproc) test-thread parallelism, so this peak already reflects full execution-thread fan-out; hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=3.5GiB (was 6GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
-      "cmd": "CARGO_BUILD_JOBS=8 cargo nextest run ${CI:+--profile ci} --workspace --exclude detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests --exclude detcore-dbi --exclude detcore-sabre --exclude hermit-install",
-      "deps": [
-        "build.workspace",
-        "setup.nextest"
-      ],
-      "timeout": 900,
-      "hint": {
-        "est_duration_s": 200,
-        "rss_baseline_bytes": 2147483648,
-        "hard_mem_max_bytes": 3758096384,
-        "classification": "cpu-bound"
-      }
-    },
-    {
-      "group": "test",
-      "job": "hermit_unit",
-      "desc": "Test Hermit unit and binary targets (-p hermit --lib --bins)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (build phase; test execution already --test-threads=1). rss_baseline=measured_peak@j8=4.6GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. NOTE the old 5GiB cap left only ~0.4GiB over the warm peak -> it was too tight; headroom=+1.9GiB additive -> hard_mem_max_bytes RAISED to 6.5GiB. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
-      "cmd": "CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --lib --bins -- --test-threads=1",
-      "deps": [
-        "build.third_party"
-      ],
-      "timeout": 900,
-      "hint": {
-        "resources": {
-          "hermit_guest": 1
-        },
-        "est_duration_s": 120,
-        "rss_baseline_bytes": 8589934592,
-        "hard_mem_max_bytes": 17179869184,
-        "classification": "cpu-bound"
-      }
-    },
-    {
-      "group": "test",
-      "job": "detcore_unit",
-      "desc": "Test Detcore unit and binary targets (-p detcore --lib --bins)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> build phase defaulted to nproc). rss_baseline=measured_peak@j8=1.8GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.7GiB additive -> hard_mem_max_bytes=3.5GiB (was 5GiB). NOTE: cpu_timeout intentionally NOT set here or on the sibling test.detcore_misc node -- detcore_misc currently livelocks under load (reverie#355 is the established fix; a cpu_timeout derived from pre-355 hang behaviour would be wrong). cpu_timeout derivation is out of scope for this memory-cap change. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
-      "cmd": "CARGO_BUILD_JOBS=8 cargo test -p detcore --lib --bins",
-      "deps": [
-        "build.workspace"
-      ],
-      "timeout": 900,
-      "hint": {
-        "est_duration_s": 120,
-        "rss_baseline_bytes": 1932735283,
-        "hard_mem_max_bytes": 3758096384,
-        "classification": "cpu-bound"
-      }
-    },
-    {
-      "group": "test",
-      "job": "detcore_misc",
-      "desc": "Detcore non-CPUID miscellaneous cases (tests_misc, skips RDRAND host probes)",
-      "cmd": "cargo test -p detcore --test tests_misc -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --skip ordinary_clone_child_starts_before_parent_resumes --skip ordinary_clone_parent_mode_can_resume_before_child --skip network_syscalls_are_deterministic_across_five_runs --test-threads=1",
-      "deps": [
-        "build.workspace"
-      ],
-      "timeout": 600,
-      "hint": {
-        "resources": {
-          "hermit_guest": 1
-        },
-        "est_duration_s": 90,
-        "rss_baseline_bytes": 8589934592,
-        "hard_mem_max_bytes": 17179869184,
-        "classification": "cpu-bound"
-      }
-    },
-    {
-      "group": "test",
-      "job": "detcore_parallel",
-      "desc": "Detcore non-PMU parallel cases (tests_parallelism, --skip detcore, -j4)",
-      "cmd": "cargo test -p detcore --test tests_parallelism -- --skip detcore --test-threads=4",
-      "deps": [
-        "build.workspace"
-      ],
-      "timeout": 600,
-      "hint": {
-        "resources": {
-          "hermit_guest": 1
-        },
-        "est_duration_s": 120,
-        "rss_baseline_bytes": 8589934592,
-        "hard_mem_max_bytes": 17179869184,
-        "classification": "cpu-bound"
-      }
-    },
-    {
-      "group": "test",
-      "job": "hermit_integration",
-      "desc": "Portable Hermit integration targets (batched compile, serial test binaries)",
-      "cmd": "cargo test -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test clock_determinism --test clock_discipline_determinism --test cpufreq_avg_determinism --test epoll_determinism --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test zero_copy_pipe_fallback -- --test-threads=1",
-      "deps": [
-        "build.third_party"
-      ],
-      "timeout": 1200,
-      "hint": {
-        "resources": {
-          "hermit_guest": 1
-        },
-        "est_duration_s": 300,
-        "rss_baseline_bytes": 8589934592,
-        "hard_mem_max_bytes": 17179869184,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "test",
-      "job": "arbitrary_binaries",
-      "desc": "Portable arbitrary-binary cases",
-      "cmd": "cargo test -p hermit --features third-party-backends --test arbitrary_binaries -- --skip record_replay_stable_arbitrary_binaries --test-threads=1",
-      "deps": [
-        "build.third_party"
-      ],
-      "timeout": 900,
-      "hint": {
-        "resources": {
-          "hermit_guest": 1
-        },
-        "est_duration_s": 120,
-        "rss_baseline_bytes": 8589934592,
-        "hard_mem_max_bytes": 17179869184,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "test",
-      "job": "cli",
-      "desc": "Portable CLI cases (skips KVM/DBI-backend-only cases)",
-      "cmd": "cargo test -p hermit --features third-party-backends --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbi_strict_returns_with_blocked_stdin_source --skip run_dbi_verifies_pipe_backpressure --skip run_dbi_keeps_diagnostics_out_of_guest_stderr --skip run_dbi_recovers_after_failed_exec --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --test-threads=1",
-      "deps": [
-        "build.third_party"
-      ],
-      "timeout": 900,
-      "hint": {
-        "resources": {
-          "hermit_guest": 1
-        },
-        "est_duration_s": 150,
-        "rss_baseline_bytes": 8589934592,
-        "hard_mem_max_bytes": 17179869184,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "test",
-      "job": "liteinst_strict",
-      "desc": "Portable LiteInst strict compatibility",
-      "cmd": "HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit cargo test -p hermit --features third-party-backends --test liteinst_advanced -- --test-threads=1",
-      "deps": [
-        "build.liteinst_runtime_release"
-      ],
-      "timeout": 900,
-      "hint": {
-        "resources": {
-          "hermit_guest": 1
-        },
-        "est_duration_s": 120,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "test",
-      "job": "sabre_examples",
-      "desc": "SaBRe non-racy examples: per-backend time determinism and non-time ptrace parity",
-      "cmd": "HERMIT_SABRE_TEST_BINARY=$PWD/target/release/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre cargo test -p hermit --features third-party-backends --test sabre_examples -- --test-threads=1",
-      "deps": [
-        "build.runtime_release"
-      ],
-      "timeout": 900,
-      "hint": {
-        "resources": {
-          "hermit_guest": 1
-        },
-        "est_duration_s": 90,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "test",
-      "job": "hermit_modes",
-      "desc": "Portable Hermit mode cases (skips default_ and chaos_buck_)",
-      "cmd": "cargo test -p hermit --features third-party-backends --test hermit_modes -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify --test-threads=1",
-      "deps": [
-        "build.third_party"
-      ],
-      "timeout": 900,
-      "hint": {
-        "resources": {
-          "hermit_guest": 1
-        },
-        "est_duration_s": 150,
-        "rss_baseline_bytes": 8589934592,
-        "hard_mem_max_bytes": 17179869184,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "test",
-      "job": "app_strict_verify",
-      "desc": "Portable application strict verification (skips java/javac)",
-      "cmd": "cargo test -p hermit --features third-party-backends --test app_strict_verify -- --ignored --skip java_ --skip javac_ --test-threads=1",
-      "deps": [
-        "build.third_party"
-      ],
-      "timeout": 900,
-      "hint": {
-        "resources": {
-          "hermit_guest": 1
-        },
-        "est_duration_s": 180,
-        "rss_baseline_bytes": 8589934592,
-        "hard_mem_max_bytes": 17179869184,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "test",
-      "job": "command_strict_verify",
-      "desc": "Portable command strict verification",
-      "cmd": "cargo test -p hermit --features third-party-backends --test command_strict_verify -- --ignored --test-threads=1",
-      "deps": [
-        "build.third_party"
-      ],
-      "timeout": 900,
-      "hint": {
-        "resources": {
-          "hermit_guest": 1
-        },
-        "est_duration_s": 180,
-        "rss_baseline_bytes": 8589934592,
-        "hard_mem_max_bytes": 17179869184,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "test",
-      "job": "ignored_syscall_regressions",
-      "desc": "Portable ignored syscall regressions (epoll_determinism, rcx_canonicalization)",
-      "cmd": "cargo test -p hermit --features third-party-backends --test epoll_determinism --test rcx_canonicalization -- --ignored --test-threads=1",
-      "deps": [
-        "build.third_party"
-      ],
-      "timeout": 600,
-      "hint": {
-        "resources": {
-          "hermit_guest": 1
-        },
-        "est_duration_s": 90,
-        "rss_baseline_bytes": 8589934592,
-        "hard_mem_max_bytes": 17179869184,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "test",
-      "job": "rr_suite_contract",
-      "desc": "rr suite source contract (scratch dirs fresh and cleaned)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which capped the OTHER compile-bearing nodes but MISSED this one): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> the test binary's build phase defaulted to nproc, and under the full portable profile that cc1plus fan-out blew the old 2.0GiB cap -> OOM; the job-pin is the actual fix). rss_baseline=measured_peak@j8=3.5GiB; method=cgroup-RECORDED (safe-ci-dag-runner step_profiles peak_bytes == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@b384187e. CAVEAT: peak_bytes is cap-influenced because compile page-cache is reclaimable (a negative-control run at a 512MiB cap PASSED via reclaim, oom_kills=0) -> the true non-reclaimable working set at j8 is well under this figure; the cap is conservative headroom, the pin is the fix. headroom=+1.5GiB additive -> hard_mem_max_bytes=5.0GiB (was 2.0GiB, which was too tight once the node was left unpinned). classification light->cpu-bound (compile-bearing).",
-      "cmd": "CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test rr_suite rr_scratch_directories_are_fresh_and_cleaned -- --exact",
-      "deps": [
-        "build.third_party"
-      ],
-      "timeout": 300,
-      "hint": {
-        "est_duration_s": 30,
-        "rss_baseline_bytes": 3758096384,
-        "hard_mem_max_bytes": 5368709120,
-        "classification": "cpu-bound"
-      }
-    },
-    {
-      "group": "test",
-      "job": "dbi_parity",
-      "desc": "DynamoRIO DBI strict backend parity matrix",
-      "cmd": "python3 tests/backend-parity/run_matrix.py --hermit target/release/hermit --backend dbi --strict --require-backend",
-      "deps": [
-        "build.runtime_release"
-      ],
-      "timeout": 900,
-      "hint": {
-        "resources": {
-          "hermit_guest": 1
-        },
-        "est_duration_s": 180,
-        "rss_baseline_bytes": 8589934592,
-        "hard_mem_max_bytes": 17179869184,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "test",
-      "job": "envelope_levels",
-      "desc": "Portable working-envelope levels (L1-L4 over true/echo/date; mirrors run_portable_envelope_levels, validate.sh:2573)",
-      "cmd": "set -e; HERMIT=target/debug/hermit; ARGS='run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled'; REPS=${L4_REPS:-20}; run_probe() { local c=\"$1\"; timeout 30s $HERMIT $ARGS --strict -- $c </dev/null; timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null; timeout 30s $HERMIT $ARGS --strict --verify --detlog-heap --detlog-stack -- $c </dev/null; local i; for ((i=0;i<REPS;i++)); do timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null; done; }; run_probe '/bin/true'; run_probe '/bin/echo hermit-envelope'; run_probe '/bin/date -u +%Y'",
-      "deps": [
-        "build.workspace"
-      ],
-      "timeout": 900,
-      "hint": {
-        "resources": {
-          "hermit_guest": 1
-        },
-        "est_duration_s": 120,
-        "rss_baseline_bytes": 8589934592,
-        "hard_mem_max_bytes": 17179869184,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "test",
-      "job": "strict_compat",
-      "desc": "Portable strict compatibility envelope (blocking L2 matrix with bounded diagnostics)",
-      "cmd": "STRICT_COMPAT_HERMIT_BIN=$PWD/target/ci/hermit-strict ./validate.sh --portable-strict-compat-only --no-label-pr --verbose",
-      "deps": [
-        "build.runtime_release",
-        "lint.clippy",
-        "doc.doctests",
-        "doc.rustdoc",
-        "test.regular_crates",
-        "test.hermit_unit",
-        "test.detcore_unit",
-        "test.rr_suite_contract"
-      ],
-      "timeout": 1800,
-      "hint": {
-        "resources": {
-          "hermit_guest": 1
-        },
-        "est_duration_s": 600,
-        "rss_baseline_bytes": 12884901888,
-        "hard_mem_max_bytes": 25769803776,
-        "classification": "latency-bound"
-      }
-    },
-    {
-      "group": "build",
-      "job": "third_party",
-      "desc": "Build debug third-party backends (DynamoRIO/SaBRe/LiteInst) and their test targets",
-      "description": "THIRD-PARTY ISOLATION 2026-08-04 (task build-workspace-forces-third-party-backends-on-31-dependents; mechanism:portable-dag-third-party-isolation): the ONLY debug node that compiles the third-party backends. Depends on build.workspace so it reuses the warm product target and compiles only the tpb delta (detcore-dbi, detcore-sabre, hermit-install and hermit's tpb-gated code -> vendored DynamoRIO). Placing DynamoRIO here, DOWNSTREAM of the product build, means a third-party compile fault can only red the third-party/DBI/SaBRe/LiteInst nodes, never the ~21 pure ptrace/determinism nodes. Cmd is identical to the pre-isolation build.workspace so its calibrated timeout/mem-cap apply unchanged.",
-      "cmd": "cargo build --workspace --all-targets --features third-party-backends",
-      "deps": [
-        "build.workspace"
-      ],
-      "timeout": 1200,
-      "jobs_flag": "",
-      "hint": {
-        "est_duration_s": 130,
-        "rss_baseline_bytes": 11663998976,
-        "hard_mem_max_bytes": 68719476736,
-        "classification": "cpu-bound",
-        "preferred_inner_jobs": 32
-      }
-    },
-    {
-      "group": "check",
-      "job": "skill_discovery",
+      "group": "check", "job": "skill_discovery",
       "desc": "Verify Claude and stock Codex discover the same safe product skills",
       "cmd": "mkdir -p target/ci && RUSTUP_TOOLCHAIN=stable rustc --edition=2021 scripts/check-skill-discovery.rs -o target/ci/check-skill-discovery && target/ci/check-skill-discovery",
       "timeout": 60,
-      "hint": {
-        "est_duration_s": 3,
-        "rss_baseline_bytes": 67108864,
-        "hard_mem_max_bytes": 536870912,
-        "classification": "light"
-      }
+      "hint": {"est_duration_s": 3, "rss_baseline_bytes": 67108864,
+               "hard_mem_max_bytes": 536870912, "classification": "light"}
+    },
+    {
+      "group": "check", "job": "backend_abstraction",
+      "desc": "Detcore backend-abstraction check",
+      "cmd": "./scripts/check-detcore-backend-abstraction.sh",
+      "timeout": 120,
+      "hint": {"est_duration_s": 20, "rss_baseline_bytes": 268435456,
+               "hard_mem_max_bytes": 1073741824, "classification": "light"}
+    },
+    {
+      "group": "check", "job": "portability_paths",
+      "desc": "Reject developer-specific paths in build/run files",
+      "cmd": "./scripts/check-portable-paths.sh",
+      "timeout": 60,
+      "hint": {"est_duration_s": 2, "rss_baseline_bytes": 67108864,
+               "hard_mem_max_bytes": 536870912, "classification": "light"}
+    },
+    {
+      "group": "check", "job": "script_sigpipe",
+      "desc": "Standalone scripts exit cleanly on downstream SIGPIPE (prog | head)",
+      "cmd": "./scripts/check-script-sigpipe.sh",
+      "timeout": 60,
+      "hint": {"est_duration_s": 3, "rss_baseline_bytes": 67108864,
+               "hard_mem_max_bytes": 536870912, "classification": "light"}
+    },
+    {
+      "group": "setup", "job": "nextest",
+      "desc": "cargo-nextest available",
+      "cmd": "cargo nextest show-config version >/dev/null 2>&1 || if command -v with-proxy >/dev/null 2>&1; then with-proxy cargo install cargo-nextest --locked --version 0.9.100; else cargo install cargo-nextest --locked --version 0.9.100; fi",
+      "timeout": 600,
+      "hint": {"est_duration_s": 30, "rss_baseline_bytes": 536870912,
+               "hard_mem_max_bytes": 2147483648, "classification": "light"}
+    },
+    {
+      "group": "build", "job": "workspace",
+      "desc": "Build all debug workspace targets in one Cargo invocation",
+      "description": "ONE-FAT-BUILD 2026-08-04 (task collapse-separate-build-nodes-into-one-fat-cargo-invocation): one cargo build owns the complete debug workspace graph, including test targets and the flaky harness. This removes the redundant flaky-harness build node. preferred_inner_jobs=32 is measured on a cold empty target at hermit@846baeca: 130.35s, cgroup-recorded peak=11663998976 bytes. The generous 64GiB cap deliberately prioritizes throughput over cap tightness. Release artifacts remain a separate profile because Cargo cannot emit dev and release profiles in one invocation; the privileged lane is a separate DAG and is unchanged.",
+      "cmd": "cargo build --workspace --all-targets --features third-party-backends",
+      "deps": ["e2e.metadata"],
+      "timeout": 1200,
+      "jobs_flag": "",
+      "hint": {"est_duration_s": 130, "rss_baseline_bytes": 11663998976,
+               "hard_mem_max_bytes": 68719476736, "classification": "cpu-bound",
+               "preferred_inner_jobs": 32}
+    },
+    {
+      "group": "build", "job": "runtime_release",
+      "desc": "Build release Hermit and all runtime backend artifacts in one Cargo invocation",
+      "description": "ONE-FAT-BUILD 2026-08-04: this is the dependency-driven exception to the debug fat build. DBI, SaBRe, and LiteInst tests require target/release/hermit and release plugins, while ordinary tests consume debug targets. One release Cargo invocation now sees hermit, detcore-dbi, detcore-sabre, and hermit-install together; the former serial dbi_release+sabre_release invocations are gone. preferred_inner_jobs=32 is measured on a cold empty target at hermit@846baeca: 185.423s, cgroup-recorded peak=9006452736 bytes. The copied binary lets the strict-compat DAG node use validate.sh's existing explicit-prebuilt contract rather than rebuilding the same release profile.",
+      "cmd": "HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-runtime cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbi -p detcore-sabre -p hermit-install && mkdir -p target/ci && install -m 755 target/release/hermit target/ci/hermit-strict && sha256sum target/install_pkg/rsrcs/sabre && cat target/install_pkg/rsrcs/sabre.revision",
+      "deps": ["e2e.metadata"],
+      "timeout": 1200,
+      "jobs_flag": "",
+      "hint": {"est_duration_s": 185, "rss_baseline_bytes": 9006452736,
+               "hard_mem_max_bytes": 68719476736, "classification": "cpu-bound",
+               "preferred_inner_jobs": 32}
+    },
+    {
+      "group": "build", "job": "liteinst_runtime_release",
+      "desc": "Build and stage the release LiteInst runtime",
+      "cmd": "./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build",
+      "deps": ["build.runtime_release"],
+      "timeout": 900,
+      "hint": {"est_duration_s": 120, "rss_baseline_bytes": 8589934592,
+               "hard_mem_max_bytes": 17179869184, "classification": "cpu-bound"}
+    },
+    {
+      "group": "e2e", "job": "metadata",
+      "desc": "Validate E2E metadata, generated test footprints, and required-cell plan",
+      "cmd": "./ci/test_harness.sh validate",
+      "timeout": 60,
+      "hint": {"est_duration_s": 5, "rss_baseline_bytes": 268435456,
+               "hard_mem_max_bytes": 1073741824, "classification": "light"}
+    },
+    {
+      "group": "build", "job": "manifest_guests",
+      "desc": "Prepare every CI-enabled portable manifest guest",
+      "cmd": "./ci/test_harness.sh build --lane portable --ci-only --allow-empty",
+      "deps": ["e2e.metadata"],
+      "timeout": 600,
+      "hint": {"est_duration_s": 90, "rss_baseline_bytes": 1073741824,
+               "hard_mem_max_bytes": 3221225472, "classification": "cpu-bound"}
+    },
+    {
+      "group": "e2e", "job": "manifest_applications",
+      "desc": "Portable manifest bucket: applications",
+      "manifest": {"lane": "portable", "category": "applications"},
+      "cmd": "./ci/test_harness.sh run --lane portable --category applications --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/applications/results.jsonl --junit ignored/e2e/portable/applications/junit.xml",
+      "deps": ["build.workspace", "build.manifest_guests", "build.runtime_release", "e2e.metadata"],
+      "timeout": 600,
+      "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 120,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "e2e", "job": "manifest_backend_parity_c",
+      "desc": "Portable manifest bucket: backend-parity-c",
+      "manifest": {"lane": "portable", "category": "backend-parity-c"},
+      "cmd": "./ci/test_harness.sh run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/backend-parity-c/results.jsonl --junit ignored/e2e/portable/backend-parity-c/junit.xml",
+      "deps": ["build.workspace", "build.manifest_guests", "e2e.metadata"],
+      "timeout": 600,
+      "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 5,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "e2e", "job": "manifest_bin_c",
+      "desc": "Portable manifest bucket: bin-c",
+      "manifest": {"lane": "portable", "category": "bin-c"},
+      "cmd": "./ci/test_harness.sh run --lane portable --category bin-c --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/bin-c/results.jsonl --junit ignored/e2e/portable/bin-c/junit.xml",
+      "deps": ["build.workspace", "build.manifest_guests", "e2e.metadata"],
+      "timeout": 600,
+      "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 5,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "e2e", "job": "manifest_c_programs",
+      "desc": "Portable manifest bucket: c-programs",
+      "manifest": {"lane": "portable", "category": "c-programs"},
+      "cmd": "./ci/test_harness.sh run --lane portable --category c-programs --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/c-programs/results.jsonl --junit ignored/e2e/portable/c-programs/junit.xml",
+      "deps": ["build.workspace", "build.manifest_guests", "build.runtime_release", "e2e.metadata"],
+      "timeout": 600,
+      "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 5,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "e2e", "job": "manifest_chaos_c",
+      "desc": "Portable manifest bucket: chaos-c",
+      "manifest": {"lane": "portable", "category": "chaos-c"},
+      "cmd": "./ci/test_harness.sh run --lane portable --category chaos-c --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/chaos-c/results.jsonl --junit ignored/e2e/portable/chaos-c/junit.xml",
+      "deps": ["build.workspace", "build.manifest_guests", "e2e.metadata"],
+      "timeout": 600,
+      "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 5,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "e2e", "job": "manifest_data_handling",
+      "desc": "Portable manifest bucket: data-handling",
+      "manifest": {"lane": "portable", "category": "data-handling"},
+      "cmd": "./ci/test_harness.sh run --lane portable --category data-handling --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/data-handling/results.jsonl --junit ignored/e2e/portable/data-handling/junit.xml",
+      "deps": ["build.workspace", "build.manifest_guests", "build.runtime_release", "e2e.metadata"],
+      "timeout": 600,
+      "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 90,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "e2e", "job": "manifest_debugger_c",
+      "desc": "Portable manifest bucket: debugger-c",
+      "manifest": {"lane": "portable", "category": "debugger-c"},
+      "cmd": "./ci/test_harness.sh run --lane portable --category debugger-c --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/debugger-c/results.jsonl --junit ignored/e2e/portable/debugger-c/junit.xml",
+      "deps": ["build.workspace", "build.manifest_guests", "e2e.metadata"],
+      "timeout": 600,
+      "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 5,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "e2e", "job": "manifest_determinism_stress_c",
+      "desc": "Portable manifest bucket: determinism-stress-c",
+      "manifest": {"lane": "portable", "category": "determinism-stress-c"},
+      "cmd": "./ci/test_harness.sh run --lane portable --category determinism-stress-c --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/determinism-stress-c/results.jsonl --junit ignored/e2e/portable/determinism-stress-c/junit.xml",
+      "deps": ["build.workspace", "build.manifest_guests", "e2e.metadata"],
+      "timeout": 600,
+      "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 5,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "e2e", "job": "manifest_determinism_stress",
+      "desc": "Portable manifest bucket: determinism-stress",
+      "manifest": {"lane": "portable", "category": "determinism-stress"},
+      "cmd": "./ci/test_harness.sh run --lane portable --category determinism-stress --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/determinism-stress/results.jsonl --junit ignored/e2e/portable/determinism-stress/junit.xml",
+      "deps": ["build.workspace", "build.manifest_guests", "e2e.metadata"],
+      "timeout": 600,
+      "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 150,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "e2e", "job": "manifest_language_runtimes",
+      "desc": "Portable manifest bucket: language-runtimes",
+      "manifest": {"lane": "portable", "category": "language-runtimes"},
+      "cmd": "./ci/test_harness.sh run --lane portable --category language-runtimes --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/language-runtimes/results.jsonl --junit ignored/e2e/portable/language-runtimes/junit.xml",
+      "deps": ["build.workspace", "build.manifest_guests", "e2e.metadata"],
+      "timeout": 600,
+      "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 120,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "e2e", "job": "manifest_shared_futex_c",
+      "desc": "Portable manifest bucket: shared-futex-c",
+      "manifest": {"lane": "portable", "category": "shared-futex-c"},
+      "cmd": "./ci/test_harness.sh run --lane portable --category shared-futex-c --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/shared-futex-c/results.jsonl --junit ignored/e2e/portable/shared-futex-c/junit.xml",
+      "deps": ["build.workspace", "build.manifest_guests", "e2e.metadata"],
+      "timeout": 600,
+      "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 5,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "e2e", "job": "manifest_system_utils",
+      "desc": "Portable manifest bucket: system-utils",
+      "manifest": {"lane": "portable", "category": "system-utils"},
+      "cmd": "./ci/test_harness.sh run --lane portable --category system-utils --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/system-utils/results.jsonl --junit ignored/e2e/portable/system-utils/junit.xml",
+      "deps": ["build.workspace", "build.manifest_guests", "build.runtime_release", "e2e.metadata"],
+      "timeout": 600,
+      "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 120,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "e2e", "job": "manifest_util_c",
+      "desc": "Portable manifest bucket: util-c",
+      "manifest": {"lane": "portable", "category": "util-c"},
+      "cmd": "./ci/test_harness.sh run --lane portable --category util-c --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/util-c/results.jsonl --junit ignored/e2e/portable/util-c/junit.xml",
+      "deps": ["build.workspace", "build.manifest_guests", "e2e.metadata"],
+      "timeout": 600,
+      "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 5,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "applications_e2e",
+      "desc": "Run application end-to-end strict verification",
+      "cmd": "./tests/e2e/lib/applications/run_all.sh",
+      "deps": ["build.workspace"],
+      "timeout": 300,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 30,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "lint", "job": "rustfmt",
+      "desc": "Rustfmt (cargo fmt --all -- --check)",
+      "cmd": "cargo fmt --all -- --check",
+      "timeout": 120,
+      "hint": {"est_duration_s": 20, "rss_baseline_bytes": 268435456,
+               "hard_mem_max_bytes": 1073741824, "classification": "light"}
+    },
+    {
+      "group": "lint", "job": "clippy",
+      "desc": "Clippy (cargo clippy --workspace --all-targets -D warnings)",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> clippy's build phase defaulted to nproc). rss_baseline=measured_peak@j8=4.0GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=5.5GiB (was 8GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo clippy --workspace --all-targets -- -D warnings",
+      "deps": ["build.workspace"],
+      "timeout": 1200,
+      "hint": {"est_duration_s": 300, "rss_baseline_bytes": 8589934592,
+               "hard_mem_max_bytes": 17179869184, "classification": "cpu-bound"}
+    },
+    {
+      "group": "doc", "job": "doctests",
+      "desc": "Test workspace documentation (cargo test --workspace --features third-party-backends --doc)",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> cargo defaulted the build phase to nproc). rss_baseline=measured_peak@j8=208MiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=2.0GiB (was 5GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo test --workspace --features third-party-backends --doc",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"est_duration_s": 180, "rss_baseline_bytes": 218103808,
+               "hard_mem_max_bytes": 2147483648, "classification": "cpu-bound"}
+    },
+    {
+      "group": "doc", "job": "rustdoc",
+      "desc": "Documentation (cargo doc --workspace --no-deps)",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> rustdoc's build phase defaulted to nproc; historical notes show this node has hit >5GiB uncapped/at-nproc, so pinning is the fix). rss_baseline=measured_peak@j8=1.1GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.9GiB additive -> hard_mem_max_bytes=3.0GiB (was 5GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo doc --workspace --no-deps",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"est_duration_s": 150, "rss_baseline_bytes": 1181116006,
+               "hard_mem_max_bytes": 3221225472, "classification": "cpu-bound"}
+    },
+    {
+      "group": "test", "job": "regular_crates",
+      "desc": "Test regular workspace crates (nextest, excludes detcore/hermit/flaky)",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (build phase; nextest execution threads stay default). rss_baseline=measured_peak@j8=2.0GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); measured on a 316-core box with nextest's default (nproc) test-thread parallelism, so this peak already reflects full execution-thread fan-out; hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=3.5GiB (was 6GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo nextest run ${CI:+--profile ci} --workspace --exclude detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests",
+      "deps": ["build.workspace", "setup.nextest"],
+      "timeout": 900,
+      "hint": {"est_duration_s": 200, "rss_baseline_bytes": 2147483648,
+               "hard_mem_max_bytes": 3758096384, "classification": "cpu-bound"}
+    },
+    {
+      "group": "test", "job": "hermit_unit",
+      "desc": "Test Hermit unit and binary targets (-p hermit --lib --bins)",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (build phase; test execution already --test-threads=1). rss_baseline=measured_peak@j8=4.6GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. NOTE the old 5GiB cap left only ~0.4GiB over the warm peak -> it was too tight; headroom=+1.9GiB additive -> hard_mem_max_bytes RAISED to 6.5GiB. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --lib --bins -- --test-threads=1",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
+               "classification": "cpu-bound"}
+    },
+    {
+      "group": "test", "job": "detcore_unit",
+      "desc": "Test Detcore unit and binary targets (-p detcore --lib --bins)",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> build phase defaulted to nproc). rss_baseline=measured_peak@j8=1.8GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.7GiB additive -> hard_mem_max_bytes=3.5GiB (was 5GiB). NOTE: cpu_timeout intentionally NOT set here or on the sibling test.detcore_misc node -- detcore_misc currently livelocks under load (reverie#355 is the established fix; a cpu_timeout derived from pre-355 hang behaviour would be wrong). cpu_timeout derivation is out of scope for this memory-cap change. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo test -p detcore --lib --bins",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"est_duration_s": 120,
+               "rss_baseline_bytes": 1932735283, "hard_mem_max_bytes": 3758096384,
+               "classification": "cpu-bound"}
+    },
+    {
+      "group": "test", "job": "detcore_misc",
+      "desc": "Detcore non-CPUID miscellaneous cases (tests_misc, skips RDRAND host probes)",
+      "cmd": "cargo test -p detcore --test tests_misc -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --skip ordinary_clone_child_starts_before_parent_resumes --skip ordinary_clone_parent_mode_can_resume_before_child --skip network_syscalls_are_deterministic_across_five_runs --test-threads=1",
+      "deps": ["build.workspace"],
+      "timeout": 600,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
+               "classification": "cpu-bound"}
+    },
+    {
+      "group": "test", "job": "detcore_parallel",
+      "desc": "Detcore non-PMU parallel cases (tests_parallelism, --skip detcore, -j4)",
+      "cmd": "cargo test -p detcore --test tests_parallelism -- --skip detcore --test-threads=4",
+      "deps": ["build.workspace"],
+      "timeout": 600,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
+               "classification": "cpu-bound"}
+    },
+    {
+      "group": "test", "job": "hermit_integration",
+      "desc": "Portable Hermit integration targets (batched compile, serial test binaries)",
+      "cmd": "cargo test -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test clock_determinism --test clock_discipline_determinism --test cpufreq_avg_determinism --test epoll_determinism --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test zero_copy_pipe_fallback -- --test-threads=1",
+      "deps": ["build.workspace"],
+      "timeout": 1200,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 300,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "arbitrary_binaries",
+      "desc": "Portable arbitrary-binary cases",
+      "cmd": "cargo test -p hermit --features third-party-backends --test arbitrary_binaries -- --skip record_replay_stable_arbitrary_binaries --test-threads=1",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "cli",
+      "desc": "Portable CLI cases (skips KVM/DBI-backend-only cases)",
+      "cmd": "cargo test -p hermit --features third-party-backends --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbi_strict_returns_with_blocked_stdin_source --skip run_dbi_verifies_pipe_backpressure --skip run_dbi_keeps_diagnostics_out_of_guest_stderr --skip run_dbi_recovers_after_failed_exec --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --test-threads=1",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "liteinst_strict",
+      "desc": "Portable LiteInst strict compatibility",
+      "cmd": "HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit cargo test -p hermit --features third-party-backends --test liteinst_advanced -- --test-threads=1",
+      "deps": ["build.liteinst_runtime_release"],
+      "timeout": 900,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "sabre_examples",
+      "desc": "SaBRe non-racy examples: per-backend time determinism and non-time ptrace parity",
+      "cmd": "HERMIT_SABRE_TEST_BINARY=$PWD/target/release/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre cargo test -p hermit --features third-party-backends --test sabre_examples -- --test-threads=1",
+      "deps": ["build.runtime_release"],
+      "timeout": 900,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "hermit_modes",
+      "desc": "Portable Hermit mode cases (skips default_ and chaos_buck_)",
+      "cmd": "cargo test -p hermit --features third-party-backends --test hermit_modes -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify --test-threads=1",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 150,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "app_strict_verify",
+      "desc": "Portable application strict verification (skips java/javac)",
+      "cmd": "cargo test -p hermit --features third-party-backends --test app_strict_verify -- --ignored --skip java_ --skip javac_ --test-threads=1",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "command_strict_verify",
+      "desc": "Portable command strict verification",
+      "cmd": "cargo test -p hermit --features third-party-backends --test command_strict_verify -- --ignored --test-threads=1",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "ignored_syscall_regressions",
+      "desc": "Portable ignored syscall regressions (epoll_determinism, rcx_canonicalization)",
+      "cmd": "cargo test -p hermit --features third-party-backends --test epoll_determinism --test rcx_canonicalization -- --ignored --test-threads=1",
+      "deps": ["build.workspace"],
+      "timeout": 600,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "rr_suite_contract",
+      "desc": "rr suite source contract (scratch dirs fresh and cleaned)",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which capped the OTHER compile-bearing nodes but MISSED this one): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> the test binary's build phase defaulted to nproc, and under the full portable profile that cc1plus fan-out blew the old 2.0GiB cap -> OOM; the job-pin is the actual fix). rss_baseline=measured_peak@j8=3.5GiB; method=cgroup-RECORDED (safe-ci-dag-runner step_profiles peak_bytes == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@b384187e. CAVEAT: peak_bytes is cap-influenced because compile page-cache is reclaimable (a negative-control run at a 512MiB cap PASSED via reclaim, oom_kills=0) -> the true non-reclaimable working set at j8 is well under this figure; the cap is conservative headroom, the pin is the fix. headroom=+1.5GiB additive -> hard_mem_max_bytes=5.0GiB (was 2.0GiB, which was too tight once the node was left unpinned). classification light->cpu-bound (compile-bearing).",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test rr_suite rr_scratch_directories_are_fresh_and_cleaned -- --exact",
+      "deps": ["build.workspace"],
+      "timeout": 300,
+      "hint": {"est_duration_s": 30, "rss_baseline_bytes": 3758096384,
+               "hard_mem_max_bytes": 5368709120, "classification": "cpu-bound"}
+    },
+    {
+      "group": "test", "job": "dbi_parity",
+      "desc": "DynamoRIO DBI strict backend parity matrix",
+      "cmd": "python3 tests/backend-parity/run_matrix.py --hermit target/release/hermit --backend dbi --strict --require-backend",
+      "deps": ["build.runtime_release"],
+      "timeout": 900,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "envelope_levels",
+      "desc": "Portable working-envelope levels (L1-L4 over true/echo/date; mirrors run_portable_envelope_levels, validate.sh:2573)",
+      "cmd": "set -e; HERMIT=target/debug/hermit; ARGS='run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled'; REPS=${L4_REPS:-20}; run_probe() { local c=\"$1\"; timeout 30s $HERMIT $ARGS --strict -- $c </dev/null; timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null; timeout 30s $HERMIT $ARGS --strict --verify --detlog-heap --detlog-stack -- $c </dev/null; local i; for ((i=0;i<REPS;i++)); do timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null; done; }; run_probe '/bin/true'; run_probe '/bin/echo hermit-envelope'; run_probe '/bin/date -u +%Y'",
+      "deps": ["build.workspace"],
+      "timeout": 900,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
+               "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "strict_compat",
+      "desc": "Portable strict compatibility envelope (blocking L2 matrix with bounded diagnostics)",
+      "cmd": "STRICT_COMPAT_HERMIT_BIN=$PWD/target/ci/hermit-strict ./validate.sh --portable-strict-compat-only --no-label-pr --verbose",
+      "deps": ["build.runtime_release", "lint.clippy", "doc.doctests", "doc.rustdoc",
+               "test.regular_crates",
+               "test.hermit_unit", "test.detcore_unit", "test.rr_suite_contract"],
+      "timeout": 1800,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 600,
+               "rss_baseline_bytes": 12884901888, "hard_mem_max_bytes": 25769803776,
+               "classification": "latency-bound"}
     }
   ]
 }

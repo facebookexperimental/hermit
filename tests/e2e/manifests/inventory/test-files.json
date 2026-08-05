@@ -339,8 +339,8 @@
     {
       "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/pid_probe.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (blocking verify selection; ci=true)",
-      "why": "tests/backend-parity/fixtures/pid_probe.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (blocking verify selection; ci=true): blocking L2 verification is established on ptrace, SaBRe, and LiteInst"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/pid_probe.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "disposition": "manifest-test",
@@ -497,6 +497,12 @@
       "path": "tests/backend-parity/retarget_to_manifest.py",
       "runner": "backend-parity matrix.tsv -> schema-v2 manifest migration tool (manual)",
       "why": "tests/backend-parity/retarget_to_manifest.py is owned by backend-parity matrix.tsv -> schema-v2 manifest migration tool (manual): Standalone migration driver that reads a source PR's added matrix.tsv rows and fixture .c files and rewrites them into the shared schema-v2 manifest -- appending a symmetric [[test]] block to tests/e2e/manifests/backend-parity-c.toml (ptrace front-door first, every backend x mode cell declared, DBI/KVM enabled only where the row's --verify L2 witness passed) and reclassifying the fixture from guest-fixture to manifest-test. It lives beside and reuses the Python parity harness (run_matrix.py / e9patch_corpus.py) and is run manually to migrate legacy PRs, so it stays a driver rather than a manifest-plan program."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/backend-parity/split_asymmetric_pr.py",
+      "runner": "matrix-symmetry backlog split tool (manual; self-test runs in ci/test_harness.sh validate)",
+      "why": "tests/backend-parity/split_asymmetric_pr.py is owned by matrix-symmetry backlog split tool (manual; self-test runs in ci/test_harness.sh validate): Mechanical PR surgery driver that partitions legacy backend-private test hunks from landable code, proves byte-for-byte source-tree losslessness, preserves source authorship, and publishes cross-linked code and deferred-test PRs without executing guest behavior itself."
     },
     {
       "disposition": "special-driver",
@@ -981,8 +987,8 @@
     {
       "disposition": "manifest-test",
       "path": "tests/c/pidfd_open_self.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (blocking verify selection; ci=true)",
-      "why": "tests/c/pidfd_open_self.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (blocking verify selection; ci=true): blocking L2 verification is established on ptrace and SaBRe"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "tests/c/pidfd_open_self.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "disposition": "manifest-test",
@@ -1227,8 +1233,8 @@
     {
       "disposition": "manifest-test",
       "path": "tests/c/scheduler_policy_queries.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (blocking verify selection; ci=true)",
-      "why": "tests/c/scheduler_policy_queries.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (blocking verify selection; ci=true): blocking L2 verification is established on ptrace and SaBRe"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "tests/c/scheduler_policy_queries.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "disposition": "manifest-test",
@@ -1395,8 +1401,8 @@
     {
       "disposition": "manifest-test",
       "path": "tests/c/syscall_file_metadata.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (blocking verify selection; ci=true)",
-      "why": "tests/c/syscall_file_metadata.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (blocking verify selection; ci=true): blocking L2 verification is established on ptrace and SaBRe"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "tests/c/syscall_file_metadata.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "disposition": "manifest-test",
@@ -3005,12 +3011,6 @@
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/vectored_io.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "special-driver",
-      "path": "tests/backend-parity/split_asymmetric_pr.py",
-      "runner": "matrix-symmetry backlog split tool (manual; self-test runs in ci/test_harness.sh validate)",
-      "why": "tests/backend-parity/split_asymmetric_pr.py is owned by matrix-symmetry backlog split tool (manual; self-test runs in ci/test_harness.sh validate): Mechanical PR surgery driver that partitions legacy backend-private test hunks from landable code, proves byte-for-byte source-tree losslessness, preserves source authorship, and publishes cross-linked code and deferred-test PRs without executing guest behavior itself."
     },
     {
       "path": "tests/c/getcpu_identity.c",

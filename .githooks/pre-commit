@@ -11,11 +11,6 @@ if [[ ! -f "$checker" ]]; then
   exit 1
 fi
 
-args=()
-if [[ -n ${HERMIT_STALE_REVERIE_PIN_REASON:-} ]]; then
-  args+=(--allow-stale-reverie-pin "$HERMIT_STALE_REVERIE_PIN_REASON")
-fi
-
 cd "$root" || exit 1
 
 proxy=()
@@ -23,7 +18,7 @@ if command -v with-proxy >/dev/null 2>&1; then
   proxy=(with-proxy)
 fi
 
-"${proxy[@]}" "$checker" "${args[@]}" || exit 1
+"${proxy[@]}" "$checker" || exit 1
 
 # Also guard the nested-workspace lockfile against pin drift once its checker is
 # present (lands separately as rrnewton/hermit#1609). Until then this is a no-op.

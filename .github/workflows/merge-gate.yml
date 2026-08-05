@@ -421,9 +421,116 @@ jobs:
 
           exit "$failed"
 
+  reverie-pin:
+    name: reverie-pin-is-latest-main
+    if: >-
+      github.repository == 'rrnewton/hermit' &&
+      github.event_name != 'workflow_run'
+    runs-on: [self-hosted, gate]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out the trusted pin checker
+        uses: actions/checkout@v4
+        with:
+          # Execute main's checker, never PR-controlled code, on the self-hosted
+          # runner. Exact PR heads are fetched below only as data to inspect.
+          ref: main
+          path: trusted
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Require every exact PR head to pin latest Reverie main
+        env:
+          BASE_REF: ${{ github.event.merge_group.base_ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Self-hosted gate runners use Actions' minimal PATH; Rust lives in
+          # the agent user's tracked rustup installation rather than /usr/bin.
+          export PATH="$HOME/.cargo/bin:$PATH"
+          command -v rustc >/dev/null || {
+            echo "::error::trusted pin checker requires rustc on the gate runner"
+            exit 1
+          }
+
+          if [ "$EVENT_NAME" = pull_request ] || [ "$EVENT_NAME" = workflow_dispatch ]; then
+            if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = null ]; then
+              echo "::error::workflow_dispatch requires a pr_number input."
+              exit 1
+            fi
+            pr_numbers="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" |
+              jq -r 'select(.base.ref == "main") | .number')"
+          else
+            owner="${REPO%%/*}"
+            name="${REPO#*/}"
+            base_branch="${BASE_REF#refs/heads/}"
+            pr_numbers="$(
+              gh api graphql \
+                -f owner="$owner" \
+                -f name="$name" \
+                -f branch="$base_branch" \
+                -f query='query($owner: String!, $name: String!, $branch: String!) {
+                repository(owner: $owner, name: $name) {
+                  mergeQueue(branch: $branch) {
+                    entries(first: 100) {
+                      nodes {
+                        headCommit { oid }
+                        pullRequest { number baseRefName }
+                      }
+                    }
+                  }
+                }
+              }' | jq -r --arg sha "$SHA" --arg base "$base_branch" '
+                .data.repository.mergeQueue.entries.nodes
+                | map(select(
+                    .headCommit.oid == $sha
+                    and .pullRequest.baseRefName == $base
+                  ) | .pullRequest.number)
+                | .[]
+              ')"
+          fi
+
+          if [ -z "$pr_numbers" ]; then
+            echo "No main-branch pull request is associated with $SHA; merge-gate will reject it."
+            exit 0
+          fi
+
+          checker="$RUNNER_TEMP/check-reverie-pin"
+          RUSTUP_TOOLCHAIN=stable rustc --edition=2021 \
+            trusted/scripts/check-reverie-pin.rs -o "$checker"
+          scratch="$(mktemp -d "$RUNNER_TEMP/reverie-pin.XXXXXX")"
+          cleanup() {
+            for checkout in "$scratch"/pr-*; do
+              [ -d "$checkout" ] || continue
+              git -C trusted worktree remove --force "$checkout" >/dev/null 2>&1 || true
+            done
+            rm -rf "$scratch"
+          }
+          trap cleanup EXIT
+
+          while read -r pr_number; do
+            [ -n "$pr_number" ] || continue
+            head_sha="$(gh api "repos/${REPO}/pulls/${pr_number}" --jq '.head.sha')"
+            checkout="$scratch/pr-${pr_number}"
+            git -C trusted fetch --quiet --no-tags origin "$head_sha"
+            git -C trusted worktree add --quiet --detach "$checkout" "$head_sha"
+            echo "Checking PR #${pr_number} exact head ${head_sha} against live Reverie main."
+            if command -v with-proxy >/dev/null 2>&1; then
+              with-proxy "$checker" --repo "$checkout"
+            else
+              "$checker" --repo "$checkout"
+            fi
+          done <<< "$pr_numbers"
+
   merge-gate:
     name: merge-gate-v4
-    needs: [invalidate-local-validation, core-review-protocol]
+    needs: [invalidate-local-validation, core-review-protocol, reverie-pin]
     if: >-
       always() &&
       github.repository == 'rrnewton/hermit' &&
@@ -482,6 +589,16 @@ jobs:
           echo '2f1c61d5ec9d98b9697317fd9e66b705161defb69b808d23e6d83384e1e2a1e8  '"$authority" | sha256sum --check
           chmod +x "$authority"
           echo "CHECK_OUTCOME_AUTHORITY=$authority" >>"$GITHUB_ENV"
+      - name: Require the latest-Reverie pin gate
+        env:
+          PIN_RESULT: ${{ needs.reverie-pin.result }}
+        run: |
+          set -euo pipefail
+          if [ "$PIN_RESULT" != success ]; then
+            echo "::error::Exact-head Reverie pin gate did not pass (result=$PIN_RESULT); blocking landing."
+            exit 1
+          fi
+          echo "Exact-head Reverie pin gate passed."
       - name: Require successful CI or local validation
         env:
           BASE_REF: ${{ github.event.merge_group.base_ref }}

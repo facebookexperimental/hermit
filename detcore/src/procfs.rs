@@ -2747,28 +2747,11 @@ fn sanitize_mountinfo(contents: &[u8]) -> Vec<u8> {
         suffix.len() == 6 && suffix.iter().all(u8::is_ascii_alphanumeric)
     }
 
-    fn is_host_user_runtime_mount(mountpoint: &[u8]) -> bool {
-        let Some(suffix) = mountpoint.strip_prefix(b"/run/user/") else {
-            return false;
-        };
-        let uid = suffix
-            .split(|byte| *byte == b'/')
-            .next()
-            .unwrap_or_default();
-        !uid.is_empty() && uid.iter().all(u8::is_ascii_digit)
-    }
-
     let mut normalized = Vec::with_capacity(contents.len());
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
         let has_newline = line.last() == Some(&b'\n');
         let body = line.strip_suffix(b"\n").unwrap_or(line);
         let fields = body.split(|byte| *byte == b' ').collect::<Vec<_>>();
-
-        // Host login sessions can appear or disappear between verified runs.
-        // They are unrelated to the guest and must not change its mount table.
-        if fields.len() >= 5 && is_host_user_runtime_mount(fields[4]) {
-            continue;
-        }
 
         if fields.len() >= 5 && is_private_temp_root(fields[3]) {
             for (index, field) in fields.iter().enumerate() {
@@ -3597,21 +3580,6 @@ mod tests {
         assert_eq!(
             sanitize_mountinfo(input),
             b"37 29 0:31 /tmpvol/.hermit/tmp /tmp rw - btrfs /dev/md0 rw\n38 29 0:31 /host/data /data ro - btrfs /dev/md0 ro\n39 29 0:31 /tmpvol/.hermit/etc/group /etc/group ro - btrfs /dev/md0 ro\n"
-        );
-    }
-
-    #[test]
-    fn host_user_runtime_mounts_are_hidden() {
-        let input = b"37 29 0:31 / /run rw - tmpfs tmpfs rw\n\
-38 37 0:42 / /run/user/30015 rw - tmpfs tmpfs rw\n\
-39 38 0:43 / /run/user/30015/doc rw - fuse.portal portal rw\n\
-40 37 0:44 / /run/user/30015-session rw - tmpfs tmpfs rw\n\
-41 37 0:45 / /run/user/shared rw - tmpfs tmpfs rw\n";
-        assert_eq!(
-            sanitize_mountinfo(input),
-            b"37 29 0:31 / /run rw - tmpfs tmpfs rw\n\
-40 37 0:44 / /run/user/30015-session rw - tmpfs tmpfs rw\n\
-41 37 0:45 / /run/user/shared rw - tmpfs tmpfs rw\n"
         );
     }
 

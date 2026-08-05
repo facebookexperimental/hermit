@@ -82,20 +82,6 @@ pub struct Config {
     #[clap(skip)]
     pub syscall_clobbers_virtualized_by_backend: bool,
 
-    /// The execution backend does not present the initial process stack
-    /// (argc/argv/envp) at the post-exec hook, so `hash_guest_env` cannot read
-    /// the guest environment there. Under DBI the post-exec tool hook fires from
-    /// the first syscall event -- after the dynamic loader and libc startup have
-    /// run -- so `%rsp` is a deep call frame rather than the entry-point `argc`
-    /// pointer; walking argv/envp from it would either fault (a raw SIGSEGV under
-    /// the in-process `LocalMemory` accessor, which never returns a recoverable
-    /// `Errno`) or, worse, hash stack garbage into a spurious difference. Set
-    /// per-backend in `prepare_backend_config`; when true the env-hash line is
-    /// emitted as `unavailable` instead of attempting the read.
-    #[serde(default)]
-    #[clap(skip)]
-    pub initial_stack_unavailable_at_post_exec: bool,
-
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-845): Review backend-local exit-group RPC cancellation.
     /// Logically killed guest threads need an explicit scheduler response because the backend

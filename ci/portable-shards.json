@@ -9,6 +9,7 @@
     "and execute them via ci/run-node.sh. Blocks are sized so each job targets <10min."
   ],
   "preflight_nodes": [
+    "check.reverie_pin",
     "check.skill_discovery",
     "check.backend_abstraction",
     "check.portability_paths",

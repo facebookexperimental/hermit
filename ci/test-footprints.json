@@ -31,7 +31,6 @@
     {
       "_why": "@generated: Cargo package `hermit-manifest-plan`; reverse-dependent closure: hermit-manifest-plan.",
       "nodes": [
-        "build.third_party",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -49,7 +48,6 @@
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
-        "build.third_party",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -96,7 +94,6 @@
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
-        "build.third_party",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -145,7 +142,6 @@
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
-        "build.third_party",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -197,7 +193,6 @@
       ],
       "nodes": [
         "build.runtime_release",
-        "build.third_party",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -214,6 +209,7 @@
         "test.hermit_unit",
         "test.ignored_syscall_regressions",
         "test.liteinst_strict",
+        "test.regular_crates",
         "test.rr_suite_contract",
         "test.sabre_examples"
       ],
@@ -227,7 +223,6 @@
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
-        "build.third_party",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -278,9 +273,12 @@
       ],
       "nodes": [
         "build.runtime_release",
-        "build.third_party",
+        "build.workspace",
         "doc.doctests",
+        "doc.rustdoc",
+        "lint.clippy",
         "lint.rustfmt",
+        "test.regular_crates",
         "test.sabre_examples"
       ],
       "paths": [
@@ -293,7 +291,6 @@
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
-        "build.third_party",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -341,7 +338,6 @@
       "_why": "@generated: Cargo package `hermetic_infra_hermit_flaky-tests`; reverse-dependent closure: hermetic_infra_hermit_flaky-tests.",
       "e2e_all": true,
       "nodes": [
-        "build.third_party",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -362,7 +358,6 @@
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
-        "build.third_party",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -408,8 +403,9 @@
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
-        "build.third_party",
+        "build.workspace",
         "doc.doctests",
+        "doc.rustdoc",
         "e2e.manifest_applications",
         "e2e.manifest_backend_parity_c",
         "e2e.manifest_bin_c",
@@ -423,6 +419,7 @@
         "e2e.manifest_shared_futex_c",
         "e2e.manifest_system_utils",
         "e2e.manifest_util_c",
+        "lint.clippy",
         "lint.rustfmt",
         "test.app_strict_verify",
         "test.applications_e2e",
@@ -436,6 +433,7 @@
         "test.hermit_unit",
         "test.ignored_syscall_regressions",
         "test.liteinst_strict",
+        "test.regular_crates",
         "test.rr_suite_contract",
         "test.sabre_examples",
         "test.strict_compat"
@@ -451,7 +449,6 @@
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
-        "build.third_party",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -495,7 +492,6 @@
     {
       "_why": "@generated: Cargo package `hermit-verify`; reverse-dependent closure: hermit-verify.",
       "nodes": [
-        "build.third_party",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -512,7 +508,6 @@
       "_why": "@generated: Cargo package `hermetic_infra_hermit_tests`; reverse-dependent closure: hermetic_infra_hermit_tests.",
       "e2e_all": true,
       "nodes": [
-        "build.third_party",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
