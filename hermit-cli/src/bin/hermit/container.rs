@@ -14,6 +14,9 @@ use std::path::Path;
 use hermit::Context;
 use hermit::Error;
 use hermit::SerializableError;
+use nix::sched::CpuSet;
+use nix::sched::sched_getaffinity;
+use nix::unistd::Pid;
 use reverie::process::Container;
 use reverie::process::Mount;
 use reverie::process::MountFlags;
@@ -106,9 +109,23 @@ pub(super) fn identity_hardening_mounts() -> Result<(Vec<Mount>, IdentityGuard),
     ))
 }
 
+fn choose_affinity_core(allowed: &[usize]) -> Option<usize> {
+    (!allowed.is_empty()).then(|| allowed[rand::random_range(0..allowed.len())])
+}
+
+fn cpu_ids(affinity: &CpuSet) -> Vec<usize> {
+    (0..CpuSet::count())
+        .filter(|cpu| affinity.is_set(*cpu).unwrap_or(false))
+        .collect()
+}
+
 pub(super) fn apply_affinity(container: &mut Container, pin_threads: bool) {
     if pin_threads {
-        let rand_core: usize = rand::random_range(0..num_cpus::get());
+        let affinity = sched_getaffinity(Pid::from_raw(0))
+            .expect("failed to query the tracer's allowed CPU affinity mask");
+        let allowed = cpu_ids(&affinity);
+        let rand_core = choose_affinity_core(&allowed)
+            .expect("the tracer's allowed CPU affinity mask is empty");
         tracing::info!("Pinning tracer and guest threads to core {}", rand_core);
         container.affinity(rand_core);
     }
@@ -233,5 +250,20 @@ mod tests {
                 .any(|line| line.split(':').nth(2) == Some(OVERFLOW_GID)),
             "frozen group database must resolve overflow gid {OVERFLOW_GID}:\n{contents}"
         );
+    }
+
+    #[test]
+    fn affinity_core_is_an_actual_member_of_a_sparse_allowed_mask() {
+        let mut affinity = CpuSet::new();
+        for cpu in [7, 31, 211] {
+            affinity.set(cpu).expect("valid sparse CPU id");
+        }
+        let allowed = cpu_ids(&affinity);
+        assert_eq!(allowed, [7, 31, 211]);
+        for _ in 0..128 {
+            let selected = choose_affinity_core(&allowed).expect("non-empty mask");
+            assert!(allowed.contains(&selected), "selected CPU {selected}");
+        }
+        assert_eq!(choose_affinity_core(&[]), None);
     }
 }
