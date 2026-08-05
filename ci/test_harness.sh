@@ -440,9 +440,10 @@ $direct_references"
     # must return the checker's typed policy refusal (1), not a compile/no-result
     # error (2).
     (
-        local scratch isolated_path fixture real_git current stale status
+        local scratch isolated_path race_path shared_compile_dir fixture
+        local real_git current stale status
         local fake_cargo staged_runtime direct_status
-        local parallel_index parallel_failures
+        local allowed_cpu parallel_index parallel_failures shared_failures
         local -a checker_pids
         scratch=$(mktemp -d)
         trap 'rm -rf -- "$scratch"' EXIT
@@ -459,12 +460,17 @@ $direct_references"
         PATH="$isolated_path:/usr/bin:/bin" "$runner" --self-test >/dev/null
 
         # The pin gate and both DBI build children may compile the checker at
-        # once in one worktree. Stress that exact topology: unique output files
-        # are insufficient because rustc also writes crate-named intermediates
-        # beside the output, so each invocation needs its own directory.
+        # once in one worktree. Exercise real rustc concurrently within the
+        # e2e.metadata node's 1 GiB cap. Pin each compiler to one allowed CPU so
+        # rustc cannot infer the 316-CPU host and create hundreds of codegen
+        # threads; filesystem concurrency remains real and deterministic.
+        allowed_cpu=$(taskset -pc "$$" | sed -E 's/.*: ([0-9]+).*/\1/')
+        [[ $allowed_cpu =~ ^[0-9]+$ ]] ||
+            die "could not determine one allowed CPU for the checker race bracket"
         checker_pids=()
-        for parallel_index in $(seq 1 12); do
-            "$runner" --self-test >"$scratch/parallel-checker-$parallel_index.log" 2>&1 &
+        for parallel_index in 1 2 3 4; do
+            taskset -c "$allowed_cpu" "$runner" --self-test \
+                >"$scratch/parallel-checker-$parallel_index.log" 2>&1 &
             checker_pids+=("$!")
         done
         parallel_failures=0
@@ -475,7 +481,73 @@ $direct_references"
             fi
         done
         ((parallel_failures == 0)) ||
-            die "$parallel_failures of 12 concurrent Reverie-pin checker builds failed"
+            die "$parallel_failures of 4 concurrent real Reverie-pin checker builds failed"
+
+        # Bracket the shared-intermediate failure deterministically at higher
+        # concurrency without making twelve rustc processes exceed that cap. The
+        # stand-in writes one crate-named intermediate beside `-o`, exactly the
+        # path class that collides when outputs share a directory. First prove a
+        # planted shared directory fails, then send twelve invocations through
+        # the production launcher and require its private directories to pass.
+        race_path="$scratch/race-bin"
+        shared_compile_dir="$scratch/shared-compile-dir"
+        mkdir -p "$race_path" "$shared_compile_dir"
+        cat >"$race_path/rustc" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+output=
+while (($# > 0)); do
+    if [[ $1 == -o ]]; then
+        output=$2
+        shift 2
+    else
+        shift
+    fi
+done
+[[ -n $output ]]
+intermediate="$(dirname -- "$output")/check_reverie_pin.rcgu.o"
+if ! (set -o noclobber; : >"$intermediate") 2>/dev/null; then
+    echo "planted shared rustc intermediate collision: $intermediate" >&2
+    exit 97
+fi
+sleep 0.2
+printf '#!/usr/bin/env bash\nexit 0\n' >"$output"
+chmod +x "$output"
+rm -f -- "$intermediate"
+EOF
+        chmod +x "$race_path/rustc"
+        checker_pids=()
+        for parallel_index in $(seq 1 12); do
+            PATH="$race_path:/usr/bin:/bin" rustc --edition=2021 --test \
+                scripts/check-reverie-pin.rs \
+                -o "$shared_compile_dir/checker-$parallel_index" \
+                >"$scratch/shared-checker-$parallel_index.log" 2>&1 &
+            checker_pids+=("$!")
+        done
+        shared_failures=0
+        for parallel_index in "${!checker_pids[@]}"; do
+            if ! wait "${checker_pids[$parallel_index]}"; then
+                shared_failures=$((shared_failures + 1))
+            fi
+        done
+        ((shared_failures > 0)) ||
+            die "planted shared-directory compiler race was inert"
+
+        checker_pids=()
+        for parallel_index in $(seq 1 12); do
+            PATH="$race_path:/usr/bin:/bin" "$runner" --self-test \
+                >"$scratch/isolated-checker-$parallel_index.log" 2>&1 &
+            checker_pids+=("$!")
+        done
+        parallel_failures=0
+        for parallel_index in "${!checker_pids[@]}"; do
+            if ! wait "${checker_pids[$parallel_index]}"; then
+                cat "$scratch/isolated-checker-$((parallel_index + 1)).log" >&2
+                parallel_failures=$((parallel_failures + 1))
+            fi
+        done
+        ((parallel_failures == 0)) ||
+            die "$parallel_failures of 12 private-directory compiler probes failed"
 
         cat >"$isolated_path/git" <<EOF
 #!/usr/bin/env bash
@@ -665,6 +737,7 @@ function audit_ci_correspondence {
             CI_DAG_LAUNCH_RAW_BUILD_JOBS
             CI_DAG_EFFECTIVE_CPUS
             CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS
+            CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS
             CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS
             REVERIE_DBI_PINNED_MAX_PARALLEL_JOBS
             REVERIE_DBI_BUDGET_CHILD
@@ -807,6 +880,12 @@ function audit_ci_correspondence {
             REVERIE_DBI_BUDGET_BOUND_PIN=wrong CARGO_BUILD_JOBS=8 \
             bash -c 'source "$1" reverie-dbi-budget-child' _ "$budget_config" 2>/dev/null; then
             die "child derivation accepted an uncalibrated Reverie pin"
+        fi
+        if PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
+            REVERIE_DBI_BUDGET_BOUND_PIN=025d37800d347c32711038bd0a3889e8e4774c2b \
+            CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS=1050 CARGO_BUILD_JOBS=8 \
+            bash -c 'source "$1" reverie-dbi-budget-child' _ "$budget_config" 2>/dev/null; then
+            die "child derivation accepted a retired unconditioned DBI threshold"
         fi
         if PATH="$scratch/nproc-zero:$PATH" "${clean_budget_env[@]}" \
             REVERIE_DBI_BUDGET_BOUND_PIN=025d37800d347c32711038bd0a3889e8e4774c2b CARGO_BUILD_JOBS=8 \

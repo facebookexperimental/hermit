@@ -41,6 +41,7 @@ if [[ $build_job_context == launcher ]]; then
     unset CI_DAG_LAUNCH_RAW_BUILD_JOBS
     unset CI_DAG_EFFECTIVE_CPUS
     unset CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS
+    unset CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS
     unset CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS
     unset REVERIE_DBI_PINNED_MAX_PARALLEL_JOBS
     unset REVERIE_DBI_BUDGET_CHILD
@@ -54,6 +55,14 @@ fi
 
 if [[ $build_job_context != reverie-dbi-budget-child ]]; then
     echo "configure-build-jobs.sh: expected source mode launcher or reverie-dbi-budget-child" >&2
+    return 2
+fi
+
+# fc97 briefly exported this unconditioned threshold before the budget was
+# normalized to effective-job-seconds. A direct wrapper invocation must not
+# carry that retired authority into Cargo; normal launchers scrub it above.
+if [[ -v CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS ]]; then
+    echo "configure-build-jobs.sh: retired CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS is not accepted in a DBI budget child" >&2
     return 2
 fi
 
