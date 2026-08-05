@@ -16,8 +16,10 @@ ship.
 
 ## Currency gate
 
-`scripts/check-reverie-pin.rs` derives its scope from `git ls-files` and checks
-every tracked `Cargo.toml` and `Cargo.lock`. Every Reverie revision in that
+`scripts/check-reverie-pin.rs` is the canonical verifier source. The tracked
+`ci/run-reverie-pin-check.sh` launcher compiles it with `rustc`, derives its
+scope from `git ls-files`, and checks every tracked `Cargo.toml` and
+`Cargo.lock`. Every Reverie revision in that
 tracked Cargo dependency metadata must be identical and must equal the live
 `rrnewton/reverie:main` tip. The checker reports the manifest, lockfile,
 pinned-file, and revision-entry counts on every run so a green result states its
@@ -27,10 +29,10 @@ nested submodule contents are excluded because Hermit does not track their
 contents. Non-Cargo files are also outside this dependency-consistency check;
 it does not certify arbitrary SHA links in source or documentation. The checker
 fails closed when the remote cannot be checked. Run it locally through the
-proxy:
+proxy and the same launcher used by CI:
 
 ```bash
-with-proxy ./scripts/check-reverie-pin.rs
+with-proxy ./ci/run-reverie-pin-check.sh
 ```
 
 Install the tracked pre-commit gate once per clone/worktree repository:
@@ -69,7 +71,7 @@ counts are authoritative as the repository changes.
 Update every derived manifest and lockfile site in one command:
 
 ```bash
-with-proxy ./scripts/check-reverie-pin.rs --update-to-latest
+with-proxy ./ci/run-reverie-pin-check.sh --update-to-latest
 ```
 
 The checker derives every manifest from `git ls-files`, replaces the old

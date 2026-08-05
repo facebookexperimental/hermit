@@ -22,13 +22,13 @@
 //! Local use on Meta hosts:
 //!
 //! ```text
-//! with-proxy ./scripts/check-reverie-pin.rs
+//! with-proxy ./ci/run-reverie-pin-check.sh
 //! ```
 //!
 //! Repair every derived manifest and lockfile site with one command:
 //!
 //! ```text
-//! with-proxy ./scripts/check-reverie-pin.rs --update-to-latest
+//! with-proxy ./ci/run-reverie-pin-check.sh --update-to-latest
 //! ```
 
 #[path = "lib/rust_script_prelude.rs"]
@@ -418,7 +418,7 @@ fn blocked_instructions() {
     eprintln!();
     eprintln!("BLOCKED. Testing must use the latest rrnewton/reverie:main.");
     eprintln!("Update every derived manifest and lockfile site with:");
-    eprintln!("  with-proxy ./scripts/check-reverie-pin.rs --update-to-latest");
+    eprintln!("  with-proxy ./ci/run-reverie-pin-check.sh --update-to-latest");
     eprintln!("Policy and recovery details: docs/updating-reverie.md");
 }
 

@@ -14,7 +14,9 @@ fi
 root_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 liteinst_profile=$1
 liteinst_stable_input=$2
-reverie_pin=$("$root_dir/scripts/check-reverie-pin.rs" --print-pin)
+reverie_pin=$(
+    "$root_dir/ci/run-reverie-pin-check.sh" --repo "$root_dir" --print-pin
+)
 liteinst_target_dir=$(realpath -m -- "$3-${reverie_pin:0:8}")
 liteinst_stage_dir=$(dirname -- "$liteinst_stable_input")
 liteinst_stage_name=$(basename -- "$liteinst_stable_input")

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Block Hermit commits whose Reverie dependency pin is not latest Reverie main.
-# See scripts/check-reverie-pin.rs and docs/updating-reverie.md.
+# See the canonical checker launcher and docs/updating-reverie.md.
 
 set -u
 root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 1
-checker="$root/scripts/check-reverie-pin.rs"
+checker="$root/ci/run-reverie-pin-check.sh"
 
 if [[ ! -f "$checker" ]]; then
   echo "REVERIE PIN LINT: checker missing at $checker -- BLOCKED" >&2
@@ -18,7 +18,7 @@ if command -v with-proxy >/dev/null 2>&1; then
   proxy=(with-proxy)
 fi
 
-"${proxy[@]}" "$checker" || exit 1
+"${proxy[@]}" "$checker" --repo "$root" || exit 1
 
 # Also guard the nested-workspace lockfile against pin drift once its checker is
 # present (lands separately as rrnewton/hermit#1609). Until then this is a no-op.

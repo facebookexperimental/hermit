@@ -107,7 +107,7 @@ lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, c
 	@git diff --check
 	python3 scripts/test_validate_stop_paths.py
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
-	$(SUBMODULE_PROXY) ./scripts/check-reverie-pin.rs
+	$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
 
 help: ## Show this help (the list of make targets)

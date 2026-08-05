@@ -2023,22 +2023,16 @@ function initialize_repository_submodules {
 # Independent enforcement of the Reverie dependency pin. `git commit --no-verify`
 # bypasses the pre-commit hook, so validate.sh (and therefore every CI profile
 # that runs it) must catch a drifted or orphaned pin on its own. The check is
-# cheap: check-reverie-pin.rs scans tracked Cargo.toml/Cargo.lock and confirms
+# cheap: the canonical Reverie-pin checker scans tracked Cargo.toml/Cargo.lock and confirms
 # the pin is a real commit on rrnewton/reverie:main history. When the nested
 # lockfile guard is present (lands separately as rrnewton/hermit#1609) it also
 # runs so liteinst-runtime-build/Cargo.lock cannot drift from the root pin.
 #
-# Run one of those checkers WITHOUT requiring the `rust-script` interpreter on
-# PATH. CI's portable shard runners install the Rust toolchain but not
-# rust-script, so invoking the checker through its `#!/usr/bin/env rust-script`
-# shebang aborts with "/usr/bin/env: 'rust-script': No such file or directory"
-# before the gate can execute at all — the gate reports FAILED having verified
-# nothing, which is a no-result masquerading as a result. Both checkers are
-# single-file, dependency-free programs whose only module is a `#[path]` include
-# under scripts/lib, so plain rustc compiles them; that is exactly what the
-# `reverie-pin` job in .github/workflows/ci-portable.yml already does for these
-# same two files. Prefer the interpreter when it is installed (the normal
-# developer path), else compile once into VALIDATION_TMP_DIR and reuse.
+# Run a remaining standalone repository checker WITHOUT requiring the
+# `rust-script` interpreter on PATH. The Reverie-pin checker itself always uses
+# ci/run-reverie-pin-check.sh, the one canonical rustc launcher shared with the
+# DAGs, hosted workflow, hook, Makefile, and LiteInst staging. The helper below
+# remains for check-nested-lockfiles.rs until it receives its own launcher.
 function run_repo_rust_script {
     local script=$1
     shift
@@ -2061,7 +2055,7 @@ function run_repo_rust_script {
 }
 
 function validate_reverie_pin_consistency {
-    run_repo_rust_script ./scripts/check-reverie-pin.rs || return 1
+    "$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR" || return 1
     if [[ -x ./scripts/check-nested-lockfiles.rs ]]; then
         run_repo_rust_script ./scripts/check-nested-lockfiles.rs || return 1
     fi
@@ -4693,7 +4687,7 @@ fi
 # The archival pin is not a testing exemption: validate always proves it equals
 # the live Reverie main tip before initializing dependencies or running tests.
 run_check "Reverie dependency pin equals latest main" \
-    "$ROOT_DIR/scripts/check-reverie-pin.rs"
+    "$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR"
 if ((failures != 0)); then
     print_summary
     exit 1

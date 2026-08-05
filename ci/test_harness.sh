@@ -330,6 +330,7 @@ function assert_validate_entrypoint {
 function assert_reverie_pin_enforcement {
     local checker="$ROOT_DIR/scripts/check-reverie-pin.rs"
     local runner="$ROOT_DIR/ci/run-reverie-pin-check.sh"
+    local liteinst_stage="$ROOT_DIR/scripts/stage-liteinst-runtime.sh"
     grep -Fq '.args(["ls-remote", "--exit-code", remote, MAIN_REF])' "$checker" ||
         die "latest-Reverie checker must dereference refs/heads/main with git ls-remote"
     ! grep -Fq 'main_sha' "$checker" ||
@@ -338,6 +339,29 @@ function assert_reverie_pin_enforcement {
         die "production callers must not redirect the latest-Reverie authority"
     [[ -x $runner ]] ||
         die "latest-Reverie CI runner must be executable"
+    [[ $(grep -Fxc '"$checker" "$@"' "$runner") == 1 ]] ||
+        die "latest-Reverie runner must forward every verifier argument exactly"
+
+    # Full tracked-call-site audit: every CI/build/hook consumer found by the
+    # corresponding rg audit uses the rustc launcher. The only direct source
+    # consumers are the launcher itself, the trusted-main merge-gate compiler,
+    # and this semantic test; documentation/source mentions are non-executable.
+    local consumer
+    for consumer in Makefile .githooks/pre-commit validate.sh scripts/stage-liteinst-runtime.sh; do
+        if git -C "$ROOT_DIR" grep -n -F 'scripts/check-reverie-pin.rs' -- "$consumer"; then
+            die "$consumer bypasses the canonical Reverie-pin launcher"
+        fi
+    done
+    [[ $(grep -Fxc $'\t$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh' "$ROOT_DIR/Makefile") == 1 ]] ||
+        die "Makefile lint must use the canonical Reverie-pin launcher"
+    [[ $(grep -Fxc 'checker="$root/ci/run-reverie-pin-check.sh"' "$ROOT_DIR/.githooks/pre-commit") == 1 ]] ||
+        die "pre-commit hook must use the canonical Reverie-pin launcher"
+    [[ $(grep -Fxc '"${proxy[@]}" "$checker" --repo "$root" || exit 1' "$ROOT_DIR/.githooks/pre-commit") == 1 ]] ||
+        die "pre-commit hook must bind the launcher to the exact repository"
+    [[ $(grep -Fc '"$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR"' "$ROOT_DIR/validate.sh") == 2 ]] ||
+        die "both validate Reverie-pin gates must use the exact-repository launcher"
+    [[ $(grep -Fxc '    "$root_dir/ci/run-reverie-pin-check.sh" --repo "$root_dir" --print-pin' "$liteinst_stage") == 1 ]] ||
+        die "LiteInst staging must obtain its cache pin through the exact-repository launcher"
 
     local dag
     for dag in "$DAG_ROOT/portable.json" "$DAG_ROOT/privileged.json"; do
@@ -359,6 +383,7 @@ function assert_reverie_pin_enforcement {
     # error (2).
     (
         local scratch isolated_path fixture real_git current stale status
+        local fake_cargo staged_runtime direct_status
         scratch=$(mktemp -d)
         trap 'rm -rf -- "$scratch"' EXIT
         isolated_path="$scratch/bin"
@@ -397,6 +422,34 @@ EOF
         fi
         [[ $status == 1 ]] ||
             die "rustc checker stale-pin bracket returned $status instead of 1"
+
+        # Reproduce the hosted release-build failure signature, then exercise
+        # the real LiteInst staging script through the canonical launcher. A
+        # tiny Cargo stand-in isolates this regression to staging/launcher
+        # behavior while still requiring the production script to atomically
+        # install a non-empty runtime under a PATH with no rust-script.
+        if PATH="$isolated_path:/usr/local/bin:/usr/bin:/bin" \
+            "$checker" --repo "$ROOT_DIR" --print-pin >/dev/null 2>&1; then
+            direct_status=0
+        else
+            direct_status=$?
+        fi
+        [[ $direct_status == 127 ]] ||
+            die "direct LiteInst pin source negative returned $direct_status instead of hosted rc=127"
+        fake_cargo="$scratch/fake-cargo"
+        staged_runtime="$scratch/staged/libreverie_liteinst.so"
+        cat >"$fake_cargo" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ ${1:-} == build ]]
+[[ -n ${HERMIT_LITEINST_STAGE:-} ]]
+printf 'hermetic-liteinst-runtime\n' >"$HERMIT_LITEINST_STAGE"
+EOF
+        chmod +x "$fake_cargo"
+        PATH="$isolated_path:/usr/local/bin:/usr/bin:/bin" CARGO="$fake_cargo" \
+            "$liteinst_stage" dev "$staged_runtime" "$scratch/runtime-target"
+        [[ -s $staged_runtime && $(<"$staged_runtime") == hermetic-liteinst-runtime ]] ||
+            die "rust-script-free LiteInst staging did not install the fixture runtime"
     )
 
     [[ $(grep -Fc 'run_check "Reverie dependency pin equals latest main"' "$ROOT_DIR/validate.sh") == 1 ]] ||
