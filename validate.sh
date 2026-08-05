@@ -634,17 +634,34 @@ if [[ ! $VALIDATION_DAG_JOBS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 
-# Gate-count obligation for landing-eligible full runs. A full run is init plus
-# two independently recorded gates (manifest check + lane execution) for each of
-# portable and privileged. Partial/custom profiles are deliberately `null` until
-# their dynamic plans carry an equally strong declaration; they cannot certify a
-# full landing receipt anyway. The shared outcome authority uses run < expected
+# Gate-count obligation for landing-eligible `full` runs, DERIVED from what the
+# run actually executed rather than a hardcoded number, so it can never go stale
+# as gates are added or removed. `run_check` is not fail-fast: a `full` run that
+# reaches the end of `run_full_suite` has recorded EVERY gate in its plan exactly
+# once (the preflight submodule + Reverie-pin checks, then the portable and
+# privileged manifest lanes). We therefore DEFER the expected count to
+# ledger-write time and set it to the observed `gates_run` -- but ONLY once
+# VALIDATION_SUITE_COMPLETE proves the whole plan ran. An incomplete `full` run
+# (e.g. a preflight abort) leaves the flag 0 and the count `null`, so the outcome
+# authority applies no completeness check and can never misread a partial run as a
+# complete FAILED one.
+#
+# The prior literal `5` predated the unconditional "Reverie pin consistency"
+# preflight gate: every complete full run then recorded 6 gates while declaring 5,
+# so the shared authority read gates_run(6) != expected(5) as TRUNCATED. A genuine
+# full red could never be recorded as FAILED, and a genuine full green was
+# discarded from the qualified population. A magic `6` would drift again on the
+# next gate change (which is exactly how the `5` went stale); deriving from the
+# executed set removes the drift class entirely.
+#
+# Partial/custom profiles stay `null`: they carry no full-landing contract (a
+# single constant cannot be correct for `full` and, e.g.,
+# `portable-strict-compat-only`, whose plans have different gate counts -- that
+# divergence is itself the proof the value must be derived, not hardcoded). The
+# authority treats gates_run < expected (and, in the classifier, run != expected)
 # as TRUNCATED, never FAILED.
-if [[ $VALIDATION_PROFILE == full ]]; then
-    VALIDATION_GATES_EXPECTED_JSON=5
-else
-    VALIDATION_GATES_EXPECTED_JSON=null
-fi
+VALIDATION_SUITE_COMPLETE=0
+VALIDATION_GATES_EXPECTED_JSON=null
 
 SUPER_JOBS=${SUPER_JOBS:-$(((host_cpus * 3 + 1) / 2))}
 if [[ ! $SUPER_JOBS =~ ^[1-9][0-9]*$ ]]; then
@@ -652,7 +669,9 @@ if [[ ! $SUPER_JOBS =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 readonly SUPER_REPETITIONS SUPER_JOBS host_cpus CI_DAG_JOBS_DEFAULT VALIDATION_DAG_JOBS
-readonly VALIDATION_GATES_EXPECTED_JSON
+# VALIDATION_GATES_EXPECTED_JSON / VALIDATION_SUITE_COMPLETE are intentionally NOT
+# readonly here: the expected count is derived at ledger-write time from the
+# gates actually executed, and the completion flag is set by run_full_suite.
 
 HOST_OS=$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | head -n 1)
 HOST_OS=${HOST_OS#\"}
@@ -1290,6 +1309,16 @@ function append_validation_ledger {
     done
     gates_json+=']'
     gates_run=${#ledger_gate_names[@]}
+
+    # Derive the full-run gate obligation from what actually executed (see the
+    # VALIDATION_SUITE_COMPLETE comment near the config block): a completed full
+    # plan recorded every gate exactly once, so gates_run IS the expected full
+    # coverage. This stays correct automatically as gates are added or removed,
+    # unlike the former hardcoded literal. Incomplete full runs and all partial
+    # profiles keep expected `null`, so no false completeness check is applied.
+    if [[ $VALIDATION_PROFILE == full ]] && ((VALIDATION_SUITE_COMPLETE == 1)); then
+        VALIDATION_GATES_EXPECTED_JSON=$gates_run
+    fi
 
     if ((VALIDATION_COMMIT_ANCHORED == 1)); then commit_anchored_json=true; else commit_anchored_json=false; fi
     if ((VALIDATION_TREE_DIRTY == 1)); then tree_dirty_json=true; else tree_dirty_json=false; fi
@@ -4267,6 +4296,10 @@ function run_quick_suite {
 function run_full_suite {
     run_ci_manifest_lane portable "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}"
     run_ci_manifest_lane privileged "${CI_PRIVILEGED_DAG_TIMEOUT_SECONDS:-7200}"
+    # Both lanes ran to completion, so every gate in the full plan has been
+    # recorded (run_check is not fail-fast). This authorizes deriving the
+    # expected gate count from the observed gates_run at ledger-write time.
+    VALIDATION_SUITE_COMPLETE=1
 }
 
 function run_portable_slow_strict_diagnostics {
