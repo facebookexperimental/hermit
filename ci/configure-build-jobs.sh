@@ -14,6 +14,23 @@ if [[ ! $CI_DAG_BUILD_JOBS =~ ^[1-9][0-9]*$ ]]; then
     return 2
 fi
 
+# The safe DAG runner writes its cap-derived CARGO_BUILD_JOBS inside each boxed
+# child, after the launch script has run. Preserve that post-wrapper value when
+# present; CI_DAG_BUILD_JOBS is only the unboxed/ambient fallback. The DBI budget
+# wrapper re-sources this file inside the child so the timeout and Cargo's actual
+# NUM_JOBS input are bound to the same raw value.
+if [[ -n ${CARGO_BUILD_JOBS:-} ]]; then
+    REVERIE_DBI_BUILD_JOBS_SOURCE=cargo-build-jobs
+    REVERIE_DBI_RAW_BUILD_JOBS=$CARGO_BUILD_JOBS
+else
+    REVERIE_DBI_BUILD_JOBS_SOURCE=ci-dag-build-jobs-fallback
+    REVERIE_DBI_RAW_BUILD_JOBS=$CI_DAG_BUILD_JOBS
+fi
+if [[ ! $REVERIE_DBI_RAW_BUILD_JOBS =~ ^[1-9][0-9]*$ ]]; then
+    echo "configure-build-jobs.sh: selected raw build width must be a positive integer" >&2
+    return 2
+fi
+
 # Reverie 025d378's DynamoRIO source-build ratchet accepts an elapsed-seconds
 # override. Its build.rs clamps Cargo's NUM_JOBS to 16 before passing it to
 # `cmake --parallel`; the operating system cannot execute more jobs at once than
@@ -50,7 +67,7 @@ if [[ ! $CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS =~ ^[1-9][0-9]*$ ]] ||
     return 2
 fi
 
-REVERIE_DBI_EFFECTIVE_BUILD_JOBS=$CI_DAG_BUILD_JOBS
+REVERIE_DBI_EFFECTIVE_BUILD_JOBS=$REVERIE_DBI_RAW_BUILD_JOBS
 if ((CI_DAG_EFFECTIVE_CPUS < REVERIE_DBI_EFFECTIVE_BUILD_JOBS)); then
     REVERIE_DBI_EFFECTIVE_BUILD_JOBS=$CI_DAG_EFFECTIVE_CPUS
 fi
@@ -71,8 +88,10 @@ REVERIE_DBI_MAX_BUILD_SECONDS=$((
 
 # Cargo converts this explicit pool width into build-script NUM_JOBS. Keep the
 # nested native-build knob identical so validate.sh cannot widen the pool again.
-export CARGO_BUILD_JOBS=$CI_DAG_BUILD_JOBS
-export THIRD_PARTY_BUILD_JOBS=$CI_DAG_BUILD_JOBS
+export CARGO_BUILD_JOBS=$REVERIE_DBI_RAW_BUILD_JOBS
+export THIRD_PARTY_BUILD_JOBS=$REVERIE_DBI_RAW_BUILD_JOBS
+export REVERIE_DBI_BUILD_JOBS_SOURCE
+export REVERIE_DBI_RAW_BUILD_JOBS
 export CI_DAG_EFFECTIVE_CPUS
 export CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS
 export REVERIE_DBI_EFFECTIVE_BUILD_JOBS
