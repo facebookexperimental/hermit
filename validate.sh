@@ -1675,6 +1675,48 @@ function append_validation_ledger {
         [[ $filtered_tests_json =~ ^(null|[0-9]+)$ ]] || filtered_tests_json=null
     fi
 
+    # schema_version 5 per-node COVERAGE obligation. Completeness is a COVERAGE
+    # question, not an executed-test COUNT (`executed_tests` above is DIAGNOSTIC
+    # ONLY -- one commit can carry several different aggregate counts). The single
+    # coverage computer is finalize_receipt.build_coverage; we call it here rather
+    # than re-implementing the per-node parse, so writer and the landing-time
+    # `--scan` minter share ONE definition. It reads THIS run's log plus the DAG
+    # manifests at the exact commit (`git show <sha>:ci/dag/*.json`) and returns
+    # coverage{planned_test_nodes,executed_test_nodes,zero_executed_nodes,
+    # absent_nodes}. We bump the row to schema 5 ONLY when a REAL judgement exists
+    # (coverage non-null AND planned_test_nodes>0): then the consumer classifies on
+    # coverage. When the finalizer, python3, jq, or the manifests are unavailable
+    # the judgement is UNRESOLVABLE -- coverage stays null / the row stays schema 4
+    # so the existing grandfather (executed_tests) still stands and absence is
+    # NEVER read as incomplete. The emitted row shape is identical to the schema-5
+    # rows finalize_receipt.py --scan already mints, so no consumer is disturbed.
+    local coverage_helper coverage_out coverage_json=null coverage_planned=0
+    local ledger_schema=4
+    coverage_helper="$DEV_HERMIT_PARENT/ci-hub/validate/finalize_receipt.py"
+    if [[ -n $DEV_HERMIT_PARENT && -r $coverage_helper && -n $VALIDATION_COMMIT ]] \
+        && command -v python3 >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+        if coverage_out=$(python3 "$coverage_helper" --log "$LOG_FILE" \
+            --sha "$VALIDATION_COMMIT" --hermit-checkout "$ROOT_DIR" \
+            --emit-only 2>>"$LOG_FILE"); then
+            coverage_json=$(jq -c '.coverage // empty' <<<"$coverage_out" 2>/dev/null)
+            [[ -n $coverage_json ]] || coverage_json=null
+            if [[ $coverage_json != null ]]; then
+                coverage_planned=$(jq -r '.planned_test_nodes // 0' <<<"$coverage_json" 2>/dev/null)
+                [[ $coverage_planned =~ ^[0-9]+$ ]] || coverage_planned=0
+                if ((coverage_planned > 0)); then
+                    # A real per-node judgement -> activate the schema-5 contract.
+                    ledger_schema=5
+                else
+                    # planned==0: manifests not derivable at this commit -> the
+                    # judgement is UNRESOLVABLE, not "complete". Emit null (as the
+                    # --scan minter reports no-manifest and skips) and stay schema 4
+                    # so the grandfather/named-gate path decides, never a false red.
+                    coverage_json=null
+                fi
+            fi
+        fi
+    fi
+
     # schema_version 3 adds commit_anchored/tree_dirty/selection_mode; schema_version
     # 4 adds `tree` (the content-addressed build+test identity, the result-cache
     # key), `toolchain` (the rustc build environment the cache must match), and
@@ -1684,7 +1726,7 @@ function append_validation_ledger {
     # the parent ledger aggregator reads via .get() and is
     # unaffected until it is taught to surface them. (warm-vs-cold is already
     # recorded as cache_state, so this does not duplicate it.)
-    line="{\"schema_version\":4,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
+    line="{\"schema_version\":$ledger_schema,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
     line+="\"finished_at\":$(json_quote "$finished_at"),\"host\":$(json_quote "$VALIDATION_HOST"),"
     line+="\"toolchain\":$(json_quote "$VALIDATION_TOOLCHAIN"),"
     line+="\"slot\":$(json_quote "$VALIDATION_SLOT"),\"cwd\":$(json_quote "$ROOT_DIR"),"
@@ -1710,6 +1752,7 @@ function append_validation_ledger {
     line+="\"gates_run\":$gates_run,\"gates_expected\":$VALIDATION_GATES_EXPECTED_JSON,"
     line+="\"interruption_signal\":$interruption_signal_json,"
     line+="\"executed_tests\":$executed_tests_json,\"filtered_tests\":$filtered_tests_json,"
+    line+="\"coverage\":$coverage_json,"
     line+="\"real_seconds\":$wall_seconds,\"user_seconds\":$cpu_user,\"sys_seconds\":$cpu_sys,"
     line+="\"log_file\":$(json_quote "$LOG_FILE"),\"gates\":$gates_json}"
 
