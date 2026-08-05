@@ -707,6 +707,9 @@ readonly VALIDATE_THIRD_PARTY_BUILD_JOBS_CAP
 
 checks=0
 failures=0
+# The signal trap sets this before EXIT cleanup writes the ledger. An explicit
+# operator stop is a NO-RESULT unless a completed gate already proved a failure.
+VALIDATION_INTERRUPTION_SIGNAL=""
 # Environmental (sandbox) blocks that survived all retries. Counted toward
 # `failures` too, so every existing `((failures == 0))` exit gate still fails a
 # blocked run, but tracked separately so the summary can distinguish an
@@ -727,8 +730,12 @@ declare -a ledger_gate_statuses=()
 declare -a ledger_gate_durations=()
 VALIDATION_CONCURRENCY_MONITOR_PID=""
 
-mkdir -p "$ROOT_DIR/target/validation"
-VALIDATION_TMP_DIR=$(mktemp -d "$ROOT_DIR/target/validation/hermit-validate.XXXXXX")
+VALIDATION_TMP_PARENT="$ROOT_DIR/target/validation"
+if [[ ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} == 1 && -n ${VALIDATE_STOP_TEST_TMP_ROOT:-} ]]; then
+    VALIDATION_TMP_PARENT=$VALIDATE_STOP_TEST_TMP_ROOT
+fi
+mkdir -p "$VALIDATION_TMP_PARENT"
+VALIDATION_TMP_DIR=$(mktemp -d "$VALIDATION_TMP_PARENT/hermit-validate.XXXXXX")
 if [[ -z $VALIDATION_TMP_DIR ]]; then
     echo "Unable to create validation workspace." >&2
     exit 1
@@ -1164,6 +1171,17 @@ function record_ledger_gate {
     ledger_gate_durations+=("$3")
 }
 
+function interruption_is_no_result {
+    local status
+
+    [[ -n $VALIDATION_INTERRUPTION_SIGNAL ]] || return 1
+    ((failures == 0)) || return 1
+    for status in "${ledger_gate_statuses[@]}"; do
+        ((status == 0)) || return 1
+    done
+    return 0
+}
+
 function json_quote {
     local value=$1
     value=${value//\\/\\\\}
@@ -1231,13 +1249,14 @@ function validate_lock_exclusivity_proven {
 function append_validation_ledger {
     local exit_status=$1
     local wall_seconds=$2 cpu_user=$3 cpu_sys=$4
-    local finished_at result gates_json gate_result line
+    local finished_at result raw_result gates_json gate_result line
     local count_helper counts executed_tests_json=null filtered_tests_json=null
     local commit_anchored_json tree_dirty_json concurrent_validates_json concurrency_proof_json gates_run
     local evidence_helper evidence_json failed_substeps_json='[]' flaky_failed_substeps_json='[]'
     local known_flaky_failure_json=null solo_rerun_confirmation_json=false
     local solo_rerun_of_json=null
     local evidence_available=0 failure_origin_json gate_substeps_json
+    local interruption_signal_json=null
     local i
 
     [[ -n $VALIDATION_LEDGER_FILE ]] || return 0
@@ -1245,9 +1264,17 @@ function append_validation_ledger {
     finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
     if ((exit_status == 0 && failures == 0)); then
-        result=pass
+        raw_result=pass
     else
-        result=fail
+        raw_result=fail
+    fi
+    if interruption_is_no_result; then
+        # An operator stop learned nothing new about the product. Preserve the
+        # raw shell result for forensics, but do not mint a FAILED verdict unless
+        # a completed gate had already established one before the stop.
+        result=no_result
+    else
+        result=$raw_result
     fi
 
     if [[ -r $VALIDATION_CONCURRENT_MARKER ]]; then
@@ -1322,6 +1349,9 @@ function append_validation_ledger {
 
     if ((VALIDATION_COMMIT_ANCHORED == 1)); then commit_anchored_json=true; else commit_anchored_json=false; fi
     if ((VALIDATION_TREE_DIRTY == 1)); then tree_dirty_json=true; else tree_dirty_json=false; fi
+    if [[ -n $VALIDATION_INTERRUPTION_SIGNAL ]]; then
+        interruption_signal_json=$(json_quote "$VALIDATION_INTERRUPTION_SIGNAL")
+    fi
 
     # Use the parent's single-sourced libtest-banner parser. Unknown stays null;
     # the receipt publisher fails closed rather than turning missing evidence
@@ -1337,8 +1367,11 @@ function append_validation_ledger {
 
     # schema_version 3 adds commit_anchored/tree_dirty/selection_mode; schema_version
     # 4 adds `tree` (the content-addressed build+test identity, the result-cache
-    # key) and `toolchain` (the rustc build environment the cache must match). The
-    # fields are additive; the parent ledger aggregator reads via .get() and is
+    # key), `toolchain` (the rustc build environment the cache must match), and
+    # first-class interruption evidence. A stopped run with no established gate
+    # failure records result=no_result; raw_result preserves the shell outcome
+    # without granting it product-verdict authority. The fields are additive;
+    # the parent ledger aggregator reads via .get() and is
     # unaffected until it is taught to surface them. (warm-vs-cold is already
     # recorded as cache_state, so this does not duplicate it.)
     line="{\"schema_version\":4,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
@@ -1352,7 +1385,7 @@ function append_validation_ledger {
     line+="\"git_depth\":$VALIDATION_GIT_DEPTH,"
     line+="\"git_ahead\":$VALIDATION_GIT_AHEAD,\"git_behind\":$VALIDATION_GIT_BEHIND,"
     line+="\"commit_anchored\":$commit_anchored_json,\"tree_dirty\":$tree_dirty_json,"
-    line+="\"result\":\"$result\",\"exit_code\":$exit_status,"
+    line+="\"result\":\"$result\",\"raw_result\":\"$raw_result\",\"exit_code\":$exit_status,"
     line+="\"checks\":$checks,\"failures\":$failures,"
     line+="\"dag_jobs\":$VALIDATION_DAG_JOBS,\"concurrent_validates\":$concurrent_validates_json,"
     line+="\"concurrency_proof\":$concurrency_proof_json,"
@@ -1361,6 +1394,7 @@ function append_validation_ledger {
     line+="\"solo_rerun_confirmation\":$solo_rerun_confirmation_json,"
     line+="\"solo_rerun_of\":$solo_rerun_of_json,"
     line+="\"gates_run\":$gates_run,\"gates_expected\":$VALIDATION_GATES_EXPECTED_JSON,"
+    line+="\"interruption_signal\":$interruption_signal_json,"
     line+="\"executed_tests\":$executed_tests_json,\"filtered_tests\":$filtered_tests_json,"
     line+="\"real_seconds\":$wall_seconds,\"user_seconds\":$cpu_user,\"sys_seconds\":$cpu_sys,"
     line+="\"log_file\":$(json_quote "$LOG_FILE"),\"gates\":$gates_json}"
@@ -1410,7 +1444,9 @@ function print_wall_cpu_summary {
     else
         ratio="n/a"
     fi
-    if ((exit_status == 0 && failures == 0)); then
+    if interruption_is_no_result; then
+        marker="⏹"
+    elif ((exit_status == 0 && failures == 0)); then
         marker="✅"
     else
         marker="❌"
@@ -1464,19 +1500,25 @@ function cleanup {
     local pid
 
     trap - EXIT
+    # Cleanup is the evidence commit point. A second stop signal must not abort
+    # it between child teardown and the single ledger append.
+    trap '' INT TERM HUP
+
+    if [[ -n ${VALIDATE_STOP_TEST_CLEANUP_READY_FILE:-} ]]; then
+        printf '%s\n' "$$" >"$VALIDATE_STOP_TEST_CLEANUP_READY_FILE"
+        sleep "${VALIDATE_STOP_TEST_CLEANUP_DELAY_SECONDS:-0.5}"
+    fi
 
     if [[ -n $VALIDATION_CONCURRENCY_MONITOR_PID ]]; then
-        kill "$VALIDATION_CONCURRENCY_MONITOR_PID" 2>/dev/null || true
-        wait "$VALIDATION_CONCURRENCY_MONITOR_PID" 2>/dev/null || true
+        terminate_gate_tree "$VALIDATION_CONCURRENCY_MONITOR_PID"
     fi
 
     if [[ -n $active_check_pid ]]; then
-        kill_process_tree "$active_check_pid" TERM
+        terminate_gate_tree "$active_check_pid"
     fi
     for pid in "${background_pids[@]}"; do
-        kill_process_tree "$pid" TERM
+        terminate_gate_tree "$pid"
     done
-    wait 2>/dev/null || true
 
     # Wall + CPU for the whole run, computed ONCE here in the trap's top-level
     # shell context (a subshell's `times` would miss the accumulated child CPU).
@@ -1517,13 +1559,41 @@ function cleanup {
 }
 
 function interrupted {
+    local signal=$1
+    VALIDATION_INTERRUPTION_SIGNAL=$signal
     trap - INT TERM
-    printf "❌ Validation interrupted (full log: %s)\n" "$LOG_FILE"
+    trap - HUP
+    printf "⏹ Validation interrupted by %s; preserving any earlier gate failure, otherwise recording NO-RESULT (full log: %s)\n" \
+        "$signal" "$LOG_FILE"
     exit 130
 }
 trap cleanup EXIT
-trap interrupted INT TERM
+trap 'interrupted INT' INT
+trap 'interrupted TERM' TERM
+trap 'interrupted HUP' HUP
 start_validation_concurrency_monitor
+
+# Test seam for scripts/test_validate_stop_paths.py. It exercises this script's
+# real traps and ledger writer without starting a product build. The mode cannot
+# produce a pass: it deliberately waits until a test sends a stop signal.
+if [[ ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} == 1 ]]; then
+    if [[ ${VALIDATE_STOP_TEST_PRIOR_FAILURE:-0} == 1 ]]; then
+        record_ledger_gate "stop-test completed gate 1" 1 0
+        failures=1
+    else
+        record_ledger_gate "stop-test completed gate 1" 0 0
+    fi
+    record_ledger_gate "stop-test completed gate 2" 0 0
+    checks=2
+    if [[ -n ${VALIDATE_STOP_TEST_PID_FILE:-} ]]; then
+        printf "%s\n" "$$" >"$VALIDATE_STOP_TEST_PID_FILE"
+    fi
+    printf "VALIDATE_STOP_TEST_READY pid=%s\n" "$$"
+    if [[ ${VALIDATE_STOP_TEST_EXIT_EARLY:-0} == 1 ]]; then
+        exit 1
+    fi
+    while :; do sleep 1; done
+fi
 
 # Return success (0) when the failed check's log region carries the signature of
 # an ENVIRONMENTAL sandbox denial rather than a product/test failure. The Claude
