@@ -188,12 +188,8 @@ jobs:
       - name: Require the exact latest Reverie main revision
         run: |
           set -euo pipefail
-          checker="$RUNNER_TEMP/check-reverie-pin"
-          checker_tests="$RUNNER_TEMP/check-reverie-pin-tests"
-          RUSTUP_TOOLCHAIN=stable rustc --edition=2021 --test scripts/check-reverie-pin.rs -o "$checker_tests"
-          "$checker_tests"
-          RUSTUP_TOOLCHAIN=stable rustc --edition=2021 scripts/check-reverie-pin.rs -o "$checker"
-          "$checker"
+          ./ci/run-reverie-pin-check.sh --self-test
+          ./ci/run-reverie-pin-check.sh
       - name: Reject a stale nested-workspace Cargo.lock before the opaque --locked build failure
         run: |
           set -euo pipefail

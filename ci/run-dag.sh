@@ -117,5 +117,5 @@ if (($# > 0)) && [[ $1 == list || $1 == ascii || $1 == dot || $1 == json ]]; the
     shift
 fi
 
-echo "run-dag.sh: lane=$lane runner=$runner verb=$verb cargo-jobs=$CARGO_BUILD_JOBS" >&2
+echo "run-dag.sh: lane=$lane runner=$runner verb=$verb cargo-jobs=$CARGO_BUILD_JOBS reverie-dbi-budget={requested-jobs:$CARGO_BUILD_JOBS,effective-cpus:$CI_DAG_EFFECTIVE_CPUS,job-seconds:$CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBI_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3}" >&2
 exec "$runner" "$verb" --dag "$dag" "$@"

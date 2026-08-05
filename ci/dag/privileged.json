@@ -8,7 +8,7 @@
     {
       "group": "check", "job": "reverie_pin",
       "desc": "Require Hermit's recorded Reverie revision to equal latest rrnewton/reverie:main",
-      "cmd": "./scripts/check-reverie-pin.rs",
+      "cmd": "./ci/run-reverie-pin-check.sh",
       "timeout": 120,
       "hint": {"est_duration_s": 5, "rss_baseline_bytes": 67108864,
                "hard_mem_max_bytes": 536870912, "classification": "light"}

@@ -329,12 +329,15 @@ function assert_validate_entrypoint {
 # different local, DAG, hosted-CI, merge-gate, or receipt path.
 function assert_reverie_pin_enforcement {
     local checker="$ROOT_DIR/scripts/check-reverie-pin.rs"
+    local runner="$ROOT_DIR/ci/run-reverie-pin-check.sh"
     grep -Fq '.args(["ls-remote", "--exit-code", remote, MAIN_REF])' "$checker" ||
         die "latest-Reverie checker must dereference refs/heads/main with git ls-remote"
     ! grep -Fq 'main_sha' "$checker" ||
         die "latest-Reverie checker must not accept a pre-recorded main SHA"
     ! grep -Fq -- '--reverie-remote' "$checker" ||
         die "production callers must not redirect the latest-Reverie authority"
+    [[ -x $runner ]] ||
+        die "latest-Reverie CI runner must be executable"
 
     local dag
     for dag in "$DAG_ROOT/portable.json" "$DAG_ROOT/privileged.json"; do
@@ -342,11 +345,59 @@ function assert_reverie_pin_enforcement {
             [.steps[] | select(
                 .group == "check"
                 and .job == "reverie_pin"
-                and .cmd == "./scripts/check-reverie-pin.rs"
+                and .cmd == "./ci/run-reverie-pin-check.sh"
             )] | length == 1
         ' "$dag" >/dev/null ||
             die "${dag#"$ROOT_DIR/"} must contain exactly one latest-Reverie pin gate"
     done
+
+    # Execute the same rustc wrapper with a PATH that deliberately excludes
+    # rust-script. A fake git transport keeps both brackets hermetic while the
+    # production checker still dereferences refs/heads/main and scans a real Git
+    # fixture. The positive arm proves the path fires; the planted stale pin
+    # must return the checker's typed policy refusal (1), not a compile/no-result
+    # error (2).
+    (
+        local scratch isolated_path fixture real_git current stale status
+        scratch=$(mktemp -d)
+        trap 'rm -rf -- "$scratch"' EXIT
+        isolated_path="$scratch/bin"
+        fixture="$scratch/hermit"
+        real_git=$(command -v git)
+        current=0123456789abcdef0123456789abcdef01234567
+        stale=89abcdef0123456789abcdef0123456789abcdef
+        mkdir -p "$isolated_path" "$fixture"
+        ln -s "$(command -v rustc)" "$isolated_path/rustc"
+        if PATH="$isolated_path:/usr/bin:/bin" command -v rust-script >/dev/null; then
+            die "rust-script unexpectedly present in isolated checker PATH"
+        fi
+        PATH="$isolated_path:/usr/bin:/bin" "$runner" --self-test >/dev/null
+        cat >"$isolated_path/git" <<EOF
+#!/usr/bin/env bash
+if [[ \${1:-} == ls-remote ]]; then
+    printf '%s\trefs/heads/main\n' '$current'
+    exit 0
+fi
+exec '$real_git' "\$@"
+EOF
+        chmod +x "$isolated_path/git"
+        "$real_git" -C "$fixture" init -q
+        printf '[dependencies]\nreverie = { git = "https://github.com/rrnewton/reverie.git", rev = "%s" }\n' \
+            "$current" >"$fixture/Cargo.toml"
+        "$real_git" -C "$fixture" add Cargo.toml
+        PATH="$isolated_path:/usr/bin:/bin" "$runner" --repo "$fixture" >/dev/null
+
+        printf '[dependencies]\nreverie = { git = "https://github.com/rrnewton/reverie.git", rev = "%s" }\n' \
+            "$stale" >"$fixture/Cargo.toml"
+        if PATH="$isolated_path:/usr/bin:/bin" "$runner" --repo "$fixture" \
+            >/dev/null 2>&1; then
+            status=0
+        else
+            status=$?
+        fi
+        [[ $status == 1 ]] ||
+            die "rustc checker stale-pin bracket returned $status instead of 1"
+    )
 
     [[ $(grep -Fc 'run_check "Reverie dependency pin equals latest main"' "$ROOT_DIR/validate.sh") == 1 ]] ||
         die "validate.sh must execute the latest-Reverie gate exactly once"
@@ -360,8 +411,10 @@ function assert_reverie_pin_enforcement {
         die "portable CI must expose exactly one latest-Reverie job"
     [[ $(grep -Fxc '      - reverie-pin' "$portable_workflow") == 1 ]] ||
         die "the authoritative portable aggregate must depend on the Reverie pin job"
-    [[ $(grep -Fxc '          "$checker"' "$portable_workflow") == 1 ]] ||
-        die "portable CI must execute the canonical live-query checker"
+    [[ $(grep -Fxc '          ./ci/run-reverie-pin-check.sh --self-test' "$portable_workflow") == 1 ]] ||
+        die "portable CI must execute the canonical checker self-tests through rustc"
+    [[ $(grep -Fxc '          ./ci/run-reverie-pin-check.sh' "$portable_workflow") == 1 ]] ||
+        die "portable CI must execute the canonical live-query checker through rustc"
     ! grep -Fq 'Stale-Reverie-Pin-Reason' "$portable_workflow" ||
         die "portable CI must not retain a stale-Reverie override"
 
@@ -408,15 +461,39 @@ function audit_ci_correspondence {
     # shellcheck disable=SC2016
     [[ $(grep -Fxc 'source "$ROOT_DIR/ci/configure-build-jobs.sh" || exit $?' "$ROOT_DIR/ci/run-node.sh") == 1 ]] ||
         die "run-node.sh must source the shared build-job configuration exactly once"
-    local configured_jobs
-    configured_jobs=$(
-        CI_DAG_BUILD_JOBS=5 bash -c 'source "$1"; printf "%s %s\n" "$CARGO_BUILD_JOBS" "$THIRD_PARTY_BUILD_JOBS"' \
+    local budget_record='reverie-dbi-budget={requested-jobs:$CARGO_BUILD_JOBS,effective-cpus:$CI_DAG_EFFECTIVE_CPUS,job-seconds:$CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBI_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3}'
+    [[ $(grep -Fc "$budget_record" "$ROOT_DIR/ci/run-dag.sh") == 1 ]] ||
+        die "run-dag.sh must log the DBI threshold together with its requested-job condition"
+    [[ $(grep -Fc "$budget_record" "$ROOT_DIR/ci/run-node.sh") == 1 ]] ||
+        die "run-node.sh must log the DBI threshold together with its requested-job condition"
+    local configured_jobs default_jobs mutated_budget
+    default_jobs=$(
+        bash -c 'unset CI_DAG_BUILD_JOBS CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS REVERIE_DBI_MAX_BUILD_SECONDS; source "$1"; printf "%s %s %s\n" "$CARGO_BUILD_JOBS" "$THIRD_PARTY_BUILD_JOBS" "$REVERIE_DBI_MAX_BUILD_SECONDS"' \
             _ "$ROOT_DIR/ci/configure-build-jobs.sh"
     )
-    [[ $configured_jobs == "5 5" ]] ||
-        die "shared build-job configuration did not propagate mutation K=5: $configured_jobs"
+    [[ $default_jobs == "8 8 263" ]] ||
+        die "shared build-job configuration did not bind the default j8 width to ceil(2100/8)=263s: $default_jobs"
+    configured_jobs=$(
+        CI_DAG_BUILD_JOBS=5 bash -c 'unset REVERIE_DBI_MAX_BUILD_SECONDS; source "$1"; printf "%s %s %s\n" "$CARGO_BUILD_JOBS" "$THIRD_PARTY_BUILD_JOBS" "$REVERIE_DBI_MAX_BUILD_SECONDS"' \
+            _ "$ROOT_DIR/ci/configure-build-jobs.sh"
+    )
+    [[ $configured_jobs == "5 5 420" ]] ||
+        die "shared build-job configuration did not propagate mutation K=5 with ceil(2100/5)=420s: $configured_jobs"
+    mutated_budget=$(
+        CI_DAG_BUILD_JOBS=8 CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS=2105 \
+            bash -c 'source "$1"; printf "%s\n" "$REVERIE_DBI_MAX_BUILD_SECONDS"' \
+            _ "$ROOT_DIR/ci/configure-build-jobs.sh"
+    )
+    [[ $mutated_budget == 264 ]] ||
+        die "shared build-job configuration did not cross the ceil boundary for mutated 2105/8=264s: $mutated_budget"
     if CI_DAG_BUILD_JOBS=0 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
         die "shared build-job configuration accepted an invalid zero width"
+    fi
+    if CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS=0 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+        die "shared build-job configuration accepted an invalid zero DBI job-second threshold"
+    fi
+    if CI_DAG_EFFECTIVE_CPUS=0 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+        die "shared build-job configuration accepted an invalid zero effective-CPU observation"
     fi
 
     for lane in portable privileged; do
