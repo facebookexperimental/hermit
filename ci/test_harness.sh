@@ -462,6 +462,14 @@ function audit_ci_correspondence {
     [[ $(grep -Fxc 'source "$ROOT_DIR/ci/configure-build-jobs.sh" || exit $?' "$ROOT_DIR/ci/run-node.sh") == 1 ]] ||
         die "run-node.sh must source the shared build-job configuration exactly once"
     local budget_wrapper="$ROOT_DIR/ci/run-with-reverie-dbi-budget.sh"
+    local -a clean_budget_env=(
+        env
+        -u CARGO_BUILD_JOBS
+        -u SAFE_CI_IN_SCOPE
+        -u CI_DAG_LAUNCH_WIDTH_BOUND
+        -u CI_DAG_LAUNCH_BUILD_JOBS_SOURCE
+        -u CI_DAG_LAUNCH_RAW_BUILD_JOBS
+    )
     [[ -x $budget_wrapper ]] || die "DBI child-budget wrapper must be executable"
     [[ $(grep -Fc 'reverie-dbi-budget=deferred-to-build-child' "$ROOT_DIR/ci/run-dag.sh") == 1 ]] ||
         die "run-dag.sh must identify its launcher budget as non-authoritative"
@@ -489,27 +497,27 @@ function audit_ci_correspondence {
     ' "$DAG_ROOT/privileged.json" >/dev/null ||
         die "portable-only DBI override must not alter the privileged launcher or timeout"
 
-    if env -u REVERIE_DBI_MAX_BUILD_SECONDS bash -c \
+    if "${clean_budget_env[@]}" -u REVERIE_DBI_MAX_BUILD_SECONDS bash -c \
         'source "$1"; export -p | grep -q "REVERIE_DBI_MAX_BUILD_SECONDS"' \
         _ "$ROOT_DIR/ci/configure-build-jobs.sh"; then
         die "launcher leaked the portable-only DBI elapsed override to unrelated children"
     fi
 
     local budget_probe budget_tuple clamp_boundaries cpu_boundaries mutated_budget
-    local hosted_wrapper_log boxed_wrapper_log
+    local hosted_wrapper_log boxed_wrapper_log polluted_wrapper_log isolated_wrapper_log
     # shellcheck disable=SC2016
     budget_probe='source "$1"; printf "%s %s %s %s %s %s %s %s\n" "$REVERIE_DBI_BUILD_JOBS_SOURCE" "$REVERIE_DBI_RAW_BUILD_JOBS" "$CARGO_BUILD_JOBS" "$THIRD_PARTY_BUILD_JOBS" "$CI_DAG_EFFECTIVE_CPUS" "$CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS" "$REVERIE_DBI_EFFECTIVE_BUILD_JOBS" "$REVERIE_DBI_MAX_BUILD_SECONDS"'
 
     # Hosted/unboxed: no post-wrapper Cargo width, so the declared DAG fallback
     # is the raw width. Boxed: the runner's child export wins over that fallback.
     budget_tuple=$(
-        env -u CARGO_BUILD_JOBS CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=4 \
+        "${clean_budget_env[@]}" CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=4 \
             bash -c "$budget_probe" _ "$ROOT_DIR/ci/configure-build-jobs.sh"
     )
     [[ $budget_tuple == "ci-dag-build-jobs-fallback 8 8 8 4 16 4 263" ]] ||
         die "hosted fallback j8/CPU4 did not derive raw=8, W=4, 263s: $budget_tuple"
     budget_tuple=$(
-        env -u CARGO_BUILD_JOBS CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=64 \
+        "${clean_budget_env[@]}" CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=64 \
             bash -c 'source "$1"; export SAFE_CI_IN_SCOPE=1 CARGO_BUILD_JOBS=32; source "$1"; printf "%s %s %s %s %s %s %s %s\n" "$REVERIE_DBI_BUILD_JOBS_SOURCE" "$REVERIE_DBI_RAW_BUILD_JOBS" "$CARGO_BUILD_JOBS" "$THIRD_PARTY_BUILD_JOBS" "$CI_DAG_EFFECTIVE_CPUS" "$CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS" "$REVERIE_DBI_EFFECTIVE_BUILD_JOBS" "$REVERIE_DBI_MAX_BUILD_SECONDS"' \
             _ "$ROOT_DIR/ci/configure-build-jobs.sh"
     )
@@ -517,30 +525,55 @@ function audit_ci_correspondence {
         die "boxed child CARGO_BUILD_JOBS=32 did not override launcher j8 and clamp to W=16: $budget_tuple"
 
     hosted_wrapper_log=$(
-        env -u CARGO_BUILD_JOBS CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=4 \
+        "${clean_budget_env[@]}" CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=4 \
             bash -c 'source "$1"; "$2" true' \
             _ "$ROOT_DIR/ci/configure-build-jobs.sh" "$budget_wrapper" 2>&1
     )
     [[ $hosted_wrapper_log == *'source:ci-dag-build-jobs-fallback,raw-build-jobs:8,effective-cpus:4,reverie-max-jobs:16,effective-native-jobs:4,effective-job-seconds:1050,max-elapsed-seconds:263'* ]] ||
         die "production DBI wrapper did not log the hosted child fallback tuple: $hosted_wrapper_log"
     boxed_wrapper_log=$(
-        env -u CARGO_BUILD_JOBS CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=64 \
+        "${clean_budget_env[@]}" CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=64 \
             bash -c 'source "$1"; SAFE_CI_IN_SCOPE=1 CARGO_BUILD_JOBS=32 "$2" true' \
             _ "$ROOT_DIR/ci/configure-build-jobs.sh" "$budget_wrapper" 2>&1
     )
     [[ $boxed_wrapper_log == *'source:runner-child-cargo-build-jobs,raw-build-jobs:32,effective-cpus:64,reverie-max-jobs:16,effective-native-jobs:16,effective-job-seconds:1050,max-elapsed-seconds:66'* ]] ||
         die "production DBI wrapper did not log the boxed child width tuple: $boxed_wrapper_log"
 
-    budget_tuple=$(CARGO_BUILD_JOBS=4 CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=4 bash -c "$budget_probe" _ "$ROOT_DIR/ci/configure-build-jobs.sh")
+    # Plant the exact outer-scope contamination that a nested audit sees inside
+    # a boxed full DAG. First prove it is live; then prove the hermetic prefix
+    # removes it before exercising the real launcher-to-wrapper sequence.
+    polluted_wrapper_log=$(
+        SAFE_CI_IN_SCOPE=1 CARGO_BUILD_JOBS=99 \
+            CI_DAG_LAUNCH_WIDTH_BOUND=1 \
+            CI_DAG_LAUNCH_BUILD_JOBS_SOURCE=planted-pollution \
+            CI_DAG_LAUNCH_RAW_BUILD_JOBS=99 \
+            CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=64 \
+            "$budget_wrapper" true 2>&1
+    )
+    [[ $polluted_wrapper_log == *'source:runner-child-cargo-build-jobs,raw-build-jobs:99'* ]] ||
+        die "planted boxed-scope pollution was inert: $polluted_wrapper_log"
+    isolated_wrapper_log=$(
+        SAFE_CI_IN_SCOPE=1 CARGO_BUILD_JOBS=99 \
+            CI_DAG_LAUNCH_WIDTH_BOUND=1 \
+            CI_DAG_LAUNCH_BUILD_JOBS_SOURCE=planted-pollution \
+            CI_DAG_LAUNCH_RAW_BUILD_JOBS=99 \
+            "${clean_budget_env[@]}" CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=4 \
+            bash -c 'source "$1"; "$2" true' \
+            _ "$ROOT_DIR/ci/configure-build-jobs.sh" "$budget_wrapper" 2>&1
+    )
+    [[ $isolated_wrapper_log == *'source:ci-dag-build-jobs-fallback,raw-build-jobs:8,effective-cpus:4'* ]] ||
+        die "hermetic budget probe retained planted outer-scope pollution: $isolated_wrapper_log"
+
+    budget_tuple=$("${clean_budget_env[@]}" CARGO_BUILD_JOBS=4 CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=4 bash -c "$budget_probe" _ "$ROOT_DIR/ci/configure-build-jobs.sh")
     [[ $budget_tuple == "ambient-cargo-build-jobs 4 4 4 4 16 4 263" ]] ||
         die "raw K=4/CPU4 DBI budget did not preserve W=4 and 263s: $budget_tuple"
-    budget_tuple=$(CARGO_BUILD_JOBS=1 CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=4 bash -c "$budget_probe" _ "$ROOT_DIR/ci/configure-build-jobs.sh")
+    budget_tuple=$("${clean_budget_env[@]}" CARGO_BUILD_JOBS=1 CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=4 bash -c "$budget_probe" _ "$ROOT_DIR/ci/configure-build-jobs.sh")
     [[ $budget_tuple == "ambient-cargo-build-jobs 1 1 1 4 16 1 1050" ]] ||
         die "raw K=1/CPU4 DBI budget did not derive W=1 and 1050s: $budget_tuple"
 
     clamp_boundaries=$(
         for requested in 15 16 17 64; do
-            CARGO_BUILD_JOBS=$requested CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=64 \
+            "${clean_budget_env[@]}" CARGO_BUILD_JOBS=$requested CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=64 \
                 bash -c "$budget_probe" _ "$ROOT_DIR/ci/configure-build-jobs.sh"
         done
     )
@@ -548,58 +581,58 @@ function audit_ci_correspondence {
         die "post-wrapper K>16 clamp boundary did not hold W at 16: $clamp_boundaries"
 
     cpu_boundaries=$(
-        CARGO_BUILD_JOBS=17 CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=4 bash -c "$budget_probe" _ "$ROOT_DIR/ci/configure-build-jobs.sh"
-        CARGO_BUILD_JOBS=8 CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=2 bash -c "$budget_probe" _ "$ROOT_DIR/ci/configure-build-jobs.sh"
+        "${clean_budget_env[@]}" CARGO_BUILD_JOBS=17 CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=4 bash -c "$budget_probe" _ "$ROOT_DIR/ci/configure-build-jobs.sh"
+        "${clean_budget_env[@]}" CARGO_BUILD_JOBS=8 CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=2 bash -c "$budget_probe" _ "$ROOT_DIR/ci/configure-build-jobs.sh"
     )
     [[ $cpu_boundaries == $'ambient-cargo-build-jobs 17 17 17 4 16 4 263\nambient-cargo-build-jobs 8 8 8 2 16 2 525' ]] ||
         die "effective-CPU boundary did not cap post-wrapper width: $cpu_boundaries"
 
     mutated_budget=$(
-        CARGO_BUILD_JOBS=8 CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=4 \
+        "${clean_budget_env[@]}" CARGO_BUILD_JOBS=8 CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=4 \
             CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS=1052 \
             bash -c 'source "$1"; printf "%s\n" "$REVERIE_DBI_MAX_BUILD_SECONDS"' \
             _ "$ROOT_DIR/ci/configure-build-jobs.sh"
-        CARGO_BUILD_JOBS=8 CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=4 \
+        "${clean_budget_env[@]}" CARGO_BUILD_JOBS=8 CI_DAG_BUILD_JOBS=8 CI_DAG_EFFECTIVE_CPUS=4 \
             CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS=1053 \
             bash -c 'source "$1"; printf "%s\n" "$REVERIE_DBI_MAX_BUILD_SECONDS"' \
             _ "$ROOT_DIR/ci/configure-build-jobs.sh"
     )
     [[ $mutated_budget == $'263\n264' ]] ||
         die "effective-job-second mutation did not cross the W=4 ceil boundary: $mutated_budget"
-    if env -u CARGO_BUILD_JOBS CI_DAG_BUILD_JOBS=0 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+    if "${clean_budget_env[@]}" CI_DAG_BUILD_JOBS=0 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
         die "shared build-job configuration accepted an invalid zero fallback width"
     fi
-    if env -u CARGO_BUILD_JOBS CI_DAG_BUILD_JOBS=not-a-number bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+    if "${clean_budget_env[@]}" CI_DAG_BUILD_JOBS=not-a-number bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
         die "shared build-job configuration accepted a noninteger fallback width"
     fi
-    if CARGO_BUILD_JOBS=0 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+    if "${clean_budget_env[@]}" CARGO_BUILD_JOBS=0 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
         die "shared build-job configuration accepted an invalid zero child width"
     fi
-    if CARGO_BUILD_JOBS=not-a-number bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+    if "${clean_budget_env[@]}" CARGO_BUILD_JOBS=not-a-number bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
         die "shared build-job configuration accepted a noninteger child width"
     fi
-    if CI_DAG_LAUNCH_WIDTH_BOUND=1 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+    if "${clean_budget_env[@]}" CI_DAG_LAUNCH_WIDTH_BOUND=1 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
         die "shared build-job configuration accepted incomplete launch provenance"
     fi
-    if CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS=0 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+    if "${clean_budget_env[@]}" CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS=0 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
         die "shared build-job configuration accepted an invalid zero DBI effective-job-second threshold"
     fi
-    if CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS=not-a-number bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+    if "${clean_budget_env[@]}" CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS=not-a-number bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
         die "shared build-job configuration accepted a noninteger DBI effective-job-second threshold"
     fi
-    if CI_DAG_EFFECTIVE_CPUS=0 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+    if "${clean_budget_env[@]}" CI_DAG_EFFECTIVE_CPUS=0 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
         die "shared build-job configuration accepted an invalid zero effective-CPU observation"
     fi
-    if CI_DAG_EFFECTIVE_CPUS=not-a-number bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+    if "${clean_budget_env[@]}" CI_DAG_EFFECTIVE_CPUS=not-a-number bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
         die "shared build-job configuration accepted a noninteger effective-CPU observation"
     fi
-    if CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS=0 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+    if "${clean_budget_env[@]}" CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS=0 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
         die "shared build-job configuration accepted a zero Reverie clamp"
     fi
-    if CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS=not-a-number bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+    if "${clean_budget_env[@]}" CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS=not-a-number bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
         die "shared build-job configuration accepted a noninteger Reverie clamp"
     fi
-    if CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS=17 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
+    if "${clean_budget_env[@]}" CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS=17 bash -c 'source "$1"' _ "$ROOT_DIR/ci/configure-build-jobs.sh" 2>/dev/null; then
         die "shared build-job configuration accepted drift from the pinned Reverie clamp"
     fi
 
