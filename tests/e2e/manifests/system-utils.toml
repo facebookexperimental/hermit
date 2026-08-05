@@ -88,7 +88,7 @@ backends_enabled = ["ptrace"]
 dbi = "DBI coverage is owned by its backend parity partition"
 kvm = "KVM requires the privileged runner"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
-sabre = "SaBRe loses its private coordinator socket after guest exec; tracked by sabre_non_gated_parity"
+sabre = "The exec socket is fixed, but required date/clock virtual-time support remains owner-gated for SaBRe"
 
 [test.modes.replay]
 ci = false
@@ -302,7 +302,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "DBI coverage is owned by its backend parity partition"
 kvm = "KVM requires the privileged runner"
-sabre = "SaBRe requires its external runtime"
+sabre = "Ptrace and SaBRe each reach L2, but coreutils mktemp consumes different deterministic entropy positions and emits different name suffixes"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 
 [test.modes.replay]
@@ -523,7 +523,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "DBI coverage is owned by its backend parity partition"
 kvm = "KVM requires the privileged runner"
-sabre = "SaBRe openssl qualification is tracked by backend compatibility"
+sabre = "SaBRe and ptrace each reach L2, but libcrypto consumes different deterministic entropy positions and emits different hex stdout"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 
 [test.modes.replay]
@@ -578,7 +578,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "DBI coverage is owned by its backend parity partition"
 kvm = "KVM requires the privileged runner"
-sabre = "SaBRe requires its external runtime"
+sabre = "Certificate issuance combines wall-clock validity with multiple entropy draws; clock, random-stream, and full-trace support remain unqualified"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 
 [test.modes.replay]
@@ -692,7 +692,7 @@ backends_enabled = ["ptrace"]
 dbi = "DBI coverage is owned by its backend parity partition"
 kvm = "KVM requires the privileged runner"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
-sabre = "SaBRe loses its private coordinator socket after guest exec; tracked by sabre_non_gated_parity"
+sabre = "Path evidence found 33 raw syscall sites per execution in ld-linux and libc; trusted shared-object native execution is not SaBRe support"
 
 [test.modes.replay]
 ci = false
@@ -744,11 +744,10 @@ native = "The test asserts Hermit's virtualized process identity"
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace", "liteinst"]
+backends_enabled = ["ptrace", "liteinst", "sabre"]
 [test.modes.verify.backends_disabled]
 dbi = "DBI coverage is owned by its backend parity partition"
 kvm = "KVM requires the privileged runner"
-sabre = "SaBRe requires its external runtime"
 
 [test.modes.replay]
 ci = true

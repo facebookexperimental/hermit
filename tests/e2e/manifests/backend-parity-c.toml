@@ -352,7 +352,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+sabre = "SaBRe does not virtualize CPUID; this oracle requires Hermit's synthetic CPU identity"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]

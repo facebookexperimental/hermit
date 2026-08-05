@@ -78,7 +78,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+sabre = "Robust-futex owner-death wakeup exercises core Detcore scheduling and currently times out under SaBRe; owner review is required"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]

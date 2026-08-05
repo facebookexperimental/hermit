@@ -469,7 +469,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "DBI Python support is tracked by backend compatibility"
 kvm = "KVM Python coverage is in the privileged applications bucket"
-sabre = "SaBRe requires its external runtime"
+sabre = "SaBRe and ptrace each reach L2, but consume different deterministic entropy positions at Python exec and produce different hash seeds and stdout"
 liteinst = "LiteInst Python support is tracked by backend compatibility"
 
 [test.modes.replay]

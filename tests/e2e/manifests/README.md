@@ -88,6 +88,21 @@ The mode contracts are:
 | `naked` | Opt-in meta-CI only; run natively three to five times and require declared variation |
 | `custom` | Run declared edge-case Hermit arguments and require three to five identical observations |
 
+An enabled `verify` cell records backend-local L2 support under the manifest's
+declared status/stdout/stderr/artifact observation. It is not, by itself, a
+full cross-backend parity claim. Full parity additionally requires matching the
+complete INFO trace, `--detlog-stack`, and `--detlog-heap` between backends.
+
+An enabled SaBRe cell has an additional execution-path contract. Every E2E
+Hermit execution writes structured evidence into the cell capture: the
+in-guest tool must have issued a coordinator RPC, and both
+`ptrace_fallback_sites` and `trusted_shared_object_sites` must be zero. A
+ptrace-installed SaBRe marker is
+classified as fallback; a raw syscall observed in a trusted shared object is
+classified as native execution outside the measured SaBRe path. Either makes
+the cell fail even when status and stdout match. The JSONL result retains the
+per-execution records and aggregate eligibility under `execution_path`.
+
 Any mode may declare backend-specific guest arguments. The harness appends
 these after the guest executable, separately from Hermit's own arguments:
 

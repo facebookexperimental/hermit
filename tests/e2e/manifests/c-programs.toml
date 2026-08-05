@@ -74,10 +74,9 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace", "dbi"]
+backends_enabled = ["ptrace", "dbi", "sabre"]
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "SaBRe does not yet portably rewrite glibc syscall wrapper sites across host libc builds"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -181,10 +180,11 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace", "sabre"]
+backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
+sabre = "Path evidence found one raw libc syscall site per execution; trusted shared-object native execution is not SaBRe support"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -288,10 +288,9 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace", "dbi"]
+backends_enabled = ["ptrace", "dbi", "sabre"]
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "SaBRe does not yet portably rewrite glibc syscall wrapper sites across host libc builds"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -1169,10 +1168,9 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace", "dbi"]
+backends_enabled = ["ptrace", "dbi", "sabre"]
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "SaBRe does not yet portably rewrite glibc syscall wrapper sites across host libc builds"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -2166,10 +2164,9 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace", "dbi"]
+backends_enabled = ["ptrace", "dbi", "sabre"]
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "SaBRe does not yet portably rewrite glibc syscall wrapper sites across host libc builds"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -2274,10 +2271,9 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace", "dbi"]
+backends_enabled = ["ptrace", "dbi", "sabre"]
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "SaBRe does not yet portably rewrite glibc syscall wrapper sites across host libc builds"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -8042,7 +8038,7 @@ backends_enabled = ["ptrace", "kvm"]
 guest_args = { ptrace = ["cancellation"], kvm = ["cancellation"] }
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
-sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+sabre = "Cancellation reaches one raw libc syscall site per execution; trusted shared-object native execution is not SaBRe support"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
@@ -8643,7 +8639,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
+sabre = "The first verify run exits with waitpid error 512 after one raw libc syscall site; neither functional L2 nor a pure SaBRe path is established"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]

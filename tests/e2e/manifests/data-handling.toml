@@ -31,7 +31,7 @@ backends_enabled = ["ptrace"]
 dbi = "DBI coverage is owned by its backend parity partition"
 kvm = "KVM requires the privileged runner"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
-sabre = "SaBRe loses its private coordinator socket after guest exec; tracked by sabre_non_gated_parity"
+sabre = "The exec socket is fixed, but SaBRe strict verification intermittently diverges in shell PATH lookup and multi-exec DETLOG ordering"
 
 [test.modes.replay]
 ci = false
@@ -85,7 +85,7 @@ backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbi = "DBI coverage is owned by its backend parity partition"
 kvm = "KVM requires the privileged runner"
-sabre = "SaBRe pipeline parity is not yet validated for this fixture; tracked as a follow-up"
+sabre = "Forwarded-DETLOG verification exposes nondeterministic multi-process scheduler and SIGCHLD ordering under SaBRe despite stable stdout"
 liteinst = "LiteInst omits the fork/clone/pipe process model this pipeline requires"
 
 [test.modes.replay]
