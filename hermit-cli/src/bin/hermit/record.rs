@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::path::Path;
+
 use clap::Parser;
 use hermit::Error;
 use reverie::process::ExitStatus;
@@ -53,6 +55,17 @@ impl RecordOpts {
     // TODO-HUMAN-REVIEW(PR-696): Review e9patch scope for record start forms.
     pub fn starts_recording(&self) -> bool {
         matches!(self.record_command, None | Some(RecordCommand::Start(_)))
+    }
+
+    /// The `--verify-json` path this invocation will publish a verdict to, if
+    /// any. Both spellings reach the same `StartOpts`: the flattened direct form
+    /// (`hermit record --verify ...`) and the explicit `record start` subcommand.
+    pub(crate) fn verify_json_path(&self) -> Option<&Path> {
+        match &self.record_command {
+            Some(RecordCommand::Start(start)) => start.verify_json_path(),
+            Some(_) => None,
+            None => self.start.verify_json_path(),
+        }
     }
 
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {

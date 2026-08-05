@@ -1791,6 +1791,15 @@ impl RunOpts {
         Ok(())
     }
 
+    /// The `--verify-json` path this invocation will publish a verdict to, if
+    /// any. Exposed so the top-level dispatcher can stamp the invocation-bound
+    /// NO-RESULT record before ANY fallible preflight runs — several of this
+    /// function's own early exits, and the DBI / `--namespace-only` bypasses
+    /// below, never reach `verify()` at all.
+    pub(crate) fn verify_json_path(&self) -> Option<&Path> {
+        self.verify.then_some(self.verify_json.as_deref()).flatten()
+    }
+
     pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         // Set up an early tracing option before we're ready to set the global default:
 

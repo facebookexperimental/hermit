@@ -345,6 +345,13 @@ impl StartOpts {
         Ok((container, identity_guard))
     }
 
+    /// The `--verify-json` path this invocation will publish a verdict to, if
+    /// any. See `RunOpts::verify_json_path`: the stamp must precede the
+    /// top-level preflight, not merely `record_verify`'s first statement.
+    pub(crate) fn verify_json_path(&self) -> Option<&Path> {
+        self.verify.then_some(self.verify_json.as_deref()).flatten()
+    }
+
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         if self.verify {
             validate_log_level(global)?;

@@ -40,6 +40,7 @@ mod version;
 use std::fs::File;
 use std::io;
 use std::os::fd::FromRawFd;
+use std::path::Path;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
 
@@ -179,6 +180,7 @@ use self::record::RecordOpts;
 use self::replay::ReplayOpts;
 use self::run::RunOpts;
 use self::strace::StraceOpts;
+use self::verify::write_pending_verification_json;
 use self::version::Version;
 
 #[derive(Debug, Parser)]
@@ -262,7 +264,42 @@ impl Subcommand {
         Ok(())
     }
 
+    /// The `--verify-json` path this invocation will publish a verdict to, if
+    /// any. Only the two subcommands that can produce a verification verdict
+    /// have one.
+    fn verification_json_path(&self) -> Option<&Path> {
+        match self {
+            Subcommand::Run(run) => run.verify_json_path(),
+            Subcommand::Record(record) => record.verify_json_path(),
+            _ => None,
+        }
+    }
+
     fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        // Stamp the invocation-bound NO-RESULT record BEFORE the first fallible
+        // statement of the whole program. This is the outermost point at which
+        // `--verify-json` is known, and it is the only placement that dominates
+        // every path that can exit without a verdict:
+        //
+        //   * `validate_backend_scope` immediately below;
+        //   * `RunOpts::main`'s preflight -- log-level validation, stdin
+        //     reservation, `validate_args`, backend availability, PMU config,
+        //     mount-source and program validation, happens-before resolution,
+        //     e9patch preparation;
+        //   * the DBI arm, which returns `run_dbi(..)` and never reaches
+        //     `verify()`, so it produces no verdict at all;
+        //   * `--namespace-only`, which likewise bypasses `verify()`;
+        //   * `StartOpts::main`'s own pre-validation before `record_verify`.
+        //
+        // Stamping as the first statement of `verify()`/`record_verify()` did
+        // NOT cover any of those: they all exit above it, leaving a previous
+        // invocation's `{verified:true}` at the path to be read as this run's
+        // result. If the stamp itself cannot be written we fail here rather than
+        // run, so the operator learns the artifact is unreliable instead of
+        // silently inheriting a stale one.
+        if let Some(path) = self.verification_json_path() {
+            write_pending_verification_json(path)?;
+        }
         self.validate_backend_scope(global.backend)?;
         match self {
             Subcommand::Run(x) => x.main(global),
@@ -319,6 +356,229 @@ mod tests {
     #[test]
     fn clap_configuration_is_valid() {
         Args::command().debug_assert();
+    }
+
+    /// Plant a previous invocation's GREEN verdict at `path`, the way a caller
+    /// that reuses one `--verify-json` file across runs would have.
+    fn plant_previous_green(path: &std::path::Path) {
+        std::fs::write(
+            path,
+            "{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\"}\n",
+        )
+        .unwrap();
+        let planted: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(planted["verified"], serde_json::json!(true));
+    }
+
+    fn read_verdict(path: &std::path::Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// The record the stamp must leave behind on every non-verdict exit.
+    fn assert_no_result(path: &std::path::Path, context: &str) {
+        let now = read_verdict(path);
+        assert_eq!(now["verdict"], serde_json::json!("no_result"), "{context}");
+        assert_eq!(now["verified"], serde_json::json!(false), "{context}");
+        assert_eq!(now["bitwise_parity"], serde_json::json!(false), "{context}");
+    }
+
+    /// Drive `Subcommand::main` for `argv` and assert that (a) it exits Err
+    /// without reaching a verdict, and (b) the planted green has been replaced
+    /// by an invocation-bound no-result.
+    ///
+    /// Each case is a DIFFERENT top-level exit that occurs ABOVE
+    /// `verify()`/`record_verify()`. Stamping as the first statement of those
+    /// inner functions did not cover any of them.
+    fn assert_top_level_exit_leaves_no_result(argv: &[&str], context: &str) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        plant_previous_green(&path);
+
+        let json = format!("--verify-json={}", path.display());
+        let mut full: Vec<&str> = argv.to_vec();
+        full.push(&json);
+        full.push("--");
+        // A guest that cannot pass program validation, so no case here can
+        // accidentally start a real run and reach a genuine verdict.
+        full.push("/nonexistent/hermit-test-guest");
+
+        let mut args = Args::try_parse_from(full).expect("argv should parse");
+        let result = args.command.main(&args.global);
+        assert!(result.is_err(), "{context}: expected a non-verdict exit");
+        assert_no_result(&path, context);
+    }
+
+    /// TOP-LEVEL EXIT 1 -- the main preflight (`validate_backend_scope`), which
+    /// runs before `RunOpts::main` is even entered.
+    #[test]
+    fn main_preflight_exit_leaves_an_invocation_bound_no_result() {
+        assert_top_level_exit_leaves_no_result(
+            &["hermit", "--backend", "kvm", "record", "--verify"],
+            "backend-scope preflight",
+        );
+    }
+
+    /// TOP-LEVEL EXIT 2 -- the DBI arm of `RunOpts::main` RETURNS `run_dbi(..)`
+    /// and never reaches `verify()`, so a `--verify --verify-json` DBI run
+    /// cannot produce a verdict at all.
+    ///
+    /// Asserted STRUCTURALLY rather than by executing the arm. `run_dbi` takes
+    /// `verify: bool` but no verdict-artifact path, in BOTH cfg arms
+    /// (`backends.rs`), so the bypass is a property of the signature: there is
+    /// no argument through which it could publish one. An earlier version of
+    /// this test drove the arm for real; with the stamp removed it did not fail
+    /// but HUNG (blocking in `reserve_output_stdin_snapshot` on the harness
+    /// stdin), which is a no-result wearing another outcome -- precisely the
+    /// bug class this file exists to prevent, and it would wedge a CI shard for
+    /// its whole timeout. A test that cannot hang is worth more here than one
+    /// that exercises the launch.
+    #[test]
+    fn dbi_arm_has_no_channel_to_publish_a_verdict() {
+        let source = include_str!("backends.rs");
+        let signatures: Vec<&str> = source
+            .match_indices("fn run_dbi(")
+            .map(|(i, _)| {
+                let rest = &source[i..];
+                &rest[..rest
+                    .find(") -> Result<ExitStatus, Error>")
+                    .expect("run_dbi signature")]
+            })
+            .collect();
+        assert_eq!(signatures.len(), 2, "expected both cfg arms of run_dbi");
+        for signature in signatures {
+            assert!(
+                signature.contains("verify"),
+                "run_dbi should still receive the verify flag"
+            );
+            assert!(
+                !signature.contains("verify_json") && !signature.contains("json"),
+                "run_dbi gained a verdict-artifact parameter; the DBI arm can now publish a \
+                 verdict, so it must clear or publish the receipt rather than relying solely on \
+                 the top-level pending stamp:\n{signature}"
+            );
+        }
+    }
+
+    /// `--namespace-only` appears on the list of paths that bypass `verify()`,
+    /// but it is NOT reachable with a verdict artifact: clap rejects
+    /// `--verify` together with `--namespace-only`, and `--verify-json`
+    /// requires `--verify`. Asserted rather than guarded, so the day that
+    /// conflict is relaxed this test fails and the stamp coverage is revisited
+    /// instead of silently developing a hole.
+    #[test]
+    fn namespace_only_cannot_carry_a_verdict_artifact() {
+        let parsed = Args::try_parse_from([
+            "hermit",
+            "run",
+            "--verify",
+            "--namespace-only",
+            "--",
+            "/bin/true",
+        ]);
+        assert!(
+            parsed.is_err(),
+            "--verify with --namespace-only must remain a parse-time conflict; if this now \
+             parses, --namespace-only bypasses verify() and needs the pending stamp too"
+        );
+    }
+
+    /// TOP-LEVEL EXIT 3 -- `RunOpts::main`'s own preflight, entered after the
+    /// dispatcher and still far above `verify()`.
+    ///
+    /// The case chosen is `validate_log_level`, which is the FIRST fallible
+    /// statement of `RunOpts::main`. That choice is deliberate: everything after
+    /// it reaches `reserve_output_stdin_snapshot(startup_stdin()?)`, which
+    /// BLOCKS reading the harness's stdin, so a test driving any later preflight
+    /// step through `main()` hangs instead of failing. The later steps
+    /// (`validate_args`, `ensure_available`, `install_pmu_config`,
+    /// `validate_mount_sources`, `validate_program`, happens-before resolution,
+    /// e9patch preparation) are therefore NOT exercised here; they are covered
+    /// by construction, because the stamp is the first statement of
+    /// `Subcommand::main` and so dominates every one of them.
+    #[test]
+    fn run_preflight_exit_leaves_an_invocation_bound_no_result() {
+        assert_top_level_exit_leaves_no_result(
+            &[
+                "hermit",
+                "--log",
+                "warn",
+                "run",
+                "--verify",
+                "--backend=ptrace",
+            ],
+            "RunOpts::main log-level preflight",
+        );
+    }
+
+    /// TOP-LEVEL EXIT 4 -- `StartOpts::main` pre-validation: the record path
+    /// validates the log level before calling `record_verify`.
+    #[test]
+    fn record_start_prevalidation_exit_leaves_an_invocation_bound_no_result() {
+        assert_top_level_exit_leaves_no_result(
+            &["hermit", "--log", "warn", "record", "start", "--verify"],
+            "record start log-level pre-validation",
+        );
+    }
+
+    /// POSITIVE control: the stamp is not a dead end. A subcommand that carries
+    /// no `--verify-json` must not have a path at all, so nothing is written and
+    /// no unrelated file is disturbed.
+    #[test]
+    fn subcommands_without_verify_json_have_no_verdict_path() {
+        for argv in [
+            vec!["hermit", "run", "--", "/bin/true"],
+            vec!["hermit", "record", "start", "--", "/bin/true"],
+            vec!["hermit", "run", "--verify", "--", "/bin/true"],
+        ] {
+            let args = Args::try_parse_from(argv.clone()).expect("argv should parse");
+            assert!(
+                args.command.verification_json_path().is_none(),
+                "{argv:?} should carry no verification-json path"
+            );
+        }
+    }
+
+    /// POSITIVE control for the accessor that feeds the stamp: when
+    /// `--verify-json` IS present, every spelling that can produce a verdict
+    /// reports it -- including `record`'s flattened direct form, which is a
+    /// different code path from `record start`.
+    #[test]
+    fn every_verdict_producing_spelling_reports_its_verdict_path() {
+        for argv in [
+            vec![
+                "hermit",
+                "run",
+                "--verify",
+                "--verify-json=/tmp/v.json",
+                "--",
+                "/bin/true",
+            ],
+            vec![
+                "hermit",
+                "record",
+                "--verify",
+                "--verify-json=/tmp/v.json",
+                "--",
+                "/bin/true",
+            ],
+            vec![
+                "hermit",
+                "record",
+                "start",
+                "--verify",
+                "--verify-json=/tmp/v.json",
+                "--",
+                "/bin/true",
+            ],
+        ] {
+            let args = Args::try_parse_from(argv.clone()).expect("argv should parse");
+            assert_eq!(
+                args.command.verification_json_path(),
+                Some(std::path::Path::new("/tmp/v.json")),
+                "{argv:?} must report its verdict path to the stamp"
+            );
+        }
     }
 
     #[test]
