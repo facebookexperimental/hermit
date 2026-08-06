@@ -44,7 +44,61 @@ SCORECARD_HEADER = (
     "duration_ms",
     "max_rss_kb",
     "reason",
+    "verify_compare",
 )
+
+# Accepted spellings for the stdout-parity column, in preference order.
+#
+# The parent renderer already accepts both while `parity` -> `stdout_parity` is
+# in flight.  Accepting both here too is the point of this whole mechanism: the
+# rename must not be able to break this gate the way `verify_compare` did.
+PARITY_COLUMNS = ("parity", "stdout_parity")
+
+# The columns this producer actually fills.  Everything else the file carries is
+# written blank.
+#
+# WHY THIS IS SEPARATE FROM SCORECARD_HEADER, and it is the whole bug: the outer
+# scorecard's schema is owned by the PARENT workspace, not by Hermit.  The parent
+# added `verify_compare` (dev-hermit commit 7080d68) and every Hermit validate
+# that reached test.dbi_parity then died on an exact-tuple header comparison --
+# with no Hermit-side change, and AFTER running the full matrix, so the failure
+# named a header while every parity cell had actually passed.  A consumer that
+# demands schema equality makes any producer-side column addition a fleet
+# outage.  So bind to the columns we WRITE and let the file carry extras.
+PRODUCED_COLUMNS = tuple(
+    c for c in SCORECARD_HEADER if c not in ("verify_compare",) and c != "parity"
+)
+
+
+def scorecard_fieldnames(actual_header, path):
+    """Bind the writer to the FILE's schema, refusing only a column we must write.
+
+    Returns ``(fieldnames, parity_column)``.  ``fieldnames`` is the file's own
+    header, so rows are written at the file's width and order; a column the file
+    has and this producer does not fill is written blank rather than short-
+    writing the row.  That last part matters more than the acceptance: simply
+    relaxing the old equality check while still writing ``SCORECARD_HEADER``
+    would append 19-field rows under a 20-column header and silently misalign
+    every value after ``reason``.
+
+    Fail-closed is preserved, and narrowed to what it should always have been:
+    a column this producer writes must exist.  The refusal names the missing
+    columns and carries the header's own size, so a reader can tell "schema
+    skew" from "wrong file" without opening it (#319 -- a count travels with
+    the thing it counted).
+    """
+    actual = tuple(actual_header)
+    parity_column = next((c for c in PARITY_COLUMNS if c in actual), None)
+    missing = [c for c in PRODUCED_COLUMNS if c not in actual]
+    if parity_column is None:
+        missing.append(" or ".join(PARITY_COLUMNS))
+    if missing:
+        raise MatrixError(
+            f"outer scorecard {path} is missing {len(missing)} column(s) this "
+            f"producer writes: {', '.join(missing)}; its header has "
+            f"{len(actual)} column(s): {','.join(actual)}"
+        )
+    return actual, parity_column
 
 # L2 (--verify) assurance kinds, ordered weakest to strongest. "gap" means the
 # contract cannot currently be verified at L2 on that backend. "guest" is
@@ -820,16 +874,19 @@ def append_parent_scorecard(
         first_line = scorecard.readline()
         if first_line:
             actual_header = next(csv.reader([first_line]))
-            if tuple(actual_header) != SCORECARD_HEADER:
-                raise MatrixError(f"outer scorecard {path} has an incompatible header")
+            fieldnames, parity_column = scorecard_fieldnames(actual_header, path)
         else:
+            fieldnames, parity_column = SCORECARD_HEADER, PARITY_COLUMNS[0]
             writer = csv.DictWriter(
-                scorecard, fieldnames=SCORECARD_HEADER, lineterminator="\n"
+                scorecard, fieldnames=fieldnames, lineterminator="\n"
             )
             writer.writeheader()
+        if parity_column != "parity":
+            for row in rows:
+                row[parity_column] = row.pop("parity")
         scorecard.seek(0, os.SEEK_END)
         writer = csv.DictWriter(
-            scorecard, fieldnames=SCORECARD_HEADER, lineterminator="\n"
+            scorecard, fieldnames=fieldnames, restval="", lineterminator="\n"
         )
         writer.writerows(rows)
         scorecard.flush()
