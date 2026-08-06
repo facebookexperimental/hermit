@@ -26,7 +26,7 @@ fi
 
 readonly ROOT_DIR TEST_ROOT MANIFEST_ROOT INVENTORY EXPECTED_PLAN HERMIT_BIN RESULT_ROOT RUN_ID SOURCE_TREE_SHA SOURCE_TREE_DIRTY BUILD_ROOT DAG_ROOT
 readonly -a MODES=(verify chaos replay naked custom)
-readonly -a BACKENDS=(ptrace dbi kvm sabre liteinst)
+readonly -a BACKENDS=(ptrace dbt kvm sabre liteinst)
 readonly -a LANES=(portable privileged)
 DAG_DIR="$ROOT_DIR/ci/dag"
 readonly DAG_DIR
@@ -46,7 +46,7 @@ Usage:
 Filters:
   --lane LANE             portable or privileged
   --mode MODE             verify, chaos, replay, naked, or custom
-  --backend BACKEND       ptrace, dbi, kvm, sabre, or liteinst
+  --backend BACKEND       ptrace, dbt, kvm, sabre, or liteinst
   --category CATEGORY     manifest category
   --test ID               exact category/test ID
   --ci-only               select only cells explicitly marked ci=true
@@ -191,7 +191,7 @@ function audit_inventory {
     # in a checkout where a tool had run.
     #
     # It is a RECURRING self-inflicted red, not a one-off: `make validate-kvm`
-    # and `make validate-dbi` both run `python3 tests/backend-parity/run_matrix.py`,
+    # and `make validate-dbt` both run `python3 tests/backend-parity/run_matrix.py`,
     # which creates tests/backend-parity/__pycache__. Running a per-backend
     # validate therefore reds the next full validate's metadata gate, via a file
     # that .gitignore hides so `git status` still reads clean.
@@ -293,7 +293,7 @@ function assert_parallel_portable_workflow {
           [$selected[] | critical(.)] | max
     ' "$DAG_ROOT/portable.json")
     release_inner_path=$(jq --slurpfile shards "$ROOT_DIR/ci/portable-shards.json" '
-        ($shards[0].build_dbi_nodes + $shards[0].build_aux_nodes) as $selected
+        ($shards[0].build_dbt_nodes + $shards[0].build_aux_nodes) as $selected
         | (.steps | map({key:(.group + "." + .job), value:.}) | from_entries) as $steps
         | def critical($id):
             $steps[$id] as $step
@@ -326,25 +326,25 @@ function assert_parallel_portable_workflow {
         die "GitHub portable workflow must expose exactly one stable aggregate gate"
     [[ $(grep -Fxc '  merge_group:' "$workflow") == 1 ]] ||
         die "GitHub portable workflow must run against merge-queue commits"
-    [[ $(grep -Fxc '            target/install_pkg/rsrcs/libdetcore_dbi.so \' "$workflow") == 1 ]] ||
-        die "GitHub portable debug artifact must preserve the installed DBI runtime"
-    [[ $(grep -Fxc '          test -f target/install_pkg/rsrcs/libdetcore_dbi.so' "$workflow") == 1 ]] ||
-        die "GitHub portable debug shards must verify the installed DBI runtime"
-    [[ $(grep -Fxc '          test -f target/debug/deps/libdetcore_dbi.so' "$workflow") == 2 ]] ||
-        die "GitHub portable workflow must package and verify the debug DBI cdylib"
+    [[ $(grep -Fxc '            target/install_pkg/rsrcs/libdetcore_dbt.so \' "$workflow") == 1 ]] ||
+        die "GitHub portable debug artifact must preserve the installed DBT runtime"
+    [[ $(grep -Fxc '          test -f target/install_pkg/rsrcs/libdetcore_dbt.so' "$workflow") == 1 ]] ||
+        die "GitHub portable debug shards must verify the installed DBT runtime"
+    [[ $(grep -Fxc '          test -f target/debug/deps/libdetcore_dbt.so' "$workflow") == 2 ]] ||
+        die "GitHub portable workflow must package and verify the debug DBT cdylib"
     [[ $(grep -Fxc '            target/ci \' "$workflow") == 1 ]] ||
         die "GitHub portable release artifact must transport the strict-compat Hermit"
     [[ $(grep -Fxc '          test -x target/ci/hermit-strict' "$workflow") == 1 ]] ||
         die "GitHub portable debug shards must verify the strict-compat Hermit"
-    # Both the debug test shards (run_dbi_* CLI tests) and the e2e backend cells
-    # consume the DBI install package built by build-release, so both must wait on
+    # Both the debug test shards (run_dbt_* CLI tests) and the e2e backend cells
+    # consume the DBT install package built by build-release, so both must wait on
     # [select, build-debug, build-release]. (select gates the affected-test matrix;
-    # dropping build-release from either would race the DBI runtime.)
+    # dropping build-release from either would race the DBT runtime.)
     [[ $(grep -Fxc '    needs: [select, build-debug, build-release]' "$workflow") == 2 ]] ||
-        die "GitHub portable debug and e2e shards must wait for the complete DBI install package"
+        die "GitHub portable debug and e2e shards must wait for the complete DBT install package"
     [[ $(grep -Fxc '          test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun' "$workflow") == 1 ]] ||
         die "GitHub portable debug shards must verify the DynamoRIO launcher"
-    [[ $(grep -Fxc '          test -f target/install_pkg/rsrcs/libreverie_dbi_client.so' "$workflow") == 1 ]] ||
+    [[ $(grep -Fxc '          test -f target/install_pkg/rsrcs/libreverie_dbt_client.so' "$workflow") == 1 ]] ||
         die "GitHub portable debug shards must verify the DynamoRIO client"
     [[ $(grep -Fxc '      - name: Enable unprivileged user and mount namespaces' "$workflow") == 4 ]] ||
         die "GitHub portable debug, release, e2e, and SaBRe diagnostics must enable user namespaces"
@@ -369,7 +369,7 @@ function assert_parallel_portable_workflow {
         | select(.slug == "integration")
         | .nodes | index("test.cli") != null
     ' "$ROOT_DIR/ci/portable-shards.json" >/dev/null ||
-        die "GitHub portable integration shard must retain the run_dbi_* CLI tests"
+        die "GitHub portable integration shard must retain the run_dbt_* CLI tests"
 }
 
 function assert_privileged_diagnostics {
@@ -481,7 +481,7 @@ $direct_references"
         fi
         PATH="$isolated_path:/usr/bin:/bin" "$runner" --self-test >/dev/null
 
-        # The pin gate and both DBI build children may compile the checker at
+        # The pin gate and both DBT build children may compile the checker at
         # once in one worktree. Exercise real rustc concurrently within the
         # e2e.metadata node's 1 GiB cap. Pin each compiler to one allowed CPU so
         # rustc cannot infer the 316-CPU host and create hundreds of codegen
@@ -679,7 +679,7 @@ function emit_manifest_buckets {
 function audit_ci_correspondence {
     local lane dag
 
-    # Both DAG launch surfaces use the explicit ordinary-launcher mode; the DBI
+    # Both DAG launch surfaces use the explicit ordinary-launcher mode; the DBT
     # wrapper is the sole child-budget caller.
     # shellcheck disable=SC2016
     [[ $(grep -Fxc 'source "$ROOT_DIR/ci/configure-build-jobs.sh" launcher || exit $?' "$ROOT_DIR/ci/run-dag.sh") == 1 ]] ||
@@ -688,34 +688,34 @@ function audit_ci_correspondence {
     [[ $(grep -Fxc 'source "$ROOT_DIR/ci/configure-build-jobs.sh" launcher || exit $?' "$ROOT_DIR/ci/run-node.sh") == 1 ]] ||
         die "run-node.sh must source ordinary build-job configuration exactly once"
     local budget_config="$ROOT_DIR/ci/configure-build-jobs.sh"
-    local budget_wrapper="$ROOT_DIR/ci/run-with-reverie-dbi-budget.sh"
-    [[ -x $budget_wrapper ]] || die "DBI child-budget wrapper must be executable"
-    [[ $(grep -Fc 'reverie-dbi-budget=portable-build-child-only' "$ROOT_DIR/ci/run-dag.sh") == 1 ]] ||
-        die "run-dag.sh must identify the DBI budget as portable-child-only"
-    [[ $(grep -Fc 'reverie-dbi-budget=portable-build-child-only' "$ROOT_DIR/ci/run-node.sh") == 1 ]] ||
-        die "run-node.sh must identify the DBI budget as portable-child-only"
-    [[ $(grep -Fxc 'source "$ROOT_DIR/ci/configure-build-jobs.sh" reverie-dbi-budget-child' "$budget_wrapper") == 1 ]] ||
-        die "DBI wrapper must select the explicit portable child-budget mode"
+    local budget_wrapper="$ROOT_DIR/ci/run-with-reverie-dbt-budget.sh"
+    [[ -x $budget_wrapper ]] || die "DBT child-budget wrapper must be executable"
+    [[ $(grep -Fc 'reverie-dbt-budget=portable-build-child-only' "$ROOT_DIR/ci/run-dag.sh") == 1 ]] ||
+        die "run-dag.sh must identify the DBT budget as portable-child-only"
+    [[ $(grep -Fc 'reverie-dbt-budget=portable-build-child-only' "$ROOT_DIR/ci/run-node.sh") == 1 ]] ||
+        die "run-node.sh must identify the DBT budget as portable-child-only"
+    [[ $(grep -Fxc 'source "$ROOT_DIR/ci/configure-build-jobs.sh" reverie-dbt-budget-child' "$budget_wrapper") == 1 ]] ||
+        die "DBT wrapper must select the explicit portable child-budget mode"
     [[ $(grep -Fxc '    "$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR" --print-pin' "$budget_wrapper") == 1 ]] ||
-        die "DBI wrapper must bind its calibration through the canonical local-pin verifier"
+        die "DBT wrapper must bind its calibration through the canonical local-pin verifier"
     [[ $(grep -Fc '5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf' "$budget_wrapper") == 1 ]] ||
-        die "DBI wrapper must name exactly one calibrated Reverie pin"
+        die "DBT wrapper must name exactly one calibrated Reverie pin"
     [[ $(grep -Fc '5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf' "$budget_config") == 2 ]] ||
-        die "DBI derivation must independently require and diagnose the calibrated Reverie pin"
+        die "DBT derivation must independently require and diagnose the calibrated Reverie pin"
     # shellcheck disable=SC2016
-    local budget_record='reverie-dbi-budget={pin:$REVERIE_DBI_BUDGET_BOUND_PIN,source:$REVERIE_DBI_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBI_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBI_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBI_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBI_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBI_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBI_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d}'
+    local budget_record='reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d}'
     [[ $(grep -Fc "$budget_record" "$budget_wrapper") == 1 ]] ||
-        die "DBI child wrapper must log the pin and every derivation condition"
+        die "DBT child wrapper must log the pin and every derivation condition"
 
     jq -e '
         [.steps[] | select(
             .group == "build"
             and (.job == "workspace" or .job == "runtime_release")
-            and (.cmd | contains("./ci/run-with-reverie-dbi-budget.sh cargo build"))
+            and (.cmd | contains("./ci/run-with-reverie-dbt-budget.sh cargo build"))
             and .timeout >= 1200
         )] | length == 2
     ' "$DAG_ROOT/portable.json" >/dev/null ||
-        die "portable DBI builds must derive inside the child and allow 1050s DBI + 150s overhead"
+        die "portable DBT builds must derive inside the child and allow 1050s DBT + 150s overhead"
     jq -e '
         [.steps[] | select(
             .group == "build" and .job == "privileged_tests"
@@ -723,7 +723,7 @@ function audit_ci_correspondence {
             and .cmd == "CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run"
         )] | length == 1
     ' "$DAG_ROOT/privileged.json" >/dev/null ||
-        die "portable-only DBI override must not alter the privileged command or timeout"
+        die "portable-only DBT override must not alter the privileged command or timeout"
 
     (
         local scratch fake_runner privileged_env privileged_node_env name
@@ -745,24 +745,24 @@ function audit_ci_correspondence {
         chmod +x "$scratch/nproc-zero/nproc" "$scratch/nproc-invalid/nproc"
 
         budget_names=(
-            REVERIE_DBI_BUDGET_BOUND_PIN
-            REVERIE_DBI_BUILD_JOBS_SOURCE
-            REVERIE_DBI_RAW_BUILD_JOBS
-            REVERIE_DBI_EFFECTIVE_CPUS_SOURCE
-            REVERIE_DBI_EFFECTIVE_CPUS
-            REVERIE_DBI_MAX_PARALLEL_JOBS
-            REVERIE_DBI_EFFECTIVE_BUILD_JOBS
-            REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS
-            REVERIE_DBI_MAX_BUILD_SECONDS
+            REVERIE_DBT_BUDGET_BOUND_PIN
+            REVERIE_DBT_BUILD_JOBS_SOURCE
+            REVERIE_DBT_RAW_BUILD_JOBS
+            REVERIE_DBT_EFFECTIVE_CPUS_SOURCE
+            REVERIE_DBT_EFFECTIVE_CPUS
+            REVERIE_DBT_MAX_PARALLEL_JOBS
+            REVERIE_DBT_EFFECTIVE_BUILD_JOBS
+            REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS
+            REVERIE_DBT_MAX_BUILD_SECONDS
             CI_DAG_LAUNCH_WIDTH_BOUND
             CI_DAG_LAUNCH_BUILD_JOBS_SOURCE
             CI_DAG_LAUNCH_RAW_BUILD_JOBS
             CI_DAG_EFFECTIVE_CPUS
-            CI_DAG_REVERIE_DBI_MAX_PARALLEL_JOBS
-            CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS
-            CI_DAG_REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS
-            REVERIE_DBI_PINNED_MAX_PARALLEL_JOBS
-            REVERIE_DBI_BUDGET_CHILD
+            CI_DAG_REVERIE_DBT_MAX_PARALLEL_JOBS
+            CI_DAG_REVERIE_DBT_MAX_BUILD_JOB_SECONDS
+            CI_DAG_REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS
+            REVERIE_DBT_PINNED_MAX_PARALLEL_JOBS
+            REVERIE_DBT_BUDGET_CHILD
         )
         clean_budget_env=(env -u CARGO_BUILD_JOBS -u THIRD_PARTY_BUILD_JOBS -u SAFE_CI_IN_SCOPE)
         for name in "${budget_names[@]}"; do
@@ -783,7 +783,7 @@ function audit_ci_correspondence {
         )
         for name in "${budget_names[@]}"; do
             ! grep -q "^${name}=" <<<"$privileged_env" ||
-                die "privileged DAG runner inherited portable DBI variable $name"
+                die "privileged DAG runner inherited portable DBT variable $name"
         done
         grep -Fxq 'CARGO_BUILD_JOBS=8' <<<"$privileged_env" ||
             die "privileged DAG runner lost the historical Cargo width"
@@ -796,7 +796,7 @@ function audit_ci_correspondence {
         )
         for name in "${budget_names[@]}"; do
             ! grep -q "^${name}=" <<<"$privileged_node_env" ||
-                die "privileged node runner inherited portable DBI variable $name"
+                die "privileged node runner inherited portable DBT variable $name"
         done
         grep -Fxq 'CARGO_BUILD_JOBS=8' <<<"$privileged_node_env" ||
             die "privileged node runner lost the historical Cargo width"
@@ -814,17 +814,17 @@ function audit_ci_correspondence {
         # All budget arithmetic uses a fake `nproc`, not an input variable. This
         # brackets the production observation point at the child process itself.
         # shellcheck disable=SC2016
-        budget_probe='source "$1" reverie-dbi-budget-child; printf "%s %s %s %s %s %s %s %s %s %s\n" "$REVERIE_DBI_BUILD_JOBS_SOURCE" "$REVERIE_DBI_RAW_BUILD_JOBS" "$CARGO_BUILD_JOBS" "$THIRD_PARTY_BUILD_JOBS" "$REVERIE_DBI_EFFECTIVE_CPUS_SOURCE" "$REVERIE_DBI_EFFECTIVE_CPUS" "$REVERIE_DBI_MAX_PARALLEL_JOBS" "$REVERIE_DBI_EFFECTIVE_BUILD_JOBS" "$REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS" "$REVERIE_DBI_MAX_BUILD_SECONDS"'
+        budget_probe='source "$1" reverie-dbt-budget-child; printf "%s %s %s %s %s %s %s %s %s %s\n" "$REVERIE_DBT_BUILD_JOBS_SOURCE" "$REVERIE_DBT_RAW_BUILD_JOBS" "$CARGO_BUILD_JOBS" "$THIRD_PARTY_BUILD_JOBS" "$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE" "$REVERIE_DBT_EFFECTIVE_CPUS" "$REVERIE_DBT_MAX_PARALLEL_JOBS" "$REVERIE_DBT_EFFECTIVE_BUILD_JOBS" "$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS" "$REVERIE_DBT_MAX_BUILD_SECONDS"'
         budget_tuple=$(
             PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
-                REVERIE_DBI_BUDGET_BOUND_PIN=5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf \
+                REVERIE_DBT_BUDGET_BOUND_PIN=5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf \
                 CARGO_BUILD_JOBS=8 bash -c "$budget_probe" _ "$budget_config"
         )
         [[ $budget_tuple == 'inherited-launch-cargo-build-jobs 8 8 8 child-nproc 4 16 4 1050 263' ]] ||
             die "hosted j8/child-CPU4 budget tuple drifted: $budget_tuple"
         budget_tuple=$(
             PATH="$scratch/nproc-64:$PATH" "${clean_budget_env[@]}" \
-                REVERIE_DBI_BUDGET_BOUND_PIN=5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf \
+                REVERIE_DBT_BUDGET_BOUND_PIN=5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf \
                 SAFE_CI_IN_SCOPE=1 CARGO_BUILD_JOBS=32 \
                 bash -c "$budget_probe" _ "$budget_config"
         )
@@ -847,7 +847,7 @@ function audit_ci_correspondence {
         clamp_boundaries=$(
             for requested in 15 16 17 64; do
                 PATH="$scratch/nproc-64:$PATH" "${clean_budget_env[@]}" \
-                    REVERIE_DBI_BUDGET_BOUND_PIN=5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf \
+                    REVERIE_DBT_BUDGET_BOUND_PIN=5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf \
                     CARGO_BUILD_JOBS=$requested bash -c "$budget_probe" _ "$budget_config"
             done
         )
@@ -855,10 +855,10 @@ function audit_ci_correspondence {
             die "Reverie clamp boundary did not hold W at 16: $clamp_boundaries"
         cpu_boundaries=$(
             PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
-                REVERIE_DBI_BUDGET_BOUND_PIN=5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf \
+                REVERIE_DBT_BUDGET_BOUND_PIN=5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf \
                 CARGO_BUILD_JOBS=17 bash -c "$budget_probe" _ "$budget_config"
             PATH="$scratch/nproc-2:$PATH" "${clean_budget_env[@]}" \
-                REVERIE_DBI_BUDGET_BOUND_PIN=5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf \
+                REVERIE_DBT_BUDGET_BOUND_PIN=5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf \
                 CARGO_BUILD_JOBS=8 bash -c "$budget_probe" _ "$budget_config"
         )
         [[ $cpu_boundaries == $'inherited-launch-cargo-build-jobs 17 17 17 child-nproc 4 16 4 1050 263\ninherited-launch-cargo-build-jobs 8 8 8 child-nproc 2 16 2 1050 525' ]] ||
@@ -879,7 +879,7 @@ function audit_ci_correspondence {
         git -C "$fixture" add Cargo.toml ci scripts
         if wrong_pin_log=$(
             PATH="$scratch/nproc-4:$PATH" CARGO_BUILD_JOBS=8 \
-                "$fixture/ci/run-with-reverie-dbi-budget.sh" true 2>&1
+                "$fixture/ci/run-with-reverie-dbt-budget.sh" true 2>&1
         ); then
             wrong_pin_status=0
         else
@@ -899,29 +899,29 @@ function audit_ci_correspondence {
             die "ordinary launcher accepted a noninteger build width"
         fi
         if PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
-            REVERIE_DBI_BUDGET_BOUND_PIN=wrong CARGO_BUILD_JOBS=8 \
-            bash -c 'source "$1" reverie-dbi-budget-child' _ "$budget_config" 2>/dev/null; then
+            REVERIE_DBT_BUDGET_BOUND_PIN=wrong CARGO_BUILD_JOBS=8 \
+            bash -c 'source "$1" reverie-dbt-budget-child' _ "$budget_config" 2>/dev/null; then
             die "child derivation accepted an uncalibrated Reverie pin"
         fi
         if PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
-            REVERIE_DBI_BUDGET_BOUND_PIN=5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf \
-            CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS=1050 CARGO_BUILD_JOBS=8 \
-            bash -c 'source "$1" reverie-dbi-budget-child' _ "$budget_config" 2>/dev/null; then
-            die "child derivation accepted a retired unconditioned DBI threshold"
+            REVERIE_DBT_BUDGET_BOUND_PIN=5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf \
+            CI_DAG_REVERIE_DBT_MAX_BUILD_JOB_SECONDS=1050 CARGO_BUILD_JOBS=8 \
+            bash -c 'source "$1" reverie-dbt-budget-child' _ "$budget_config" 2>/dev/null; then
+            die "child derivation accepted a retired unconditioned DBT threshold"
         fi
         if PATH="$scratch/nproc-zero:$PATH" "${clean_budget_env[@]}" \
-            REVERIE_DBI_BUDGET_BOUND_PIN=5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf CARGO_BUILD_JOBS=8 \
-            bash -c 'source "$1" reverie-dbi-budget-child' _ "$budget_config" 2>/dev/null; then
+            REVERIE_DBT_BUDGET_BOUND_PIN=5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf CARGO_BUILD_JOBS=8 \
+            bash -c 'source "$1" reverie-dbt-budget-child' _ "$budget_config" 2>/dev/null; then
             die "child derivation accepted nproc=0"
         fi
         if PATH="$scratch/nproc-invalid:$PATH" "${clean_budget_env[@]}" \
-            REVERIE_DBI_BUDGET_BOUND_PIN=5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf CARGO_BUILD_JOBS=8 \
-            bash -c 'source "$1" reverie-dbi-budget-child' _ "$budget_config" 2>/dev/null; then
+            REVERIE_DBT_BUDGET_BOUND_PIN=5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf CARGO_BUILD_JOBS=8 \
+            bash -c 'source "$1" reverie-dbt-budget-child' _ "$budget_config" 2>/dev/null; then
             die "child derivation accepted a noninteger nproc observation"
         fi
         if PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
-            REVERIE_DBI_BUDGET_BOUND_PIN=5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf CARGO_BUILD_JOBS=0 \
-            bash -c 'source "$1" reverie-dbi-budget-child' _ "$budget_config" 2>/dev/null; then
+            REVERIE_DBT_BUDGET_BOUND_PIN=5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf CARGO_BUILD_JOBS=0 \
+            bash -c 'source "$1" reverie-dbt-budget-child' _ "$budget_config" 2>/dev/null; then
             die "child derivation accepted a zero Cargo width"
         fi
         if "${clean_budget_env[@]}" bash -c 'source "$1"' _ "$budget_config" 2>/dev/null; then

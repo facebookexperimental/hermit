@@ -4,7 +4,7 @@
  * Exercises mkfifo / mknodat / mknod for FIFO and regular-file nodes, plus the
  * EEXIST refusal on a duplicate path. Every node is created and then inspected
  * with lstat only -- the FIFO is never opened, because opening a FIFO without a
- * peer blocks indefinitely and would livelock the single-threaded DBI backend.
+ * peer blocks indefinitely and would livelock the single-threaded DBT backend.
  *
  * Character/block device nodes are deliberately omitted: creating them requires
  * privilege the strict guest does not hold, so their behavior is a permission

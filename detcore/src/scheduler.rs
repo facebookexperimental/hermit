@@ -473,7 +473,7 @@ pub struct Scheduler {
     /// (`reconnect_after_exec` -> `logically_kill_thread`), deferred to the same
     /// deterministic drain point (`step2`). `RunQueue::remove_tid` carries the same
     /// `tentative_selection.is_none()` guard as the push operations, so a
-    /// multi-threaded exec that reconnects on an asynchronous backend (DBI)
+    /// multi-threaded exec that reconnects on an asynchronous backend (DBT)
     /// inside the daemon's tentative window would otherwise trip it, poison the
     /// scheduler mutex, and hang the run.
     ///
@@ -1610,7 +1610,7 @@ impl Scheduler {
             writer.set_current(new_leader, survivor_priority);
         }
         // Post-exec reconnection can arrive asynchronously on backends whose
-        // exec-child self-bootstraps outside a scheduler turn (DBI), so route
+        // exec-child self-bootstraps outside a scheduler turn (DBT), so route
         // the new leader's admission (a run-queue *push*) through the
         // tentative-safe buffer rather than pushing directly.
         //
@@ -3200,7 +3200,7 @@ impl Scheduler {
     /// `reconnect_after_exec`) hold the scheduler lock but run on whichever
     /// backend worker fielded the RPC, not on the scheduler daemon's turn. The
     /// point in the daemon's loop at which such a handler acquires the lock is
-    /// host-timing-dependent on asynchronous backends (e.g. DBI): it may land
+    /// host-timing-dependent on asynchronous backends (e.g. DBT): it may land
     /// inside the tentative-pop window (between `step3_peek` and `step4`'s
     /// commit, where the lock is released across `req.get().await`) *or* outside
     /// it (during the quiescence-wait / backoff awaits at the top of
@@ -4321,7 +4321,7 @@ mod test {
     /// pop so the selection does not outlive the turn; otherwise the next pass's
     /// step2 removal drain calls `remove_tid` while `tentative_selection` is
     /// still `Some`, tripping the run queue's transaction guard -- the "reconnect
-    /// panic moved one pass" defect (reachable in NORMAL async-DBI operation, not
+    /// panic moved one pass" defect (reachable in NORMAL async-DBT operation, not
     /// just the reviewed edge case: any thread that exits during the await window
     /// races here). This drives the ACTUAL async daemon function end to end
     /// rather than poking `RunQueue` directly, which is the coverage gap the

@@ -629,7 +629,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // getuid/geteuid/getgid/getegid/getresuid/getresgid were pass-through
         // and returned 0 only because the ptrace backend runs the guest inside a
         // CLONE_NEWUSER namespace (hermit-cli/src/lib.rs) that maps the real uid
-        // to 0. In-process backends (DBI) have no such namespace, so pass-through
+        // to 0. In-process backends (DBT) have no such namespace, so pass-through
         // leaked the host uid/gid and contradicted the credential model.
         // Emulating the query side to the constant virtual-root identity (0)
         // makes the result backend-independent, matches the ptrace golden
@@ -766,7 +766,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::symlink
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::sync_file_range
-        // Ptrace executes rt_sigreturn directly; DBI has dedicated injected-sigreturn
+        // Ptrace executes rt_sigreturn directly; DBT has dedicated injected-sigreturn
         // handling, while KVM deterministically reports its current lack of signal support.
         | Sysno::rt_sigreturn => SyscallClassification::PassThrough,
         // ===== END PASS-THRU SYSCALLS =====
@@ -1219,7 +1219,7 @@ pub(crate) const fn is_host_kernel_probe_syscall(sysno: Sysno) -> bool {
 /// boundary. Classifying a syscall this way in the ptrace path only enforces the
 /// isolation boundary where the shared Detcore dispatcher runs. A backend that
 /// lets a guest execute a syscall natively outside that dispatcher (most
-/// importantly the DBI copied pre-exec child fast path, which runs on the
+/// importantly the DBT copied pre-exec child fast path, which runs on the
 /// DynamoRIO client stack with no Detcore tool) would otherwise reach the host
 /// and leak or mutate the very state the classification is meant to hide. Such a
 /// backend must fail closed for these syscalls in strict mode instead.
@@ -2116,7 +2116,7 @@ mod tests {
         // The aggregate predicate is the union of the fixed-ENOSYS/EPERM refusal
         // families the strict dispatcher rejects without consulting the host.
         // Backends that execute guest syscalls outside Detcore's dispatcher
-        // (the DBI copied-child fast path, the KVM executor) consult this
+        // (the DBT copied-child fast path, the KVM executor) consult this
         // predicate to enforce the same fixed refusal, so representative members
         // of every family must be present.
         let refused_members = [

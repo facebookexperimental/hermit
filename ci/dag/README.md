@@ -121,7 +121,7 @@ moving parts:
   portable strict compatibility reuses `STRICT_COMPAT_HERMIT_BIN` from the
   preceding workspace build. Without that override, the strict flag builds
   release as before.
-- **The DBI stderr-isolation CLI case is a separate 120-second node** so a
+- **The DBT stderr-isolation CLI case is a separate 120-second node** so a
   backend hang fails quickly without consuming the aggregate CLI budget. The
   aggregate node skips that case, so the test set remains unchanged.
 - **Portable strict compatibility starts after every non-guest Cargo node** so

@@ -11,7 +11,7 @@
 //
 // Everything is a property of the calling thread. There is no file, no memory
 // mapping, no data transfer, and no blocking wait, so the fixture is idempotent
-// under --verify and safe for the DBI cooperative scheduler.
+// under --verify and safe for the DBT cooperative scheduler.
 #include <stdio.h>
 #include <sys/syscall.h>
 #include <unistd.h>

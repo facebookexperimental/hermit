@@ -26,7 +26,7 @@
  * issued on a small file that was just written, so writeback completes promptly
  * and the WAIT flags do not turn into an unbounded block.
  *
- * ptrace and DBI drive the full barrier set; if KVM's ElfExecutor does not
+ * ptrace and DBT drive the full barrier set; if KVM's ElfExecutor does not
  * implement sync_file_range it refuses deterministically with ENOSYS, recorded as
  * a KVM gap in matrix.tsv (mirrors the syncfs gap in fsync_durability).
  */

@@ -22,9 +22,9 @@
  * is a pure per-thread register with no host-derived state, so it is
  * deterministic across repeated runs and backends.
  *
- * ptrace and DBI drive the full state machine; KVM's ElfExecutor does not
+ * ptrace and DBT drive the full state machine; KVM's ElfExecutor does not
  * implement the PR_*_PDEATHSIG requests and refuses them with ENOSYS (recorded
- * as a KVM gap in matrix.tsv), so this row runs on ptrace and DBI. The fixture
+ * as a KVM gap in matrix.tsv), so this row runs on ptrace and DBT. The fixture
  * prints only a check count.
  */
 

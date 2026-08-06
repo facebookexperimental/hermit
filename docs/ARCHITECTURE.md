@@ -6,7 +6,7 @@ This document focuses on the production ptrace backend: where state lives, how a
 event travels from the guest to Detcore and back, and how scheduling, resources,
 time, record/replay, signals, procfs, and CPUID fit together. It also describes
 the backend strategy — the abstraction that lets the same Detcore policy run over
-alternative execution mechanisms (in-process DBI and hardware virtualization).
+alternative execution mechanisms (in-process DBT and hardware virtualization).
 
 The most important boundary is:
 
@@ -70,7 +70,7 @@ determinism curve:
 | --- | --- | --- | --- |
 | **ptrace** | seccomp-BPF `SECCOMP_RET_TRACE` + `PTRACE`, out-of-process tracer | Production; the only in-tree backend (`reverie-ptrace`) | Complete and strongly deterministic; per-event context-switch cost |
 | **LiteInst + ptrace** | Online hot-site patching with a ptrace-owned Tool and in-guest patch/helper DSO | Experimental hybrid | Keeps ptrace lifecycle/PMU correctness while replacing eligible repeated syscall traps; dynamic single-process/single-thread scope |
-| **DBI** (SaBRe / DynamoRIO style) | In-process binary rewriting / function hooking of syscall sites | Experimental / research | Low overhead; today it is a syscall-boundary interceptor, **not** a deterministic backend |
+| **DBT** (SaBRe / DynamoRIO style) | In-process binary rewriting / function hooking of syscall sites | Experimental / research | Low overhead; today it is a syscall-boundary interceptor, **not** a deterministic backend |
 | **KVM / SVM** | Run the guest inside a hardware VM and trap via VM-exits | Exploratory | Can trap instructions ptrace cannot (see CPUID below); heaviest isolation and integration cost |
 | **e9patch + ptrace** | Cached offline main-ELF rewriting followed by the ptrace Detcore runtime | Experimental hybrid | Exact coverage of e9tool-recovered candidate sites; raw random/TSX instructions remain unsupported even when mapped |
 
@@ -106,7 +106,7 @@ rather than losing set-ID or file-capability semantics. A future standalone
 backend requires an in-process Detcore
 callback seam; this implementation does not claim that performance property.
 
-**DBI (in-process).** A dynamic binary instrumentation backend such as the
+**DBT (in-process).** A dynamic binary instrumentation backend such as the
 restored SaBRe loader rewrites syscall sites in-process and calls into a tool
 without leaving the guest address space, which is much cheaper per event. The
 current state is a low-overhead *syscall interceptor*: native guest threads run
@@ -119,8 +119,8 @@ for the gap analysis and roadmap.
 **KVM / SVM (hardware virtualization).** Running the guest as a VM guest lets the
 monitor use hardware controls to trap instructions such as `RDRAND` and `CPUID`
 without relying on host user-space faulting support. A sufficiently complete
-DBI could instead decode and rewrite those instructions before they execute;
-the current DBI prototype does not provide that coverage. Hardware
+DBT could instead decode and rewrite those instructions before they execute;
+the current DBT prototype does not provide that coverage. Hardware
 virtualization has a much larger integration surface and loses the simple
 "host process under ptrace" model.
 
@@ -860,7 +860,7 @@ The main implementation entry points are:
 | Reverie tool contract | Reverie `reverie/src/tool.rs` and `reverie/src/guest.rs` |
 | Ptrace startup/filter | Reverie `reverie-ptrace/src/tracer.rs` |
 | Ptrace stop, injection, CPUID/RDTSC trap | Reverie `reverie-ptrace/src/task.rs` |
-| DBI backend gap analysis | `ai_docs/sabre-determinism-analysis.md` |
+| DBT backend gap analysis | `ai_docs/sabre-determinism-analysis.md` |
 
 Start at the Detcore dispatch for policy questions and at Reverie's tracing task
 for execution-control questions. Scheduler bugs often cross both local and

@@ -6,7 +6,7 @@
  * and EBADF on a closed one. The contract records those outcomes so a backend
  * cannot silently turn a durability barrier into an error.
  *
- * ptrace and DBI forward all three. The KVM ElfExecutor personality forwards
+ * ptrace and DBT forward all three. The KVM ElfExecutor personality forwards
  * fsync and fdatasync but returns deterministic ENOSYS for syncfs, so KVM is a
  * documented gap on this row (ok=5 instead of ok=6).
  */

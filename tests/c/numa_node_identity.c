@@ -15,7 +15,7 @@
  * (nodes == NULL) reports node 0 for EVERY page it is asked about — including
  * pages that are not resident, which a real kernel reports as -ENOENT. Those
  * constants are what make the values bitwise-identical across --verify repeat
- * runs and under record/replay, and they must match across backends: DBI and
+ * runs and under record/replay, and they must match across backends: DBT and
  * KVM have to mirror the golden ptrace reference exactly.
  *
  * This fixture uses the RAW syscalls (no libnuma) so it observes precisely what

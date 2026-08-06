@@ -61,6 +61,6 @@ int main(void) {
     return 3;
   }
 
-  puts("dbi-self-sigqueue-ok");
+  puts("dbt-self-sigqueue-ok");
   return 0;
 }

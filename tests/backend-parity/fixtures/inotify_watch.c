@@ -9,7 +9,7 @@
  * the descriptor lifecycle is asserted. The instance is created non-blocking
  * and close-on-exec.
  *
- * ptrace and DBI complete all four steps. KVM's ElfExecutor personality does
+ * ptrace and DBT complete all four steps. KVM's ElfExecutor personality does
  * not implement the inotify family, so it is a documented gap.
  */
 

@@ -14,16 +14,16 @@ crate-type = ["rlib", "cdylib"]
 # Third-party-dependency execution backends are OFF by default so the shipped
 # `hermit` binary is a single static binary with the ptrace/kvm/liteinst
 # backends and no DynamoRIO/e9patch/SaBRe third-party dependencies. CI builds
-# with `--features third-party-backends` to compile and test them. `dbi` is the
-# only feature that adds Rust dependencies (detcore-dbi + reverie-dbi); `sabre`
+# with `--features third-party-backends` to compile and test them. `dbt` is the
+# only feature that adds Rust dependencies (detcore-dbt + reverie-dbt); `sabre`
 # and `e9patch` shell out to external artifacts at runtime and only gate their
 # in-crate dispatch code.
 [features]
 default = []
-dbi = ["dep:detcore-dbi", "dep:reverie-dbi"]
+dbt = ["dep:detcore-dbt", "dep:reverie-dbt"]
 sabre = []
 e9patch = []
-third-party-backends = ["dbi", "sabre", "e9patch"]
+third-party-backends = ["dbt", "sabre", "e9patch"]
 
 [dependencies]
 anyhow = "1.0.103"
@@ -32,7 +32,7 @@ addr2line = "0.26.1"
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 colored = "2.1.0"
 detcore = { package = "hermit-detcore", version = "0.2.0", path = "../detcore" }
-detcore-dbi = { version = "0.2.0", path = "../detcore-dbi", optional = true }
+detcore-dbt = { version = "0.2.0", path = "../detcore-dbt", optional = true }
 detcore-model = { version = "0.2.0", path = "../detcore-model" }
 diff = "0.1.13"
 dirs = "6.0"
@@ -50,12 +50,12 @@ rand_pcg = { version = "0.10.2", features = ["serde"] }
 regex = "1.13.1"
 # Reverie is pinned to a specific commit for reproducibility. Keep this rev in
 # sync across all crates and bump it via docs/updating-reverie.md.
-reverie = { package = "reverie-core", version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf" }
-reverie-dbi = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf", default-features = false, optional = true }
-reverie-kvm = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf" }
-reverie-ptrace = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf" }
-reverie-liteinst = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf", default-features = false }
-reverie-rpc-transport = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf" }
+reverie = { package = "reverie-core", version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "88363a56870dcdd88b13b1309233706b691f6a41" }
+reverie-dbt = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "88363a56870dcdd88b13b1309233706b691f6a41", default-features = false, optional = true }
+reverie-kvm = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "88363a56870dcdd88b13b1309233706b691f6a41" }
+reverie-ptrace = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "88363a56870dcdd88b13b1309233706b691f6a41" }
+reverie-liteinst = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "88363a56870dcdd88b13b1309233706b691f6a41", default-features = false }
+reverie-rpc-transport = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "88363a56870dcdd88b13b1309233706b691f6a41" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 shell-words = "1.1.1"

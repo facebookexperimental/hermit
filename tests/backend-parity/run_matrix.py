@@ -18,7 +18,7 @@ import time
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPOSITORY = SCRIPT_DIR.parent.parent
-BACKENDS = ("ptrace", "dbi", "kvm")
+BACKENDS = ("ptrace", "dbt", "kvm")
 RUNS = 3
 
 # The compatibility scorecard is measurement state, not Hermit source.  When
@@ -133,7 +133,7 @@ def scorecard_fieldnames(actual_header, path):
 # contract cannot currently be verified at L2 on that backend. "guest" is
 # guest-visible L2: the two --verify runs produced identical stdout+exit but the
 # internal trace is not compared (KVM concurrent mode). "detlog" is full L2: the
-# two runs produced a bitwise-identical DETLOG after normalization (ptrace, DBI).
+# two runs produced a bitwise-identical DETLOG after normalization (ptrace, DBT).
 #
 # `stripped` is the rung that was missing, and its absence is what made every
 # green over-tiered: plain `--verify` DOES compare the DETLOG, but under the
@@ -146,7 +146,7 @@ L2_RANK = {"gap": 0, "guest": 1, "stripped": 2, "bitwise": 3}
 # never emit a DETLOG witness, so it is capped at guest-visible L2.
 L2_ALLOWED = {
     "ptrace": {"stripped", "bitwise"},
-    "dbi": {"stripped", "bitwise", "gap"},
+    "dbt": {"stripped", "bitwise", "gap"},
     "kvm": {"guest", "gap"},
 }
 
@@ -193,10 +193,10 @@ class Fixtures:
         sources: dict[str, tuple[Path, tuple[str, ...]]] = {
             "pthread_lifecycle": (local / "pthread_lifecycle.c", ("-pthread",)),
             "process_wait_lifecycle": (
-                REPOSITORY / "tests/c/dbi_wait_lifecycle.c",
+                REPOSITORY / "tests/c/dbt_wait_lifecycle.c",
                 ("-D_GNU_SOURCE",),
             ),
-            "mmap_exec": (REPOSITORY / "tests/c/dbi_mmap_exec.c", ()),
+            "mmap_exec": (REPOSITORY / "tests/c/dbt_mmap_exec.c", ()),
             "syscall_file_io": (
                 REPOSITORY / "tests/c/syscall_file_io.c",
                 (),
@@ -318,7 +318,7 @@ def case_catalog(
         "executable_mmap": (
             [str(fixtures.binary("mmap_exec"))],
             0,
-            b"dbi-mmap-exec-ok\n",
+            b"dbt-mmap-exec-ok\n",
         ),
         "memory_advice": (
             [str(fixtures.binary("madvise_determinism"))],
@@ -394,17 +394,17 @@ def case_catalog(
 # New cases are green contracts by default.  Only stable, diagnosed exceptions
 # belong here; live pass/fail evidence is written to the outer scorecard.
 L1_GAPS = {
-    ("dbi", "file_metadata"): (
+    ("dbt", "file_metadata"): (
         "PR #1549 determinizes credential queries (getuid/getgid/getresuid/"
-        "getresgid) to virtual-root identity 0; DBI forwards fchown(fd,0,0) to "
+        "getresgid) to virtual-root identity 0; DBT forwards fchown(fd,0,0) to "
         "the real kernel with no CLONE_NEWUSER uid map, so the guest performs an "
         "unprivileged chown-to-root and gets EPERM, whereas ptrace remaps it "
         "through the user namespace. fchown is not correctly implemented under "
-        "DBI, and an assertion against a half-implemented syscall could pass by "
-        "accident and prove nothing; declared a gap until DBI determinizes "
-        "fchown (see the determinize_fchown_under_dbi TODO)"
+        "DBT, and an assertion against a half-implemented syscall could pass by "
+        "accident and prove nothing; declared a gap until DBT determinizes "
+        "fchown (see the determinize_fchown_under_dbt TODO)"
     ),
-    ("dbi", "pthread_lifecycle"): (
+    ("dbt", "pthread_lifecycle"): (
         "Portable release DynamoRIO can stall or exit during native pthread "
         "startup before Detcore readiness"
     ),
@@ -414,17 +414,17 @@ L1_GAPS = {
     ),
 }
 L2_GAPS = {
-    ("dbi", "file_metadata"): (
-        "Inherited from the L1 DBI file_metadata gap: the fchown EPERM aborts "
+    ("dbt", "file_metadata"): (
+        "Inherited from the L1 DBT file_metadata gap: the fchown EPERM aborts "
         "the guest before any --verify double-run, so no L2 determinism witness "
         "can be produced"
     ),
-    ("dbi", "exit_status"): (
-        "hermit --verify runs the DBI guest only once when the first run exits "
+    ("dbt", "exit_status"): (
+        "hermit --verify runs the DBT guest only once when the first run exits "
         "non-zero (--verify-allow both), so the double-run DETLOG comparison "
         "never executes for this non-zero-exit contract"
     ),
-    ("dbi", "pthread_lifecycle"): ("DynamoRIO startup stall prevents an L2 verify run"),
+    ("dbt", "pthread_lifecycle"): ("DynamoRIO startup stall prevents an L2 verify run"),
     ("kvm", "process_wait_accounting"): (
         "under --verify the concurrent double-run races child reaping: waitid "
         "on the already-reaped child returns ECHILD"
@@ -477,8 +477,8 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
 
 
 def backend_block(backend: str, hermit: Path, strict: bool) -> str | None:
-    if backend == "dbi":
-        smoke_command = [str(hermit), "run", "--backend", "dbi"]
+    if backend == "dbt":
+        smoke_command = [str(hermit), "run", "--backend", "dbt"]
         if strict:
             smoke_command.append("--strict")
         smoke_command.extend(["--", "/bin/true"])
@@ -491,10 +491,10 @@ def backend_block(backend: str, hermit: Path, strict: bool) -> str | None:
                 check=False,
             )
         except subprocess.TimeoutExpired:
-            return "DBI smoke timed out"
+            return "DBT smoke timed out"
         if smoke.returncode != 0:
             diagnostic = smoke.stderr.decode(errors="replace").strip()
-            return f"DBI smoke exited {smoke.returncode}: {diagnostic[-300:]}"
+            return f"DBT smoke exited {smoke.returncode}: {diagnostic[-300:]}"
     elif backend == "kvm":
         kvm = Path("/dev/kvm")
         if not kvm.exists() or not os.access(kvm, os.R_OK | os.W_OK):
@@ -631,7 +631,7 @@ def root_random_output(stdout: bytes) -> bytes:
 
 # Two distinct `--verify` success witnesses, and they are NOT the same assurance:
 #
-#  * DETLOG-bitwise (ptrace, DBI): hermit re-runs the guest and finds the two
+#  * DETLOG-bitwise (ptrace, DBT): hermit re-runs the guest and finds the two
 #    DETLOG streams bitwise-identical after normalization. This is full L2 -- the
 #    internal syscall/scheduling trace is itself reproducible.
 #  * guest-visible (KVM): reverie-kvm runs concurrently and states outright that
@@ -839,7 +839,7 @@ def run_case(
     evidence: dict[str, str] | None = None,
 ) -> tuple[str, str, float]:
     guest, expected_status, expected_stdout = case_command(name, fixtures)
-    if backend == "dbi" and name == "random_sources":
+    if backend == "dbt" and name == "random_sources":
         guest = [*guest, "--root-only"]
     if backend == "kvm" and name == "memory_advice":
         guest = [*guest, "--kvm"]
@@ -850,7 +850,7 @@ def run_case(
     baseline: bytes | None = None
     started = time.monotonic()
     ptrace_random: bytes | None = None
-    if backend == "dbi" and name == "random_sources":
+    if backend == "dbt" and name == "random_sources":
         reference = run_with_timeout(
             hermit_command(hermit, "ptrace", guest, name, strict)
         )

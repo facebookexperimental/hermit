@@ -19,7 +19,7 @@
  * guest-visible byte stream ("reclock ok=6") is identical across repeated runs.
  * The absolute lock offsets/lengths are never printed, only the pass count.
  *
- * ptrace and DBI implement the whole family. KVM's ElfExecutor implements
+ * ptrace and DBT implement the whole family. KVM's ElfExecutor implements
  * F_SETLK (acquire/release/read-lock all succeed) but returns a deterministic
  * ENOSYS for F_GETLK, so it reports ok=5 and is recorded as an explicit gap.
  */

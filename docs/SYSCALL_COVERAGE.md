@@ -26,7 +26,7 @@ The historical counts below predate Detcore's `madvise(2)` handler. Current
 optimized run mode and record/replay subscriptions trap `madvise` and apply this
 explicit policy:
 
-- Normal ptrace/DBI runs forward `MADV_NORMAL`, `MADV_RANDOM`,
+- Normal ptrace/DBT runs forward `MADV_NORMAL`, `MADV_RANDOM`,
   `MADV_SEQUENTIAL`, `MADV_WILLNEED`, `MADV_DONTNEED`, and supported advice
   with guest-visible fork, dump, or guard semantics. Record/replay treats pure
   hints as fixed-success no-ops and returns fixed `ENOSYS` for every guest-semantic

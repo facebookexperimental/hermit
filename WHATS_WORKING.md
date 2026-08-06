@@ -464,12 +464,12 @@ threaded Python remains a separate gap. Ruby and PHP are excluded for host/runti
 | Backend | Flag | Status |
 |---------|------|--------|
 | **ptrace** | `--backend ptrace` (default) | **Working.** Every result in this doc uses it. |
-| **DBI** (DynamoRIO) | `--backend dbi` | **SDK-gated.** Now *ungated when a DynamoRIO SDK is present* (PR #213). With no SDK it fail-closes: `backend 'dbi' is unavailable: the DynamoRIO SDK was not found; set DYNAMORIO_HOME or DynamoRIO_DIR to a valid SDK`. No SDK is installed on this host, so the DBI E2E path is untested here. |
+| **DBT** (DynamoRIO) | `--backend dbt` | **SDK-gated.** Now *ungated when a DynamoRIO SDK is present* (PR #213). With no SDK it fail-closes: `backend 'dbt' is unavailable: the DynamoRIO SDK was not found; set DYNAMORIO_HOME or DynamoRIO_DIR to a valid SDK`. No SDK is installed on this host, so the DBT E2E path is untested here. |
 | **KVM** | `--backend kvm` | **Wiring in progress.** Fail-closed; no Tool/Guest adapter for executing Linux programs yet. |
 
 ```bash
 $HERMIT run --strict --verify -- /bin/echo hi   # ptrace: works
-$HERMIT run --backend dbi -- /bin/echo hi        # needs DYNAMORIO_HOME/DynamoRIO_DIR
+$HERMIT run --backend dbt -- /bin/echo hi        # needs DYNAMORIO_HOME/DynamoRIO_DIR
 $HERMIT run --backend kvm -- /bin/echo hi        # fail-closed
 ```
 
@@ -578,20 +578,20 @@ that path.
   | Repo | PR | Title |
   |---|---:|---|
   | hermit | [#211](https://github.com/rrnewton/hermit/pull/211) | validate: auto-apply `locally-validated` PR label on a green run |
-  | hermit | [#225](https://github.com/rrnewton/hermit/pull/225) | DBI M2a: add `reverie-dbi` dependency to `hermit-cli` |
+  | hermit | [#225](https://github.com/rrnewton/hermit/pull/225) | DBT M2a: add `reverie-dbt` dependency to `hermit-cli` |
   | hermit | [#229](https://github.com/rrnewton/hermit/pull/229) | KVM M3: prove Detcore drives `KvmGuest` via `run_with_tool` |
   | hermit | [#230](https://github.com/rrnewton/hermit/pull/230) | detcore: classify internal pipes as `InternalIOPolling` (fix R/R pipe record deadlock) |
   | hermit | [#233](https://github.com/rrnewton/hermit/pull/233) | Fix KVM backend dispatch and private-flag futex timeout classification |
-  | hermit | [#234](https://github.com/rrnewton/hermit/pull/234) | DBI M2b: route DBI backend through `reverie_dbi::DbiRunner` |
+  | hermit | [#234](https://github.com/rrnewton/hermit/pull/234) | DBT M2b: route DBT backend through `reverie_dbt::DbtRunner` |
   | hermit | [#235](https://github.com/rrnewton/hermit/pull/235) | detcore: record internal-pipe read data on the `InternalIOPolling` path (R/R replay ordering) |
   | reverie | [#23](https://github.com/rrnewton/reverie/pull/23) | Document and formalize the Reverie backend contract |
-  | reverie | [#32](https://github.com/rrnewton/reverie/pull/32) | reverie-dbi: Guest stack + `tail_inject` (M2); simple observation tools |
+  | reverie | [#32](https://github.com/rrnewton/reverie/pull/32) | reverie-dbt: Guest stack + `tail_inject` (M2); simple observation tools |
   | reverie | [#39](https://github.com/rrnewton/reverie/pull/39) | reverie-kvm: `StraceTool` over `KvmGuest` (KVM M2) |
-  | reverie | [#40](https://github.com/rrnewton/reverie/pull/40) | reverie-dbi: park/unpark executor so DBI handlers can suspend (async FFI bridge) |
+  | reverie | [#40](https://github.com/rrnewton/reverie/pull/40) | reverie-dbt: park/unpark executor so DBT handlers can suspend (async FFI bridge) |
 
-  These advance the DBI (DynamoRIO) and KVM backends behind the still-default ptrace backend
+  These advance the DBT (DynamoRIO) and KVM backends behind the still-default ptrace backend
   (#225/#233/#234 + reverie #23/#32/#39/#40) and the record/replay pipe path (#230/#235); the
-  DBI/KVM E2E paths remain gated/in-progress as described in §4, and pipe R/R is not yet
+  DBT/KVM E2E paths remain gated/in-progress as described in §4, and pipe R/R is not yet
   `--verify`-clean (see §5).
 
 **Not Hermit issues (documented so they aren't mis-filed):**

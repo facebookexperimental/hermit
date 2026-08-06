@@ -6,7 +6,7 @@
  * On a bare host that mask reflects the running kernel's capabilities and is
  * therefore host-dependent. Under Hermit every backend normalizes the mask to
  * the canonical value 31, so the query result is stable and identical across
- * ptrace, DBI, and KVM. MEMBARRIER_CMD_GLOBAL is the always-available
+ * ptrace, DBT, and KVM. MEMBARRIER_CMD_GLOBAL is the always-available
  * process-wide barrier and returns 0.
  *
  * The contract deliberately avoids the registered-private and expedited

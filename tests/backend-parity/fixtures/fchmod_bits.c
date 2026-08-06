@@ -4,7 +4,7 @@
 // fchmod(2), chmod(2), and fchmodat(2), reading the result back with
 // fstat(2)/stat(2) each time. The mode a program sets on a file it owns is a
 // deterministic property of the guest filesystem view, independent of host
-// umask or the host's real inode metadata, so ptrace, DBI, and KVM must all
+// umask or the host's real inode metadata, so ptrace, DBT, and KVM must all
 // observe the same permission bits. Only the low twelve mode bits are examined
 // and only the final self-set mode is printed; no host-derived ownership,
 // device, inode, or timestamp field is exposed.

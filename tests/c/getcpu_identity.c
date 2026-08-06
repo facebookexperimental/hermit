@@ -13,7 +13,7 @@
  * the raw SYS_getcpu syscall must always report CPU 0 / node 0 and succeed,
  * regardless of which host CPU actually ran the guest. That constant answer is
  * what makes the value bitwise-identical across --verify repeat runs and under
- * record/replay, and it must be identical across backends: the DBI backend has
+ * record/replay, and it must be identical across backends: the DBT backend has
  * to match the golden ptrace reference exactly.
  *
  * This fixture exercises the raw syscall (not glibc's vDSO-accelerated

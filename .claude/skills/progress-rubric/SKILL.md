@@ -15,7 +15,7 @@ leading mode to trailing modes**.
 1. Measure one exact `origin/main` SHA in a clean checkout. If main moves and
    product code changed, update and rerun affected measurements.
 2. Run the same app probes through non-KVM
-   `--strict --verify --verify-strict --verify-json`, record/replay, DBI, and
+   `--strict --verify --verify-strict --verify-json`, record/replay, DBT, and
    KVM. Require `bitwise_parity: true` for every L2 cell. KVM's current
    output/status-only verification is a separate, lower-assurance cell. Do not
    substitute old task notes for live results.
@@ -33,7 +33,7 @@ leading mode to trailing modes**.
 2. **Coverage slope**: one compact row per mode showing `passed / probes`, the
    first unsupported workload class, and the current blocking layer.
 3. **App matrix**: one row per identical program/workload, columns for strict
-   verify, R/R, DBI, and KVM. Include at least a trivial ELF, a file-processing
+   verify, R/R, DBT, and KVM. Include at least a trivial ELF, a file-processing
    tool, an interpreter, a concurrent pipeline, and a toolchain frontend.
 4. **Repository health**: `cargo test`, `validate.sh`, the working-envelope
    vector, focused R/R suite, and live main CI. Preserve incomplete-run status.
@@ -80,13 +80,13 @@ For each probe, run:
   --verify-json /tmp/progress-verify.json -- PROGRAM ARGS...
 ./target/debug/hermit record start --verify --verify-strict --record-timeout 90 \
   --data-dir "$(mktemp -d /tmp/hermit-report-rr.XXXXXX)" -- PROGRAM ARGS...
-./target/debug/hermit run --backend dbi --strict --verify --verify-strict \
-  --verify-json /tmp/progress-dbi-verify.json -- PROGRAM ARGS...
+./target/debug/hermit run --backend dbt --strict --verify --verify-strict \
+  --verify-json /tmp/progress-dbt-verify.json -- PROGRAM ARGS...
 ./target/debug/hermit run --backend kvm --strict --verify \
   --verify-json /tmp/progress-kvm-output.json -- PROGRAM ARGS...
 ```
 
-If DBI or KVM has a backend-wide preflight failure, run one representative
+If DBT or KVM has a backend-wide preflight failure, run one representative
 probe, quote the error, and mark the remaining cells `BLOCKED*` with one shared
 footnote. Do not use a client, SDK, pin, or proof branch that is not supplied by
 main. For R/R, distinguish record timeout, replay divergence, output mismatch,

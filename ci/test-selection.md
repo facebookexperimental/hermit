@@ -87,13 +87,13 @@ to the jobs a workflow would launch.
 
 - **Test shards** (`ci/portable-shards.json`, `debug_shards` + `release_shards`).
   A shard runs iff **any** of its nodes was selected. A release shard also
-  declares `needs` (`dbi` / `aux`), which is how the selector decides whether the
-  `build-dbi` / `build-aux` release builds are needed.
+  declares `needs` (`dbt` / `aux`), which is how the selector decides whether the
+  `build-dbt` / `build-aux` release builds are needed.
 - **E2E cells** (`ci/expected-e2e-plan.json`, the 52 portable cells). Cells are
   filtered by **per-change backend affinity**, not by node membership — see next
   section.
-- **Release builds.** `build-dbi` / `build-aux` are emitted only when a selected
-  shard needs them or a selected e2e cell uses that backend (dbi ⇒ build-dbi;
+- **Release builds.** `build-dbt` / `build-aux` are emitted only when a selected
+  shard needs them or a selected e2e cell uses that backend (dbt ⇒ build-dbt;
   sabre/liteinst ⇒ build-aux). `build-debug` is emitted whenever any shard or
   cell runs.
 
@@ -103,12 +103,12 @@ A footprint entry may carry an e2e affinity that filters the cell matrix:
 
 | Footprint key | Meaning | Cells run |
 | --- | --- | --- |
-| `"e2e_backends": ["dbi"]` | change only affects that backend's e2e path | only `dbi` cells |
+| `"e2e_backends": ["dbt"]` | change only affects that backend's e2e path | only `dbt` cells |
 | `"e2e_all": true` | change can affect any backend (core Detcore, the CLI, a guest fixture) | every cell |
 | *neither* | pure lint/doc/script change | no cells |
 
-So a `detcore-dbi/**` change runs the DBI parity shard + only the 8 DBI cells +
-`build-dbi` (not `build-aux`); a `detcore-sabre/**` change runs the SaBRe shard +
+So a `detcore-dbt/**` change runs the DBT parity shard + only the 8 DBT cells +
+`build-dbt` (not `build-aux`); a `detcore-sabre/**` change runs the SaBRe shard +
 only the 4 SaBRe cells + `build-aux`; a core `detcore/**` change runs all 52
 cells. `force_full` and unknown paths still run the full cell matrix (fail-safe).
 
@@ -121,7 +121,7 @@ cells. `force_full` and unknown paths still run the full cell matrix (fail-safe)
 ### GitHub matrix output
 
 `--format github` writes, in addition to `decision`/`shard_count`/`cell_count`/
-`build_debug`/`build_dbi`/`build_aux`, two ready-to-consume matrices:
+`build_debug`/`build_dbt`/`build_aux`, two ready-to-consume matrices:
 
 - `shard_matrix` — `{"shards": ["unit", "clippy", …]}`
 - `cell_matrix`  — `{"include": [{"category","mode","backend","slug"}, …]}`

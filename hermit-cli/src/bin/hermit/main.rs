@@ -286,7 +286,7 @@ impl Subcommand {
         //     reservation, `validate_args`, backend availability, PMU config,
         //     mount-source and program validation, happens-before resolution,
         //     e9patch preparation;
-        //   * the DBI arm, which returns `run_dbi(..)` and never reaches
+        //   * the DBT arm, which returns `run_dbt(..)` and never reaches
         //     `verify()`, so it produces no verdict at all;
         //   * `--namespace-only`, which likewise bypasses `verify()`;
         //   * `StartOpts::main`'s own pre-validation before `record_verify`.
@@ -419,11 +419,11 @@ mod tests {
         );
     }
 
-    /// TOP-LEVEL EXIT 2 -- the DBI arm of `RunOpts::main` RETURNS `run_dbi(..)`
-    /// and never reaches `verify()`, so a `--verify --verify-json` DBI run
+    /// TOP-LEVEL EXIT 2 -- the DBT arm of `RunOpts::main` RETURNS `run_dbt(..)`
+    /// and never reaches `verify()`, so a `--verify --verify-json` DBT run
     /// cannot produce a verdict at all.
     ///
-    /// Asserted STRUCTURALLY rather than by executing the arm. `run_dbi` takes
+    /// Asserted STRUCTURALLY rather than by executing the arm. `run_dbt` takes
     /// `verify: bool` but no verdict-artifact path, in BOTH cfg arms
     /// (`backends.rs`), so the bypass is a property of the signature: there is
     /// no argument through which it could publish one. An earlier version of
@@ -434,26 +434,26 @@ mod tests {
     /// its whole timeout. A test that cannot hang is worth more here than one
     /// that exercises the launch.
     #[test]
-    fn dbi_arm_has_no_channel_to_publish_a_verdict() {
+    fn dbt_arm_has_no_channel_to_publish_a_verdict() {
         let source = include_str!("backends.rs");
         let signatures: Vec<&str> = source
-            .match_indices("fn run_dbi(")
+            .match_indices("fn run_dbt(")
             .map(|(i, _)| {
                 let rest = &source[i..];
                 &rest[..rest
                     .find(") -> Result<ExitStatus, Error>")
-                    .expect("run_dbi signature")]
+                    .expect("run_dbt signature")]
             })
             .collect();
-        assert_eq!(signatures.len(), 2, "expected both cfg arms of run_dbi");
+        assert_eq!(signatures.len(), 2, "expected both cfg arms of run_dbt");
         for signature in signatures {
             assert!(
                 signature.contains("verify"),
-                "run_dbi should still receive the verify flag"
+                "run_dbt should still receive the verify flag"
             );
             assert!(
                 !signature.contains("verify_json") && !signature.contains("json"),
-                "run_dbi gained a verdict-artifact parameter; the DBI arm can now publish a \
+                "run_dbt gained a verdict-artifact parameter; the DBT arm can now publish a \
                  verdict, so it must clear or publish the receipt rather than relying solely on \
                  the top-level pending stamp:\n{signature}"
             );

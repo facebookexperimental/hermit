@@ -132,7 +132,7 @@ The root Cargo workspace has thirteen members:
 | `hermit-cli` | Main `hermit` CLI and `libhermit`; run, record, replay, log-diff, analyze, and container orchestration. |
 | `detcore` | Core determinism engine and Reverie tool; scheduler, virtual time, syscall handling, content digests, CPUID handling, and record/replay behavior. |
 | `detcore-model` | Shared deterministic state and model types, including PIDs, file descriptors, futexes, schedules, and logical time. |
-| `detcore-dbi` | Feature-gated DynamoRIO backend glue; private while the public DBT package boundary and name remain undecided. |
+| `detcore-dbt` | Feature-gated DynamoRIO backend glue; private while the public DBT package boundary and name remain undecided. |
 | `detcore-sabre` | Feature-gated SaBRe backend glue; private while third-party backend packaging remains provisional. |
 | `detcore/tests/testutils` | Helpers used by Detcore integration tests. |
 | `hermit-verify` | Verification executable for stress, trace, schedule, and replay checks. |
@@ -165,7 +165,7 @@ the backend-specific guest implementation. Every real backend runs the same
 copy of the Detcore determinism code; a separate reimplementation or a command
 that merely launches a program is not a backend.
 
-The `ptrace` backend is the default and best-tested path. DBI and KVM are real
+The `ptrace` backend is the default and best-tested path. DBT and KVM are real
 backends only where they execute this full Detcore tool path. Use these terms
 precisely:
 
@@ -222,7 +222,7 @@ presupposes the ones below it:
 A claim that a run "passes" is meaningless without a level. Write, for example,
 "passes at L2 (ptrace backend)". When reporting a run, also state:
 
-- **Backend**: `ptrace`, `DBI`, or `KVM`.
+- **Backend**: `ptrace`, `DBT`, or `KVM`.
 - **Log level**: the `--log`/`RUST_LOG` level, or "default" when unset.
 - **Relaxations**: any flag that weakens determinism, for example
   `--no-strict` or `--no-sequentialize-threads`. State "none" when there are

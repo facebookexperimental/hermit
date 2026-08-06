@@ -203,7 +203,7 @@ fn copy_licenses(repository_root: &Path, reverie_root: &Path, install: &Path) {
 }
 
 fn copy_dynamorio(resources: &Path) -> PathBuf {
-    let drrun = reverie_dbi::bundled_drrun_path();
+    let drrun = reverie_dbt::bundled_drrun_path();
     let root = drrun
         .parent()
         .and_then(Path::parent)
@@ -214,17 +214,17 @@ fn copy_dynamorio(resources: &Path) -> PathBuf {
             &resources.join("dynamorio").join(relative),
         );
     }
-    reverie_dbi::bundled_dynamorio_cmake_dir().to_path_buf()
+    reverie_dbt::bundled_dynamorio_cmake_dir().to_path_buf()
 }
 
-fn build_dbi_client(
+fn build_dbt_client(
     manifest_dir: &Path,
     build_root: &Path,
     resources: &Path,
     dynamorio_cmake: &Path,
 ) {
-    let source = reverie_dbi::native_client_source_dir().join("client.c");
-    let build = build_root.join("dbi-client");
+    let source = reverie_dbt::native_client_source_dir().join("client.c");
+    let build = build_root.join("dbt-client");
     run(
         Command::new("cmake")
             .arg("-S")
@@ -233,25 +233,25 @@ fn build_dbi_client(
             .arg(&build)
             .arg("-DCMAKE_BUILD_TYPE=Release")
             .arg(format!("-DDynamoRIO_DIR={}", dynamorio_cmake.display()))
-            .arg(format!("-DREVERIE_DBI_NATIVE_SOURCE={}", source.display()))
+            .arg(format!("-DREVERIE_DBT_NATIVE_SOURCE={}", source.display()))
             .arg(format!("-DHERMIT_RESOURCE_DIR={}", resources.display())),
-        "configure the relocatable Detcore DBI client",
+        "configure the relocatable Detcore DBT client",
     );
     let mut command = Command::new("cmake");
     command.arg("--build").arg(&build).args([
         "--config",
         "Release",
         "--target",
-        "reverie_dbi_client",
+        "reverie_dbt_client",
         "--parallel",
     ]);
     if let Some(jobs) = env::var_os("NUM_JOBS") {
         command.arg(jobs);
     }
-    run(&mut command, "build the relocatable Detcore DBI client");
+    run(&mut command, "build the relocatable Detcore DBT client");
     assert!(
-        resources.join("libreverie_dbi_client.so").is_file(),
-        "DBI client build did not produce libreverie_dbi_client.so"
+        resources.join("libreverie_dbt_client.so").is_file(),
+        "DBT client build did not produce libreverie_dbt_client.so"
     );
 }
 
@@ -313,7 +313,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=HERMIT_INSTALL_FORCE_RESTAGE");
     println!("cargo:rerun-if-changed=../scripts/stage-liteinst-runtime.sh");
     println!("cargo:rerun-if-changed=native-client/CMakeLists.txt");
-    println!("cargo:rerun-if-changed=native-client/detcore_dbi_link_stub.c");
+    println!("cargo:rerun-if-changed=native-client/detcore_dbt_link_stub.c");
 
     let profile = env::var("PROFILE");
     if profile.as_deref() != Ok("release")
@@ -349,7 +349,7 @@ fn main() {
     fs::create_dir_all(&build_root)
         .unwrap_or_else(|error| panic!("failed to create {}: {error}", build_root.display()));
 
-    for library in ["libdetcore_dbi.so", "libdetcore_sabre.so"] {
+    for library in ["libdetcore_dbt.so", "libdetcore_sabre.so"] {
         replace_symlink(
             &resources.join(library),
             &Path::new("../../release").join(library),
@@ -358,17 +358,17 @@ fn main() {
     }
 
     let dynamorio_cmake = copy_dynamorio(&resources);
-    build_dbi_client(&manifest_dir, &build_root, &resources, &dynamorio_cmake);
+    build_dbt_client(&manifest_dir, &build_root, &resources, &dynamorio_cmake);
 
     let repository = manifest_dir
         .parent()
         .expect("hermit-install is not inside the Hermit repository");
     build_liteinst_runtime(repository, &build_root, &profile_dir, &resources);
 
-    let reverie_root = reverie_dbi::native_client_source_dir()
+    let reverie_root = reverie_dbt::native_client_source_dir()
         .parent()
         .and_then(Path::parent)
-        .expect("reverie-dbi source is not inside the Reverie repository");
+        .expect("reverie-dbt source is not inside the Reverie repository");
     build_sabre(reverie_root, &build_root, &resources);
     build_e9patch(reverie_root, &build_root, &resources);
     copy_licenses(repository, reverie_root, &install);

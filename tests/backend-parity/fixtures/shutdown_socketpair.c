@@ -3,7 +3,7 @@
 // Half-closes and fully closes connected socket-pair endpoints and checks the
 // return value of each shutdown. shutdown returns immediately and transfers no
 // data, so there is no blocking cross-endpoint wait for the scheduler to order
-// (a blocking read would livelock the DBI cooperative scheduler). No byte is
+// (a blocking read would livelock the DBT cooperative scheduler). No byte is
 // ever written after a shutdown, so no SIGPIPE is raised — signal delivery is
 // deliberately avoided, keeping this a pure return-value contract.
 //

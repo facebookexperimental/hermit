@@ -139,7 +139,7 @@ pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
 /// Returns whether the audited runtime policy classifies `sysno` as unsupported.
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-644): Review the copied-DBI-child classification surface.
+// TODO-HUMAN-REVIEW(PR-644): Review the copied-DBT-child classification surface.
 pub fn is_unsupported_syscall(sysno: Sysno) -> bool {
     matches!(
         syscall_classification::classify_syscall(sysno),
@@ -151,7 +151,7 @@ pub fn is_unsupported_syscall(sysno: Sysno) -> bool {
 /// `request_key`, `keyctl`) that Detcore hides behind a deterministic
 /// `CONFIG_KEYS`-absent boundary under strict mode.
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-916): Exposed so the copied-DBI-child policy can preserve
+// TODO-HUMAN-REVIEW(PR-916): Exposed so the copied-DBT-child policy can preserve
 // the same keyring isolation boundary that the reclassification (PR-848) moved
 // out of the Unsupported set.
 pub fn is_kernel_keyring_syscall(sysno: Sysno) -> bool {
@@ -162,14 +162,14 @@ pub fn is_kernel_keyring_syscall(sysno: Sysno) -> bool {
 /// errno in strict mode without consulting the host.
 ///
 /// This is the boundary backends that execute guest syscalls outside Detcore's
-/// `handle_syscall_event` dispatcher (the DBI copied-child fast path and the
+/// `handle_syscall_event` dispatcher (the DBT copied-child fast path and the
 /// KVM executor) consult to enforce the same fixed refusal the ptrace path
 /// enforces. It deliberately excludes emulated / no-op / host-forwarding
 /// families (credential no-ops, `timer_create`, AF_UNIX autobind, `openat2`,
 /// `copy_file_range`), because fail-closing a copied child for those would
 /// diverge from the ptrace path rather than match it.
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-978): Review the copied-DBI-child deterministic-refusal surface.
+// TODO-HUMAN-REVIEW(PR-978): Review the copied-DBT-child deterministic-refusal surface.
 pub fn is_deterministically_refused_syscall(sysno: Sysno) -> bool {
     syscall_classification::is_deterministically_refused_syscall(sysno)
 }
@@ -1073,7 +1073,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // opt-in, Detcore MUST still see every syscall it deterministically
             // refuses with a fixed ENOSYS/EPERM; otherwise passthru_opt would let
             // strict guests execute those syscalls natively against the host,
-            // exactly the leak the DBI copied-child path also had to close.
+            // exactly the leak the DBT copied-child path also had to close.
             subscription.syscalls(Sysno::iter().filter(|sysno| {
                 syscall_classification::is_deterministically_refused_syscall(*sysno)
             }));

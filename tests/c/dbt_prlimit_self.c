@@ -60,6 +60,6 @@ int main(void) {
     return 7;
   }
 
-  puts("dbi-prlimit-self-ok");
+  puts("dbt-prlimit-self-ok");
   return 0;
 }

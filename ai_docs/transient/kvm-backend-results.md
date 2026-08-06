@@ -4,7 +4,7 @@ Last tested: 2026-07-22
 
 This report records an attempt to validate Hermit's `--backend kvm` execution
 backend against real applications (`echo`, a hello binary, Redis, Python), the
-same way the DBI backend is being exercised. The headline result is that the
+same way the DBT backend is being exercised. The headline result is that the
 KVM backend **is not an execution backend**: it cannot run arbitrary Linux ELF
 programs, so "test it with real apps" reduces to confirming the status of its
 built-in demonstration path and the CLI plumbing around it.
@@ -34,7 +34,7 @@ Hermit's driver reflects this. `hermit-cli/src/bin/hermit/backends.rs::run_kvm`
 **ignores the program argument** and always builds a tiny real-mode guest that
 issues a single `write(2)` via `vmcall`; the host handler performs the write so
 the message reaches real stdout. The module doc-comment states plainly that the
-DBI and KVM backends "do not yet load and execute arbitrary Linux ELF programs"
+DBT and KVM backends "do not yet load and execute arbitrary Linux ELF programs"
 and only "run a minimal 'hello world' demonstration through their real
 interception path."
 
@@ -163,7 +163,7 @@ single `write`, not application execution, and would be misleading.
 
 ## Conclusion
 
-The KVM backend cannot be "validated with real apps" the way DBI can, because it
+The KVM backend cannot be "validated with real apps" the way DBT can, because it
 is a prototype vmcall demonstration, not an ELF execution backend. Concretely:
 
 - **What works:** the `reverie-kvm` VM-exit → typed-syscall interception path and

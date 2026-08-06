@@ -144,7 +144,7 @@ hermit run --base-env=minimal -e LANG=C --workdir=/tmp -- /bin/pwd
 
 #### Backend Selection
 
-Use `--backend=ptrace|dbi|liteinst|sabre|kvm|e9patch` to select the process
+Use `--backend=ptrace|dbt|liteinst|sabre|kvm|e9patch` to select the process
 instrumentation backend.
 It is a global option and belongs before the subcommand, but backend scope is
 command-specific. LiteInst and e9patch support only `run`, while SaBRe supports

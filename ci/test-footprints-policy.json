@@ -70,7 +70,7 @@
         "e2e.manifest_system_utils",
         "e2e.manifest_util_c",
         "test.applications_e2e",
-        "test.dbi_parity",
+        "test.dbt_parity",
         "test.envelope_levels",
         "test.strict_compat"
       ],
@@ -98,7 +98,7 @@
         "test.arbitrary_binaries",
         "test.cli",
         "test.command_strict_verify",
-        "test.dbi_parity",
+        "test.dbt_parity",
         "test.envelope_levels",
         "test.hermit_integration",
         "test.hermit_modes",
@@ -142,10 +142,10 @@
       "e2e_all": true
     },
     {
-      "_why": "The DBI plugin has a backend-private release/parity harness and DBI cells.",
-      "packages": ["detcore-dbi"],
-      "nodes": ["e2e.manifest_backend_parity_c", "test.dbi_parity"],
-      "e2e_backends": ["dbi"]
+      "_why": "The DBT plugin has a backend-private release/parity harness and DBT cells.",
+      "packages": ["detcore-dbt"],
+      "nodes": ["e2e.manifest_backend_parity_c", "test.dbt_parity"],
+      "e2e_backends": ["dbt"]
     },
     {
       "_why": "The SaBRe plugin has a backend-private release/examples harness and SaBRe cells.",
@@ -167,10 +167,10 @@
   ],
   "path_footprints": [
     {
-      "_why": "Legacy DBI parity fixtures are outside Cargo targets.",
+      "_why": "Legacy DBT parity fixtures are outside Cargo targets.",
       "paths": ["tests/backend-parity/**"],
-      "nodes": ["e2e.manifest_backend_parity_c", "test.dbi_parity"],
-      "e2e_backends": ["dbi"]
+      "nodes": ["e2e.manifest_backend_parity_c", "test.dbt_parity"],
+      "e2e_backends": ["dbt"]
     },
     {
       "_why": "Shared non-Cargo guest fixtures are consumed by the manifest and Hermit integration harnesses.",

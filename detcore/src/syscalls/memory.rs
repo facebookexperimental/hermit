@@ -101,7 +101,7 @@ fn validate_common_args(call: syscalls::Madvise) -> Result<(), Error> {
 impl<T: RecordOrReplay> Detcore<T> {
     /// Apply a deterministic policy to madvise(2).
     ///
-    /// Ptrace/DBI forward hints and supported advice with guest-visible semantics.
+    /// Ptrace/DBT forward hints and supported advice with guest-visible semantics.
     /// Record/replay accepts pure hints as no-ops and rejects guest-semantic advice
     /// because replay replaces file mappings with anonymous mappings. Reclaim and
     /// asynchronous VM-policy

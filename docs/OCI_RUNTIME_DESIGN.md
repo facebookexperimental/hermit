@@ -309,7 +309,7 @@ assumption:
 | Backend path | Rootfs presentation | First qualification |
 | --- | --- | --- |
 | ptrace | Host mount namespace, overlay, `pivot_root`, then normal Reverie attach | Compatibility baseline |
-| DBI/SaBRe | Same host namespace view, but instrumentation/runtime files must be opened before `pivot_root` or deliberately staged inside the image | Performance follow-up |
+| DBT/SaBRe | Same host namespace view, but instrumentation/runtime files must be opened before `pivot_root` or deliberately staged inside the image | Performance follow-up |
 | LiteInst hybrid | Same host namespace view; preload DSO and post-exec bootstrap must be qualified inside the image | After its exec/lifecycle support |
 | KVM | Export the prepared root through a block image, virtio-fs, or equivalent guest-kernel filesystem channel | Separate performance/isolation phase |
 
@@ -320,7 +320,7 @@ fallback to ptrace and no silent use of the host root.
 
 This preserves the backend-agnostic filesystem seam without making the false
 claim that host `chroot` automatically configures KVM. Ptrace is the golden
-compatibility baseline; DBI and KVM are performance paths qualified against
+compatibility baseline; DBT and KVM are performance paths qualified against
 the same image, argv, environment, and filesystem fixture.
 
 ## Interactive TTY Design
@@ -467,7 +467,7 @@ restores the host terminal after success, guest crash, and Hermit interruption.
 ### Phase 4: Backend qualification
 
 - Move rootfs setup behind the explicit backend capability interface.
-- Qualify DBI/SaBRe runtime artifacts and exact output against ptrace fixtures.
+- Qualify DBT/SaBRe runtime artifacts and exact output against ptrace fixtures.
 - Qualify LiteInst only after its image-replacement lifecycle is supported.
 - Implement and qualify a KVM rootfs export mechanism; do not reuse the host
   `pivot_root` claim for KVM.
@@ -480,7 +480,7 @@ digest and transcript. Unsupported backends fail before guest launch.
 - Credential-helper coverage and registry auth-file compatibility.
 - Signature policy, offline policy, cache inspection, and garbage collection.
 - Pull progress, cancellation, quotas, and decompression resource limits.
-- Performance measurement of cold pull, warm snapshot, overlay startup, DBI,
+- Performance measurement of cold pull, warm snapshot, overlay startup, DBT,
   and KVM without weakening the correctness gates.
 
 ## Required Tests

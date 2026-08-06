@@ -22,9 +22,9 @@
  * channel; the flag is a policy hint the kernel records but the fixture never
  * relies on any hugepage-backing side effect.
  *
- * ptrace and DBI drive the full round-trip; KVM's ElfExecutor does not implement
+ * ptrace and DBT drive the full round-trip; KVM's ElfExecutor does not implement
  * the PR_*_THP_DISABLE requests and refuses them with ENOSYS (recorded as a KVM
- * gap in matrix.tsv), so this row runs on ptrace and DBI. The fixture prints
+ * gap in matrix.tsv), so this row runs on ptrace and DBT. The fixture prints
  * only a check count.
  */
 

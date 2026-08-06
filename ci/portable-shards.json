@@ -22,7 +22,7 @@
     "build.workspace",
     "build.manifest_guests"
   ],
-  "build_dbi_nodes": [
+  "build_dbt_nodes": [
     "build.runtime_release"
   ],
   "build_aux_nodes": [
@@ -39,8 +39,8 @@
     { "slug": "strict-compat", "nodes": ["test.strict_compat"] }
   ],
   "release_shards": [
-    { "slug": "dbi-parity", "needs": "dbi", "nodes": ["test.dbi_parity"] },
-    { "slug": "sabre",      "needs": "dbi", "nodes": ["test.sabre_examples"] },
+    { "slug": "dbt-parity", "needs": "dbt", "nodes": ["test.dbt_parity"] },
+    { "slug": "sabre",      "needs": "dbt", "nodes": ["test.sabre_examples"] },
     { "slug": "liteinst",   "needs": "aux", "nodes": ["test.liteinst_strict"] }
   ]
 }

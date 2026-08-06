@@ -44,7 +44,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `test-allocator`; reverse-dependent closure: detcore-dbi, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify, test-allocator.",
+      "_why": "@generated: Cargo package `test-allocator`; reverse-dependent closure: detcore-dbt, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify, test-allocator.",
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
@@ -71,7 +71,7 @@
         "test.arbitrary_binaries",
         "test.cli",
         "test.command_strict_verify",
-        "test.dbi_parity",
+        "test.dbt_parity",
         "test.detcore_misc",
         "test.detcore_parallel",
         "test.detcore_unit",
@@ -92,7 +92,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit-detcore`; reverse-dependent closure: detcore-dbi, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
+      "_why": "@generated: Cargo package `hermit-detcore`; reverse-dependent closure: detcore-dbt, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
@@ -119,7 +119,7 @@
         "test.arbitrary_binaries",
         "test.cli",
         "test.command_strict_verify",
-        "test.dbi_parity",
+        "test.dbt_parity",
         "test.detcore_misc",
         "test.detcore_parallel",
         "test.detcore_unit",
@@ -141,9 +141,9 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `detcore-dbi`; reverse-dependent closure: detcore-dbi, hermit.",
+      "_why": "@generated: Cargo package `detcore-dbt`; reverse-dependent closure: detcore-dbt, hermit.",
       "e2e_backends": [
-        "dbi"
+        "dbt"
       ],
       "nodes": [
         "build.runtime_release",
@@ -157,7 +157,7 @@
         "test.arbitrary_binaries",
         "test.cli",
         "test.command_strict_verify",
-        "test.dbi_parity",
+        "test.dbt_parity",
         "test.hermit_integration",
         "test.hermit_modes",
         "test.hermit_unit",
@@ -168,12 +168,12 @@
         "test.sabre_examples"
       ],
       "paths": [
-        "detcore-dbi/**/*.rs",
-        "detcore-dbi/Cargo.toml"
+        "detcore-dbt/**/*.rs",
+        "detcore-dbt/Cargo.toml"
       ]
     },
     {
-      "_why": "@generated: Cargo package `detcore-model`; reverse-dependent closure: detcore-dbi, detcore-model, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
+      "_why": "@generated: Cargo package `detcore-model`; reverse-dependent closure: detcore-dbt, detcore-model, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
@@ -200,7 +200,7 @@
         "test.arbitrary_binaries",
         "test.cli",
         "test.command_strict_verify",
-        "test.dbi_parity",
+        "test.dbt_parity",
         "test.detcore_misc",
         "test.detcore_parallel",
         "test.detcore_unit",
@@ -241,7 +241,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `detcore-testutils`; reverse-dependent closure: detcore-dbi, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
+      "_why": "@generated: Cargo package `detcore-testutils`; reverse-dependent closure: detcore-dbt, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
@@ -268,7 +268,7 @@
         "test.arbitrary_binaries",
         "test.cli",
         "test.command_strict_verify",
-        "test.dbi_parity",
+        "test.dbt_parity",
         "test.detcore_misc",
         "test.detcore_parallel",
         "test.detcore_unit",
@@ -335,7 +335,7 @@
         "test.arbitrary_binaries",
         "test.cli",
         "test.command_strict_verify",
-        "test.dbi_parity",
+        "test.dbt_parity",
         "test.envelope_levels",
         "test.hermit_integration",
         "test.hermit_modes",
@@ -380,7 +380,7 @@
         "test.arbitrary_binaries",
         "test.cli",
         "test.command_strict_verify",
-        "test.dbi_parity",
+        "test.dbt_parity",
         "test.envelope_levels",
         "test.hermit_integration",
         "test.hermit_modes",
@@ -399,7 +399,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit-resources`; reverse-dependent closure: detcore-dbi, hermit, hermit-resources.",
+      "_why": "@generated: Cargo package `hermit-resources`; reverse-dependent closure: detcore-dbt, hermit, hermit-resources.",
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
@@ -426,7 +426,7 @@
         "test.arbitrary_binaries",
         "test.cli",
         "test.command_strict_verify",
-        "test.dbi_parity",
+        "test.dbt_parity",
         "test.envelope_levels",
         "test.hermit_integration",
         "test.hermit_modes",
@@ -498,13 +498,13 @@
       ]
     },
     {
-      "_why": "Legacy DBI parity fixtures are outside Cargo targets.",
+      "_why": "Legacy DBT parity fixtures are outside Cargo targets.",
       "e2e_backends": [
-        "dbi"
+        "dbt"
       ],
       "nodes": [
         "e2e.manifest_backend_parity_c",
-        "test.dbi_parity"
+        "test.dbt_parity"
       ],
       "paths": [
         "tests/backend-parity/**"

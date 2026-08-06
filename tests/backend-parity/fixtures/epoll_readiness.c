@@ -5,7 +5,7 @@
  * exercises the full non-blocking readiness cycle: register a pre-armed eventfd
  * with epoll_ctl, observe it ready via a zero-timeout epoll_wait, deregister it,
  * and observe the empty set. epoll_wait is called with timeout 0 throughout, so
- * it never blocks -- a blocking wait would livelock the single-threaded DBI
+ * it never blocks -- a blocking wait would livelock the single-threaded DBT
  * backend against the deterministic scheduler.
  */
 #include <errno.h>

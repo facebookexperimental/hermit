@@ -28,7 +28,7 @@ native = "Elapsed time drives progress but final output is intentionally stable"
 ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
-dbi = "DBI application coverage is owned by backend parity"
+dbt = "DBT application coverage is owned by backend parity"
 kvm = "KVM requires the privileged runner"
 sabre = "SaBRe does not yet determinize busy-wait polling on virtual wall-clock advancement; main validation has observed verify failure under load"
 liteinst = "LiteInst application coverage is owned by backend compatibility"
@@ -38,7 +38,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Focused time and entropy sentinels own the blocking replay contract"
-dbi = "Record/replay is unsupported by DBI"
+dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
@@ -48,7 +48,7 @@ ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "The application is single-threaded"
-dbi = "Chaos scheduling is unsupported by DBI"
+dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
 liteinst = "Chaos scheduling is unsupported by LiteInst"
@@ -58,7 +58,7 @@ ci = false
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No edge-case Hermit arguments are required"
-dbi = "No edge-case Hermit arguments are required"
+dbt = "No edge-case Hermit arguments are required"
 kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
@@ -81,7 +81,7 @@ native = "Elapsed time changes, but the final progress-bar output is intentional
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace", "dbi", "kvm", "liteinst"]
+backends_enabled = ["ptrace", "dbt", "kvm", "liteinst"]
 [test.modes.verify.backends_disabled]
 sabre = "SaBRe does not yet determinize busy-wait polling on virtual wall-clock advancement; keep the identical example workload unqualified"
 
@@ -90,7 +90,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Strict verification owns the examples-directory parity contract"
-dbi = "Record/replay is unsupported by DBI"
+dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
@@ -100,7 +100,7 @@ ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "The example is single-threaded"
-dbi = "Chaos scheduling is unsupported by DBI"
+dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
 liteinst = "Chaos scheduling is unsupported by LiteInst"
@@ -110,7 +110,7 @@ ci = false
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No edge-case Hermit arguments are required"
-dbi = "No edge-case Hermit arguments are required"
+dbt = "No edge-case Hermit arguments are required"
 kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
@@ -137,7 +137,7 @@ ci = true
 backends_enabled = ["kvm"]
 [test.modes.verify.backends_disabled]
 ptrace = "This test specifically asserts the KVM execution path"
-dbi = "This test specifically asserts the KVM execution path"
+dbt = "This test specifically asserts the KVM execution path"
 sabre = "This test specifically asserts the KVM execution path"
 liteinst = "This test specifically asserts the KVM execution path"
 
@@ -146,7 +146,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "This is a KVM integration test"
-dbi = "Record/replay is unsupported by DBI"
+dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
@@ -156,7 +156,7 @@ ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "The examples are single-threaded"
-dbi = "Chaos scheduling is unsupported by DBI"
+dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
 liteinst = "Chaos scheduling is unsupported by LiteInst"
@@ -166,7 +166,7 @@ ci = false
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No edge-case Hermit arguments are required"
-dbi = "No edge-case Hermit arguments are required"
+dbt = "No edge-case Hermit arguments are required"
 kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
@@ -193,7 +193,7 @@ ci = true
 backends_enabled = ["kvm"]
 [test.modes.verify.backends_disabled]
 ptrace = "This test specifically asserts the KVM execution path"
-dbi = "This test specifically asserts the KVM execution path"
+dbt = "This test specifically asserts the KVM execution path"
 sabre = "This test specifically asserts the KVM execution path"
 liteinst = "This test specifically asserts the KVM execution path"
 
@@ -202,7 +202,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "This is a KVM integration test"
-dbi = "Record/replay is unsupported by DBI"
+dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
@@ -212,7 +212,7 @@ ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "The workload is single-threaded"
-dbi = "Chaos scheduling is unsupported by DBI"
+dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
 liteinst = "Chaos scheduling is unsupported by LiteInst"
@@ -222,7 +222,7 @@ ci = false
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No edge-case Hermit arguments are required"
-dbi = "No edge-case Hermit arguments are required"
+dbt = "No edge-case Hermit arguments are required"
 kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"

@@ -261,7 +261,7 @@ const PREFLIGHT: &[&str] = &[
 // ---------------------------------------------------------------------------
 
 /// One test shard: a workflow matrix cell running a set of DAG nodes.
-/// `needs` is the release-build dependency ("dbi", "aux") or empty for debug.
+/// `needs` is the release-build dependency ("dbt", "aux") or empty for debug.
 struct Shard {
     slug: String,
     needs: String,
@@ -493,7 +493,7 @@ struct RunPlan {
     shards: Vec<String>,      // shard slugs (debug + release) to run
     cells: Vec<Cell>,         // e2e cells to run
     build_debug: bool,        // the shared debug build job
-    build_dbi: bool,          // the DBI release artifact
+    build_dbt: bool,          // the DBT release artifact
     build_aux: bool,          // the sabre/liteinst release artifacts
     total_shards: usize,      // universe sizes, for reporting
     total_cells: usize,
@@ -535,12 +535,12 @@ fn derive_run_plan(sel: &Selection, shards: &Shards, plan: &Plan) -> RunPlan {
     };
 
     // Which release-build artifacts do the selected release shards / cells need?
-    let mut build_dbi = false;
+    let mut build_dbt = false;
     let mut build_aux = false;
     for s in &shards.release {
         if shard_slugs.contains(&s.slug) {
             match s.needs.as_str() {
-                "dbi" => build_dbi = true,
+                "dbt" => build_dbt = true,
                 "aux" => build_aux = true,
                 _ => {}
             }
@@ -548,7 +548,7 @@ fn derive_run_plan(sel: &Selection, shards: &Shards, plan: &Plan) -> RunPlan {
     }
     for c in &cells {
         match c.backend.as_str() {
-            "dbi" | "sabre" => build_dbi = true,
+            "dbt" | "sabre" => build_dbt = true,
             "liteinst" => build_aux = true,
             _ => {}
         }
@@ -560,7 +560,7 @@ fn derive_run_plan(sel: &Selection, shards: &Shards, plan: &Plan) -> RunPlan {
         shards: shard_slugs,
         cells,
         build_debug,
-        build_dbi,
+        build_dbt,
         build_aux,
         total_shards,
         total_cells,
@@ -821,13 +821,13 @@ fn emit(sel: &Selection, rp: &RunPlan, format: &str, n_files: usize) {
                 println!("  - {r}");
             }
             println!(
-                "shards: {}/{}   e2e cells: {}/{}   build[debug={} dbi={} aux={}]",
+                "shards: {}/{}   e2e cells: {}/{}   build[debug={} dbt={} aux={}]",
                 rp.shards.len(),
                 rp.total_shards,
                 rp.cells.len(),
                 rp.total_cells,
                 rp.build_debug,
-                rp.build_dbi,
+                rp.build_dbt,
                 rp.build_aux,
             );
             if !rp.shards.is_empty() {
@@ -862,7 +862,7 @@ fn emit(sel: &Selection, rp: &RunPlan, format: &str, n_files: usize) {
                 "shard_matrix": shard_matrix,
                 "cell_matrix": cell_matrix,
                 "cell_count": rp.cells.len(),
-                "build": { "debug": rp.build_debug, "dbi": rp.build_dbi, "aux": rp.build_aux },
+                "build": { "debug": rp.build_debug, "dbt": rp.build_dbt, "aux": rp.build_aux },
                 "reasons": sel.reasons,
             });
             println!("{}", serde_json::to_string_pretty(&obj).unwrap());
@@ -871,7 +871,7 @@ fn emit(sel: &Selection, rp: &RunPlan, format: &str, n_files: usize) {
             let (shard_matrix, cell_matrix) = matrices(rp);
             let lines = format!(
                 "decision={}\nskip={}\nfull={}\nnode_count={}\nnodes={}\n\
-                 shard_count={}\ncell_count={}\nbuild_debug={}\nbuild_dbi={}\nbuild_aux={}\n\
+                 shard_count={}\ncell_count={}\nbuild_debug={}\nbuild_dbt={}\nbuild_aux={}\n\
                  shard_matrix={}\ncell_matrix={}\n",
                 decision_str(&sel.decision),
                 sel.decision == Decision::Skip,
@@ -881,7 +881,7 @@ fn emit(sel: &Selection, rp: &RunPlan, format: &str, n_files: usize) {
                 rp.shards.len(),
                 rp.cells.len(),
                 rp.build_debug,
-                rp.build_dbi,
+                rp.build_dbt,
                 rp.build_aux,
                 serde_json::to_string(&shard_matrix).unwrap(),
                 serde_json::to_string(&cell_matrix).unwrap(),
@@ -942,10 +942,10 @@ The selected node set is then projected onto how CI actually runs post-44df2944
 (see ci/portable-shards.json + ci/expected-e2e-plan.json):
   * test shards  — a shard runs iff ANY of its nodes was selected.
   * e2e cells    — the (category × mode × backend) matrix, filtered by per-change
-                   BACKEND AFFINITY: a detcore-dbi change runs only dbi cells, a
+                   BACKEND AFFINITY: a detcore-dbt change runs only dbt cells, a
                    detcore-sabre change only sabre cells, a core/CLI/fixture
                    change runs every cell. (Portable lane has no KVM cells.)
-  * release builds — build-dbi / build-aux are emitted only when a selected shard
+  * release builds — build-dbt / build-aux are emitted only when a selected shard
                    or cell needs them.
 --format github writes shard_matrix + cell_matrix (GitHub-Actions fromJSON-ready)
 plus shard_count/cell_count/build_* to $GITHUB_OUTPUT.
@@ -980,8 +980,8 @@ fn self_test() {
     check("glob doublestar rs root", glob_match("**/*.rs", "main.rs"));
     check("glob dir rs", glob_match("detcore/**/*.rs", "detcore/src/a/b.rs"));
     check("glob dir rs miss", !glob_match("detcore/**/*.rs", "hermit-cli/src/a.rs"));
-    check("glob prefix dir", glob_match("detcore-dbi/**", "detcore-dbi/src/lib.rs"));
-    check("glob prefix dir file", glob_match("detcore-dbi/**", "detcore-dbi/Cargo.toml"));
+    check("glob prefix dir", glob_match("detcore-dbt/**", "detcore-dbt/src/lib.rs"));
+    check("glob prefix dir file", glob_match("detcore-dbt/**", "detcore-dbt/Cargo.toml"));
     check("glob question", glob_match("a?c", "abc"));
     check("glob mid doublestar", glob_match("a/**/z.c", "a/b/c/z.c"));
     check("glob mid doublestar empty", glob_match("a/**/z.c", "a/z.c"));
@@ -1016,15 +1016,15 @@ fn self_test() {
         skill.nodes.contains("check.script_sigpipe"),
     );
 
-    let dbi = select(&fp, &dag, &vec!["detcore-dbi/src/lib.rs".into()]);
-    check("dbi-only ⇒ selective", dbi.decision == Decision::Selective);
-    check("dbi-only runs dbi_parity", dbi.nodes.contains("test.dbi_parity"));
-    check("dbi-only pulls build.runtime_release", dbi.nodes.contains("build.runtime_release"));
-    check("dbi-only pulls build.workspace (dep)", dbi.nodes.contains("build.workspace"));
-    check("dbi-only skips strict_compat", !dbi.nodes.contains("test.strict_compat"));
-    check("dbi-only skips language_runtimes", !dbi.nodes.contains("e2e.manifest_language_runtimes"));
-    check("dbi-only is a strict subset", dbi.nodes.len() < dag.all_nodes.len());
-    check("dbi-only includes preflight", dbi.nodes.contains("lint.rustfmt"));
+    let dbt = select(&fp, &dag, &vec!["detcore-dbt/src/lib.rs".into()]);
+    check("dbt-only ⇒ selective", dbt.decision == Decision::Selective);
+    check("dbt-only runs dbt_parity", dbt.nodes.contains("test.dbt_parity"));
+    check("dbt-only pulls build.runtime_release", dbt.nodes.contains("build.runtime_release"));
+    check("dbt-only pulls build.workspace (dep)", dbt.nodes.contains("build.workspace"));
+    check("dbt-only skips strict_compat", !dbt.nodes.contains("test.strict_compat"));
+    check("dbt-only skips language_runtimes", !dbt.nodes.contains("e2e.manifest_language_runtimes"));
+    check("dbt-only is a strict subset", dbt.nodes.len() < dag.all_nodes.len());
+    check("dbt-only includes preflight", dbt.nodes.contains("lint.rustfmt"));
 
     let core = select(&fp, &dag, &vec!["detcore/src/scheduler.rs".into()]);
     check("detcore core ⇒ selective", core.decision == Decision::Selective);
@@ -1034,11 +1034,11 @@ fn self_test() {
     let unknown = select(&fp, &dag, &vec!["some/brand/new/area/file.py".into()]);
     check("unknown path ⇒ full", unknown.decision == Decision::Full);
 
-    let mixed = select(&fp, &dag, &vec!["detcore-dbi/src/lib.rs".into(), "README.md".into()]);
-    check("dbi + docs ⇒ selective (docs inert)", mixed.decision == Decision::Selective);
+    let mixed = select(&fp, &dag, &vec!["detcore-dbt/src/lib.rs".into(), "README.md".into()]);
+    check("dbt + docs ⇒ selective (docs inert)", mixed.decision == Decision::Selective);
 
-    let mixed2 = select(&fp, &dag, &vec!["detcore-dbi/src/lib.rs".into(), "Cargo.lock".into()]);
-    check("dbi + Cargo.lock ⇒ full (force wins)", mixed2.decision == Decision::Full);
+    let mixed2 = select(&fp, &dag, &vec!["detcore-dbt/src/lib.rs".into(), "Cargo.lock".into()]);
+    check("dbt + Cargo.lock ⇒ full (force wins)", mixed2.decision == Decision::Full);
 
     let rs_lint = select(&fp, &dag, &vec!["hermit-verify/src/main.rs".into()]);
     check("rs change pulls clippy", rs_lint.nodes.contains("lint.clippy"));
@@ -1055,24 +1055,24 @@ fn self_test() {
     let rp_full = derive_run_plan(&lock, &shards, &plan);
     check("full ⇒ all shards", rp_full.shards.len() == total_shards);
     check("full ⇒ all cells", rp_full.cells.len() == total_cells);
-    check("full ⇒ all builds", rp_full.build_debug && rp_full.build_dbi && rp_full.build_aux);
+    check("full ⇒ all builds", rp_full.build_debug && rp_full.build_dbt && rp_full.build_aux);
 
-    // DBI is a Cargo dependency of hermit. Package-level reverse-dependency
+    // DBT is a Cargo dependency of hermit. Package-level reverse-dependency
     // closure therefore includes Hermit's other third-party-backend test
-    // nodes, while explicit backend affinity still limits e2e cells to DBI.
-    let rp_dbi = derive_run_plan(&dbi, &shards, &plan);
-    check("dbi ⇒ dbi-parity shard", rp_dbi.shards.contains(&"dbi-parity".to_string()));
-    check("dbi ⇒ hermit reverse-dep sabre shard", rp_dbi.shards.contains(&"sabre".to_string()));
-    check("dbi ⇒ only dbi cells", !rp_dbi.cells.is_empty() && rp_dbi.cells.iter().all(|c| c.backend == "dbi"));
-    check("dbi ⇒ reverse-dep builds dbi and aux", rp_dbi.build_dbi && rp_dbi.build_aux);
-    check("dbi ⇒ cells are a strict subset", rp_dbi.cells.len() < total_cells);
+    // nodes, while explicit backend affinity still limits e2e cells to DBT.
+    let rp_dbt = derive_run_plan(&dbt, &shards, &plan);
+    check("dbt ⇒ dbt-parity shard", rp_dbt.shards.contains(&"dbt-parity".to_string()));
+    check("dbt ⇒ hermit reverse-dep sabre shard", rp_dbt.shards.contains(&"sabre".to_string()));
+    check("dbt ⇒ only dbt cells", !rp_dbt.cells.is_empty() && rp_dbt.cells.iter().all(|c| c.backend == "dbt"));
+    check("dbt ⇒ reverse-dep builds dbt and aux", rp_dbt.build_dbt && rp_dbt.build_aux);
+    check("dbt ⇒ cells are a strict subset", rp_dbt.cells.len() < total_cells);
 
     // SaBRe backend change: only sabre cells + sabre shard.
     let sabre = select(&fp, &dag, &vec!["detcore-sabre/src/lib.rs".into()]);
     let rp_sabre = derive_run_plan(&sabre, &shards, &plan);
     check("sabre ⇒ sabre shard", rp_sabre.shards.contains(&"sabre".to_string()));
     check("sabre ⇒ only sabre cells", !rp_sabre.cells.is_empty() && rp_sabre.cells.iter().all(|c| c.backend == "sabre"));
-    check("sabre ⇒ build_dbi, not aux", rp_sabre.build_dbi && !rp_sabre.build_aux);
+    check("sabre ⇒ build_dbt, not aux", rp_sabre.build_dbt && !rp_sabre.build_aux);
 
     // LiteInst runtime change: only liteinst cells + liteinst shard.
     let liteinst = select(&fp, &dag, &vec!["scripts/stage-liteinst-runtime.sh".into()]);
@@ -1089,10 +1089,10 @@ fn self_test() {
     let rp_scripts = derive_run_plan(&rs_lint, &shards, &plan);
     check("hermit-verify ⇒ 0 e2e cells", rp_scripts.cells.is_empty());
 
-    // Backend disjointness: the dbi and sabre cell sets never overlap.
+    // Backend disjointness: the dbt and sabre cell sets never overlap.
     check(
-        "dbi vs sabre cells disjoint",
-        !rp_dbi.cells.iter().any(|d| rp_sabre.cells.iter().any(|s| Plan::slug(d) == Plan::slug(s))),
+        "dbt vs sabre cells disjoint",
+        !rp_dbt.cells.iter().any(|d| rp_sabre.cells.iter().any(|s| Plan::slug(d) == Plan::slug(s))),
     );
 
     // --- local-delta merge (pure) ---

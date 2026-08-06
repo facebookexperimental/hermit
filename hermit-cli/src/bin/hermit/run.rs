@@ -795,7 +795,7 @@ fn backend_defaults_to_ptrace() {
 fn backend_values_parse_and_round_trip() {
     for (value, expected) in [
         ("ptrace", Backend::Ptrace),
-        ("dbi", Backend::Dbi),
+        ("dbt", Backend::Dbt),
         ("liteinst", Backend::Liteinst),
         ("sabre", Backend::Sabre),
         ("kvm", Backend::Kvm),
@@ -892,7 +892,7 @@ fn guest_env_disables_sanitizer_leak_detection_on_every_backend() {
 
     // The two variables are present with identical values regardless of the
     // selected backend, so no backend-specific spawn hook is required for parity.
-    for backend in ["ptrace", "kvm", "sabre", "dbi"] {
+    for backend in ["ptrace", "kvm", "sabre", "dbt"] {
         let ro = RunOpts::parse_from(["fakehermit", "--backend", backend, "/bin/echo", "hi"]);
         let envs = ro.guest_command().unwrap().get_captured_envs();
         assert_eq!(
@@ -1190,7 +1190,7 @@ fn skid_margin_override_parses_and_round_trips() {
 
 #[test]
 fn skid_margin_override_rejects_non_ptrace_backed_backends() {
-    for backend in ["dbi", "kvm", "sabre"] {
+    for backend in ["dbt", "kvm", "sabre"] {
         let mut opts = RunOpts::parse_from([
             "fakehermit",
             &format!("--backend={backend}"),
@@ -1350,16 +1350,16 @@ fn no_namespace_uses_host_resources_and_disables_uts_assumption() {
 }
 
 #[test]
-fn dbi_backend_disables_uts_assumption() {
-    // The DBI backend runs the guest under DynamoRIO without Reverie's
+fn dbt_backend_disables_uts_assumption() {
+    // The DBT backend runs the guest under DynamoRIO without Reverie's
     // `Container`, so it never enters a UTS namespace or applies the
     // deterministic hostname. `has_uts_namespace` must therefore be false even
     // with namespaces otherwise enabled, so Detcore's `handle_uname` rewrites
     // the nodename to `hermetic-container.local` instead of leaking the host
-    // FQDN. Regression guard for DBI uname parity with the ptrace backend.
-    let mut opts = RunOpts::parse_from(["fakehermit", "--backend=dbi", "fakeprog"]);
+    // FQDN. Regression guard for DBT uname parity with the ptrace backend.
+    let mut opts = RunOpts::parse_from(["fakehermit", "--backend=dbt", "fakeprog"]);
     opts.validate_args_with_perf_support(true).unwrap();
-    assert_eq!(opts.selected_backend(), Backend::Dbi);
+    assert_eq!(opts.selected_backend(), Backend::Dbt);
     assert!(!opts.no_namespace);
     assert!(!opts.det_opts.det_config.has_uts_namespace);
 }
@@ -1369,7 +1369,7 @@ fn ptrace_backend_keeps_uts_assumption_with_namespaces() {
     // The default (ptrace) backend does launch through Reverie's `Container`,
     // which unshares CLONE_NEWUTS and sets the deterministic hostname, so the
     // UTS assumption must stay enabled when namespaces are on. Pins the fix to
-    // DBI so it does not regress the ptrace trust-the-namespace path.
+    // DBT so it does not regress the ptrace trust-the-namespace path.
     let mut opts = RunOpts::parse_from(["fakehermit", "fakeprog"]);
     opts.validate_args_with_perf_support(true).unwrap();
     assert_eq!(opts.selected_backend(), Backend::Ptrace);
@@ -1402,7 +1402,7 @@ fn image_rejects_unqualified_backend_and_namespace_paths() {
     let mut backend = RunOpts::parse_from([
         "fakehermit",
         "--image=busybox@sha256:deadbeef",
-        "--backend=dbi",
+        "--backend=dbt",
         "/bin/sh",
     ]);
     let message = backend
@@ -1498,7 +1498,7 @@ fn strict_help_describes_compatibility_and_opt_outs() {
         "--backend <BACKEND>",
         "Select the process instrumentation backend",
         "ptrace",
-        "dbi",
+        "dbt",
         "kvm",
     ] {
         assert!(
@@ -1798,7 +1798,7 @@ impl RunOpts {
     /// The `--verify-json` path this invocation will publish a verdict to, if
     /// any. Exposed so the top-level dispatcher can stamp the invocation-bound
     /// NO-RESULT record before ANY fallible preflight runs — several of this
-    /// function's own early exits, and the DBI / `--namespace-only` bypasses
+    /// function's own early exits, and the DBT / `--namespace-only` bypasses
     /// below, never reach `verify()` at all.
     pub(crate) fn verify_json_path(&self) -> Option<&Path> {
         self.verify.then_some(self.verify_json.as_deref()).flatten()
@@ -1872,7 +1872,7 @@ impl RunOpts {
         }
         // });
 
-        // DBI uses its dedicated CLI launch adapter. SaBRe, LiteInst, KVM,
+        // DBT uses its dedicated CLI launch adapter. SaBRe, LiteInst, KVM,
         // e9patch, and ptrace use the common container and run/verify machinery.
         match backend {
             Backend::Ptrace
@@ -1880,9 +1880,9 @@ impl RunOpts {
             | Backend::Sabre
             | Backend::Kvm
             | Backend::E9patch => {}
-            Backend::Dbi => {
+            Backend::Dbt => {
                 let environment = self.guest_command()?.get_captured_envs();
-                return super::backends::run_dbi(
+                return super::backends::run_dbt(
                     &self.program,
                     &self.args,
                     self.verify,
@@ -1928,7 +1928,7 @@ impl RunOpts {
             Backend::Ptrace | Backend::Liteinst | Backend::E9patch => {
                 reverie_ptrace::is_perf_supported()
             }
-            Backend::Dbi | Backend::Sabre | Backend::Kvm => true,
+            Backend::Dbt | Backend::Sabre | Backend::Kvm => true,
         };
         self.validate_args_with_perf_support(perf_supported)
     }
@@ -1973,15 +1973,15 @@ impl RunOpts {
         // Only the ptrace-family backends launch the guest through Reverie's
         // `Container` (see `container::default_container`), which unshares
         // `CLONE_NEWUTS` and applies the deterministic hostname
-        // `hermetic-container.local`. The DBI backend returns early from
+        // `hermetic-container.local`. The DBT backend returns early from
         // dispatch and runs the guest under DynamoRIO with no UTS namespace, so
         // its `uname()` nodename would otherwise leak the real host FQDN.
         // Reflect that reality here so Detcore's `handle_uname` deterministic
-        // nodename/domainname rewrite fires for DBI (it is gated on
+        // nodename/domainname rewrite fires for DBT (it is gated on
         // `!has_uts_namespace`). Guest `sethostname`/`setdomainname` are refused
         // with a deterministic `EPERM` on every backend, so this never masks a
         // hostname the guest legitimately set.
-        let backend_applies_uts_hostname = !matches!(backend, Backend::Dbi);
+        let backend_applies_uts_hostname = !matches!(backend, Backend::Dbt);
         config.has_uts_namespace = !self.no_namespace && backend_applies_uts_hostname;
 
         if self.no_namespace {
@@ -3067,7 +3067,7 @@ impl RunOpts {
         // Hand the scheduler the resolved happens-before program (already resolved
         // against the guest binary in `main()`). `#[serde(skip)]` on the field means
         // this is in-process only; it reaches the ptrace backend directly and is not
-        // carried through the DBI JSON config or `--save-config`.
+        // carried through the DBT JSON config or `--save-config`.
         config.happens_before = self.resolved_happens_before.clone();
         config
     }

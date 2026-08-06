@@ -313,7 +313,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     // TODO-HUMAN-REVIEW(PR-1119): Review unmaskable process-group SIGKILL forwarding.
     /// Resolve signal-zero existence checks in the fixed PID namespace, then route an
     /// unambiguous positive-PID process signal through the backend. Backends that can execute
-    /// with guest PIDs preserve process-directed delivery; DBI translates it to the sole live
+    /// with guest PIDs preserve process-directed delivery; DBT translates it to the sole live
     /// thread because its native process uses a host PID. An unmaskable SIGKILL to a specific
     /// process group is also safe to preserve on backends whose guests use real namespace PIDs;
     /// other process-group and broadcast delivery remains refused until Detcore models eligible

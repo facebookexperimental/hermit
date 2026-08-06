@@ -3,7 +3,7 @@
 # compat-map.sh — quick Hermit compatibility / frontier status at a glance.
 #
 # Answers "where are we?" without running the full stress/envelope suite:
-#   * which instrumentation backends are usable on this host (ptrace/kvm/dbi),
+#   * which instrumentation backends are usable on this host (ptrace/kvm/dbt),
 #   * pass/fail counts for a small set of system binaries at assurance
 #     levels L1..L3, on the ptrace backend, and
 #   * an inventory of the rr-test and OSS-app buckets (counted, not executed,
@@ -155,15 +155,15 @@ if [[ $backend_flag_supported -eq 1 ]]; then
     fi
 fi
 
-# dbi needs a configured DynamoRIO environment.
-dbi_available=0
-dbi_reason="no --backend flag"
+# dbt needs a configured DynamoRIO environment.
+dbt_available=0
+dbt_reason="no --backend flag"
 if [[ $backend_flag_supported -eq 1 ]]; then
-    if [[ -n ${DYNAMORIO_HOME:-} && -n ${HERMIT_DRRUN:-} && -n ${HERMIT_DBI_CLIENT:-} ]]; then
-        dbi_available=1
-        dbi_reason="DynamoRIO environment configured"
+    if [[ -n ${DYNAMORIO_HOME:-} && -n ${HERMIT_DRRUN:-} && -n ${HERMIT_DBT_CLIENT:-} ]]; then
+        dbt_available=1
+        dbt_reason="DynamoRIO environment configured"
     else
-        dbi_reason="DynamoRIO env not set (DYNAMORIO_HOME/HERMIT_DRRUN/HERMIT_DBI_CLIENT)"
+        dbt_reason="DynamoRIO env not set (DYNAMORIO_HOME/HERMIT_DRRUN/HERMIT_DBT_CLIENT)"
     fi
 fi
 
@@ -217,7 +217,7 @@ if [[ $ptrace_available -eq 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Backend launch probes (kvm/dbi run only a builtin hello-world)
+# Backend launch probes (kvm/dbt run only a builtin hello-world)
 # ---------------------------------------------------------------------------
 
 kvm_probe="not-run"
@@ -229,12 +229,12 @@ if [[ $kvm_available -eq 1 ]]; then
     fi
 fi
 
-dbi_probe="not-run"
-if [[ $dbi_available -eq 1 ]]; then
-    if timeout "$CASE_TIMEOUT" "$HERMIT_BIN" run --backend dbi -- /bin/true </dev/null >/dev/null 2>&1; then
-        dbi_probe="pass"
+dbt_probe="not-run"
+if [[ $dbt_available -eq 1 ]]; then
+    if timeout "$CASE_TIMEOUT" "$HERMIT_BIN" run --backend dbt -- /bin/true </dev/null >/dev/null 2>&1; then
+        dbt_probe="pass"
     else
-        dbi_probe="fail"
+        dbt_probe="fail"
     fi
 fi
 
@@ -285,8 +285,8 @@ build_json() {
     printf '    "ptrace": {"available": true, "probe": "system-binaries-matrix"},\n'
     printf '    "kvm": {"available": %s, "reason": %s, "probe": %s},\n' \
         "$([[ $kvm_available -eq 1 ]] && echo true || echo false)" "$(json_str "$kvm_reason")" "$(json_str "$kvm_probe")"
-    printf '    "dbi": {"available": %s, "reason": %s, "probe": %s}\n' \
-        "$([[ $dbi_available -eq 1 ]] && echo true || echo false)" "$(json_str "$dbi_reason")" "$(json_str "$dbi_probe")"
+    printf '    "dbt": {"available": %s, "reason": %s, "probe": %s}\n' \
+        "$([[ $dbt_available -eq 1 ]] && echo true || echo false)" "$(json_str "$dbt_reason")" "$(json_str "$dbt_probe")"
     printf '  },\n'
     printf '  "buckets": {\n'
     printf '    "system_binaries": {\n'
@@ -355,8 +355,8 @@ echo "Backends"
 printf '  ptrace  available     (arbitrary ELF; used for the matrix below)\n'
 printf '  kvm     %-11s %s [probe: %s]\n' \
     "$([[ $kvm_available -eq 1 ]] && echo available || echo unavailable)" "$kvm_reason" "$kvm_probe"
-printf '  dbi     %-11s %s [probe: %s]\n' \
-    "$([[ $dbi_available -eq 1 ]] && echo available || echo unavailable)" "$dbi_reason" "$dbi_probe"
+printf '  dbt     %-11s %s [probe: %s]\n' \
+    "$([[ $dbt_available -eq 1 ]] && echo available || echo unavailable)" "$dbt_reason" "$dbt_probe"
 hr
 echo "System binaries (ptrace backend) — pass/total per assurance level"
 printf '  L1 deterministic run        %d/%d\n' "${pass[L1]}" "$sysbin_total"

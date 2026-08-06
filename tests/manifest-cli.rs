@@ -716,7 +716,7 @@ USAGE:
 
 FILTERS (list):
   --bucket   manifest bucket (e.g. system-utils, c-programs)
-  --backend  a backend enabled in some mode (ptrace, dbi, kvm, sabre, liteinst, native)
+  --backend  a backend enabled in some mode (ptrace, dbt, kvm, sabre, liteinst, native)
   --tag      a `requires` capability token (e.g. python3, bash, kvm, cpuid)
   --mode     verify | naked | replay | chaos | custom
   --lane     portable | privileged

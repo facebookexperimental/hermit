@@ -9,7 +9,7 @@
 // AUTONOMOUS-BOT-IMPLEMENTED
 
 //! DynamoRIO callback runtime that executes the real Detcore [`Tool`] over
-//! [`reverie_dbi::DbiGuest`].
+//! [`reverie_dbt::DbtGuest`].
 
 #![deny(missing_docs)]
 
@@ -52,13 +52,13 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
-use reverie_dbi::DbiGuest;
-use reverie_dbi::DbiSyscallOutcome;
-use reverie_dbi::MemoryReader;
-use reverie_dbi::MemoryWriter;
-use reverie_dbi::RegisterReader;
-use reverie_dbi::RegisterWriter;
-use reverie_dbi::SyscallInvoker;
+use reverie_dbt::DbtGuest;
+use reverie_dbt::DbtSyscallOutcome;
+use reverie_dbt::MemoryReader;
+use reverie_dbt::MemoryWriter;
+use reverie_dbt::RegisterReader;
+use reverie_dbt::RegisterWriter;
+use reverie_dbt::SyscallInvoker;
 use tracing::Event;
 use tracing::Metadata;
 use tracing::Subscriber;
@@ -74,23 +74,23 @@ const GETRANDOM_MAX_BYTES: usize = (i32::MAX as usize) & !4095;
 const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | libc::GRND_INSECURE;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-644): Review the inherited DBI report descriptor.
+// TODO-HUMAN-REVIEW(PR-644): Review the inherited DBT report descriptor.
 /// Fixed inherited descriptor receiving unsupported syscall records.
 pub const UNSUPPORTED_SYSCALL_REPORT_FD: i32 = 199;
 
 type DetcoreThreadState = <Detcore as Tool>::ThreadState;
-type Emitter = reverie_dbi::RuntimeEmitter;
-type Idler = reverie_dbi::RuntimeIdler;
+type Emitter = reverie_dbt::RuntimeEmitter;
+type Idler = reverie_dbt::RuntimeIdler;
 
-static DBI_TRACING_ACTIVE: AtomicBool = AtomicBool::new(false);
+static DBT_TRACING_ACTIVE: AtomicBool = AtomicBool::new(false);
 static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
 
-struct DbiSubscriber {
+struct DbtSubscriber {
     emit: Emitter,
-    level: DbiLogLevel,
+    level: DbtLogLevel,
 }
 
-impl Subscriber for DbiSubscriber {
+impl Subscriber for DbtSubscriber {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
         self.level.enables(metadata.level())
     }
@@ -105,7 +105,7 @@ impl Subscriber for DbiSubscriber {
 
     fn event(&self, event: &Event<'_>) {
         let metadata = event.metadata();
-        let mut visitor = DbiEventVisitor::default();
+        let mut visitor = DbtEventVisitor::default();
         event.record(&mut visitor);
         let line = format!(
             "{} {}: {}\n",
@@ -122,11 +122,11 @@ impl Subscriber for DbiSubscriber {
 }
 
 #[derive(Default)]
-struct DbiEventVisitor {
+struct DbtEventVisitor {
     fields: String,
 }
 
-impl DbiEventVisitor {
+impl DbtEventVisitor {
     fn push(&mut self, field: &Field, value: String) {
         if !self.fields.is_empty() {
             self.fields.push(' ');
@@ -139,7 +139,7 @@ impl DbiEventVisitor {
     }
 }
 
-impl Visit for DbiEventVisitor {
+impl Visit for DbtEventVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         self.push(field, format!("{value:?}"));
     }
@@ -150,7 +150,7 @@ impl Visit for DbiEventVisitor {
 }
 
 #[derive(Clone, Copy)]
-enum DbiLogLevel {
+enum DbtLogLevel {
     Error,
     Warn,
     Info,
@@ -158,7 +158,7 @@ enum DbiLogLevel {
     Trace,
 }
 
-impl DbiLogLevel {
+impl DbtLogLevel {
     fn enables(self, level: &tracing::Level) -> bool {
         match self {
             Self::Error => *level == tracing::Level::ERROR,
@@ -174,11 +174,11 @@ fn emit_marker(emit: Emitter, message: &'static [u8]) {
     unsafe { emit(message.as_ptr(), message.len()) };
 }
 
-/// Emit a routine per-run lifecycle breadcrumb (`detcore-dbi: …`).
+/// Emit a routine per-run lifecycle breadcrumb (`detcore-dbt: …`).
 ///
-/// These progress markers narrate DBI backend startup and are useful when
+/// These progress markers narrate DBT backend startup and are useful when
 /// debugging the runtime, but they are noise for a normal `hermit run --backend
-/// dbi`. Gate them behind `HERMIT_LOG=info` (or `debug`/`trace`) so a default
+/// dbt`. Gate them behind `HERMIT_LOG=info` (or `debug`/`trace`) so a default
 /// run is quiet. Genuine warnings and unsupported-syscall diagnostics do not go
 /// through this helper and stay unconditional. The decision is read once and
 /// cached, so hot callers pay only an atomic load.
@@ -199,43 +199,43 @@ fn info_logging_enabled() -> bool {
     )
 }
 
-fn dbi_log_level() -> Option<DbiLogLevel> {
+fn dbt_log_level() -> Option<DbtLogLevel> {
     match std::env::var("HERMIT_LOG")
         .unwrap_or_default()
         .to_ascii_lowercase()
         .as_str()
     {
-        "error" => Some(DbiLogLevel::Error),
-        "warn" => Some(DbiLogLevel::Warn),
-        "info" => Some(DbiLogLevel::Info),
-        "debug" => Some(DbiLogLevel::Debug),
-        "trace" => Some(DbiLogLevel::Trace),
+        "error" => Some(DbtLogLevel::Error),
+        "warn" => Some(DbtLogLevel::Warn),
+        "info" => Some(DbtLogLevel::Info),
+        "debug" => Some(DbtLogLevel::Debug),
+        "trace" => Some(DbtLogLevel::Trace),
         _ => None,
     }
 }
 
-fn init_dbi_tracing(emit: Emitter) -> bool {
-    if DBI_TRACING_ACTIVE.load(Ordering::Acquire) {
+fn init_dbt_tracing(emit: Emitter) -> bool {
+    if DBT_TRACING_ACTIVE.load(Ordering::Acquire) {
         return true;
     }
-    let Some(level) = dbi_log_level() else {
+    let Some(level) = dbt_log_level() else {
         return false;
     };
-    if tracing::subscriber::set_global_default(DbiSubscriber { emit, level }).is_err() {
+    if tracing::subscriber::set_global_default(DbtSubscriber { emit, level }).is_err() {
         return false;
     }
-    DBI_TRACING_ACTIVE.store(true, Ordering::Release);
+    DBT_TRACING_ACTIVE.store(true, Ordering::Release);
     true
 }
 
-/// Environment variable through which `hermit run --backend dbi` hands the
+/// Environment variable through which `hermit run --backend dbt` hands the
 /// CLI-derived Detcore [`Config`] (JSON) to this in-guest runtime.
 ///
-/// The guest process inherits it from `drrun` (see the DBI launcher), so it is
+/// The guest process inherits it from `drrun` (see the DBT launcher), so it is
 /// the cross-process channel that lets flags like `--strict`, `--seed`, and the
-/// time/CPUID virtualization switches reach the DBI Detcore Tool the same way
+/// time/CPUID virtualization switches reach the DBT Detcore Tool the same way
 /// they reach the ptrace backend.
-pub const DETCONFIG_ENV: &str = "HERMIT_DBI_DETCONFIG";
+pub const DETCONFIG_ENV: &str = "HERMIT_DBT_DETCONFIG";
 
 /// Where the effective Detcore [`Config`] came from, for native diagnostics.
 enum ConfigSource {
@@ -247,8 +247,8 @@ enum ConfigSource {
     Default,
 }
 
-/// A strict, deterministic default configuration for standalone DBI runs.
-fn default_dbi_config() -> Config {
+/// A strict, deterministic default configuration for standalone DBT runs.
+fn default_dbt_config() -> Config {
     Config {
         sequentialize_threads: true,
         deterministic_io: true,
@@ -257,22 +257,22 @@ fn default_dbi_config() -> Config {
     }
 }
 
-/// Builds the Detcore [`Config`] for this DBI runtime.
+/// Builds the Detcore [`Config`] for this DBT runtime.
 ///
 /// The configuration is taken from the CLI-derived Detcore config serialized
 /// into [`DETCONFIG_ENV`] when present; otherwise a strict default is used.
-/// Regardless of the source, the DBI execution-model invariants are re-asserted:
+/// Regardless of the source, the DBT execution-model invariants are re-asserted:
 /// the backend drives the Detcore global scheduler externally on a branch count
 /// rather than PMU retired-conditional-branch preemption, so timeslice
 /// preemption (`max_timeslice`) is disabled and threads stay sequentialized for
 /// the single external scheduler.
-fn load_dbi_config() -> (Config, ConfigSource) {
+fn load_dbt_config() -> (Config, ConfigSource) {
     let (mut config, source) = match std::env::var(DETCONFIG_ENV) {
         Ok(value) if !value.is_empty() => match serde_json::from_str::<Config>(&value) {
             Ok(config) => (config, ConfigSource::Cli),
-            Err(_) => (default_dbi_config(), ConfigSource::ParseFallback),
+            Err(_) => (default_dbt_config(), ConfigSource::ParseFallback),
         },
-        _ => (default_dbi_config(), ConfigSource::Default),
+        _ => (default_dbt_config(), ConfigSource::Default),
     };
     config.max_timeslice = None;
     config.sequentialize_threads = true;
@@ -294,8 +294,8 @@ fn requires_native_lifecycle(sysnum: i64) -> bool {
     }
 }
 
-// TODO-HUMAN-REVIEW(PR-1038): Review DBI self-target queued-signal identity translation.
-// TODO-HUMAN-REVIEW(PR-1065): Review DBI self-target prlimit64 translation.
+// TODO-HUMAN-REVIEW(PR-1038): Review DBT self-target queued-signal identity translation.
+// TODO-HUMAN-REVIEW(PR-1065): Review DBT self-target prlimit64 translation.
 fn translate_self_identity_targets(
     sysnum: i64,
     args: &mut [u64; 6],
@@ -424,15 +424,15 @@ fn current_runtime() -> Arc<Runtime> {
     Arc::clone(
         RUNTIME
             .read()
-            .expect("Detcore DBI runtime lock poisoned")
+            .expect("Detcore DBT runtime lock poisoned")
             .as_ref()
-            .expect("Detcore DBI runtime was not initialized"),
+            .expect("Detcore DBT runtime was not initialized"),
     )
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-1060): Review the stable DBI child RNG identity encoding.
-fn dbi_child_rng_entropy(virtual_pid: i32, child_ordinal: u64) -> Option<u128> {
+// TODO-HUMAN-REVIEW(PR-1060): Review the stable DBT child RNG identity encoding.
+fn dbt_child_rng_entropy(virtual_pid: i32, child_ordinal: u64) -> Option<u128> {
     if virtual_pid <= 0 || child_ordinal == 0 {
         return None;
     }
@@ -440,8 +440,8 @@ fn dbi_child_rng_entropy(virtual_pid: i32, child_ordinal: u64) -> Option<u128> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-1060): Review preservation of physical DBI child TIDs.
-fn dbi_scheduler_tid(host_tid: i32) -> Option<Tid> {
+// TODO-HUMAN-REVIEW(PR-1060): Review preservation of physical DBT child TIDs.
+fn dbt_scheduler_tid(host_tid: i32) -> Option<Tid> {
     (host_tid > 0).then(|| Tid::from_raw(host_tid))
 }
 
@@ -475,7 +475,7 @@ fn update_memory_hash(sysnum: i64, args: &[u64], read_memory: MemoryReader) {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-1065): Review fault-safe DBI prlimit64 input validation.
+// TODO-HUMAN-REVIEW(PR-1065): Review fault-safe DBT prlimit64 input validation.
 fn prlimit_new_limit_is_readable(
     sysnum: i64,
     args: &[u64],
@@ -488,7 +488,7 @@ fn prlimit_new_limit_is_readable(
     read(args[2] as usize, &mut limit)
 }
 
-// TODO-HUMAN-REVIEW(PR-1079): Review fault-safe DBI multiplexed-IO input validation.
+// TODO-HUMAN-REVIEW(PR-1079): Review fault-safe DBT multiplexed-IO input validation.
 fn multiplexed_io_inputs_are_readable(
     sysnum: i64,
     args: &[u64],
@@ -646,11 +646,11 @@ fn error_result(error: Error) -> i64 {
     }
 }
 
-/// Returns the Detcore DBI cdylib built beside the running Hermit binary or in Cargo's deps directory.
+/// Returns the Detcore DBT cdylib built beside the running Hermit binary or in Cargo's deps directory.
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-738): Review native-client linkage to the minimal DBI runtime.
+// TODO-HUMAN-REVIEW(PR-738): Review native-client linkage to the minimal DBT runtime.
 pub fn runtime_library_path() -> io::Result<PathBuf> {
-    if let Some(runtime) = hermit_resources::resource("libdetcore_dbi.so")?
+    if let Some(runtime) = hermit_resources::resource("libdetcore_dbt.so")?
         && runtime.is_file()
     {
         return Ok(runtime);
@@ -667,7 +667,7 @@ pub fn runtime_library_path() -> io::Result<PathBuf> {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!(
-                    "Hermit DBI runtime was not built beside {} or in its deps directory",
+                    "Hermit DBT runtime was not built beside {} or in its deps directory",
                     executable.display()
                 ),
             )
@@ -681,8 +681,8 @@ fn runtime_library_candidates(executable: &std::path::Path) -> io::Result<[PathB
         )
     })?;
     Ok([
-        directory.join("deps/libdetcore_dbi.so"),
-        directory.join("libdetcore_dbi.so"),
+        directory.join("deps/libdetcore_dbt.so"),
+        directory.join("libdetcore_dbt.so"),
     ])
 }
 
@@ -706,26 +706,26 @@ fn lock_native_client_build(directory: &std::path::Path) -> io::Result<fs::File>
 }
 
 /// Builds the DynamoRIO native client against the Detcore runtime if needed.
-// TODO-HUMAN-REVIEW(PR-1002): Review packaged DBI runtime and client discovery.
+// TODO-HUMAN-REVIEW(PR-1002): Review packaged DBT runtime and client discovery.
 pub fn prepare_native_client() -> io::Result<(PathBuf, PathBuf)> {
     if let Some(install_dir) = hermit_resources::install_dir()? {
         let resources = install_dir.join("rsrcs");
         let drrun = resources.join("dynamorio/bin64/drrun");
-        let client = resources.join("libreverie_dbi_client.so");
+        let client = resources.join("libreverie_dbt_client.so");
         if drrun.is_file() && client.is_file() {
             return Ok((drrun, client));
         }
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "Hermit installation {} is missing its packaged DynamoRIO launcher or DBI client",
+                "Hermit installation {} is missing its packaged DynamoRIO launcher or DBT client",
                 install_dir.display()
             ),
         ));
     }
 
     let runtime = runtime_library_path()?;
-    let source = reverie_dbi::native_client_source_dir();
+    let source = reverie_dbt::native_client_source_dir();
     let source_identity = source
         .parent()
         .and_then(std::path::Path::parent)
@@ -735,7 +735,7 @@ pub fn prepare_native_client() -> io::Result<(PathBuf, PathBuf)> {
         .parent()
         .expect("runtime library path must have a parent")
         .join(format!(
-            "detcore-dbi-native-{}",
+            "detcore-dbt-native-{}",
             source_identity.to_string_lossy()
         ));
     fs::create_dir_all(&directory)?;
@@ -749,13 +749,13 @@ pub fn prepare_native_client() -> io::Result<(PathBuf, PathBuf)> {
         .arg("-DCMAKE_BUILD_TYPE=Release")
         .arg(format!(
             "-DDynamoRIO_DIR={}",
-            reverie_dbi::bundled_dynamorio_cmake_dir().display()
+            reverie_dbt::bundled_dynamorio_cmake_dir().display()
         ))
-        .arg(format!("-DREVERIE_DBI_RUNTIME={}", runtime.display()))
+        .arg(format!("-DREVERIE_DBT_RUNTIME={}", runtime.display()))
         .output()?;
     if !configure.status.success() {
         return Err(io::Error::other(format!(
-            "failed to configure Detcore DBI client: {}",
+            "failed to configure Detcore DBT client: {}",
             String::from_utf8_lossy(&configure.stderr)
         )));
     }
@@ -767,66 +767,66 @@ pub fn prepare_native_client() -> io::Result<(PathBuf, PathBuf)> {
         .output()?;
     if !build.status.success() {
         return Err(io::Error::other(format!(
-            "failed to build Detcore DBI client: {}",
+            "failed to build Detcore DBT client: {}",
             String::from_utf8_lossy(&build.stderr)
         )));
     }
 
-    let client = directory.join("libreverie_dbi_client.so");
+    let client = directory.join("libreverie_dbt_client.so");
     if !client.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("Detcore DBI client was not built at {}", client.display()),
+            format!("Detcore DBT client was not built at {}", client.display()),
         ));
     }
-    Ok((reverie_dbi::bundled_drrun_path().to_path_buf(), client))
+    Ok((reverie_dbt::bundled_drrun_path().to_path_buf(), client))
 }
 
 /// Begins a new DynamoRIO application image and returns its generation.
 #[unsafe(no_mangle)]
-pub extern "C" fn reverie_dbi_runtime_image_init() -> u64 {
+pub extern "C" fn reverie_dbt_runtime_image_init() -> u64 {
     IMAGE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
 }
 
 /// Runs Detcore's async global scheduler on a DynamoRIO-managed client thread.
 ///
 /// The native client starts this entry point before registering guest events
-/// and waits for [`reverie_dbi_runtime_ready`] before allowing callbacks.
+/// and waits for [`reverie_dbt_runtime_ready`] before allowing callbacks.
 ///
 /// # Safety
 ///
-/// `argument` must point to a valid [`reverie_dbi::DbiRuntimeCallbacks`] value.
+/// `argument` must point to a valid [`reverie_dbt::DbtRuntimeCallbacks`] value.
 #[unsafe(no_mangle)]
 // TODO-HUMAN-REVIEW(PR-587): Confirm external scheduler callback and restart semantics.
-pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_void) {
+pub unsafe extern "C" fn reverie_dbt_runtime_background_init(argument: *mut c_void) {
     let image_generation = IMAGE_GENERATION.load(Ordering::SeqCst);
-    let callbacks = unsafe { &*argument.cast::<reverie_dbi::DbiRuntimeCallbacks>() };
+    let callbacks = unsafe { &*argument.cast::<reverie_dbt::DbtRuntimeCallbacks>() };
     let emit = callbacks.emit;
     RUNTIME_SHUTDOWN.store(false, Ordering::Release);
     RUNTIME_PAUSE_REQUESTED.store(false, Ordering::Release);
     RUNTIME_PAUSED.store(false, Ordering::Release);
-    emit_lifecycle_marker(emit, b"detcore-dbi: background client thread entered\n");
-    let tracing_active = init_dbi_tracing(emit);
+    emit_lifecycle_marker(emit, b"detcore-dbt: background client thread entered\n");
+    let tracing_active = init_dbt_tracing(emit);
     let runtime = {
-        let mut slot = RUNTIME.write().expect("Detcore DBI runtime lock poisoned");
+        let mut slot = RUNTIME.write().expect("Detcore DBT runtime lock poisoned");
         if slot.is_none() {
-            emit_lifecycle_marker(emit, b"detcore-dbi: constructing Detcore Config\n");
-            let (mut config, source) = load_dbi_config();
+            emit_lifecycle_marker(emit, b"detcore-dbt: constructing Detcore Config\n");
+            let (mut config, source) = load_dbt_config();
             match source {
                 ConfigSource::Cli => {
-                    emit_lifecycle_marker(emit, b"detcore-dbi: using CLI-provided Detcore Config\n")
+                    emit_lifecycle_marker(emit, b"detcore-dbt: using CLI-provided Detcore Config\n")
                 }
                 ConfigSource::ParseFallback => emit_marker(
                     emit,
-                    b"detcore-dbi: WARNING could not parse HERMIT_DBI_DETCONFIG; using strict default\n",
+                    b"detcore-dbt: WARNING could not parse HERMIT_DBT_DETCONFIG; using strict default\n",
                 ),
                 ConfigSource::Default => {
-                    emit_lifecycle_marker(emit, b"detcore-dbi: using strict default Detcore Config\n")
+                    emit_lifecycle_marker(emit, b"detcore-dbt: using strict default Detcore Config\n")
                 }
             }
             // Fail-closed unsupported-syscall handling (PR #644): the rest of the
             // Config arrives via the CLI env above, but the panic flag comes from
-            // the DBI callback (the `-panic-on-unsupported-syscalls` client
+            // the DBT callback (the `-panic-on-unsupported-syscalls` client
             // argument), because DynamoRIO re-injects the client across execve
             // while an empty-env exec would drop the serialized config. Set up
             // the protected report descriptor the guest children write aggregated
@@ -843,7 +843,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
                 )
             };
             COPIED_UNSUPPORTED_REPORT_FD.store(copied_report_fd, Ordering::Release);
-            // The DBI backend reports and aborts through the exit path plus the
+            // The DBT backend reports and aborts through the exit path plus the
             // protected report descriptor, not the ptrace-style unrecoverable
             // shutdown: unrecoverable_shutdown runs first in the handler and
             // would suppress the UnsupportedSyscallError that carries the
@@ -855,9 +855,9 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
                 report_fd_is_available().then_some(UNSUPPORTED_SYSCALL_REPORT_FD);
             config.validate();
 
-            emit_lifecycle_marker(emit, b"detcore-dbi: initializing Detcore GlobalState\n");
+            emit_lifecycle_marker(emit, b"detcore-dbt: initializing Detcore GlobalState\n");
             let global = GlobalState::init_for_external_scheduler(&config);
-            emit_lifecycle_marker(emit, b"detcore-dbi: GlobalState initialized\n");
+            emit_lifecycle_marker(emit, b"detcore-dbt: GlobalState initialized\n");
             *slot = Some(Arc::new(Runtime {
                 config,
                 global,
@@ -865,9 +865,9 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
                 next_child_ordinal: AtomicU64::new(1),
             }));
         }
-        Arc::clone(slot.as_ref().expect("Detcore DBI runtime was initialized"))
+        Arc::clone(slot.as_ref().expect("Detcore DBT runtime was initialized"))
     };
-    emit_lifecycle_marker(emit, b"detcore-dbi: background scheduler ready\n");
+    emit_lifecycle_marker(emit, b"detcore-dbt: background scheduler ready\n");
     READY_IMAGE.store(image_generation, Ordering::SeqCst);
     let log_scheduler = info_logging_enabled() && !tracing_active;
     let observer = Arc::new(move |event: &'static str| {
@@ -880,13 +880,13 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
         runtime.global.run_external_scheduler(observer),
         callbacks.idle,
     );
-    emit_lifecycle_marker(emit, b"detcore-dbi: background scheduler completed\n");
+    emit_lifecycle_marker(emit, b"detcore-dbt: background scheduler completed\n");
 }
 
 /// Requests shutdown of the backend-owned scheduler at process exit.
 #[unsafe(no_mangle)]
 // TODO-HUMAN-REVIEW(PR-587): Confirm process-exit scheduler ownership.
-pub extern "C" fn reverie_dbi_runtime_process_exit() {
+pub extern "C" fn reverie_dbt_runtime_process_exit() {
     READY_IMAGE.store(0, Ordering::Release);
     RUNTIME_SHUTDOWN.store(true, Ordering::Release);
 }
@@ -894,7 +894,7 @@ pub extern "C" fn reverie_dbi_runtime_process_exit() {
 /// Reports whether the Detcore global scheduler is ready for this image.
 #[unsafe(no_mangle)]
 // TODO-HUMAN-REVIEW(PR-587): Confirm image-generation readiness ordering.
-pub extern "C" fn reverie_dbi_runtime_ready(image_generation: u64) -> i32 {
+pub extern "C" fn reverie_dbt_runtime_ready(image_generation: u64) -> i32 {
     i32::from(
         READY_IMAGE.load(Ordering::Acquire) == image_generation
             && !RUNTIME_PAUSE_REQUESTED.load(Ordering::Acquire)
@@ -916,11 +916,11 @@ pub extern "C" fn reverie_dbi_runtime_ready(image_generation: u64) -> i32 {
 /// The native client must pass a valid writable `scratch` pointer, a live
 /// DynamoRIO `context`, and callback pointers valid for this application.
 // TODO-HUMAN-REVIEW(PR-743): Review the native thread initialization ABI and state handoff.
-// TODO-HUMAN-REVIEW(PR-874): Review compatibility with Reverie's expanded DBI callback ABI.
+// TODO-HUMAN-REVIEW(PR-874): Review compatibility with Reverie's expanded DBT callback ABI.
 // TODO-HUMAN-REVIEW(PR-1060): Review separation of host thread identity from stable RNG entropy.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
+pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
     scratch: *mut c_void,
     context: *mut c_void,
     tid: i32,
@@ -967,14 +967,14 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
     } else {
         let parent = PENDING_THREAD_PARENTS
             .lock()
-            .expect("pending DBI thread parent lock poisoned")
+            .expect("pending DBT thread parent lock poisoned")
             .remove(&host_tid);
         let Some(parent) = parent else {
             return 1;
         };
         Some(parent)
     };
-    let Some(det_tid) = dbi_scheduler_tid(host_tid) else {
+    let Some(det_tid) = dbt_scheduler_tid(host_tid) else {
         return -1;
     };
     let parent_ref = parent
@@ -992,7 +992,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
         initialized: false,
         post_exec_pending: host_tid == pid,
     });
-    if reverie_dbi::run_tool_thread_start(
+    if reverie_dbt::run_tool_thread_start(
         tool,
         context as usize,
         det_pid,
@@ -1025,7 +1025,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
 // TODO-HUMAN-REVIEW(PR-1060): Review deterministic child RNG identity allocation.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
+pub unsafe extern "C" fn reverie_dbt_runtime_thread_created(
     scratch: *mut c_void,
     context: *mut c_void,
     _parent_tid: i32,
@@ -1047,24 +1047,24 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
     let tool = runtime
         .tool
         .get()
-        .expect("Detcore DBI tool was initialized");
+        .expect("Detcore DBT tool was initialized");
     let virtual_pid = scratch.virtual_pid;
     let parent = unsafe { &mut *scratch.runtime_state };
     let flags = CloneFlags::from_bits_truncate(flags);
     parent.state.clone_flags = Some(flags);
     let parent_snapshot = parent.state.clone();
     let child_ordinal = runtime.next_child_ordinal.fetch_add(1, Ordering::SeqCst);
-    let Some(rng_entropy) = dbi_child_rng_entropy(virtual_pid, child_ordinal) else {
+    let Some(rng_entropy) = dbt_child_rng_entropy(virtual_pid, child_ordinal) else {
         parent.state.clone_flags = None;
         return -1;
     };
-    let Some(child_scheduler_tid) = dbi_scheduler_tid(child_tid) else {
+    let Some(child_scheduler_tid) = dbt_scheduler_tid(child_tid) else {
         parent.state.clone_flags = None;
         return -1;
     };
     if PENDING_THREAD_PARENTS
         .lock()
-        .expect("pending DBI thread parent lock poisoned")
+        .expect("pending DBT thread parent lock poisoned")
         .insert(
             child_tid,
             PendingThreadParent {
@@ -1080,7 +1080,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
     }
 
     {
-        let mut guest = DbiGuest::new(
+        let mut guest = DbtGuest::new(
             context as usize,
             parent.tid,
             Pid::from_raw(pid),
@@ -1109,9 +1109,9 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
 /// # Safety
 ///
 /// `scratch` must be the pointer initialized by
-/// [`reverie_dbi_runtime_thread_init`].
+/// [`reverie_dbt_runtime_thread_init`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reverie_dbi_runtime_thread_exit(scratch: *mut c_void) {
+pub unsafe extern "C" fn reverie_dbt_runtime_thread_exit(scratch: *mut c_void) {
     let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
     if scratch.runtime_state.is_null() {
         return;
@@ -1128,8 +1128,8 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_exit(scratch: *mut c_void) {
         let tool = runtime
             .tool
             .get()
-            .expect("Detcore DBI tool was initialized");
-        let _ = reverie_dbi::run_tool_thread_exit(
+            .expect("Detcore DBT tool was initialized");
+        let _ = reverie_dbt::run_tool_thread_exit(
             tool,
             tid,
             state,
@@ -1152,15 +1152,15 @@ fn resume_paused_runtime() {
 ///
 /// # Safety
 ///
-/// `_scratch` must be the pointer supplied by the native DBI callback. It is not
+/// `_scratch` must be the pointer supplied by the native DBT callback. It is not
 /// dereferenced because a failed exec preserves the current Detcore thread state.
 #[unsafe(no_mangle)]
 // TODO-HUMAN-REVIEW(PR-587): Confirm failed-exec preserves Runtime and thread state.
-pub unsafe extern "C" fn reverie_dbi_runtime_exec_failed(_scratch: *mut c_void, _pid: i32) {
+pub unsafe extern "C" fn reverie_dbt_runtime_exec_failed(_scratch: *mut c_void, _pid: i32) {
     assert!(
         RUNTIME
             .read()
-            .expect("Detcore DBI runtime lock poisoned")
+            .expect("Detcore DBT runtime lock poisoned")
             .is_some(),
         "failed exec had no Detcore runtime"
     );
@@ -1171,7 +1171,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_exec_failed(_scratch: *mut c_void, 
 // TODO-HUMAN-REVIEW(PR-644): Review fork-safe policy enforcement before copied children bypass.
 // TODO-HUMAN-REVIEW(PR-978): Review extending the copied-child gate from the
 // Unsupported set to the full deterministic-refusal boundary.
-/// Applies the deterministic-refusal policy in a copied pre-exec DBI child.
+/// Applies the deterministic-refusal policy in a copied pre-exec DBT child.
 ///
 /// A copied pre-exec child runs natively on the DynamoRIO client stack with no
 /// Detcore tool, so every syscall it makes bypasses `handle_syscall_event`.
@@ -1190,12 +1190,12 @@ pub unsafe extern "C" fn reverie_dbi_runtime_exec_failed(_scratch: *mut c_void, 
 ///
 /// # Safety
 ///
-/// `args` must be null or point to the DBI client's live six-element syscall
+/// `args` must be null or point to the DBT client's live six-element syscall
 /// argument array for the duration of this call.
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1061): Review copied-child ioctl errno emulation.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reverie_dbi_runtime_copied_syscall(sysnum: i64, args: *const u64) -> i32 {
+pub unsafe extern "C" fn reverie_dbt_runtime_copied_syscall(sysnum: i64, args: *const u64) -> i32 {
     let sysno = Sysno::from(sysnum as i32);
     let strict = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
     // Bash probes the foreground process group in a copied child before
@@ -1211,7 +1211,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_copied_syscall(sysnum: i64, args: *
         let request = if args.is_null() {
             None
         } else {
-            // SAFETY: Reverie's DBI client passes its live six-element syscall
+            // SAFETY: Reverie's DBT client passes its live six-element syscall
             // argument array for the duration of this callback.
             Some(unsafe { args.add(1).read() })
         };
@@ -1220,7 +1220,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_copied_syscall(sysnum: i64, args: *
         }
         return 1;
     }
-    // TODO-HUMAN-REVIEW(PR-981): Copied DBI children cannot enter the Rust
+    // TODO-HUMAN-REVIEW(PR-981): Copied DBT children cannot enter the Rust
     // Detcore Tool. Strict mode therefore fails closed for receive syscalls that
     // can expose native socket timestamps. Non-strict mode retains native
     // behavior.
@@ -1251,7 +1251,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_copied_syscall(sysnum: i64, args: *
     }
 }
 
-// TODO-HUMAN-REVIEW(PR-874): Review deferred DBI syscall encoding.
+// TODO-HUMAN-REVIEW(PR-874): Review deferred DBT syscall encoding.
 unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut u64) {
     let (sysno, syscall_args) = syscall.into_parts();
     unsafe { number.write(sysno.id() as i64) };
@@ -1277,8 +1277,8 @@ unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut 
 // TODO-HUMAN-REVIEW(PR-587): Confirm native process dispatch pauses only exec.
 // TODO-HUMAN-REVIEW(PR-874): Review deferred-syscall and register-writer ABI compatibility.
 // TODO-HUMAN-REVIEW(PR-1060): Review host child DetTid syscall dispatch.
-// TODO-HUMAN-REVIEW(PR-1118): Review fault-safe DBI getrandom memory writes.
-pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
+// TODO-HUMAN-REVIEW(PR-1118): Review fault-safe DBT getrandom memory writes.
+pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     context: *mut c_void,
     scratch: *mut c_void,
     tid: i32,
@@ -1299,7 +1299,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
 ) -> i32 {
     let first_event = TOTAL_SYSCALLS.fetch_add(1, Ordering::Relaxed) == 0;
     if first_event {
-        emit_lifecycle_marker(emit, b"detcore-dbi: entered Rust syscall callback\n");
+        emit_lifecycle_marker(emit, b"detcore-dbt: entered Rust syscall callback\n");
     }
     let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
     let mut dispatch_args: [u64; 6] = raw_args.try_into().expect("six syscall arguments");
@@ -1313,7 +1313,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         tid,
     );
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-1065): Review fault-safe DBI prlimit64 input validation.
+    // TODO-HUMAN-REVIEW(PR-1065): Review fault-safe DBT prlimit64 input validation.
     if !prlimit_new_limit_is_readable(sysnum, raw_args, |address, bytes| unsafe {
         read_memory(address, bytes.as_mut_ptr(), bytes.len()) != 0
     }) {
@@ -1329,7 +1329,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         return 1;
     }
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-849): Review fault-safe DBI getrandom writes.
+    // TODO-HUMAN-REVIEW(PR-849): Review fault-safe DBT getrandom writes.
     // Probe with deterministic zeros through DynamoRIO's fault-safe writer, then let Detcore
     // overwrite the entire writable prefix before the application resumes.
     let getrandom_probe = if sysnum == libc::SYS_getrandom {
@@ -1367,7 +1367,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             assert_eq!(
                 IMAGE_GENERATION.load(Ordering::Acquire),
                 image_generation,
-                "DBI image generation changed while pausing for exec"
+                "DBT image generation changed while pausing for exec"
             );
         }
         return 0;
@@ -1393,18 +1393,18 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     );
 
     if first_event {
-        emit_lifecycle_marker(emit, b"detcore-dbi: initializing Detcore thread state\n");
+        emit_lifecycle_marker(emit, b"detcore-dbt: initializing Detcore thread state\n");
     }
     if scratch.runtime_state.is_null() {
         if first_event {
-            emit_lifecycle_marker(emit, b"detcore-dbi: constructing Detcore thread state\n");
+            emit_lifecycle_marker(emit, b"detcore-dbt: constructing Detcore thread state\n");
         }
         let mut state = tool.init_thread_state(Tid::from_raw(tid.into()), None);
         if scratch.virtual_tid > 0 {
             state.set_open_file_creator(DetTid::from_raw(scratch.virtual_tid));
         }
         if first_event {
-            emit_lifecycle_marker(emit, b"detcore-dbi: Detcore thread state constructed\n");
+            emit_lifecycle_marker(emit, b"detcore-dbt: Detcore thread state constructed\n");
         }
         scratch.runtime_state = Box::into_raw(Box::new(ThreadRuntime {
             tid,
@@ -1417,9 +1417,9 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     let det_tid = thread.tid;
     if !thread.initialized {
         if first_event {
-            emit_lifecycle_marker(emit, b"detcore-dbi: running Detcore thread-start hook\n");
+            emit_lifecycle_marker(emit, b"detcore-dbt: running Detcore thread-start hook\n");
         }
-        if let Err(error) = reverie_dbi::run_tool_thread_start(
+        if let Err(error) = reverie_dbt::run_tool_thread_start(
             tool,
             context as usize,
             det_tid,
@@ -1442,10 +1442,10 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         if first_event {
             emit_lifecycle_marker(
                 emit,
-                b"detcore-dbi: thread-start hook completed; running post-exec\n",
+                b"detcore-dbt: thread-start hook completed; running post-exec\n",
             );
         }
-        if let Err(errno) = reverie_dbi::run_tool_post_exec(
+        if let Err(errno) = reverie_dbt::run_tool_post_exec(
             tool,
             context as usize,
             det_tid,
@@ -1463,7 +1463,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             return 1;
         }
         if first_event {
-            emit_lifecycle_marker(emit, b"detcore-dbi: post-exec hook completed\n");
+            emit_lifecycle_marker(emit, b"detcore-dbt: post-exec hook completed\n");
         }
         thread.post_exec_pending = false;
     }
@@ -1471,19 +1471,19 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     if first_event {
         emit_lifecycle_marker(
             emit,
-            b"detcore-dbi: dispatching first syscall through Detcore\n",
+            b"detcore-dbt: dispatching first syscall through Detcore\n",
         );
     }
     let getrandom_prng = getrandom_probe
         .filter(|probe| probe.writable < probe.requested)
         .map(|probe| (probe, thread.state.prng.clone()));
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-1057): Review production fault-safe DBI backtraces.
-    // Preserve DynamoRIO's fault containment when Detcore asks DbiGuest for a
+    // TODO-HUMAN-REVIEW(PR-1057): Review production fault-safe DBT backtraces.
+    // Preserve DynamoRIO's fault containment when Detcore asks DbtGuest for a
     // backtrace. Dropping this callback makes the adapter fall back to direct
     // self-process reads, which cannot distinguish a guest fault from a client
     // fault as reliably as dr_safe_read.
-    let mut outcome = reverie_dbi::run_tool_syscall_with_memory_reader(
+    let mut outcome = reverie_dbt::run_tool_syscall_with_memory_reader(
         tool,
         context as usize,
         det_tid,
@@ -1503,28 +1503,28 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         // Detcore handler consumes before its first guest-memory fault.
         thread.state.prng = original_prng;
         advance_getrandom_prng(&mut thread.state.prng, probe.consumed());
-        if matches!(outcome, Ok(DbiSyscallOutcome::Suppress(_))) {
+        if matches!(outcome, Ok(DbtSyscallOutcome::Suppress(_))) {
             let value = if probe.writable == 0 {
                 -(Errno::EFAULT.into_raw() as i64)
             } else {
                 probe.writable as i64
             };
-            outcome = Ok(DbiSyscallOutcome::Suppress(value));
+            outcome = Ok(DbtSyscallOutcome::Suppress(value));
         }
     }
     match outcome {
-        Ok(DbiSyscallOutcome::Suppress(value)) => {
+        Ok(DbtSyscallOutcome::Suppress(value)) => {
             unsafe { result.write(value) };
             TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
             1
         }
-        Ok(DbiSyscallOutcome::ExecuteOriginal(syscall)) => {
+        Ok(DbtSyscallOutcome::ExecuteOriginal(syscall)) => {
             unsafe { write_deferred_syscall(syscall, deferred_sysnum, deferred_args) };
             2
         }
         Err(Error::Tool(error)) => {
             if let Some(unsupported) = error.downcast_ref::<UnsupportedSyscallError>() {
-                let message = format!("detcore-dbi: {unsupported}\n");
+                let message = format!("detcore-dbt: {unsupported}\n");
                 unsafe { emit(message.as_ptr(), message.len()) };
                 -1
             } else {
@@ -1541,19 +1541,19 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     }
 }
 
-/// Returns the linked Reverie Tool name for native DBI-path evidence.
+/// Returns the linked Reverie Tool name for native DBT-path evidence.
 #[unsafe(no_mangle)]
-pub extern "C" fn reverie_dbi_runtime_name() -> *const libc::c_char {
+pub extern "C" fn reverie_dbt_runtime_name() -> *const libc::c_char {
     c"Detcore".as_ptr()
 }
 
-/// Returns Detcore DBI counters and the observed guest-memory hash.
+/// Returns Detcore DBT counters and the observed guest-memory hash.
 ///
 /// # Safety
 ///
 /// Every output pointer must be aligned and writable for one `u64`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reverie_dbi_runtime_totals(
+pub unsafe extern "C" fn reverie_dbt_runtime_totals(
     branches: *mut u64,
     syscalls: *mut u64,
     rewritten: *mut u64,
@@ -1572,9 +1572,9 @@ mod tests {
 
     #[test]
     fn child_rng_entropy_is_stable_and_partitioned() {
-        let first = dbi_child_rng_entropy(3, 1).unwrap();
-        let second = dbi_child_rng_entropy(3, 2).unwrap();
-        let next_process = dbi_child_rng_entropy(4, 1).unwrap();
+        let first = dbt_child_rng_entropy(3, 1).unwrap();
+        let second = dbt_child_rng_entropy(3, 2).unwrap();
+        let next_process = dbt_child_rng_entropy(4, 1).unwrap();
 
         assert_eq!(first, (3_u128 << 64) | 1);
         assert_ne!(first, second);
@@ -1583,20 +1583,20 @@ mod tests {
 
     #[test]
     fn child_rng_entropy_has_no_small_thread_lifetime_limit() {
-        assert_eq!(dbi_child_rng_entropy(0, 1), None);
-        assert_eq!(dbi_child_rng_entropy(3, 0), None);
-        assert!(dbi_child_rng_entropy(3, 2_048).is_some());
-        assert!(dbi_child_rng_entropy(3, u64::MAX).is_some());
-        assert!(dbi_child_rng_entropy(i32::MAX, 1).is_some());
+        assert_eq!(dbt_child_rng_entropy(0, 1), None);
+        assert_eq!(dbt_child_rng_entropy(3, 0), None);
+        assert!(dbt_child_rng_entropy(3, 2_048).is_some());
+        assert!(dbt_child_rng_entropy(3, u64::MAX).is_some());
+        assert!(dbt_child_rng_entropy(i32::MAX, 1).is_some());
     }
 
     #[test]
     fn child_scheduler_identity_remains_the_host_tid() {
         let host_tid = 42_001;
-        let scheduler_tid: i32 = dbi_scheduler_tid(host_tid).unwrap().into();
+        let scheduler_tid: i32 = dbt_scheduler_tid(host_tid).unwrap().into();
         assert_eq!(scheduler_tid, host_tid);
-        assert_eq!(dbi_scheduler_tid(0), None);
-        assert_eq!(dbi_scheduler_tid(-1), None);
+        assert_eq!(dbt_scheduler_tid(0), None);
+        assert_eq!(dbt_scheduler_tid(-1), None);
     }
 
     #[test]
@@ -1764,20 +1764,20 @@ mod tests {
     fn copied_child_action_with_args(sysnum: i64, args: [u64; 6]) -> i32 {
         // SAFETY: The callback reads the argument array only for the duration
         // of this call.
-        unsafe { reverie_dbi_runtime_copied_syscall(sysnum, args.as_ptr()) }
+        unsafe { reverie_dbt_runtime_copied_syscall(sysnum, args.as_ptr()) }
     }
 
     #[test]
-    fn native_client_links_only_the_dedicated_dbi_runtime() {
+    fn native_client_links_only_the_dedicated_dbt_runtime() {
         let executable = std::path::Path::new("/workspace/target/debug/hermit");
         let [deps, direct] = runtime_library_candidates(executable).unwrap();
         assert_eq!(
             deps,
-            std::path::Path::new("/workspace/target/debug/deps/libdetcore_dbi.so")
+            std::path::Path::new("/workspace/target/debug/deps/libdetcore_dbt.so")
         );
         assert_eq!(
             direct,
-            std::path::Path::new("/workspace/target/debug/libdetcore_dbi.so")
+            std::path::Path::new("/workspace/target/debug/libdetcore_dbt.so")
         );
     }
 
@@ -1803,7 +1803,7 @@ mod tests {
         }
     }
 
-    // TODO-HUMAN-REVIEW(PR-916): Regression for the copied-DBI-child keyring
+    // TODO-HUMAN-REVIEW(PR-916): Regression for the copied-DBT-child keyring
     // isolation boundary. A copied pre-exec child runs no Rust Detcore Tool, so
     // the gate must refuse the (now Determinized) keyring family in strict mode
     // rather than let it execute natively against the host keyring.
@@ -1914,7 +1914,7 @@ mod tests {
 
         let mut scratch = std::mem::MaybeUninit::<NativeThreadScratch>::uninit();
         let status = unsafe {
-            reverie_dbi_runtime_thread_init(
+            reverie_dbt_runtime_thread_init(
                 scratch.as_mut_ptr().cast(),
                 std::ptr::null_mut(),
                 7,
@@ -2014,7 +2014,7 @@ mod tests {
         // SAFETY: A null argument vector is an explicit fail-closed ABI test;
         // the callback checks it before dereferencing.
         assert_eq!(
-            unsafe { reverie_dbi_runtime_copied_syscall(libc::SYS_ioctl, std::ptr::null()) },
+            unsafe { reverie_dbt_runtime_copied_syscall(libc::SYS_ioctl, std::ptr::null()) },
             1,
             "missing ioctl arguments must fail closed"
         );

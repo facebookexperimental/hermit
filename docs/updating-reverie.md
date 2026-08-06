@@ -87,5 +87,5 @@ compiles.
   builder is an isolated workspace, so update and commit both lockfiles with
   every pin change.
 - To point at a fork instead of upstream (e.g. for the experimental
-  `reverie-dbi` / `reverie-kvm` backends), change the `git =` URL as well as the
+  `reverie-dbt` / `reverie-kvm` backends), change the `git =` URL as well as the
   `rev`, and keep all Reverie crates on the same source.

@@ -15,7 +15,7 @@
  * 16-byte (VIRTUAL_CPUSET_BYTES) cpumask size regardless of how many CPUs the
  * host actually has. That constant answer is what makes the value
  * bitwise-identical across --verify repeat runs and under record/replay, and it
- * must be identical across backends: the DBI and KVM backends have to match the
+ * must be identical across backends: the DBT and KVM backends have to match the
  * golden ptrace reference exactly.
  *
  * This fixture exercises the raw syscall (not glibc's sched_getaffinity

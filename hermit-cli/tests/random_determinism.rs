@@ -110,11 +110,11 @@ fn random_sources_are_deterministic_under_strict_verify() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-1060): Review DBI child identity and RNG lifecycle coverage.
+// TODO-HUMAN-REVIEW(PR-1060): Review DBT child identity and RNG lifecycle coverage.
 #[test]
-fn dbi_random_sources_are_deterministic_under_strict_verify() {
+fn dbt_random_sources_are_deterministic_under_strict_verify() {
     let guest =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join("random-determinism/dbi-random-sources");
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("random-determinism/dbt-random-sources");
     compile_guest(&guest);
-    assert_guest_l2(&guest, Some("dbi"));
+    assert_guest_l2(&guest, Some("dbt"));
 }

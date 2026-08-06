@@ -11,7 +11,7 @@ Background
 ----------
 The legacy ``tests/backend-parity/matrix.tsv`` side-matrix (driven by the
 standalone ``run_matrix.py`` harness) records parity per backend for freestanding
-C guests, but only ptrace/DBI/KVM ever run it -- it is invisible to the
+C guests, but only ptrace/DBT/KVM ever run it -- it is invisible to the
 mode x backend x test symmetry enforced over ``tests/e2e/manifests/*.toml`` by
 ``ci/manifest-plan`` (PR #1518). #1498 removes ``matrix.tsv`` entirely and folds
 its catalog back into ``run_matrix.py``. Dozens of open PRs still add a
@@ -25,7 +25,7 @@ This tool mechanizes the coverage migration for those PRs. For each source PR it
      exists for the lint) if it is not already present;
   3. appends a symmetric ``[[test]]`` block to
      ``tests/e2e/manifests/backend-parity-c.toml`` -- ptrace established first,
-     every backend x mode cell declared, DBI/KVM enabled only where the source
+     every backend x mode cell declared, DBT/KVM enabled only where the source
      row's ``--verify`` (L2) witness actually passed, everything else disabled
      with a concrete reason carried over from the matrix row;
   4. reclassifies the fixture in
@@ -95,15 +95,15 @@ class MatrixRow:
     name: str
     # L1 pass/gap
     ptrace: str
-    dbi: str
+    dbt: str
     kvm: str
-    dbi_reason: str
+    dbt_reason: str
     kvm_reason: str
     # L2 detlog/guest/gap (empty when the source row is the 6-col schema)
     ptrace_l2: str = ""
-    dbi_l2: str = ""
+    dbt_l2: str = ""
     kvm_l2: str = ""
-    dbi_l2_reason: str = ""
+    dbt_l2_reason: str = ""
     kvm_l2_reason: str = ""
     has_l2: bool = False
 
@@ -114,40 +114,40 @@ def parse_matrix_row(raw: str) -> MatrixRow:
     if cols and cols[0] == "test_name":
         raise ConvertError("header row, not a data row")
     if len(cols) == 6:
-        name, ptrace, dbi, kvm, dbi_r, kvm_r = cols
-        row = MatrixRow(name, ptrace, dbi, kvm, dbi_r, kvm_r)
+        name, ptrace, dbt, kvm, dbt_r, kvm_r = cols
+        row = MatrixRow(name, ptrace, dbt, kvm, dbt_r, kvm_r)
     elif len(cols) == 11:
         (
             name,
             ptrace,
-            dbi,
+            dbt,
             kvm,
-            dbi_r,
+            dbt_r,
             kvm_r,
             p_l2,
-            dbi_l2,
+            dbt_l2,
             kvm_l2,
-            dbi_l2_r,
+            dbt_l2_r,
             kvm_l2_r,
         ) = cols
         row = MatrixRow(
             name,
             ptrace,
-            dbi,
+            dbt,
             kvm,
-            dbi_r,
+            dbt_r,
             kvm_r,
             p_l2,
-            dbi_l2,
+            dbt_l2,
             kvm_l2,
-            dbi_l2_r,
+            dbt_l2_r,
             kvm_l2_r,
             has_l2=True,
         )
     else:
         raise ConvertError(f"unexpected column count {len(cols)} (want 6 or 11)")
 
-    for backend in ("ptrace", "dbi", "kvm"):
+    for backend in ("ptrace", "dbt", "kvm"):
         if getattr(row, backend) not in ("pass", "gap"):
             raise ConvertError(f"{row.name}/{backend}: expected pass|gap")
     if row.ptrace != "pass":
@@ -202,7 +202,7 @@ def build_plan(
                     else f"{backend.upper()} L1 gap in the source matrix row"
                 )
 
-    classify("dbi", row.dbi, row.dbi_reason, row.dbi_l2, row.dbi_l2_reason)
+    classify("dbt", row.dbt, row.dbt_reason, row.dbt_l2, row.dbt_l2_reason)
     classify("kvm", row.kvm, row.kvm_reason, row.kvm_l2, row.kvm_l2_reason)
     disabled["sabre"] = (
         "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -239,7 +239,7 @@ def render_test_block(plan: Plan) -> str:
         f"backends_enabled = [{enabled_toml}]",
         "[test.modes.verify.backends_disabled]",
     ]
-    for backend in ("dbi", "kvm", "sabre", "liteinst"):
+    for backend in ("dbt", "kvm", "sabre", "liteinst"):
         if backend in plan.disabled:
             lines.append(f'{backend} = "{_escape(plan.disabled[backend])}"')
     lines += [
@@ -255,7 +255,7 @@ def render_test_block(plan: Plan) -> str:
         "backends_enabled = []",
         "[test.modes.replay.backends_disabled]",
         'ptrace = "Record/replay qualification is separate from the initial strict-verification migration"',
-        'dbi = "Record/replay is unsupported by DBI"',
+        'dbt = "Record/replay is unsupported by DBT"',
         'kvm = "Record/replay is unsupported by KVM"',
         'sabre = "Record/replay is unsupported by SaBRe"',
         'liteinst = "Record/replay is unsupported by LiteInst"',
@@ -265,7 +265,7 @@ def render_test_block(plan: Plan) -> str:
         "backends_enabled = []",
         "[test.modes.chaos.backends_disabled]",
         'ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"',
-        'dbi = "Chaos scheduling is unsupported by DBI"',
+        'dbt = "Chaos scheduling is unsupported by DBT"',
         'kvm = "Chaos scheduling is unsupported by KVM"',
         'sabre = "Chaos scheduling is unsupported by SaBRe"',
         'liteinst = "Chaos scheduling is unsupported by LiteInst"',
@@ -275,7 +275,7 @@ def render_test_block(plan: Plan) -> str:
         "backends_enabled = []",
         "[test.modes.custom.backends_disabled]",
         'ptrace = "No custom edge-case arguments have been calibrated for this C guest"',
-        'dbi = "No custom edge-case arguments have been calibrated for this C guest"',
+        'dbt = "No custom edge-case arguments have been calibrated for this C guest"',
         'kvm = "No custom edge-case arguments have been calibrated for this C guest"',
         'sabre = "No custom edge-case arguments have been calibrated for this C guest"',
         'liteinst = "No custom edge-case arguments have been calibrated for this C guest"',

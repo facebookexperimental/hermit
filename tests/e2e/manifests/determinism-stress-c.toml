@@ -23,7 +23,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 ci = false
 backends_enabled = ["ptrace", "sabre"]
 [test.modes.verify.backends_disabled]
-dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
@@ -38,7 +38,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
+dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
@@ -48,7 +48,7 @@ ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
+dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
 liteinst = "Chaos scheduling is unsupported by LiteInst"
@@ -58,7 +58,7 @@ ci = false
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
+dbt = "No custom edge-case arguments have been calibrated for this C guest"
 kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
@@ -80,7 +80,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
-dbi = "This determinism cell calibrates the ptrace strict-verify baseline; qualify DBI separately"
+dbt = "This determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately"
 kvm = "This determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately"
 sabre = "This determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately"
 liteinst = "This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately"
@@ -96,7 +96,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
+dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
@@ -106,7 +106,7 @@ ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
+dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
 liteinst = "Chaos scheduling is unsupported by LiteInst"
@@ -116,7 +116,7 @@ ci = false
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
+dbt = "No custom edge-case arguments have been calibrated for this C guest"
 kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
@@ -135,7 +135,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 ci = false
 backends_enabled = ["ptrace", "sabre"]
 [test.modes.verify.backends_disabled]
-dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
@@ -150,7 +150,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
+dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
@@ -160,7 +160,7 @@ ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
+dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
 liteinst = "Chaos scheduling is unsupported by LiteInst"
@@ -170,7 +170,7 @@ ci = false
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
+dbt = "No custom edge-case arguments have been calibrated for this C guest"
 kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
@@ -189,7 +189,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
-dbi = "This determinism cell calibrates the ptrace strict-verify baseline; qualify DBI separately"
+dbt = "This determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately"
 kvm = "This determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately"
 sabre = "This determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately"
 liteinst = "This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately"
@@ -205,7 +205,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
+dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
@@ -215,7 +215,7 @@ ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
+dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
 liteinst = "Chaos scheduling is unsupported by LiteInst"
@@ -225,7 +225,7 @@ ci = false
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
+dbt = "No custom edge-case arguments have been calibrated for this C guest"
 kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
@@ -301,7 +301,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 ci = false
 backends_enabled = ["ptrace", "sabre"]
 [test.modes.verify.backends_disabled]
-dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
@@ -316,7 +316,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
+dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
@@ -326,7 +326,7 @@ ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
+dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
 liteinst = "Chaos scheduling is unsupported by LiteInst"
@@ -336,7 +336,7 @@ ci = false
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
+dbt = "No custom edge-case arguments have been calibrated for this C guest"
 kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
@@ -355,7 +355,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
-dbi = "This determinism cell calibrates the ptrace strict-verify baseline; qualify DBI separately"
+dbt = "This determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately"
 kvm = "This determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately"
 sabre = "Forwarded-DETLOG SaBRe verification exits during the first run before producing guest output; the historical stdout-only qualification is insufficient"
 liteinst = "This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately"
@@ -371,7 +371,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
+dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
@@ -381,7 +381,7 @@ ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
+dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
 liteinst = "Chaos scheduling is unsupported by LiteInst"
@@ -391,7 +391,7 @@ ci = false
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
+dbt = "No custom edge-case arguments have been calibrated for this C guest"
 kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
@@ -410,7 +410,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
-dbi = "This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify DBI separately"
+dbt = "This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately"
 kvm = "This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately"
 sabre = "This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately"
 liteinst = "This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately"
@@ -427,7 +427,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the strict-verification determinism cell"
-dbi = "Record/replay is unsupported by DBI"
+dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
@@ -437,7 +437,7 @@ ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
+dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
 liteinst = "Chaos scheduling is unsupported by LiteInst"
@@ -447,7 +447,7 @@ ci = false
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
+dbt = "No custom edge-case arguments have been calibrated for this C guest"
 kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
@@ -468,7 +468,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
-dbi = "This determinism cell calibrates the ptrace strict-verify baseline; qualify DBI separately"
+dbt = "This determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately"
 kvm = "This determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately"
 sabre = "This determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately"
 liteinst = "This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately"
@@ -484,7 +484,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
+dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
@@ -494,7 +494,7 @@ ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
+dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
 liteinst = "Chaos scheduling is unsupported by LiteInst"
@@ -504,7 +504,7 @@ ci = false
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
+dbt = "No custom edge-case arguments have been calibrated for this C guest"
 kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
@@ -524,7 +524,7 @@ ci = false
 backends_enabled = ["ptrace"]
 guest_args = { ptrace = ["contention"] }
 [test.modes.verify.backends_disabled]
-dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
 sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
@@ -540,7 +540,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
+dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
@@ -550,7 +550,7 @@ ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
+dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
 liteinst = "Chaos scheduling is unsupported by LiteInst"
@@ -560,7 +560,7 @@ ci = false
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
+dbt = "No custom edge-case arguments have been calibrated for this C guest"
 kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
@@ -579,7 +579,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 ci = false
 backends_enabled = ["ptrace", "sabre"]
 [test.modes.verify.backends_disabled]
-dbi = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBI separately"
+dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
@@ -594,7 +594,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
-dbi = "Record/replay is unsupported by DBI"
+dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
@@ -604,7 +604,7 @@ ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
-dbi = "Chaos scheduling is unsupported by DBI"
+dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
 liteinst = "Chaos scheduling is unsupported by LiteInst"
@@ -614,7 +614,7 @@ ci = false
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
+dbt = "No custom edge-case arguments have been calibrated for this C guest"
 kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"

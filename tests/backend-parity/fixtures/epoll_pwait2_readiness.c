@@ -3,17 +3,17 @@
 // This is the syscall-441 sibling of the epoll_readiness row (which drives
 // epoll_wait). epoll_pwait2 is the newer epoll wait entry point that takes an
 // absolute-precision struct timespec timeout and an optional signal mask.
-// ptrace and DBI forward it faithfully; KVM's ElfExecutor does not implement
+// ptrace and DBT forward it faithfully; KVM's ElfExecutor does not implement
 // syscall 441 and returns a deterministic ENOSYS, so this is a KVM gap rather
 // than a triple-pass row.
 //
 // The probe uses a zero timespec ({0, 0}) so epoll_pwait2 polls without ever
-// blocking — a blocking epoll wait would livelock the DBI no-preemption
+// blocking — a blocking epoll wait would livelock the DBT no-preemption
 // scheduler, and any real timeout would be a gated wall-clock channel. No time
 // value is asserted: the contract only checks the readiness count, the woken
 // descriptor, and its event bits over an eventfd that the fixture itself arms.
 //
-// ptrace and DBI pass all seven checks (ok=7). KVM passes only the three that
+// ptrace and DBT pass all seven checks (ok=7). KVM passes only the three that
 // do not depend on epoll_pwait2 (add, arm, del) and fails the four wait-driven
 // checks because syscall 441 returns -1/ENOSYS (ok=3).
 

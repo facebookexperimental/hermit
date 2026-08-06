@@ -58,7 +58,7 @@ DEFAULT_REPO = "rrnewton/hermit"
 DEFERRED_LABEL = "matrix-asymmetric-tests-deferred"
 INVENTORY = "tests/e2e/manifests/inventory/test-files.json"
 SYMMETRY_BASELINE = "ci/matrix-symmetry-baseline.json"
-BACKEND_TOKENS = {"ptrace", "dbi", "dynamorio", "kvm", "sabre", "e9patch"}
+BACKEND_TOKENS = {"ptrace", "dbt", "dynamorio", "kvm", "sabre", "e9patch"}
 
 
 class SplitError(RuntimeError):

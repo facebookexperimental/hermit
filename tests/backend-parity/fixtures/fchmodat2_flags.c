@@ -7,7 +7,7 @@
 // implementation is deterministic by construction: identical mode changes and
 // identical error classifications on every run.
 //
-// The ptrace and DBI backends forward syscall 452 to the host, so all five
+// The ptrace and DBT backends forward syscall 452 to the host, so all five
 // checks pass (ok=5) exactly as they do natively. The KVM backend's ElfExecutor
 // does not route syscall 452 and returns ENOSYS for every fchmodat2 call, so it
 // fails all five checks (ok=0); that is a documented KVM gap in matrix.tsv, not

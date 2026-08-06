@@ -854,7 +854,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // POSIX requires non-null infop. Linux accepts null, but that form can
         // expose host rusage and requires backend-neutral scratch memory for
         // deterministic polling. Reject it uniformly instead of diverging or
-        // panicking on DBI's unsupported scratch stack.
+        // panicking on DBT's unsupported scratch stack.
         if call.info().is_none() {
             return Err(Errno::EFAULT.into());
         }

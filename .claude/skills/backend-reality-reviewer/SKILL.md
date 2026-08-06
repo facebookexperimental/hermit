@@ -59,7 +59,7 @@ the current source when changing the owning backend, and preserve them in tests
 or backend documentation rather than copying coordinator charters into this
 repository:
 
-- **DBI/DynamoRIO:** build the client in release mode; debug frames can overflow
+- **DBT/DynamoRIO:** build the client in release mode; debug frames can overflow
   DynamoRIO's roughly 56 KiB client stack. A Rust panic in a handler aborts the
   process, so `catch_unwind` is not a recovery path. DynamoRIO follows
   fork/exec children by default (`-follow_children`). The selected Reverie
@@ -91,7 +91,7 @@ repository:
 Before assigning a backend score, trace and record the literal implementation path.
 
 1. Trace `--backend X` from CLI parsing and dispatch to `Detcore<XxxGuest>`; identify any path that bypasses Detcore.
-2. Inspect `run_kvm()` and `run_dbi()`. Each must instantiate `detcore::Config` and construct a real Detcore tool (or the exact shared Detcore construction used by ptrace).
+2. Inspect `run_kvm()` and `run_dbt()`. Each must instantiate `detcore::Config` and construct a real Detcore tool (or the exact shared Detcore construction used by ptrace).
 3. Trace representative syscalls from backend interception into Detcore handlers and back to the guest; determine whether they are determinized or merely passed through to the host.
 4. Capture INFO logs for the same program under ptrace and backend X, then compare whether both paths show equivalent syscall interception and Detcore handling.
 5. **If backend X bypasses Detcore, its score is B0 regardless of test passes, program output, or Guest implementation completeness.**
@@ -158,7 +158,7 @@ grep -rn 'Detcore<' hermit-cli/src/ detcore/src/
 grep -n 'reverie-' hermit-cli/Cargo.toml
 
 # 5. Trace CLI dispatch and real Detcore construction
-rg -n 'run_kvm|run_dbi|detcore::Config|Detcore<' hermit-cli/src/ detcore/src/
+rg -n 'run_kvm|run_dbt|detcore::Config|Detcore<' hermit-cli/src/ detcore/src/
 
 # 6. Trace syscall interception, determinization, and possible passthrough
 rg -n 'syscall|intercept|passthrough|forward' hermit-cli/src/ detcore/src/ reverie-*/src/

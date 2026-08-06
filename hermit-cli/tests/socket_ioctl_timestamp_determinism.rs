@@ -31,7 +31,7 @@ fn socket_timestamp_ioctls_use_logical_time() {
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    for backend in ["ptrace", "dbi", "liteinst"] {
+    for backend in ["ptrace", "dbt", "liteinst"] {
         for mode in ["v4-us", "v4-ns", "v6-us"] {
             let verify = Command::new("timeout")
                 .args(["--kill-after", "5s", "90s"])

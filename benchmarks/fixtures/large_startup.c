@@ -1,4 +1,4 @@
-/* Execute 4 MiB of text so DBI must translate the full code path. */
+/* Execute 4 MiB of text so DBT must translate the full code path. */
 __asm__(
     ".pushsection .text.benchmark_padding,\"ax\",@progbits\n"
     ".balign 16\n"

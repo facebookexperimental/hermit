@@ -37,7 +37,7 @@ fn socket_receive_timestamps_use_logical_time() {
             String::from_utf8_lossy(&compile.stderr)
         );
 
-        for backend in ["ptrace", "dbi", "liteinst"] {
+        for backend in ["ptrace", "dbt", "liteinst"] {
             let verify = Command::new("timeout")
                 .args(["--kill-after", "5s", "90s"])
                 .arg(env!("CARGO_BIN_EXE_hermit"))

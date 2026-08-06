@@ -13,7 +13,7 @@
  * range [first, last] in one syscall. It is a pure file-descriptor-table
  * operation: its effect is a deterministic function of which descriptors the
  * process itself opened, with no dependence on time, scheduling, pid, or host
- * identity. Detcore forwards it on the ptrace and DBI backends, so both must
+ * identity. Detcore forwards it on the ptrace and DBT backends, so both must
  * apply it identically.
  *
  * A single process opens one temporary file, then places four dups at known

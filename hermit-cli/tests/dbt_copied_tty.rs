@@ -11,23 +11,23 @@ use std::path::Path;
 use std::process::Command;
 
 #[test]
-fn copied_child_tiocgpgrp_verifies_under_dbi_strict() {
+fn copied_child_tiocgpgrp_verifies_under_dbt_strict() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbi-copied-tiocgpgrp");
-    fs::create_dir_all(&build_root).expect("failed to create DBI TIOCGPGRP guest directory");
-    let guest = build_root.join("dbi_copied_tiocgpgrp");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-copied-tiocgpgrp");
+    fs::create_dir_all(&build_root).expect("failed to create DBT TIOCGPGRP guest directory");
+    let guest = build_root.join("dbt_copied_tiocgpgrp");
     let compile = Command::new("cc")
         .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
-        .arg(repository.join("tests/c/dbi_copied_tiocgpgrp.c"))
+        .arg(repository.join("tests/c/dbt_copied_tiocgpgrp.c"))
         .arg("-o")
         .arg(&guest)
         .output()
-        .expect("failed to compile DBI TIOCGPGRP guest");
+        .expect("failed to compile DBT TIOCGPGRP guest");
     assert!(
         compile.status.success(),
-        "DBI TIOCGPGRP guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+        "DBT TIOCGPGRP guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&compile.stdout),
         String::from_utf8_lossy(&compile.stderr),
     );
@@ -38,7 +38,7 @@ fn copied_child_tiocgpgrp_verifies_under_dbi_strict() {
         .args([
             "--log=info",
             "run",
-            "--backend=dbi",
+            "--backend=dbt",
             "--strict",
             "--verify",
             "--base-env=minimal",
@@ -46,16 +46,16 @@ fn copied_child_tiocgpgrp_verifies_under_dbi_strict() {
         ])
         .arg(&guest)
         .output()
-        .expect("failed to run DBI TIOCGPGRP guest");
+        .expect("failed to run DBT TIOCGPGRP guest");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "DBI copied-child TIOCGPGRP verification failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "DBT copied-child TIOCGPGRP verification failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    assert_eq!(stdout, "dbi-copied-tiocgpgrp-ok\n");
+    assert_eq!(stdout, "dbt-copied-tiocgpgrp-ok\n");
     assert!(
         stderr.contains("Determinism verified"),
-        "DBI verification omitted its success marker:\n{stderr}"
+        "DBT verification omitted its success marker:\n{stderr}"
     );
 }

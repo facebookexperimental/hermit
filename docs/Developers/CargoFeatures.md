@@ -18,21 +18,21 @@ All Hermit-local features belong to the `hermit` package and are declared in
 | Feature | Default | What it gates |
 | --- | --- | --- |
 | `default` | On, empty | Enables no optional backend. |
-| `dbi` | Off | Optional `detcore-dbi` and `reverie-dbi` dependencies plus DBI dispatch, runtime callbacks, tests, and imports. |
+| `dbt` | Off | Optional `detcore-dbt` and `reverie-dbt` dependencies plus DBT dispatch, runtime callbacks, tests, and imports. |
 | `sabre` | Off | SaBRe runtime availability and its enabled-path test. The external loader and plugin are staged separately. |
 | `e9patch` | Off | e9patch runtime availability. The preprocessing module remains compiled because it shares parser and instruction-map machinery with core code. |
-| `third-party-backends` | Off | Aggregate enabling `dbi`, `sabre`, and `e9patch`; it has no direct source cfg. |
+| `third-party-backends` | Off | Aggregate enabling `dbt`, `sabre`, and `e9patch`; it has no direct source cfg. |
 
 The workspace's
 [`default-members`](https://github.com/rrnewton/hermit/blob/065980ea661f9d5e84b4fbaa0c69f4a4f69a81a9/Cargo.toml)
-exclude `detcore-dbi`, `detcore-sabre`, and `hermit-install`. The default Cargo
+exclude `detcore-dbt`, `detcore-sabre`, and `hermit-install`. The default Cargo
 build therefore remains the lean release configuration.
 
 ## Reverie Features
 
 | Crate | Feature | Default | What it gates |
 | --- | --- | --- | --- |
-| [`reverie-dbi`](https://github.com/rrnewton/reverie/blob/37f04b7661a4f77955ba2fce7d3c9e8f1886631d/reverie-dbi/Cargo.toml) | `prototype-runtime` | On | The bundled prototype runtime and its exported callbacks. Hermit disables this default and supplies Detcore's runtime. |
+| [`reverie-dbt`](https://github.com/rrnewton/reverie/blob/37f04b7661a4f77955ba2fce7d3c9e8f1886631d/reverie-dbt/Cargo.toml) | `prototype-runtime` | On | The bundled prototype runtime and its exported callbacks. Hermit disables this default and supplies Detcore's runtime. |
 | [`reverie-e9patch`](https://github.com/rrnewton/reverie/blob/37f04b7661a4f77955ba2fce7d3c9e8f1886631d/reverie-e9patch/Cargo.toml) | `preload-constructor` | On | Automatic runtime installation from the shared library constructor. |
 | [`reverie-liteinst`](https://github.com/rrnewton/reverie/blob/37f04b7661a4f77955ba2fce7d3c9e8f1886631d/reverie-liteinst/Cargo.toml) | `preload-constructor` | On | Automatic LiteInst runtime installation. Hermit disables this default for its host-hybrid integration. |
 | [`reverie-preload`](https://github.com/rrnewton/reverie/blob/37f04b7661a4f77955ba2fce7d3c9e8f1886631d/reverie-preload/Cargo.toml) | `preload-constructor` | On | Automatic preload runtime installation. |
@@ -51,7 +51,7 @@ the repeated name is intentional rather than a shared feature.
 | `ptrace` | Yes | None | Host ptrace, namespaces, seccomp, and PMU when preemption is enabled. |
 | `kvm` | Yes | None | `/dev/kvm` and the KVM guest ABI. |
 | `liteinst` | Yes | None | Staged `libreverie_liteinst.so`; Hermit uses `reverie-liteinst` with its constructor default disabled. |
-| `dbi` | No | `dbi` | Staged DynamoRIO, native client, and `libdetcore_dbi.so`. |
+| `dbt` | No | `dbt` | Staged DynamoRIO, native client, and `libdetcore_dbt.so`. |
 | `sabre` | No | `sabre` | Staged SaBRe loader and `libdetcore_sabre.so`. |
 | `e9patch` | No | `e9patch` | Staged `e9tool` and `e9patch`; execution remains ptrace-backed preprocessing rather than a separate Detcore runtime. |
 
@@ -74,7 +74,7 @@ beside it, or change LiteInst to an embedded runtime.
 
 | Repository | Feature cfg occurrences | Result |
 | --- | --- | --- |
-| Hermit | `dbi`: 78; `sabre`: 3; `e9patch`: 2; aggregate: 0 | Every cfg names a declared leaf feature. All occurrences are confined to `hermit-cli`; no dead or contradictory feature name was found. |
+| Hermit | `dbt`: 78; `sabre`: 3; `e9patch`: 2; aggregate: 0 | Every cfg names a declared leaf feature. All occurrences are confined to `hermit-cli`; no dead or contradictory feature name was found. |
 | Reverie | `prototype-runtime`: 23; `preload-constructor`: 3; `coordinator-rpc`: 1; `nightly`: 2; `memory`: 1; `notifier`: 37 | Every cfg names a feature declared by its containing crate. Positive/negative pairs provide explicit enabled and disabled behavior where required. |
 
 Hermit's gates are in
@@ -83,7 +83,7 @@ and
 [`hermit-cli/src/bin/hermit/backends.rs`](https://github.com/rrnewton/hermit/blob/065980ea661f9d5e84b4fbaa0c69f4a4f69a81a9/hermit-cli/src/bin/hermit/backends.rs).
 Reverie's gates are confined to the six feature-declaring crates listed above;
 the largest groups are
-[`reverie-dbi/src/lib.rs`](https://github.com/rrnewton/reverie/blob/37f04b7661a4f77955ba2fce7d3c9e8f1886631d/reverie-dbi/src/lib.rs)
+[`reverie-dbt/src/lib.rs`](https://github.com/rrnewton/reverie/blob/37f04b7661a4f77955ba2fce7d3c9e8f1886631d/reverie-dbt/src/lib.rs)
 and
 [`safeptrace/src`](https://github.com/rrnewton/reverie/tree/37f04b7661a4f77955ba2fce7d3c9e8f1886631d/safeptrace/src).
 
@@ -101,8 +101,8 @@ behave differently.
    developer policy in `make`, not by changing the published crate defaults.
 3. Keep both no-feature and `third-party-backends` builds in CI. Also retain
    independent leaf-feature checks so accidental coupling is detected.
-4. Continue setting `default-features = false` on Hermit's `reverie-dbi` and
-   `reverie-liteinst` dependencies; Hermit supplies the Detcore DBI runtime and
+4. Continue setting `default-features = false` on Hermit's `reverie-dbt` and
+   `reverie-liteinst` dependencies; Hermit supplies the Detcore DBT runtime and
    controls LiteInst activation itself.
 5. Treat `sabre` and `e9patch` as availability gates, not complete module
    elimination. Gate more code only after measuring binary-size benefit and

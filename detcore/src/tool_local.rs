@@ -2818,7 +2818,7 @@ fn thread_rng_from_parent_entropy_labeled(
     parent.clone().fill_bytes(seed.as_mut());
     detlog!("RNG {} Generated new seed {:?}", msg, seed);
     // Pcg64Mcg forces its internal state odd, so seed bit zero carries no
-    // entropy. DBI uses 96 bits for a stable process/thread sequence; mix those
+    // entropy. DBT uses 96 bits for a stable process/thread sequence; mix those
     // bytes after the forced bit while retaining the existing DetTid layout.
     let entropy_bytes = entropy.to_le_bytes();
     for (seed_byte, entropy_byte) in seed[4..].iter_mut().zip(entropy_bytes) {

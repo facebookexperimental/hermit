@@ -21,14 +21,14 @@ use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
-static DBI_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
-static DBI_EXEC_FAILURE_GUEST: OnceLock<PathBuf> = OnceLock::new();
-static DBI_EXECVEAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
-static DBI_PID_GUEST: OnceLock<PathBuf> = OnceLock::new();
-static DBI_PRLIMIT_SELF_GUEST: OnceLock<PathBuf> = OnceLock::new();
-static DBI_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
-static DBI_UNSUPPORTED_SYSCALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
-static DBI_SELF_SIGQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DBT_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DBT_EXEC_FAILURE_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DBT_EXECVEAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DBT_PID_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DBT_PRLIMIT_SELF_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DBT_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DBT_UNSUPPORTED_SYSCALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DBT_SELF_SIGQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
@@ -83,24 +83,24 @@ fn liteinst_inert_runtime() -> &'static Path {
     })
 }
 
-fn dbi_mmap_guest() -> &'static Path {
-    DBI_MMAP_GUEST.get_or_init(|| {
+fn dbt_mmap_guest() -> &'static Path {
+    DBT_MMAP_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbi-mmap");
-        fs::create_dir_all(&build_root).expect("failed to create DBI mmap guest directory");
-        let guest = build_root.join("dbi_mmap_exec");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-mmap");
+        fs::create_dir_all(&build_root).expect("failed to create DBT mmap guest directory");
+        let guest = build_root.join("dbt_mmap_exec");
         let output = Command::new("cc")
             .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
-            .arg(repository.join("tests/c/dbi_mmap_exec.c"))
+            .arg(repository.join("tests/c/dbt_mmap_exec.c"))
             .arg("-o")
             .arg(&guest)
             .output()
-            .expect("failed to compile DBI mmap guest");
+            .expect("failed to compile DBT mmap guest");
         assert!(
             output.status.success(),
-            "DBI mmap guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            "DBT mmap guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -108,24 +108,24 @@ fn dbi_mmap_guest() -> &'static Path {
     })
 }
 
-fn dbi_exec_failure_guest() -> &'static Path {
-    DBI_EXEC_FAILURE_GUEST.get_or_init(|| {
+fn dbt_exec_failure_guest() -> &'static Path {
+    DBT_EXEC_FAILURE_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbi-exec-failure");
-        fs::create_dir_all(&build_root).expect("failed to create DBI exec-failure guest directory");
-        let guest = build_root.join("dbi_exec_failure");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-exec-failure");
+        fs::create_dir_all(&build_root).expect("failed to create DBT exec-failure guest directory");
+        let guest = build_root.join("dbt_exec_failure");
         let output = Command::new("cc")
             .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
-            .arg(repository.join("tests/c/dbi_exec_failure.c"))
+            .arg(repository.join("tests/c/dbt_exec_failure.c"))
             .arg("-o")
             .arg(&guest)
             .output()
-            .expect("failed to compile DBI exec-failure guest");
+            .expect("failed to compile DBT exec-failure guest");
         assert!(
             output.status.success(),
-            "DBI exec-failure guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            "DBT exec-failure guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -133,24 +133,24 @@ fn dbi_exec_failure_guest() -> &'static Path {
     })
 }
 
-fn dbi_execveat_guest() -> &'static Path {
-    DBI_EXECVEAT_GUEST.get_or_init(|| {
+fn dbt_execveat_guest() -> &'static Path {
+    DBT_EXECVEAT_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbi-execveat");
-        fs::create_dir_all(&build_root).expect("failed to create DBI execveat guest directory");
-        let guest = build_root.join("dbi_execveat_unsupported");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-execveat");
+        fs::create_dir_all(&build_root).expect("failed to create DBT execveat guest directory");
+        let guest = build_root.join("dbt_execveat_unsupported");
         let output = Command::new("cc")
             .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
-            .arg(repository.join("tests/c/dbi_execveat_unsupported.c"))
+            .arg(repository.join("tests/c/dbt_execveat_unsupported.c"))
             .arg("-o")
             .arg(&guest)
             .output()
-            .expect("failed to compile DBI execveat guest");
+            .expect("failed to compile DBT execveat guest");
         assert!(
             output.status.success(),
-            "DBI execveat guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            "DBT execveat guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -158,24 +158,24 @@ fn dbi_execveat_guest() -> &'static Path {
     })
 }
 
-fn dbi_wait_guest() -> &'static Path {
-    DBI_WAIT_GUEST.get_or_init(|| {
+fn dbt_wait_guest() -> &'static Path {
+    DBT_WAIT_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbi-wait");
-        fs::create_dir_all(&build_root).expect("failed to create DBI wait guest directory");
-        let guest = build_root.join("dbi_wait_lifecycle");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-wait");
+        fs::create_dir_all(&build_root).expect("failed to create DBT wait guest directory");
+        let guest = build_root.join("dbt_wait_lifecycle");
         let output = Command::new("cc")
             .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
-            .arg(repository.join("tests/c/dbi_wait_lifecycle.c"))
+            .arg(repository.join("tests/c/dbt_wait_lifecycle.c"))
             .arg("-o")
             .arg(&guest)
             .output()
-            .expect("failed to compile DBI wait guest");
+            .expect("failed to compile DBT wait guest");
         assert!(
             output.status.success(),
-            "DBI wait guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            "DBT wait guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -183,52 +183,25 @@ fn dbi_wait_guest() -> &'static Path {
     })
 }
 
-// TODO-HUMAN-REVIEW(PR-723): Review the DBI PID fixture build.
-fn dbi_pid_guest() -> &'static Path {
-    DBI_PID_GUEST.get_or_init(|| {
+// TODO-HUMAN-REVIEW(PR-723): Review the DBT PID fixture build.
+fn dbt_pid_guest() -> &'static Path {
+    DBT_PID_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbi-pid");
-        fs::create_dir_all(&build_root).expect("failed to create DBI PID guest directory");
-        let guest = build_root.join("dbi_pid_virtualization");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-pid");
+        fs::create_dir_all(&build_root).expect("failed to create DBT PID guest directory");
+        let guest = build_root.join("dbt_pid_virtualization");
         let output = Command::new("cc")
             .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
-            .arg(repository.join("tests/c/dbi_pid_virtualization.c"))
+            .arg(repository.join("tests/c/dbt_pid_virtualization.c"))
             .arg("-o")
             .arg(&guest)
             .output()
-            .expect("failed to compile DBI PID guest");
+            .expect("failed to compile DBT PID guest");
         assert!(
             output.status.success(),
-            "DBI PID guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        guest
-    })
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-1065): Review DBI self-prlimit fixture coverage.
-fn dbi_prlimit_self_guest() -> &'static Path {
-    DBI_PRLIMIT_SELF_GUEST.get_or_init(|| {
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbi-prlimit-self");
-        fs::create_dir_all(&build_root).expect("failed to create DBI self-prlimit guest directory");
-        let guest = build_root.join("dbi_prlimit_self");
-        let output = Command::new("cc")
-            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
-            .arg(repository.join("tests/c/dbi_prlimit_self.c"))
-            .arg("-o")
-            .arg(&guest)
-            .output()
-            .expect("failed to compile DBI self-prlimit guest");
-        assert!(
-            output.status.success(),
-            "DBI self-prlimit guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            "DBT PID guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -237,26 +210,25 @@ fn dbi_prlimit_self_guest() -> &'static Path {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-644): Review the DBI unsupported-syscall fixture build.
-fn dbi_unsupported_syscall_guest() -> &'static Path {
-    DBI_UNSUPPORTED_SYSCALL_GUEST.get_or_init(|| {
+// TODO-HUMAN-REVIEW(PR-1065): Review DBT self-prlimit fixture coverage.
+fn dbt_prlimit_self_guest() -> &'static Path {
+    DBT_PRLIMIT_SELF_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbi-unsupported-syscall");
-        fs::create_dir_all(&build_root)
-            .expect("failed to create DBI unsupported-syscall guest directory");
-        let guest = build_root.join("dbi_unsupported_syscall");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-prlimit-self");
+        fs::create_dir_all(&build_root).expect("failed to create DBT self-prlimit guest directory");
+        let guest = build_root.join("dbt_prlimit_self");
         let output = Command::new("cc")
             .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
-            .arg(repository.join("tests/c/dbi_unsupported_syscall.c"))
+            .arg(repository.join("tests/c/dbt_prlimit_self.c"))
             .arg("-o")
             .arg(&guest)
             .output()
-            .expect("failed to compile DBI unsupported-syscall guest");
+            .expect("failed to compile DBT self-prlimit guest");
         assert!(
             output.status.success(),
-            "DBI unsupported-syscall guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            "DBT self-prlimit guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -264,26 +236,54 @@ fn dbi_unsupported_syscall_guest() -> &'static Path {
     })
 }
 
-// TODO-HUMAN-REVIEW(PR-1038): Review the DBI self-signal fixture build.
-fn dbi_self_sigqueue_guest() -> &'static Path {
-    DBI_SELF_SIGQUEUE_GUEST.get_or_init(|| {
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-644): Review the DBT unsupported-syscall fixture build.
+fn dbt_unsupported_syscall_guest() -> &'static Path {
+    DBT_UNSUPPORTED_SYSCALL_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbi-self-sigqueue");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-unsupported-syscall");
         fs::create_dir_all(&build_root)
-            .expect("failed to create DBI self-sigqueue guest directory");
-        let guest = build_root.join("dbi_self_sigqueue");
+            .expect("failed to create DBT unsupported-syscall guest directory");
+        let guest = build_root.join("dbt_unsupported_syscall");
         let output = Command::new("cc")
             .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
-            .arg(repository.join("tests/c/dbi_self_sigqueue.c"))
+            .arg(repository.join("tests/c/dbt_unsupported_syscall.c"))
             .arg("-o")
             .arg(&guest)
             .output()
-            .expect("failed to compile DBI self-sigqueue guest");
+            .expect("failed to compile DBT unsupported-syscall guest");
         assert!(
             output.status.success(),
-            "DBI self-sigqueue guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            "DBT unsupported-syscall guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+// TODO-HUMAN-REVIEW(PR-1038): Review the DBT self-signal fixture build.
+fn dbt_self_sigqueue_guest() -> &'static Path {
+    DBT_SELF_SIGQUEUE_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-self-sigqueue");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create DBT self-sigqueue guest directory");
+        let guest = build_root.join("dbt_self_sigqueue");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/dbt_self_sigqueue.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile DBT self-sigqueue guest");
+        assert!(
+            output.status.success(),
+            "DBT self-sigqueue guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -443,7 +443,7 @@ fn run_rejects_unknown_backends_during_argument_parsing() {
         stderr.contains("invalid value 'unknown'"),
         "unexpected error:\n{stderr}"
     );
-    for backend in ["ptrace", "dbi", "kvm"] {
+    for backend in ["ptrace", "dbt", "kvm"] {
         assert!(
             stderr.contains(backend),
             "missing {backend:?} in:\n{stderr}"
@@ -452,60 +452,60 @@ fn run_rejects_unknown_backends_during_argument_parsing() {
 }
 
 #[test]
-fn run_dbi_executes_integrated_backend() {
-    let args = ["run", "--backend", "dbi", "--", "/bin/true"];
+fn run_dbt_executes_integrated_backend() {
+    let args = ["run", "--backend", "dbt", "--", "/bin/true"];
     let output = hermit(&args);
     assert_success(&output, &args);
 }
 
 #[test]
-fn run_dbi_uses_the_requested_guest_environment() {
+fn run_dbt_uses_the_requested_guest_environment() {
     let args = [
         "run",
         "--backend",
-        "dbi",
+        "dbt",
         "--strict",
         "--base-env=empty",
-        "--env=DBI_GUEST_ONLY=present",
+        "--env=DBT_GUEST_ONLY=present",
         "--",
         "/usr/bin/env",
     ];
     let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .env("DBI_HOST_ONLY", "must-not-leak")
+        .env("DBT_HOST_ONLY", "must-not-leak")
         .args(args)
         .output()
-        .expect("failed to run DBI environment regression");
+        .expect("failed to run DBT environment regression");
 
     assert_success(&output, &args);
     let stdout = stdout(&output);
     assert!(
-        stdout.lines().any(|line| line == "DBI_GUEST_ONLY=present"),
-        "DBI guest environment omitted the requested value:\n{stdout}",
+        stdout.lines().any(|line| line == "DBT_GUEST_ONLY=present"),
+        "DBT guest environment omitted the requested value:\n{stdout}",
     );
     assert!(
         !stdout
             .lines()
-            .any(|line| line.starts_with("DBI_HOST_ONLY=")),
-        "DBI guest inherited a host-only value:\n{stdout}",
+            .any(|line| line.starts_with("DBT_HOST_ONLY=")),
+        "DBT guest inherited a host-only value:\n{stdout}",
     );
 }
 
 #[test]
-fn run_dbi_verifies_simple_env_shebang() {
+fn run_dbt_verifies_simple_env_shebang() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-        .expect("failed to create DBI env-shebang test directory");
+        .expect("failed to create DBT env-shebang test directory");
     let script = directory.path().join("env-echo");
     fs::write(&script, b"#!/usr/bin/env echo\n")
-        .expect("failed to write DBI env-shebang test script");
+        .expect("failed to write DBT env-shebang test script");
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
-        .expect("failed to mark DBI env-shebang test script executable");
+        .expect("failed to mark DBT env-shebang test script executable");
     let program = script
         .to_str()
-        .expect("DBI env-shebang test path should be UTF-8");
+        .expect("DBT env-shebang test path should be UTF-8");
     let args = [
         "run",
         "--backend",
-        "dbi",
+        "dbt",
         "--strict",
         "--verify",
         "--",
@@ -518,7 +518,7 @@ fn run_dbi_verifies_simple_env_shebang() {
     assert_eq!(stdout(&output), format!("{}\n", script.display()));
     assert!(
         stderr(&output).contains(":: Success: deterministic. Determinism verified."),
-        "DBI determinism confirmation missing:\n{}",
+        "DBT determinism confirmation missing:\n{}",
         stderr(&output),
     );
 }
@@ -529,12 +529,12 @@ fn run_dbi_verifies_simple_env_shebang() {
 // lone remaining Unsupported syscall. Under ptrace it is consumed by reverie's
 // syscall-restart machinery before Detcore classification, so it never surfaces
 // as a guest aggregate "used but not yet supported" warning. The ptrace verify
-// path therefore emits zero such warnings for this fixture; the DBI backend
+// path therefore emits zero such warnings for this fixture; the DBT backend
 // (which routes it through Detcore classification) still aggregates it, covered
-// by run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them.
+// by run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them.
 #[test]
 fn run_ptrace_verify_emits_no_unsupported_syscall_warning() {
-    let program = dbi_unsupported_syscall_guest()
+    let program = dbt_unsupported_syscall_guest()
         .to_str()
         .expect("unsupported-syscall guest path should be UTF-8");
     let args = ["--log", "info", "run", "--verify", "--", program];
@@ -549,17 +549,17 @@ fn run_ptrace_verify_emits_no_unsupported_syscall_warning() {
     );
 }
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-644): Review DBI normal aggregation and strict failure coverage.
+// TODO-HUMAN-REVIEW(PR-644): Review DBT normal aggregation and strict failure coverage.
 #[test]
-fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
-    let program = dbi_unsupported_syscall_guest()
+fn run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them() {
+    let program = dbt_unsupported_syscall_guest()
         .to_str()
-        .expect("DBI unsupported-syscall guest path should be UTF-8");
+        .expect("DBT unsupported-syscall guest path should be UTF-8");
 
-    let normal_args = ["run", "--backend", "dbi", "--verify", "--", program];
+    let normal_args = ["run", "--backend", "dbt", "--verify", "--", program];
     let normal = hermit(&normal_args);
     assert_success(&normal, &normal_args);
-    assert_eq!(stdout(&normal), "dbi-unsupported-ok\n");
+    assert_eq!(stdout(&normal), "dbt-unsupported-ok\n");
     let normal_stderr = stderr(&normal);
     let warning = "syscalls restart_syscall used but not yet supported";
     assert_eq!(
@@ -568,10 +568,10 @@ fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         "expected one aggregate warning:\n{normal_stderr}"
     );
 
-    let tamper_args = ["run", "--backend", "dbi", "--", program, "report-tamper"];
+    let tamper_args = ["run", "--backend", "dbt", "--", program, "report-tamper"];
     let tamper = hermit(&tamper_args);
     assert_success(&tamper, &tamper_args);
-    assert_eq!(stdout(&tamper), "dbi-unsupported-report-tamper-ok\n");
+    assert_eq!(stdout(&tamper), "dbt-unsupported-report-tamper-ok\n");
     assert_eq!(
         stderr(&tamper).matches(warning).count(),
         1,
@@ -582,7 +582,7 @@ fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
     let fork_tamper_args = [
         "run",
         "--backend",
-        "dbi",
+        "dbt",
         "--",
         program,
         "fork-report-tamper",
@@ -591,7 +591,7 @@ fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
     assert_success(&fork_tamper, &fork_tamper_args);
     assert_eq!(
         stdout(&fork_tamper),
-        "dbi-unsupported-fork-report-tamper-ok\n"
+        "dbt-unsupported-fork-report-tamper-ok\n"
     );
     assert_eq!(
         stderr(&fork_tamper).matches(warning).count(),
@@ -600,22 +600,22 @@ fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         stderr(&fork_tamper)
     );
 
-    let strict_args = ["run", "--backend", "dbi", "--strict", "--", program];
+    let strict_args = ["run", "--backend", "dbt", "--strict", "--", program];
     let strict = hermit(&strict_args);
     assert!(
         !strict.status.success(),
-        "strict DBI unexpectedly succeeded:\n{}",
+        "strict DBT unexpectedly succeeded:\n{}",
         stderr(&strict)
     );
     assert!(
         stderr(&strict).contains("unsupported syscall: restart_syscall"),
-        "strict DBI failure omitted unsupported syscall:\n{}",
+        "strict DBT failure omitted unsupported syscall:\n{}",
         stderr(&strict)
     );
-    let normal_fork_args = ["run", "--backend", "dbi", "--verify", "--", program, "fork"];
+    let normal_fork_args = ["run", "--backend", "dbt", "--verify", "--", program, "fork"];
     let normal_fork = hermit(&normal_fork_args);
     assert_success(&normal_fork, &normal_fork_args);
-    assert_eq!(stdout(&normal_fork), "dbi-unsupported-fork-ok\n");
+    assert_eq!(stdout(&normal_fork), "dbt-unsupported-fork-ok\n");
     assert_eq!(
         stderr(&normal_fork).matches(warning).count(),
         1,
@@ -626,7 +626,7 @@ fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
     let normal_fork_exec_args = [
         "run",
         "--backend",
-        "dbi",
+        "dbt",
         "--verify",
         "--",
         program,
@@ -636,7 +636,7 @@ fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
     assert_success(&normal_fork_exec, &normal_fork_exec_args);
     assert_eq!(
         stdout(&normal_fork_exec),
-        "dbi-unsupported-exec-ok\ndbi-unsupported-fork-exec-parent-ok\n"
+        "dbt-unsupported-exec-ok\ndbt-unsupported-fork-exec-parent-ok\n"
     );
     assert_eq!(
         stderr(&normal_fork_exec).matches(warning).count(),
@@ -646,47 +646,47 @@ fn run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them() {
     );
 
     for mode in ["fork", "fork-exec", "fork-setsid-exec", "exec-empty"] {
-        let args = ["run", "--backend", "dbi", "--strict", "--", program, mode];
+        let args = ["run", "--backend", "dbt", "--strict", "--", program, mode];
         let output = hermit(&args);
         assert!(
             !output.status.success(),
-            "strict DBI {mode} unexpectedly succeeded:\n{}",
+            "strict DBT {mode} unexpectedly succeeded:\n{}",
             stderr(&output)
         );
         assert!(
             stderr(&output).contains("unsupported syscall"),
-            "strict DBI {mode} omitted unsupported-syscall diagnostic:\n{}",
+            "strict DBT {mode} omitted unsupported-syscall diagnostic:\n{}",
             stderr(&output)
         );
     }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-644): Review strict DBI teardown with a blocked stdin source.
+// TODO-HUMAN-REVIEW(PR-644): Review strict DBT teardown with a blocked stdin source.
 #[test]
-fn run_dbi_strict_returns_with_blocked_stdin_source() {
-    let program = dbi_unsupported_syscall_guest()
+fn run_dbt_strict_returns_with_blocked_stdin_source() {
+    let program = dbt_unsupported_syscall_guest()
         .to_str()
-        .expect("DBI unsupported-syscall guest path should be UTF-8");
+        .expect("DBT unsupported-syscall guest path should be UTF-8");
     let mut source = Command::new("sleep")
         .arg("30")
         .stdout(Stdio::piped())
         .spawn()
-        .expect("failed to start blocked DBI stdin source");
-    let args = ["run", "--backend", "dbi", "--strict", "--", program];
+        .expect("failed to start blocked DBT stdin source");
+    let args = ["run", "--backend", "dbt", "--strict", "--", program];
     let output = Command::new("timeout")
         .args(["--kill-after", "2s", "10s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args(args)
         .stdin(source.stdout.take().expect("sleep stdout was not piped"))
         .output()
-        .expect("failed to run strict DBI blocked-input regression");
+        .expect("failed to run strict DBT blocked-input regression");
     let _ = source.kill();
     let _ = source.wait();
-    assert_ne!(output.status.code(), Some(124), "strict DBI hung on stdin");
+    assert_ne!(output.status.code(), Some(124), "strict DBT hung on stdin");
     assert!(
         !output.status.success(),
-        "strict DBI unexpectedly succeeded"
+        "strict DBT unexpectedly succeeded"
     );
     assert!(stderr(&output).contains("unsupported syscall"));
 }
@@ -793,14 +793,14 @@ fn run_liteinst_rejects_an_inert_dso_before_activation_claim() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#679): validate the dedicated DBI diagnostic channel.
+// TODO-HUMAN-REVIEW(#679): validate the dedicated DBT diagnostic channel.
 #[test]
-fn run_dbi_keeps_diagnostics_out_of_guest_stderr() {
+fn run_dbt_keeps_diagnostics_out_of_guest_stderr() {
     let script = r#"set -euo pipefail; output=$(/bin/sh -c 'printf guest-stderr >&2' 2>&1); test "$output" = guest-stderr; printf 'isolated=%s\n' "$output""#;
     let args = [
         "run",
         "--backend",
-        "dbi",
+        "dbt",
         "--strict",
         "--verify",
         "--",
@@ -813,20 +813,20 @@ fn run_dbi_keeps_diagnostics_out_of_guest_stderr() {
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "isolated=guest-stderr\n");
     assert!(
-        stderr(&output).contains(":: DBI path confirmed: DynamoRIO client reported tool=Detcore"),
-        "DBI confirmation missing:\n{}",
+        stderr(&output).contains(":: DBT path confirmed: DynamoRIO client reported tool=Detcore"),
+        "DBT confirmation missing:\n{}",
         stderr(&output),
     );
 }
 
 #[test]
-fn run_dbi_forwards_detcore_info_logs() {
+fn run_dbt_forwards_detcore_info_logs() {
     let args = [
         "--log",
         "INFO",
         "run",
         "--backend",
-        "dbi",
+        "dbt",
         "--strict",
         "--",
         "/bin/true",
@@ -837,20 +837,20 @@ fn run_dbi_forwards_detcore_info_logs() {
     let stderr = stderr(&output);
     assert!(
         stderr.contains("INFO detcore") && stderr.contains("DETLOG [syscall]"),
-        "DBI did not forward the Detcore INFO syscall stream:\n{stderr}",
+        "DBT did not forward the Detcore INFO syscall stream:\n{stderr}",
     );
 }
 
-// TODO-HUMAN-REVIEW(PR-1038): Review DBI queued self-signal verification.
+// TODO-HUMAN-REVIEW(PR-1038): Review DBT queued self-signal verification.
 #[test]
-fn run_dbi_verifies_queued_self_signals() {
-    let program = dbi_self_sigqueue_guest()
+fn run_dbt_verifies_queued_self_signals() {
+    let program = dbt_self_sigqueue_guest()
         .to_str()
-        .expect("DBI self-sigqueue guest path should be UTF-8");
+        .expect("DBT self-sigqueue guest path should be UTF-8");
     let args = [
         "run",
         "--backend",
-        "dbi",
+        "dbt",
         "--strict",
         "--verify",
         "--",
@@ -859,41 +859,41 @@ fn run_dbi_verifies_queued_self_signals() {
     let output = hermit(&args);
 
     assert_success(&output, &args);
-    assert_eq!(stdout(&output), "dbi-self-sigqueue-ok\n");
+    assert_eq!(stdout(&output), "dbt-self-sigqueue-ok\n");
     assert!(
         stderr(&output).contains(":: Success: deterministic. Determinism verified."),
-        "DBI determinism confirmation missing:\n{}",
+        "DBT determinism confirmation missing:\n{}",
         stderr(&output),
     );
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#543): validate the explicit application-mmap DBI regression.
+// TODO-HUMAN-REVIEW(#543): validate the explicit application-mmap DBT regression.
 #[test]
-fn run_dbi_verifies_application_mmap() {
-    let program = dbi_mmap_guest()
+fn run_dbt_verifies_application_mmap() {
+    let program = dbt_mmap_guest()
         .to_str()
-        .expect("DBI mmap guest path should be UTF-8");
-    let args = ["run", "--backend", "dbi", "--verify", "--", program];
+        .expect("DBT mmap guest path should be UTF-8");
+    let args = ["run", "--backend", "dbt", "--verify", "--", program];
     let output = hermit(&args);
     assert_success(&output, &args);
-    assert_eq!(stdout(&output), "dbi-mmap-exec-ok\n");
+    assert_eq!(stdout(&output), "dbt-mmap-exec-ok\n");
     assert!(
-        stderr(&output).contains(":: DBI path confirmed: DynamoRIO client reported tool=Detcore"),
-        "DBI confirmation missing:\n{}",
+        stderr(&output).contains(":: DBT path confirmed: DynamoRIO client reported tool=Detcore"),
+        "DBT confirmation missing:\n{}",
         stderr(&output),
     );
 }
 
 #[test]
-fn run_dbi_verifies_process_wait_lifecycle() {
-    let program = dbi_wait_guest()
+fn run_dbt_verifies_process_wait_lifecycle() {
+    let program = dbt_wait_guest()
         .to_str()
-        .expect("DBI wait guest path should be UTF-8");
+        .expect("DBT wait guest path should be UTF-8");
     let args = [
         "run",
         "--backend",
-        "dbi",
+        "dbt",
         "--strict",
         "--verify",
         "--",
@@ -908,22 +908,22 @@ fn run_dbi_verifies_process_wait_lifecycle() {
     );
     assert!(
         stderr(&output).contains(":: Success: deterministic. Determinism verified."),
-        "DBI determinism confirmation missing:\n{}",
+        "DBT determinism confirmation missing:\n{}",
         stderr(&output),
     );
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-723): Review DBI PID virtualization L2 coverage.
+// TODO-HUMAN-REVIEW(PR-723): Review DBT PID virtualization L2 coverage.
 #[test]
-fn run_dbi_virtualizes_process_identities() {
-    let program = dbi_pid_guest()
+fn run_dbt_virtualizes_process_identities() {
+    let program = dbt_pid_guest()
         .to_str()
-        .expect("DBI PID guest path should be UTF-8");
+        .expect("DBT PID guest path should be UTF-8");
     let args = [
         "run",
         "--backend",
-        "dbi",
+        "dbt",
         "--strict",
         "--verify",
         "--",
@@ -952,22 +952,22 @@ fn run_dbi_virtualizes_process_identities() {
     );
     assert!(
         stderr(&output).contains(":: Success: deterministic. Determinism verified."),
-        "DBI determinism confirmation missing:\n{}",
+        "DBT determinism confirmation missing:\n{}",
         stderr(&output),
     );
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-1065): Review DBI self-prlimit L2 coverage.
+// TODO-HUMAN-REVIEW(PR-1065): Review DBT self-prlimit L2 coverage.
 #[test]
-fn run_dbi_verifies_self_prlimit() {
-    let program = dbi_prlimit_self_guest()
+fn run_dbt_verifies_self_prlimit() {
+    let program = dbt_prlimit_self_guest()
         .to_str()
-        .expect("DBI self-prlimit guest path should be UTF-8");
+        .expect("DBT self-prlimit guest path should be UTF-8");
     let args = [
         "run",
         "--backend",
-        "dbi",
+        "dbt",
         "--strict",
         "--verify",
         "--",
@@ -976,20 +976,20 @@ fn run_dbi_verifies_self_prlimit() {
     let output = hermit(&args);
 
     assert_success(&output, &args);
-    assert_eq!(stdout(&output), "dbi-prlimit-self-ok\n");
+    assert_eq!(stdout(&output), "dbt-prlimit-self-ok\n");
     assert!(
         stderr(&output).contains(":: Success: deterministic. Determinism verified."),
-        "DBI determinism confirmation missing:\n{}",
+        "DBT determinism confirmation missing:\n{}",
         stderr(&output),
     );
 }
 
 #[test]
-fn run_dbi_verifies_shell_process_lifecycle() {
+fn run_dbt_verifies_shell_process_lifecycle() {
     let args = [
         "run",
         "--backend",
-        "dbi",
+        "dbt",
         "--verify",
         "--",
         "/bin/sh",
@@ -1002,7 +1002,7 @@ fn run_dbi_verifies_shell_process_lifecycle() {
     assert_eq!(stdout(&output), "hello\n");
     assert!(
         stderr(&output).contains(":: Success: deterministic. Determinism verified."),
-        "DBI determinism confirmation missing:\n{}",
+        "DBT determinism confirmation missing:\n{}",
         stderr(&output),
     );
 }
@@ -1011,11 +1011,11 @@ fn run_dbi_verifies_shell_process_lifecycle() {
 // TODO-HUMAN-REVIEW(#598): Confirm this captures the host-inherited O_NONBLOCK regression.
 // TODO-HUMAN-REVIEW(#689): Confirm the split-write case protects partial-read semantics.
 #[test]
-fn run_dbi_verifies_pipe_backpressure() {
+fn run_dbt_verifies_pipe_backpressure() {
     let args = [
         "run",
         "--backend",
-        "dbi",
+        "dbt",
         "--verify",
         "--",
         "/bin/bash",
@@ -1028,20 +1028,20 @@ fn run_dbi_verifies_pipe_backpressure() {
     assert_eq!(stdout(&output), "5467\n");
     assert!(
         stderr(&output).contains(":: Success: deterministic. Determinism verified."),
-        "DBI determinism confirmation missing:\n{}",
+        "DBT determinism confirmation missing:\n{}",
         stderr(&output),
     );
 }
 
 #[test]
-fn run_dbi_recovers_after_failed_exec() {
-    let program = dbi_exec_failure_guest()
+fn run_dbt_recovers_after_failed_exec() {
+    let program = dbt_exec_failure_guest()
         .to_str()
-        .expect("DBI exec-failure guest path should be UTF-8");
+        .expect("DBT exec-failure guest path should be UTF-8");
     let args = [
         "run",
         "--backend",
-        "dbi",
+        "dbt",
         "--strict",
         "--verify",
         "--",
@@ -1053,19 +1053,19 @@ fn run_dbi_recovers_after_failed_exec() {
     assert_eq!(stdout(&output), "recovered after failed exec\n");
     assert!(
         stderr(&output).contains(":: Success: deterministic. Determinism verified."),
-        "DBI determinism confirmation missing:\n{}",
+        "DBT determinism confirmation missing:\n{}",
         stderr(&output),
     );
 }
 #[test]
-fn run_dbi_rejects_unfollowed_execveat() {
-    let program = dbi_execveat_guest()
+fn run_dbt_rejects_unfollowed_execveat() {
+    let program = dbt_execveat_guest()
         .to_str()
-        .expect("DBI execveat guest path should be UTF-8");
+        .expect("DBT execveat guest path should be UTF-8");
     let args = [
         "run",
         "--backend",
-        "dbi",
+        "dbt",
         "--strict",
         "--verify",
         "--",
@@ -1080,7 +1080,7 @@ fn run_dbi_rejects_unfollowed_execveat() {
     );
     assert!(
         stderr(&output).contains(":: Success: deterministic. Determinism verified."),
-        "DBI determinism confirmation missing:\n{}",
+        "DBT determinism confirmation missing:\n{}",
         stderr(&output),
     );
 }
@@ -1735,7 +1735,7 @@ fn run_kvm_reports_fixed_supplementary_groups() {
 
 #[test]
 fn namespace_only_rejects_every_explicit_backend() {
-    for backend in ["ptrace", "dbi", "kvm"] {
+    for backend in ["ptrace", "dbt", "kvm"] {
         let args = [
             "run",
             "--backend",
@@ -1761,11 +1761,11 @@ fn namespace_only_rejects_every_explicit_backend() {
 #[test]
 fn backend_accepted_in_global_position() {
     // The global-position `--backend` (before the subcommand) must be threaded
-    // through to `run` and reach the integrated DBI backend.
-    let dbi_args = ["--backend", "dbi", "run", "--", "/bin/true"];
-    let dbi = hermit(&dbi_args);
+    // through to `run` and reach the integrated DBT backend.
+    let dbt_args = ["--backend", "dbt", "run", "--", "/bin/true"];
+    let dbt = hermit(&dbt_args);
 
-    assert_success(&dbi, &dbi_args);
+    assert_success(&dbt, &dbt_args);
 
     if Path::new("/dev/kvm").exists() {
         let args = ["--backend", "kvm", "run", "--", "/bin/true"];

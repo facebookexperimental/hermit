@@ -104,7 +104,7 @@ scripts/hermit-code-coverage.rs diff \
 
 Compare exact normalized covered line and region sets. Equal percentages are
 not evidence of equal coverage. Repeat collection for every claimed backend;
-coverage under ptrace does not prove coverage under KVM, DBI, SaBRe, or
+coverage under ptrace does not prove coverage under KVM, DBT, SaBRe, or
 LiteInst.
 
 Derive sorted syscall and event-class sets from the same logging mode for both

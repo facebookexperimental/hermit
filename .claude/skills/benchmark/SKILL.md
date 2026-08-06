@@ -39,7 +39,7 @@ ratio, precision, source-linking, and reader-audit rules.
 ## Historical orientation is not a baseline
 
 Old exploratory work reported roughly 40 microseconds per ptrace trap versus
-roughly 1 microsecond for SaBRe, gVisor-KVM, and DBI; it also reported a
+roughly 1 microsecond for SaBRe, gVisor-KVM, and DBT; it also reported a
 strict-mode fixed startup cost around 18–30 ms, about 87x CPU-bound overhead
 under single-step execution, and throughput that varied approximately linearly
 with `--preemption-timeout`. Preserve these only as hypotheses that motivate a

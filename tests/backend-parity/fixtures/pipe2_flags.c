@@ -6,7 +6,7 @@
 // description's O_NONBLOCK status flag, and the two are independent. A final
 // F_SETFL clears O_NONBLOCK and confirms FD_CLOEXEC is unaffected. These flag
 // bits are a deterministic property of the syscall arguments, not of host
-// timing, so ptrace, DBI, and KVM must agree. The fixture performs no read or
+// timing, so ptrace, DBT, and KVM must agree. The fixture performs no read or
 // write on the pipe: an empty-pipe blocking read is a scheduler-gated operation
 // and out of scope for this flag-semantics contract.
 //

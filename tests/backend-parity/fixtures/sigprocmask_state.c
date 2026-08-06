@@ -6,7 +6,7 @@
  * ever raised or delivered, so this stays clear of the gated signal-delivery /
  * frame-synthesis path (see process_wait_lifecycle) and of any scheduling
  * behavior. Every observable is the blocked-mask membership read straight back
- * from the kernel, which must be identical across ptrace, DBI, and KVM.
+ * from the kernel, which must be identical across ptrace, DBT, and KVM.
  */
 #include <signal.h>
 #include <stdio.h>

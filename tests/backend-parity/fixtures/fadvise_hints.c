@@ -6,7 +6,7 @@
  * deterministically accepted. posix_fadvise returns 0 on success or a positive
  * errno directly (it does not set errno). Advice is a pure hint with no
  * observable side effect on file contents, so acceptance must be identical
- * across ptrace, DBI, and KVM. The fixture deliberately avoids the
+ * across ptrace, DBT, and KVM. The fixture deliberately avoids the
  * invalid-advice edge case, whose refusal semantics are a backend modeling
  * choice rather than a cross-backend contract.
  */

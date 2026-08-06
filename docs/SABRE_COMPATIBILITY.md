@@ -157,7 +157,7 @@ their guest output is still backend-specific:
 | Cell | Disposition | Evidence |
 | --- | --- | --- |
 | `backend-parity-c/pid-probe` | Fixed and promoted | Root PID alignment makes ptrace and SaBRe output byte-identical. |
-| `c-programs/dbi-pid-virtualization` | Blocked | Child allocation and vfork/exec behavior still expose different backend task topologies. |
+| `c-programs/dbt-pid-virtualization` | Blocked | Child allocation and vfork/exec behavior still expose different backend task topologies. |
 | `c-programs/print-memaddrs` | Blocked | SaBRe relocation changes the stack, brk heap, and large-allocation addresses. |
 | `c-programs/proc-fdinfo` | Blocked | Loader-visible regular-file opens shift the virtual inode: ptrace reports 3 and SaBRe reports 1. |
 | `c-programs/random-sources` | Owner-gated | Multithreaded random ordering belongs to the MT-random owner. |
@@ -194,7 +194,7 @@ remain disabled:
 backend-parity-c/cpuid-probe
 bin-c/robust-futex-test
 c-programs/clone
-c-programs/dbi-unsupported-syscall
+c-programs/dbt-unsupported-syscall
 c-programs/fp-reduction-nondeterminism
 c-programs/hello-nostdlib
 c-programs/ipc-determinism

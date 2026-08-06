@@ -7,7 +7,7 @@
 // a fixed literal the guest chooses, so getsockname must echo exactly the bytes the
 // guest supplied: this is a pure property of the socket the guest itself created,
 // independent of any host state. No byte is transferred, so there is no blocking
-// wait to schedule (a blocking read would livelock the DBI cooperative scheduler).
+// wait to schedule (a blocking read would livelock the DBT cooperative scheduler).
 //
 // bind is a distinct syscall from the getsockname/getpeername reads in
 // sockname_unnamed and the getsockopt reads in socketpair_flags/socket_options.

@@ -16,7 +16,7 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 
 .PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
 	install-build-tools check-submodules check-skill-discovery validate lint \
-	validate-kvm validate-dbi validate-sabre validate-liteinst validate-e9patch
+	validate-kvm validate-dbt validate-sabre validate-liteinst validate-e9patch
 
 build: prune-stale-release install-deps ## Build the development Hermit binary with every backend
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --locked \
@@ -30,7 +30,7 @@ build: prune-stale-release install-deps ## Build the development Hermit binary w
 install-deps: INSTALL_BUILD_TOOLS := 1
 install-deps: install-hooks check-submodules ## Build and stage all third-party backend runtimes and plugins
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --release --locked \
-		-p detcore-dbi -p detcore-sabre -p hermit-install
+		-p detcore-dbt -p detcore-sabre -p hermit-install
 
 # Install this clone's git pre-commit hooks (core.hooksPath -> .githooks) so a
 # fresh clone/worktree gets the BLOCKING Reverie pin-drift gate without a manual
@@ -115,14 +115,14 @@ help: ## Show this help (the list of make targets)
 	@printf '\nPer-backend validate targets run ONLY one backend'"'"'s compatibility\n'
 	@printf 'corpus, for a tight per-backend iteration loop. Runtimes are approximate:\n'
 	@printf '  validate-kvm       KVM parity corpus     (needs /dev/kvm)            ~5-15 min\n'
-	@printf '  validate-dbi       DBI parity corpus     (third-party-backends)      ~5-15 min\n'
+	@printf '  validate-dbt       DBT parity corpus     (third-party-backends)      ~5-15 min\n'
 	@printf '  validate-sabre     SaBRe corpus          (needs HERMIT_SABRE_BINARY) ~10-20 min\n'
 	@printf '  validate-liteinst  LiteInst strict corpus                            ~5-15 min\n'
 	@printf '  validate-e9patch   e9patch corpus        (needs HERMIT_E9PATCH_BACKEND) ~5-20 min\n'
 	@printf '\nThe full multi-backend suite is ./validate.sh (see ./validate.sh --help).\n'
 
 # Detect the native build toolchain (cmake + a C and C++ compiler) that the
-# third-party backends need. reverie-dbi's build.rs CMake-configures DynamoRIO
+# third-party backends need. reverie-dbt's build.rs CMake-configures DynamoRIO
 # roughly 30s into `cargo build`; when cmake or a compiler is absent that step
 # fails to SPAWN cmake and panics with the cryptic "failed to configure
 # DynamoRIO: No such file or directory (os error 2)" — an ENOENT on the cmake
@@ -150,7 +150,7 @@ check-build-tools: ## Verify the native build toolchain (cmake + C/C++ compiler)
 	fi; \
 	if [ -n "$$missing" ]; then \
 		echo "error: required native build tool(s) not found on PATH:$$missing" >&2; \
-		echo "  The DBI backend builds DynamoRIO from source with CMake; without" >&2; \
+		echo "  The DBT backend builds DynamoRIO from source with CMake; without" >&2; \
 		echo "  these the build fails ~30s in with a cryptic \"failed to configure" >&2; \
 		echo "  DynamoRIO: No such file or directory\". Install them, for example:" >&2; \
 		echo "    Debian/Ubuntu: sudo apt-get install -y cmake build-essential" >&2; \
@@ -203,7 +203,7 @@ check-submodules: checkout-all ## Verify every pinned submodule is checked out a
 # Each target runs ONLY its backend's compatibility corpus so a backend lane
 # agent can iterate tightly without paying for the full cross-backend suite.
 # They wrap the pre-existing mechanisms rather than adding new ones:
-#   * KVM and DBI (real Detcore backends) -> the backend-parity matrix,
+#   * KVM and DBT (real Detcore backends) -> the backend-parity matrix,
 #     scoped to one backend with `run_matrix.py --backend <backend>`, exactly
 #     as validate.sh's full "Real backend compatibility matrix" gate invokes it.
 #   * SaBRe / LiteInst / e9patch          -> validate.sh's focused
@@ -215,9 +215,9 @@ validate-kvm: check-submodules ## Run ONLY the KVM backend parity corpus (needs 
 	cargo build -p hermit
 	$(RUN_MATRIX) --hermit $(HERMIT_DEBUG_BIN) --backend kvm --probe-gaps --require-backend
 
-validate-dbi: check-submodules ## Run ONLY the DBI backend parity corpus (third-party-backends feature)
+validate-dbt: check-submodules ## Run ONLY the DBT backend parity corpus (third-party-backends feature)
 	cargo build -p hermit --features third-party-backends
-	$(RUN_MATRIX) --hermit $(HERMIT_DEBUG_BIN) --backend dbi --probe-gaps --require-backend
+	$(RUN_MATRIX) --hermit $(HERMIT_DEBUG_BIN) --backend dbt --probe-gaps --require-backend
 
 validate-sabre: check-submodules ## Run ONLY the SaBRe compatibility corpus (needs HERMIT_SABRE_BINARY)
 	./validate.sh --sabre-compat-only

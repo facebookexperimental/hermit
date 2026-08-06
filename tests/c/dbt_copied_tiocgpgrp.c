@@ -36,6 +36,6 @@ int main(void) {
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
     return 1;
   }
-  puts("dbi-copied-tiocgpgrp-ok");
+  puts("dbt-copied-tiocgpgrp-ok");
   return 0;
 }

@@ -6,7 +6,7 @@
 // length of just the family field (sizeof(sa_family_t)) and no sun_path. This is
 // a stable, host-independent property of the pair the guest itself created, so
 // no host state enters the result. No byte is transferred, so there is no
-// blocking wait to schedule (a blocking read would livelock the DBI cooperative
+// blocking wait to schedule (a blocking read would livelock the DBT cooperative
 // scheduler).
 //
 // getsockname and getpeername are distinct syscalls from the getsockopt option

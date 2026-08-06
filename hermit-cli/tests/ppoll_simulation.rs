@@ -64,7 +64,7 @@ fn ppoll_waits_use_nonblocking_probes_and_verify() {
         "ppoll did not use nonblocking scheduler probes\nstdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
     );
 
-    for backend in ["ptrace", "dbi"] {
+    for backend in ["ptrace", "dbt"] {
         let mut verify_command = Command::new("timeout");
         verify_command
             .args(["--kill-after", "5s", "30s"])

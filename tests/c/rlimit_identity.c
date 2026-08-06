@@ -32,9 +32,9 @@
  *
  * No raw host-dependent number is ever printed, so the observable result depends
  * only on the program, not on the host process's inherited limits. That makes
- * the contract byte-identical across repeated runs and across the ptrace, DBI,
+ * the contract byte-identical across repeated runs and across the ptrace, DBT,
  * and KVM backends. It uses no threads, no blocking I/O, and no signal delivery,
- * so it is safe under the DBI no-preemption scheduler.
+ * so it is safe under the DBT no-preemption scheduler.
  */
 
 #include <errno.h>

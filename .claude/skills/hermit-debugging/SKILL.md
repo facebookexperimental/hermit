@@ -178,7 +178,7 @@ but a syscall returned different data — an unvirtualized source.
 
 ## 4. Debugging-specific CLI flags
 
-Global (before the subcommand): `--log`, `--log-file`, `--backend <ptrace|dbi|kvm>`.
+Global (before the subcommand): `--log`, `--log-file`, `--backend <ptrace|dbt|kvm>`.
 
 On `run` (see `hermit run --help`), the internal/debug flags:
 

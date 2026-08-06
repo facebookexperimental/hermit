@@ -21,7 +21,7 @@ use serde_json::Value as JsonValue;
 use serde_json::json;
 use toml::Value;
 
-const KNOWN_BACKENDS: [&str; 5] = ["ptrace", "dbi", "kvm", "sabre", "liteinst"];
+const KNOWN_BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 const MATRIX_SYMMETRY_BASELINE: &str = "ci/matrix-symmetry-baseline.json";
 const TEST_INVENTORY: &str = "tests/e2e/manifests/inventory/test-files.json";
@@ -231,7 +231,7 @@ fn names_backend(value: &str) -> bool {
             let token = token.to_ascii_lowercase();
             matches!(
                 token.as_str(),
-                "ptrace" | "dbi" | "dynamorio" | "kvm" | "sabre" | "e9patch"
+                "ptrace" | "dbt" | "dynamorio" | "kvm" | "sabre" | "e9patch"
             ) || token.starts_with("liteinst")
         })
 }
@@ -831,7 +831,7 @@ ci = false
 backends_enabled = ["ptrace"]
 
 [backends_disabled]
-dbi = "unsupported"
+dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 "#,
@@ -880,7 +880,7 @@ backends_enabled = ["ptrace"]
 guest_args = { ptrace = ["multi"] }
 
 [backends_disabled]
-dbi = "unsupported"
+dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
@@ -1010,7 +1010,7 @@ backends_enabled = ["ptrace"]
 guest_args = { kvm = ["--kvm"] }
 
 [backends_disabled]
-dbi = "unsupported"
+dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"

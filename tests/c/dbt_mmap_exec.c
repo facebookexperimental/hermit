@@ -15,7 +15,7 @@
 #include <unistd.h>
 
 #if !defined(__x86_64__)
-#error "This DBI regression guest requires x86-64."
+#error "This DBT regression guest requires x86-64."
 #endif
 
 typedef int (*mapped_function)(void);
@@ -61,6 +61,6 @@ int main(void) {
     fail("munmap");
   }
 
-  puts("dbi-mmap-exec-ok");
+  puts("dbt-mmap-exec-ok");
   return 0;
 }

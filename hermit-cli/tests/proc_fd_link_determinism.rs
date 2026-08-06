@@ -146,7 +146,7 @@ fn proc_fd_link_aliases_and_truncation_verify() {
         "lexical=pipe:[1001]\n",
         "readlinkat=pipe:[1001]\n",
     );
-    for backend in ["ptrace", "dbi", "liteinst"] {
+    for backend in ["ptrace", "dbt", "liteinst"] {
         let output = Command::new("timeout")
             .args(["--kill-after", "10s", "90s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))

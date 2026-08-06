@@ -39,7 +39,7 @@ const SCHEMA: &str = "hermit-code-coverage/v1";
 const PRODUCT_ROOTS: &[&str] = &[
     "common",
     "detcore",
-    "detcore-dbi",
+    "detcore-dbt",
     "detcore-liteinst",
     "detcore-model",
     "detcore-sabre",

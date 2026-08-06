@@ -38,7 +38,7 @@ inventory does not silently imply support.
 
 Compatibility coverage enters through these shared schema-v2 manifests, not
 through a backend-owned guest list. Every test declares all five modes, and
-every non-naked mode partitions the complete `ptrace`, `dbi`, `kvm`, `sabre`,
+every non-naked mode partitions the complete `ptrace`, `dbt`, `kvm`, `sabre`,
 and `liteinst` axis into enabled cells and explicit gaps. Any active mode must
 include ptrace so the reference behavior is established before another backend
 ratchets it.
@@ -64,7 +64,7 @@ command. Program extensions select the runner:
 tables: `verify`, `chaos`, `replay`, `naked`, and `custom`. Each table has a
 `backends_enabled` list and a `backends_disabled` table. The two must form a
 complete, disjoint partition and every disabled backend needs a nonempty WHY.
-For non-naked modes the axis is `ptrace`, `dbi`, `kvm`, `sabre`, and
+For non-naked modes the axis is `ptrace`, `dbt`, `kvm`, `sabre`, and
 `liteinst`; naked partitions only `native`.
 
 ```toml
@@ -72,7 +72,7 @@ For non-naked modes the axis is `ptrace`, `dbi`, `kvm`, `sabre`, and
 ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
-dbi = "DBI coverage is owned by its backend parity partition"
+dbt = "DBT coverage is owned by its backend parity partition"
 kvm = "KVM requires the privileged runner"
 sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst coverage is owned by its compatibility partition"

@@ -284,7 +284,7 @@ pub struct GlobalState {
     // Unsupported syscall names observed across every process in this run.
     unsupported_syscalls: Mutex<BTreeSet<String>>,
 
-    // Optional append-only sink shared by DBI fork descendants.
+    // Optional append-only sink shared by DBT fork descendants.
     unsupported_syscall_report_fd: Option<Mutex<File>>,
 
     // Open file description to bound port.
@@ -364,12 +364,12 @@ impl GlobalState {
         let range = Self::read_port_range();
 
         let unsupported_syscall_report_fd = cfg.unsupported_syscall_report_fd.and_then(|fd| {
-            // This writer is internal controller state. In an in-process DBI
+            // This writer is internal controller state. In an in-process DBT
             // runtime it must not leak into the next guest image across exec
             // (hence F_DUPFD_CLOEXEC), and it must not perturb the descriptor
             // namespace the *current* guest observes. The backend places the
             // report fd itself high, out of the guest's working range (e.g. 199
-            // for the DBI backend). Duplicating with a min hint of `fd` keeps
+            // for the DBT backend). Duplicating with a min hint of `fd` keeps
             // this private copy up in that same reserved band instead of
             // grabbing the lowest free descriptor (fd 3), which would shift
             // every fd the guest subsequently opens and diverge from the golden
@@ -429,7 +429,7 @@ impl GlobalState {
     /// Reports that a backend supervisor received a process's final kernel exit status.
     ///
     /// This only records a barrier observation when the backend advertises physical-exit
-    /// reporting; it is therefore a no-op for ptrace, DBI, KVM, and LiteInst execution. The
+    /// reporting; it is therefore a no-op for ptrace, DBT, KVM, and LiteInst execution. The
     /// exact process's barrier is released at this physical-waitability boundary.
     pub fn complete_physical_process_exit(&self, raw_pid: i32) {
         let detpid = DetPid::from_raw(raw_pid);
@@ -1292,7 +1292,7 @@ impl GlobalState {
             // Describe *how* the admission side is chosen, but do not resolve it
             // (and in particular do not draw the post-fork PRNG) here: this
             // handler runs on whichever backend worker fielded the RPC, so on an
-            // asynchronous backend (e.g. DBI, where the child self-registers
+            // asynchronous backend (e.g. DBT, where the child self-registers
             // outside a scheduler turn) resolving the side now would consume the
             // PRNG draw in host RPC order. `admit_to_run_queue` resolves the
             // intent at the step2 drain -- which under ptrace is post-commit, in

@@ -9,7 +9,7 @@
 # portable fan-out. Asserts that ci/portable-shards.json assigns EVERY portable
 # DAG node to exactly one job, with no overlap and no unknown node names:
 #
-#   union(preflight, build_debug, build_dbi, build_aux, debug_shards, release_shards)
+#   union(preflight, build_debug, build_dbt, build_aux, debug_shards, release_shards)
 #     ==  { portable.json nodes } minus { e2e.manifest_* }
 #
 # The 13 e2e.manifest_* nodes are intentionally excluded here: they are covered by
@@ -39,7 +39,7 @@ mapfile -t assigned < <(
     jq -r '
         (.preflight_nodes // [])
       + (.build_debug_nodes // [])
-      + (.build_dbi_nodes // [])
+      + (.build_dbt_nodes // [])
       + (.build_aux_nodes // [])
       + ([ (.debug_shards // [])[]   | .nodes[] ])
       + ([ (.release_shards // [])[] | .nodes[] ])

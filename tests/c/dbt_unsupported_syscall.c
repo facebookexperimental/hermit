@@ -39,7 +39,7 @@ int main(int argc, char **argv) {
     if (call_unsupported() != 0) {
       return 1;
     }
-    puts("dbi-unsupported-exec-ok");
+    puts("dbt-unsupported-exec-ok");
     return 0;
   }
 
@@ -56,7 +56,7 @@ int main(int argc, char **argv) {
       return 1;
     }
     (void)ftruncate(199, 0);
-    puts("dbi-unsupported-report-tamper-ok");
+    puts("dbt-unsupported-report-tamper-ok");
     return 0;
   }
 
@@ -82,9 +82,9 @@ int main(int argc, char **argv) {
       return 1;
     }
     if (strcmp(argv[1], "fork-report-tamper") == 0) {
-      puts("dbi-unsupported-fork-report-tamper-ok");
+      puts("dbt-unsupported-fork-report-tamper-ok");
     } else {
-      puts("dbi-unsupported-fork-ok");
+      puts("dbt-unsupported-fork-ok");
     }
     return 0;
   }
@@ -99,7 +99,7 @@ int main(int argc, char **argv) {
     if (child == 0) {
       if (strcmp(argv[1], "fork-setsid-exec") == 0 && setsid() < 0) {
         // setsid can return EPERM when the forked child is already a process
-        // group leader, which the DBI backend has been observed to do. Report
+        // group leader, which the DBT backend has been observed to do. Report
         // it but still exec: the assertion under test is that the strict policy
         // rejects the unsupported syscall in the exec'd grandchild, and
         // session-leader promotion is incidental to that.
@@ -118,9 +118,9 @@ int main(int argc, char **argv) {
       return 1;
     }
     if (strcmp(argv[1], "fork-setsid-exec") == 0) {
-      puts("dbi-unsupported-fork-setsid-exec-parent-ok");
+      puts("dbt-unsupported-fork-setsid-exec-parent-ok");
     } else {
-      puts("dbi-unsupported-fork-exec-parent-ok");
+      puts("dbt-unsupported-fork-exec-parent-ok");
     }
     return 0;
   }
@@ -128,6 +128,6 @@ int main(int argc, char **argv) {
   if (call_unsupported() != 0) {
     return 1;
   }
-  puts("dbi-unsupported-ok");
+  puts("dbt-unsupported-ok");
   return 0;
 }

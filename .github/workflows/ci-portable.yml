@@ -7,7 +7,7 @@ name: CI (GitHub-managed portable)
 # nodes). Its measured wall (dag-perf-regular @c7531a83) is ~32 min: total
 # node-work 1918s ~= wall 1920s, i.e. the ~2.7x core usage is entirely WITHIN
 # nodes (cargo/nextest -j), not across them. The critical path is only 935s
-# (build.workspace 241s -> build.dbi_release 564s -> build.liteinst_runtime 79s ->
+# (build.workspace 241s -> build.dbt_release 564s -> build.liteinst_runtime 79s ->
 # test.liteinst_strict 52s), so ~half the wall is left on the table
 # (benchmarks/ci-dag-portable_20260802). This workflow exploits that headroom.
 #
@@ -16,13 +16,13 @@ name: CI (GitHub-managed portable)
 # assigned DAG nodes via ci/run-node.sh against the prebuilt tree. Wall time
 # becomes max(build stage, slowest single shard) instead of the serial sum.
 #
-# The release backends compile in ONE build-release job (build.dbi_release +
+# The release backends compile in ONE build-release job (build.dbt_release +
 # build.sabre_release + build.liteinst_runtime_release). An earlier
-# build-dbi-cache -> build-dbi -> build-aux split chased a <10-min-per-build-job
-# target but was a net loss: it re-compiled detcore-dbi twice and shuttled
+# build-dbt-cache -> build-dbt -> build-aux split chased a <10-min-per-build-job
+# target but was a net loss: it re-compiled detcore-dbt twice and shuttled
 # target/release through two extra artifact round-trips, turning one ~9.4-min node
 # into ~18 min across three serial jobs (benchmarks/ci-dag-portable_20260802).
-# build.dbi_release alone is ~10-12 min cold on a 4-core hosted runner, so the
+# build.dbt_release alone is ~10-12 min cold on a 4-core hosted runner, so the
 # per-job target is met by a warm cargo cache, not by fragmenting the compile.
 #
 # CORRESPONDENCE (fail-closed): ci/check-shard-coverage.sh asserts the shard map
@@ -70,7 +70,7 @@ env:
   DETCORE_TEST_RUST_LOG: "off"
   DEBUG_ARTIFACT: hermit-debug-${{ github.run_id }}
   DEBUG_TARBALL: hermit-portable-debug.tzst
-  RELEASE_DBI_ARTIFACT: hermit-release-dbi-${{ github.run_id }}
+  RELEASE_DBT_ARTIFACT: hermit-release-dbt-${{ github.run_id }}
   RELEASE_ARTIFACT: hermit-release-${{ github.run_id }}
   RELEASE_TARBALL: hermit-portable-release.tzst
 
@@ -164,7 +164,7 @@ jobs:
           run_dbg=$(jq -e '.include|length>0' <<<"$dbg" >/dev/null 2>&1 && echo true || echo false)
           run_rel=$(jq -e '.include|length>0' <<<"$rel" >/dev/null 2>&1 && echo true || echo false)
           build_debug=$(jq -r '.build.debug' <<<"$sel_json")
-          build_release=$(jq -r 'if (.build.dbi or .build.aux) then "true" else "false" end' <<<"$sel_json")
+          build_release=$(jq -r 'if (.build.dbt or .build.aux) then "true" else "false" end' <<<"$sel_json")
           if [[ -n "$backends" ]]; then run_e2e=true; else run_e2e=false; fi
           # e2e cells consume BOTH prebuilt trees, so force their builds on.
           if [[ "$run_e2e" == "true" ]]; then build_debug=true; build_release=true; fi
@@ -319,13 +319,13 @@ jobs:
           nextest=$(command -v cargo-nextest)
           install -Dm755 "$nextest" target/ci/bin/cargo-nextest
           target/ci/bin/cargo-nextest --version
-      - name: Stage debug DBI runtime
+      - name: Stage debug DBT runtime
         run: |
           set -euo pipefail
           runtime=$(
-            cargo build -p detcore-dbi --message-format=json-render-diagnostics |
+            cargo build -p detcore-dbt --message-format=json-render-diagnostics |
               jq -r '
-                select(.reason == "compiler-artifact" and .target.name == "detcore_dbi")
+                select(.reason == "compiler-artifact" and .target.name == "detcore_dbt")
                 | .filenames[]
                 | select(endswith(".so"))
               ' |
@@ -333,7 +333,7 @@ jobs:
           )
           test -n "$runtime"
           test -f "$runtime"
-          install -Dm755 "$runtime" target/debug/deps/libdetcore_dbi.so
+          install -Dm755 "$runtime" target/debug/deps/libdetcore_dbt.so
       - name: Enumerate portable (mode x manifest block x backend) e2e cells
         id: cells
         env:
@@ -394,17 +394,17 @@ jobs:
           # empty dir so the pack is robust — e2e cells run with --allow-empty and
           # simply find no prebuilt fixtures, exactly as an unstaged tree intends.
           mkdir -p ignored/e2e/build
-          test -f target/debug/deps/libdetcore_dbi.so
-          # Cargo test shards may rewrite target/debug/deps. Keep the DBI runtime
+          test -f target/debug/deps/libdetcore_dbt.so
+          # Cargo test shards may rewrite target/debug/deps. Keep the DBT runtime
           # in Hermit's normal install-resource location so later CLI nodes do
           # not depend on that mutable Cargo output directory.
-          install -Dm755 target/debug/deps/libdetcore_dbi.so \
-            target/install_pkg/rsrcs/libdetcore_dbi.so
+          install -Dm755 target/debug/deps/libdetcore_dbt.so \
+            target/install_pkg/rsrcs/libdetcore_dbt.so
           test -x target/ci/bin/cargo-nextest
           tar --zstd -cf "$DEBUG_TARBALL" \
             target/debug/hermit \
-            target/debug/deps/libdetcore_dbi.so \
-            target/install_pkg/rsrcs/libdetcore_dbi.so \
+            target/debug/deps/libdetcore_dbt.so \
+            target/install_pkg/rsrcs/libdetcore_dbt.so \
             target/ci/bin/cargo-nextest \
             ignored/e2e/build
           ls -lh "$DEBUG_TARBALL"
@@ -416,15 +416,15 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # ---------------------- build (release: dbi + sabre + liteinst, ONE warm pass)
-  # Consolidated from the former build-dbi-cache -> build-dbi -> build-aux serial
+  # ---------------------- build (release: dbt + sabre + liteinst, ONE warm pass)
+  # Consolidated from the former build-dbt-cache -> build-dbt -> build-aux serial
   # chain (see the WHAT note above). Runs every release build node in one
-  # cargo-warm job, packs target/ ONCE, and publishes both the DBI install package
-  # (RELEASE_DBI_ARTIFACT, consumed by the debug shards) and the full release tree
+  # cargo-warm job, packs target/ ONCE, and publishes both the DBT install package
+  # (RELEASE_DBT_ARTIFACT, consumed by the debug shards) and the full release tree
   # (RELEASE_ARTIFACT, consumed by the release/e2e/sabre shards). Both artifacts
   # carry the identical prebuilt tree, so downstream consumers are unchanged.
   build-release:
-    name: Build release backends once (dbi + sabre + liteinst)
+    name: Build release backends once (dbt + sabre + liteinst)
     needs: select
     if: needs.select.outputs.build_release != 'false'
     runs-on: ubuntu-latest
@@ -448,11 +448,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang cmake file g++ gcc git jq libelf-dev libunwind-dev liblzma-dev make pkg-config python3-full zlib1g-dev zstd
       # Reproduce EXACTLY the release build nodes from portable.json (no drift):
-      # build.dbi_release, build.sabre_release, build.liteinst_runtime_release.
-      - name: Run release build nodes (dbi + sabre + liteinst)
+      # build.dbt_release, build.sabre_release, build.liteinst_runtime_release.
+      - name: Run release build nodes (dbt + sabre + liteinst)
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
-        run: ./ci/run-node.sh portable "$(jq -r '(.build_dbi_nodes + .build_aux_nodes)|join(",")' ci/portable-shards.json)"
+        run: ./ci/run-node.sh portable "$(jq -r '(.build_dbt_nodes + .build_aux_nodes)|join(",")' ci/portable-shards.json)"
       - name: Upload release-build node performance report
         if: always()
         uses: actions/upload-artifact@v4
@@ -461,7 +461,7 @@ jobs:
           path: ${{ runner.temp }}/run-node-perf
           if-no-files-found: warn
           retention-days: 14
-      - name: Pack full release prebuilt tree (dbi + sabre + liteinst)
+      - name: Pack full release prebuilt tree (dbt + sabre + liteinst)
         run: |
           set -euo pipefail
           tar --zstd -cf "$RELEASE_TARBALL" \
@@ -474,10 +474,10 @@ jobs:
             target/ci \
             target/install_pkg
           ls -lh "$RELEASE_TARBALL"
-      - name: Upload DBI install package (debug shards)
+      - name: Upload DBT install package (debug shards)
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.RELEASE_DBI_ARTIFACT }}
+          name: ${{ env.RELEASE_DBT_ARTIFACT }}
           path: ${{ env.RELEASE_TARBALL }}
           if-no-files-found: error
           retention-days: 1
@@ -494,7 +494,7 @@ jobs:
     name: "test: ${{ matrix.slug }}"
     needs: [select, build-debug, build-release]
     # build-release is legitimately SKIPPED when the selected debug shards need no
-    # DBI runtime (build.dbi=false). A bare custom `if` would still inherit the
+    # DBT runtime (build.dbt=false). A bare custom `if` would still inherit the
     # implicit success() over every need and skip this job; the explicit status
     # checks let it run when build-release was skipped, while still skipping (and
     # letting `regular` fail closed) if build-debug or a to-be-run build-release
@@ -569,15 +569,15 @@ jobs:
         with:
           name: ${{ env.DEBUG_ARTIFACT }}
           path: .
-      # The DBI runtime (drrun + libreverie_dbi_client.so) lives only in the
+      # The DBT runtime (drrun + libreverie_dbt_client.so) lives only in the
       # release package. A selective run reaches this job with build-release
-      # skipped ONLY when the tool proved no selected debug shard needs DBI
-      # (build.dbi=false), so the package is downloaded and asserted only then.
-      - name: Download dbi install package
+      # skipped ONLY when the tool proved no selected debug shard needs DBT
+      # (build.dbt=false), so the package is downloaded and asserted only then.
+      - name: Download dbt install package
         if: needs.build-release.result == 'success'
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.RELEASE_DBI_ARTIFACT }}
+          name: ${{ env.RELEASE_DBT_ARTIFACT }}
           path: .
       - name: Unpack debug tree
         run: |
@@ -585,8 +585,8 @@ jobs:
           tar --zstd -xf "$DEBUG_TARBALL"
           rm -f "$DEBUG_TARBALL"
           test -x target/debug/hermit
-          test -f target/debug/deps/libdetcore_dbi.so
-          test -f target/install_pkg/rsrcs/libdetcore_dbi.so
+          test -f target/debug/deps/libdetcore_dbt.so
+          test -f target/install_pkg/rsrcs/libdetcore_dbt.so
           test -x target/ci/bin/cargo-nextest
       # Install into CARGO_HOME/bin rather than adding target/ci/bin to PATH:
       # cargo searches $CARGO_HOME/bin BEFORE PATH when resolving
@@ -604,7 +604,7 @@ jobs:
           install -Dm755 target/ci/bin/cargo-nextest \
             "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-nextest"
           cargo nextest --version
-      - name: Unpack dbi install package
+      - name: Unpack dbt install package
         if: needs.build-release.result == 'success'
         run: |
           set -euo pipefail
@@ -612,7 +612,7 @@ jobs:
           rm -f "$RELEASE_TARBALL"
           test -x target/ci/hermit-strict
           test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun
-          test -f target/install_pkg/rsrcs/libreverie_dbi_client.so
+          test -f target/install_pkg/rsrcs/libreverie_dbt_client.so
       - name: Run shard nodes (${{ matrix.slug }})
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
@@ -955,7 +955,7 @@ jobs:
   cleanup:
     name: Delete prebuilt build artifacts
     # Name every artifact consumer directly. In particular, test-debug is a
-    # matrix job whose integration shard owns test.cli and the run_dbi_* tests.
+    # matrix job whose integration shard owns test.cli and the run_dbt_* tests.
     needs: [test-debug, test-release, e2e, sabre_non_gated_parity, regular]
     if: always()
     runs-on: ubuntu-latest
@@ -969,7 +969,7 @@ jobs:
           script: |
             const names = new Set([
               `hermit-debug-${context.runId}`,
-              `hermit-release-dbi-${context.runId}`,
+              `hermit-release-dbt-${context.runId}`,
               `hermit-release-${context.runId}`,
             ]);
             const arts = await github.paginate(

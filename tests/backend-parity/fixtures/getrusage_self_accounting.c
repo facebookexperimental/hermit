@@ -10,7 +10,7 @@
 // spuriously fail), but the accounting it reports is the determinized zero.
 //
 // ru_maxrss is deliberately NOT asserted: peak resident set is a legitimate
-// backend-local memory-footprint number (ptrace, DBI, and KVM each report a
+// backend-local memory-footprint number (ptrace, DBT, and KVM each report a
 // different value) and determinizing it is neither required nor claimed.
 //
 // The fixture first burns measurable CPU so that a native run has clearly

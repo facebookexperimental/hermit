@@ -9,7 +9,7 @@
 // The guest writes the bytes it then counts, so the FIONREAD result is a pure
 // function of the guest's own actions, and the FIONBIO round-trip is a
 // process-local status-flag toggle. No blocking read is performed (a read on an
-// empty non-blocking pipe would livelock under DBI), so the contract is a pure
+// empty non-blocking pipe would livelock under DBT), so the contract is a pure
 // query/flag round-trip that every backend and native agree on.
 #include <errno.h>
 #include <fcntl.h>

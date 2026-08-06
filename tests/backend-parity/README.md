@@ -1,7 +1,7 @@
 # Hermit backend parity runner
 
 This directory tracks executable parity contracts across Hermit's ptrace,
-DynamoRIO (DBI), and KVM backends. The case catalog and its small set of known
+DynamoRIO (DBT), and KVM backends. The case catalog and its small set of known
 gaps live in `run_matrix.py`; new cases are green contracts by default. Live
 results are compatibility measurement state, so when Hermit is checked out
 inside dev-hermit the runner appends them to the outer
@@ -18,7 +18,7 @@ L1 (`hermit run --strict`):
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
 | ptrace | 28/28 | 100% |
-| DBI | 26/28 | 93% |
+| DBT | 26/28 | 93% |
 | KVM | 23/28 | 82% |
 
 L2 (`hermit run --strict --verify`):
@@ -26,11 +26,11 @@ L2 (`hermit run --strict --verify`):
 | Backend | Verified pairs | L2 kind | Parity vs ptrace |
 | --- | ---: | --- | ---: |
 | ptrace | 28/28 | DETLOG-bitwise | 100% |
-| DBI | 26/28 | DETLOG-bitwise | 93% |
+| DBT | 26/28 | DETLOG-bitwise | 93% |
 | KVM | 22/28 | guest-visible only | 79% |
 
 The two L2 assurance *kinds* are not interchangeable. **DETLOG-bitwise** L2
-(ptrace, DBI) means hermit re-ran the guest and found the two normalized DETLOG
+(ptrace, DBT) means hermit re-ran the guest and found the two normalized DETLOG
 streams — the full syscall and scheduling trace — bitwise-identical.
 **guest-visible** L2 (KVM) is strictly weaker: reverie-kvm runs concurrently and
 declares outright that its internal syscall trace order is not deterministic, so
@@ -38,10 +38,10 @@ declares outright that its internal syscall trace order is not deterministic, so
 column is therefore capped at `guest`, never `detlog`. See the L2 subsection
 below for the two contracts that hold at L1 but not L2.
 
-The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
+The task's pre-existing DBT-native baseline is 70/89 tests (78.7%). That number
 measures the backend's own Reverie suite. The 23/24 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
-The current DBI path satisfies the virtual clock, virtual PID, root-thread
+The current DBT path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
 file-mutation contracts, plus deterministic memory-advice and
 memory-layout behavior. It is an explicit gap on the file-metadata row (see
@@ -69,14 +69,14 @@ links, reads, and removes temporary files without exposing backend-specific meta
 The file-metadata row checks positional I/O, ownership and access operations,
 hard and symbolic links, path/fd/symlink extended attributes, a shared file
 mapping, readahead, and range synchronization. It permits documented filesystem
-policy failures for extended attributes but not an unimplemented syscall. DBI is
+policy failures for extended attributes but not an unimplemented syscall. DBT is
 an explicit gap on this row: it forwards `fchown` to the real kernel, so once
 credential queries are determinized to virtual-root identity `0` (PR #1549) the
 guest's `fchown(fd, 0, 0)` becomes an unprivileged chown-to-root and returns
 `EPERM`, while ptrace remaps it through the user namespace. `fchown` is not
-correctly implemented under DBI, and asserting against a half-implemented syscall
-could pass by accident and prove nothing, so the DBI cell is a declared gap until
-DBI determinizes `fchown`.
+correctly implemented under DBT, and asserting against a half-implemented syscall
+could pass by accident and prove nothing, so the DBT cell is a declared gap until
+DBT determinizes `fchown`.
 The io_uring fallback row requires all three io_uring entry points to return
 deterministic `ENOSYS`, then checks that `epoll_create1` still succeeds.
 The listmount row requires deterministic `ENOSYS` even when the host kernel
@@ -109,7 +109,7 @@ Each cell shows the L1 status and, after `/`, the L2 status: `detlog` for
 DETLOG-bitwise L2, `guest` for KVM guest-visible L2, and `gap` where the level
 is not reached.
 
-| Test | ptrace | DBI | KVM |
+| Test | ptrace | DBT | KVM |
 | --- | --- | --- | --- |
 | `hello_stdout` | pass / detlog | pass / detlog | pass / guest |
 | `argument_forwarding` | pass / detlog | pass / detlog | pass / guest |
@@ -146,15 +146,15 @@ time, queries `ioprio_get` (fixed virtual default 0), and issues a
 `sched_setattr` requesting `SCHED_DEADLINE`. That last call returns `EPERM`
 outside Hermit (real-time scheduling needs privilege), but Detcore accepts it
 as a deterministic no-op because it replaces the Linux scheduler with its own,
-so the guest observes an identical, host-independent result across ptrace, DBI,
+so the guest observes an identical, host-independent result across ptrace, DBT,
 and KVM and across the `--verify` double run.
 
 The authoritative exceptions and their reasons live in `L1_GAPS` and
 `L2_GAPS` in the runner. The runner executes each passing pair three times and
 checks exit status, stdout, and (for determinism cases) byte-identical repeated output.
-Passing `--strict` adds `hermit run --strict` to every probe; the hosted DBI
+Passing `--strict` adds `hermit run --strict` to every probe; the hosted DBT
 gate uses this mode.
-The DBI random-source contract also compares the root thread's post-fault
+The DBT random-source contract also compares the root thread's post-fault
 random stream byte-for-byte with a ptrace reference run. It deliberately uses
 the fixture's root-only mode to keep that comparison independent of the
 pthread lifecycle row.
@@ -171,7 +171,7 @@ the guest's own stdout into per-run temporary logs, the L2 path cannot re-check
 stdout the way the L1 path does; instead it enforces that the guest exit status
 matches and that hermit's double-run comparison succeeded at *at least* the
 assurance kind expected for the backend. The runner keys on two distinct stderr
-witnesses: `Determinism verified` (DETLOG-bitwise, ptrace and DBI) and
+witnesses: `Determinism verified` (DETLOG-bitwise, ptrace and DBT) and
 `guest output and exit status matched` (KVM guest-visible). A DETLOG result
 satisfies a `guest` contract because it is strictly stronger; the reverse fails.
 
@@ -276,12 +276,12 @@ cargo build -p hermit
 python3 tests/backend-parity/run_matrix.py --backend ptrace
 ```
 
-Run DBI with the pinned DynamoRIO runtime and client built by Cargo:
+Run DBT with the pinned DynamoRIO runtime and client built by Cargo:
 
 ```bash
 cargo build --release -p hermit
 python3 tests/backend-parity/run_matrix.py \
-    --hermit target/release/hermit --backend dbi --strict --require-backend
+    --hermit target/release/hermit --backend dbt --strict --require-backend
 ```
 
 Run KVM on a host with read-write `/dev/kvm` access:
@@ -297,7 +297,7 @@ contract:
 ```bash
 python3 tests/backend-parity/run_matrix.py --backend ptrace --verify --require-backend
 python3 tests/backend-parity/run_matrix.py --hermit target/release/hermit \
-    --backend dbi --verify --require-backend
+    --backend dbt --verify --require-backend
 python3 tests/backend-parity/run_matrix.py --backend kvm --verify --require-backend
 ```
 

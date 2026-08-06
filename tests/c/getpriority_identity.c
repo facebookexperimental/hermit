@@ -16,7 +16,7 @@
  * `which`, and setpriority(2) is accepted as an inert no-op (returns 0) that
  * never actually changes the reported priority. That constant is what makes the
  * value bitwise-identical across --verify repeat runs and under record/replay,
- * and it must match across backends: DBI and KVM have to mirror the golden
+ * and it must match across backends: DBT and KVM have to mirror the golden
  * ptrace reference exactly.
  *
  * This fixture uses the RAW syscalls, not glibc's getpriority()/setpriority()

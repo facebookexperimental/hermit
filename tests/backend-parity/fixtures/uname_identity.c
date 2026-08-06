@@ -9,12 +9,12 @@
  *   machine  == "x86_64"                   (ISA, host-generic on this corpus)
  *   release  == "5.2.0"                    (pinned kernel release; native leaks
  *                                           the real running kernel, e.g. 6.x)
- *   nodename == "hermetic-container.local" (pinned hostname; native and the DBI
+ *   nodename == "hermetic-container.local" (pinned hostname; native and the DBT
  *                                           backend leak the real host hostname)
  *
- * The ptrace and KVM backends determinize all four. The DBI (DynamoRIO) backend
+ * The ptrace and KVM backends determinize all four. The DBT (DynamoRIO) backend
  * pins release but forwards the *host* nodename, so it deterministically-but-
- * host-dependently fails the nodename check; matrix.tsv records that as a DBI
+ * host-dependently fails the nodename check; matrix.tsv records that as a DBT
  * gap. Native Linux honors none of the pinned values, proving these are Hermit
  * determinization choices rather than host coincidences.
  *

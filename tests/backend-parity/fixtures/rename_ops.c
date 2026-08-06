@@ -7,7 +7,7 @@
 // nonexistent source fails with ENOENT. Only presence/absence and file size are
 // observed, all derived from the guest's own writes, so the result is a
 // deterministic property of the filesystem operations rather than of host inode
-// metadata or timing. ptrace, DBI, and KVM must agree.
+// metadata or timing. ptrace, DBT, and KVM must agree.
 //
 // _GNU_SOURCE is supplied by the harness compile flags (see run_matrix.py).
 #include <errno.h>

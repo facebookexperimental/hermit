@@ -91,7 +91,7 @@ Run the complete matrix from the repository root:
 with-proxy ./benchmarks/targeted.py
 ```
 
-The default is five measured samples plus one warmup for native, ptrace, DBI,
+The default is five measured samples plus one warmup for native, ptrace, DBT,
 and KVM. Every Hermit command uses explicit `--strict`, `--log=error`, and
 no determinism relaxations. Before timing, the runner requires each backend to
 exit zero and produce byte-identical stdout to native. A backend or workload

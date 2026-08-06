@@ -94,7 +94,16 @@ hermit run --strict -- /bin/echo hello
 
 ### Execution Backends
 
-Hermit accepts `--backend=ptrace|dbi|liteinst|sabre|kvm|e9patch` as a global
+A *backend* is the low-level mechanism Hermit uses to observe and control a
+running guest — how it intercepts the program's system calls and CPU events.
+Different backends make different trade-offs in speed, host requirements, and
+which programs they support, which is why there is more than one. The default
+`ptrace` backend needs no special setup and is the most thoroughly tested; the
+rest are experimental or specialized. If you are just getting started, use the
+default and skip the rest of this section. See [Architecture](#architecture)
+for how a backend fits into the whole system.
+
+Hermit accepts `--backend=ptrace|dbt|liteinst|sabre|kvm|e9patch` as a global
 option before the subcommand. Backend scope is command-specific: LiteInst and
 e9patch support only `run`, while SaBRe supports `run` and `strace`; unsupported
 combinations fail closed. Omitting the option selects `ptrace`, preserving the

@@ -12,7 +12,7 @@
  *   5. pwritev2(fd, iov, 1, off=-1, RWF_APPEND) appends at EOF -> rc == 6
  *   6. preadv2(fd,  iov, 1, off=12, flags=0) reads the appended chunk -> match
  *
- * golden ok=6 on native Linux and on the ptrace and DBI backends: positioned
+ * golden ok=6 on native Linux and on the ptrace and DBT backends: positioned
  * vectored I/O with RWF flags targets an offset the caller supplies, so it does
  * not depend on host time, PID, the scheduler, or a shared file position — a
  * faithful, deterministic result on every backend that implements the syscalls.

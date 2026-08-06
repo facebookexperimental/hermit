@@ -26,10 +26,10 @@ it runs `full` for backward compatibility.
 
 | Level | Typical estimate | Coverage |
 | --- | --- | --- |
-| `quick` | About 3 minutes | Builds the workspace, runs Detcore's core unit tests, and exercises ptrace run, repeat-output, verify, record, and replay smoke tests. It does not execute DBI or KVM or build the optimized binary. |
+| `quick` | About 3 minutes | Builds the workspace, runs Detcore's core unit tests, and exercises ptrace run, repeat-output, verify, record, and replay smoke tests. It does not execute DBT or KVM or build the optimized binary. |
 | `portable-only` | About 8 minutes | Executes the same `ci/dag/portable.json` plan as the GitHub-managed portable job: build, portable workspace tests, Hermit and Detcore library/binary tests, docs, Clippy, and rustfmt. It does not require PMU or guest namespaces. |
 | `full` (default) | About 20-70 minutes | Executes the exact portable and privileged DAG manifests used by GitHub CI. This includes the portable product gates plus the focused CPUID, PMU, KVM, and record/replay capability partition. |
-| `super` | About 30-90 minutes | Builds Hermit and repeats each bounded determinism probe 20 times by default. It reports `passed/total` for every probe and fails if any iteration fails. Available KVM and DBI verify probes join the ptrace strict-verify, pipeline, and record/replay probes. |
+| `super` | About 30-90 minutes | Builds Hermit and repeats each bounded determinism probe 20 times by default. It reports `passed/total` for every probe and fails if any iteration fails. Available KVM and DBT verify probes join the ptrace strict-verify, pipeline, and record/replay probes. |
 
 Select a level positionally or with `VALIDATE_LEVEL`. The long-form aliases are
 useful in scripts and make the intended capability tier explicit:
@@ -96,7 +96,7 @@ count so a fix prompts removal of the exception instead of silently leaving a
 stale waiver.
 
 The full and super backend gates probe actual runtime capability: KVM requires
-a readable and writable `/dev/kvm`; DBI must complete a bounded `/bin/true`
+a readable and writable `/dev/kvm`; DBT must complete a bounded `/bin/true`
 smoke using either its bundled DynamoRIO runtime or explicit environment
 configuration. An unavailable alternate backend is reported as `SKIP`, not as
 a ptrace failure.

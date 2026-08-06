@@ -58,26 +58,26 @@ pub use detcore::Config as DetConfig;
 pub use detcore::Detcore;
 pub use detcore::RecordOrReplay;
 #[doc(hidden)]
-#[cfg(feature = "dbi")]
-pub use detcore_dbi::reverie_dbi_runtime_background_init;
+#[cfg(feature = "dbt")]
+pub use detcore_dbt::reverie_dbt_runtime_background_init;
 #[doc(hidden)]
-#[cfg(feature = "dbi")]
-pub use detcore_dbi::reverie_dbi_runtime_name;
+#[cfg(feature = "dbt")]
+pub use detcore_dbt::reverie_dbt_runtime_name;
 #[doc(hidden)]
-#[cfg(feature = "dbi")]
-pub use detcore_dbi::reverie_dbi_runtime_pre_syscall;
+#[cfg(feature = "dbt")]
+pub use detcore_dbt::reverie_dbt_runtime_pre_syscall;
 #[doc(hidden)]
-#[cfg(feature = "dbi")]
-pub use detcore_dbi::reverie_dbi_runtime_ready;
+#[cfg(feature = "dbt")]
+pub use detcore_dbt::reverie_dbt_runtime_ready;
 #[doc(hidden)]
-#[cfg(feature = "dbi")]
-pub use detcore_dbi::reverie_dbi_runtime_thread_exit;
+#[cfg(feature = "dbt")]
+pub use detcore_dbt::reverie_dbt_runtime_thread_exit;
 #[doc(hidden)]
-#[cfg(feature = "dbi")]
-pub use detcore_dbi::reverie_dbi_runtime_thread_init;
+#[cfg(feature = "dbt")]
+pub use detcore_dbt::reverie_dbt_runtime_thread_init;
 #[doc(hidden)]
-#[cfg(feature = "dbi")]
-pub use detcore_dbi::reverie_dbi_runtime_totals;
+#[cfg(feature = "dbt")]
+pub use detcore_dbt::reverie_dbt_runtime_totals;
 pub use error::Context;
 pub use error::Error;
 pub use error::SerializableError;
@@ -370,21 +370,21 @@ fn validate_tracing_environment() -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(feature = "dbi")]
+#[cfg(feature = "dbt")]
 fn is_dynamorio_sdk(path: &Path) -> bool {
     path.join("include/dr_api.h").is_file()
         || path.join("DynamoRIOConfig.cmake").is_file()
         || path.join("cmake/DynamoRIOConfig.cmake").is_file()
 }
 
-#[cfg(feature = "dbi")]
+#[cfg(feature = "dbt")]
 fn dynamorio_sdk_available() -> bool {
     if hermit_resources::resource("dynamorio/bin64/drrun")
         .is_ok_and(|path| path.is_some_and(|path| path.is_file()))
     {
         return true;
     }
-    if reverie_dbi::bundled_drrun_path().is_file() {
+    if reverie_dbt::bundled_drrun_path().is_file() {
         return true;
     }
     const DEFAULT_ROOTS: [&str; 3] = [
@@ -401,11 +401,11 @@ fn dynamorio_sdk_available() -> bool {
         .any(|path| is_dynamorio_sdk(&path))
 }
 
-#[cfg(feature = "dbi")]
-fn dbi_runtime_unavailable_reason() -> Option<String> {
-    detcore_dbi::runtime_library_path().err().map(|error| {
+#[cfg(feature = "dbt")]
+fn dbt_runtime_unavailable_reason() -> Option<String> {
+    detcore_dbt::runtime_library_path().err().map(|error| {
         format!(
-            "the Detcore DBI runtime is unavailable: {error}; build the hermit binary and \
+            "the Detcore DBT runtime is unavailable: {error}; build the hermit binary and \
              cdylib in the same target directory"
         )
     })
@@ -597,7 +597,7 @@ pub enum Backend {
     #[default]
     Ptrace,
     /// Use the DynamoRIO backend.
-    Dbi,
+    Dbt,
     /// Use the ptrace-hosted LiteInst hybrid with one Detcore Tool.
     Liteinst,
     /// Use the SaBRe static binary rewriting backend.
@@ -612,7 +612,7 @@ pub enum Backend {
 impl Backend {
     const ALL: [Self; 6] = [
         Self::Ptrace,
-        Self::Dbi,
+        Self::Dbt,
         Self::Liteinst,
         Self::Sabre,
         Self::Kvm,
@@ -623,7 +623,7 @@ impl Backend {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ptrace => "ptrace",
-            Self::Dbi => "dbi",
+            Self::Dbt => "dbt",
             Self::Liteinst => "liteinst",
             Self::Sabre => "sabre",
             Self::Kvm => "kvm",
@@ -663,7 +663,7 @@ impl Backend {
             Self::Ptrace => validate_tracing_environment()
                 .err()
                 .map(|error| error.to_string()),
-            Self::Dbi => dbi_unavailable_reason(),
+            Self::Dbt => dbt_unavailable_reason(),
             Self::Liteinst => liteinst_runtime_unavailable_reason(),
             // TODO-HUMAN-REVIEW(#589): Review SaBRe backend availability reporting.
             Self::Sabre => sabre_unavailable_reason(),
@@ -703,21 +703,21 @@ fn e9patch_unavailable_reason() -> Option<String> {
     Some("e9patch support was not included in this build".to_owned())
 }
 
-#[cfg(feature = "dbi")]
-fn dbi_unavailable_reason() -> Option<String> {
+#[cfg(feature = "dbt")]
+fn dbt_unavailable_reason() -> Option<String> {
     if !dynamorio_sdk_available() {
         return Some(
             "the DynamoRIO runtime was not found; build target/install_pkg, set HERMIT_INSTALL_DIR, or set DYNAMORIO_HOME/DynamoRIO_DIR to a valid SDK"
                 .to_owned(),
         );
     }
-    dbi_runtime_unavailable_reason()
+    dbt_runtime_unavailable_reason()
 }
 
-#[cfg(not(feature = "dbi"))]
-// TODO-HUMAN-REVIEW(PR-1150): Review the default-on DBI compile-time feature boundary.
-fn dbi_unavailable_reason() -> Option<String> {
-    Some("DBI support was not included in this build".to_owned())
+#[cfg(not(feature = "dbt"))]
+// TODO-HUMAN-REVIEW(PR-1150): Review the default-on DBT compile-time feature boundary.
+fn dbt_unavailable_reason() -> Option<String> {
+    Some("DBT support was not included in this build".to_owned())
 }
 
 const SABRE_BINARY_ENV: &str = "HERMIT_SABRE_BINARY";
@@ -980,7 +980,7 @@ fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
              e9patch::prepare and then select `ptrace`"
         ));
     }
-    // KVM and DBI have dedicated dispatches (`run_kvm` and `run_dbi`); neither
+    // KVM and DBT have dedicated dispatches (`run_kvm` and `run_dbt`); neither
     // must reach this generic rejection path.
     backend.ensure_available()?;
     Err(anyhow!(
@@ -1340,17 +1340,17 @@ async fn run_kvm(
     })
 }
 
-// TODO-HUMAN-REVIEW(PR-743): Review bounded relaunch before DBI guest execution.
-#[cfg(feature = "dbi")]
-fn dbi_client_thread_start_failed(status: &std::process::ExitStatus) -> bool {
-    status.code() == Some(reverie_dbi::CLIENT_THREAD_START_FAILURE_EXIT_CODE)
+// TODO-HUMAN-REVIEW(PR-743): Review bounded relaunch before DBT guest execution.
+#[cfg(feature = "dbt")]
+fn dbt_client_thread_start_failed(status: &std::process::ExitStatus) -> bool {
+    status.code() == Some(reverie_dbt::CLIENT_THREAD_START_FAILURE_EXIT_CODE)
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-737): Review public DBI dispatch and child environment ownership.
-/// Dispatch a command onto the Detcore-linked reverie-dbi runtime.
-#[cfg(feature = "dbi")]
-async fn run_dbi(
+// TODO-HUMAN-REVIEW(PR-737): Review public DBT dispatch and child environment ownership.
+/// Dispatch a command onto the Detcore-linked reverie-dbt runtime.
+#[cfg(feature = "dbt")]
+async fn run_dbt(
     command: Command,
     config: DetConfig,
     print_summary: bool,
@@ -1358,20 +1358,20 @@ async fn run_dbi(
 ) -> Result<Output, Error> {
     if !config.sequentialize_threads {
         return Err(anyhow!(
-            "the dbi backend requires sequentialized threads; remove \
-             --no-sequentialize-threads (or --strace-only) to run under --backend dbi"
+            "the dbt backend requires sequentialized threads; remove \
+             --no-sequentialize-threads (or --strace-only) to run under --backend dbt"
         ));
     }
 
     let config_json = serde_json::to_string(&config)
-        .map_err(|error| anyhow!("failed to serialize the Detcore config for DBI: {error}"))?;
+        .map_err(|error| anyhow!("failed to serialize the Detcore config for DBT: {error}"))?;
     let panic_on_unsupported_syscalls = config.panic_on_unsupported_syscalls;
-    let (drrun, client) = detcore_dbi::prepare_native_client()
+    let (drrun, client) = detcore_dbt::prepare_native_client()
         .map_err(|error| anyhow!("failed to prepare the Detcore DynamoRIO client: {error}"))?;
-    let mut runner = reverie_dbi::DbiRunner::new(&drrun, &client)
+    let mut runner = reverie_dbt::DbtRunner::new(&drrun, &client)
         .map_err(|error| {
             anyhow!(
-                "failed to configure the DynamoRIO DBI runner (drrun={}, client={}): {error}",
+                "failed to configure the DynamoRIO DBT runner (drrun={}, client={}): {error}",
                 drrun.display(),
                 client.display()
             )
@@ -1384,14 +1384,14 @@ async fn run_dbi(
 
     let program = command.get_program().to_owned();
     let mut environment = command.get_captured_envs();
-    environment.insert(detcore_dbi::DETCONFIG_ENV.into(), config_json.into());
+    environment.insert(detcore_dbt::DETCONFIG_ENV.into(), config_json.into());
     let guest = command.into_std_lossy();
     tracing::info!(
-        target: "hermit::dbi",
+        target: "hermit::dbt",
         program = ?program,
         drrun = %drrun.display(),
         client = %client.display(),
-        "launching guest through reverie-dbi with Detcore<DbiGuest>",
+        "launching guest through reverie-dbt with Detcore<DbtGuest>",
     );
 
     if capture_output {
@@ -1401,9 +1401,9 @@ async fn run_dbi(
                 .map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))
         };
         let mut output = launch()?;
-        if dbi_client_thread_start_failed(&output.status) {
+        if dbt_client_thread_start_failed(&output.status) {
             tracing::warn!(
-                target: "hermit::dbi",
+                target: "hermit::dbt",
                 "DynamoRIO client thread failed before guest start; retrying once",
             );
             output = launch()?;
@@ -1421,9 +1421,9 @@ async fn run_dbi(
             .map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))
     };
     let mut status = launch()?;
-    if dbi_client_thread_start_failed(&status) {
+    if dbt_client_thread_start_failed(&status) {
         tracing::warn!(
-            target: "hermit::dbi",
+            target: "hermit::dbt",
             "DynamoRIO client thread failed before guest start; retrying once",
         );
         status = launch()?;
@@ -1490,7 +1490,7 @@ fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig 
     // TODO-HUMAN-REVIEW(PR-1122): Review concurrent KVM process-child scheduling.
     config.backend_serializes_fork_children = false;
     config.backend_dispatches_thread_tools = true;
-    config.backend_requires_thread_directed_process_signals = backend == Backend::Dbi;
+    config.backend_requires_thread_directed_process_signals = backend == Backend::Dbt;
     config.backend_virtualizes_capability_prctls = backend == Backend::Kvm;
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1152): KVM defers the vfork child spawn, so the child
@@ -1527,15 +1527,15 @@ async fn run_with_backend_inner(
         .await?
         .status);
     }
-    if backend == Backend::Dbi {
-        #[cfg(feature = "dbi")]
+    if backend == Backend::Dbt {
+        #[cfg(feature = "dbt")]
         {
-            return Ok(run_dbi(command, config, print_summary, false).await?.status);
+            return Ok(run_dbt(command, config, print_summary, false).await?.status);
         }
-        #[cfg(not(feature = "dbi"))]
+        #[cfg(not(feature = "dbt"))]
         {
             backend.ensure_available()?;
-            unreachable!("DBI availability must fail when the feature is disabled");
+            unreachable!("DBT availability must fail when the feature is disabled");
         }
     }
     if backend == Backend::Sabre {
@@ -1635,15 +1635,15 @@ async fn run_with_output_backend_inner(
         )
         .await;
     }
-    if backend == Backend::Dbi {
-        #[cfg(feature = "dbi")]
+    if backend == Backend::Dbt {
+        #[cfg(feature = "dbt")]
         {
-            return run_dbi(command, config, print_summary, true).await;
+            return run_dbt(command, config, print_summary, true).await;
         }
-        #[cfg(not(feature = "dbi"))]
+        #[cfg(not(feature = "dbt"))]
         {
             backend.ensure_available()?;
-            unreachable!("DBI availability must fail when the feature is disabled");
+            unreachable!("DBT availability must fail when the feature is disabled");
         }
     }
     if backend == Backend::Sabre {
@@ -1920,16 +1920,16 @@ mod tests {
     use super::Backend;
     use super::ExitStatus;
     use super::SABRE_RPC_SOCKET_ENV;
-    #[cfg(feature = "dbi")]
-    use super::dbi_runtime_unavailable_reason;
-    #[cfg(feature = "dbi")]
+    #[cfg(feature = "dbt")]
+    use super::dbt_runtime_unavailable_reason;
+    #[cfg(feature = "dbt")]
     use super::dynamorio_sdk_available;
     use super::ensure_backend_dispatch;
-    #[cfg(feature = "dbi")]
+    #[cfg(feature = "dbt")]
     use super::is_dynamorio_sdk;
     use super::kvm_device_unavailable_reason;
     use super::liteinst_requires_forced_shutdown;
-    #[cfg(feature = "dbi")]
+    #[cfg(feature = "dbt")]
     use super::liteinst_runtime_unavailable_reason;
     use super::output_backend_stdin_file;
     use super::prepare_backend_config;
@@ -2050,8 +2050,8 @@ mod tests {
     }
 
     #[test]
-    fn dbi_backend_config_translates_process_signals_to_host_threads() {
-        let config = prepare_backend_config(super::DetConfig::default(), Backend::Dbi);
+    fn dbt_backend_config_translates_process_signals_to_host_threads() {
+        let config = prepare_backend_config(super::DetConfig::default(), Backend::Dbt);
         assert!(config.backend_requires_thread_directed_process_signals);
         assert!(!config.backend_defers_vfork_child_registration);
     }
@@ -2087,7 +2087,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "dbi")]
+    #[cfg(feature = "dbt")]
     fn default_and_available_backends_reflect_host_probes() {
         assert_eq!(Backend::default(), Backend::Ptrace);
         let available = Backend::available().collect::<Vec<_>>();
@@ -2096,8 +2096,8 @@ mod tests {
             Backend::Ptrace.is_available()
         );
         assert_eq!(
-            available.contains(&Backend::Dbi),
-            dynamorio_sdk_available() && dbi_runtime_unavailable_reason().is_none()
+            available.contains(&Backend::Dbt),
+            dynamorio_sdk_available() && dbt_runtime_unavailable_reason().is_none()
         );
         assert_eq!(
             available.contains(&Backend::Liteinst),
@@ -2118,7 +2118,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "dbi")]
+    #[cfg(feature = "dbt")]
     fn dependency_probes_require_usable_paths() {
         let temp = tempfile::tempdir().unwrap();
         assert!(!is_dynamorio_sdk(temp.path()));
@@ -2304,19 +2304,19 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "dbi")]
+    #[cfg(feature = "dbt")]
     fn optional_backends_report_accurate_availability() {
-        match Backend::Dbi.ensure_available() {
+        match Backend::Dbt.ensure_available() {
             Ok(()) => assert!(
-                dynamorio_sdk_available() && dbi_runtime_unavailable_reason().is_none(),
-                "DBI reported available without its SDK and runtime"
+                dynamorio_sdk_available() && dbt_runtime_unavailable_reason().is_none(),
+                "DBT reported available without its SDK and runtime"
             ),
-            Err(dbi_error) => {
-                let message = dbi_error.to_string();
+            Err(dbt_error) => {
+                let message = dbt_error.to_string();
                 assert!(
                     message.contains("DynamoRIO runtime")
-                        || message.contains("Detcore DBI runtime"),
-                    "unexpected DBI availability error: {message}"
+                        || message.contains("Detcore DBT runtime"),
+                    "unexpected DBT availability error: {message}"
                 );
             }
         }
@@ -2351,81 +2351,81 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "dbi")]
-    fn dbi_retries_only_the_pre_guest_bootstrap_failure() {
+    #[cfg(feature = "dbt")]
+    fn dbt_retries_only_the_pre_guest_bootstrap_failure() {
         use std::os::unix::process::ExitStatusExt as _;
 
         let failure = std::process::ExitStatus::from_raw(
-            reverie_dbi::CLIENT_THREAD_START_FAILURE_EXIT_CODE << 8,
+            reverie_dbt::CLIENT_THREAD_START_FAILURE_EXIT_CODE << 8,
         );
-        assert!(super::dbi_client_thread_start_failed(&failure));
-        assert!(!super::dbi_client_thread_start_failed(
+        assert!(super::dbt_client_thread_start_failed(&failure));
+        assert!(!super::dbt_client_thread_start_failed(
             &std::process::ExitStatus::from_raw(1 << 8)
         ));
     }
 
     #[test]
-    #[cfg(feature = "dbi")]
-    fn dbi_public_dispatch_requires_sequentialized_threads() {
+    #[cfg(feature = "dbt")]
+    fn dbt_public_dispatch_requires_sequentialized_threads() {
         let command = super::Command::new("/bin/true");
         let config = super::DetConfig {
             sequentialize_threads: false,
             ..Default::default()
         };
 
-        let error = super::run_with_output_backend(command, config, false, &None, Backend::Dbi)
-            .expect_err("DBI must reject non-sequentialized execution");
+        let error = super::run_with_output_backend(command, config, false, &None, Backend::Dbt)
+            .expect_err("DBT must reject non-sequentialized execution");
         assert!(
             error
                 .to_string()
-                .contains("dbi backend requires sequentialized threads"),
+                .contains("dbt backend requires sequentialized threads"),
             "unexpected error: {error}"
         );
     }
 
     #[test]
-    #[cfg(feature = "dbi")]
-    fn dbi_public_dispatch_runs_echo_through_detcore() {
+    #[cfg(feature = "dbt")]
+    fn dbt_public_dispatch_runs_echo_through_detcore() {
         use clap::Parser;
 
-        if Backend::Dbi.ensure_available().is_err() {
+        if Backend::Dbt.ensure_available().is_err() {
             return;
         }
 
         let mut command = super::Command::new("/bin/echo");
         command.arg("hello");
-        let mut config = super::DetConfig::parse_from(["hermit-dbi-test"]);
+        let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
         config.sequentialize_threads = true;
         config.validate();
-        let output = super::run_with_output_backend(command, config, true, &None, Backend::Dbi)
-            .expect("run /bin/echo through DbiGuest<Detcore>");
+        let output = super::run_with_output_backend(command, config, true, &None, Backend::Dbt)
+            .expect("run /bin/echo through DbtGuest<Detcore>");
 
         assert_eq!(output.status, super::ExitStatus::Exited(0));
         assert_eq!(output.stdout, b"hello\n");
         assert!(
             String::from_utf8_lossy(&output.stderr)
                 .lines()
-                .any(|line| line.starts_with("reverie-dbi: tool=Detcore ")),
-            "DBI native summary did not prove Detcore dispatch: {}",
+                .any(|line| line.starts_with("reverie-dbt: tool=Detcore ")),
+            "DBT native summary did not prove Detcore dispatch: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
 
     #[test]
-    #[cfg(feature = "dbi")]
-    fn dbi_public_status_dispatch_runs_true_through_detcore() {
+    #[cfg(feature = "dbt")]
+    fn dbt_public_status_dispatch_runs_true_through_detcore() {
         use clap::Parser;
 
-        if Backend::Dbi.ensure_available().is_err() {
+        if Backend::Dbt.ensure_available().is_err() {
             return;
         }
 
         let command = super::Command::new("/bin/true");
-        let mut config = super::DetConfig::parse_from(["hermit-dbi-test"]);
+        let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
         config.sequentialize_threads = true;
         config.validate();
-        let status = super::run_with_backend(command, config, true, &None, Backend::Dbi)
-            .expect("run /bin/true through DbiGuest<Detcore>");
+        let status = super::run_with_backend(command, config, true, &None, Backend::Dbt)
+            .expect("run /bin/true through DbtGuest<Detcore>");
 
         assert_eq!(status, super::ExitStatus::Exited(0));
     }

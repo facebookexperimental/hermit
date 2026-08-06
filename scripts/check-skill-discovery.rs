@@ -38,7 +38,7 @@ const PACKAGED_SKILLS: &[&str] = &[
 const PARENT_ONLY_ROLES: &[&str] = &[
     "hermit-ci",
     "hermit-coord",
-    "hermit-dbi",
+    "hermit-dbt",
     "hermit-kvm",
     "hermit-lander",
     "hermit-liteinst",

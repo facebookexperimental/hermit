@@ -2,7 +2,7 @@
 // introspection, with NO data transfer.
 //
 // A prior socketpair data-transfer probe was rejected: a blocking cross-process
-// socket read is scheduling-gated and livelocks under DBI. This contract instead
+// socket read is scheduling-gated and livelocks under DBT. This contract instead
 // exercises only the process-local, non-blocking facets of the socket family:
 //   - socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK) creation
 //   - the SOCK_CLOEXEC flag surfacing as FD_CLOEXEC (fcntl F_GETFD)

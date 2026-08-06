@@ -4,7 +4,7 @@
  * Detcore serializes every guest thread onto a single virtual CPU (CPU 0,
  * NUMA node 0) regardless of the physical topology of the host. This fixture
  * pins that guest-visible contract so it is byte-identical across the ptrace,
- * DBI, and KVM backends and across repeated --verify runs: a passthrough of
+ * DBT, and KVM backends and across repeated --verify runs: a passthrough of
  * getcpu / sched_getaffinity would otherwise leak the host's CPU count and the
  * scheduler's placement decisions, both of which vary run to run and host to
  * host.

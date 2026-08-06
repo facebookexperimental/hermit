@@ -14,8 +14,8 @@
  * fixed post-exec default), so the observable result depends only on the
  * program, not on the host task's inherited name, dumpable flag, keepcaps bit,
  * or parent-death signal. That makes the contract byte-identical across repeated
- * runs and across the ptrace, DBI, and KVM backends. It uses no threads, no
- * blocking I/O, and no signal delivery, so it is safe under the DBI
+ * runs and across the ptrace, DBT, and KVM backends. It uses no threads, no
+ * blocking I/O, and no signal delivery, so it is safe under the DBT
  * no-preemption scheduler.
  */
 

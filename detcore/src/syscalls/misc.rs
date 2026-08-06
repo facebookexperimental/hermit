@@ -709,7 +709,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// the real, effective, and saved user IDs are all the constant 0. Under the
     /// ptrace backend the guest runs inside a CLONE_NEWUSER namespace that already
     /// maps the host uid to 0; emulating the same constant here makes in-process
-    /// backends (DBI) agree with that golden reference instead of leaking the host
+    /// backends (DBT) agree with that golden reference instead of leaking the host
     /// uid, and the fully emulated result is bitwise-identical across --verify and
     /// record/replay.
     // AUTONOMOUS-BOT-IMPLEMENTED
