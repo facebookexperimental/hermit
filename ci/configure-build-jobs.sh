@@ -66,11 +66,11 @@ if [[ -v CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS ]]; then
     return 2
 fi
 
-# The calibration below is valid only for Reverie e159d6c. The portable wrapper
+# The calibration below is valid only for Reverie 6a6b4ec. The portable wrapper
 # obtains the repository's recorded pin through the canonical checker and
 # carries it here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != e159d6cef0fc9a75020d70e6374c7899da07868f ]]; then
-    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie e159d6cef0fc9a75020d70e6374c7899da07868f" >&2
+if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 6a6b4ec3e1806aacec0299cc46359a8f57e968fe ]]; then
+    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 6a6b4ec3e1806aacec0299cc46359a8f57e968fe" >&2
     return 2
 fi
 
@@ -147,6 +147,14 @@ fi
 # A cold local CARGO_BUILD_JOBS=4 check observed the new identity and completed
 # its native build in 30.73s (122.92 effective-job-seconds). This confirms the
 # identity transition but does not replace the slower GitHub-runner calibration.
+#
+# CARRY TO 6a6b4ec (2026-08-06). The e159d6c..6a6b4ec changes are confined to
+# reverie-kvm task lifecycle, process-tree exit accounting, and KVM tests.
+# reverie-dbi/build.rs, its vendored DynamoRIO tree, build commands, and the
+# MAX_PARALLEL_JOBS=16 clamp are byte-identical, so source_recipe_key() remains
+# sha256:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d.
+# CI_MAX_BUILD_JOB_SECONDS=572 and the measured hosted-runner budget therefore
+# carry without changing the derivation.
 #
 # Those 2026-08-05 samples deliberately do NOT replace 1050. They come from a
 # development host whose cores finish the identical work ~3.3x faster than the
