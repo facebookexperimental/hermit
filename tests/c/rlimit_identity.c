@@ -41,8 +41,36 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <unistd.h>
+
+/*
+ * getrlimit(2) and setrlimit(2) must be issued as RAW SYSCALLS.
+ *
+ * Modern glibc implements getrlimit(3)/setrlimit(3) on top of prlimit64(2), so
+ * the library wrappers never reach Detcore's getrlimit/setrlimit handlers
+ * (detcore/src/syscalls/sysinfo.rs). A wrapper-based version of this contract
+ * therefore compares prlimit64 against itself and claims coverage of two
+ * handlers it never executes.
+ *
+ * That is not hypothetical: with a one-line divergence planted in
+ * handle_getrlimit (rlim_cur + 1), the wrapper-based version of this fixture
+ * still printed rlimit-identity-ok and exited 0. Going through the raw
+ * syscalls, the same plant is caught.
+ *
+ * glibc's syscall(2) wrapper already returns -1 and sets errno, so these
+ * helpers must NOT translate the return value themselves -- doing so turns
+ * every failure into errno 1 (EPERM) and silently breaks the EINVAL refusal
+ * check below.
+ */
+static int getrlimit_raw(int resource, struct rlimit *out) {
+  return (int)syscall(SYS_getrlimit, resource, out);
+}
+
+static int setrlimit_raw(int resource, const struct rlimit *in) {
+  return (int)syscall(SYS_setrlimit, resource, in);
+}
 
 static int fail(const char *what) {
   fprintf(stderr, "rlimit-identity: %s failed: %s\n", what, strerror(errno));
@@ -55,7 +83,7 @@ int main(void) {
    * ourselves, so nothing host-specific escapes to stdout. */
   struct rlimit nofile;
   memset(&nofile, 0xff, sizeof(nofile));
-  if (getrlimit(RLIMIT_NOFILE, &nofile) != 0)
+  if (getrlimit_raw(RLIMIT_NOFILE, &nofile) != 0)
     return fail("getrlimit RLIMIT_NOFILE");
   const rlim_t hard = nofile.rlim_max;
 
@@ -65,11 +93,11 @@ int main(void) {
    * hard limit is left unchanged. */
   const rlim_t soft1 = (hard >= 64) ? (rlim_t)64 : hard;
   struct rlimit set1 = {.rlim_cur = soft1, .rlim_max = hard};
-  if (setrlimit(RLIMIT_NOFILE, &set1) != 0)
+  if (setrlimit_raw(RLIMIT_NOFILE, &set1) != 0)
     return fail("setrlimit RLIMIT_NOFILE soft1");
   struct rlimit read1;
   memset(&read1, 0xff, sizeof(read1));
-  if (getrlimit(RLIMIT_NOFILE, &read1) != 0)
+  if (getrlimit_raw(RLIMIT_NOFILE, &read1) != 0)
     return fail("getrlimit RLIMIT_NOFILE read1");
   if (read1.rlim_cur != soft1 || read1.rlim_max != hard) {
     fprintf(stderr, "rlimit-identity: soft1 round-trip mismatch\n");
@@ -100,7 +128,7 @@ int main(void) {
   }
   struct rlimit read2;
   memset(&read2, 0xff, sizeof(read2));
-  if (getrlimit(RLIMIT_NOFILE, &read2) != 0)
+  if (getrlimit_raw(RLIMIT_NOFILE, &read2) != 0)
     return fail("getrlimit RLIMIT_NOFILE read2");
   if (read2.rlim_cur != soft2 || read2.rlim_max != hard) {
     fprintf(stderr, "rlimit-identity: soft2 round-trip mismatch\n");
@@ -110,11 +138,11 @@ int main(void) {
   /* Raise the soft limit back up to the hard limit; raising the soft limit up to
    * (but not above) the hard limit is always permitted. */
   struct rlimit restore = {.rlim_cur = hard, .rlim_max = hard};
-  if (setrlimit(RLIMIT_NOFILE, &restore) != 0)
+  if (setrlimit_raw(RLIMIT_NOFILE, &restore) != 0)
     return fail("setrlimit RLIMIT_NOFILE restore");
   struct rlimit read3;
   memset(&read3, 0xff, sizeof(read3));
-  if (getrlimit(RLIMIT_NOFILE, &read3) != 0)
+  if (getrlimit_raw(RLIMIT_NOFILE, &read3) != 0)
     return fail("getrlimit RLIMIT_NOFILE read3");
   if (read3.rlim_cur != hard || read3.rlim_max != hard) {
     fprintf(stderr, "rlimit-identity: restore round-trip mismatch\n");
@@ -126,7 +154,7 @@ int main(void) {
   if (hard != RLIM_INFINITY && hard > 0) {
     struct rlimit bad = {.rlim_cur = hard, .rlim_max = hard - 1};
     errno = 0;
-    if (setrlimit(RLIMIT_NOFILE, &bad) == 0) {
+    if (setrlimit_raw(RLIMIT_NOFILE, &bad) == 0) {
       fprintf(stderr, "rlimit-identity: soft>hard was not rejected\n");
       return 1;
     }
@@ -143,7 +171,7 @@ int main(void) {
   if (hard != RLIM_INFINITY) {
     struct rlimit raise_hard = {.rlim_cur = hard, .rlim_max = hard + 1};
     errno = 0;
-    if (setrlimit(RLIMIT_NOFILE, &raise_hard) == 0) {
+    if (setrlimit_raw(RLIMIT_NOFILE, &raise_hard) == 0) {
       fprintf(stderr, "rlimit-identity: raising hard limit was permitted\n");
       return 1;
     }
