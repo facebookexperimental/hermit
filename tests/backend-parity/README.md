@@ -192,6 +192,42 @@ without per-child Detcore tool callbacks. The CPUID row similarly validates
 reverie-kvm's backend-local `KVM_SET_CPUID2` policy, not Detcore CPUID-event
 parity.
 
+### Memory-layout ADDRESSES are not a parity contract under DBT
+
+`anonymous_mmap_layout` checks that a backend places anonymous mappings
+**repeatably across its own runs**. Its name invites a stronger reading, so
+state the limit explicitly: it does **not** compare layout between backends, and
+it cannot — the guest prints absolute addresses (`multiple %p %p %p`), which a
+translator necessarily shifts.
+
+Do not add a cross-backend fixture that asserts anonymous-mmap addresses, either
+absolute **or relative**. It is unreachable for DBI, and the reason is
+structural rather than a bug to fix:
+
+* DynamoRIO's runtime makes the guest-visible address space **185 VMAs instead
+  of 25**, which changes where the kernel's top-down allocator puts the
+  **guest's own** mappings.
+* This is *not* translator allocations interleaving with the guest's. Measured:
+  under DBI four successive anonymous mmaps of 1+2+3+4 pages occupy a span of
+  **exactly the 10 pages requested, coalesced into one VMA, with zero DynamoRIO
+  allocations inside it**. The ptrace arm needs 14 pages for the same 10,
+  because of glibc loader slack. DBI packs *tighter*, not looser.
+* It is therefore also not a separability problem. DR's allocations are
+  separable by provenance (`dr_memory_is_dr_internal`, `dr_query_memory_ex`);
+  perfect separability would not move the guest's own mappings by one byte.
+  Attribution and placement are different properties.
+* There is no stable ptrace layout to match in any case. Varying the guest's
+  allocation prefix by 0–8 pages produces **nine distinct ptrace layouts and one
+  DBI layout**, and at a 7-page prefix the two backends are byte-identical.
+  Native itself shows a 1–2% tail on the same measurement.
+
+What **is** a parity contract, and does hold on every backend measured: pointer
+**ordering** between mappings, and mapping **contents**. Assert those.
+
+Evidence and reproduction: `dev-hermit` PR #60,
+`experiments/dbi-anon-mmap-layout-divergence_20260806/` (`VERDICT.md`,
+`README-prefix-sweep.md`, `interleave.txt`).
+
 ## e9patch preprocessing corpus
 
 e9patch is not a backend in this matrix. It is binary-rewriting *preprocessing*
