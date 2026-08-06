@@ -58,6 +58,13 @@
 //! generated files and files inside nested submodules are outside this check;
 //! their contents are not tracked by the Hermit repository.
 //!
+//! Every reported pin carries the commit it was read from. The checker reads
+//! the *working tree*, so in a checkout that sits behind `main` it faithfully
+//! reports the pin of an older commit — which then reads as a stale pin when
+//! compared against live Reverie `main`. A bare pin value records none of that,
+//! so the reported pin is always accompanied on stderr by its HEAD, plus a loud
+//! warning when HEAD is a strict ancestor of `origin/main`.
+//!
 //! Local use on Meta hosts:
 //!
 //! ```text
@@ -207,6 +214,76 @@ fn git_root() -> Result<PathBuf, String> {
     Ok(PathBuf::from(
         String::from_utf8_lossy(&output.stdout).trim(),
     ))
+}
+
+/// Which commit the pin was read from, so a reported pin carries its conditions.
+///
+/// A bare pin value is a proxy: it does not record the tree it came from, so a
+/// checkout sitting behind `main` yields a perfectly correct pin for an old
+/// commit that reads as a stale pin on `main`.
+///
+/// Offline by construction — only local refs are dereferenced, so `--print-pin`
+/// keeps its documented no-network contract. A stale local `origin/main` weakens
+/// the signal but cannot make it wrong in the dangerous direction: being a
+/// strict ancestor of even a stale `origin/main` still means being behind.
+struct CheckoutProvenance {
+    head: String,
+    /// `Some(main)` only when HEAD is a *strict ancestor* of local `origin/main`.
+    ///
+    /// Strict ancestry, not inequality: a PR head legitimately differs from
+    /// `main` while carrying its own commits, and must not be warned about.
+    behind_main: Option<String>,
+}
+
+fn rev_parse(root: &Path, rev: &str) -> Option<String> {
+    let output = git_in(root, &["rev-parse", "--verify", "--quiet", rev]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    is_full_sha(&value).then_some(value)
+}
+
+fn checkout_provenance(root: &Path) -> Option<CheckoutProvenance> {
+    let head = rev_parse(root, "HEAD")?;
+    let Some(main) = rev_parse(root, "refs/remotes/origin/main") else {
+        return Some(CheckoutProvenance {
+            head,
+            behind_main: None,
+        });
+    };
+    let behind = head != main
+        && git_in(root, &["merge-base", "--is-ancestor", &head, &main])
+            .is_ok_and(|output| output.status.success());
+    Some(CheckoutProvenance {
+        head,
+        behind_main: behind.then_some(main),
+    })
+}
+
+/// Emit the pin's provenance on stderr. Never touches stdout: `--print-pin`
+/// consumers capture stdout by command substitution and must keep receiving
+/// exactly the bare pin.
+fn report_provenance(provenance: Option<&CheckoutProvenance>) {
+    let Some(provenance) = provenance else {
+        eprintln!(
+            "Pin provenance: HEAD could not be resolved; the reported pin is not bound to a commit."
+        );
+        return;
+    };
+    eprintln!("Pin read from checkout HEAD {}.", provenance.head);
+    let Some(main) = &provenance.behind_main else {
+        return;
+    };
+    loud_header("CHECKOUT IS BEHIND origin/main - PIN VALUE IS HISTORICAL");
+    eprintln!("HEAD         {}", provenance.head);
+    eprintln!("origin/main  {main}");
+    eprintln!("HEAD is a strict ancestor of origin/main, so the pin reported here is the pin AT");
+    eprintln!("THAT OLDER COMMIT -- not the pin on main. Comparing it against live Reverie main");
+    eprintln!("will show a spurious 'stale pin' and can trigger a bump that is not needed.");
+    eprintln!("Fast-forward this checkout, or read the pin from main without checking it out:");
+    eprintln!("  git show origin/main:detcore/Cargo.toml");
+    eprintln!("This is a warning, not a refusal: the exit code is unchanged.");
 }
 
 fn tracked_cargo_metadata(root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -1022,9 +1099,11 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     let root = config.repo.clone().map_or_else(git_root, Ok)?;
     let scan = read_pins(&root)?;
     let pins = &scan.occurrences;
+    let provenance = checkout_provenance(&root);
 
     if config.print_pin {
         println!("{}", unique_pin(&scan)?);
+        report_provenance(provenance.as_ref());
         return Ok(0);
     }
 
@@ -1051,6 +1130,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     eprintln!(
         "Scope exclusions: non-Cargo tracked files, untracked/generated files, and nested submodule contents; tracked vendored Cargo metadata is included."
     );
+    report_provenance(provenance.as_ref());
 
     let mut by_rev: BTreeMap<&str, Vec<&PinOccurrence>> = BTreeMap::new();
     for pin in pins {
@@ -1409,6 +1489,110 @@ mod tests {
                 .status
                 .success()
         );
+    }
+
+    fn commit_file(root: &Path, name: &str, body: &str) -> String {
+        fs::write(root.join(name), body).expect("write fixture file");
+        assert!(git_in(root, &["add", name]).unwrap().status.success());
+        assert!(
+            git_in(root, &["commit", "-qm", name])
+                .unwrap()
+                .status
+                .success()
+        );
+        String::from_utf8_lossy(&git_in(root, &["rev-parse", "HEAD"]).unwrap().stdout)
+            .trim()
+            .to_string()
+    }
+
+    fn set_origin_main(root: &Path, sha: &str) {
+        assert!(
+            git_in(root, &["update-ref", "refs/remotes/origin/main", sha])
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+
+    fn checkout_detached(root: &Path, sha: &str) {
+        assert!(
+            git_in(root, &["checkout", "-q", "--detach", sha])
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+
+    /// NEGATIVE SIDE: plant a checkout that is strictly behind `origin/main`
+    /// and confirm the provenance check catches it. This is the shape that
+    /// makes a correct pin read as a stale pin.
+    #[test]
+    fn provenance_flags_a_checkout_behind_main() {
+        let root = temp_path("behind-main");
+        init_fixture_repo(&root);
+        let old = commit_file(&root, "a", "old\n");
+        let main = commit_file(&root, "b", "new\n");
+        set_origin_main(&root, &main);
+        checkout_detached(&root, &old);
+
+        let provenance = checkout_provenance(&root).expect("resolve provenance");
+        assert_eq!(provenance.head, old);
+        assert_eq!(
+            provenance.behind_main.as_deref(),
+            Some(main.as_str()),
+            "a strict ancestor of origin/main must be reported as behind"
+        );
+    }
+
+    /// POSITIVE SIDE: a checkout sitting exactly on `origin/main` must not
+    /// warn, or the warning is noise everyone learns to ignore.
+    #[test]
+    fn provenance_is_silent_at_main() {
+        let root = temp_path("at-main");
+        init_fixture_repo(&root);
+        commit_file(&root, "a", "old\n");
+        let main = commit_file(&root, "b", "new\n");
+        set_origin_main(&root, &main);
+        checkout_detached(&root, &main);
+
+        let provenance = checkout_provenance(&root).expect("resolve provenance");
+        assert_eq!(provenance.head, main);
+        assert_eq!(provenance.behind_main, None);
+    }
+
+    /// A PR head legitimately differs from `main` while carrying its own
+    /// commits. Keying on inequality instead of strict ancestry would warn on
+    /// every CI run and destroy the signal.
+    #[test]
+    fn provenance_is_silent_on_a_divergent_pr_head() {
+        let root = temp_path("pr-head");
+        init_fixture_repo(&root);
+        let base = commit_file(&root, "a", "old\n");
+        let main = commit_file(&root, "b", "new\n");
+        set_origin_main(&root, &main);
+        checkout_detached(&root, &base);
+        let pr_head = commit_file(&root, "c", "feature\n");
+
+        assert_ne!(pr_head, main);
+        let provenance = checkout_provenance(&root).expect("resolve provenance");
+        assert_eq!(provenance.head, pr_head);
+        assert_eq!(
+            provenance.behind_main, None,
+            "a divergent PR head is not 'behind main' and must not warn"
+        );
+    }
+
+    /// No `origin/main` ref (fresh clone of a fork, or a bare fixture) is a
+    /// missing authority, not a violation: report HEAD, claim nothing else.
+    #[test]
+    fn provenance_without_origin_main_reports_head_only() {
+        let root = temp_path("no-origin-main");
+        init_fixture_repo(&root);
+        let head = commit_file(&root, "a", "only\n");
+
+        let provenance = checkout_provenance(&root).expect("resolve provenance");
+        assert_eq!(provenance.head, head);
+        assert_eq!(provenance.behind_main, None);
     }
 
     #[test]
