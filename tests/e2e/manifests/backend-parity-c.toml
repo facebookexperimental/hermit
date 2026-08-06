@@ -4833,3 +4833,64 @@ dbt = "No custom edge-case arguments have been calibrated for this C guest"
 kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
+id = "backend-parity-c/hardware-trap-identity"
+description = "Cross-backend identity of HARDWARE-generated traps for tests/c/hardware_trap_identity.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 120
+occasional = false
+program = "tests/c/hardware_trap_identity.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.build]
+cflags = ["-D_GNU_SOURCE"]
+
+# Enabled set is MEASURED (2026-08-06, hermit-verify, release binary, --strict,
+# pinned env): ptrace and dbi both deliver #UD, #DE and #PF with the same signal
+# AND the same si_code as a native run. Disabled backends carry the observation
+# that disabled them, not a template default.
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace", "dbt"]
+[test.modes.verify.backends_disabled]
+sabre = "MEASURED 2026-08-06: does not deliver #UD to a child with no handler installed (child runs past ud2 and exits 99), and then HANGS on the hardware #DE case until the harness timeout. Re-enable when both are fixed."
+kvm = "Cannot complete a guest on the current host (startup livelock); no trap observation exists to compare"
+liteinst = "Unmeasured for this guest; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "The native run is the reference this fixture is compared against, not a case it asserts"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay of hardware-trap termination is not part of this contract"
+dbt = "Record/replay of hardware-trap termination is not part of this contract"
+kvm = "Record/replay of hardware-trap termination is not part of this contract"
+sabre = "Record/replay of hardware-trap termination is not part of this contract"
+liteinst = "Record/replay of hardware-trap termination is not part of this contract"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Trap identity is a fixed contract; chaos scheduling adds no signal there"
+dbt = "Trap identity is a fixed contract; chaos scheduling adds no signal there"
+kvm = "Trap identity is a fixed contract; chaos scheduling adds no signal there"
+sabre = "Trap identity is a fixed contract; chaos scheduling adds no signal there"
+liteinst = "Trap identity is a fixed contract; chaos scheduling adds no signal there"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbt = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"

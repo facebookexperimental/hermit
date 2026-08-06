@@ -908,6 +908,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/hardware_trap_identity.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/c/hardware_trap_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): pins cross-backend identity of HARDWARE-generated traps (#UD, #DE, #PF) by both wait status and siginfo si_code, with ptrace and dbi measured identical to native; SaBRe is disabled on a measured undelivered #UD and a hang on #DE"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/hello_alarm.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
       "why": "tests/c/hello_alarm.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
