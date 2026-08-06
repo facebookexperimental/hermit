@@ -40,12 +40,17 @@ pub(crate) struct ComparisonOptions<'a> {
     /// bitwise-strict — the two knobs were historically conflated behind a single
     /// `verbose` flag, which made the only bitwise comparison also the loudest.
     pub verbose: bool,
-    /// How strictly the internal DETLOG event stream is compared. This is the
+    /// How strictly the internal event stream is compared. This is the
     /// condition the verdict rests on, and is recorded verbatim in the resulting
     /// [`VerificationOutcome`] so a consumer can tell a stripped match from a
     /// bitwise one.
     pub strictness: LogCompareStrictness,
     pub compare_logs: bool,
+    /// Compare DEBUG/TRACE diagnostics in addition to the canonical INFO
+    /// envelope. This is reserved for the explicit `--verify-verbose` diagnostic
+    /// mode; an ordinary `--verify-strict` verdict must not depend on diagnostic
+    /// events merely because the caller requested that they be captured.
+    pub diagnostic_full_trace: bool,
 }
 
 /// How strictly two runs' internal logs are compared — the condition a
@@ -90,6 +95,23 @@ pub enum LogCompareStrictness {
     Canonical,
 }
 
+/// Which captured messages actually participated in the log comparison.
+///
+/// This travels in the typed report so an INFO-parity consumer never has to
+/// infer the observation envelope from the requested logging verbosity. In
+/// particular, explicitly capturing DEBUG does not silently promote those
+/// diagnostics into the `BitwiseInfoV1` verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparedLogScope {
+    /// The legacy selected DETLOG/scheduler subset used by stripped verification.
+    Deterministic,
+    /// Every INFO message, exactly; DEBUG/TRACE captures remain diagnostic.
+    Info,
+    /// Every captured message, selected only by explicit diagnostic verification.
+    FullTrace,
+}
+
 /// Versioned policy token: the only strippable datum is the real wall-clock
 /// timestamp PREFIX. Recorded in [`ComparisonSpec::stripped_prefixes`] so a
 /// consumer sees exactly which prefixes were removed, not a bare boolean.
@@ -124,17 +146,21 @@ const PARITY_CANONICALIZATIONS: &[&str] = &[CANON_ADDRESS_ORDINAL_V1];
 ///
 /// The high-level [`Self::strictness`] and the concrete flags it expands to are
 /// both recorded: a JSON consumer keying a bitwise-parity ratchet on the verdict
-/// can require `strip_lines == false` and `full_trace == true` directly, rather
-/// than having to know how a strictness label maps onto the diff engine.
+/// can require `strip_lines == false`, `full_trace == true`, and an INFO-or-
+/// stronger [`Self::log_scope`] directly, rather than having to know how a
+/// strictness label maps onto the diff engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ComparisonSpec {
     /// The strictness label the comparison ran under.
     pub strictness: LogCompareStrictness,
-    /// Whether the internal DETLOG event stream was compared at all. When
+    /// Whether the internal event stream was compared at all. When
     /// `false` (e.g. KVM concurrent mode) only stdout/stderr/exit status were
     /// compared and the strictness fields describe a log comparison that did not
     /// run — a consumer must not read such a verdict as bitwise log parity.
     pub compare_logs: bool,
+    /// The message envelope selected from the captured log. The compared-message
+    /// counts refer exactly to this scope.
+    pub log_scope: ComparedLogScope,
     /// Concrete: were numeric values, addresses, tmp paths, and timestamps
     /// normalized away wholesale before diffing (the lossy [`Stripped`] path)?
     ///
@@ -145,8 +171,10 @@ pub struct ComparisonSpec {
     /// [`Self::strip_lines`] this is lossless for parity: it discards only the
     /// raw pointer value, keeping identity, order, and aliasing.
     pub canonicalize_addresses: bool,
-    /// Concrete: was the full captured trace compared (vs. the deterministic
-    /// subset)?
+    /// Concrete: was the complete parity observation envelope compared (vs. the
+    /// legacy deterministic subset)? For `BitwiseInfoV1`, that complete envelope
+    /// is INFO and [`Self::log_scope`] records whether the explicit diagnostic
+    /// full-trace superset was requested.
     pub full_trace: bool,
     /// Concrete: was everything OTHER than the stripped prefix and the
     /// canonicalized addresses compared exactly (virtual-time timestamps,
@@ -179,18 +207,38 @@ impl ComparisonSpec {
     /// single place the strictness label maps onto `strip_lines`/`full_trace`,
     /// so the flags the diff engine sees and the flags the verdict reports can
     /// never drift apart.
-    pub fn new(strictness: LogCompareStrictness, compare_logs: bool) -> Self {
+    pub fn new(
+        strictness: LogCompareStrictness,
+        compare_logs: bool,
+        diagnostic_full_trace: bool,
+    ) -> Self {
         // Map the strictness label onto the concrete diff flags AND the versioned
         // policy tokens in one place, so the flags the engine sees, the tokens
         // the verdict reports, and the strictness label can never drift apart.
-        let (strip_lines, canonicalize_addresses, full_trace, exact_remainder) = match strictness {
-            // Lossy wholesale normalization: numbers/addresses/paths/timestamps
-            // erased; the remainder is NOT compared exactly.
-            LogCompareStrictness::Stripped => (true, false, false, false),
-            // Parity (BitwiseInfoV1): strip only the wall-clock prefix,
-            // canonicalize addresses, compare the full-trace remainder exactly.
-            LogCompareStrictness::Canonical => (false, true, true, true),
-        };
+        let (strip_lines, canonicalize_addresses, full_trace, exact_remainder, log_scope) =
+            match strictness {
+                // Lossy wholesale normalization: numbers/addresses/paths/timestamps
+                // erased; the remainder is NOT compared exactly.
+                LogCompareStrictness::Stripped => {
+                    debug_assert!(!diagnostic_full_trace);
+                    (true, false, false, false, ComparedLogScope::Deterministic)
+                }
+                // Parity (BitwiseInfoV1): strip only the wall-clock prefix,
+                // canonicalize addresses, and compare every INFO message exactly.
+                // The explicit verbose diagnostic mode compares the all-level
+                // superset without changing the canonicalization policy.
+                LogCompareStrictness::Canonical => (
+                    false,
+                    true,
+                    true,
+                    true,
+                    if diagnostic_full_trace {
+                        ComparedLogScope::FullTrace
+                    } else {
+                        ComparedLogScope::Info
+                    },
+                ),
+            };
         let (stripped_prefixes, canonicalizations): (&[&str], &[&str]) = match strictness {
             LogCompareStrictness::Stripped => (
                 &[STRIP_WALL_CLOCK_PREFIX_V1, STRIP_UNSAFE_NORMALIZATION_V1],
@@ -203,6 +251,7 @@ impl ComparisonSpec {
         ComparisonSpec {
             strictness,
             compare_logs,
+            log_scope,
             strip_lines,
             canonicalize_addresses,
             full_trace,
@@ -223,10 +272,10 @@ impl ComparisonSpec {
 
     /// The `LogComparisonMode` this spec selects for the diff engine.
     fn log_comparison_mode(&self) -> LogComparisonMode {
-        if self.full_trace {
-            LogComparisonMode::FullTrace
-        } else {
-            LogComparisonMode::Deterministic
+        match self.log_scope {
+            ComparedLogScope::Deterministic => LogComparisonMode::Deterministic,
+            ComparedLogScope::Info => LogComparisonMode::Info,
+            ComparedLogScope::FullTrace => LogComparisonMode::FullTrace,
         }
     }
 
@@ -241,8 +290,9 @@ impl ComparisonSpec {
     /// This requires the EXACT `BitwiseInfoV1` policy shape, not merely
     /// "not stripped": a generic `strip_lines = false` is inadmissible on its
     /// own. All clauses must hold:
-    /// - the full INFO event stream was compared ([`Self::full_trace`]), which is
-    ///   what carries exact virtual timestamps and syscall argument/result values;
+    /// - the full INFO event stream (or the explicit all-level diagnostic
+    ///   superset) was compared ([`Self::full_trace`] and [`Self::log_scope`]),
+    ///   which carries exact virtual timestamps and syscall argument/result values;
     /// - no lossy wholesale normalization ran (`!strip_lines`) and the remainder
     ///   was compared exactly ([`Self::exact_remainder`]);
     /// - addresses were CANONICALIZED, not erased ([`Self::canonicalize_addresses`]),
@@ -260,6 +310,10 @@ impl ComparisonSpec {
     pub fn is_bitwise_parity(&self) -> bool {
         self.compare_logs
             && self.full_trace
+            && matches!(
+                self.log_scope,
+                ComparedLogScope::Info | ComparedLogScope::FullTrace
+            )
             && !self.strip_lines
             && self.canonicalize_addresses
             && self.exact_remainder
@@ -395,9 +449,9 @@ pub struct VerificationReport {
     /// consumer cannot distinguish a stripped match from a bitwise one. `null`
     /// when no verdict was reached (see [`Verdict::NoResult`]).
     pub comparison: Option<ComparisonSpec>,
-    /// How many log messages were actually compared. `null` means the log
-    /// comparison did not run. A strict *configuration* is not proof that the
-    /// configured comparison had data, so this count is what makes
+    /// How many messages in [`ComparisonSpec::log_scope`] were actually compared.
+    /// `null` means the log comparison did not run. A strict *configuration* is
+    /// not proof that the configured comparison had data, so this count is what makes
     /// [`Self::bitwise_parity`] falsifiable.
     pub compared_log_messages: Option<ComparedLogCounts>,
     /// The guest's exit code, if it exited normally.
@@ -513,8 +567,6 @@ fn write_report_json(path: &Path, report: &VerificationReport) -> Result<(), Err
 }
 
 /// Reject an explicit log level that would suppress the events verification compares.
-///
-/// With no explicit level, the verification paths select `DEBUG` internally.
 pub(crate) fn validate_log_level(global: &GlobalOpts) -> Result<(), Error> {
     if let Some(level) = global.log
         && level < LevelFilter::INFO
@@ -525,6 +577,31 @@ pub(crate) fn validate_log_level(global: &GlobalOpts) -> Result<(), Error> {
         );
     }
     Ok(())
+}
+
+/// Resolve the capture verbosity independently from the comparison scope.
+///
+/// Canonical verification defaults to INFO because INFO is the declared
+/// `BitwiseInfoV1` observation envelope. An explicit DEBUG/TRACE request is
+/// preserved in the capture for diagnostics, but ordinary canonical comparison
+/// still selects INFO. Legacy stripped verification keeps its DEBUG default.
+/// The explicit full-trace diagnostic mode requires TRACE regardless of a lower
+/// requested level.
+pub(crate) fn verification_log_level(
+    requested: Option<LevelFilter>,
+    strictness: LogCompareStrictness,
+    diagnostic_full_trace: bool,
+) -> LevelFilter {
+    if diagnostic_full_trace {
+        requested
+            .unwrap_or(LevelFilter::TRACE)
+            .max(LevelFilter::TRACE)
+    } else {
+        requested.unwrap_or(match strictness {
+            LogCompareStrictness::Stripped => LevelFilter::DEBUG,
+            LogCompareStrictness::Canonical => LevelFilter::INFO,
+        })
+    }
 }
 
 pub fn temp_log_files(name1: &str, name2: &str) -> io::Result<(NamedTempFile, NamedTempFile)> {
@@ -544,6 +621,7 @@ pub fn setup_double_run(
     global: &GlobalOpts,
     name1: &str,
     name2: &str,
+    strictness: LogCompareStrictness,
 ) -> ((GlobalOpts, NamedTempFile), (GlobalOpts, NamedTempFile)) {
     let (file1, file2) = temp_log_files(name1, name2).unwrap();
 
@@ -554,7 +632,7 @@ pub fn setup_double_run(
     // screen.
     let mut global = global.clone();
     global.log_file = Some(path1);
-    global.log = Some(LevelFilter::DEBUG);
+    global.log = Some(verification_log_level(global.log, strictness, false));
 
     let mut global2 = global.clone();
     global2.log_file = Some(path2);
@@ -607,7 +685,11 @@ pub fn compare_two_runs(
     // Resolve the strictness label to concrete diff flags once, and carry the
     // resulting spec through to the verdict so the returned outcome records
     // exactly which comparison certified it.
-    let spec = ComparisonSpec::new(options.strictness, options.compare_logs);
+    let spec = ComparisonSpec::new(
+        options.strictness,
+        options.compare_logs,
+        options.diagnostic_full_trace,
+    );
 
     if out1.stdout != out2.stdout {
         failed = true;
@@ -809,6 +891,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn verification_capture_level_honors_info_and_preserves_explicit_debug() {
+        assert_eq!(
+            verification_log_level(None, LogCompareStrictness::Canonical, false),
+            LevelFilter::INFO
+        );
+        assert_eq!(
+            verification_log_level(
+                Some(LevelFilter::INFO),
+                LogCompareStrictness::Canonical,
+                false,
+            ),
+            LevelFilter::INFO
+        );
+        assert_eq!(
+            verification_log_level(
+                Some(LevelFilter::DEBUG),
+                LogCompareStrictness::Canonical,
+                false,
+            ),
+            LevelFilter::DEBUG,
+            "explicit DEBUG remains captured for diagnostics"
+        );
+        assert_eq!(
+            verification_log_level(None, LogCompareStrictness::Stripped, false),
+            LevelFilter::DEBUG,
+            "legacy stripped verification keeps its default"
+        );
+        assert_eq!(
+            verification_log_level(
+                Some(LevelFilter::INFO),
+                LogCompareStrictness::Stripped,
+                false,
+            ),
+            LevelFilter::INFO,
+            "an explicit INFO request must not be promoted"
+        );
+        assert_eq!(
+            verification_log_level(
+                Some(LevelFilter::INFO),
+                LogCompareStrictness::Canonical,
+                true,
+            ),
+            LevelFilter::TRACE,
+            "explicit full-trace diagnostics require TRACE capture"
+        );
+    }
+
     fn compare_with(
         left: &Output,
         left_log: TempPath,
@@ -831,6 +961,7 @@ mod tests {
                 verbose: false,
                 strictness,
                 compare_logs: true,
+                diagnostic_full_trace: false,
             },
         )
     }
@@ -855,7 +986,9 @@ mod tests {
     /// leading tag lets `extract_log_messages` accept it; " DETLOG " + "detcore:"
     /// let it survive the deterministic-message filter.
     fn detlog_with_value(value: u64) -> String {
-        format!("DEBUG detcore: [dtid 2] DETLOG [syscall] write(fd=1, count={value})\n")
+        format!(
+            "2026-08-06T01:00:00.000000Z INFO detcore: [dtid 2] DETLOG [syscall] write(fd=1, count={value})\n"
+        )
     }
 
     #[test]
@@ -946,6 +1079,7 @@ mod tests {
                 verbose: false,
                 strictness: LogCompareStrictness::Stripped,
                 compare_logs: false,
+                diagnostic_full_trace: false,
             },
         )
         .unwrap();
@@ -984,7 +1118,7 @@ mod tests {
 
     #[test]
     fn comparison_spec_maps_strictness_to_concrete_flags() {
-        let stripped = ComparisonSpec::new(LogCompareStrictness::Stripped, true);
+        let stripped = ComparisonSpec::new(LogCompareStrictness::Stripped, true, false);
         assert!(stripped.strip_lines);
         assert!(!stripped.full_trace);
         assert_eq!(
@@ -992,15 +1126,102 @@ mod tests {
             LogComparisonMode::Deterministic
         );
 
-        let canonical = ComparisonSpec::new(LogCompareStrictness::Canonical, true);
+        let canonical = ComparisonSpec::new(LogCompareStrictness::Canonical, true, false);
         assert!(!canonical.strip_lines);
         assert!(canonical.canonicalize_addresses);
         assert!(canonical.exact_remainder);
         assert!(canonical.full_trace);
+        assert_eq!(canonical.log_scope, ComparedLogScope::Info);
+        assert_eq!(canonical.log_comparison_mode(), LogComparisonMode::Info);
+
+        let diagnostic = ComparisonSpec::new(LogCompareStrictness::Canonical, true, true);
+        assert_eq!(diagnostic.log_scope, ComparedLogScope::FullTrace);
         assert_eq!(
-            canonical.log_comparison_mode(),
+            diagnostic.log_comparison_mode(),
             LogComparisonMode::FullTrace
         );
+    }
+
+    #[test]
+    fn bitwise_info_ignores_debug_diagnostics_but_rejects_real_info_divergence() {
+        let out = output(0, b"hello\n", b"");
+        let make_logs = |right_info: u64| {
+            let (left, right) = empty_logs();
+            fs::write(
+                &left,
+                format!(
+                    "{}2026-08-06T01:00:00.000001Z DEBUG detcore: diagnostic host timing=100\n",
+                    detlog_with_value(7)
+                ),
+            )
+            .unwrap();
+            fs::write(
+                &right,
+                format!(
+                    "{}2026-08-06T01:00:00.000002Z DEBUG detcore: diagnostic host timing=200\n",
+                    detlog_with_value(right_info)
+                ),
+            )
+            .unwrap();
+            (left, right)
+        };
+
+        // Positive INFO bracket: the captured DEBUG diagnostics differ, while
+        // the one INFO event on each side matches exactly.
+        let (left, right) = make_logs(7);
+        let matched =
+            compare_with(&out, left, &out, right, LogCompareStrictness::Canonical).unwrap();
+        assert_eq!(matched.verdict, Verdict::Matched);
+        assert_eq!(matched.comparison.log_scope, ComparedLogScope::Info);
+        assert_eq!(
+            matched.compared_log_messages,
+            Some(ComparedLogCounts { left: 1, right: 1 })
+        );
+        assert!(VerificationReport::from(&matched).bitwise_parity);
+
+        // Negative INFO bracket: changing the actual INFO payload must fail even
+        // though DEBUG remains outside the parity envelope.
+        let (left, right) = make_logs(8);
+        let left_path = left.to_path_buf();
+        let right_path = right.to_path_buf();
+        let info_diverged =
+            compare_with(&out, left, &out, right, LogCompareStrictness::Canonical).unwrap();
+        assert_eq!(info_diverged.verdict, Verdict::Diverged);
+        let _ = fs::remove_file(left_path);
+        let _ = fs::remove_file(right_path);
+
+        // DEBUG is still available as an explicit diagnostic comparison. The
+        // same matching INFO / differing DEBUG captures fail only when that
+        // full-trace scope is requested.
+        let (left, right) = make_logs(7);
+        let left_path = left.to_path_buf();
+        let right_path = right.to_path_buf();
+        let debug_diverged = compare_two_runs(
+            ComparedRun {
+                output: &out,
+                log: left,
+            },
+            ComparedRun {
+                output: &out,
+                log: right,
+            },
+            ComparisonOptions {
+                success_message: "verified",
+                failure_message: "failed",
+                verbose: true,
+                strictness: LogCompareStrictness::Canonical,
+                compare_logs: true,
+                diagnostic_full_trace: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(debug_diverged.verdict, Verdict::Diverged);
+        assert_eq!(
+            debug_diverged.comparison.log_scope,
+            ComparedLogScope::FullTrace
+        );
+        let _ = fs::remove_file(left_path);
+        let _ = fs::remove_file(right_path);
     }
 
     // The core of the strip-lines/verdict decoupling: two runs whose logs differ
@@ -1269,6 +1490,7 @@ mod tests {
             serde_json::json!(false)
         );
         assert_eq!(parsed["comparison"]["full_trace"], serde_json::json!(true));
+        assert_eq!(parsed["comparison"]["log_scope"], serde_json::json!("info"));
         assert_eq!(
             parsed["comparison"]["compare_logs"],
             serde_json::json!(true)
@@ -1300,7 +1522,7 @@ mod tests {
     fn bitwise_parity_contract_accepts_only_full_unfiltered_comparison() {
         // Positive: the exact qualifying comparison the `--verify-strict` path
         // produces.
-        let full = ComparisonSpec::new(LogCompareStrictness::Canonical, true);
+        let full = ComparisonSpec::new(LogCompareStrictness::Canonical, true, false);
         assert!(
             full.is_bitwise_parity(),
             "a full-INFO unstripped unfiltered comparison must qualify"
@@ -1308,7 +1530,7 @@ mod tests {
 
         // Negatives: each independent weakening of the qualifying spec must be
         // refused, so no single relaxed dimension can pass as bitwise parity.
-        let stripped = ComparisonSpec::new(LogCompareStrictness::Stripped, true);
+        let stripped = ComparisonSpec::new(LogCompareStrictness::Stripped, true, false);
         assert!(
             !stripped.is_bitwise_parity(),
             "a stripped comparison normalizes away the parity-relevant data"
@@ -1339,6 +1561,10 @@ mod tests {
             // full_trace off (Deterministic-mode subset) is also below bitwise.
             ComparisonSpec {
                 full_trace: false,
+                ..full
+            },
+            ComparisonSpec {
+                log_scope: ComparedLogScope::Deterministic,
                 ..full
             },
         ] {

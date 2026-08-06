@@ -30,6 +30,10 @@ pub enum LogComparisonMode {
     /// Compare deterministic Detcore and scheduler messages.
     #[default]
     Deterministic,
+    /// Compare every INFO message exactly, while leaving any captured DEBUG or
+    /// TRACE messages available for diagnostics. This is the observation
+    /// envelope used by the `BitwiseInfoV1` verification policy.
+    Info,
     /// Compare every captured log message without filtering.
     FullTrace,
 }
@@ -783,8 +787,8 @@ fn log_diff_summary_from_strs(
 
     let detcore_a = filter_detcore(&all_a);
     let detcore_b = filter_detcore(&all_b);
-    let infos_a = filter_infos(&detcore_a);
-    let infos_b = filter_infos(&detcore_b);
+    let infos_a = filter_infos(&all_a);
+    let infos_b = filter_infos(&all_b);
     let detlogs_a = opts.filter_deterministic(&detcore_a);
     let detlogs_b = opts.filter_deterministic(&detcore_b);
     let left_syscalls = collect_syscalls(&all_a);
@@ -822,6 +826,7 @@ fn log_diff_summary_from_strs(
 
     let (which, compared_a, compared_b) = match opts.comparison {
         LogComparisonMode::Deterministic => ("DETLOG", &detlogs_a, &detlogs_b),
+        LogComparisonMode::Info => ("INFO", &infos_a, &infos_b),
         LogComparisonMode::FullTrace => ("full trace", &all_a, &all_b),
     };
 
@@ -1040,6 +1045,48 @@ mod test {
         assert!(output.contains("clock_gettime(CLOCK_MONOTONIC, 101)"));
         assert!(output.contains("run 1"));
         assert!(output.contains("run 2"));
+        Ok(())
+    }
+
+    #[test]
+    fn info_scope_compares_info_exactly_without_promoting_debug_diagnostics() -> std::io::Result<()>
+    {
+        let stable_info = "2026-08-06T01:00:00.000000Z INFO detcore: DETLOG [syscall] finish syscall #1: write(1, 0x2, 1) = Ok(1)";
+        let left = format!(
+            "{stable_info}\n2026-08-06T01:00:00.000001Z DEBUG detcore: diagnostic host timing=100"
+        );
+        let right = format!(
+            "{stable_info}\n2026-08-06T01:00:00.000002Z DEBUG detcore: diagnostic host timing=200"
+        );
+        let info = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::Info,
+            no_color: true,
+            ..Default::default()
+        };
+
+        // Positive bracket: DEBUG remains present in both captures, but the
+        // BitwiseInfoV1 envelope selects exactly the one INFO event per side.
+        let matched = super::log_diff_summary_from_strs(&left, &right, &info, &mut Vec::new())?;
+        assert!(matched.matched_with_evidence());
+        assert_eq!(matched.compared_left, 1);
+        assert_eq!(matched.compared_right, 1);
+
+        // Negative bracket: a real INFO payload difference must still fail.
+        let divergent_info = right.replace("write(1, 0x2, 1)", "write(1, 0x6, 1)");
+        let diverged =
+            super::log_diff_summary_from_strs(&left, divergent_info, &info, &mut Vec::new())?;
+        assert!(diverged.diff_found);
+
+        // DEBUG comparison remains an explicit diagnostic mode rather than an
+        // implicit part of INFO parity.
+        let full_trace = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::FullTrace,
+            no_color: true,
+            ..Default::default()
+        };
+        let debug_diverged =
+            super::log_diff_summary_from_strs(left, right, &full_trace, &mut Vec::new())?;
+        assert!(debug_diverged.diff_found);
         Ok(())
     }
 

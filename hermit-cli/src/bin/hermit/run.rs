@@ -23,7 +23,6 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::LazyLock;
 
-use ::tracing::metadata::LevelFilter;
 use clap::Parser;
 use colored::Colorize;
 use detcore_model::happens_before::HappensBeforeProgram;
@@ -59,6 +58,7 @@ use super::verify::LogCompareStrictness;
 use super::verify::compare_two_runs;
 use super::verify::temp_log_files;
 use super::verify::validate_log_level;
+use super::verify::verification_log_level;
 use super::verify::write_pending_verification_json;
 use super::verify::write_verification_json;
 
@@ -321,8 +321,11 @@ pub struct RunOpts {
     /// the real wall-clock timestamp prefix (genuinely irreproducible),
     /// canonicalize host memory addresses to first-appearance ordinals (so an
     /// ASLR shift is tolerated but allocation-order and aliasing changes still
-    /// diverge), and compare everything else — virtual-time timestamps, raw
-    /// syscall argument/result values, counts, sizes, flags — exactly. Without
+    /// diverge), and compare every INFO message's remaining bytes — virtual-time
+    /// timestamps, raw syscall argument/result values, counts, sizes, flags —
+    /// exactly. An explicit `--log=debug` or `--log=trace` remains captured for
+    /// `--verify-logs` diagnostics but does not change this INFO verdict; use
+    /// `--verify-verbose` to request an all-level diagnostic comparison. Without
     /// this (and without --verify-verbose) the default `--verify` normalizes away
     /// numbers, addresses, tmp paths, and timestamps before comparing, so a
     /// "verified" result asserts only stripped parity, not bitwise identity.
@@ -349,7 +352,8 @@ pub struct RunOpts {
     /// With --verify, write the verification verdict as a single JSON line to
     /// this path: `{"verified":bool,"bitwise_parity":bool,
     /// "verdict":"matched"|"diverged","comparison":{"strictness":
-    /// "stripped"|"canonical","compare_logs":bool,"strip_lines":bool,
+    /// "stripped"|"canonical","compare_logs":bool,"log_scope":
+    /// "deterministic"|"info"|"full_trace","strip_lines":bool,
     /// "canonicalize_addresses":bool,"full_trace":bool,"exact_remainder":bool,
     /// "stripped_prefixes":[str],"canonicalizations":[str],"ignore_lines":bool,
     /// "skip_commit":bool,"skip_detlog":bool},"guest_exit_code":int|null,
@@ -2782,6 +2786,7 @@ impl RunOpts {
                     LogCompareStrictness::Stripped
                 },
                 compare_logs: !kvm_output_only,
+                diagnostic_full_trace: self.verify_verbose,
             },
         )?;
 
@@ -3109,12 +3114,12 @@ impl RunOpts {
         // `log_file` by value. Guaranteed by caller to never panic.
         let log_file = log_file.take().unwrap();
 
-        let minimum_level = if self.verify_verbose {
-            LevelFilter::TRACE
+        let strictness = if self.verify_verbose || self.verify_strict {
+            LogCompareStrictness::Canonical
         } else {
-            LevelFilter::DEBUG
+            LogCompareStrictness::Stripped
         };
-        let level = global.log.unwrap_or(minimum_level).max(minimum_level);
+        let level = verification_log_level(global.log, strictness, self.verify_verbose);
 
         let _guard = init_file_tracing(Some(level), log_file);
 

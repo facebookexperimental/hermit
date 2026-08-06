@@ -201,7 +201,8 @@ pub struct StartOpts {
     /// With --verify, write the verification verdict as a single JSON line to
     /// this path: `{"verified":bool,"bitwise_parity":bool,
     /// "verdict":"matched"|"diverged","comparison":{"strictness":
-    /// "stripped"|"canonical","compare_logs":bool,"strip_lines":bool,
+    /// "stripped"|"canonical","compare_logs":bool,"log_scope":
+    /// "deterministic"|"info"|"full_trace","strip_lines":bool,
     /// "canonicalize_addresses":bool,"full_trace":bool,"exact_remainder":bool,
     /// "stripped_prefixes":[str],"canonicalizations":[str],"ignore_lines":bool,
     /// "skip_commit":bool,"skip_detlog":bool},"guest_exit_code":int|null,
@@ -221,8 +222,10 @@ pub struct StartOpts {
     /// parity policy: strip only the real wall-clock timestamp prefix, canonicalize
     /// host memory addresses to first-appearance ordinals (tolerating an ASLR
     /// shift while still diverging on allocation-order or aliasing changes), and
-    /// compare everything else — virtual-time timestamps, raw syscall
-    /// argument/result values, counts, sizes, flags — exactly. Without this the
+    /// compare every INFO message's remaining bytes — virtual-time timestamps,
+    /// raw syscall argument/result values, counts, sizes, flags — exactly. An
+    /// explicit DEBUG/TRACE level remains captured for diagnostics but does not
+    /// change the INFO verdict. Without this the
     /// default `--verify` normalizes away numbers, addresses, tmp paths, and
     /// timestamps before comparing, so a "verified" result asserts only stripped
     /// parity, not bitwise identity. A record/replay determinism ratchet keying on
@@ -411,7 +414,13 @@ impl StartOpts {
         if let Some(path) = &self.verify_json {
             write_pending_verification_json(path)?;
         }
-        let ((global1, log1), (global2, log2)) = setup_double_run(global, "record", "replay");
+        let strictness = if self.verify_strict {
+            LogCompareStrictness::Canonical
+        } else {
+            LogCompareStrictness::Stripped
+        };
+        let ((global1, log1), (global2, log2)) =
+            setup_double_run(global, "record", "replay", strictness);
 
         let (mut recording_container, _record_identity_guard) = self.recording_container(global)?;
 
@@ -462,12 +471,9 @@ impl StartOpts {
                 success_message: "Success: replay matched recording.",
                 failure_message: "Recording output did not match replay output!",
                 verbose: false,
-                strictness: if self.verify_strict {
-                    LogCompareStrictness::Canonical
-                } else {
-                    LogCompareStrictness::Stripped
-                },
+                strictness,
                 compare_logs: true,
+                diagnostic_full_trace: false,
             },
         )?;
 
