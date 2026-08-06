@@ -1221,3 +1221,61 @@ kvm = "Record/replay identity of file timestamps is a separate contract"
 liteinst = "Record/replay identity of file timestamps is a separate contract"
 ptrace = "Record/replay identity of file timestamps is a separate contract"
 sabre = "Record/replay identity of file timestamps is a separate contract"
+
+[[test]]
+id = "system-utils/startup-surface-identity"
+description = "argv, environ order, the full auxv vector (incl. AT_RANDOM bytes and the raw vDSO base) and initial stack layout are identical across repeated Hermit runs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 120
+occasional = false
+program = "tests/c/startup_surface_identity.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.build]
+cflags = ["-O0", "-D_GNU_SOURCE"]
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbt = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away"
+kvm = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away"
+liteinst = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away"
+sabre = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "Native is the NEGATIVE control: AT_RANDOM, the vDSO base and stack addresses differ every run by design, so this cell must never be enabled"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+dbt = "The startup surface is fixed before main() and is not what chaos scheduling perturbs"
+kvm = "The startup surface is fixed before main() and is not what chaos scheduling perturbs"
+liteinst = "The startup surface is fixed before main() and is not what chaos scheduling perturbs"
+ptrace = "The startup surface is fixed before main() and is not what chaos scheduling perturbs"
+sabre = "The startup surface is fixed before main() and is not what chaos scheduling perturbs"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+dbt = "No custom multi-run assertion is needed; verify's double-run comparison is the whole contract"
+kvm = "No custom multi-run assertion is needed; verify's double-run comparison is the whole contract"
+liteinst = "No custom multi-run assertion is needed; verify's double-run comparison is the whole contract"
+ptrace = "No custom multi-run assertion is needed; verify's double-run comparison is the whole contract"
+sabre = "No custom multi-run assertion is needed; verify's double-run comparison is the whole contract"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+dbt = "Record/replay identity of the startup surface is a separate contract and is not what this fixture pins"
+kvm = "Record/replay identity of the startup surface is a separate contract and is not what this fixture pins"
+liteinst = "Record/replay identity of the startup surface is a separate contract and is not what this fixture pins"
+ptrace = "Record/replay identity of the startup surface is a separate contract and is not what this fixture pins"
+sabre = "Record/replay identity of the startup surface is a separate contract and is not what this fixture pins"

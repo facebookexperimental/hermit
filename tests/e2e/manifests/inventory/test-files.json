@@ -1628,6 +1628,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/startup_surface_identity.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/system-utils.toml",
+      "why": "tests/c/startup_surface_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/system-utils.toml: prints argv, environ in order, the full auxv vector including the AT_RANDOM bytes and the raw vDSO base, and the initial stack layout, and branches on those values so verify's double run asserts identity of both the inputs and the decisions made from them"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/statmount_enosys.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
       "why": "tests/c/statmount_enosys.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
