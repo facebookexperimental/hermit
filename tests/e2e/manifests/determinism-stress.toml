@@ -272,8 +272,8 @@ ci = true
 # not curate individual seeds, and never restore diversity by relaxing the
 # assertions below or by weakening --strict/--chaos.
 #
-# Seed sweeps, ptrace chaos, portable profile, devbig 316-core host, each
-# 64 seeds x 2 runs = 128 invocations
+# Seed sweeps, ptrace chaos, portable profile, one 316-core x86_64 host,
+# each 64 seeds x 2 runs = 128 invocations
 # (--log=off run --backend ptrace --strict --chaos --sched-heuristic=random
 #  --seed=N --no-virtualize-cpuid --max-timeslice=disabled):
 #   2026-08-06, build A @ 4c70658e7858: failures 18 of 64 (28.1%)
