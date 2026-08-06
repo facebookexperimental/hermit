@@ -224,6 +224,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/event_delivery_ordering.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
+      "why": "tests/backend-parity/fixtures/event_delivery_ordering.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): it is the deliberate complement to inotify_watch.c and signalfd_create.c, which both stop short of reading an event; ptrace is calibrated for blocking verification, DBI does not complete the guest and KVM omits the inotify family"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/eventfd_probe.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/eventfd_probe.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
