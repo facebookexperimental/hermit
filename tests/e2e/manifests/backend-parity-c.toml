@@ -1671,7 +1671,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt"]
 [test.modes.verify.backends_disabled]
 kvm = "Fresh shared-manifest L2 revalidation timed out at the 90-second contract on current main; requalify KVM before enabling this cell"
@@ -1963,7 +1963,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but liteinst FAIL (exit 1), sabre FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but liteinst FAIL (exit 1), sabre FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "sabre", "liteinst"]
 [test.modes.verify.backends_disabled]
 dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
@@ -2196,7 +2196,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but sabre FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but sabre FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "sabre"]
 [test.modes.verify.backends_disabled]
 dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
@@ -3426,7 +3426,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -3663,7 +3663,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt"]
 [test.modes.verify.backends_disabled]
 kvm = "inherited from the L1 KVM prctl_identity gap: PR_SET_NAME returns ENOSYS so the guest exits non-zero and there is no L2 run to verify"
@@ -3725,7 +3725,7 @@ cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -4248,7 +4248,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -4305,7 +4305,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -4362,7 +4362,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -4419,7 +4419,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -4476,7 +4476,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -4534,7 +4534,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -4592,7 +4592,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
