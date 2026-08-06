@@ -20,8 +20,7 @@ program = "tests/backend-parity/fixtures/aio_refusal.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -80,8 +79,7 @@ program = "tests/backend-parity/fixtures/set_tid_address.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -202,8 +200,7 @@ program = "tests/backend-parity/fixtures/cachestat_refusal.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -261,8 +258,7 @@ program = "tests/backend-parity/fixtures/child_subreaper_refusal.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (PASSES, NOT YET ENABLED): ptrace verify PASSED locally, measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Held ci=false pending one clean full-family sweep plus the matching ci/expected-e2e-plan.json regeneration; enable then."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -320,8 +316,7 @@ program = "tests/backend-parity/fixtures/close_range_fds.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -380,8 +375,7 @@ program = "tests/backend-parity/fixtures/copy_file_range_refusal.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -440,8 +434,7 @@ program = "tests/backend-parity/fixtures/cpuid_probe.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (measured red): ptrace verify did not pass, measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build)."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
@@ -500,8 +493,7 @@ program = "tests/backend-parity/fixtures/epoll_pwait2_readiness.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -560,8 +552,7 @@ program = "tests/backend-parity/fixtures/epoll_readiness.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (PASSES, NOT YET ENABLED): ptrace verify PASSED locally, measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Held ci=false pending one clean full-family sweep plus the matching ci/expected-e2e-plan.json regeneration; enable then."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -620,8 +611,7 @@ program = "tests/backend-parity/fixtures/faccessat2_flags.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -683,8 +673,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (PASSES, NOT YET ENABLED): ptrace verify PASSED locally, measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Held ci=false pending one clean full-family sweep plus the matching ci/expected-e2e-plan.json regeneration; enable then."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -743,8 +732,7 @@ program = "tests/backend-parity/fixtures/fallocate_extents.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -803,8 +791,7 @@ program = "tests/backend-parity/fixtures/fchmod_bits.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -863,8 +850,7 @@ program = "tests/backend-parity/fixtures/file_backed_mmap.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -922,8 +908,7 @@ program = "tests/backend-parity/fixtures/flock_lifecycle.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -982,8 +967,7 @@ program = "tests/backend-parity/fixtures/fsync_durability.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1042,8 +1026,7 @@ program = "tests/backend-parity/fixtures/getrusage_self_accounting.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (PASSES, NOT YET ENABLED): ptrace verify PASSED locally, measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Held ci=false pending one clean full-family sweep plus the matching ci/expected-e2e-plan.json regeneration; enable then."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1102,8 +1085,7 @@ program = "tests/backend-parity/fixtures/inotify_watch.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (PASSES, NOT YET ENABLED): ptrace verify PASSED locally, measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Held ci=false pending one clean full-family sweep plus the matching ci/expected-e2e-plan.json regeneration; enable then."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1161,8 +1143,7 @@ program = "tests/backend-parity/fixtures/ioctl_fionread.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (PASSES, NOT YET ENABLED): ptrace verify PASSED locally, measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Held ci=false pending one clean full-family sweep plus the matching ci/expected-e2e-plan.json regeneration; enable then."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1220,8 +1201,7 @@ program = "tests/backend-parity/fixtures/kcmp_refusal.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1279,8 +1259,7 @@ program = "tests/backend-parity/fixtures/linkat_flags.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1339,8 +1318,7 @@ program = "tests/backend-parity/fixtures/mce_kill_policy.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1398,8 +1376,7 @@ program = "tests/backend-parity/fixtures/memfd_create.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1458,8 +1435,7 @@ program = "tests/backend-parity/fixtures/mempolicy_default.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1517,8 +1493,7 @@ program = "tests/backend-parity/fixtures/mincore_residency.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1577,8 +1552,7 @@ program = "tests/backend-parity/fixtures/mkdir_rmdir.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1637,8 +1611,7 @@ program = "tests/backend-parity/fixtures/mknod_special.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1698,7 +1671,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt"]
 [test.modes.verify.backends_disabled]
 kvm = "Fresh shared-manifest L2 revalidation timed out at the 90-second contract on current main; requalify KVM before enabling this cell"
@@ -1756,8 +1729,7 @@ program = "tests/backend-parity/fixtures/name_to_handle.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1815,8 +1787,7 @@ program = "tests/backend-parity/fixtures/no_new_privs_refusal.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1874,8 +1845,7 @@ program = "tests/backend-parity/fixtures/openat2_refusal.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1933,8 +1903,7 @@ program = "tests/backend-parity/fixtures/path_file_ops.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1994,7 +1963,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but liteinst FAIL (exit 1), sabre FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "sabre", "liteinst"]
 [test.modes.verify.backends_disabled]
 dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
@@ -2051,8 +2020,7 @@ program = "tests/backend-parity/fixtures/pipe2_flags.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2111,8 +2079,7 @@ program = "tests/backend-parity/fixtures/prctl_pdeathsig.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2170,8 +2137,7 @@ program = "tests/backend-parity/fixtures/preadv2_flags.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2230,7 +2196,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but sabre FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "sabre"]
 [test.modes.verify.backends_disabled]
 dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
@@ -2288,8 +2254,7 @@ program = "tests/backend-parity/fixtures/readdir_entries.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2348,8 +2313,7 @@ program = "tests/backend-parity/fixtures/rename_ops.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2408,8 +2372,7 @@ program = "tests/backend-parity/fixtures/renameat2_flags.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2467,8 +2430,7 @@ program = "tests/backend-parity/fixtures/robust_list.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2526,8 +2488,7 @@ program = "tests/backend-parity/fixtures/seccomp_refusal.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2585,8 +2546,7 @@ program = "tests/backend-parity/fixtures/signalfd_create.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2644,8 +2604,7 @@ program = "tests/backend-parity/fixtures/statfs_free_determinism.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2703,8 +2662,7 @@ program = "tests/backend-parity/fixtures/statx_metadata.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2763,8 +2721,7 @@ program = "tests/backend-parity/fixtures/symlink_ops.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2823,8 +2780,7 @@ program = "tests/backend-parity/fixtures/sync_file_range.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2882,8 +2838,7 @@ program = "tests/backend-parity/fixtures/sysv_ipc_refusal.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2941,8 +2896,7 @@ program = "tests/backend-parity/fixtures/thp_disable.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3000,8 +2954,7 @@ program = "tests/backend-parity/fixtures/umask_mode.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3060,8 +3013,7 @@ program = "tests/backend-parity/fixtures/uname_identity.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT forwards the host uname(2) nodename instead of pinning it; ptrace and KVM determinize the hostname, DBT leaks the real host name"
@@ -3119,8 +3071,7 @@ program = "tests/backend-parity/fixtures/utimensat_determinism.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3179,8 +3130,7 @@ program = "tests/backend-parity/fixtures/socket_options.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3239,8 +3189,7 @@ program = "tests/backend-parity/fixtures/shutdown_socketpair.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3299,8 +3248,7 @@ program = "tests/backend-parity/fixtures/sockname_unnamed.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3359,8 +3307,7 @@ program = "tests/backend-parity/fixtures/bind_getsockname.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3419,8 +3366,7 @@ program = "tests/backend-parity/fixtures/msync_writeback.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3480,7 +3426,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -3537,8 +3483,7 @@ program = "tests/backend-parity/fixtures/sendfile_copy.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3597,8 +3542,7 @@ program = "tests/backend-parity/fixtures/poll_readiness.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3660,8 +3604,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3720,7 +3663,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt"]
 [test.modes.verify.backends_disabled]
 kvm = "inherited from the L1 KVM prctl_identity gap: PR_SET_NAME returns ENOSYS so the guest exits non-zero and there is no L2 run to verify"
@@ -3782,7 +3725,7 @@ cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -3839,8 +3782,7 @@ program = "tests/backend-parity/fixtures/pipe_ipc.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3898,8 +3840,7 @@ program = "tests/backend-parity/fixtures/vectored_io.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3957,8 +3898,7 @@ program = "tests/backend-parity/fixtures/eventfd_probe.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -4016,8 +3956,7 @@ program = "tests/backend-parity/fixtures/ftruncate_sparse.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -4075,8 +4014,7 @@ program = "tests/backend-parity/fixtures/vectored_file_io.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -4134,8 +4072,7 @@ program = "tests/backend-parity/fixtures/openat_flags.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -4193,8 +4130,7 @@ program = "tests/backend-parity/fixtures/fchmodat2_flags.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -4253,8 +4189,7 @@ program = "tests/backend-parity/fixtures/socketpair_flags.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -4313,7 +4248,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -4370,7 +4305,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -4427,7 +4362,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -4484,7 +4419,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -4541,7 +4476,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -4599,7 +4534,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -4657,7 +4592,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
+ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build, devbig014), twice at different concurrency with identical verdicts. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -4717,8 +4652,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -4780,8 +4714,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -4843,8 +4776,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -4906,8 +4838,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -4969,8 +4900,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -5032,8 +4962,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"

@@ -142,7 +142,7 @@
       "cmd": "./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/test_harness.sh run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/backend-parity-c/results.jsonl --junit ignored/e2e/portable/backend-parity-c/junit.xml",
       "deps": ["build.e2e_artifact", "build.manifest_guests", "e2e.metadata"],
       "timeout": 600,
-      "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 5,
+      "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 40,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "latency-bound"}
     },
