@@ -542,6 +542,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/short_io_split_identity.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
+      "why": "tests/backend-parity/fixtures/short_io_split_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): completion and return-value sanity are asserted in-guest while the partial-transfer split itself is printed and pinned by the harness stdout comparison; ptrace is calibrated for blocking verification, DBI does not complete the guest and KVM does not start"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/shutdown_socketpair.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/shutdown_socketpair.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
