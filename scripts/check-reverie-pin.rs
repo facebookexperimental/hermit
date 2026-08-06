@@ -714,7 +714,18 @@ fn rewrite_manifest_pins(scan: &PinScan, main: &str) -> Result<(usize, usize), S
         })
         .map(|occurrence| occurrence.path.as_path())
         .collect();
-    let mut changed_files = 0;
+    // ALL-OR-NOTHING. The bump spans ~20 revision entries across ~8 manifests, and a tree with
+    // some advanced is worse than one with none: consumers grepping the pin see two answers, and
+    // the next agent inherits a half-applied bump with no record of which half. Writing straight
+    // through the loop had exactly that failure mode -- measured, by making one late manifest
+    // unwritable: 18 of 20 entries advanced, 2 left stale, nothing restored. The post-condition in
+    // `update_to_latest` caught the inconsistency afterwards but could not undo it, and detection
+    // without restoration still leaves the tree broken.
+    //
+    // Compute every replacement first; write only once all are known; undo the writes already made
+    // if a later one fails. Rollback can itself fail, so a partial rollback names the exact files
+    // rather than being swallowed -- that is the one state a human must be told about.
+    let mut planned: Vec<(&Path, String, String)> = Vec::new();
     let mut changed_entries = 0;
     for path in manifest_paths {
         let original = fs::read_to_string(path)
@@ -726,12 +737,38 @@ fn rewrite_manifest_pins(scan: &PinScan, main: &str) -> Result<(usize, usize), S
             updated = updated.replace(*old, main);
         }
         if updated != original {
-            fs::write(path, updated)
-                .map_err(|error| format!("could not update {}: {error}", path.display()))?;
-            changed_files += 1;
+            planned.push((path, original, updated));
         }
     }
-    Ok((changed_files, changed_entries))
+
+    let mut written: Vec<(&Path, &str)> = Vec::new();
+    for (path, original, updated) in &planned {
+        match fs::write(path, updated) {
+            Ok(()) => written.push((path, original.as_str())),
+            Err(error) => {
+                let mut unrestored = Vec::new();
+                for (done_path, done_original) in &written {
+                    if fs::write(done_path, done_original).is_err() {
+                        unrestored.push(done_path.display().to_string());
+                    }
+                }
+                let restored = written.len() - unrestored.len();
+                let mut message = format!(
+                    "could not update {}: {error}; rolled back {restored} already-written \
+                     manifest(s) so the tree is not left partially bumped",
+                    path.display()
+                );
+                if !unrestored.is_empty() {
+                    message.push_str(&format!(
+                        ". ROLLBACK INCOMPLETE -- still advanced, restore by hand: {}",
+                        unrestored.join(", ")
+                    ));
+                }
+                return Err(message);
+            }
+        }
+    }
+    Ok((written.len(), changed_entries))
 }
 
 /// The one site that records a JUDGEMENT rather than a reference.
