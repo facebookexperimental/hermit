@@ -4656,3 +4656,22 @@ dbt = "No custom edge-case arguments have been calibrated for this C guest"
 kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
+id = "backend-parity-c/stat-metadata-identity"
+description = "Contract fixture: stat/fstat/lstat/statx metadata (st_ino, st_dev, timestamps incl. statx btime, st_nlink, st_blocks) does not leak host state; timestamps come from continuous virtual time (identical double-run AND still advancing within a run); includes a branch on an inode comparison."
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 120
+occasional = false
+program = "tests/backend-parity/fixtures/stat_metadata_identity.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbi = "Not buildable on the authoring host (cmake absent); qualify DBI separately"
+kvm = "KVM does not complete a guest on the authoring host; qualify KVM separately"
+sabre = "Not buildable on the authoring host (cmake absent); qualify SaBRe separately"
+liteinst = "LiteInst preload handshake fails on the authoring host; qualify LiteInst separately"
