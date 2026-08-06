@@ -23,6 +23,18 @@ use toml::Value;
 
 const KNOWN_BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
+/// Buckets where `ci = false` is not allowed to be a silent default.
+///
+/// `backends_disabled` has always required a per-backend reason, but `ci =
+/// false` switches a whole mode-cell off with no justification at all — so a
+/// generated cell is born not-running and nothing records that it is. In the
+/// buckets listed here, every `ci = false` mode must carry a non-empty
+/// `ci_disabled_reason`, and every `ci = true` mode must omit it (a leftover
+/// reason on a running cell is stale documentation).
+///
+/// This is a ratchet: add a bucket once its cells all carry reasons. Cells
+/// outside these buckets may still carry `ci_disabled_reason` voluntarily.
+const CI_REASON_REQUIRED_BUCKETS: [&str; 1] = ["backend-parity-c"];
 const MATRIX_SYMMETRY_BASELINE: &str = "ci/matrix-symmetry-baseline.json";
 const TEST_INVENTORY: &str = "tests/e2e/manifests/inventory/test-files.json";
 
@@ -599,6 +611,40 @@ fn validate_observation(test: &Value, id: &str) {
     }
 }
 
+/// Enforce that a switched-off mode-cell says why it is switched off.
+///
+/// Only applies to [`CI_REASON_REQUIRED_BUCKETS`]. The rule is symmetric on
+/// purpose: `ci = false` must explain itself, and `ci = true` must not carry a
+/// reason, so flipping a cell on forces the stale justification to be deleted
+/// in the same edit rather than left behind to mislead the next reader.
+fn validate_ci_disabled_reason(
+    id: &str,
+    bucket: &str,
+    mode: &str,
+    spec: &toml::map::Map<String, Value>,
+    ci: bool,
+) {
+    if !CI_REASON_REQUIRED_BUCKETS.contains(&bucket) {
+        return;
+    }
+    let reason = spec.get("ci_disabled_reason");
+    if ci {
+        if reason.is_some() {
+            die(format!(
+                "{id}: modes.{mode} is CI-enabled, so it must not carry ci_disabled_reason"
+            ));
+        }
+        return;
+    }
+    match reason.and_then(Value::as_str) {
+        Some(text) if !text.trim().is_empty() => {}
+        _ => die(format!(
+            "{id}: modes.{mode} sets ci = false and must state why in a non-empty \
+             ci_disabled_reason (bucket `{bucket}` forbids a silent default-off cell)"
+        )),
+    }
+}
+
 fn validate_mode(
     id: &str,
     bucket: &str,
@@ -611,7 +657,13 @@ fn validate_mode(
     let spec = spec_value
         .as_table()
         .unwrap_or_else(|| die(format!("{id}: modes.{mode} must be a table")));
-    let mut allowed = vec!["ci", "backends_enabled", "backends_disabled", "guest_args"];
+    let mut allowed = vec![
+        "ci",
+        "ci_disabled_reason",
+        "backends_enabled",
+        "backends_disabled",
+        "guest_args",
+    ];
     match mode {
         "naked" => allowed.extend(["runs", "assert"]),
         "chaos" => allowed.extend(["seeds", "assert"]),
@@ -646,6 +698,7 @@ fn validate_mode(
         .get("ci")
         .and_then(Value::as_bool)
         .unwrap_or_else(|| die(format!("{id}: modes.{mode}.ci must be a boolean")));
+    validate_ci_disabled_reason(id, bucket, mode, spec, ci);
     let enabled = string_array(
         spec.get("backends_enabled"),
         &format!("{id}.modes.{mode}.backends_enabled"),
@@ -921,6 +974,107 @@ liteinst = "unsupported"
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].backend, "ptrace");
         assert!(rows[0].ci);
+    }
+
+    const REASON_BUCKET: &str = CI_REASON_REQUIRED_BUCKETS[0];
+
+    fn disabled_verify_spec(extra: &str) -> Value {
+        parse_mode(&format!(
+            r#"
+ci = false
+backends_enabled = ["ptrace"]
+{extra}
+
+[backends_disabled]
+dbi = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#
+        ))
+    }
+
+    #[test]
+    #[should_panic(expected = "must state why in a non-empty ci_disabled_reason")]
+    fn rejects_silent_default_off_cell_in_ratcheted_bucket() {
+        validate_mode(
+            "bucket/test",
+            REASON_BUCKET,
+            "portable",
+            "verify",
+            &disabled_verify_spec(""),
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must state why in a non-empty ci_disabled_reason")]
+    fn rejects_blank_ci_disabled_reason() {
+        validate_mode(
+            "bucket/test",
+            REASON_BUCKET,
+            "portable",
+            "verify",
+            &disabled_verify_spec(r#"ci_disabled_reason = "   ""#),
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    fn accepts_default_off_cell_that_states_a_reason() {
+        let mut rows = Vec::new();
+        validate_mode(
+            "bucket/test",
+            REASON_BUCKET,
+            "portable",
+            "verify",
+            &disabled_verify_spec(r#"ci_disabled_reason = "fixture does not compile""#),
+            &mut rows,
+        );
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].ci);
+    }
+
+    #[test]
+    #[should_panic(expected = "must not carry ci_disabled_reason")]
+    fn rejects_stale_reason_on_enabled_cell() {
+        let spec = parse_mode(
+            r#"
+ci = true
+backends_enabled = ["ptrace"]
+ci_disabled_reason = "left over from when this was off"
+
+[backends_disabled]
+dbi = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            REASON_BUCKET,
+            "portable",
+            "verify",
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    fn leaves_unratcheted_buckets_alone() {
+        // The ratchet must not silently impose the rule on every other bucket;
+        // those still carry bare `ci = false` and must keep validating.
+        let mut rows = Vec::new();
+        validate_mode(
+            "bucket/test",
+            "c-programs",
+            "portable",
+            "verify",
+            &disabled_verify_spec(""),
+            &mut rows,
+        );
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]

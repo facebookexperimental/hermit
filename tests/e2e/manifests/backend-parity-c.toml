@@ -21,6 +21,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -30,12 +31,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -46,6 +49,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -56,6 +60,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -76,6 +81,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -85,12 +91,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -101,6 +109,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -111,6 +120,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -143,12 +153,14 @@ liteinst = "Not yet qualified for the personality(2) execution-domain round-trip
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "Native Linux is used as a focused correctness oracle; repeated native execution is not a nondeterminism contract"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the strict personality-domain contract"
@@ -159,6 +171,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "The process-local personality round-trip has no schedule-diversity oracle"
@@ -169,6 +182,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No additional personality-domain edge-case arguments are calibrated"
@@ -189,6 +203,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -198,12 +213,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -214,6 +231,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -224,6 +242,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -243,6 +262,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (PASSES, NOT YET ENABLED): ptrace verify PASSED locally, measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Held ci=false pending one clean full-family sweep plus the matching ci/expected-e2e-plan.json regeneration; enable then."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -252,12 +272,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -268,6 +290,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -278,6 +301,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -297,6 +321,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -306,12 +331,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -322,6 +349,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -332,6 +360,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -352,6 +381,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -361,12 +391,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -377,6 +409,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -387,6 +420,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -407,6 +441,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (measured red): ptrace verify did not pass, measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build)."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
@@ -416,12 +451,14 @@ liteinst = "Initial C-corpus migration preserves the established ptrace baseline
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -432,6 +469,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -442,6 +480,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -462,6 +501,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -471,12 +511,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -487,6 +529,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -497,6 +540,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -517,6 +561,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (PASSES, NOT YET ENABLED): ptrace verify PASSED locally, measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Held ci=false pending one clean full-family sweep plus the matching ci/expected-e2e-plan.json regeneration; enable then."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -526,12 +571,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -542,6 +589,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -552,6 +600,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -572,6 +621,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -581,12 +631,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -597,6 +649,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -607,6 +660,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -630,6 +684,7 @@ cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (PASSES, NOT YET ENABLED): ptrace verify PASSED locally, measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Held ci=false pending one clean full-family sweep plus the matching ci/expected-e2e-plan.json regeneration; enable then."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -639,12 +694,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -655,6 +712,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -665,6 +723,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -685,6 +744,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -694,12 +754,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -710,6 +772,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -720,6 +783,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -740,6 +804,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -749,12 +814,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -765,6 +832,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -775,6 +843,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -795,6 +864,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -804,12 +874,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -820,6 +892,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -830,6 +903,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -849,6 +923,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -858,12 +933,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -874,6 +951,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -884,6 +962,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -904,6 +983,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -913,12 +993,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -929,6 +1011,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -939,6 +1022,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -959,6 +1043,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (PASSES, NOT YET ENABLED): ptrace verify PASSED locally, measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Held ci=false pending one clean full-family sweep plus the matching ci/expected-e2e-plan.json regeneration; enable then."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -968,12 +1053,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -984,6 +1071,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -994,6 +1082,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -1014,6 +1103,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (PASSES, NOT YET ENABLED): ptrace verify PASSED locally, measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Held ci=false pending one clean full-family sweep plus the matching ci/expected-e2e-plan.json regeneration; enable then."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1023,12 +1113,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -1039,6 +1131,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -1049,6 +1142,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -1068,6 +1162,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (PASSES, NOT YET ENABLED): ptrace verify PASSED locally, measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Held ci=false pending one clean full-family sweep plus the matching ci/expected-e2e-plan.json regeneration; enable then."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1077,12 +1172,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -1093,6 +1190,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -1103,6 +1201,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -1122,6 +1221,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1131,12 +1231,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -1147,6 +1249,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -1157,6 +1260,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -1176,6 +1280,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1185,12 +1290,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -1201,6 +1308,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -1211,6 +1319,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -1231,6 +1340,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1240,12 +1350,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -1256,6 +1368,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -1266,6 +1379,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -1285,6 +1399,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1294,12 +1409,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -1310,6 +1427,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -1320,6 +1438,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -1340,6 +1459,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1349,12 +1469,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -1365,6 +1487,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -1375,6 +1498,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -1394,6 +1518,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1403,12 +1528,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -1419,6 +1546,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -1429,6 +1557,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -1449,6 +1578,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1458,12 +1588,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -1474,6 +1606,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -1484,6 +1617,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -1504,6 +1638,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1513,12 +1648,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -1529,6 +1666,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -1539,6 +1677,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -1559,6 +1698,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace", "dbt"]
 [test.modes.verify.backends_disabled]
 kvm = "Fresh shared-manifest L2 revalidation timed out at the 90-second contract on current main; requalify KVM before enabling this cell"
@@ -1567,12 +1707,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -1583,6 +1725,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -1593,6 +1736,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -1613,6 +1757,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1622,12 +1767,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -1638,6 +1785,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -1648,6 +1796,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -1667,6 +1816,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1676,12 +1826,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -1692,6 +1844,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -1702,6 +1855,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -1721,6 +1875,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1730,12 +1885,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -1746,6 +1903,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -1756,6 +1914,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -1775,6 +1934,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1784,12 +1944,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -1800,6 +1962,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -1810,6 +1973,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -1830,6 +1994,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace", "sabre", "liteinst"]
 [test.modes.verify.backends_disabled]
 dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
@@ -1837,12 +2002,14 @@ kvm = "Initial C-corpus migration preserves the established ptrace baseline; qua
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -1853,6 +2020,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -1863,6 +2031,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -1883,6 +2052,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1892,12 +2062,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -1908,6 +2080,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -1918,6 +2091,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -1938,6 +2112,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -1947,12 +2122,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -1963,6 +2140,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -1973,6 +2151,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -1992,6 +2171,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2001,12 +2181,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -2017,6 +2199,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -2027,6 +2210,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -2046,6 +2230,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace", "sabre"]
 [test.modes.verify.backends_disabled]
 dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
@@ -2054,12 +2239,14 @@ liteinst = "Initial C-corpus migration preserves the established ptrace baseline
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -2070,6 +2257,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -2080,6 +2268,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -2100,6 +2289,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2109,12 +2299,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -2125,6 +2317,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -2135,6 +2328,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -2155,6 +2349,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2164,12 +2359,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -2180,6 +2377,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -2190,6 +2388,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -2210,6 +2409,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2219,12 +2419,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -2235,6 +2437,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -2245,6 +2448,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -2264,6 +2468,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2273,12 +2478,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -2289,6 +2496,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -2299,6 +2507,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -2318,6 +2527,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2327,12 +2537,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -2343,6 +2555,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -2353,6 +2566,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -2372,6 +2586,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2381,12 +2596,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -2397,6 +2614,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -2407,6 +2625,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -2426,6 +2645,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2435,12 +2655,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -2451,6 +2673,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -2461,6 +2684,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -2480,6 +2704,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2489,12 +2714,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -2505,6 +2732,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -2515,6 +2743,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -2535,6 +2764,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2544,12 +2774,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -2560,6 +2792,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -2570,6 +2803,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -2590,6 +2824,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2599,12 +2834,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -2615,6 +2852,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -2625,6 +2863,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -2644,6 +2883,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2653,12 +2893,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -2669,6 +2911,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -2679,6 +2922,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -2698,6 +2942,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2707,12 +2952,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -2723,6 +2970,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -2733,6 +2981,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -2752,6 +3001,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2761,12 +3011,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -2777,6 +3029,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -2787,6 +3040,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -2807,6 +3061,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT forwards the host uname(2) nodename instead of pinning it; ptrace and KVM determinize the hostname, DBT leaks the real host name"
@@ -2816,12 +3071,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -2832,6 +3089,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -2842,6 +3100,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -2861,6 +3120,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2870,12 +3130,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -2886,6 +3148,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -2896,6 +3159,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -2916,6 +3180,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2925,12 +3190,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -2941,6 +3208,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -2951,6 +3219,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -2971,6 +3240,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -2980,12 +3250,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -2996,6 +3268,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -3006,6 +3279,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -3026,6 +3300,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3035,12 +3310,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -3051,6 +3328,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -3061,6 +3339,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -3081,6 +3360,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3090,12 +3370,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -3106,6 +3388,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -3116,6 +3399,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -3136,6 +3420,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3145,12 +3430,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -3161,6 +3448,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -3171,6 +3459,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -3191,6 +3480,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -3198,12 +3488,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -3214,6 +3506,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -3224,6 +3517,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -3244,6 +3538,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3253,12 +3548,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -3269,6 +3566,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -3279,6 +3577,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -3299,6 +3598,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3308,12 +3608,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -3324,6 +3626,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -3334,6 +3637,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -3357,6 +3661,7 @@ cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3366,12 +3671,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -3382,6 +3689,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -3392,6 +3700,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -3411,6 +3720,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace", "dbt"]
 [test.modes.verify.backends_disabled]
 kvm = "inherited from the L1 KVM prctl_identity gap: PR_SET_NAME returns ENOSYS so the guest exits non-zero and there is no L2 run to verify"
@@ -3419,12 +3729,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -3435,6 +3747,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -3445,6 +3758,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -3468,6 +3782,7 @@ cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -3475,12 +3790,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -3491,6 +3808,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -3501,6 +3819,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -3521,6 +3840,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3530,12 +3850,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -3546,6 +3868,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -3556,6 +3879,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -3575,6 +3899,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3584,12 +3909,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -3600,6 +3927,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -3610,6 +3938,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -3629,6 +3958,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3638,12 +3968,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -3654,6 +3986,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -3664,6 +3997,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -3683,6 +4017,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3692,12 +4027,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -3708,6 +4045,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -3718,6 +4056,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -3737,6 +4076,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3746,12 +4086,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -3762,6 +4104,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -3772,6 +4115,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -3791,6 +4135,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3800,12 +4145,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -3816,6 +4163,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -3826,6 +4174,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -3845,6 +4194,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3854,12 +4204,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -3870,6 +4222,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -3880,6 +4233,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -3900,6 +4254,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -3909,12 +4264,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -3925,6 +4282,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -3935,6 +4293,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -3954,6 +4313,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -3961,12 +4321,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -3977,6 +4339,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -3987,6 +4350,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -4006,6 +4370,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -4013,12 +4378,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -4029,6 +4396,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -4039,6 +4407,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -4058,6 +4427,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -4065,12 +4435,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -4081,6 +4453,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -4091,6 +4464,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -4110,6 +4484,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -4117,12 +4492,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -4133,6 +4510,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -4143,6 +4521,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -4162,6 +4541,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -4169,12 +4549,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -4185,6 +4567,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -4195,6 +4578,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -4215,6 +4599,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -4222,12 +4607,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -4238,6 +4625,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -4248,6 +4636,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -4268,6 +4657,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (BROKEN FIXTURE): the guest does not compile under the harness's cc -std=c11 -O2 -g -Wall -Wextra -Werror -- missing _GNU_SOURCE and/or headers, so -Werror=implicit-function-declaration is fatal; measured 2026-08-06 at hermit 4c70658e785834737cbe1524f77330c781a6f5ea (ptrace, portable lane, debug build). Fix the fixture before enabling."
 backends_enabled = ["ptrace", "dbt", "kvm"]
 [test.modes.verify.backends_disabled]
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
@@ -4275,12 +4665,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -4291,6 +4683,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -4301,6 +4694,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -4324,6 +4718,7 @@ cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -4333,12 +4728,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -4349,6 +4746,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -4359,6 +4757,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -4382,6 +4781,7 @@ cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -4391,12 +4791,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -4407,6 +4809,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -4417,6 +4820,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -4440,6 +4844,7 @@ cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -4449,12 +4854,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -4465,6 +4872,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -4475,6 +4883,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -4498,6 +4907,7 @@ cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -4507,12 +4917,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -4523,6 +4935,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -4533,6 +4946,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -4556,6 +4970,7 @@ cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -4565,12 +4980,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -4581,6 +4998,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -4591,6 +5009,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -4614,6 +5033,7 @@ cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (NEVER MEASURED): the guest compiles, but ptrace verify has never been run for it at any commit -- no pass/fail is known. Measure before enabling."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
@@ -4623,12 +5043,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -4639,6 +5061,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -4649,6 +5072,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"

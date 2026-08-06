@@ -77,6 +77,18 @@ REPO_ROOT = SCRIPT_DIR.parent.parent
 MANIFEST = REPO_ROOT / "tests/e2e/manifests/backend-parity-c.toml"
 INVENTORY = REPO_ROOT / "tests/e2e/manifests/inventory/test-files.json"
 BUCKET = "backend-parity-c"
+
+# Every generated mode-cell is born `ci = false`, because a cell that has never
+# been executed cannot be claimed as coverage. What must NOT be silent is *why*.
+# ci/manifest-plan rejects a backend-parity-c cell that sets `ci = false` without
+# a reason, so the birth default carries this one until somebody measures the
+# cell and replaces it (or enables the cell and deletes it).
+BIRTH_CI_DISABLED_REASON = (
+    "NOT-EXERCISED (NEVER MEASURED): newly generated cell; ptrace verify has never "
+    "been run for it at any commit -- no pass/fail is known. Measure it, then either "
+    "enable the cell and delete this reason, or replace this reason with the "
+    "measured verdict and its commit."
+)
 REPO = "rrnewton/hermit"
 
 # Fixtures whose determinism contract needs a privileged lane (CPUID interception
@@ -236,6 +248,10 @@ def render_test_block(plan: Plan) -> str:
         "",
         "[test.modes.verify]",
         "ci = false",
+        # A generated cell has never been run, so it is born not-running WITH a
+        # reason saying exactly that. ci/manifest-plan enforces this for the
+        # backend-parity-c bucket; do not emit a bare `ci = false`.
+        f'ci_disabled_reason = "{_escape(BIRTH_CI_DISABLED_REASON)}"',
         f"backends_enabled = [{enabled_toml}]",
         "[test.modes.verify.backends_disabled]",
     ]
@@ -246,12 +262,14 @@ def render_test_block(plan: Plan) -> str:
         "",
         "[test.modes.naked]",
         "ci = false",
+        'ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."',
         "backends_enabled = []",
         "[test.modes.naked.backends_disabled]",
         'native = "This migration inventories strict verification; it does not assert native nondeterminism"',
         "",
         "[test.modes.replay]",
         "ci = false",
+        'ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."',
         "backends_enabled = []",
         "[test.modes.replay.backends_disabled]",
         'ptrace = "Record/replay qualification is separate from the initial strict-verification migration"',
@@ -262,6 +280,7 @@ def render_test_block(plan: Plan) -> str:
         "",
         "[test.modes.chaos]",
         "ci = false",
+        'ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."',
         "backends_enabled = []",
         "[test.modes.chaos.backends_disabled]",
         'ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"',
@@ -272,6 +291,7 @@ def render_test_block(plan: Plan) -> str:
         "",
         "[test.modes.custom]",
         "ci = false",
+        'ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."',
         "backends_enabled = []",
         "[test.modes.custom.backends_disabled]",
         'ptrace = "No custom edge-case arguments have been calibrated for this C guest"',
