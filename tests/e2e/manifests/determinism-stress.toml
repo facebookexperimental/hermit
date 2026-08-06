@@ -307,6 +307,23 @@ ci = true
 # clustered (build B has a run of twelve consecutive same-class seeds at the
 # head of the prefix), so independence understates the risk at small N.
 seeds = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]
+#
+# OUTCOME CEILING / ORACLE SATURATION. order_violation.c has exactly TWO
+# observable outcomes: Thread1 either reads global_str before Thread2 stores it
+# (prints the null-use error, exit 1) or after (prints "Hello world!", exit 0).
+# So min_distinct = 2 is simultaneously this oracle's floor AND the guest's
+# ceiling: the count is SATURATED and can only ever catch a total collapse to
+# one class, never a partial narrowing. Declaring the ceiling makes that
+# visible on every recorded row (`oracle_saturated: true`) instead of letting a
+# pinned `distinct = 2` read as strength. For this guest the only available
+# degree signal is the class BALANCE, recorded by the harness as
+# normalized_entropy / minority_share. No `min_normalized_entropy` floor is set
+# here: measured normalized entropy at this cell's own width (32) spans
+# 0.544-0.954 across four builds, so any floor tight enough to catch a real
+# narrowing would red-line a healthy build. Desaturating the COUNT needs a
+# guest with more than two outcome classes; see determinism-stress/thread-
+# interleaving, which carries the derived min_distinct floor.
+outcome_classes = 2
 assert = { min_distinct = 2, min_passes = 1, min_failures = 1 }
 backends_enabled = ["ptrace"]
 [test.modes.chaos.backends_disabled]

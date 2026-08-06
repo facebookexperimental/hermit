@@ -2756,6 +2756,7 @@ function append_result {
     local test_id=$1 category=$2 lane=$3 mode=$4 backend=$5 outcome=$6 duration_ms=$7 reason=$8
     local path_evidence=$9
     local error_kind=${10}
+    local diversity=${11:-null}
     local test_file test_sha256 binary_sha256 effective_args guest_args guest_backend relaxations log_level classification kind
     test_file=${TEST_BY_ID[$test_id]}
     if [[ -f $test_file ]]; then
@@ -2834,7 +2835,8 @@ function append_result {
         --argjson guest_args "$guest_args" \
         --argjson relaxations "$relaxations" \
         --argjson path_evidence "$path_evidence" \
-        '{schema:2,run_id:$run_id,hermit_sha:$hermit_sha,source_tree_dirty:$source_tree_dirty,
+        --argjson diversity "$diversity" \
+        '{schema:3,run_id:$run_id,hermit_sha:$hermit_sha,source_tree_dirty:$source_tree_dirty,
           binary_sha256:(if $binary_sha256 == "" then null else $binary_sha256 end),
           test_sha256:$test_sha256,test:$test,category:$category,lane:$lane,mode:$mode,
           backend:(if $backend == "" then null else $backend end),classification:$classification,
@@ -2844,6 +2846,7 @@ function append_result {
           log_level:(if $log_level == "" then null else $log_level end),
           effective_args:$effective_args,guest_args:$guest_args,
           relaxations:$relaxations,preprocessor:null,execution_path:$path_evidence,
+          diversity:$diversity,
           reason:(if $reason == "" then null else $reason end)}' >>"$RESULTS"
 }
 
@@ -2859,7 +2862,7 @@ function run_cell {
     prepare_cell_dirs "$cell_dir"
     start_ms=$(date +%s%3N)
 
-    local outcome=PASS reason='' error_kind='' path_evidence=null launch_refusal_stderr=''
+    local outcome=PASS reason='' error_kind='' path_evidence=null launch_refusal_stderr='' diversity=null
     local timeout_reason='' prepare_status=0
     prepare_test "$test" "$cell_dir" "$timeout_seconds" || prepare_status=$?
     if ((prepare_status != 0)); then
@@ -2904,11 +2907,15 @@ function run_cell {
     elif [[ $mode == chaos ]]; then
         local min_distinct min_passes min_failures seed row1 row2 status1 hash1 status2 hash2
         local stdout1 stderr1 execution1 stdout2 stderr2 execution2
+        local outcome_classes min_normalized_entropy
         local passes=0 failures=0 repeat_mismatches=0
         local -a hashes=()
         min_distinct=$(jq -r '.modes.chaos.assert.min_distinct // 2' <<<"$metadata")
         min_passes=$(jq -r '.modes.chaos.assert.min_passes // 0' <<<"$metadata")
         min_failures=$(jq -r '.modes.chaos.assert.min_failures // 0' <<<"$metadata")
+        outcome_classes=$(jq -r '.modes.chaos.outcome_classes // 0' <<<"$metadata")
+        min_normalized_entropy=$(jq -r \
+            '.modes.chaos.assert.min_normalized_entropy // "none"' <<<"$metadata")
         while IFS= read -r seed; do
             row1=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" "seed-$seed-a" "$seed")
             IFS=$'\t' read -r status1 hash1 stdout1 stderr1 execution1 <<<"$row1"
@@ -2950,11 +2957,88 @@ function run_cell {
         else
             local distinct
             distinct=$(printf '%s\n' "${hashes[@]}" | LC_ALL=C sort -u | wc -l)
-            if ((repeat_mismatches > 0 || distinct < min_distinct || passes < min_passes || failures < min_failures)); then
+            # DEGREE-SENSITIVE DIVERSITY. `distinct` saturates at the guest's
+            # outcome-class ceiling: on a two-class guest it can only read 1 or 2, so
+            # `distinct >= 2` is simultaneously the floor and the ceiling and cannot
+            # distinguish a healthy 32/32 split from a nearly-collapsed 63/1 one. Both
+            # are "distinct=2" and both pass. The distribution over classes does not
+            # saturate, so we compute it and record it on every chaos row:
+            #   * entropy_bits        raw Shannon entropy of the class histogram
+            #   * normalized_entropy  entropy / log2(outcome_classes), i.e. relative to
+            #                         what THIS guest could possibly express. Dividing
+            #                         by log2(observed classes) instead would report
+            #                         1.0 for any uniform split and would saturate in
+            #                         the same way `distinct` does.
+            #   * minority_share      smallest class as a fraction of the sweep; the
+            #                         plain-language version of the same signal.
+            # A partial narrowing moves all three while `distinct` stays pinned.
+            local class_histogram spread entropy_bits normalized_entropy minority_share
+            class_histogram=$(printf '%s\n' "${hashes[@]}" | LC_ALL=C sort | uniq -c \
+                | LC_ALL=C sort -rn \
+                | awk '{printf "%s%s:%s", (NR > 1 ? "," : ""), substr($2, 1, 12), $1}')
+            spread=$(printf '%s\n' "${hashes[@]}" | LC_ALL=C sort | uniq -c \
+                | awk -v classes="$outcome_classes" '
+                    { count[NR] = $1; total += $1 }
+                    END {
+                        if (total == 0) { printf "0.0000 0.0000 0.0000"; exit }
+                        bits = 0
+                        least = count[1]
+                        for (i = 1; i <= NR; i++) {
+                            share = count[i] / total
+                            if (share > 0) bits -= share * log(share) / log(2)
+                            if (count[i] < least) least = count[i]
+                        }
+                        norm = (classes >= 2) ? bits / (log(classes) / log(2)) : 0
+                        printf "%.4f %.4f %.4f", bits, norm, least / total
+                    }')
+            read -r entropy_bits normalized_entropy minority_share <<<"$spread"
+            # An oracle whose pass threshold sits ON the guest ceiling can only catch
+            # total collapse. Say so in the record rather than letting a pinned
+            # `distinct` read as strength.
+            local oracle_saturated=false
+            if ((outcome_classes > 0 && min_distinct >= outcome_classes)); then
+                oracle_saturated=true
+            fi
+            local entropy_short=0
+            if [[ $min_normalized_entropy != none ]]; then
+                entropy_short=$(awk -v observed="$normalized_entropy" \
+                    -v floor="$min_normalized_entropy" \
+                    'BEGIN { print (observed < floor) ? 1 : 0 }')
+            fi
+            diversity=$(jq -cn \
+                --argjson distinct "$distinct" \
+                --argjson outcome_classes "$outcome_classes" \
+                --argjson seeds "${#hashes[@]}" \
+                --argjson entropy_bits "$entropy_bits" \
+                --argjson normalized_entropy "$normalized_entropy" \
+                --argjson minority_share "$minority_share" \
+                --argjson oracle_saturated "$oracle_saturated" \
+                --arg class_histogram "$class_histogram" \
+                --arg min_normalized_entropy "$min_normalized_entropy" \
+                '{distinct:$distinct,
+                  outcome_classes:(if $outcome_classes == 0 then null else $outcome_classes end),
+                  seeds:$seeds,entropy_bits:$entropy_bits,
+                  normalized_entropy:$normalized_entropy,minority_share:$minority_share,
+                  oracle_saturated:$oracle_saturated,class_histogram:$class_histogram,
+                  min_normalized_entropy:(if $min_normalized_entropy == "none" then null
+                                          else ($min_normalized_entropy | tonumber) end)}')
+            local diversity_summary
+            diversity_summary="distinct=$distinct/${outcome_classes:-?}"
+            diversity_summary+=" entropy=$normalized_entropy ($entropy_bits bits)"
+            diversity_summary+=" minority_share=$minority_share classes=[$class_histogram]"
+            diversity_summary+=" oracle_saturated=$oracle_saturated"
+            if ((repeat_mismatches > 0 || distinct < min_distinct || passes < min_passes \
+                || failures < min_failures || entropy_short == 1)); then
                 outcome=FAIL
-                reason="chaos distinct=$distinct passes=$passes failures=$failures repeat_mismatches=$repeat_mismatches"
+                reason="chaos $diversity_summary passes=$passes failures=$failures"
+                reason+=" repeat_mismatches=$repeat_mismatches"
+                if ((entropy_short == 1)); then
+                    reason+="; normalized entropy $normalized_entropy below floor"
+                    reason+=" $min_normalized_entropy (diversity narrowed without collapsing)"
+                fi
             else
-                reason="chaos distinct=$distinct passes=$passes failures=$failures; every seed reproduced"
+                reason="chaos $diversity_summary passes=$passes failures=$failures;"
+                reason+=" every seed reproduced"
             fi
         fi
     elif [[ $mode == custom ]]; then
@@ -3045,7 +3129,7 @@ function run_cell {
 
     end_ms=$(date +%s%3N)
     duration_ms=$((end_ms - start_ms))
-    append_result "$id" "$category" "$lane" "$mode" "$backend" "$outcome" "$duration_ms" "$reason" "$path_evidence" "$error_kind"
+    append_result "$id" "$category" "$lane" "$mode" "$backend" "$outcome" "$duration_ms" "$reason" "$path_evidence" "$error_kind" "$diversity"
     printf '%-5s %-10s %-11s %-9s %s%s\n' "$outcome" "$lane" "$mode" "${backend:--}" "$id" \
         "${reason:+ - $reason}"
     [[ $outcome == PASS ]]
