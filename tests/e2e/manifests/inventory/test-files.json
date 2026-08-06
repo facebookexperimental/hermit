@@ -3239,6 +3239,18 @@
       "path": "tests/util/ssl_server.py",
       "runner": "scripts/validate.rs or Hermit integration targets",
       "why": "tests/util/ssl_server.py is owned by scripts/validate.rs or Hermit integration targets: The `ssl_server` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/backend-parity/measurements/README.md",
+      "runner": "maintainers of tests/e2e/manifests/backend-parity-c.toml",
+      "why": "tests/backend-parity/measurements/README.md is owned by maintainers of tests/e2e/manifests/backend-parity-c.toml: This note records the method and the traps behind the measured verify sweeps that justify each ci flag in the backend-parity-c manifest, so a later flip cites recorded evidence instead of re-deriving it. It is documentation consumed by humans; no runner reads it and the generic manifest must not treat it as guest input."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/backend-parity/measurements/verify-sweep-6e1b59af0.tsv",
+      "runner": "maintainers of tests/e2e/manifests/backend-parity-c.toml",
+      "why": "tests/backend-parity/measurements/verify-sweep-6e1b59af0.tsv is owned by maintainers of tests/e2e/manifests/backend-parity-c.toml: This table is the recorded per-cell verify evidence, one row per declared test and backend pair with both sweep verdicts, that every ci = true flag in the backend-parity-c manifest rests on. It is inert recorded data read by reviewers rather than by any runner, and the generic manifest must not schedule it as an executable guest."
     }
   ],
   "schema": 2

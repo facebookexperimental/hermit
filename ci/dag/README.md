@@ -107,6 +107,12 @@ The centralized manifests use an explicit build barrier before execution:
    exporting exact `HERMIT_BIN` and `HERMIT_INSTALL_DIR` paths. Parallel Cargo
    tests may then relink `target/debug/hermit` or restage `target/install_pkg`
    without invalidating a running bucket.
+4. `e2e.audit_compile_backend_parity_c` compiles every C guest that bucket
+   declares, `ci=false` cells included. Nothing else in the DAG ever builds a
+   disabled cell, so without this node a disabled fixture rots invisibly — it
+   never reaches `-Werror`, and "the file is in the repo" quietly stops meaning
+   "the file builds". It fails closed: zero guests compiled, or a filter that
+   selects nothing, is a failure rather than a vacuous pass.
 
 Every run node carries a structured `manifest` selector as well as its command.
 `ci/test_harness.sh audit-ci` derives the expected bucket set from the TOMLs,

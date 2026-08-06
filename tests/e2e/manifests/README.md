@@ -161,6 +161,16 @@ inventory is mechanically complete.
 or reclassifying a `ci=true` cell fails validation until the expected plan is
 updated in the same review.
 
+A `ci = false` cell is never executed **and never compiled**, so its guest can
+rot without any node noticing. Two mechanisms bound that. In
+`CI_REASON_REQUIRED_BUCKETS` (currently `backend-parity-c`), `manifest-plan`
+rejects `ci = false` without a non-empty `ci_disabled_reason`, and rejects a
+stale reason left behind on a `ci = true` cell — so switching a cell off states
+why, and switching it on deletes the excuse in the same edit. Separately,
+`./ci/test_harness.sh audit-compile --category <bucket>` compiles every C guest
+the bucket declares regardless of its `ci` flag; it is wired into the portable
+DAG for `backend-parity-c` and fails closed on zero compiled.
+
 Use the load-bearing entrypoints:
 
 ```sh

@@ -83,6 +83,7 @@ Usage:
   ci/test_harness.sh audit-test-footprints
   ci/test_harness.sh audit-test-binary-registration
   ci/test_harness.sh audit-ci
+  ci/test_harness.sh audit-compile [--lane LANE] [--category CATEGORY] [--test ID]
 
 Filters:
   --lane LANE             portable or privileged
@@ -3130,6 +3131,54 @@ function run_required {
     ((failures == 0))
 }
 
+# Compile every C guest a bucket declares, DELIBERATELY IGNORING each cell's `ci`
+# flag and its modes. A `ci = false` cell is never compiled by any other node, so
+# its fixture rots invisibly -- -Werror is never reached, and "the file is in the
+# repo" degrades to something that does not even build. This is the only node that
+# sees a disabled fixture, so it must fail closed: zero compiled is a failure, not
+# a vacuous pass.
+function audit_compile {
+    ((PREBUILT == 0)) || die "audit-compile does not accept --prebuilt; it exists to compile from source"
+    local test test_id metadata kind category lane timeout_seconds cell_dir scratch
+    local checked=0 failed=0 skipped=0 considered=0
+    scratch=$(mktemp -d)
+    for test in "${TESTS[@]}"; do
+        metadata=$(metadata_json "$test")
+        test_id=$(jq -r .id <<<"$metadata")
+        category=$(jq -r .category <<<"$metadata")
+        lane=$(jq -r .lane <<<"$metadata")
+        [[ $CATEGORY_FILTER == "" || $category == "$CATEGORY_FILTER" ]] || continue
+        [[ $LANE_FILTER == "" || $lane == "$LANE_FILTER" ]] || continue
+        [[ $TEST_FILTER == "" || $test_id == "$TEST_FILTER" ]] || continue
+        considered=$((considered + 1))
+        kind=$(jq -r .program_kind <<<"$metadata")
+        if [[ $kind != c ]]; then
+            skipped=$((skipped + 1))
+            printf 'SKIP    %-11s %s\n' "$kind" "$test_id"
+            continue
+        fi
+        timeout_seconds=$(jq -r .timeout_seconds <<<"$metadata")
+        cell_dir="$scratch/${test_id//\//-}"
+        prepare_cell_dirs "$cell_dir"
+        if prepare_test "$test" "$cell_dir" "$timeout_seconds"; then
+            checked=$((checked + 1))
+            printf 'COMPILE %-11s %s\n' "$kind" "$test_id"
+        else
+            failed=$((failed + 1))
+            printf 'FAIL    %-11s %s\n' "$kind" "$test_id"
+        fi
+    done
+    rm -rf "$scratch"
+    printf 'compile audit: considered=%d compiled=%d failed=%d skipped-non-c=%d\n' \
+        "$considered" "$checked" "$failed" "$skipped"
+    ((considered > 0)) ||
+        die "compile audit selected no tests; a filter that matches nothing is a vacuous pass"
+    ((checked > 0)) ||
+        die "compile audit compiled zero guests; a vacuous pass is the failure class this audit exists to catch"
+    ((failed == 0)) ||
+        die "$failed declared C guest(s) do not compile"
+}
+
 subcommand=${1:-}
 [[ -n $subcommand ]] || { usage; exit 2; }
 shift
@@ -3178,6 +3227,9 @@ case "$subcommand" in
         ;;
     audit-ci)
         audit_ci_correspondence
+        ;;
+    audit-compile)
+        audit_compile
         ;;
     *)
         usage
