@@ -1,34 +1,17 @@
 # Hermit
 
-Hermit runs a Linux program *deterministically*: run the same program on the
-same inputs twice and you get byte-for-byte the same result — the same output,
-the same exit status, even the same "random" numbers and the same interleaving
-of threads. Ordinary programs do not behave this way. Two runs can differ
-because the operating system schedules threads differently, the clock advances,
-`/dev/urandom` returns fresh bytes, or a race surfaces one time in a thousand.
-Hermit removes those differences by running the program under its own
-supervision and controlling every source of nondeterminism it can reach: thread
-scheduling, time, randomness, CPUID results, and selected file metadata. The
-program itself is unmodified — there is no need to recompile, relink, or edit
-it.
+Hermit is a deterministic execution environment for x86-64 Linux programs. It
+runs an unmodified guest under the
+[Reverie](https://github.com/rrnewton/reverie) ptrace backend and controls
+sources of nondeterminism including thread scheduling, time, random data,
+CPUID results, and selected file metadata. That is the fork this repository
+builds against — both the Cargo git dependency and the workspace submodule pin
+`https://github.com/rrnewton/reverie.git`. Reverie's upstream reference
+repository is
+[facebookexperimental/reverie](https://github.com/facebookexperimental/reverie).
 
-Reproducible execution is useful whenever "it only fails sometimes" or "it
-works on my machine" is the problem:
-
-- **Reproduce a flaky, schedule-dependent bug on demand** instead of waiting for
-  it to reappear.
-- **Search for concurrency bugs** by replaying a program under many different —
-  but each individually reproducible — thread schedules ("chaos mode").
-- **Record an execution now and replay it later,** step by step, for debugging
-  or analysis.
-- **Get reproducible output** from build steps, tests, or data pipelines that
-  would otherwise vary from run to run.
-
-Hermit targets x86-64 Linux. It runs the program inside its own Linux
-namespaces, so an ordinary run needs no special privileges. Under the hood it
-uses [Reverie](https://github.com/facebookexperimental/reverie) to intercept the
-program's system calls and CPU events; the [Architecture](#architecture) section
-explains how the pieces fit together.
+Hermit is useful for repeatable execution, controlled concurrency testing,
+record/replay experiments, and diagnosing schedule-sensitive failures.
 
 ## Requirements
 
@@ -111,15 +94,6 @@ hermit run --strict -- /bin/echo hello
 
 ### Execution Backends
 
-A *backend* is the low-level mechanism Hermit uses to observe and control a
-running guest — how it intercepts the program's system calls and CPU events.
-Different backends make different trade-offs in speed, host requirements, and
-which programs they support, which is why there is more than one. The default
-`ptrace` backend needs no special setup and is the most thoroughly tested; the
-rest are experimental or specialized. If you are just getting started, use the
-default and skip the rest of this section. See [Architecture](#architecture)
-for how a backend fits into the whole system.
-
 Hermit accepts `--backend=ptrace|dbi|liteinst|sabre|kvm|e9patch` as a global
 option before the subcommand. Backend scope is command-specific: LiteInst and
 e9patch support only `run`, while SaBRe supports `run` and `strace`; unsupported
@@ -155,15 +129,12 @@ hook. Later invocations enter the LiteInst trampoline and return to the same
 ptrace-owned Detcore lifecycle.
 
 `--verify` runs the normal Detcore comparison over captured status, output,
-and deterministic scheduler logs, so a successful result is verified
-bitwise-identical between the two runs (an *L2* result in Hermit's assurance
-levels).
+and deterministic scheduler logs, so a successful result is an L2 claim.
 Current support is limited to single-threaded, single-process guests. Thread
 clone, `fork`, and `vfork` fail closed with `EOPNOTSUPP`; `exec` is also
 unsupported because runtime rebootstrap after image replacement is not yet
-implemented. Retired-conditional-branch (RCB) preemption and CPUID/RDTSC interception use
-the ptrace host and retain its performance-counter and CPU capability
-requirements.
+implemented. RCB preemption and CPUID/RDTSC interception use the ptrace host
+and retain its PMU and CPU capability requirements.
 The default Hermit namespace path is supported; `--no-namespace` remains an
 explicit option for trusted guests. The in-guest patch runtime is experimental
 and continues to receive compatibility and lifecycle improvements.
