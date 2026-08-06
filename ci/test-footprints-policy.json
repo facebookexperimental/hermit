@@ -39,8 +39,7 @@
     ".github/**"
   ],
   "package_paths": {
-    "detcore": ["detcore/**"],
-    "edit-distance": ["common/edit-distance/**"],
+    "hermit-detcore": ["detcore/**"],
     "hermetic_infra_hermit_flaky-tests": ["flaky-tests/**"],
     "hermit": ["hermit-cli/**"],
     "hermit-install": ["hermit-install/**"]
@@ -49,10 +48,9 @@
     {
       "_why": "Shared Detcore/CLI code drives the non-Cargo strict, backend-parity, and manifest harnesses.",
       "packages": [
-        "detcore",
+        "hermit-detcore",
         "detcore-model",
         "detcore-testutils",
-        "edit-distance",
         "hermit",
         "hermit-resources",
         "test-allocator"

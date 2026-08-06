@@ -24,7 +24,7 @@ Deterministic because reasons and an informal proof.
 Matches the kernel behavior described here.
 
 ## Validation
-`cargo test -p detcore` passed at L2 (ptrace).
+`cargo test -p hermit-detcore` passed at L2 (ptrace).
 
 ## Human Review Required
 Trigger 4: core DetCore scheduling change.'

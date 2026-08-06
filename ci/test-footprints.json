@@ -44,53 +44,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `edit-distance`; reverse-dependent closure: edit-distance, hermit, hermit-verify.",
-      "e2e_all": true,
-      "nodes": [
-        "build.runtime_release",
-        "build.workspace",
-        "doc.doctests",
-        "doc.rustdoc",
-        "e2e.manifest_applications",
-        "e2e.manifest_backend_parity_c",
-        "e2e.manifest_bin_c",
-        "e2e.manifest_c_programs",
-        "e2e.manifest_chaos_c",
-        "e2e.manifest_data_handling",
-        "e2e.manifest_debugger_c",
-        "e2e.manifest_determinism_stress",
-        "e2e.manifest_determinism_stress_c",
-        "e2e.manifest_language_runtimes",
-        "e2e.manifest_shared_futex_c",
-        "e2e.manifest_system_utils",
-        "e2e.manifest_util_c",
-        "lint.clippy",
-        "lint.rustfmt",
-        "test.app_strict_verify",
-        "test.applications_e2e",
-        "test.arbitrary_binaries",
-        "test.cli",
-        "test.command_strict_verify",
-        "test.dbi_parity",
-        "test.envelope_levels",
-        "test.hermit_integration",
-        "test.hermit_modes",
-        "test.hermit_unit",
-        "test.ignored_syscall_regressions",
-        "test.liteinst_strict",
-        "test.regular_crates",
-        "test.rr_suite_contract",
-        "test.sabre_examples",
-        "test.strict_compat"
-      ],
-      "paths": [
-        "common/edit-distance/**",
-        "common/edit-distance/**/*.rs",
-        "common/edit-distance/Cargo.toml"
-      ]
-    },
-    {
-      "_why": "@generated: Cargo package `test-allocator`; reverse-dependent closure: detcore, detcore-dbi, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-verify, test-allocator.",
+      "_why": "@generated: Cargo package `test-allocator`; reverse-dependent closure: detcore-dbi, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify, test-allocator.",
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
@@ -138,7 +92,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `detcore`; reverse-dependent closure: detcore, detcore-dbi, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-verify.",
+      "_why": "@generated: Cargo package `hermit-detcore`; reverse-dependent closure: detcore-dbi, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
@@ -219,7 +173,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `detcore-model`; reverse-dependent closure: detcore, detcore-dbi, detcore-model, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-verify.",
+      "_why": "@generated: Cargo package `detcore-model`; reverse-dependent closure: detcore-dbi, detcore-model, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
@@ -287,7 +241,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `detcore-testutils`; reverse-dependent closure: detcore, detcore-dbi, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-verify.",
+      "_why": "@generated: Cargo package `detcore-testutils`; reverse-dependent closure: detcore-dbi, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",

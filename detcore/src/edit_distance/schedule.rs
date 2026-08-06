@@ -83,7 +83,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use crate::damerau_lev;
+    use crate::edit_distance::damerau_lev;
 
     // TODO: Find out if both schedules are permutations of each other (after
     // slicing off the end of the longer schedule).

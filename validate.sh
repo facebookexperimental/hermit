@@ -4465,7 +4465,7 @@ function run_exact_detcore_cases {
     for test_name in "$@"; do
         printf "Running %s: %s\n" "$label" "$test_name"
         run_check_with_timeout "$timeout_seconds" "$label: $test_name" \
-            cargo test -p detcore --test "$target" "$test_name" -- --exact --test-threads=1
+            cargo test -p hermit-detcore --test "$target" "$test_name" -- --exact --test-threads=1
         if ((failures > failures_before)); then
             printf "Skipping remaining %s cases after the first failure.\n" "$label"
             return
@@ -4540,7 +4540,7 @@ function run_quick_suite {
     run_check "Portable E2E metadata" ./ci/test_harness.sh validate
     run_check "Portable ptrace E2E verification" \
         ./ci/test_harness.sh run --lane portable --mode verify --backend ptrace --ci-only
-    run_check "Detcore core unit tests" cargo test -p detcore --lib
+    run_check "Detcore core unit tests" cargo test -p hermit-detcore --lib
     run_check "Hermit run smoke test" hermit_run_smoke
     run_check "Hermit verify-mode smoke test" hermit_verify_smoke
     run_check "Hermit record/replay smoke test" hermit_record_replay_smoke
@@ -4618,9 +4618,9 @@ function run_super_diagnostic_suite {
         env HERMIT_APP_VERIFY_TIMEOUT=20s RUST_BACKTRACE=1 \
         cargo test -p hermit --features third-party-backends --test app_strict_verify java -- --ignored --test-threads=1 --nocapture
     run_check_with_timeout 180 "Post-fork scheduling diagnostics" \
-        cargo test -p detcore --test tests_misc ordinary_clone_ -- --test-threads=1
+        cargo test -p hermit-detcore --test tests_misc ordinary_clone_ -- --test-threads=1
     run_check_with_timeout 180 "Network syscall determinism diagnostic" \
-        cargo test -p detcore --test tests_misc network_syscalls_are_deterministic_across_five_runs -- --exact --test-threads=1
+        cargo test -p hermit-detcore --test tests_misc network_syscalls_are_deterministic_across_five_runs -- --exact --test-threads=1
     run_check_with_timeout 180 "IPC determinism diagnostic" \
         cargo test -p hermit --features third-party-backends --test ipc_determinism ipc_patterns_are_deterministic_across_five_runs -- --exact --test-threads=1
     run_check_with_timeout 180 "Random-source determinism diagnostic" \

@@ -79,8 +79,8 @@ cargo test --workspace
 During iteration, prefer the narrowest relevant target, for example:
 
 ```bash
-cargo test -p detcore
-cargo test -p detcore --test tests_time
+cargo test -p hermit-detcore
+cargo test -p hermit-detcore --test tests_time
 cargo test -p hermit
 ```
 
@@ -125,7 +125,7 @@ and the reason is documented.
 
 ## Workspace Map
 
-The root Cargo workspace has fourteen members:
+The root Cargo workspace has thirteen members:
 
 | Path | Role |
 | --- | --- |
@@ -136,7 +136,6 @@ The root Cargo workspace has fourteen members:
 | `detcore-sabre` | Feature-gated SaBRe backend glue; private while third-party backend packaging remains provisional. |
 | `detcore/tests/testutils` | Helpers used by Detcore integration tests. |
 | `hermit-verify` | Verification executable for stress, trace, schedule, and replay checks. |
-| `common/edit-distance` | Edit-distance utility used when comparing executions and logs. |
 | `common/test-allocator` | Test allocator and supporting test binary. |
 | `ci/manifest-plan` | Private generator and validator for the E2E manifest, test inventory, and test-selection artifacts. |
 | `hermit-install` | Private build helper that stages feature-gated third-party backend resources for tests and development. |

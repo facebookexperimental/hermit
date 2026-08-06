@@ -30,7 +30,7 @@
 #
 # Examples:
 #   scripts/stress-test.sh                          # whole suite, 20x
-#   scripts/stress-test.sh -n 20 -j 32 -p detcore   # oversubscribed detcore
+#   scripts/stress-test.sh -n 20 -j 32 -p hermit-detcore   # oversubscribed detcore
 #   scripts/stress-test.sh -n 5 -E 'test(/futex/)'  # just futex tests, 5x
 
 set -uo pipefail

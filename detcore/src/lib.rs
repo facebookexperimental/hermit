@@ -41,6 +41,9 @@ mod consts;
 mod cpuid;
 mod digest;
 mod dirents;
+/// Schedule-alignment and edit-distance algorithms shared by Hermit tools.
+#[allow(missing_docs)]
+pub mod edit_distance;
 mod fd;
 #[allow(unused)]
 mod ivar;

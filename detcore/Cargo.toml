@@ -23,12 +23,17 @@
 # ===========================================================================
 
 [package]
-name = "detcore"
+name = "hermit-detcore"
 description = "Detcore: the deterministic scheduler and syscall determinization core of the Hermit execution engine."
 version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"
+
+# The public package uses the available crates.io name, while the Rust library
+# keeps the established `detcore` import name for all consumers.
+[lib]
+name = "detcore"
 
 [[bin]]
 name = "syscaller"

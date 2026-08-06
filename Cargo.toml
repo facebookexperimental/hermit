@@ -1,6 +1,5 @@
 [workspace]
 members = [
-  "common/edit-distance",
   "common/test-allocator",
   "ci/manifest-plan",
   "detcore",
@@ -23,7 +22,6 @@ members = [
 # third-party dependencies. CI opts them back in with `--workspace` plus
 # `cargo ... -p hermit --features third-party-backends`.
 default-members = [
-  "common/edit-distance",
   "common/test-allocator",
   "ci/manifest-plan",
   "detcore",

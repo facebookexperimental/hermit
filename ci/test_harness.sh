@@ -698,7 +698,7 @@ function audit_ci_correspondence {
         [.steps[] | select(
             .group == "build" and .job == "privileged_tests"
             and .timeout == 120
-            and .cmd == "CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && CARGO_BUILD_JOBS=8 cargo test -p detcore --test tests_misc --no-run"
+            and .cmd == "CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run"
         )] | length == 1
     ' "$DAG_ROOT/privileged.json" >/dev/null ||
         die "portable-only DBI override must not alter the privileged command or timeout"

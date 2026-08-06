@@ -17,7 +17,7 @@
       "group": "build", "job": "privileged_tests",
       "desc": "Build Hermit and the focused test binaries used by the privileged lane",
       "description": "MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which MISSED this privileged-lane build node): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix on BOTH build commands (was unset -> both cargo build and cargo test --no-run defaulted their build phase to nproc; that cc1plus fan-out is the OOM class the pin bounds; the job-pin is the actual fix). Cap KEPT at the existing generous 8.0GiB: a warm/incremental measurement read peak_bytes~1.64GiB @j8, but that reused build.workspace artifacts and UNDER-estimates a cold from-scratch privileged build, so the 8.0GiB headroom is retained rather than tightened on an unreliable warm figure. rss_baseline=5.0GiB (scheduling reservation). hermit@b384187e.",
-      "cmd": "CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && CARGO_BUILD_JOBS=8 cargo test -p detcore --test tests_misc --no-run",
+      "cmd": "CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run",
       "deps": ["e2e.metadata"],
       "timeout": 120,
       "hint": {"est_duration_s": 60, "rss_baseline_bytes": 5368709120,
@@ -26,7 +26,7 @@
     {
       "group": "cpuid", "job": "faulting",
       "desc": "CPUID-faulting smoke: Detcore masks host RDRAND/RDSEED feature bits",
-      "cmd": "timeout 30 cargo test -p detcore --test tests_misc rdrand_rdseed_is_masked -- --exact",
+      "cmd": "timeout 30 cargo test -p hermit-detcore --test tests_misc rdrand_rdseed_is_masked -- --exact",
       "deps": ["build.privileged_tests"],
       "timeout": 40,
       "hint": {"est_duration_s": 15,

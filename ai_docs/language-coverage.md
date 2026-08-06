@@ -86,7 +86,7 @@ All entries use the repository nightly Rust toolchain above.
 
 | Suite | Tests/targets | Cargo status |
 | --- | --- | --- |
-| Workspace unit/doc tests | `common/digest`, `common/edit-distance`, `common/test-allocator`, `detcore-model`, `detcore`, `hermit`, `hermit-verify` | Active. |
+| Workspace unit/doc tests | `common/digest`, `common/test-allocator`, `detcore-model`, `hermit-detcore`, `hermit`, `hermit-verify` | Active. |
 | Detcore integration | `tests_misc`, `tests_parallelism`, `tests_time` | Active; some cases are ignored for PMU/hardware requirements. |
 | Hermit CLI integration | `arbitrary_binaries`, `cli`, `clock_determinism`, `epoll_determinism`, `hermit_modes`, `ipc_determinism`, `mmap_determinism`, `procfs_determinism`, `random_determinism`, `record_replay`, `signal_determinism`, `stress_suite`, `thread_sync_determinism` | Active on capable/privileged hosts. |
 | Runtime matrix | `language_runtime_determinism` with six tests | New, explicit `--ignored` matrix because external toolchains are required. |

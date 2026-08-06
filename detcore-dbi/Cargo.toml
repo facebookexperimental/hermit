@@ -11,7 +11,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-detcore = { version = "0.2.0", path = "../detcore" }
+detcore = { package = "hermit-detcore", version = "0.2.0", path = "../detcore" }
 hermit-resources = { version = "0.2.0", path = "../hermit-resources" }
 libc = "0.2.186"
 rand = "0.10.2"
