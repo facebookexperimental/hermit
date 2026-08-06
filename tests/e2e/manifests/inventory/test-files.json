@@ -830,6 +830,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/file_timestamp_identity.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/system-utils.toml",
+      "why": "tests/c/file_timestamp_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/system-utils.toml: creates files and directories, prints their stat and statx metadata including atime/mtime/ctime/btime and the mtime ORDERING between them, and exercises utimensat fixed and UTIME_NOW, so verify's double run asserts guest-created file timestamps are reproducible without freezing them"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/fp_reduction_nondeterminism.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
       "why": "tests/c/fp_reduction_nondeterminism.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
