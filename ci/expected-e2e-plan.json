@@ -8,6 +8,13 @@
       "test": "applications/timed-progress-bar"
     },
     {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/personality-domain"
+    },
+    {
       "backend": "dbi",
       "category": "c-programs",
       "lane": "portable",
