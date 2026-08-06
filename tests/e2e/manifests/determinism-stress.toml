@@ -264,7 +264,33 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = true
-seeds = [0,9]
+# The seed list is a SAMPLE, not a fixture: the contiguous prefix 0..31, chosen
+# without reference to any seed's outcome. A hand-picked pair that happens to
+# straddle the two outcome classes is only stable until the scheduler changes,
+# at which point the cell false-reds for a sampling reason and looks like a
+# determinism regression. Extend or shrink by moving the end of the prefix; do
+# not curate individual seeds, and never restore diversity by relaxing the
+# assertions below or by weakening --strict/--chaos.
+#
+# Seed sweep 2026-08-06 @ Hermit 4c70658e7858, ptrace chaos
+# (--log=off run --backend ptrace --strict --chaos --sched-heuristic=random
+#  --seed=N --no-virtualize-cpuid --max-timeslice=disabled), portable profile,
+# 64 seeds x 2 runs = 128 invocations, devbig 316-core host:
+#   distinct = 2 of 64 seeds (the guest's full outcome space: rc=0
+#     "Hello world!" vs rc=1 "ERROR! global_str is null at use.")
+#   failures = 18 of 64 seeds (28.1%); passes = 46 of 64
+#   repeat_mismatches = 0 of 64 seeds -- every seed reproduced bit-for-bit
+#   median 45 ms/run; the 32-seed cell measured 2.96 s for its 64 invocations
+# Chaos exploration is healthy: both outcome classes appear at every prefix
+# width from 2 to 64, so min_distinct = 2 is met by running the race.
+#
+# Width choice. Model a future scheduler change as reshuffling which seeds
+# expose the race, each landing in the failing class with the measured
+# p = 0.281. A fixed N-seed list false-reds when it lands wholly inside one
+# class: P = (1-p)^N + p^N. N=2 => 59.6%, N=8 => 7.1%, N=16 => 0.51%,
+# N=32 => 0.0026%. N=32 costs 2.96 s, so the coverage/runtime tradeoff is not
+# a real constraint at this workload size.
+seeds = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]
 assert = { min_distinct = 2, min_passes = 1, min_failures = 1 }
 backends_enabled = ["ptrace"]
 [test.modes.chaos.backends_disabled]
