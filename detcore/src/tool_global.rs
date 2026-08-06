@@ -105,7 +105,10 @@ struct InodePool {
     // TODO(T87258449): merge these two maps:
     inodes: HashMap<RawInode, DetInode>,
     detinodes_info: HashMap<DetInode, DetInodeInfo>,
-    next_inode: RawInode,
+    /// Counter backing the minted [`DetInode`]s. Deliberately a plain integer:
+    /// it is the *source* of deterministic inodes, not one itself, and typing
+    /// it `RawInode` previously blurred that distinction.
+    next_inode: u64,
 }
 
 /// Everything we know (globally) about a DetInode.
@@ -165,7 +168,11 @@ impl InodePool {
     fn add_inode(&mut self, raw_inode: RawInode, mtime: LogicalTime) -> (DetInode, LogicalTime) {
         match self.inodes.get(&raw_inode) {
             None => {
-                let new = self.next_inode;
+                // THE determinization boundary: the single place a host inode
+                // is deliberately mapped to a deterministic one. The value is
+                // minted from a monotonic counter, never derived from the host
+                // inode's bits.
+                let new = DetInode::mint(self.next_inode);
                 self.next_inode += 1;
                 assert!(self.inodes.insert(raw_inode, new).is_none());
                 let prev = self.detinodes_info.insert(
@@ -3897,5 +3904,32 @@ mod tests {
             .is_ok(),
             "cleanup waited after cancelling a registered scheduler"
         );
+    }
+
+    /// A deterministic inode must be minted from the monotonic counter, never
+    /// derived from the host inode's bits. This is the behavioural half of the
+    /// guarantee whose static half is `DetInode` being a newtype: even for a
+    /// large, realistic host inode the det value stays small and dense, so a
+    /// leaked host inode is distinguishable from a genuine det one.
+    #[test]
+    fn det_inodes_are_minted_not_passed_through() {
+        use crate::types::DetInode;
+
+        let mut pool = super::InodePool::new();
+        let t = LogicalTime::from_nanos(0);
+
+        let host_a = 221_742_951; // the value observed leaking into FileContents
+        let host_b = 998_877_665;
+        let (a, _) = pool.add_inode(host_a, t);
+        let (b, _) = pool.add_inode(host_b, t);
+
+        assert_ne!(a.as_raw(), host_a, "det inode must not be the host inode");
+        assert_ne!(b.as_raw(), host_b, "det inode must not be the host inode");
+        assert_eq!(a, DetInode::mint(1), "minting starts at 1");
+        assert_eq!(b, DetInode::mint(2), "minting is monotonic");
+
+        // Re-determinizing the same host inode is stable, not a fresh mint.
+        let (a_again, _) = pool.add_inode(host_a, t);
+        assert_eq!(a, a_again, "mapping must be stable per host inode");
     }
 }

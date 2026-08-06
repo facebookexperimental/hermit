@@ -19,7 +19,53 @@ pub type RawFd = std::os::unix::io::RawFd;
 pub type RawInode = u64;
 
 /// Deterministic "virtual" inode.
-pub type DetInode = RawInode;
+///
+/// Deliberately a newtype rather than an alias for [`RawInode`]. As an alias
+/// the two were the same type to the compiler, so a host inode could be used
+/// wherever a deterministic one was required and nothing diagnosed it; that is
+/// how raw host inodes reached guest-visible `ResourceID`s.
+///
+/// There is intentionally no `From<RawInode>` impl. The only supported way to
+/// turn a host inode into a `DetInode` is the determinization boundary in
+/// `tool_global` (`determinize_inode` -> `add_inode`), which mints values from
+/// a monotonic counter. [`DetInode::mint`] exists for that boundary and for the
+/// handful of compile-time constants; every call site is a deliberate,
+/// auditable assertion that the value is already deterministic.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize
+)]
+pub struct DetInode(RawInode);
+
+impl DetInode {
+    /// Assert that `value` is a deterministic inode.
+    ///
+    /// Reserved for the determinization boundary and for compile-time
+    /// constants. Passing a host inode here reintroduces the leak this newtype
+    /// exists to prevent.
+    pub const fn mint(value: RawInode) -> Self {
+        Self(value)
+    }
+
+    /// The underlying integer, for writing into guest-visible stat buffers.
+    pub const fn as_raw(self) -> RawInode {
+        self.0
+    }
+}
+
+impl std::fmt::Display for DetInode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Identity of a Linux descriptor table (`files_struct`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
