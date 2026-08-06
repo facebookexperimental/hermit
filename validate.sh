@@ -869,12 +869,57 @@ function detect_cache_state {
 # Catches corruption from a kill we did not observe, which the per-crate build.rs
 # guard cannot: cargo re-runs a build script only on input change or prior failure,
 # so a neighbour that truncates an already-built object is otherwise linked as-is.
+# True when a linkable build artifact is structurally incomplete.
+#
+# Size is only a PROXY for corruption: an OOM-killed compiler routinely leaves a
+# partial write that is nonzero AND retains valid magic, so both `-size 0` and a
+# bare magic check pass it through and the linker then reports a bogus
+# "undefined reference". ELF is self-describing, so truncation is detectable from
+# the artifact's own header: the section table must fit inside the file.
+#
+# Magic is PER-FORMAT. `.a`/`.rlib` are ar archives ("!<arch>\n"), NOT ELF, so a
+# single ELF-magic test would delete every valid static archive.
+function artifact_is_corrupt {
+    local f=$1 magic size
+    size=$(stat -c %s -- "$f" 2>/dev/null) || return 1
+    ((size == 0)) && return 0
+    magic=$(head -c 8 -- "$f" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    case "$f" in
+        *.a | *.rlib)
+            [[ $magic == 213c617263683e0a* ]] || return 0 # !<arch>\n
+            ((size < 68)) && return 0                     # ar header + one member header
+            return 1
+            ;;
+        *.o | *.so | *.so.* | *.lo)
+            [[ $magic == 7f454c46* ]] || return 0 # \x7fELF
+            python3 - "$f" <<'PY' && return 1 || return 0
+import struct, sys
+with open(sys.argv[1], "rb") as fh:
+    head = fh.read(64)
+if len(head) < 64:
+    sys.exit(1)
+if head[4] != 2:  # not ELFCLASS64: magic-only check
+    sys.exit(0)
+shoff = struct.unpack_from("<Q", head, 0x28)[0]
+need = shoff + struct.unpack_from("<H", head, 0x3A)[0] * struct.unpack_from("<H", head, 0x3C)[0]
+import os
+sys.exit(1 if shoff and need > os.path.getsize(sys.argv[1]) else 0)
+PY
+            ;;
+    esac
+    return 1
+}
+
+# Delete build artifacts a killed compiler left structurally incomplete. cmake
+# compares TIMESTAMPS, not content, so a truncated object with a fresh mtime is
+# trusted forever and every later build links against a symbol-less file.
 function purge_zero_byte_objects {
     local root=$1 removed=0 f
     [[ -d $root ]] || { printf 0; return 0; }
     while IFS= read -r -d '' f; do
-        rm -f -- "$f" && removed=$((removed + 1))
-    done < <(find "$root" -type f -name '*.o' -size 0 -print0 2>/dev/null)
+        artifact_is_corrupt "$f" && rm -f -- "$f" && removed=$((removed + 1))
+    done < <(find "$root" -type f \( -name '*.o' -o -name '*.a' -o -name '*.so' \
+        -o -name '*.so.*' -o -name '*.rlib' -o -name '*.lo' \) -print0 2>/dev/null)
     printf '%s' "$removed"
 }
 
