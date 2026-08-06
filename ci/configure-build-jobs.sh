@@ -66,11 +66,11 @@ if [[ -v CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS ]]; then
     return 2
 fi
 
-# The calibration below is valid only for Reverie 6a6b4ec. The portable wrapper
+# The calibration below is valid only for Reverie dd3c178. The portable wrapper
 # obtains the repository's recorded pin through the canonical checker and
 # carries it here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 6a6b4ec3e1806aacec0299cc46359a8f57e968fe ]]; then
-    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 6a6b4ec3e1806aacec0299cc46359a8f57e968fe" >&2
+if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != dd3c178ea9553004d7bf4c494e1b7fd80e7b6ae6 ]]; then
+    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie dd3c178ea9553004d7bf4c494e1b7fd80e7b6ae6" >&2
     return 2
 fi
 
@@ -155,6 +155,13 @@ fi
 # sha256:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d.
 # CI_MAX_BUILD_JOB_SECONDS=572 and the measured hosted-runner budget therefore
 # carry without changing the derivation.
+#
+# CARRY TO dd3c178 (2026-08-06). The only 6a6b4ec..dd3c178 change adds
+# reverie-kvm sendmsg/recvmsg ancillary-data translation and KVM tests.
+# reverie-dbi/build.rs, its vendored DynamoRIO tree, build commands, and the
+# MAX_PARALLEL_JOBS=16 clamp remain byte-identical. The DBI recipe identity
+# therefore remains sha256:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d,
+# and the hosted-runner budget carries unchanged.
 #
 # Those 2026-08-05 samples deliberately do NOT replace 1050. They come from a
 # development host whose cores finish the identical work ~3.3x faster than the
