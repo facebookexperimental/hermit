@@ -9,6 +9,7 @@
 //
 // _GNU_SOURCE is supplied by the harness compile flags (see run_matrix.py);
 // do not define it here (it would collide with -D_GNU_SOURCE under -Werror).
+#define _GNU_SOURCE
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>

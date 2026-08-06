@@ -25,6 +25,7 @@
  * the kernel's pos_lo/pos_hi pair correctly); the harness supplies
  * -D_GNU_SOURCE for the wrapper prototypes and RWF_APPEND.
  */
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>

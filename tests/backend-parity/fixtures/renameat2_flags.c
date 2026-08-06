@@ -13,6 +13,7 @@
  * Do not #define _GNU_SOURCE here: the harness compiles with -D_GNU_SOURCE and
  * an in-file define would trip -Werror=... redefinition.
  */
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/fs.h> /* RENAME_NOREPLACE / RENAME_EXCHANGE */

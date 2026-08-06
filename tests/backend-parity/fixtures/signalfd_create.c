@@ -15,6 +15,7 @@
  * clean triple pass.
  */
 
+#define _GNU_SOURCE
 #include <signal.h>
 #include <stdio.h>
 #include <sys/signalfd.h>

@@ -12,6 +12,7 @@
  * All values are self-created and content-derived, so output is "linkat ok=5"
  * on every run regardless of host. All three backends pass (triple parity).
  */
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>

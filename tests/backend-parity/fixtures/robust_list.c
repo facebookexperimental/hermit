@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#define _GNU_SOURCE
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>

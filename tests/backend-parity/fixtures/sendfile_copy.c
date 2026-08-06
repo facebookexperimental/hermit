@@ -34,6 +34,7 @@
  * and no pid, timestamp, cpu-time, or address is observed.
  */
 
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>

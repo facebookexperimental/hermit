@@ -11,6 +11,7 @@
 // Every value is a property of the guest's own creation arguments, so the
 // answer is host-independent and identical across backends and native. No byte
 // is ever written or read, so there is no blocking wait to schedule.
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>

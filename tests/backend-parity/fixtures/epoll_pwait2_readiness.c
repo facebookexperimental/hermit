@@ -17,6 +17,7 @@
 // do not depend on epoll_pwait2 (add, arm, del) and fails the four wait-driven
 // checks because syscall 441 returns -1/ENOSYS (ok=3).
 
+#define _GNU_SOURCE
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>

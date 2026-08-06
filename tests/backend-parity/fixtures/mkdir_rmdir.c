@@ -30,6 +30,7 @@
  * no pid, timestamp, cpu-time, inode, device, uid, gid, or address is observed.
  */
 
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>

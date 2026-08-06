@@ -10,6 +10,7 @@
  * fsync and fdatasync but returns deterministic ENOSYS for syncfs, so KVM is a
  * documented gap on this row (ok=5 instead of ok=6).
  */
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>

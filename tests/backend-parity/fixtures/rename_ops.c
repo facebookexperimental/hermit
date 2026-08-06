@@ -10,6 +10,7 @@
 // metadata or timing. ptrace, DBT, and KVM must agree.
 //
 // _GNU_SOURCE is supplied by the harness compile flags (see run_matrix.py).
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>

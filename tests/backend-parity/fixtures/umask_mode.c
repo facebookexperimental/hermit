@@ -8,6 +8,7 @@
  * real user, or filesystem. umask() also returns the previous mask, which the
  * fixture checks to confirm the value round-trips.
  */
+#define _GNU_SOURCE
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>

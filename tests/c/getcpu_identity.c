@@ -24,6 +24,7 @@
  * calls means the container leaked host topology or the backend diverged.
  */
 
+#define _GNU_SOURCE
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/syscall.h>

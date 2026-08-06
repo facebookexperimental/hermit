@@ -10,6 +10,7 @@
  * privilege the strict guest does not hold, so their behavior is a permission
  * policy question rather than a syscall-parity contract.
  */
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>

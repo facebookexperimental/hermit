@@ -10,6 +10,7 @@
 // device, inode, or timestamp field is exposed.
 //
 // _GNU_SOURCE is supplied by the harness compile flags (see run_matrix.py).
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>

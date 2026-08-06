@@ -18,6 +18,7 @@
  * across runs, backends, and hosts.
  */
 
+#define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>
 #include <sys/syscall.h>

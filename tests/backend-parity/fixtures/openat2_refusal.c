@@ -14,6 +14,7 @@
  * is irrelevant; "/" is used so no temporary file is required.
  */
 
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/types.h>

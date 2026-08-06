@@ -16,10 +16,12 @@
  * and hosts.
  */
 
+#define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <sys/types.h>
 
 #ifndef SYS_kcmp
 #define SYS_kcmp 312

@@ -14,6 +14,7 @@
 // with EINVAL, and that both descriptors close. There is no file, no memory
 // mapping, no data transfer, and no blocking wait, so the fixture is idempotent
 // under --verify and safe for the DBT cooperative scheduler.
+#define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>
 #include <sys/syscall.h>

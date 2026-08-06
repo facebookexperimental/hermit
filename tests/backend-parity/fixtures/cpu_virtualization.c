@@ -16,6 +16,7 @@
  * _GNU_SOURCE is supplied by the harness compile flags (-D_GNU_SOURCE); it is
  * deliberately not redefined here to avoid a -Werror redefinition collision.
  */
+#define _GNU_SOURCE
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>

@@ -12,6 +12,7 @@
 // faithful checks (3-6) match native exactly. Under Hermit all six pass
 // (ok=6); native passes only the four faithful checks (ok=4).
 
+#define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>

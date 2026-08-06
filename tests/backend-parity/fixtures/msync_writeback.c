@@ -14,6 +14,7 @@
 // literals and pread reads them straight back, so no host state enters any
 // check. There is no data transfer to another endpoint and no blocking wait,
 // and the temp file is unlinked before printing for --verify idempotency.
+#define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>

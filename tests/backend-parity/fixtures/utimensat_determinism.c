@@ -13,12 +13,14 @@
 // Hermit all five checks pass (ok=5); native passes only the two acceptance
 // checks (ok=2) because it faithfully echoes the requested atime/mtime.
 
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <time.h>
 
 int main(void) {
     char dir[] = "/tmp/utimensat_determinism.XXXXXX";

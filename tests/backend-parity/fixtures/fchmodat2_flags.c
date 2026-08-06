@@ -14,6 +14,7 @@
 // a determinism relaxation. Native and the two forwarding backends agree, which
 // is the faithful-support shape.
 
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>

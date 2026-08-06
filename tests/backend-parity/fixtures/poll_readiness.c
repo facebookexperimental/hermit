@@ -33,6 +33,7 @@
  * no timestamp, cpu-time, pid, or address is observed.
  */
 
+#define _GNU_SOURCE
 #include <errno.h>
 #include <poll.h>
 #include <stdio.h>

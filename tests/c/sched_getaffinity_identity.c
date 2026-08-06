@@ -29,6 +29,7 @@
  * rather than a tautology.
  */
 
+#define _GNU_SOURCE
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/syscall.h>

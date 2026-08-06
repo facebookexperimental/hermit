@@ -22,6 +22,7 @@
  *
  * Uses raw syscall(); the harness supplies -D_GNU_SOURCE.
  */
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>

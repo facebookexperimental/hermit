@@ -7,6 +7,7 @@
 // The guest creates the file it queries, so the accessibility answer is a pure
 // function of the guest's own actions, independent of host user, umask, or real
 // filesystem state, and every backend (and native) agrees.
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
