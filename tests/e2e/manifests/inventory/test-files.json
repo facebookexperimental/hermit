@@ -1478,6 +1478,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/shm_coherency_identity.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/system-utils.toml",
+      "why": "tests/c/shm_coherency_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/system-utils.toml: forks a writer and samples MAP_SHARED anonymous, MAP_SHARED file-backed and memfd mappings without any added barrier, printing the observed words and the branch taken including whether a partial update was caught, plus MAP_PRIVATE COW isolation and msync writeback, so verify's double run asserts that what each process OBSERVES is reproducible"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/sigmask_preemption.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
       "why": "tests/c/sigmask_preemption.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"

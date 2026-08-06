@@ -1279,3 +1279,61 @@ kvm = "Record/replay identity of the startup surface is a separate contract and 
 liteinst = "Record/replay identity of the startup surface is a separate contract and is not what this fixture pins"
 ptrace = "Record/replay identity of the startup surface is a separate contract and is not what this fixture pins"
 sabre = "Record/replay identity of the startup surface is a separate contract and is not what this fixture pins"
+
+[[test]]
+id = "system-utils/shm-coherency-identity"
+description = "what each process observes through MAP_SHARED / memfd / COW mappings is identical across repeated Hermit runs, including partial updates"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 120
+occasional = false
+program = "tests/c/shm_coherency_identity.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.build]
+cflags = ["-O0", "-D_GNU_SOURCE"]
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbt = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away"
+kvm = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away"
+liteinst = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away"
+sabre = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "Native is the NEGATIVE control: the reader catches a different prefix of the writer's record run to run, by design, so this cell must never be enabled"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+dbt = "Chaos deliberately perturbs the interleaving this fixture pins; a difference there would not be a regression"
+kvm = "Chaos deliberately perturbs the interleaving this fixture pins; a difference there would not be a regression"
+liteinst = "Chaos deliberately perturbs the interleaving this fixture pins; a difference there would not be a regression"
+ptrace = "Chaos deliberately perturbs the interleaving this fixture pins; a difference there would not be a regression"
+sabre = "Chaos deliberately perturbs the interleaving this fixture pins; a difference there would not be a regression"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+dbt = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+kvm = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+liteinst = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+ptrace = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+sabre = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+dbt = "Record/replay identity of shared-memory observation is a separate contract"
+kvm = "Record/replay identity of shared-memory observation is a separate contract"
+liteinst = "Record/replay identity of shared-memory observation is a separate contract"
+ptrace = "Record/replay identity of shared-memory observation is a separate contract"
+sabre = "Record/replay identity of shared-memory observation is a separate contract"
