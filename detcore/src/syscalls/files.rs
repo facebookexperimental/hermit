@@ -374,16 +374,35 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         // A backend-owned read may have advanced the kernel cursor without
         // passing through Detcore's logical procfs cursor (KVM does this for
-        // worker-shared descriptors). Always rewind before taking the initial
-        // snapshot so a later intercepted pread cannot snapshot from EOF.
-        guest
+        // worker-shared descriptors). Rewind before taking the initial snapshot
+        // so a later intercepted pread cannot snapshot from EOF.
+        //
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#1903): ESPIPE is not a failure here. Several procfs
+        // files are legitimately non-seekable -- `/proc/net/*` single-release
+        // seq_files return ESPIPE from `llseek` on the host, verified natively:
+        // `lseek(fd, 0, SEEK_SET)` on `/proc/net/sockstat` gives ESPIPE while the
+        // subsequent `read(2)` returns data. Propagating that ESPIPE made the
+        // GUEST's `read` fail on a file Linux reads fine (`cat
+        // /proc/net/sockstat` -> "Illegal seek"), which is a deviation from Linux
+        // semantics, not a determinism requirement: the rewind is an internal
+        // correction Detcore performs for its own benefit and the guest never
+        // asked for it. A non-seekable fd also cannot have been advanced behind
+        // our back by a seek, and a freshly opened one is already at offset 0, so
+        // skipping the rewind loses nothing the rewind was protecting.
+        match guest
             .inject_with_retry(Syscall::Lseek(
                 syscalls::Lseek::new()
                     .with_fd(call.fd())
                     .with_offset(0)
                     .with_whence(Whence::SEEK_SET),
             ))
-            .await?;
+            .await
+        {
+            Ok(_) => {}
+            Err(Errno::ESPIPE) => {}
+            Err(err) => return Err(err.into()),
+        }
 
         let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
         let mut contents = Vec::new();
