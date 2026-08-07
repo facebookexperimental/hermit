@@ -2104,6 +2104,56 @@ function emit_failure_reason {
     fi
 }
 
+# Hermit validates the program before creating the guest.  Those refusals are
+# harness no-results: no guest observation exists to count as a chaos failure.
+# Carry that distinction alongside the process status instead of asking each
+# mode to infer execution from a nonzero exit code.
+function classify_attempt_execution {
+    local mode=$1
+    local status=$2
+    local stderr_file=$3
+
+    if [[ $mode != naked && $status != 0 ]] &&
+        grep -Eq '^Error: (Program |Could not resolve program )' "$stderr_file"; then
+        echo LAUNCH_REFUSED
+    else
+        echo ATTEMPT_RESULT
+    fi
+}
+
+function launch_refusal_reason {
+    local stderr_file=$1
+    local first_line
+    first_line=$(head -n 1 "$stderr_file")
+    first_line=${first_line#Error: }
+    printf 'guest launch refused before execution: %s' "$first_line"
+}
+
+function audit_guest_launch_classification_contract {
+    local fixture_dir refusal_stderr guest_failure_stderr
+    fixture_dir=$(mktemp -d "${TMPDIR:-/tmp}/hermit-harness-launch-classification.XXXXXX")
+    refusal_stderr="$fixture_dir/refusal.stderr"
+    guest_failure_stderr="$fixture_dir/guest-failure.stderr"
+    printf '%s\n' \
+        'Error: Program /tmp/guest is under host /tmp, but Hermit replaces guest /tmp with an isolated directory.' \
+        >"$refusal_stderr"
+    printf '%s\n' 'guest reported an application failure' >"$guest_failure_stderr"
+
+    [[ $(classify_attempt_execution chaos 1 "$refusal_stderr") == LAUNCH_REFUSED ]] || {
+        rm -rf "$fixture_dir"
+        die "a Hermit program launch refusal must be a typed no-result"
+    }
+    [[ $(classify_attempt_execution chaos 1 "$guest_failure_stderr") == ATTEMPT_RESULT ]] || {
+        rm -rf "$fixture_dir"
+        die "a genuine nonzero guest result must remain countable"
+    }
+    [[ $(classify_attempt_execution naked 1 "$refusal_stderr") == ATTEMPT_RESULT ]] || {
+        rm -rf "$fixture_dir"
+        die "native guest stderr must not be mistaken for a Hermit launch refusal"
+    }
+    rm -rf "$fixture_dir"
+}
+
 function observation_hash {
     local metadata=$1
     local status=$2
@@ -2446,14 +2496,17 @@ function execute_attempt {
     status=$?
     set -e
 
-    local hash
+    local hash attempt_execution
     hash=$(observation_hash "$metadata" "$status" "$stdout_file" "$stderr_file" "$cell_dir/tmp")
-    printf '%s\t%s\t%s\t%s\n' "$status" "$hash" "$stdout_file" "$stderr_file"
+    attempt_execution=$(classify_attempt_execution "$mode" "$status" "$stderr_file")
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$status" "$hash" "$stdout_file" "$stderr_file" "$attempt_execution"
 }
 
 function append_result {
     local test_id=$1 category=$2 lane=$3 mode=$4 backend=$5 outcome=$6 duration_ms=$7 reason=$8
     local path_evidence=$9
+    local error_kind=${10}
     local test_file test_sha256 binary_sha256 effective_args guest_args guest_backend relaxations log_level classification kind
     test_file=${TEST_BY_ID[$test_id]}
     if [[ -f $test_file ]]; then
@@ -2524,6 +2577,7 @@ function append_result {
         --arg backend "$backend" \
         --arg classification "$classification" \
         --arg outcome "$outcome" \
+        --arg error_kind "$error_kind" \
         --arg reason "$reason" \
         --arg log_level "$log_level" \
         --argjson duration_ms "$duration_ms" \
@@ -2535,7 +2589,9 @@ function append_result {
           binary_sha256:(if $binary_sha256 == "" then null else $binary_sha256 end),
           test_sha256:$test_sha256,test:$test,category:$category,lane:$lane,mode:$mode,
           backend:(if $backend == "" then null else $backend end),classification:$classification,
-          outcome:$outcome,duration_ms:$duration_ms,
+          outcome:$outcome,
+          error_kind:(if $error_kind == "" then null else $error_kind end),
+          duration_ms:$duration_ms,
           log_level:(if $log_level == "" then null else $log_level end),
           effective_args:$effective_args,guest_args:$guest_args,
           relaxations:$relaxations,preprocessor:null,execution_path:$path_evidence,
@@ -2554,19 +2610,19 @@ function run_cell {
     prepare_cell_dirs "$cell_dir"
     start_ms=$(date +%s%3N)
 
-    local outcome=PASS reason='' path_evidence=null
+    local outcome=PASS reason='' error_kind='' path_evidence=null launch_refusal_stderr=''
     if ! prepare_test "$test" "$cell_dir" "$timeout_seconds"; then
         outcome=ERROR
         reason="fixture preparation failed"
     elif [[ $mode == naked ]]; then
-        local runs min_distinct attempt row status hash
+        local runs min_distinct attempt row status hash _stdout_file _stderr_file attempt_execution
         local failed_runs=0
         local -a hashes=()
         runs=$(jq -r '.modes.naked.runs // 3' <<<"$metadata")
         min_distinct=$(jq -r '.modes.naked.assert.min_distinct // 2' <<<"$metadata")
         for ((attempt = 1; attempt <= runs; attempt++)); do
             row=$(execute_attempt "$test" "$metadata" "$mode" "" "$cell_dir" "$attempt")
-            IFS=$'\t' read -r status hash _ _ <<<"$row"
+            IFS=$'\t' read -r status hash _stdout_file _stderr_file attempt_execution <<<"$row"
             hashes+=("$hash")
             [[ $status == 0 ]] || ((failed_runs += 1))
         done
@@ -2583,6 +2639,7 @@ function run_cell {
         fi
     elif [[ $mode == chaos ]]; then
         local min_distinct min_passes min_failures seed row1 row2 status1 hash1 status2 hash2
+        local stdout1 stderr1 execution1 stdout2 stderr2 execution2
         local passes=0 failures=0 repeat_mismatches=0
         local -a hashes=()
         min_distinct=$(jq -r '.modes.chaos.assert.min_distinct // 2' <<<"$metadata")
@@ -2590,9 +2647,17 @@ function run_cell {
         min_failures=$(jq -r '.modes.chaos.assert.min_failures // 0' <<<"$metadata")
         while IFS= read -r seed; do
             row1=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" "seed-$seed-a" "$seed")
+            IFS=$'\t' read -r status1 hash1 stdout1 stderr1 execution1 <<<"$row1"
+            if [[ $execution1 == LAUNCH_REFUSED ]]; then
+                launch_refusal_stderr=$stderr1
+                break
+            fi
             row2=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" "seed-$seed-b" "$seed")
-            IFS=$'\t' read -r status1 hash1 _ _ <<<"$row1"
-            IFS=$'\t' read -r status2 hash2 _ _ <<<"$row2"
+            IFS=$'\t' read -r status2 hash2 stdout2 stderr2 execution2 <<<"$row2"
+            if [[ $execution2 == LAUNCH_REFUSED ]]; then
+                launch_refusal_stderr=$stderr2
+                break
+            fi
             hashes+=("$hash1")
             if [[ $status1 == 0 ]]; then
                 ((passes += 1))
@@ -2601,39 +2666,59 @@ function run_cell {
             fi
             [[ $status1 == "$status2" && $hash1 == "$hash2" ]] || ((repeat_mismatches += 1))
         done < <(jq -r '.modes.chaos.seeds[]' <<<"$metadata")
-        local distinct
-        distinct=$(printf '%s\n' "${hashes[@]}" | LC_ALL=C sort -u | wc -l)
-        if ((repeat_mismatches > 0 || distinct < min_distinct || passes < min_passes || failures < min_failures)); then
-            outcome=FAIL
-            reason="chaos distinct=$distinct passes=$passes failures=$failures repeat_mismatches=$repeat_mismatches"
+        if [[ -n $launch_refusal_stderr ]]; then
+            outcome=ERROR
+            error_kind=guest-launch-refused
+            reason=$(launch_refusal_reason "$launch_refusal_stderr")
         else
-            reason="chaos distinct=$distinct passes=$passes failures=$failures; every seed reproduced"
+            local distinct
+            distinct=$(printf '%s\n' "${hashes[@]}" | LC_ALL=C sort -u | wc -l)
+            if ((repeat_mismatches > 0 || distinct < min_distinct || passes < min_passes || failures < min_failures)); then
+                outcome=FAIL
+                reason="chaos distinct=$distinct passes=$passes failures=$failures repeat_mismatches=$repeat_mismatches"
+            else
+                reason="chaos distinct=$distinct passes=$passes failures=$failures; every seed reproduced"
+            fi
         fi
     elif [[ $mode == custom ]]; then
-        local runs repeat_identical attempt row status hash
+        local runs repeat_identical attempt row status hash stdout_file stderr_file attempt_execution
         local failed_runs=0
         local -a hashes=()
         runs=$(jq -r '.modes.custom.assert.runs // 1' <<<"$metadata")
         repeat_identical=$(jq -r '.modes.custom.assert.repeat_identical // false' <<<"$metadata")
         for ((attempt = 1; attempt <= runs; attempt++)); do
             row=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" "$attempt")
-            IFS=$'\t' read -r status hash _ _ <<<"$row"
+            IFS=$'\t' read -r status hash stdout_file stderr_file attempt_execution <<<"$row"
+            if [[ $attempt_execution == LAUNCH_REFUSED ]]; then
+                launch_refusal_stderr=$stderr_file
+                break
+            fi
             hashes+=("$hash")
             [[ $status == 0 ]] || ((failed_runs += 1))
         done
-        local distinct
-        distinct=$(printf '%s\n' "${hashes[@]}" | LC_ALL=C sort -u | wc -l)
-        if ((failed_runs > 0)) || [[ $repeat_identical == true && $distinct != 1 ]]; then
-            outcome=FAIL
-            reason="custom runs=$runs failed_runs=$failed_runs distinct=$distinct"
+        if [[ -n $launch_refusal_stderr ]]; then
+            outcome=ERROR
+            error_kind=guest-launch-refused
+            reason=$(launch_refusal_reason "$launch_refusal_stderr")
         else
-            reason="custom output identical across $runs runs"
+            local distinct
+            distinct=$(printf '%s\n' "${hashes[@]}" | LC_ALL=C sort -u | wc -l)
+            if ((failed_runs > 0)) || [[ $repeat_identical == true && $distinct != 1 ]]; then
+                outcome=FAIL
+                reason="custom runs=$runs failed_runs=$failed_runs distinct=$distinct"
+            else
+                reason="custom output identical across $runs runs"
+            fi
         fi
     else
-        local row status
+        local row status _hash stdout_file stderr_file attempt_execution
         row=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" 1)
-        IFS=$'\t' read -r status _ _ _ <<<"$row"
-        if [[ $status != 0 ]]; then
+        IFS=$'\t' read -r status _hash stdout_file stderr_file attempt_execution <<<"$row"
+        if [[ $attempt_execution == LAUNCH_REFUSED ]]; then
+            outcome=ERROR
+            error_kind=guest-launch-refused
+            reason=$(launch_refusal_reason "$stderr_file")
+        elif [[ $status != 0 ]]; then
             outcome=FAIL
             reason="$mode exited with status $status"
         elif [[ $mode == verify && $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
@@ -2672,7 +2757,7 @@ function run_cell {
 
     end_ms=$(date +%s%3N)
     duration_ms=$((end_ms - start_ms))
-    append_result "$id" "$category" "$lane" "$mode" "$backend" "$outcome" "$duration_ms" "$reason" "$path_evidence"
+    append_result "$id" "$category" "$lane" "$mode" "$backend" "$outcome" "$duration_ms" "$reason" "$path_evidence" "$error_kind"
     printf '%-5s %-10s %-11s %-9s %s%s\n' "$outcome" "$lane" "$mode" "${backend:--}" "$id" \
         "${reason:+ - $reason}"
     [[ $outcome == PASS ]]
@@ -2691,7 +2776,9 @@ function write_junit {
             def esc: @html;
             "  <testcase classname=\"" + (.category|esc) + "\" name=\"" + ((.test + "/" + .mode + "/" + (.backend // "none"))|esc) + "\" time=\"" + ((.duration_ms / 1000)|tostring) + "\">" +
             (if .outcome == "FAIL" then ("<failure>" + ((.reason // "failed")|esc) + "</failure>")
-             elif .outcome == "ERROR" then ("<error>" + ((.reason // "error")|esc) + "</error>")
+             elif .outcome == "ERROR" then
+               ("<error" + (if .error_kind then (" type=\"" + (.error_kind|esc) + "\"") else "" end)
+                + ">" + ((.reason // "error")|esc) + "</error>")
              else "" end) + "</testcase>"
         ' "$RESULTS"
         printf '</testsuite>\n'
@@ -2767,6 +2854,7 @@ case "$subcommand" in
         (($# == 0)) || true
         audit_immutable_hermit_binary
         audit_test_binary_registration
+        audit_guest_launch_classification_contract
         audit_sabre_path_evidence_contract
         audit_test_footprints
         python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
