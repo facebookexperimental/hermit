@@ -23,6 +23,80 @@ static void require_zero(long result, const char *name) {
   }
 }
 
+/* A path that a rename or unlink should have removed must be GONE, and gone for
+ * the right reason: `stat` failing for any other errno is not evidence of
+ * removal. */
+static void require_absent(const char *path, const char *name) {
+  struct stat gone;
+  errno = 0;
+  if (stat(path, &gone) == 0) {
+    fprintf(stderr, "%s: %s still exists\n", name, path);
+    exit(1);
+  }
+  if (errno != ENOENT) {
+    fprintf(stderr, "%s: %s stat errno %d, want ENOENT\n", name, path, errno);
+    exit(1);
+  }
+}
+
+/* Read the file back and compare the BYTES.
+ *
+ * Without this the fixture only ever checked that `write` RETURNED 7 and that
+ * `stat` reported the right size. A backend that reports a 7-byte write while
+ * dropping or corrupting the buffer passed, because nothing ever looked at the
+ * content -- the fixture asserted write parity it did not check.
+ *
+ * Two properties, and the second is not decoration: the payload must survive,
+ * and the region `truncate` grew must read as zeros, which is the behaviour
+ * POSIX requires of a file extended by truncation.
+ */
+static void require_content(const char *path, const char *payload,
+                            size_t payload_len, size_t expected_size) {
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) {
+    perror("open for readback");
+    exit(1);
+  }
+  char *buffer = calloc(1, expected_size + 1);
+  if (buffer == NULL) {
+    fprintf(stderr, "readback: out of memory\n");
+    exit(1);
+  }
+  size_t got = 0;
+  while (got < expected_size + 1) {
+    ssize_t chunk = read(fd, buffer + got, expected_size + 1 - got);
+    if (chunk < 0) {
+      perror("read for readback");
+      exit(1);
+    }
+    if (chunk == 0) {
+      break;
+    }
+    got += (size_t)chunk;
+  }
+  require_zero(close(fd), "close after readback");
+  if (got != expected_size) {
+    fprintf(stderr, "readback %s: read %zu bytes, want %zu\n", path, got,
+            expected_size);
+    exit(1);
+  }
+  if (memcmp(buffer, payload, payload_len) != 0) {
+    fprintf(stderr, "readback %s: payload mismatch, got \"%.*s\" want \"%.*s\"\n",
+            path, (int)payload_len, buffer, (int)payload_len, payload);
+    exit(1);
+  }
+  for (size_t at = payload_len; at < expected_size; ++at) {
+    if (buffer[at] != 0) {
+      fprintf(stderr,
+              "readback %s: byte %zu is 0x%02x, want 0 (truncate must extend "
+              "with zeros)\n",
+              path, at, (unsigned char)buffer[at]);
+      exit(1);
+    }
+  }
+  free(buffer);
+}
+
 int main(void) {
   char original[128];
   char renamed[128];
@@ -62,8 +136,16 @@ int main(void) {
   }
 
   require_zero(syscall(SYS_rename, original, renamed), "rename");
+  require_absent(original, "after rename");
   require_zero(syscall(SYS_renameat, AT_FDCWD, renamed, AT_FDCWD, renamed_at),
                "renameat");
+  require_absent(renamed, "after renameat");
+
+  /* The point of doing this HERE: the bytes must have survived both renames,
+   * so the comparison is against the final path, not the one they were
+   * written to. */
+  require_content(renamed_at, "file-io", 7, 4096);
+
   require_zero(symlinkat(renamed_at, AT_FDCWD, link_path), "symlinkat");
 
   char target[128] = {0};
@@ -81,6 +163,8 @@ int main(void) {
 
   require_zero(unlink(link_path), "unlink link");
   require_zero(unlink(renamed_at), "unlink file");
+  require_absent(link_path, "after unlink link");
+  require_absent(renamed_at, "after unlink file");
   puts("syscall-file-io-ok count=5");
   return 0;
 }
