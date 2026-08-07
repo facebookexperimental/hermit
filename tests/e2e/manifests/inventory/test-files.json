@@ -3089,6 +3089,18 @@
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
       "why": "tests/backend-parity/fixtures/personality_domain.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): The fail-closed query/toggle/query/restore/query contract is calibrated for blocking ptrace verification; DBI and KVM remain explicit typed-verdict and execution gaps"
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/backend-parity/test_verify_tier_evidence.py",
+      "runner": "tests/backend-parity/run_matrix.py maintainers",
+      "why": "tests/backend-parity/test_verify_tier_evidence.py is owned by tests/backend-parity/run_matrix.py maintainers: it is a self-contained focused suite over run_matrix.py's verify-tier derivation, asserting that a stripped verdict can never claim the bitwise tier and that a bitwise_parity record with a zero compared-message count is refused. It runs directly as a script and observes no guest program, so it is a driver-side suite rather than a manifest test."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/backend-parity/test_scorecard_header_compat.py",
+      "runner": "tests/backend-parity/run_matrix.py maintainers",
+      "why": "tests/backend-parity/test_scorecard_header_compat.py is owned by tests/backend-parity/run_matrix.py maintainers: it is a self-contained focused suite over run_matrix.py's outer-scorecard writer, asserting that the writer binds to the target file's header so a parent-side column addition cannot refuse every append. It runs directly as a script and observes no guest program, so it is a driver-side suite rather than a manifest test."
     }
   ],
   "schema": 2
