@@ -181,7 +181,29 @@ function audit_inventory {
     scratch=$(mktemp -d)
     expected="$scratch/expected"
     actual="$scratch/actual"
-    find "$ROOT_DIR/tests" \( -type f -o -type l \) -printf 'tests/%P\n' | LC_ALL=C sort >"$expected"
+    # Enumerate through GIT, not a bare filesystem walk.
+    #
+    # `find` reported every file ON DISK, so any ignored build output under
+    # tests/ failed this gate: __pycache__, .pytest_cache, coverage data, editor
+    # swap files, core dumps. That conflates "exists on disk" with "must be
+    # inventoried", and it made the gate depend on checkout state rather than on
+    # repository content -- the same commit passed in a fresh worktree and failed
+    # in a checkout where a tool had run.
+    #
+    # It is a RECURRING self-inflicted red, not a one-off: `make validate-kvm`
+    # and `make validate-dbi` both run `python3 tests/backend-parity/run_matrix.py`,
+    # which creates tests/backend-parity/__pycache__. Running a per-backend
+    # validate therefore reds the next full validate's metadata gate, via a file
+    # that .gitignore hides so `git status` still reads clean.
+    #
+    # `--cached --others --exclude-standard` is tracked files PLUS genuinely new
+    # untracked ones, MINUS ignored output. This does not relax the check: a new
+    # undispositioned test file is still caught by `--others`. Verified three
+    # ways -- on a clean tree the two enumerations are byte-identical (518 files);
+    # with a planted `__pycache__/*.pyc` only `find` reports it; with a planted
+    # new `tests/*.c` both still report it.
+    git -C "$ROOT_DIR" ls-files --cached --others --exclude-standard -- tests \
+        | LC_ALL=C sort >"$expected"
     jq -r '.files[].path' "$INVENTORY" | LC_ALL=C sort >"$actual"
     if ! diff -u "$expected" "$actual"; then
         rm -rf "$scratch"
