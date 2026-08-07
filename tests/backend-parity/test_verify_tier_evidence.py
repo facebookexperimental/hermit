@@ -133,20 +133,20 @@ check("'detlog' is no longer a tier name", "detlog" not in L2_RANK, repr(L2_RANK
 
 print("case CONTRACT — today's contracts demand 'stripped', not 'bitwise'")
 # Asserting bitwise before an INFO-tier comparator exists would red every
-# ptrace/DBI cell for a comparator limitation, not a guest defect.
+# ptrace/DBT cell for a comparator limitation, not a guest defect.
 check("ptrace verify contract is 'stripped'",
       expectation("ptrace", "exit_status", True)[0] == "stripped")
-# `exit_status` is a declared dbi L2 gap, so it would report "gap" regardless of
-# tiering; use a case dbi is actually contracted for.
-check("dbi verify contract is 'stripped'",
-      expectation("dbi", "hello_stdout", True)[0] == "stripped")
-check("a declared dbi L2 gap still reports 'gap'",
-      expectation("dbi", "exit_status", True)[0] == "gap")
+# `exit_status` is a declared dbt L2 gap, so it would report "gap" regardless of
+# tiering; use a case dbt is actually contracted for.
+check("dbt verify contract is 'stripped'",
+      expectation("dbt", "hello_stdout", True)[0] == "stripped")
+check("a declared dbt L2 gap still reports 'gap'",
+      expectation("dbt", "exit_status", True)[0] == "gap")
 check("kvm verify contract stays 'guest'",
       expectation("kvm", "exit_status", True)[0] == "guest")
 
 print("case FALLBACK — a run with no typed verdict must NOT issue a determinism positive")
-# DBI accepts --verify-json and writes nothing (measured: rc=0, no file). The old
+# DBT accepts --verify-json and writes nothing (measured: rc=0, no file). The old
 # behaviour emitted deterministic=1 beside a blank comparator and blank counts --
 # a positive whose required fields are empty, which a wired verifier must refuse.
 # Producing rows designed to be refused is not a contract, so the row is published
@@ -163,7 +163,7 @@ def emitted_row(evidence):
         path.write_text(",".join(SCORECARD_HEADER) + "\n", encoding="utf-8")
         append_parent_scorecard(
             path,
-            [{"test_name": "t", "backend": "dbi", "expectation": "stripped",
+            [{"test_name": "t", "backend": "dbt", "expectation": "stripped",
               "result": "PASS", "seconds": "1.0", "detail": "d", "evidence": evidence}],
             strict=True, verify=True, probe_gaps=False)
         return list(_csv.DictReader(path.open(encoding="utf-8")))[-1]

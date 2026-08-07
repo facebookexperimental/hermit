@@ -5,7 +5,7 @@
 `compat-envelope/scorecard.csv`.  That file's schema belongs to the parent, and
 the parent adds columns without touching Hermit.  The consumer used to demand
 exact tuple equality with its own `SCORECARD_HEADER`, so when the parent added
-`verify_compare` every Hermit validate that reached `test.dbi_parity` died --
+`verify_compare` every Hermit validate that reached `test.dbt_parity` died --
 with no Hermit-side change, AFTER running the whole matrix, and with a message
 naming a header while every parity cell had actually passed.
 
@@ -46,26 +46,26 @@ LEGACY_19 = (
 CURRENT_20 = LEGACY_19 + ",verify_compare"
 RENAMED_20 = CURRENT_20.replace(",parity,", ",stdout_parity,")
 
-# A planted dbi PASS and a planted dbi FAIL. #323: the point is not that the
+# A planted dbt PASS and a planted dbt FAIL. #323: the point is not that the
 # writer runs, it is that a REAL pass reads back as pass and a REAL diff reads
 # back as fail -- a schema skew that silently swaps those is the failure mode
 # this whole gate exists to prevent.
 PLANTED = [
     {
         "result": "PASS",
-        "backend": "dbi",
-        "test_name": "planted-dbi-pass",
+        "backend": "dbt",
+        "test_name": "planted-dbt-pass",
         "expectation": "pass",
         "seconds": "1.0",
-        "detail": "planted genuine dbi parity",
+        "detail": "planted genuine dbt parity",
     },
     {
         "result": "FAIL",
-        "backend": "dbi",
-        "test_name": "planted-dbi-diff",
+        "backend": "dbt",
+        "test_name": "planted-dbt-diff",
         "expectation": "pass",
         "seconds": "2.0",
-        "detail": "planted genuine dbi divergence",
+        "detail": "planted genuine dbt divergence",
     },
 ]
 
@@ -122,11 +122,11 @@ path, err = append(CURRENT_20)
 check("append is accepted, not refused", err is None, repr(err))
 if err is None:
     got = read_planted(path)
-    check("planted dbi PASS reads outcome=pass", got["planted-dbi-pass"]["outcome"] == "pass")
-    check("planted dbi PASS reads parity=1", parity_of(got["planted-dbi-pass"]) == "1")
-    check("planted dbi FAIL reads outcome=fail", got["planted-dbi-diff"]["outcome"] == "fail")
-    check("planted dbi FAIL reads parity=0", parity_of(got["planted-dbi-diff"]) == "0")
-    check("backend column says dbi", got["planted-dbi-pass"]["backend"] == "dbi")
+    check("planted dbt PASS reads outcome=pass", got["planted-dbt-pass"]["outcome"] == "pass")
+    check("planted dbt PASS reads parity=1", parity_of(got["planted-dbt-pass"]) == "1")
+    check("planted dbt FAIL reads outcome=fail", got["planted-dbt-diff"]["outcome"] == "fail")
+    check("planted dbt FAIL reads parity=0", parity_of(got["planted-dbt-diff"]) == "0")
+    check("backend column says dbt", got["planted-dbt-pass"]["backend"] == "dbt")
     # Alignment: the latent short-write bug.
     widths = {
         len(r) for r in csv.reader(path.read_text(encoding="utf-8").splitlines()) if r
@@ -134,12 +134,12 @@ if err is None:
     check("every row is 20 fields wide (no short write)", widths == {20}, str(widths))
     check(
         "reason did not shift into verify_compare",
-        got["planted-dbi-pass"]["verify_compare"] == "",
-        repr(got["planted-dbi-pass"].get("verify_compare")),
+        got["planted-dbt-pass"]["verify_compare"] == "",
+        repr(got["planted-dbt-pass"].get("verify_compare")),
     )
     check(
         "reason still holds the detail",
-        "planted genuine dbi parity" in got["planted-dbi-pass"]["reason"],
+        "planted genuine dbt parity" in got["planted-dbt-pass"]["reason"],
     )
 
 print("case LEGACY-19 — a parent file predating verify_compare still works")
@@ -147,8 +147,8 @@ path, err = append(LEGACY_19)
 check("append is accepted", err is None, repr(err))
 if err is None:
     got = read_planted(path)
-    check("PASS still reads pass", got["planted-dbi-pass"]["outcome"] == "pass")
-    check("FAIL still reads fail", got["planted-dbi-diff"]["outcome"] == "fail")
+    check("PASS still reads pass", got["planted-dbt-pass"]["outcome"] == "pass")
+    check("FAIL still reads fail", got["planted-dbt-diff"]["outcome"] == "fail")
     widths = {
         len(r) for r in csv.reader(path.read_text(encoding="utf-8").splitlines()) if r
     }
@@ -159,8 +159,8 @@ path, err = append(RENAMED_20)
 check("append is accepted", err is None, repr(err))
 if err is None:
     got = read_planted(path)
-    check("parity value landed in stdout_parity", got["planted-dbi-pass"].get("stdout_parity") == "1")
-    check("FAIL landed as 0", got["planted-dbi-diff"].get("stdout_parity") == "0")
+    check("parity value landed in stdout_parity", got["planted-dbt-pass"].get("stdout_parity") == "1")
+    check("FAIL landed as 0", got["planted-dbt-diff"].get("stdout_parity") == "0")
 
 print("case PRESERVE — an existing parent row keeps its verify_compare value")
 seed = (

@@ -247,7 +247,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
-dbi = "DBI was observed emitting a raw host tid in DETLOG records; this fixture is the gate for enabling it"
+dbt = "DBT was observed emitting a raw host tid in DETLOG records; this fixture is the gate for enabling it"
 kvm = "KVM compares output only and cannot assert DETLOG identity yet"
 sabre = "Not yet qualified for the pid-identity fixture"
 liteinst = "Not yet qualified for the pid-identity fixture"
@@ -263,7 +263,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the pid-identity contract"
-dbi = "Record/replay qualification is separate from the pid-identity contract"
+dbt = "Record/replay qualification is separate from the pid-identity contract"
 kvm = "Record/replay qualification is separate from the pid-identity contract"
 sabre = "Record/replay qualification is separate from the pid-identity contract"
 liteinst = "Record/replay qualification is separate from the pid-identity contract"
@@ -273,7 +273,7 @@ ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is orthogonal to pid-identity virtualization"
-dbi = "Chaos scheduling is orthogonal to pid-identity virtualization"
+dbt = "Chaos scheduling is orthogonal to pid-identity virtualization"
 kvm = "Chaos scheduling is orthogonal to pid-identity virtualization"
 sabre = "Chaos scheduling is orthogonal to pid-identity virtualization"
 liteinst = "Chaos scheduling is orthogonal to pid-identity virtualization"
@@ -283,7 +283,7 @@ ci = false
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No calibrated custom arguments for the pid-identity fixture"
-dbi = "No calibrated custom arguments for the pid-identity fixture"
+dbt = "No calibrated custom arguments for the pid-identity fixture"
 kvm = "No calibrated custom arguments for the pid-identity fixture"
 sabre = "No calibrated custom arguments for the pid-identity fixture"
 liteinst = "No calibrated custom arguments for the pid-identity fixture"

@@ -64,7 +64,7 @@ PARITY_COLUMNS = ("parity", "stdout_parity")
 # WHY THIS IS SEPARATE FROM SCORECARD_HEADER, and it is the whole bug: the outer
 # scorecard's schema is owned by the PARENT workspace, not by Hermit.  The parent
 # added `verify_compare` (dev-hermit commit 7080d68) and every Hermit validate
-# that reached test.dbi_parity then died on an exact-tuple header comparison --
+# that reached test.dbt_parity then died on an exact-tuple header comparison --
 # with no Hermit-side change, and AFTER running the full matrix, so the failure
 # named a header while every parity cell had actually passed.  A consumer that
 # demands schema equality makes any producer-side column addition a fleet
@@ -463,7 +463,7 @@ def expectation(backend: str, name: str, verify: bool) -> tuple[str, str]:
     # `stripped`, not `bitwise`: this is the tier the probe's own comparator can
     # actually earn today.  Raising it to `bitwise` is a RATCHET that belongs
     # with the INFO-tier comparator work, not with this correction -- asserting
-    # it now would red every ptrace/DBI cell for a comparator limitation rather
+    # it now would red every ptrace/DBT cell for a comparator limitation rather
     # than a guest defect, which is the mirror image of the bug being fixed.
     return ("guest" if backend == "kvm" else "stripped"), "-"
 
@@ -660,7 +660,7 @@ def verify_tier_from_json(path: Path) -> dict[str, str] | None:
     "no difference" under the strictest possible spec, so without it a run that
     produced no DETLOG at all would certify as bitwise parity.
 
-    Returns ``None`` when no usable record exists -- notably the DBI backend,
+    Returns ``None`` when no usable record exists -- notably the DBT backend,
     which accepts `--verify-json` and writes nothing (measured: rc=0, no file).
     """
     try:
@@ -756,7 +756,7 @@ def run_case_verify(
         # Typed verdict: authoritative.
         observed = observed_evidence["tier"]
     elif VERIFY_WITNESS_DETLOG in result.stderr:
-        # No `--verify-json` record (DBI accepts the flag and writes nothing;
+        # No `--verify-json` record (DBT accepts the flag and writes nothing;
         # measured rc=0, no file).  The banner proves the DETLOG was COMPARED; it
         # cannot say under WHICH policy or over HOW MANY messages.  Those are the
         # two fields a determinism claim rests on, so this run cannot support one.

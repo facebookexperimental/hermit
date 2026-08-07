@@ -17,7 +17,7 @@
  * type work makes host-id confusion a COMPILE error, this makes a host id that
  * reaches the guest a TEST failure. Neither subsumes the other. A backend can
  * type-check perfectly and still emit a raw host tid, which is exactly what was
- * observed from DBI in DETLOG records.
+ * observed from DBT in DETLOG records.
  *
  * Every value below is printed, so the harness's stdout comparison is the
  * assertion; a host pid leaking in on either side of a double run diverges.

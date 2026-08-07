@@ -495,12 +495,12 @@ liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
 id = "c-programs/dbt-copied-tiocgpgrp"
-description = "Strict verification for tests/c/dbi_copied_tiocgpgrp.c"
+description = "Strict verification for tests/c/dbt_copied_tiocgpgrp.c"
 lane = "portable"
 requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
 timeout_seconds = 90
 occasional = false
-program = "tests/c/dbi_copied_tiocgpgrp.c"
+program = "tests/c/dbt_copied_tiocgpgrp.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
@@ -549,12 +549,12 @@ liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
 id = "c-programs/dbt-exec-failure"
-description = "Strict verification for tests/c/dbi_exec_failure.c"
+description = "Strict verification for tests/c/dbt_exec_failure.c"
 lane = "portable"
 requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
 timeout_seconds = 90
 occasional = false
-program = "tests/c/dbi_exec_failure.c"
+program = "tests/c/dbt_exec_failure.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
   [test.build]
@@ -606,12 +606,12 @@ liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
 id = "c-programs/dbt-execveat-unsupported"
-description = "Strict verification for tests/c/dbi_execveat_unsupported.c"
+description = "Strict verification for tests/c/dbt_execveat_unsupported.c"
 lane = "portable"
 requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
 timeout_seconds = 90
 occasional = false
-program = "tests/c/dbi_execveat_unsupported.c"
+program = "tests/c/dbt_execveat_unsupported.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
@@ -659,12 +659,12 @@ liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
 id = "c-programs/dbt-mmap-exec"
-description = "Strict verification for tests/c/dbi_mmap_exec.c"
+description = "Strict verification for tests/c/dbt_mmap_exec.c"
 lane = "portable"
 requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
 timeout_seconds = 90
 occasional = false
-program = "tests/c/dbi_mmap_exec.c"
+program = "tests/c/dbt_mmap_exec.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
@@ -713,12 +713,12 @@ liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
 id = "c-programs/dbt-pid-virtualization"
-description = "Strict verification for tests/c/dbi_pid_virtualization.c"
+description = "Strict verification for tests/c/dbt_pid_virtualization.c"
 lane = "portable"
 requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
 timeout_seconds = 90
 occasional = false
-program = "tests/c/dbi_pid_virtualization.c"
+program = "tests/c/dbt_pid_virtualization.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
@@ -768,12 +768,12 @@ liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
 id = "c-programs/dbt-prlimit-self"
-description = "Strict verification for tests/c/dbi_prlimit_self.c"
+description = "Strict verification for tests/c/dbt_prlimit_self.c"
 lane = "portable"
 requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
 timeout_seconds = 90
 occasional = false
-program = "tests/c/dbi_prlimit_self.c"
+program = "tests/c/dbt_prlimit_self.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
   [test.build]
@@ -825,12 +825,12 @@ liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
 id = "c-programs/dbt-self-sigqueue"
-description = "Strict verification for tests/c/dbi_self_sigqueue.c"
+description = "Strict verification for tests/c/dbt_self_sigqueue.c"
 lane = "portable"
 requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
 timeout_seconds = 90
 occasional = false
-program = "tests/c/dbi_self_sigqueue.c"
+program = "tests/c/dbt_self_sigqueue.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
@@ -878,12 +878,12 @@ liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
 id = "c-programs/dbt-unsupported-syscall"
-description = "Strict verification for tests/c/dbi_unsupported_syscall.c"
+description = "Strict verification for tests/c/dbt_unsupported_syscall.c"
 lane = "portable"
 requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
 timeout_seconds = 90
 occasional = false
-program = "tests/c/dbi_unsupported_syscall.c"
+program = "tests/c/dbt_unsupported_syscall.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
@@ -933,12 +933,12 @@ liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
 id = "c-programs/dbt-wait-lifecycle"
-description = "Strict verification for tests/c/dbi_wait_lifecycle.c"
+description = "Strict verification for tests/c/dbt_wait_lifecycle.c"
 lane = "portable"
 requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
 timeout_seconds = 90
 occasional = false
-program = "tests/c/dbi_wait_lifecycle.c"
+program = "tests/c/dbt_wait_lifecycle.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
   [test.build]
