@@ -66,11 +66,11 @@ if [[ -v CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS ]]; then
     return 2
 fi
 
-# The calibration below is valid only for Reverie dd3c178. The portable wrapper
+# The calibration below is valid only for Reverie 0ae0c01. The portable wrapper
 # obtains the repository's recorded pin through the canonical checker and
 # carries it here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != dd3c178ea9553004d7bf4c494e1b7fd80e7b6ae6 ]]; then
-    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie dd3c178ea9553004d7bf4c494e1b7fd80e7b6ae6" >&2
+if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 0ae0c01b5e4c9fbf85c97adc66c2740f280727df ]]; then
+    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 0ae0c01b5e4c9fbf85c97adc66c2740f280727df" >&2
     return 2
 fi
 
@@ -162,6 +162,26 @@ fi
 # MAX_PARALLEL_JOBS=16 clamp remain byte-identical. The DBI recipe identity
 # therefore remains sha256:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d,
 # and the hosted-runner budget carries unchanged.
+#
+# CARRY TO 0ae0c01 (2026-08-06). dd3c178..0ae0c01 is rrnewton/reverie#396,
+# which revives the KVM backend: it stops answering the `Guest::ppid`
+# traced-tree contract from the guest-visible getppid() value, so Detcore
+# registers the root thread again. Before it, every `hermit run --backend kvm`
+# hung before the first guest syscall, including /bin/true.
+#
+# `git diff --name-only dd3c178..0ae0c01` is exactly two files, both KVM:
+#   reverie-kvm/src/elf.rs
+#   reverie-kvm/src/executor.rs
+# The DBI inputs are byte-identical by git object identity at both pins --
+# reverie-dbi/build.rs 9e35e1b699b7, reverie-dbi/vendor/dynamorio de352475846e,
+# third-party fb49c0ba7a9a, and the whole reverie-dbi subtree eb284556d2df --
+# so source_recipe_key() is unchanged at
+# sha256:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d and
+# the MAX_PARALLEL_JOBS=16 clamp still applies. The hosted-runner budget
+# therefore carries without re-derivation. This carry is evidenced by tree
+# identity rather than by a fresh timing run, exactly as the 6a6b4ec and
+# dd3c178 carries above: no DBI build input changed, so there is nothing for a
+# new timing sample to measure.
 #
 # Those 2026-08-05 samples deliberately do NOT replace 1050. They come from a
 # development host whose cores finish the identical work ~3.3x faster than the
