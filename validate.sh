@@ -1074,14 +1074,11 @@ printf "Build cache: %s (target/ debug=%s release=%s)\n" \
     "$VALIDATION_CACHE_STATE" \
     "$([[ -x "$ROOT_DIR/target/debug/hermit" ]] && printf present || printf absent)" \
     "$([[ -x "$ROOT_DIR/target/release/hermit" ]] && printf present || printf absent)"
-VALIDATION_ZERO_BYTE_PURGED=$(purge_zero_byte_objects "$ROOT_DIR/target")
-readonly VALIDATION_ZERO_BYTE_PURGED
-if ((VALIDATION_ZERO_BYTE_PURGED > 0)); then
-    printf "🧹 Artifact-integrity: purged %s zero-byte object(s) from target/ before build (killed/OOM-truncated; would otherwise link as 'undefined reference'). Rebuild will regenerate them.\n" \
-        "$VALIDATION_ZERO_BYTE_PURGED"
-    printf "validate.sh: purged %s zero-byte object(s) from target/ pre-build\n" \
-        "$VALIDATION_ZERO_BYTE_PURGED" >>"$LOG_FILE"
-fi
+# DEFERRED past the cheap fail-closed preflight gates -- see the call site below.
+# Declared here (not readonly) so the ledger writer at the `zero_byte_purged`
+# field always has a value, including on the refusal paths that exit before the
+# scan ever runs.
+VALIDATION_ZERO_BYTE_PURGED=0
 printf "Estimated time: %s\n" \
     "$(history_estimate "$VALIDATION_PROFILE" "$VALIDATION_CACHE_STATE" "$VALIDATION_HOST" "$VALIDATION_LEDGER_FILE")"
 if [[ $VALIDATION_LEVEL == super ]]; then
@@ -4779,6 +4776,36 @@ run_check "Reverie pin consistency" validate_reverie_pin_consistency
 if ((failures != 0)); then
     print_summary
     exit 1
+fi
+
+# Artifact-integrity scan, DELIBERATELY PLACED HERE: after the cheap fail-closed
+# preflight gates, still before anything builds.
+#
+# It used to run in the pre-build preamble, ~3700 lines earlier. Every statement
+# between there and the first gate is a `readonly` assignment or a function
+# definition, so the scan was always paid IN FULL before a gate that can refuse
+# in zero seconds for a reason that has nothing to do with build artifacts -- the
+# Reverie pin gate fails closed when it merely cannot REACH the remote.
+#
+# Measured cost of that ordering, from two runs of the SAME commit d5e29ce9051e
+# in the SAME slot (w30) four minutes apart:
+#   05:01:58Z cache=cold  real_seconds=357   gates_run=7  -- whole suite ran
+#   05:11:03Z cache=warm  real_seconds=2722  gates_run=1  -- pin gate failed in 0s
+# The warm run spent 45 minutes to accomplish nothing, 7.6x the wall of the cold
+# run that validated everything, at CPU/wall 0.957 (single-core-bound: the
+# serial per-file fork storm). A WARMER cache made validate SLOWER, because the
+# scan's cost scales with the artifact count it has to inspect.
+#
+# Running it here keeps the guarantee that matters -- no build ever consumes a
+# structurally-incomplete artifact -- while making a 0-second refusal cost 0
+# seconds. Nothing between the two points builds anything.
+VALIDATION_ZERO_BYTE_PURGED=$(purge_zero_byte_objects "$ROOT_DIR/target")
+readonly VALIDATION_ZERO_BYTE_PURGED
+if ((VALIDATION_ZERO_BYTE_PURGED > 0)); then
+    printf "Artifact-integrity: purged %s structurally-incomplete object(s) from target/ before build (killed/OOM-truncated; would otherwise link as 'undefined reference'). Rebuild will regenerate them.\n" \
+        "$VALIDATION_ZERO_BYTE_PURGED"
+    printf "validate.sh: purged %s incomplete object(s) from target/ pre-build\n" \
+        "$VALIDATION_ZERO_BYTE_PURGED" >>"$LOG_FILE"
 fi
 
 # --only is the first-class fast path for one already-built DAG shard. Run it
