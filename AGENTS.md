@@ -335,6 +335,27 @@ Typical flow for a change:
 - Branch from `origin/main`, make one coherent change per branch, and write an
   imperative, descriptive commit subject that states what changed. Explain the
   reason and any non-obvious constraints in the body.
+- **End every commit body with a role + team tag**, as its own final line:
+  `[<role>, MODEL] [<full-team-name>]` — for example
+  `[impl agent, claude-opus-5] [claude-coord-176]`. Role is `impl agent`,
+  `adversarial-reviewer agent`, `coordinator`, or `Human`; the team name includes
+  the machine. The same tag opens the PR description and prefixes any GitHub
+  comment coordinating across teams.
+
+  The commit trailer is the load-bearing one. This repository lands PRs by
+  **rebase merge**, which replays the branch commit onto `main` verbatim and adds
+  no pull-request reference to the message — so a tag that lives only in the PR
+  description is invisible in `git log main`, and a properly-reviewed commit is
+  indistinguishable there from one pushed by hand. An audit of the 27 commits
+  landed across `rrnewton/hermit` and `rrnewton/reverie` in the 24 hours to
+  2026-08-07 found all 27 came from pull requests, 26 of 27 PR bodies carried a
+  role tag, and only 2 of 27 named a team: the convention was being followed and
+  still left `main` unattributable.
+
+  When you do need a commit's provenance, the authority is
+  `gh api repos/<owner>/<repo>/commits/<sha>/pulls`, which resolves the source PR
+  even for a rebase merge. Do not conclude from an untagged commit message that a
+  change bypassed review.
 - Run the workspace test, format, and Clippy gates relevant to the change, and
   report the assurance level reached along with the backend, log level, and any
   relaxations.
