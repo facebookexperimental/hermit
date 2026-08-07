@@ -61,6 +61,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   NEXTEST_VERSION: "0.9.100"
+  # Pinned to the version the fleet's dev boxes run, so the interpreter that
+  # resolves `#!/usr/bin/env rust-script` here is the same one that resolved it
+  # for the local validate run a PR is being compared against.
+  RUST_SCRIPT_VERSION: "0.36.0"
   RUSTFLAGS: -D warnings -C link-arg=-llzma
   RUSTDOCFLAGS: -D warnings
   DETCORE_TEST_RUST_LOG: "off"
@@ -524,6 +528,37 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      # The strict-compat node runs `./validate.sh`, which is a shim that
+      # `exec`s `scripts/validate.rs` through `#!/usr/bin/env rust-script`. No
+      # runner image ships that interpreter, and no workflow installed it, so
+      # the exec fails with status 127 before any test runs -- a step that dies
+      # in 0.1s having measured nothing, which reads like a product failure.
+      #
+      # Compiling the driver instead of installing the interpreter is not an
+      # option here: validate.rs carries an embedded `//! ```cargo` manifest and
+      # depends on `safe_ci_dag_runner` from the agent-utils submodule, so plain
+      # `rustc` cannot build it the way the check.skill_discovery node builds its
+      # std-only script.
+      #
+      # `taiki-e/install-action` is used above for cargo-nextest but does NOT
+      # list rust-script in its supported-tool manifest, so it would silently
+      # take an unverified fallback path. A pinned `cargo install` is slower but
+      # its failure mode is legible, which is the whole point of this fix.
+      - name: Install rust-script (strict-compat shard)
+        if: matrix.slug == 'strict-compat'
+        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+      # Fail with a diagnostic naming the interpreter rather than letting the
+      # shard die at exec. `env` reports the missing program on stderr and the
+      # shell exits 127, but neither string contains "error", so the standard
+      # log triage grep misses it entirely.
+      - name: Verify rust-script resolves (strict-compat shard)
+        if: matrix.slug == 'strict-compat'
+        run: |
+          if ! command -v rust-script >/dev/null; then
+            echo "::error::rust-script is not on PATH; ./validate.sh execs scripts/validate.rs through it and would die at exec with status 127."
+            exit 1
+          fi
+          echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
       - name: Enable unprivileged user and mount namespaces
         run: |
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
