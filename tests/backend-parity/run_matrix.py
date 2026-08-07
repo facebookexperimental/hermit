@@ -84,6 +84,16 @@ EVIDENCE_COLUMNS = (
     "tier",
 )
 
+# Recorded as the comparator when the run produced no typed verdict at all, so a
+# reader can tell "no verdict existed" from "a verdict existed and was stripped".
+# A blank would conflate those two, and only one of them is a measurement.
+VERIFY_COMPARE_UNAVAILABLE = "unavailable:no-verify-json"
+
+# Comparators whose match may be read as bitwise identity. An allowlist, not a
+# not-equal-to-"stripped" test: an unrecognised comparator name is an unknown
+# policy, and an unknown policy cannot license the strongest claim in the ladder.
+BITWISE_CAPABLE_COMPARATORS = ("canonical",)
+
 PRODUCED_COLUMNS = tuple(
     c for c in SCORECARD_HEADER if c not in EVIDENCE_COLUMNS and c != "parity"
 )
@@ -746,28 +756,42 @@ def run_case_verify(
         # Typed verdict: authoritative.
         observed = observed_evidence["tier"]
     elif VERIFY_WITNESS_DETLOG in result.stderr:
-        # No `--verify-json` record (DBI writes none).  The banner proves the
-        # DETLOG was COMPARED; it cannot prove it was IDENTICAL, so the most this
-        # fallback may ever claim is `stripped`.  Never `bitwise`.
+        # No `--verify-json` record (DBI accepts the flag and writes nothing;
+        # measured rc=0, no file).  The banner proves the DETLOG was COMPARED; it
+        # cannot say under WHICH policy or over HOW MANY messages.  Those are the
+        # two fields a determinism claim rests on, so this run cannot support one.
+        #
+        # It is still a contract PASS -- the guest ran and hermit's own compare
+        # succeeded -- but the row is published UNMEASURED (`deterministic=""`,
+        # which is exactly what blank already means in that column) rather than as
+        # a positive with hollow evidence.  Emitting `deterministic=1` beside a
+        # blank comparator and blank counts is the shape a wired verifier must
+        # refuse, and producing rows designed to be refused is not a contract.
         observed = "stripped"
         if evidence is not None:
             evidence.update(
                 {
                     "tier": "stripped",
-                    "verify_compare": "",
+                    "verify_compare": VERIFY_COMPARE_UNAVAILABLE,
                     "bitwise_parity": "0",
                     "compared_log_messages": "",
+                    "determinism_unmeasured": "1",
                 }
             )
     elif VERIFY_WITNESS_GUEST_VISIBLE in result.stderr:
+        # Guest-visible: stdout+exit compared, the log stream deliberately not.
+        # Absent counts are CORRECT here rather than missing, so this tier can
+        # carry a determinism claim without them -- but it still needs to say
+        # which comparison produced it.
         observed = "guest"
         if evidence is not None:
             evidence.update(
                 {
                     "tier": "guest",
-                    "verify_compare": "",
+                    "verify_compare": VERIFY_COMPARE_UNAVAILABLE,
                     "bitwise_parity": "0",
                     "compared_log_messages": "",
+                    "determinism_unmeasured": "1",
                 }
             )
     else:
@@ -1004,7 +1028,15 @@ def append_parent_scorecard(
                     "disabled" if result["expectation"] == "gap" else "enabled"
                 ),
                 "outcome": outcome,
-                "deterministic": "1" if passed and strict else "",
+                # A determinism positive requires evidence that a comparison
+                # happened AND what it was. When the run produced no typed
+                # verdict, `determinism_unmeasured` is set and this stays blank:
+                # the cell is genuinely unmeasured, not deterministic-by-default.
+                "deterministic": (
+                    ""
+                    if (result.get("evidence") or {}).get("determinism_unmeasured")
+                    else ("1" if passed and strict else "")
+                ),
                 "parity": parity,
                 "output_hash": "",
                 "duration_ms": str(round(float(result["seconds"]) * 1000)),

@@ -145,6 +145,49 @@ check("a declared dbi L2 gap still reports 'gap'",
 check("kvm verify contract stays 'guest'",
       expectation("kvm", "exit_status", True)[0] == "guest")
 
+print("case FALLBACK — a run with no typed verdict must NOT issue a determinism positive")
+# DBI accepts --verify-json and writes nothing (measured: rc=0, no file). The old
+# behaviour emitted deterministic=1 beside a blank comparator and blank counts --
+# a positive whose required fields are empty, which a wired verifier must refuse.
+# Producing rows designed to be refused is not a contract, so the row is published
+# UNMEASURED instead.
+import tempfile as _tf, csv as _csv  # noqa: E402
+from run_matrix import (  # noqa: E402
+    VERIFY_COMPARE_UNAVAILABLE, BITWISE_CAPABLE_COMPARATORS, append_parent_scorecard,
+)
+
+
+def emitted_row(evidence):
+    with _tf.TemporaryDirectory(prefix="fallback-") as tmp:
+        path = Path(tmp) / "sc.csv"
+        path.write_text(",".join(SCORECARD_HEADER) + "\n", encoding="utf-8")
+        append_parent_scorecard(
+            path,
+            [{"test_name": "t", "backend": "dbi", "expectation": "stripped",
+              "result": "PASS", "seconds": "1.0", "detail": "d", "evidence": evidence}],
+            strict=True, verify=True, probe_gaps=False)
+        return list(_csv.DictReader(path.open(encoding="utf-8")))[-1]
+
+
+fallback = emitted_row({"tier": "stripped", "verify_compare": VERIFY_COMPARE_UNAVAILABLE,
+                        "bitwise_parity": "0", "compared_log_messages": "",
+                        "determinism_unmeasured": "1"})
+check("fallback row does NOT claim deterministic=1",
+      fallback["deterministic"] == "", repr(fallback["deterministic"]))
+check("fallback row names why no verdict exists, rather than leaving it blank",
+      fallback["verify_compare"] == VERIFY_COMPARE_UNAVAILABLE, repr(fallback["verify_compare"]))
+check("fallback outcome is still a PASS (the guest ran and the compare succeeded)",
+      fallback["outcome"] == "pass", repr(fallback["outcome"]))
+check("the no-verdict sentinel is not a bitwise-capable comparator",
+      VERIFY_COMPARE_UNAVAILABLE not in BITWISE_CAPABLE_COMPARATORS)
+
+typed = emitted_row({"tier": "bitwise", "verify_compare": "canonical",
+                     "bitwise_parity": "1", "compared_log_messages": "348|348"})
+check("a typed verdict DOES still claim deterministic=1 (not inert)",
+      typed["deterministic"] == "1", repr(typed["deterministic"]))
+check("typed row carries its counts into the row",
+      typed["compared_log_messages"] == "348|348", repr(typed["compared_log_messages"]))
+
 print("case SCHEMA — the evidence columns exist and sit in the canonical header")
 for column in EVIDENCE_COLUMNS:
     check(f"{column} is in SCORECARD_HEADER", column in SCORECARD_HEADER)
