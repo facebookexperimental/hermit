@@ -1,6 +1,6 @@
 ---
 name: post-facto-review
-description: "Current Hermit post-facto human-review protocol: exact trigger set, dual Claude+Codex adversarial review for triggered changes, exact-head validation, and fix-forward human review after landing."
+description: "Current Hermit post-facto human-review protocol: exact trigger set, dual Claude+Codex adversarial review for triggered changes, the close precondition an adversarial reviewer must satisfy before closing a PR, exact-head validation, and fix-forward human review after landing."
 ---
 
 # Post-facto human review
@@ -45,6 +45,38 @@ host addresses are ordinalized, while virtual time, branch counts, syscall
 values, sizes, flags, and other payloads remain exact). Default `--verify` is
 lossy, and KVM is output/status-only, so neither is full L2 INFO parity.
 First-sample agreement is not proof of a continuously evolving clock.
+
+## Close precondition
+
+Closing a pull request is the reviewer's last resort, not a review verdict. The
+default outcome of an adversarial review that finds defects is to **update the
+PR in place**: push a corrected head to the same branch, restate the objection
+against the new head, and let the one PR carry the work forward. A PR generally
+should be UPDATED, not replaced. Three predicates gate a close:
+
+1. **No close without a named successor or an explicit owner instruction.** The
+   closing comment contains a literal `SUPERSEDED-BY: #<n>` naming the open pull
+   request that carries the same work forward, or it quotes an explicit owner
+   instruction to close this PR. A closing comment carrying neither is invalid:
+   reopen the PR and update it in place. "The head is recoverable" is not a
+   successor — a recoverable SHA is a rescue path, not published work.
+2. **A rejection names the concrete change required.** State the exact defect
+   and the exact change that resolves it: the file, the gate, the missing
+   evidence, or the command whose output would settle it. "Procedurally
+   deficient", "not closure-grade", and "does not meet the bar" are verdicts,
+   not reviews. A reviewer who cannot name what to change has not finished the
+   review, and the PR is not ready to be rejected.
+3. **"A task exists in the TaskGraph" is NOT a valid reason to close.**
+   Deferring the work to a task does not satisfy rule 1 and never substitutes
+   for a successor PR. A task is neither a guarantee the work happens nor an
+   artifact on `main`. Owner-cited fleet measurement, 2026-08-07: 106 tasks
+   tagged `implemented` → 38 landed → 4 met their stated goal. Closing a PR
+   against a task trades a reviewable diff for that attrition.
+
+Hermit [PR #1635](https://github.com/rrnewton/hermit/pull/1635) is the incident
+these rules encode: a critical-path change was closed without landing, with no
+successor PR named and remediation deferred to two TaskGraph tasks. It then had
+to be reopened and updated in place — which is what rule 1 requires first.
 
 ## Landing
 
