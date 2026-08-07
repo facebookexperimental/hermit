@@ -776,6 +776,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/clock_exec_continuity.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/system-utils.toml",
+      "why": "tests/c/clock_exec_continuity.c is owned by ci/test_harness.sh via tests/e2e/manifests/system-utils.toml: regression guard for the PR #1095 clock freeze; reads the virtual clock repeatedly inside each generation and re-execs itself, asserting the clock is never rebased onto a round origin, never resets across exec, and is never coarsened -- the axis a first-sample comparison cannot see, which is how #1095 passed review"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/clone.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
       "why": "tests/c/clone.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"

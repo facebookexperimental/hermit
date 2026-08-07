@@ -1337,3 +1337,61 @@ kvm = "Record/replay identity of shared-memory observation is a separate contrac
 liteinst = "Record/replay identity of shared-memory observation is a separate contract"
 ptrace = "Record/replay identity of shared-memory observation is a separate contract"
 sabre = "Record/replay identity of shared-memory observation is a separate contract"
+
+[[test]]
+id = "system-utils/clock-exec-continuity"
+description = "Guest clock keeps advancing across execs and is never rebased onto a round origin"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/c/clock_exec_continuity.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.build]
+cflags = ["-O0", "-D_GNU_SOURCE"]
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "The guard asserts Hermit's virtual clock; the host clock is not the contract"
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbt = "Enable once the DBI post-exec clock path is qualified against the ptrace baseline"
+kvm = "Enable once the KVM post-exec clock path is qualified against the ptrace baseline"
+sabre = "SaBRe does not intercept RDTSCP; clock probes can leak raw host TSC"
+liteinst = "The preload runtime does not survive the guest's own re-exec"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Clock replay divergence is tracked by the clock-determinism entry"
+dbt = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The guard guest is single-threaded"
+dbt = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "The verify mode owns this contract; the guest self-asserts"
+dbt = "The verify mode owns this contract; the guest self-asserts"
+kvm = "The verify mode owns this contract; the guest self-asserts"
+sabre = "The verify mode owns this contract; the guest self-asserts"
+liteinst = "The verify mode owns this contract; the guest self-asserts"
