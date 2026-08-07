@@ -66,11 +66,11 @@ if [[ -v CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS ]]; then
     return 2
 fi
 
-# The calibration below is valid only for Reverie 0ae0c01. The portable wrapper
+# The calibration below is valid only for Reverie 6144323. The portable wrapper
 # obtains the repository's recorded pin through the canonical checker and
 # carries it here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 0ae0c01b5e4c9fbf85c97adc66c2740f280727df ]]; then
-    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 0ae0c01b5e4c9fbf85c97adc66c2740f280727df" >&2
+if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 6144323c5dab8b521278fce206f8774360c2b05f ]]; then
+    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 6144323c5dab8b521278fce206f8774360c2b05f" >&2
     return 2
 fi
 
@@ -182,6 +182,24 @@ fi
 # identity rather than by a fresh timing run, exactly as the 6a6b4ec and
 # dd3c178 carries above: no DBI build input changed, so there is nothing for a
 # new timing sample to measure.
+#
+# CARRY TO 6144323 (2026-08-07). 0ae0c01..6144323 is exactly one commit,
+# rrnewton/reverie#377 (HybridPtrace A-class lifecycle-owner for reverie-e9patch),
+# touching 8 files: reverie-e9patch/{README.md,src/backend.rs,src/lib.rs,
+# src/runtime.rs}, reverie-preload/{README.md,src/lifecycle.rs}, and
+# reverie-ptrace/{src/tracer.rs,tests/stdio_drain.rs}. NONE is a DBI input.
+#
+# Verified by git object identity at both pins, not by inspection: build.rs
+# 9e35e1b699b7, vendor/dynamorio de352475846e, third-party fb49c0ba7a9a, and the
+# whole reverie-dbi subtree eb284556d2df are byte-identical at 0ae0c01 and at
+# 6144323 -- the same four object ids this file already records for 0ae0c01, so
+# the recorded evidence for the previous carry independently checks out too.
+# source_recipe_key() is therefore unchanged at
+# sha256:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d and the
+# MAX_PARALLEL_JOBS=16 clamp (reverie-dbi/build.rs:25) still applies, so the
+# hosted-runner budget carries without re-derivation. Evidenced by tree identity
+# rather than a fresh timing run, exactly as the 6a6b4ec, dd3c178 and 0ae0c01
+# carries above: no DBI build input changed, so there is nothing to re-measure.
 #
 # Those 2026-08-05 samples deliberately do NOT replace 1050. They come from a
 # development host whose cores finish the identical work ~3.3x faster than the
