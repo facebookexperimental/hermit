@@ -747,7 +747,7 @@ pub fn compare_two_runs(
         // if `LogDiffOpts::default()` ever grew a filtering default, the spec
         // would silently misreport "no filters", so refuse to run in that case.
         debug_assert!(
-            diff_options.ignore_lines.is_empty() == !spec.ignore_lines,
+            diff_options.ignore_lines.is_empty() != spec.ignore_lines,
             "ComparisonSpec.ignore_lines must match the diff engine's ignore_lines"
         );
 

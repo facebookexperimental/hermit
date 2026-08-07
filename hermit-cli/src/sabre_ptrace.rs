@@ -100,7 +100,7 @@ fn should_replace_signal_diagnostic(
         && signal == Signal::SIGILL
         && existing_code > 0
         && !existing_is_marker
-        && !si_code.is_some_and(|code| code > 0)
+        && si_code.is_none_or(|code| code <= 0)
     {
         return false;
     }
