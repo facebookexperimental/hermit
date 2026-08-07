@@ -5,8 +5,8 @@
  * itself executed under Hermit. It exercises the guest kernel's networking
  * stack entirely INTERNALLY (no external egress, which is inherently
  * nondeterministic): an AF_UNIX socketpair echo, /etc/hosts name resolution,
- * loopback interface bring-up, an AF_INET TCP client/server handshake over
- * 127.0.0.1, and an HTTP request/response over that connection.
+ * loopback interface bring-up, AF_INET TCP and UDP client/server exchanges
+ * over 127.0.0.1, and an HTTP request/response over the TCP connection.
  *
  * Everything happens inside the guest via TCG, so under `hermit run --strict
  * --verify` the whole exchange -- TCP initial sequence numbers, ephemeral
@@ -391,9 +391,9 @@ void _start(void) {
     put_dec(line, &pos, -lr);
     line[pos++] = '\n';
     outn(line, pos);
-    /* Without lo we cannot do the AF_INET path; still a clean, deterministic
-     * run of the socketpair + DNS stages. */
-    out("QEMU_NET_ALL_OK\n");
+    /* Without lo neither required AF_INET lifecycle engaged.  This is a
+     * typed no-result, never a successful (or falsely failing) milestone. */
+    out("QEMU_NET_NO_RESULT lifecycle=0/2 reason=loopback-unavailable\n");
     power_off();
   }
   out("QEMU_NET_LO_UP\n");
@@ -474,7 +474,62 @@ void _start(void) {
     outn(line, pos);
   }
 
-  if (req_ok && client_ok) out("QEMU_NET_ALL_OK\n");
+  /* 6. AF_INET UDP client/server request + response over fixed loopback
+   * ports.  Fixed ports avoid smuggling an ephemeral-port choice into the
+   * evidence while still exercising UDP socket, bind, connect, write, and
+   * read paths in both directions. */
+  int udp_ok = 0;
+  long us = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+  long uc = -1;
+  if (us < 0) {
+    out("QEMU_NET_UDP_SERVER_SOCKET_FAILED\n");
+  } else {
+    syscall5(SYS_SETSOCKOPT, us, SOL_SOCKET, SO_REUSEADDR, (long)&one, 4);
+    u8 server_addr[16];
+    make_sin(server_addr, 8081, ipnet);
+    if (syscall3(SYS_BIND, us, (long)server_addr, 16) < 0) {
+      out("QEMU_NET_UDP_SERVER_BIND_FAILED\n");
+    } else {
+      uc = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+      if (uc < 0) {
+        out("QEMU_NET_UDP_CLIENT_SOCKET_FAILED\n");
+      } else {
+        syscall5(SYS_SETSOCKOPT, uc, SOL_SOCKET, SO_REUSEADDR, (long)&one, 4);
+        u8 client_addr[16];
+        make_sin(client_addr, 8082, ipnet);
+        if (syscall3(SYS_BIND, uc, (long)client_addr, 16) < 0) {
+          out("QEMU_NET_UDP_CLIENT_BIND_FAILED\n");
+        } else if (syscall3(SYS_CONNECT, uc, (long)server_addr, 16) < 0) {
+          out("QEMU_NET_UDP_CLIENT_CONNECT_FAILED\n");
+        } else {
+          const char *ping = "PING";
+          char request[8];
+          long sent = syscall3(SYS_WRITE, uc, (long)ping, 4);
+          long received = syscall3(SYS_READ, us, (long)request, sizeof(request));
+          if (sent != 4 || received != 4 || !seq_eq(request, "PING", 4)) {
+            out("QEMU_NET_UDP_REQUEST_MISMATCH\n");
+          } else if (syscall3(SYS_CONNECT, us, (long)client_addr, 16) < 0) {
+            out("QEMU_NET_UDP_SERVER_CONNECT_FAILED\n");
+          } else {
+            const char *pong = "PONG";
+            char response[8];
+            long replied = syscall3(SYS_WRITE, us, (long)pong, 4);
+            long got = syscall3(SYS_READ, uc, (long)response, sizeof(response));
+            if (replied == 4 && got == 4 && seq_eq(response, "PONG", 4)) {
+              udp_ok = 1;
+              out("QEMU_NET_UDP_OK proto=udp server=127.0.0.1:8081 client=127.0.0.1:8082 request=PING response=PONG\n");
+            } else {
+              out("QEMU_NET_UDP_RESPONSE_MISMATCH\n");
+            }
+          }
+        }
+      }
+    }
+  }
+  if (uc >= 0) syscall1(SYS_CLOSE, uc);
+  if (us >= 0) syscall1(SYS_CLOSE, us);
+
+  if (req_ok && client_ok && udp_ok) out("QEMU_NET_ALL_OK\n");
   else out("QEMU_NET_PARTIAL\n");
 
   power_off();

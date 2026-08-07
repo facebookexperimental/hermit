@@ -2,9 +2,9 @@
 #
 # In-VM network determinism test: boot a QEMU-emulated Linux kernel under Hermit
 # whose init exercises the guest networking stack ENTIRELY internally (AF_UNIX
-# socketpair, /etc/hosts name resolution, loopback bring-up, an AF_INET TCP
-# client/server handshake over 127.0.0.1, and an HTTP request/response), then
-# prove the whole exchange is bitwise-deterministic under `--strict --verify`.
+# socketpair, /etc/hosts name resolution, loopback bring-up, AF_INET TCP and UDP
+# client/server exchanges over 127.0.0.1, and an HTTP request/response), then
+# prove the whole exchange is bitwise-deterministic under strict verification.
 #
 # All traffic stays inside the guest (no external egress), so unlike a real
 # DNS/HTTP call to the internet it CAN be -- and is required to be -- L2
@@ -89,19 +89,20 @@ if [[ ! $phase_timeout_seconds =~ ^[1-9][0-9]*$ ]]; then
   fail "QEMU_L2_PHASE_TIMEOUT_SECONDS must be a positive integer"
 fi
 
-for command in cpio find gcc gzip grep mktemp setsid sleep tail; do
+for command in cpio find gcc gzip grep jq mktemp setsid sleep tail; do
   command -v "$command" >/dev/null || fail "required command not found: $command"
 done
 
 mkdir -p "$output_dir"
 run_dir=$(mktemp -d "$output_dir/run.XXXXXX")
 initramfs_image=${INITRAMFS_IMAGE:-$run_dir/initramfs.cpio.gz}
-init_source=$repo_root/tests/shared-futex-verify/qemu_net_init.c
+init_source=${INIT_SOURCE:-$repo_root/tests/shared-futex-verify/qemu_net_init.c}
 initramfs_root=$run_dir/initramfs-root
 boot_stdout=$run_dir/boot.stdout
 boot_stderr=$run_dir/boot.stderr
 verifier_stdout=$run_dir/verifier.stdout
 verifier_stderr=$run_dir/verifier.stderr
+verify_report=$run_dir/verify.json
 [[ -r $init_source ]] || fail "init source is not readable: $init_source"
 mkdir -p "$initramfs_root/etc" "$(dirname -- "$initramfs_image")"
 
@@ -137,7 +138,8 @@ guest_command=(
   -append 'console=ttyS0 panic=-1 rdinit=/init'
 )
 boot_command=("$hermit_bin" --log info run --strict -- "${guest_command[@]}")
-verify_command=("$hermit_bin" --log info run --strict --verify -- "${guest_command[@]}")
+verify_command=("$hermit_bin" --log info run --strict --verify --verify-strict \
+  --verify-json "$verify_report" -- "${guest_command[@]}")
 
 # --- Phase 1: boot oracle. Run once under strict mode and assert the guest
 # reached every network milestone. -nic none: the QEMU-level NIC is absent on
@@ -167,20 +169,33 @@ if ((status != 0)); then
   fail "QEMU strict network boot oracle exited with status $status"
 fi
 
-require_marker() {
+require_marker_count() {
   local marker=$1
-  if ! grep -Fq "$marker" "$boot_stdout"; then
+  local expected=$2
+  local actual
+  actual=$(grep -Fc "$marker" "$boot_stdout" || true)
+  if ((actual != expected)); then
     tail -200 "$boot_stderr" >&2
-    fail "QEMU strict network boot oracle exited without marker: $marker"
+    fail "QEMU strict network boot oracle marker count $actual/$expected: $marker"
   fi
 }
-require_marker SHARED_FUTEX_QEMU_KERNEL_OK
-require_marker "QEMU_NET_SOCKETPAIR_OK bytes=4 data=PING"
-require_marker "QEMU_NET_DNS_OK localhost=127.0.0.1"
-require_marker QEMU_NET_LO_UP
-require_marker "QEMU_NET_TCP_OK proto=tcp addr=127.0.0.1:8080"
-require_marker "QEMU_NET_HTTP_OK status=200 body=HELLO"
-require_marker QEMU_NET_ALL_OK
+tcp_lifecycle=$(grep -Fc "QEMU_NET_TCP_OK proto=tcp addr=127.0.0.1:8080" "$boot_stdout" || true)
+udp_lifecycle=$(grep -Fc "QEMU_NET_UDP_OK proto=udp server=127.0.0.1:8081 client=127.0.0.1:8082 request=PING response=PONG" "$boot_stdout" || true)
+if ((tcp_lifecycle == 0 && udp_lifecycle == 0)); then
+  printf 'QEMU_NET_RESULT outcome=NO_RESULT lifecycle=0/2\n' >&2
+  exit 2
+fi
+printf 'QEMU_NET_LIFECYCLE tcp=%s/1 udp=%s/1 total=%s/2\n' \
+  "$tcp_lifecycle" "$udp_lifecycle" "$((tcp_lifecycle + udp_lifecycle))"
+
+require_marker_count SHARED_FUTEX_QEMU_KERNEL_OK 1
+require_marker_count "QEMU_NET_SOCKETPAIR_OK bytes=4 data=PING" 1
+require_marker_count "QEMU_NET_DNS_OK localhost=127.0.0.1" 1
+require_marker_count QEMU_NET_LO_UP 1
+require_marker_count "QEMU_NET_TCP_OK proto=tcp addr=127.0.0.1:8080" 1
+require_marker_count "QEMU_NET_HTTP_OK status=200 body=HELLO" 1
+require_marker_count "QEMU_NET_UDP_OK proto=udp server=127.0.0.1:8081 client=127.0.0.1:8082 request=PING response=PONG" 1
+require_marker_count QEMU_NET_ALL_OK 1
 
 clock_failures='Unable to calibrate against PIT|Clocksource .* skewed|Marking TSC unstable|No current clocksource'
 if grep -Eq "$clock_failures" "$boot_stdout"; then
@@ -229,6 +244,21 @@ if ((status != 0)); then
 fi
 grep -Fq ':: Success: deterministic. Determinism verified.' "$verifier_stderr" || \
   fail "Hermit exited successfully without the L2 verification marker"
+[[ -s $verify_report ]] || fail "Hermit published no typed verification report"
+jq -e '
+  type == "object"
+  and .verdict == "matched"
+  and .verified == true
+  and .bitwise_parity == true
+  and ((.compared_log_messages.left // 0) > 0)
+  and ((.compared_log_messages.right // 0) > 0)
+' "$verify_report" >/dev/null || {
+  cat "$verify_report" >&2
+  fail "typed verification report did not establish non-vacuous bitwise parity"
+}
+jq -r '
+  "QEMU_NET_VERIFY verdict=\(.verdict) verified=\(.verified) bitwise_parity=\(.bitwise_parity) compared=\(.compared_log_messages.left)/\(.compared_log_messages.right)"
+' "$verify_report"
 stop_active_group
 
-printf 'QEMU strict L2 in-VM network boot passed.\n'
+printf 'QEMU strict L2 in-VM TCP/UDP network boot passed.\n'
