@@ -2063,6 +2063,47 @@ function run_capture {
         </dev/null >"$stdout_file" 2>"$stderr_file"
 }
 
+# Emit WHY a prepare/compile step failed. Guaranteed to write at least one line.
+#
+# The reason is normally the child's own stderr, which is the right answer when
+# the child wrote one. But a guest whose prepare is a bare
+# `command -v foo >/dev/null` under `set -e` exits nonzero having printed
+# nothing, so the caller emitted `prepare failed for <guest>` with no cause at
+# all. That failure is unattributable from the log, and downstream the validate
+# ledger cannot classify it either — it is the second half of the hermit #1711
+# triage defect, where one node failed two guests and only one was explicable.
+#
+# So when stderr is empty, synthesize a reason from what is nonetheless known:
+# the exit status (with the two dispositions GNU timeout reserves named
+# explicitly), and the tail of stdout if the child wrote there instead. A
+# synthesized reason is always marked as such so it is never mistaken for the
+# child's own words.
+function emit_failure_reason {
+    local status=$1
+    local stdout_file=$2
+    local stderr_file=$3
+    if [[ -s $stderr_file ]]; then
+        cat "$stderr_file" >&2
+        return 0
+    fi
+    local disposition="exit status $status"
+    case $status in
+        # `timeout` reports 124 when the deadline fired, and 137 when the
+        # follow-up KILL was needed. Both are wall-clock faults, not the child
+        # rejecting its input, and naming them prevents a timeout being read as
+        # a missing dependency.
+        124) disposition="TIMEOUT (exit 124: deadline reached)" ;;
+        137) disposition="TIMEOUT-KILLED (exit 137: SIGKILL after --kill-after)" ;;
+        127) disposition="exit 127: command not found" ;;
+    esac
+    if [[ -s $stdout_file ]]; then
+        printf 'no stderr from the step; %s; last stdout line: %s\n' \
+            "$disposition" "$(tail -n 1 "$stdout_file")" >&2
+    else
+        printf 'no output on stdout or stderr; %s\n' "$disposition" >&2
+    fi
+}
+
 function observation_hash {
     local metadata=$1
     local status=$2
@@ -2210,33 +2251,44 @@ function prepare_test {
         return 0
     fi
     local -a prepare_args=() compile_args=()
+    # Each failure path below captures the child's exit status rather than
+    # discarding it via `if ! …`, so `emit_failure_reason` can name the
+    # disposition when the child produced no stderr of its own. A "failed" line
+    # with no following cause must not be possible on any of the three paths.
+    local status
     if [[ $kind == c ]]; then
         mapfile -t compile_args < <(jq -r '.compile_args[]' <<<"$metadata")
-        if ! run_capture "$stdout_file" "$stderr_file" "$timeout_seconds" \
+        status=0
+        run_capture "$stdout_file" "$stderr_file" "$timeout_seconds" \
             cc -std=c11 -O2 -g -Wall -Wextra -Werror "${compile_args[@]}" \
-            "$test" -o "$cell_dir/fixtures/program"; then
+            "$test" -o "$cell_dir/fixtures/program" || status=$?
+        if ((status != 0)); then
             echo "C program compilation failed for ${test#"$ROOT_DIR/"}" >&2
-            cat "$stderr_file" >&2
+            emit_failure_reason "$status" "$stdout_file" "$stderr_file"
             return 1
         fi
         return 0
     fi
     if [[ $kind == rust ]]; then
         mapfile -t compile_args < <(jq -r '.compile_args[]' <<<"$metadata")
-        if ! run_capture "$stdout_file" "$stderr_file" "$timeout_seconds" \
-            rustc -O "${compile_args[@]}" "$test" -o "$cell_dir/fixtures/program"; then
+        status=0
+        run_capture "$stdout_file" "$stderr_file" "$timeout_seconds" \
+            rustc -O "${compile_args[@]}" "$test" -o "$cell_dir/fixtures/program" || status=$?
+        if ((status != 0)); then
             echo "Rust program compilation failed for ${test#"$ROOT_DIR/"}" >&2
-            cat "$stderr_file" >&2
+            emit_failure_reason "$status" "$stdout_file" "$stderr_file"
             return 1
         fi
         return 0
     fi
     [[ $kind != direct && $kind != direct-argv ]] || return 0
     mapfile -t prepare_args < <(jq -r '.prepare_args[]' <<<"$metadata")
-    if ! run_capture "$stdout_file" "$stderr_file" "$timeout_seconds" \
-        "${env_args[@]}" "$test" "${prepare_args[@]}"; then
+    status=0
+    run_capture "$stdout_file" "$stderr_file" "$timeout_seconds" \
+        "${env_args[@]}" "$test" "${prepare_args[@]}" || status=$?
+    if ((status != 0)); then
         echo "prepare failed for ${test#"$TEST_ROOT/"}" >&2
-        cat "$stderr_file" >&2
+        emit_failure_reason "$status" "$stdout_file" "$stderr_file"
         return 1
     fi
 }

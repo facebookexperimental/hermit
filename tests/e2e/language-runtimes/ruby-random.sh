@@ -16,7 +16,16 @@ set -euo pipefail
 prog='a=rand(1000000); b=rand(1000000); c=rand(1000000); s=(1..100).map{|i| i*i}.sum; w=%w[hermit determinism ruby].sort.join("-"); puts "rand=#{a},#{b},#{c} sumsq=#{s} sorted=#{w} len=#{"abcdefghij".length}"'
 
 case ${1:-} in
-    --prepare) command -v ruby >/dev/null ;;
+    # Say WHY on failure. A bare `command -v ruby >/dev/null` exits nonzero under
+    # `set -e` having printed nothing, and the harness then reports only
+    # "prepare failed for language-runtimes/ruby-random.sh" with no cause —
+    # unattributable from the CI log (hermit #1711).
+    --prepare)
+        command -v ruby >/dev/null || {
+            echo "ruby not found on PATH" >&2
+            exit 1
+        }
+        ;;
     --run) exec ruby --disable-gems -e "$prog" ;;
     *) echo "usage: $0 --prepare|--run" >&2; exit 2 ;;
 esac

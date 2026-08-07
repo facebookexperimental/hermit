@@ -45,7 +45,12 @@ print(string.format("rand=%d,%d,%d sumsq=%d sorted=%s len=%d",
 case ${1:-} in
     --prepare)
         lua_bin >/dev/null 2>&1 || {
-            echo "lua5.4 not found" >&2
+            # Name BOTH candidates lua_bin actually tried. The old text said
+            # only "lua5.4 not found", which sent triage after that one package
+            # when the real condition is that neither interpreter is on PATH —
+            # a reason that names one of two things checked is a weak fact
+            # (hermit #1711).
+            echo "no Lua interpreter on PATH (tried: lua5.4, lua)" >&2
             exit 1
         }
         exit 0
