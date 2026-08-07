@@ -186,8 +186,16 @@ path, err = append(None)
 check("append is accepted", err is None, repr(err))
 if err is None:
     hdr = path.read_text(encoding="utf-8").splitlines()[0]
-    check("created header carries verify_compare", hdr.endswith(",verify_compare"))
-    check("created header is 20 columns", len(hdr.split(",")) == 20, hdr)
+    # The canonical schema grew from 20 to 23 when the tier-evidence columns
+    # landed: a bare `deterministic=1` cannot say WHICH comparison earned it, so
+    # the verdict now travels with its strictness, its parity boolean and the
+    # counts that make the boolean falsifiable.
+    check(
+        "created header carries the tier-evidence columns",
+        hdr.endswith(",verify_compare,bitwise_parity,compared_log_messages,tier"),
+        hdr,
+    )
+    check("created header is 23 columns", len(hdr.split(",")) == 23, hdr)
 
 print()
 if FAILURES:
