@@ -284,9 +284,21 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/file_io_roundtrip.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (verify mode; ci=true, ptrace only)",
+      "why": "tests/backend-parity/fixtures/file_io_roundtrip.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (verify mode; ci=true, ptrace only): Real-execution guest exercising a single descriptor's full lifecycle: write, fsync, lseek, read-back checksum, fstat size, ftruncate, unlink. Unlike the ci=false C fixtures it enters blocking CI immediately because its standalone build and output contract are already calibrated: it compiles clean under -std=c11 -Wall -Wextra -Werror, asserts every printed invariant so the guest is its own oracle, was verified deterministic under hermit run --strict --verify on the ptrace reference, and was proven able to fail by planting a semantic defect that turned the harness cell FAIL. Non-ptrace backends are disabled so the ptrace reference is established first."
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/flock_lifecycle.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/flock_lifecycle.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/fork_exec_pipeline.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (verify mode; ci=true, ptrace only)",
+      "why": "tests/backend-parity/fixtures/fork_exec_pipeline.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (verify mode; ci=true, ptrace only): Real-execution guest exercising fd inheritance across an execve image replacement with output captured through a pipe and exit status reaped. Unlike the ci=false C fixtures it enters blocking CI immediately because its standalone build and output contract are already calibrated: it compiles clean under -std=c11 -Wall -Wextra -Werror, asserts every printed invariant so the guest is its own oracle, was verified deterministic under hermit run --strict --verify on the ptrace reference, and was proven able to fail by planting a semantic defect that turned the harness cell FAIL. Non-ptrace backends are disabled so the ptrace reference is established first."
     },
     {
       "disposition": "manifest-test",
@@ -569,6 +581,12 @@
       "path": "tests/backend-parity/fixtures/sigaltstack_state.c",
       "runner": "tests/backend-parity/run_matrix.py",
       "why": "tests/backend-parity/fixtures/sigaltstack_state.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic sigaltstack(2) alternate signal-stack install/query round-tripping as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBT/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/signal_delivery_sequence.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (verify mode; ci=true, ptrace only)",
+      "why": "tests/backend-parity/fixtures/signal_delivery_sequence.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (verify mode; ci=true, ptrace only): Real-execution guest exercising sigaction, a blocked non-realtime signal coalescing to one pending delivery, sigpending, and post-unblock delivery. Unlike the ci=false C fixtures it enters blocking CI immediately because its standalone build and output contract are already calibrated: it compiles clean under -std=c11 -Wall -Wextra -Werror, asserts every printed invariant so the guest is its own oracle, was verified deterministic under hermit run --strict --verify on the ptrace reference, and was proven able to fail by planting a semantic defect that turned the harness cell FAIL. Non-ptrace backends are disabled so the ptrace reference is established first."
     },
     {
       "disposition": "manifest-test",
