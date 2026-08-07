@@ -201,6 +201,42 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
     (commands.join(" && "), guest)
 }
 
+/// Per-backend guest arguments declared by `modes.<mode>.guest_args.<backend>`.
+///
+/// These are arguments for the **guest**, not for Hermit, so they go after the
+/// `--` separator. They are per-backend because a manifest may qualify one
+/// backend on a cheaper scenario than another.
+///
+/// A guest that requires an argument and is not given one prints usage and
+/// exits non-zero. Before this channel existed, every consumer of the manifests
+/// invoked such a guest bare, and the resulting non-zero exit was recorded as a
+/// determinism failure — see rrnewton/hermit#1815.
+fn mode_guest_args(spec: &Value, mode: &str, backend: &str, id: &str) -> Vec<String> {
+    let Some(by_backend) = spec.get("guest_args") else {
+        return Vec::new();
+    };
+    let by_backend = by_backend
+        .as_table()
+        .unwrap_or_else(|| fail(format!("{id}.modes.{mode}.guest_args must be a table")));
+    string_array(
+        by_backend.get(backend),
+        &format!("{id}.modes.{mode}.guest_args.{backend}"),
+    )
+}
+
+/// Append the guest's own arguments to an already-quoted guest word.
+fn guest_with_args(guest: &str, guest_args: &[String]) -> String {
+    if guest_args.is_empty() {
+        return guest.to_owned();
+    }
+    let rendered = guest_args
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{guest} {rendered}")
+}
+
 fn hermit_command(
     mode: &str,
     backend: &str,
@@ -297,6 +333,8 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
             fail(format!("{id}: mode `{mode}` has no enabled backend"));
         }
         let extra = string_array(spec.get("args"), &format!("{id}.modes.{mode}.args"));
+        // `args` are Hermit's; `guest_args` are the guest's and are per-backend,
+        // so they are resolved inside the backend loop below.
         let assert = spec.get("assert").and_then(Value::as_table);
         let custom_runs = assert
             .and_then(|a| a.get("runs"))
@@ -310,6 +348,8 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
         };
 
         for backend in backends {
+            let guest_args = mode_guest_args(spec, mode, &backend, &id);
+            let guest = guest_with_args(&guest, &guest_args);
             for seed in &seeds {
                 let seed = (mode == "chaos").then_some(*seed);
                 let command = hermit_command(mode, &backend, lane, timeout, seed, &extra, &guest);
@@ -329,37 +369,61 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
     lines
 }
 
-// TODO-HUMAN-REVIEW(PR-1081): Review the manifest-to-command CLI and generated shell contract.
-const USAGE: &str = "\
-Usage: manifest-to-commands.rs [-h|--help]
-
-Regenerate the flattened e2e command files under ignored/e2e-commands/ from the
-TOML manifests in tests/e2e/manifests/. Takes no arguments; it discovers the
-repo root from git and rewrites the generated *.txt files in place.";
-
-fn main() -> ExitCode {
-    rust_script_prelude::init();
-    if std::env::args().skip(1).any(|a| a == "-h" || a == "--help") {
-        println!("{USAGE}");
-        return ExitCode::SUCCESS;
-    }
-    let root = repo_root();
-    let manifests = root.join("tests/e2e/manifests");
-    let output = root.join("ignored/e2e-commands");
-    fs::create_dir_all(&output)
-        .unwrap_or_else(|e| fail(format!("cannot create {}: {e}", output.display())));
-    for entry in fs::read_dir(&output)
-        .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", output.display())))
-        .filter_map(Result::ok)
-    {
-        let path = entry.path();
-        if path.is_file() && path.extension().is_some_and(|ext| ext == "txt") {
-            fs::remove_file(&path)
-                .unwrap_or_else(|e| fail(format!("cannot remove stale {}: {e}", path.display())));
+/// Emit every declared per-backend guest-argument vector as TSV on stdout:
+/// `<test-id>\t<mode>\t<backend>\t<arg>...`, sorted, one line per cell.
+///
+/// This is the machine-readable form of the same `guest_args` the generated
+/// commands embed, so an out-of-tree harness (the `compat-envelope` corpus
+/// collector) can invoke a guest correctly without maintaining a second copy of
+/// the argument list, which would drift. Cells with no declared arguments are
+/// omitted rather than emitted empty, so a consumer can distinguish "declared
+/// nothing" from "not in the manifests" only by the test id's absence.
+fn guest_args_tsv(tests: &[(String, Value)]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (bucket, test) in tests {
+        let id = test_id(test, bucket);
+        let Some(modes) = test.get("modes").and_then(Value::as_table) else {
+            continue;
+        };
+        let mut mode_names = modes.keys().map(String::as_str).collect::<Vec<_>>();
+        mode_names.sort_unstable();
+        for mode in mode_names {
+            let spec = &modes[mode];
+            let backends = match spec.get("backends_enabled") {
+                Some(value) => string_array(
+                    Some(value),
+                    &format!("{id}.modes.{mode}.backends_enabled"),
+                ),
+                None => continue,
+            };
+            for backend in backends {
+                let args = mode_guest_args(spec, mode, &backend, &id);
+                if args.is_empty() {
+                    continue;
+                }
+                lines.push(format!("{id}\t{mode}\t{backend}\t{}", args.join("\t")));
+            }
         }
     }
+    lines.sort();
+    lines
+}
 
-    let mut paths = fs::read_dir(&manifests)
+// TODO-HUMAN-REVIEW(PR-1081): Review the manifest-to-command CLI and generated shell contract.
+const USAGE: &str = "\
+Usage: manifest-to-commands.rs [-h|--help] [--guest-args]
+
+Regenerate the flattened e2e command files under ignored/e2e-commands/ from the
+TOML manifests in tests/e2e/manifests/. It discovers the repo root from git and
+rewrites the generated *.txt files in place.
+
+  --guest-args  Write nothing; print the declared per-backend guest arguments as
+                TSV (`<test-id> <mode> <backend> <arg>...`) on stdout instead.";
+
+/// Parse every manifest under `manifests`, validating schema and bucket naming,
+/// and return `(bucket, test)` pairs in file order.
+fn load_manifest_tests(manifests: &Path) -> Vec<(String, Value)> {
+    let mut paths = fs::read_dir(manifests)
         .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", manifests.display())))
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -367,8 +431,7 @@ fn main() -> ExitCode {
         .collect::<Vec<_>>();
     paths.sort();
 
-    let mut files = 0usize;
-    let mut commands = 0usize;
+    let mut collected = Vec::new();
     for path in paths {
         let stem = path
             .file_stem()
@@ -405,11 +468,54 @@ fn main() -> ExitCode {
             .get("test")
             .and_then(Value::as_array)
             .unwrap_or_else(|| fail(format!("{}: missing [[test]] entries", path.display())));
-        let mut lines = Vec::new();
         for test in tests {
-            lines.extend(commands_for_test(test, bucket));
+            collected.push((bucket.to_owned(), test.clone()));
         }
-        let destination = output.join(format!("{stem}.txt"));
+    }
+    collected
+}
+
+fn main() -> ExitCode {
+    rust_script_prelude::init();
+    if std::env::args().skip(1).any(|a| a == "-h" || a == "--help") {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    let root = repo_root();
+    let manifests = root.join("tests/e2e/manifests");
+    if std::env::args().skip(1).any(|a| a == "--guest-args") {
+        for line in guest_args_tsv(&load_manifest_tests(&manifests)) {
+            println!("{line}");
+        }
+        return ExitCode::SUCCESS;
+    }
+    let output = root.join("ignored/e2e-commands");
+    fs::create_dir_all(&output)
+        .unwrap_or_else(|e| fail(format!("cannot create {}: {e}", output.display())));
+    for entry in fs::read_dir(&output)
+        .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", output.display())))
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "txt") {
+            fs::remove_file(&path)
+                .unwrap_or_else(|e| fail(format!("cannot remove stale {}: {e}", path.display())));
+        }
+    }
+
+    let mut by_bucket: Vec<(String, Vec<String>)> = Vec::new();
+    for (bucket, test) in load_manifest_tests(&manifests) {
+        let lines = commands_for_test(&test, &bucket);
+        match by_bucket.iter_mut().find(|(name, _)| name == &bucket) {
+            Some((_, existing)) => existing.extend(lines),
+            None => by_bucket.push((bucket, lines)),
+        }
+    }
+
+    let mut files = 0usize;
+    let mut commands = 0usize;
+    for (bucket, lines) in by_bucket {
+        let destination = output.join(format!("{bucket}.txt"));
         let body = if lines.is_empty() {
             String::new()
         } else {
@@ -431,4 +537,127 @@ fn main() -> ExitCode {
 
     println!("generated {commands} commands across {files} bucket files");
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(body: &str) -> Vec<(String, Value)> {
+        let value: Value = body.parse().expect("test manifest must parse");
+        value
+            .get("test")
+            .and_then(Value::as_array)
+            .expect("test manifest needs [[test]]")
+            .iter()
+            .map(|test| ("c-programs".to_owned(), test.clone()))
+            .collect()
+    }
+
+    const DECLARED: &str = r#"
+[[test]]
+id = "c-programs/example"
+program = "tests/c/example.c"
+[test.modes.verify]
+backends_enabled = ["ptrace", "liteinst"]
+guest_args = { ptrace = ["multi", "value with spaces"], liteinst = ["edge"] }
+"#;
+
+    /// POSITIVE side: a declared argument vector must reach the guest word, and
+    /// must be quoted, so a scenario name containing a space stays one argument.
+    #[test]
+    fn declared_guest_args_are_appended_and_quoted() {
+        let tests = manifest(DECLARED);
+        let spec = &tests[0].1["modes"]["verify"];
+        let args = mode_guest_args(spec, "verify", "ptrace", "c-programs/example");
+        assert_eq!(args, vec!["multi", "value with spaces"]);
+        assert_eq!(
+            guest_with_args("\"$cell/guest\"", &args),
+            "\"$cell/guest\" multi 'value with spaces'"
+        );
+    }
+
+    /// The channel is per-BACKEND, not per-cell: two backends of the same cell
+    /// must be able to disagree. A per-cell channel would silently hand one
+    /// backend the other's scenario.
+    #[test]
+    fn guest_args_are_resolved_per_backend() {
+        let tests = manifest(DECLARED);
+        let spec = &tests[0].1["modes"]["verify"];
+        assert_eq!(
+            mode_guest_args(spec, "verify", "liteinst", "c-programs/example"),
+            vec!["edge"]
+        );
+        assert_ne!(
+            mode_guest_args(spec, "verify", "ptrace", "c-programs/example"),
+            mode_guest_args(spec, "verify", "liteinst", "c-programs/example")
+        );
+    }
+
+    /// NEGATIVE side: a cell that declares nothing must gain nothing. If this
+    /// flips, every argument-less guest starts receiving a stray argument.
+    #[test]
+    fn undeclared_guest_args_leave_the_guest_word_untouched() {
+        let tests = manifest(
+            r#"
+[[test]]
+id = "c-programs/bare"
+program = "tests/c/bare.c"
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+"#,
+        );
+        let spec = &tests[0].1["modes"]["verify"];
+        let args = mode_guest_args(spec, "verify", "ptrace", "c-programs/bare");
+        assert!(args.is_empty());
+        assert_eq!(guest_with_args("\"$cell/guest\"", &args), "\"$cell/guest\"");
+    }
+
+    /// A backend that is enabled but not named in `guest_args` gets nothing,
+    /// rather than inheriting a sibling backend's arguments.
+    #[test]
+    fn enabled_backend_absent_from_guest_args_gets_none() {
+        let tests = manifest(
+            r#"
+[[test]]
+id = "c-programs/partial"
+program = "tests/c/partial.c"
+[test.modes.verify]
+backends_enabled = ["ptrace", "kvm"]
+guest_args = { ptrace = ["multi"] }
+"#,
+        );
+        let spec = &tests[0].1["modes"]["verify"];
+        assert!(mode_guest_args(spec, "verify", "kvm", "c-programs/partial").is_empty());
+    }
+
+    /// The TSV dump is the out-of-tree harness's only source for these
+    /// arguments, so its shape is a contract: one line per (id, mode, backend)
+    /// that declares arguments, sorted, tab-separated, and cells declaring
+    /// nothing omitted entirely.
+    #[test]
+    fn guest_args_tsv_emits_one_sorted_line_per_declaring_cell() {
+        let mut tests = manifest(DECLARED);
+        tests.extend(manifest(
+            r#"
+[[test]]
+id = "c-programs/bare"
+program = "tests/c/bare.c"
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+"#,
+        ));
+        let lines = guest_args_tsv(&tests);
+        assert_eq!(
+            lines,
+            vec![
+                "c-programs/example\tverify\tliteinst\tedge",
+                "c-programs/example\tverify\tptrace\tmulti\tvalue with spaces",
+            ]
+        );
+        assert!(
+            !lines.iter().any(|line| line.starts_with("c-programs/bare")),
+            "a cell declaring no guest_args must not appear in the dump"
+        );
+    }
 }
