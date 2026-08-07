@@ -7,6 +7,46 @@
 
 set -euo pipefail
 
+# SAY WHY WE ARE EXITING NON-ZERO.
+#
+# `set -e` plus `var=$(cmd 2>&1)` is a silent killer: when `cmd` fails, the
+# ASSIGNMENT fails, and the shell exits right there -- before the `|| die "...:
+# $var"` on the very next line can run. The diagnostic `cmd` printed is sitting
+# inside the variable that just went out of scope, so it is destroyed rather
+# than reported. `audit_ci_correspondence` had nine such captures and exited 2
+# printing NOTHING on stdout or stderr.
+#
+# That silence was expensive out of proportion to the bug behind it. validate.sh
+# can only render a wordless exit 2 as `exit 2: }` (the last line of unrelated
+# JSON that happened to be on stdout), and this one audit runs in four of the
+# seven validate gates, so a one-line stale constant took all four red with no
+# indication of which check failed or why. Finding it needed `bash -x`.
+#
+# `set -E` propagates this trap into functions, subshells, and command
+# substitutions, which is exactly where the silent exits live. The trap only
+# reports; it never changes the exit status, so no gate becomes more lenient.
+#
+# The trap must stay SHORT. `$BASH_COMMAND` for a compound `( ... )` block is the
+# entire block: the first version of this trap printed 11 KB of reconstructed
+# subshell source and buried the one line that mattered. A diagnostic that has to
+# be searched is barely better than no diagnostic. So: first line only, capped,
+# and compound blocks are named rather than dumped.
+set -E
+__harness_err() {
+    local rc=$1 line=$2 cmd=$3
+    [[ $rc -eq 0 ]] && return 0
+    cmd=${cmd%%$'\n'*}
+    if [[ $cmd == '('* ]]; then
+        cmd='(compound block — see the message above for the actual failure)'
+    elif ((${#cmd} > 120)); then
+        cmd="${cmd:0:120}…"
+    fi
+    printf 'test_harness.sh: FAILED (exit %s) near line %s: %s\n' "$rc" "$line" "$cmd" >&2
+    printf '  If no reason was printed above, a probe captured its own output into a\n' >&2
+    printf '  variable (var=$(cmd 2>&1)) and set -e aborted before the || die could speak.\n' >&2
+}
+trap '__harness_err "$?" "$LINENO" "$BASH_COMMAND"' ERR
+
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 TEST_ROOT="$ROOT_DIR/tests/e2e"
 MANIFEST_ROOT="$TEST_ROOT/manifests"
@@ -1237,7 +1277,7 @@ function audit_ci_correspondence {
             env "${planted_budget_env[@]}" CI_DAG_BUILD_JOBS=8 \
                 SAFE_CI_DAG_RUNNER="$fake_runner" \
                 "$ROOT_DIR/ci/run-dag.sh" privileged ascii 2>/dev/null
-        )
+        ) || privileged_env="[probe exited $?] $privileged_env"
         for name in "${budget_names[@]}"; do
             ! grep -q "^${name}=" <<<"$privileged_env" ||
                 die "privileged DAG runner inherited portable DBT variable $name"
@@ -1250,7 +1290,7 @@ function audit_ci_correspondence {
             env "${planted_budget_env[@]}" CI_DAG_BUILD_JOBS=8 \
                 SAFE_CI_DAG_RUNNER="$fake_runner" RUN_NODE_PERF_DIR="$scratch/perf" \
                 "$ROOT_DIR/ci/run-node.sh" privileged build.privileged_tests 2>/dev/null
-        )
+        ) || privileged_node_env="[probe exited $?] $privileged_node_env"
         for name in "${budget_names[@]}"; do
             ! grep -q "^${name}=" <<<"$privileged_node_env" ||
                 die "privileged node runner inherited portable DBT variable $name"
@@ -1264,7 +1304,7 @@ function audit_ci_correspondence {
             "${clean_budget_env[@]}" CI_DAG_BUILD_JOBS=5 \
                 bash -c 'source "$1" launcher; printf "%s %s\n" "$CARGO_BUILD_JOBS" "$THIRD_PARTY_BUILD_JOBS"' \
                 _ "$budget_config"
-        )
+        ) || configured_jobs="[probe exited $?] $configured_jobs"
         [[ $configured_jobs == '5 5' ]] ||
             die "ordinary launcher did not propagate mutation K=5: $configured_jobs"
 
@@ -1276,7 +1316,7 @@ function audit_ci_correspondence {
             PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
                 REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 \
                 CARGO_BUILD_JOBS=8 bash -c "$budget_probe" _ "$budget_config"
-        )
+        ) || budget_tuple="[probe exited $?] $budget_tuple"
         [[ $budget_tuple == 'inherited-launch-cargo-build-jobs 8 8 8 child-nproc 4 16 4 1050 263' ]] ||
             die "hosted j8/child-CPU4 budget tuple drifted: $budget_tuple"
         budget_tuple=$(
@@ -1284,7 +1324,7 @@ function audit_ci_correspondence {
                 REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 \
                 SAFE_CI_IN_SCOPE=1 CARGO_BUILD_JOBS=32 \
                 bash -c "$budget_probe" _ "$budget_config"
-        )
+        ) || budget_tuple="[probe exited $?] $budget_tuple"
         [[ $budget_tuple == 'runner-child-cargo-build-jobs 32 32 32 child-nproc 64 16 16 1050 66' ]] ||
             die "boxed j32/child-CPU64 budget tuple drifted: $budget_tuple"
 
@@ -1330,7 +1370,7 @@ EOF
                     REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 \
                     CARGO_BUILD_JOBS=$requested bash -c "$budget_probe" _ "$budget_config"
             done
-        )
+        ) || clamp_boundaries="[probe exited $?] $clamp_boundaries"
         [[ $clamp_boundaries == $'inherited-launch-cargo-build-jobs 15 15 15 child-nproc 64 16 15 1050 70\ninherited-launch-cargo-build-jobs 16 16 16 child-nproc 64 16 16 1050 66\ninherited-launch-cargo-build-jobs 17 17 17 child-nproc 64 16 16 1050 66\ninherited-launch-cargo-build-jobs 64 64 64 child-nproc 64 16 16 1050 66' ]] ||
             die "Reverie clamp boundary did not hold W at 16: $clamp_boundaries"
         cpu_boundaries=$(
@@ -1340,7 +1380,7 @@ EOF
             PATH="$scratch/nproc-2:$PATH" "${clean_budget_env[@]}" \
                 REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 \
                 CARGO_BUILD_JOBS=8 bash -c "$budget_probe" _ "$budget_config"
-        )
+        ) || cpu_boundaries="[probe exited $?] $cpu_boundaries"
         [[ $cpu_boundaries == $'inherited-launch-cargo-build-jobs 17 17 17 child-nproc 4 16 4 1050 263\ninherited-launch-cargo-build-jobs 8 8 8 child-nproc 2 16 2 1050 525' ]] ||
             die "child nproc boundary did not cap the budget width: $cpu_boundaries"
 
