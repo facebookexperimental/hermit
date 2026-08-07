@@ -35,6 +35,7 @@ int main(void) {
         ok++;
     }
     char moved[4096];
+    moved[0] = '\0';
     if (getcwd(moved, sizeof(moved)) != NULL && strcmp(moved, start) != 0) {
         ok++;
     }
@@ -61,6 +62,30 @@ int main(void) {
 #ifdef HERMIT_TEST_ORACLE_NEGATIVE
     ok--; /* plant one failed contract check to bracket the exit oracle */
 #endif
-    printf("cwd ok=%d\n", ok);
+    /*
+     * EMIT AN OBSERVED VALUE, NOT ONLY THE CHECK TALLY. Check 3 only asks that
+     * the moved-to path DIFFERS from the start, so it holds for any differing
+     * path: a backend that VIRTUALISES the path namespace (returning, say,
+     * "/virtual/tmp/cwd_roundtrip_ab12cd") and one that does not both satisfy
+     * every check above and both printed the identical byte stream "cwd ok=6".
+     *
+     * The raw path is not run-stable -- mkdtemp randomises the final six
+     * characters and hermit isolates the guest /tmp per repeat -- and stdout is
+     * double-run compared under `--strict --verify`. So emit the DIRNAME of the
+     * observed path. That drops the random component entirely, is the constant
+     * "/tmp" on a non-virtualising backend, and changes exactly when a backend
+     * rewrites the namespace: value-bearing, run-stable, host-independent.
+     */
+    char moved_dir[4096];
+    snprintf(moved_dir, sizeof(moved_dir), "%s", moved);
+    char *cut = strrchr(moved_dir, '/');
+    if (cut == moved_dir) {
+        cut[1] = '\0'; /* the observed path was at the root: report "/" */
+    } else if (cut != NULL) {
+        *cut = '\0';
+    } else {
+        snprintf(moved_dir, sizeof(moved_dir), "%s", "<no-slash>");
+    }
+    printf("cwd ok=%d moved_dir=%s\n", ok, moved_dir);
     return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

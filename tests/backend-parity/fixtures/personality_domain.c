@@ -11,8 +11,21 @@
  *
  * Hermit already enables ADDR_NO_RANDOMIZE, so OR-ing that flag can be a
  * no-op. XOR-ing UNAME26 guarantees that a successful run exercises a real
- * state transition. The starting value is never printed, which keeps the
- * fixed success oracle portable: "pers ok=5".
+ * state transition.
+ *
+ * EMIT THE OBSERVED PERSONA, NOT ONLY THE CHECK TALLY. Every check above is
+ * RELATIONAL (start->target->start), so they hold for ANY starting persona.
+ * The starting value is the one observation this fixture makes that is not
+ * pinned by a check, and while it went unprinted two backends that inherited
+ * DIFFERENT personas both emitted the identical byte stream "pers ok=5" and
+ * their disagreement was invisible to a stdout parity comparison. Printing
+ * `start` and the restored `final` is what lets that comparison see anything.
+ *
+ * This makes stdout host-dependent, which the previous fixed oracle avoided.
+ * That trade is deliberate: parity compares backends ON ONE HOST, and buying a
+ * host-portable byte stream by discarding the observation is exactly what
+ * created the blind spot. The values are stable across repeats on a host, so
+ * the `--strict --verify` double-run comparison still holds.
  */
 
 #include <stdbool.h>
@@ -63,6 +76,7 @@ int main(void) {
     }
 
     rc = personality(0xffffffffUL);
+    unsigned int final = rc == -1 ? 0xffffffffU : (unsigned int)rc;
     if (rc != -1 && (unsigned int)rc == start) {
         ok++;
     }
@@ -70,6 +84,6 @@ int main(void) {
 #ifdef HERMIT_TEST_ORACLE_NEGATIVE
     ok--; /* stable wrong stdout must be rejected by the normal exit oracle */
 #endif
-    printf("pers ok=%d\n", ok);
+    printf("pers ok=%d start=0x%x final=0x%x\n", ok, start, final);
     return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }
