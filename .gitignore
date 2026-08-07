@@ -27,3 +27,11 @@ envelope.json
 
 # Backend-parity observations belong to the outer dev-hermit compat scorecard.
 /tests/backend-parity/matrix.tsv
+
+# safe-ci-dag-runner's per-checkout profile store. The DAG runner writes it into
+# whatever checkout it runs in, so without this every validate.sh run leaves its
+# own tree dirty and `ci-hub validate-run` then REFUSES the next run in that
+# checkout ("checkout is dirty (?? .safe-ci-dag-runner/); refusing unrepeatable
+# validation") -- a slot self-poisons after exactly one validation. The profiles
+# are useful output, so ignore them in place rather than relocating them.
+/.safe-ci-dag-runner/
