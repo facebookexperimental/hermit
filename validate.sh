@@ -855,72 +855,102 @@ function detect_cache_state {
 }
 
 # Artifact-integrity pre-flight. A compiler/archiver killed mid-write leaves a
-# TRUNCATED zero-length *.o in a build tree -- classically the OOM-killer firing
-# on a NEIGHBOUR's step cgroup with memory.oom.group=1, so make never runs its
+# TRUNCATED artifact in a build tree -- classically the OOM-killer firing on a
+# NEIGHBOUR's step cgroup with memory.oom.group=1, so make never runs its
 # .DELETE_ON_ERROR cleanup. cmake/make key incremental freshness on TIMESTAMP not
 # CONTENT, so they trust the empty object forever and link it, producing an
 # "undefined reference" that reads as a source defect and never self-corrects.
 # Scan before we trust the tree and delete any such object so the build rebuilds
 # it. This is a CONTENT FACT, not a heuristic: it removes ONLY genuinely-corrupt
-# (0-byte) objects, so healthy artifacts -- and thus incremental skipping and the
-# warm cache -- are preserved (a blanket "clean rebuild after any failure" would
-# not be: cold rebuilds cost +232s and fail more). Covers DynamoRIO (reverie-dbi),
-# SaBRe + e9patch (hermit-install); rustc's target/deps self-heal via fingerprints.
-# Catches corruption from a kill we did not observe, which the per-crate build.rs
-# guard cannot: cargo re-runs a build script only on input change or prior failure,
-# so a neighbour that truncates an already-built object is otherwise linked as-is.
-# True when a linkable build artifact is structurally incomplete.
+# artifacts, so healthy ones -- and thus incremental skipping and the warm cache
+# -- are preserved (a blanket "clean rebuild after any failure" would not be).
 #
-# Size is only a PROXY for corruption: an OOM-killed compiler routinely leaves a
-# partial write that is nonzero AND retains valid magic, so both `-size 0` and a
-# bare magic check pass it through and the linker then reports a bogus
-# "undefined reference". ELF is self-describing, so truncation is detectable from
-# the artifact's own header: the section table must fit inside the file.
+# ONE PROCESS FOR THE WHOLE TREE. This scan used to run per file: `stat`, then
+# `head | od | tr`, then a WHOLE python3 interpreter for every .o/.so -- about
+# five forks each. It runs BEFORE the first gate prints anything, so its cost is
+# indistinguishable from a hang. Measured on a warm checkout: 31.5 ms/file across
+# 101,751 candidates = 53 MINUTES OF SILENCE before validate appeared to start,
+# which is why runs were being killed on the assumption they had wedged. Feeding
+# the whole list to a single python3 scans the same 101,751 files in 15.8 s.
 #
-# Magic is PER-FORMAT. `.a`/`.rlib` are ar archives ("!<arch>\n"), NOT ELF, so a
-# single ELF-magic test would delete every valid static archive.
-function artifact_is_corrupt {
-    local f=$1 magic size
-    size=$(stat -c %s -- "$f" 2>/dev/null) || return 1
-    ((size == 0)) && return 0
-    magic=$(head -c 8 -- "$f" 2>/dev/null | od -An -tx1 | tr -d ' \n')
-    case "$f" in
-        *.a | *.rlib)
-            [[ $magic == 213c617263683e0a* ]] || return 0 # !<arch>\n
-            ((size < 68)) && return 0                     # ar header + one member header
-            return 1
-            ;;
-        *.o | *.so | *.so.* | *.lo)
-            [[ $magic == 7f454c46* ]] || return 0 # \x7fELF
-            python3 - "$f" <<'PY' && return 1 || return 0
-import struct, sys
-with open(sys.argv[1], "rb") as fh:
-    head = fh.read(64)
-if len(head) < 64:
-    sys.exit(1)
-if head[4] != 2:  # not ELFCLASS64: magic-only check
-    sys.exit(0)
-shoff = struct.unpack_from("<Q", head, 0x28)[0]
-need = shoff + struct.unpack_from("<H", head, 0x3A)[0] * struct.unpack_from("<H", head, 0x3C)[0]
-import os
-sys.exit(1 if shoff and need > os.path.getsize(sys.argv[1]) else 0)
-PY
-            ;;
-    esac
-    return 1
-}
-
-# Delete build artifacts a killed compiler left structurally incomplete. cmake
-# compares TIMESTAMPS, not content, so a truncated object with a fresh mtime is
-# trusted forever and every later build links against a symbol-less file.
+# The predicate below is the SAME one the per-file version applied, kept in one
+# place now that it has one caller:
+#   size == 0                        -> corrupt
+#   *.a / *.rlib : must begin "!<arch>\n" and be >= 68 bytes (ar header + one
+#                  member header), else corrupt
+#   *.o *.so *.so.* *.lo : must begin \x7fELF, else corrupt; a header shorter
+#                  than 64 bytes is corrupt; a non-ELFCLASS64 object is accepted
+#                  on magic alone; otherwise the section table must fit inside
+#                  the file (shoff + e_shentsize*e_shnum <= size)
+#   anything else                    -> not corrupt
+# Size alone is only a PROXY: an OOM-killed compiler routinely leaves a partial
+# write that is nonzero AND retains valid magic, so both `-size 0` and a bare
+# magic test pass it through and the linker then reports a bogus "undefined
+# reference". ELF is self-describing, so truncation is detectable from the
+# artifact's own header. Magic is PER-FORMAT: `.a`/`.rlib` are ar archives, NOT
+# ELF, so a single ELF-magic test would delete every valid static archive.
+#
+# FAILS SAFE. If python3 is unavailable the scan is SKIPPED and reports 0. The
+# per-file version instead ran `python3 ... && return 1 || return 0`, so a
+# missing interpreter made every .o/.so classify as CORRUPT and the purge would
+# have deleted the entire object tree.
 function purge_zero_byte_objects {
-    local root=$1 removed=0 f
+    local root=$1
     [[ -d $root ]] || { printf 0; return 0; }
-    while IFS= read -r -d '' f; do
-        artifact_is_corrupt "$f" && rm -f -- "$f" && removed=$((removed + 1))
-    done < <(find "$root" -type f \( -name '*.o' -o -name '*.a' -o -name '*.so' \
-        -o -name '*.so.*' -o -name '*.rlib' -o -name '*.lo' \) -print0 2>/dev/null)
-    printf '%s' "$removed"
+    if ! command -v python3 >/dev/null 2>&1; then
+        printf 0
+        return 0
+    fi
+    find "$root" -type f \( -name '*.o' -o -name '*.a' -o -name '*.so' \
+        -o -name '*.so.*' -o -name '*.rlib' -o -name '*.lo' \) -print0 2>/dev/null \
+        | python3 -c '
+import fnmatch, os, struct, sys
+
+def corrupt(path):
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False                      # unstattable: not our business
+    if size == 0:
+        return True
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(64)
+    except OSError:
+        return False
+    # Case order mirrors the shell `case`: *.a|*.rlib is tested before the
+    # object/shared-library globs, so e.g. "foo.so.a" is treated as an archive.
+    if fnmatch.fnmatch(path, "*.a") or fnmatch.fnmatch(path, "*.rlib"):
+        if not head.startswith(b"!<arch>\n"):
+            return True
+        return size < 68
+    if (fnmatch.fnmatch(path, "*.o") or fnmatch.fnmatch(path, "*.so")
+            or fnmatch.fnmatch(path, "*.so.*") or fnmatch.fnmatch(path, "*.lo")):
+        if not head.startswith(b"\x7fELF"):
+            return True
+        if len(head) < 64:
+            return True                   # too short to carry a section table
+        if head[4] != 2:
+            return False                  # not ELFCLASS64: magic-only check
+        shoff = struct.unpack_from("<Q", head, 0x28)[0]
+        need = (shoff + struct.unpack_from("<H", head, 0x3A)[0]
+                * struct.unpack_from("<H", head, 0x3C)[0])
+        return bool(shoff and need > size)
+    return False
+
+removed = 0
+for path in sys.stdin.buffer.read().split(b"\0"):
+    if not path:
+        continue
+    name = os.fsdecode(path)
+    if corrupt(name):
+        try:
+            os.unlink(name)
+        except OSError:
+            continue
+        removed += 1
+sys.stdout.write(str(removed))
+'
 }
 
 # Print a REAL runtime estimate derived from this machine's validate-run history,
