@@ -3275,6 +3275,12 @@
       "path": "tests/backend-parity/parity_mutation.py",
       "runner": "ci/dag/portable.json e2e.parity_mutation",
       "why": "tests/backend-parity/parity_mutation.py is owned by ci/dag/portable.json e2e.parity_mutation: This is the shared mutation harness for the backend-parity identity family: it proves each declared field is load-bearing and compares every candidate backend against the golden ptrace reference at a recorded strictness tier. It is a driver invoked directly by CI, not a guest, and the generic manifest must not schedule it as one."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/exec_clock_continuity.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/exec_clock_continuity.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this self-re-execing guest and asserts that guest virtual time is strictly monotonic ACROSS the execve boundary, comparing pre-exec and post-exec CLOCK_REALTIME samples handed through argv; it remains a guest fixture because a generic manifest cannot express the exec-boundary hand-off contract or the cross-image ordering assertion."
     }
   ],
   "schema": 2

@@ -30,6 +30,7 @@ static DBT_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_UNSUPPORTED_SYSCALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_SELF_SIGQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
+static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 fn hermit(args: &[&str]) -> Output {
@@ -80,6 +81,32 @@ fn liteinst_inert_runtime() -> &'static Path {
             String::from_utf8_lossy(&output.stderr),
         );
         runtime
+    })
+}
+
+fn exec_clock_continuity_guest() -> &'static Path {
+    EXEC_CLOCK_CONTINUITY_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("exec-clock-continuity");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create exec-clock-continuity guest directory");
+        let guest = build_root.join("exec_clock_continuity");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/exec_clock_continuity.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile exec-clock-continuity guest");
+        assert!(
+            output.status.success(),
+            "exec-clock-continuity guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
     })
 }
 
@@ -2122,4 +2149,59 @@ fn run_reports_denied_ptrace_and_seccomp_capabilities() {
         let output = command.output().expect("failed to run restricted hermit");
         assert_failure_contains(&output, &expected);
     }
+}
+
+/// The container's virtual clock must keep advancing across `execve`.
+///
+/// `execve` replaces the process image, not the container, so a guest must
+/// never see time restart at the configured epoch after an exec. This is the
+/// property hermit#705 was ultimately about: showing the guest a *plausible*
+/// epoch is not clock virtualization if the clock rewinds at every image
+/// boundary. The guest itself samples the whole trajectory (repeated reads
+/// before and after the exec) rather than a single value, because first-sample
+/// agreement on a tidy origin is the classic false green here.
+///
+/// ptrace is the golden reference and keeps one container-wide `GlobalTime`
+/// out-of-process, so this is a regression guard for that reference.
+#[test]
+fn run_ptrace_virtual_clock_advances_across_execve() {
+    let program = exec_clock_continuity_guest()
+        .to_str()
+        .expect("exec-clock-continuity guest path should be UTF-8");
+    let args = [
+        "run",
+        "--strict",
+        "--max-timeslice=disabled",
+        "--no-virtualize-cpuid",
+        "--",
+        program,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "exec-clock-continuity-ok\n");
+}
+
+/// The same exec-boundary clock trajectory must also be reproducible, so the
+/// continuity above cannot be bought with a nondeterministic clock.
+#[test]
+fn run_ptrace_virtual_clock_across_execve_is_deterministic() {
+    let program = exec_clock_continuity_guest()
+        .to_str()
+        .expect("exec-clock-continuity guest path should be UTF-8");
+    let args = [
+        "run",
+        "--strict",
+        "--verify",
+        "--max-timeslice=disabled",
+        "--no-virtualize-cpuid",
+        "--",
+        program,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert!(
+        stderr(&output).contains("deterministic"),
+        "expected a determinism verdict from --verify:\n{}",
+        stderr(&output),
+    );
 }
