@@ -487,6 +487,72 @@ if ((VALIDATION_NESTED == 1 && only_modes == 0)); then
     exit 2
 fi
 
+# --- Concurrent invocation ---------------------------------------------------
+# A second validate in the SAME checkout is unambiguously wrong: both drive one
+# target/ tree and one ledger. Refuse it LOUDLY and IMMEDIATELY, naming the
+# holder, rather than letting the two interleave or one silently block.
+#
+# SCOPE IS PER-CHECKOUT, deliberately. Box-wide exclusivity belongs to
+# `ci-hub validate-lock`; duplicating it here would give the fleet two
+# independent admission controllers that can disagree.
+#
+# THE PRIMITIVE IS flock, NOT A PIDFILE, and not a scan of the process table:
+#   * flock is released by the KERNEL when the holder dies, so a crashed or
+#     SIGKILLed run cannot strand the lock. A pidfile makes the dead-owner case
+#     something you have to represent and reclaim; flock makes it unrepresentable.
+#   * a `ps | grep validate.sh` scan would count PARKED fixtures. Measured on
+#     this box: 9 live `validate.sh` process groups, 8 of them stop-test
+#     fixtures sitting in `sleep 1` at CPU/wall 0.00-0.02. A scan-based guard
+#     would have refused EVERY validate on the box -- an outage strictly worse
+#     than the reentrancy it set out to fix.
+#
+# Two invocations deliberately do NOT take the lock, because neither is a second
+# driver: a NESTED payload (the outer run already holds it) and the stop-test
+# fixture (which never runs gates, and whose leaked orphans must never wedge a
+# real run).
+VALIDATION_LOCK_DIR="$ROOT_DIR/target/validation"
+VALIDATION_LOCK_FILE="$VALIDATION_LOCK_DIR/validate-invocation.lock"
+VALIDATION_LOCK_HOLDER="$VALIDATION_LOCK_DIR/validate-invocation.holder"
+readonly VALIDATION_LOCK_DIR VALIDATION_LOCK_FILE VALIDATION_LOCK_HOLDER
+if ((VALIDATION_NESTED == 0)) && [[ ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} != 1 ]] \
+    && command -v flock >/dev/null 2>&1; then
+    mkdir -p "$VALIDATION_LOCK_DIR"
+    exec {VALIDATION_LOCK_FD}>>"$VALIDATION_LOCK_FILE"
+    if ! flock -n "$VALIDATION_LOCK_FD"; then
+        {
+            printf 'validate.sh: REFUSED - another validate is already running in this checkout.\n'
+            printf '  checkout: %s\n' "$ROOT_DIR"
+            # The holder RECORD is written by validate.sh; anything else holding
+            # the lock (or a record left by an earlier run) would name a pid that
+            # is not the live holder. Check liveness before presenting it, so the
+            # refusal never points at a dead process as though it were running.
+            holder_pid=""
+            if [[ -r $VALIDATION_LOCK_HOLDER ]]; then
+                holder_pid=$(sed -n 's/^pid=//p' "$VALIDATION_LOCK_HOLDER" 2>/dev/null)
+            fi
+            if [[ $holder_pid =~ ^[1-9][0-9]*$ ]] && kill -0 "$holder_pid" 2>/dev/null; then
+                printf '  holder (pid %s is LIVE):\n' "$holder_pid"
+                sed 's/^/    /' "$VALIDATION_LOCK_HOLDER"
+            elif [[ -r $VALIDATION_LOCK_HOLDER ]]; then
+                printf '  holder: lock is held, but the recorded pid %s is NOT alive, so this\n' "${holder_pid:-unknown}"
+                printf '          record is STALE and does not describe the current holder:\n'
+                sed 's/^/    /' "$VALIDATION_LOCK_HOLDER"
+            else
+                printf '  holder: (lock held, but no holder record was readable)\n'
+            fi
+            printf '  This is a refusal, not a wait: two validates in one checkout share\n'
+            printf "  target/ and the ledger, and would corrupt each other's results.\n"
+            printf '  Wait for the holder to finish, or run in a different checkout.\n'
+        } >&2
+        exit 3
+    fi
+    : >"$VALIDATION_LOCK_HOLDER"
+    printf 'pid=%s\nstarted_at=%s\ncommit=%s\nprofile=%s\ncheckout=%s\n' \
+        "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        "$(git rev-parse HEAD 2>/dev/null || printf unknown)" \
+        "$VALIDATION_PROFILE" "$ROOT_DIR" >"$VALIDATION_LOCK_HOLDER" 2>/dev/null || true
+fi
+
 VALIDATION_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 VALIDATION_STARTED_EPOCH=$(date +%s)
 VALIDATION_HOST=$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf "unknown")
