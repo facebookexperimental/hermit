@@ -456,6 +456,37 @@ readonly STRICT_COMPAT_ONLY PORTABLE_STRICT_COMPAT_ONLY RR_COMPAT_ONLY SABRE_COM
 readonly E9PATCH_COMPAT_ONLY LITEINST_COMPAT_ONLY QEMU_L2_ONLY PRIVILEGED_ONLY
 readonly VALIDATION_LEVEL VALIDATION_PROFILE
 
+# --- Re-entrancy -------------------------------------------------------------
+# validate.sh MUST NOT run its full driver inside itself. ci/dag/portable.json's
+# `test.strict_compat` node invokes `./validate.sh --portable-strict-compat-only`,
+# so a plain run re-entered this script and paid the ENTIRE preamble a second
+# time -- dirty-tree gate, result-cache lookup, artifact scan, history estimate,
+# concurrency monitor -- inside a node with a 1800s budget, and then appended a
+# SECOND ledger row and could publish a SECOND receipt for one logical run.
+#
+# A nested invocation is now explicitly a PAYLOAD, not a driver: it runs its
+# focused envelope and nothing else. The outer run owns all bookkeeping.
+# Re-entering at a non-focused LEVEL is refused outright -- that would be a full
+# suite inside a full suite, which is never intended.
+#
+# The durable fix is to stop shipping the envelope inside the driver at all; that
+# is what the Rust port does by making each probe its own DAG node.
+if [[ -n ${HERMIT_VALIDATE_ACTIVE:-} ]]; then
+    VALIDATION_NESTED=1
+    VALIDATION_OUTER_PID=$HERMIT_VALIDATE_ACTIVE
+else
+    VALIDATION_NESTED=0
+    VALIDATION_OUTER_PID=""
+fi
+# Capture the OUTER pid before claiming the marker, so diagnostics name the run
+# we are nested inside rather than ourselves.
+export HERMIT_VALIDATE_ACTIVE=$$
+readonly VALIDATION_NESTED VALIDATION_OUTER_PID
+if ((VALIDATION_NESTED == 1 && only_modes == 0)); then
+    echo "validate.sh: refusing to re-enter a full validation level from inside validate.sh (outer pid ${VALIDATION_OUTER_PID}); nested invocations may only run a focused mode" >&2
+    exit 2
+fi
+
 VALIDATION_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 VALIDATION_STARTED_EPOCH=$(date +%s)
 VALIDATION_HOST=$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf "unknown")
@@ -548,7 +579,7 @@ readonly VALIDATION_COMMIT_ANCHORED VALIDATION_SELECTION_MODE
 # (agents must not). A forced run is likewise stamped commit_anchored=false. This
 # gate runs before the validation tmp dir and EXIT trap are established, so a
 # refused run leaves no partial state behind.
-if ((VALIDATION_WORKTREE_DIRTY == 1 && RUN_ON_DIRTY_TREE == 0)); then
+if ((VALIDATION_NESTED == 0 && VALIDATION_WORKTREE_DIRTY == 1 && RUN_ON_DIRTY_TREE == 0)); then
     {
         printf "validate.sh: refusing to run on a dirty working tree.\n"
         printf "  HEAD %s has uncommitted changes in the working tree, so a\n" "$VALIDATION_COMMIT"
@@ -652,7 +683,7 @@ function cache_lookup_record {
               end' 2>/dev/null
 }
 
-if ((IGNORE_CACHE == 0)) && ((VALIDATION_COMMIT_ANCHORED == 1)) \
+if ((VALIDATION_NESTED == 0)) && ((IGNORE_CACHE == 0)) && ((VALIDATION_COMMIT_ANCHORED == 1)) \
    && [[ $VALIDATION_SELECTION_MODE == full && $VALIDATION_TREE != unknown ]]; then
     cache_hit_tsv=$(cache_lookup_record pass)
     if [[ -n $cache_hit_tsv ]]; then
@@ -896,6 +927,14 @@ function detect_cache_state {
 # have deleted the entire object tree.
 function purge_zero_byte_objects {
     local root=$1
+    # DISABLED BY DEFAULT (owner directive, 2026-08-07). This scan was added
+    # without review inside a 23-PR coalesce batch (#1633, commit b7f9c7131) and
+    # then escalated to a per-file ELF probe by a bot (#1705, commit 23874c0d0).
+    # It ran before the first gate and produced no output while it worked, so its
+    # cost was indistinguishable from a hang: a warm tree of 44,996 artifacts cost
+    # more than the 1800s budget of the very DAG node that re-invokes this script.
+    # Opt back in with VALIDATE_PURGE_ARTIFACTS=1 once its cost is justified.
+    [[ ${VALIDATE_PURGE_ARTIFACTS:-0} == 1 ]] || { printf 0; return 0; }
     [[ -d $root ]] || { printf 0; return 0; }
     if ! command -v python3 >/dev/null 2>&1; then
         printf 0
@@ -1079,8 +1118,13 @@ printf "Build cache: %s (target/ debug=%s release=%s)\n" \
 # field always has a value, including on the refusal paths that exit before the
 # scan ever runs.
 VALIDATION_ZERO_BYTE_PURGED=0
-printf "Estimated time: %s\n" \
-    "$(history_estimate "$VALIDATION_PROFILE" "$VALIDATION_CACHE_STATE" "$VALIDATION_HOST" "$VALIDATION_LEDGER_FILE")"
+if ((VALIDATION_NESTED == 0)); then
+    printf "Estimated time: %s\n" \
+        "$(history_estimate "$VALIDATION_PROFILE" "$VALIDATION_CACHE_STATE" "$VALIDATION_HOST" "$VALIDATION_LEDGER_FILE")"
+else
+    printf "Nested validate (payload of outer pid %s): focused mode %s only; the outer run owns the ledger, receipt, cache and concurrency accounting.\n" \
+        "$VALIDATION_OUTER_PID" "$VALIDATION_PROFILE"
+fi
 if [[ $VALIDATION_LEVEL == super ]]; then
     printf "Super stress: %s repetitions/probe, up to %s concurrent jobs (%s online CPUs)\n" \
         "$SUPER_REPETITIONS" "$SUPER_JOBS" "$host_cpus"
@@ -1757,9 +1801,11 @@ function cleanup {
     if declare -F print_compatibility_summary >/dev/null; then
         print_compatibility_summary
     fi
-    append_validation_ledger "$exit_status" \
-        "$validation_wall" "$validation_user" "$validation_sys"
-    if ((exit_status == 0 && failures == 0 && LABEL_PR == 1 && \
+    if ((VALIDATION_NESTED == 0)); then
+        append_validation_ledger "$exit_status" \
+            "$validation_wall" "$validation_user" "$validation_sys"
+    fi
+    if ((VALIDATION_NESTED == 0 && exit_status == 0 && failures == 0 && LABEL_PR == 1 && \
         VALIDATION_COMMIT_ANCHORED == 1 && VALIDATION_TREE_DIRTY == 0)) && \
        [[ $VALIDATION_LEVEL == full ]]; then
         publish_receipt_backed_label
@@ -1784,7 +1830,9 @@ trap cleanup EXIT
 trap 'interrupted INT' INT
 trap 'interrupted TERM' TERM
 trap 'interrupted HUP' HUP
-start_validation_concurrency_monitor
+if ((VALIDATION_NESTED == 0)); then
+    start_validation_concurrency_monitor
+fi
 
 # Test seam for scripts/test_validate_stop_paths.py. It exercises this script's
 # real traps and ledger writer without starting a product build. The mode cannot
