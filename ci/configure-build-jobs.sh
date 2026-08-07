@@ -66,11 +66,11 @@ if [[ -v CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS ]]; then
     return 2
 fi
 
-# The calibration below is valid only for Reverie 6144323. The portable wrapper
+# The calibration below is valid only for Reverie 038e993. The portable wrapper
 # obtains the repository's recorded pin through the canonical checker and
 # carries it here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 6144323c5dab8b521278fce206f8774360c2b05f ]]; then
-    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 6144323c5dab8b521278fce206f8774360c2b05f" >&2
+if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 038e993926e45514264d30367b70df9b6ac3b9b8 ]]; then
+    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 038e993926e45514264d30367b70df9b6ac3b9b8" >&2
     return 2
 fi
 
@@ -200,6 +200,26 @@ fi
 # hosted-runner budget carries without re-derivation. Evidenced by tree identity
 # rather than a fresh timing run, exactly as the 6a6b4ec, dd3c178 and 0ae0c01
 # carries above: no DBI build input changed, so there is nothing to re-measure.
+#
+# CARRY TO 038e993 (2026-08-07). NOTE: unlike the 6a6b4ec/dd3c178/0ae0c01/6144323
+# carries above, the whole reverie-dbi subtree is NOT identical this time, so the
+# argument is narrower and is stated explicitly rather than reused.
+#
+# 6144323..038e993 touches reverie-dbi/native/client.c, two test fixtures
+# (first_scrub_marker.c, stack_scrub_marker.c) and one test
+# (stack_scrub_preserves_guest_data.rs).
+#
+# The budget governs exactly one quantity: the elapsed time build_dynamorio()
+# reports on a DynamoRIO content-key MISS. source_recipe_key() is computed over
+# (source_dir = reverie-dbi/vendor/dynamorio, reverie-dbi/build.rs, $CMAKE,
+# $CMAKE_GENERATOR) -- see reverie-dbi/build.rs:75-80 -- and ALL FOUR are
+# unchanged: vendor/dynamorio and build.rs are byte-identical at both pins.
+# build_dynamorio() only cmake-configures and cmake-builds source_dir
+# (build.rs:199-220); native/client.c is not referenced by build.rs at all and is
+# compiled outside the timed region. So the recipe identity remains
+# sha256:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d, the
+# MAX_PARALLEL_JOBS=16 clamp still applies, and the measured MISS cost is
+# unaffected by a client.c edit.
 #
 # Those 2026-08-05 samples deliberately do NOT replace 1050. They come from a
 # development host whose cores finish the identical work ~3.3x faster than the
