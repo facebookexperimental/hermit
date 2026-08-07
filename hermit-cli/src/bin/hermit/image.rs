@@ -40,7 +40,51 @@ use hermit::Error;
 /// that an image layer often omits (busybox, distroless, and `scratch`-derived
 /// images ship no `/proc` or `/sys`). We create them so reverie can mount the
 /// deterministic `/proc` into the chrooted root.
-const REQUIRED_DIRS: &[&str] = &["proc", "sys", "dev", "tmp"];
+///
+/// `dev/pts` is here rather than in [`DEV_BIND_TARGETS`] because it receives a
+/// whole filesystem (a fresh `devpts` instance), not a single bind.
+const REQUIRED_DIRS: &[&str] = &["proc", "sys", "dev", "dev/pts", "tmp"];
+
+/// Character devices the guest gets as bind mounts of the host node, relative to
+/// the image root. See `container::image_container` for the mounts themselves and
+/// for why each is safe to expose; this list only has to guarantee the mount
+/// *targets* exist, because the image root is remounted read-only before the
+/// binds are applied and a bind mount cannot create its own target.
+///
+/// An unprivileged user namespace cannot `mknod` a character device, so binding
+/// the host node is the only way to give the guest one. That is also what
+/// rootless podman and runc do.
+pub(super) const DEV_BIND_TARGETS: &[&str] = &["null", "zero", "full", "random", "urandom"];
+
+/// Conventional `/dev` symlinks, as `(link, target)`. These need no privilege and
+/// no mount: they resolve through `/proc`, which Hermit already replaces with its
+/// deterministic instance inside the image root.
+///
+/// `ptmx` completes the fresh `devpts` instance mounted at `/dev/pts`; the
+/// kernel's devpts documentation names exactly this symlink (or a bind) as the
+/// supported way to expose a per-instance `ptmx`. `fd`, `stdin`, `stdout` and
+/// `stderr` are what bash process substitution (`<(...)`) and countless build
+/// scripts open.
+const DEV_SYMLINKS: &[(&str, &str)] = &[
+    ("ptmx", "pts/ptmx"),
+    ("fd", "/proc/self/fd"),
+    ("stdin", "/proc/self/fd/0"),
+    ("stdout", "/proc/self/fd/1"),
+    ("stderr", "/proc/self/fd/2"),
+];
+
+/// Version of the materialized-rootfs *layout* (which mount targets and symlinks
+/// the tree must contain), mixed into the cache key.
+///
+/// A cached tree is reused whenever its readiness marker exists, so a tree
+/// materialized by an older Hermit would silently lack the `/dev` targets added
+/// here and the binds would fail at mount time. Versioning the key
+/// re-materializes instead. The key is used rather than the marker because an
+/// image root is often mode `0555` and can carry entries owned by unmapped
+/// sub-UIDs, so hermit cannot reliably rewrite or delete a tree it already
+/// produced -- but it can always create a new one beside it. Superseded trees are
+/// left on disk; clearing `~/.cache/hermit/oci-rootfs` reclaims them.
+const ROOTFS_LAYOUT_VERSION: &str = "rootfs-layout-v2-dev";
 
 /// Basename of the captured `Config.Env` file (one `KEY=VALUE` per line).
 const ENV_BASENAME: &str = ".hermit-oci-env";
@@ -58,7 +102,12 @@ fn rootfs_cache_dir(image_ref: &str) -> Result<PathBuf, Error> {
     } else {
         std::env::temp_dir()
     };
-    let key = Digest::new(image_ref.as_bytes()).to_string();
+    // NUL-separate the two fields so no image reference can collide with a
+    // different (reference, layout) pair by concatenation.
+    let mut keyed = Vec::from(image_ref.as_bytes());
+    keyed.push(0);
+    keyed.extend_from_slice(ROOTFS_LAYOUT_VERSION.as_bytes());
+    let key = Digest::new(&keyed).to_string();
     Ok(base.join("hermit").join("oci-rootfs").join(key))
 }
 
@@ -246,6 +295,36 @@ pub(crate) fn materialize_rootfs(image_ref: &str) -> Result<PathBuf, Error> {
     // (e.g. the nixos/nix image's `PATH=/root/.nix-profile/bin:...`) so that the
     // image's own tools resolve. We persist them beside the rootfs so later runs
     // do not depend on the image remaining in buildah storage.
+    // Bind-mount targets for the character devices, plus the conventional
+    // symlinks. Both are created here, inside the `buildah unshare` user
+    // namespace where we are ns-root, for the same reason as the directories
+    // above: afterwards the tree may be mode 0555 with sub-UID-owned entries.
+    // They must also exist *before* the image root is remounted read-only at run
+    // time, because a bind mount cannot create its own target.
+    //
+    // The device targets are empty regular files: a bind mount replaces the
+    // target inode, so the placeholder's type does not matter, and creating a
+    // real character device would need a CAP_MKNOD we do not have.
+    let dev_targets = DEV_BIND_TARGETS
+        .iter()
+        .map(|node| {
+            format!(
+                "{dest}/dev/{node}",
+                dest = shell_quote(&rootfs.to_string_lossy())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let dev_symlinks = DEV_SYMLINKS
+        .iter()
+        .map(|(link, target)| {
+            format!(
+                "\tln -sfn {target} {dest}/dev/{link}\n",
+                target = shell_quote(target),
+                dest = shell_quote(&rootfs.to_string_lossy()),
+            )
+        })
+        .collect::<String>();
     let script = format!(
         r#"set -euo pipefail
 cid=$(buildah from -- {ref})
@@ -256,7 +335,10 @@ mp=$(buildah mount "$cid")
 	chmod u+w {dest}
 	mkdir -p {mkdirs}
 	chmod u+rwx {mkdirs}
-	buildah inspect --type image --format '{{{{.OCIv1.Config.WorkingDir}}}}' {ref} > {workdir_file}
+	rm -f {dev_targets}
+	touch {dev_targets}
+	chmod u+rw {dev_targets}
+{dev_symlinks}	buildah inspect --type image --format '{{{{.OCIv1.Config.WorkingDir}}}}' {ref} > {workdir_file}
 	buildah inspect --type image --format '{{{{range .OCIv1.Config.Env}}}}{{{{println .}}}}{{{{end}}}}' {ref} > {env_file}
 	cp -f {workdir_file} {dest}/{workdir_base}
 	cp -f {env_file} {dest}/{env_base}
@@ -265,6 +347,8 @@ mp=$(buildah mount "$cid")
         ref = shell_quote(image_ref),
         dest = shell_quote(&rootfs.to_string_lossy()),
         mkdirs = mkdirs,
+        dev_targets = dev_targets,
+        dev_symlinks = dev_symlinks,
         workdir_file = shell_quote(&workdir_file(&cache).to_string_lossy()),
         env_file = shell_quote(&env_file(&cache).to_string_lossy()),
         workdir_base = WORKDIR_BASENAME,
@@ -415,6 +499,102 @@ mod tests {
         assert!(
             comp.len() == 64 && comp.chars().all(|c| c.is_ascii_hexdigit()),
             "cache key component must be a SHA-256 hex digest, got {comp}"
+        );
+    }
+
+    /// The `/dev` bind targets and `/dev/pts` must be created by the
+    /// materializer, because the image root is remounted read-only before the
+    /// binds are applied and a bind mount cannot create its own target. A node
+    /// added to `DEV_BIND_TARGETS` without a matching target is a mount failure
+    /// at run time, not a compile error, so pin the relationship here.
+    #[test]
+    fn every_dev_bind_target_is_created_by_the_materializer() {
+        assert!(
+            REQUIRED_DIRS.contains(&"dev"),
+            "the /dev directory itself must be created"
+        );
+        assert!(
+            REQUIRED_DIRS.contains(&"dev/pts"),
+            "the devpts mount point must be created"
+        );
+        for node in DEV_BIND_TARGETS {
+            assert!(
+                !node.contains('/'),
+                "{node} must be a bare basename under /dev; a nested target would \
+                 need its parent directory created too"
+            );
+            assert!(
+                Path::new("/dev").join(node).exists(),
+                "/dev/{node} does not exist on this host, so binding it would fail"
+            );
+        }
+    }
+
+    /// The host entropy devices may be bound in, but only because Detcore
+    /// virtualizes reads on them by path. Anything else host-coupled must stay
+    /// out: `/dev/tty` is the caller's controlling terminal, and `/dev/shm` is
+    /// writable cross-process shared state.
+    #[test]
+    fn minimal_dev_excludes_host_coupled_nodes() {
+        for excluded in ["tty", "shm", "console", "kvm", "fuse"] {
+            assert!(
+                !DEV_BIND_TARGETS.contains(&excluded),
+                "/dev/{excluded} is host-coupled and must not be bound into an image guest"
+            );
+        }
+        // These two are present ONLY because detcore/src/syscalls/files.rs maps
+        // the paths "/dev/random" and "/dev/urandom" to FdType::Rng and serves
+        // reads from the deterministic PRNG. If that classification is ever
+        // keyed on something other than the path, this bind starts leaking host
+        // entropy and must be revisited.
+        assert!(DEV_BIND_TARGETS.contains(&"random"));
+        assert!(DEV_BIND_TARGETS.contains(&"urandom"));
+    }
+
+    /// `/dev/ptmx` must point at the per-container devpts instance, never at a
+    /// host node: allocating out of the host's devpts would leak host-global pty
+    /// numbers into the guest.
+    #[test]
+    fn ptmx_resolves_into_the_container_devpts_instance() {
+        let ptmx = DEV_SYMLINKS
+            .iter()
+            .find(|(link, _)| *link == "ptmx")
+            .expect("a /dev/ptmx symlink must be created");
+        assert_eq!(ptmx.1, "pts/ptmx", "ptmx must be instance-relative");
+        assert!(
+            !ptmx.1.starts_with('/'),
+            "an absolute ptmx target would resolve outside the devpts instance"
+        );
+        assert!(
+            !DEV_BIND_TARGETS.contains(&"ptmx"),
+            "ptmx must come from the container's own devpts, not a host bind"
+        );
+    }
+
+    /// Bumping the layout must change the cache key, or a tree materialized by
+    /// an older Hermit is silently reused without the new `/dev` targets.
+    #[test]
+    fn layout_version_participates_in_the_cache_key() {
+        let reference = "docker.io/library/busybox:latest";
+        let current = rootfs_cache_dir(reference).unwrap();
+
+        let mut keyed = Vec::from(reference.as_bytes());
+        keyed.push(0);
+        keyed.extend_from_slice(b"some-other-layout");
+        let other = Digest::new(&keyed).to_string();
+        assert_ne!(
+            current.file_name().unwrap().to_string_lossy(),
+            other,
+            "a different layout version must produce a different cache dir"
+        );
+
+        // ...and the un-versioned key (what pre-/dev Hermit computed) must not
+        // collide with the current one, which is the whole point of the bump.
+        let unversioned = Digest::new(reference.as_bytes()).to_string();
+        assert_ne!(
+            current.file_name().unwrap().to_string_lossy(),
+            unversioned,
+            "the versioned key must differ from the historical un-versioned key"
         );
     }
 

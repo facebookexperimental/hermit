@@ -190,6 +190,54 @@ pub(super) fn image_container(
     let proc_target = rootfs.join("proc");
     container.mount(Mount::proc().target(&proc_target));
 
+    // A minimal /dev. An OCI image layer ships no device nodes, so without this
+    // the guest sees an empty /dev on a read-only root: `> /dev/null` fails with
+    // EROFS and anything wanting a pty fails outright.
+    //
+    // Every node here is one whose contents a guest cannot use to observe the
+    // host:
+    //
+    // * `null`, `zero` and `full` have kernel-defined, constant behaviour.
+    // * `random` and `urandom` are bound only so that `open(2)` finds an inode.
+    //   Detcore classifies these two by the path the guest opened
+    //   (`FdType::Rng`, see `detcore/src/syscalls/files.rs`) and serves reads
+    //   from its deterministic PRNG, so the host entropy pool is never read.
+    //   Binding the host node therefore restores functionality without handing
+    //   the guest host entropy -- but it does mean the determinism of these two
+    //   rests on Detcore's path classification, not on the mount.
+    //
+    // Deliberately absent:
+    //
+    // * `/dev/tty` -- its contents *are* the caller's controlling terminal, so it
+    //   is pure host coupling, and the guest's behaviour would depend on whether
+    //   Hermit was invoked from a terminal or a pipe. Removing exactly that kind
+    //   of environmental coupling is the point of image mode. Absent,
+    //   `open("/dev/tty")` reports ENOENT instead of ENXIO; both mean "no
+    //   controlling terminal".
+    // * `/dev/shm` -- a writable shared-memory area is cross-process shared state
+    //   and a determinism question in its own right, and nothing in the current
+    //   image workloads needs it.
+    let dev_root = rootfs.join("dev");
+    for node in crate::image::DEV_BIND_TARGETS {
+        container.mount(Mount::bind(
+            Path::new("/dev").join(node),
+            dev_root.join(node),
+        ));
+    }
+
+    // A FRESH devpts instance, not a bind of the host's. `newinstance` numbers
+    // this container's ptys from 0 independently of the host, which is both the
+    // isolation-correct and the deterministic choice: binding the host
+    // `/dev/ptmx` would allocate out of the host's devpts and leak host-global
+    // pty numbers into the guest. `ptmxmode=0666` makes the instance's own
+    // `pts/ptmx` usable, which is what the `/dev/ptmx -> pts/ptmx` symlink the
+    // materializer creates points at.
+    container.mount(
+        Mount::devpts(dev_root.join("pts"))
+            .data("newinstance,ptmxmode=0666")
+            .flags(MountFlags::MS_NOSUID | MountFlags::MS_NOEXEC),
+    );
+
     // Enter the image root last, mirroring the replay chroot ordering
     // (mounts first, then chroot).
     container.chroot(rootfs);
