@@ -650,6 +650,13 @@ fn get_fd(s: Syscall) -> Option<i32> {
 }
 
 /// A system call which may or may not block, but which can be MADE nonblocking.
+// `async_trait` rewrites `into_nonblocking` to return a boxed future and marks it
+// `#[must_use]`; the future is already `#[must_use]` in its own right, so clippy sees a double
+// annotation. Both are generated, so the lint's own suggestion -- give the `must_use` an explicit
+// reason -- cannot be applied at this source. Allowed at the item rather than crate-wide so any
+// hand-written double `must_use` elsewhere still fails `#![deny(clippy::all)]` (detcore/src/lib.rs:35).
+// Appeared with nightly-2026-08-08 (rustc 1.99.0-nightly 1a98b1e13) against an unchanged tree.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait NonblockableSyscall: SyscallInfo {
     /// Convert the system call to a nonblocking version of itself.  Sometimes this means
