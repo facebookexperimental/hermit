@@ -200,17 +200,42 @@ jobs:
       pull-requests: read
     steps:
       - name: Fetch the trusted receipt verifier
+        # Transition phase: provision the two registry files before deploying
+        # the verifier revision that requires them.  VERIFIER_REF deliberately
+        # stays on the self-contained verifier; the registry files are inert to
+        # that revision.  After the compatible parent producer stack lands,
+        # advance BOTH refs and all three digests together, then register this
+        # workflow's new blob in MERGE_GATE_V4_BLOB in the same operation.
         env:
           GH_TOKEN: ${{ github.token }}
+          REGISTRY_REF: 1973c801f46a4bceda9f108e4ae6cd7f3f65fdc0
+          VERIFIER_REF: 4b78d727f35bc8612ac460a6e270dda5f5df304c
         run: |
           set -euo pipefail
           verifier="$RUNNER_TEMP/verify-local-validation-receipt.sh"
-          gh api \
-            'repos/rrnewton/dev-hermit/contents/ci-hub/validation/verify_receipt.sh?ref=4b78d727f35bc8612ac460a6e270dda5f5df304c' \
-            --jq .content | tr -d '\n' | base64 --decode >"$verifier"
-          echo 'e4d24084056b0080d94d99b48a4a9a0df65df372f5321f35b76781fc0ece1f79  '"$verifier" | sha256sum --check
+          predicate="$RUNNER_TEMP/qualifying-receipt.json"
+          producer="$RUNNER_TEMP/producer-definition.json"
+
+          fetch() { # fetch <repo-path> <destination> <expected-sha256>
+            ref=$REGISTRY_REF
+            [ "$1" = ci-hub/validation/verify_receipt.sh ] && ref=$VERIFIER_REF
+            gh api \
+              "repos/rrnewton/dev-hermit/contents/$1?ref=$ref" \
+              --jq .content | tr -d '\n' | base64 --decode >"$2"
+            echo "$3  $2" | sha256sum --check
+          }
+
+          fetch ci-hub/validation/verify_receipt.sh "$verifier" \
+            e4d24084056b0080d94d99b48a4a9a0df65df372f5321f35b76781fc0ece1f79
+          fetch ci-hub/validate/qualifying-receipt.json "$predicate" \
+            09f01dd1435ac7cd6ebbcf28b619ff9ff739587b19bf88f1dd23a53f5c881760
+          fetch ci-hub/validate/producer-definition.json "$producer" \
+            5567b73c7390918bc29b1de41f0eb5cbacffc7b0fc99291c06e60c21c45ba0e9
+
           chmod +x "$verifier"
           echo "RECEIPT_VERIFIER=$verifier" >>"$GITHUB_ENV"
+          echo "QUALIFYING_RECEIPT_PREDICATE=$predicate" >>"$GITHUB_ENV"
+          echo "PRODUCER_DEFINITION_REGISTRY=$producer" >>"$GITHUB_ENV"
       - name: Remove local-validation label when its evidence is no longer valid
         # The verifier fetch is part of the authorization boundary. If that
         # preceding step fails (API outage, missing commit, or digest mismatch),
@@ -566,17 +591,42 @@ jobs:
           fi
           echo "Gate definition is registered v4 blob ${actual_blob}."
       - name: Fetch the trusted receipt verifier
+        # Transition phase: provision the two registry files before deploying
+        # the verifier revision that requires them.  VERIFIER_REF deliberately
+        # stays on the self-contained verifier; the registry files are inert to
+        # that revision.  After the compatible parent producer stack lands,
+        # advance BOTH refs and all three digests together, then register this
+        # workflow's new blob in MERGE_GATE_V4_BLOB in the same operation.
         env:
           GH_TOKEN: ${{ github.token }}
+          REGISTRY_REF: 1973c801f46a4bceda9f108e4ae6cd7f3f65fdc0
+          VERIFIER_REF: 4b78d727f35bc8612ac460a6e270dda5f5df304c
         run: |
           set -euo pipefail
           verifier="$RUNNER_TEMP/verify-local-validation-receipt.sh"
-          gh api \
-            'repos/rrnewton/dev-hermit/contents/ci-hub/validation/verify_receipt.sh?ref=4b78d727f35bc8612ac460a6e270dda5f5df304c' \
-            --jq .content | tr -d '\n' | base64 --decode >"$verifier"
-          echo 'e4d24084056b0080d94d99b48a4a9a0df65df372f5321f35b76781fc0ece1f79  '"$verifier" | sha256sum --check
+          predicate="$RUNNER_TEMP/qualifying-receipt.json"
+          producer="$RUNNER_TEMP/producer-definition.json"
+
+          fetch() { # fetch <repo-path> <destination> <expected-sha256>
+            ref=$REGISTRY_REF
+            [ "$1" = ci-hub/validation/verify_receipt.sh ] && ref=$VERIFIER_REF
+            gh api \
+              "repos/rrnewton/dev-hermit/contents/$1?ref=$ref" \
+              --jq .content | tr -d '\n' | base64 --decode >"$2"
+            echo "$3  $2" | sha256sum --check
+          }
+
+          fetch ci-hub/validation/verify_receipt.sh "$verifier" \
+            e4d24084056b0080d94d99b48a4a9a0df65df372f5321f35b76781fc0ece1f79
+          fetch ci-hub/validate/qualifying-receipt.json "$predicate" \
+            09f01dd1435ac7cd6ebbcf28b619ff9ff739587b19bf88f1dd23a53f5c881760
+          fetch ci-hub/validate/producer-definition.json "$producer" \
+            5567b73c7390918bc29b1de41f0eb5cbacffc7b0fc99291c06e60c21c45ba0e9
+
           chmod +x "$verifier"
           echo "RECEIPT_VERIFIER=$verifier" >>"$GITHUB_ENV"
+          echo "QUALIFYING_RECEIPT_PREDICATE=$predicate" >>"$GITHUB_ENV"
+          echo "PRODUCER_DEFINITION_REGISTRY=$producer" >>"$GITHUB_ENV"
       - name: Fetch the trusted check-outcome authority
         env:
           GH_TOKEN: ${{ github.token }}
