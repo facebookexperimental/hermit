@@ -609,7 +609,7 @@ if [[ \${1:-} == ls-remote ]]; then
     printf '%s\trefs/heads/main\n' '$current' 
     exit 0
 fi
-# `git -C <dir> fetch ...` puts the subcommand in \$3, not \$1 -- a positional
+# "git -C DIR fetch ..." puts the subcommand in \$3, not \$1 -- a positional
 # check silently passes the fetch through to the REAL remote, which both breaks
 # hermeticity and makes the graph disagree with the stubbed ls-remote tip.
 is_fetch=0
@@ -632,11 +632,11 @@ EOF
         printf '[dependencies]\nreverie = { git = "https://github.com/rrnewton/reverie.git", rev = "%s" }\n' \
             "$current" >"$fixture/Cargo.toml"
         "$real_git" -C "$fixture" add Cargo.toml
-        PATH="$isolated_path:/usr/bin:/bin" "$runner" --repo "$fixture" >/dev/null
+        PATH="$isolated_path:/usr/bin:/bin" "$runner" --repo "$fixture" --no-base >/dev/null
 
         printf '[dependencies]\nreverie = { git = "https://github.com/rrnewton/reverie.git", rev = "%s" }\n' \
             "$stale" >"$fixture/Cargo.toml"
-        if PATH="$isolated_path:/usr/bin:/bin" "$runner" --repo "$fixture" \
+        if PATH="$isolated_path:/usr/bin:/bin" "$runner" --repo "$fixture" --no-base \
             >/dev/null 2>&1; then
             status=0
         else
@@ -651,7 +651,7 @@ EOF
         # you looked rather than on the tree.
         printf '[dependencies]\nreverie = { git = "https://github.com/rrnewton/reverie.git", rev = "%s" }\n' \
             "$old_pin" >"$fixture/Cargo.toml"
-        PATH="$isolated_path:/usr/bin:/bin" "$runner" --repo "$fixture" >/dev/null ||
+        PATH="$isolated_path:/usr/bin:/bin" "$runner" --repo "$fixture" --no-base >/dev/null ||
             die "rustc checker lagging-pin bracket must PASS under ancestry"
 
         # Reproduce the hosted release-build failure signature, then exercise

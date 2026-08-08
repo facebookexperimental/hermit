@@ -189,7 +189,15 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Require the exact latest Reverie main revision
+      # MONOTONICITY NEEDS A BASE, and a bare checkout@v4 is depth 1 with no
+      # origin/main -- so the monotonicity clause would have been INERT in the
+      # very job that exists to enforce it. The checker now refuses rather than
+      # skipping when the base is unresolvable, which turns that silent hole
+      # into a loud one; this fetch is what makes the job answerable. Fetching
+      # just main is far cheaper than fetch-depth: 0.
+      - name: Fetch the monotonicity base (origin/main)
+        run: git fetch --no-tags --quiet origin main:refs/remotes/origin/main
+      - name: Require an ancestor of Reverie main that never regresses
         run: |
           set -euo pipefail
           ./ci/run-reverie-pin-check.sh --self-test

@@ -26,6 +26,33 @@
 //! All Reverie revisions across tracked Cargo dependency metadata must also be
 //! identical to each other; that is decided offline and always blocks.
 //!
+//! # THREE OUTCOMES, NOT TWO -- specified deliberately, not left to control flow
+//!
+//! Every gate has PASS, REFUSE, and COULD-NOT-DETERMINE. Collapsing the third
+//! into either of the first two is the defect that produced nearly every gate
+//! failure this repository saw on 2026-08-08. THIS GATE FAILS CLOSED on every
+//! could-not-determine, and each one is enumerated here so a future edit cannot
+//! quietly add a silent-open path:
+//!
+//!   * the Reverie graph cannot be fetched (network, proxy, bad remote)
+//!         -> CHECKER ERROR rc=2. Never PASS: a gate that opens when the
+//!            network hiccups is not a gate.
+//!   * the fetched graph does not contain `main`
+//!         -> CHECKER ERROR rc=2, saying "incomplete fetch, not a pin
+//!            violation". Distinct from the pin being off-history.
+//!   * `ls-remote` cannot resolve the authority tip
+//!         -> BLOCKED rc=1 (pre-existing behaviour, kept).
+//!   * the monotonicity BASE cannot be resolved (no such ref, a depth-1 clone
+//!     with no `origin/main`, an incoherent base pinning two revisions)
+//!         -> CHECKER ERROR rc=2 unless `--no-base` is passed. An unevaluated
+//!            monotonicity check is INDISTINGUISHABLE from a passing one, and
+//!            it shipped exactly that way: with no base ref the gate printed
+//!            "does not regress" and returned 0. `--no-base` exists so a caller
+//!            with genuinely no base DECLARES it instead of stumbling into it.
+//!
+//! The only could-not-determine that is allowed to pass is the one the caller
+//! explicitly asked for by name.
+//!
 //! Scope is derived with `git ls-files`: every tracked `Cargo.toml` and
 //! `Cargo.lock` is inspected, including tracked vendored paths. Untracked or
 //! generated files and files inside nested submodules are outside this check;
@@ -74,6 +101,9 @@ struct Config {
     /// `staged_pin_advisory`). Never a hard refusal: case 3 is an
     /// ACKNOWLEDGEMENT, cleared by HERMIT_PIN_BELOW_MASTER_ACK=1.
     staged_advisory: bool,
+    /// Declare that this invocation has NO monotonicity base, so an
+    /// unresolvable base is an intended skip rather than a silent one.
+    no_base: bool,
     /// Revision whose recorded pin is the monotonicity floor. Defaults to
     /// `origin/main`: the base a PR would land on. A caller with no such ref
     /// (a fresh clone, an isolated fixture) simply gets no floor asserted.
@@ -90,6 +120,7 @@ impl Default for Config {
             update_to_latest: false,
             offline: false,
             staged_advisory: false,
+            no_base: false,
             base_ref: DEFAULT_BASE_REF.to_string(),
         }
     }
@@ -116,6 +147,7 @@ fn usage() -> &'static str {
        --update-to-latest                  Update every derived Cargo pin site to latest main\n\
        --base-ref REF                      Monotonicity floor (default: origin/main)\n\
        --offline                           Local consistency only; no network, no currency\n\
+       --no-base                           Declare there is no monotonicity base (skip it)\n\
        --staged-pin-advisory               Pre-commit advisory on a STAGED pin edit\n\
        -h, --help                          Show this help\n\
      \n\
@@ -140,6 +172,7 @@ fn parse_args() -> Result<Config, String> {
             "--print-pin" => config.print_pin = true,
             "--base-ref" => config.base_ref = take_value(&args, &mut i, "--base-ref")?,
             "--offline" => config.offline = true,
+            "--no-base" => config.no_base = true,
             "--staged-pin-advisory" => config.staged_advisory = true,
             "--update-to-latest" => config.update_to_latest = true,
             "-h" | "--help" => {
@@ -1139,7 +1172,17 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     // (2) MONOTONIC: the pin may not regress below the base this change lands
     // on. Equal is fine (the overwhelmingly common no-op case); forward is the
     // point; backward is refused.
-    if let Some(base) = base_pin(&root, base_ref) {
+    let resolved_base = base_pin(&root, base_ref);
+    if resolved_base.is_none() && !config.no_base {
+        return Err(format!(
+            "cannot resolve a monotonicity base from {base_ref:?}: the ref is missing (a \
+             depth-1 clone has no origin/main), unreadable, or pins more than one Reverie \
+             revision. REFUSING rather than skipping: an unevaluated monotonicity check is \
+             indistinguishable from a passing one. Fetch the base ref, pass --base-ref, or \
+             pass --no-base to declare that this invocation genuinely has no base."
+        ));
+    }
+    if let Some(base) = resolved_base {
         if base != pin && !is_ancestor(&graph, &base, pin)? {
             let direction = if is_ancestor(&graph, pin, &base)? {
                 "REGRESSES to an older commit"
@@ -1391,6 +1434,9 @@ mod tests {
         let code = run_with_config(Config {
             repo: Some(root.clone()),
             remote: Some(remote.to_string_lossy().into_owned()),
+            // Isolated fixture: there is genuinely no base ref here, so the
+            // skip is DECLARED rather than stumbled into.
+            no_base: true,
             ..Config::default()
         })
         .expect("current pin should be classified");
@@ -1467,6 +1513,9 @@ mod tests {
         let code = run_with_config(Config {
             repo: Some(root.clone()),
             remote: Some(remote.to_string_lossy().into_owned()),
+            // Isolated fixture: there is genuinely no base ref here, so the
+            // skip is DECLARED rather than stumbled into.
+            no_base: true,
             ..Config::default()
         })
         .expect("behind pin should be classified");
@@ -1544,6 +1593,47 @@ mod tests {
         fs::write(root.join("Cargo.toml"), manifest(pin)).expect("write candidate manifest");
         assert!(git_in(&root, &["add", "Cargo.toml"]).unwrap().status.success());
         root
+    }
+
+    #[test]
+    fn an_unresolvable_base_is_an_error_not_a_pass() {
+        // THE THIRD STATE. Before this was specified, a repo with no resolvable
+        // base ref -- exactly a depth-1 CI checkout, which is what the
+        // reverie-pin job actually had -- returned rc=0 and printed "does not
+        // regress". An unevaluated monotonicity check is indistinguishable from
+        // a passing one, so COULD-NOT-DETERMINE must fail closed.
+        let (remote, old, _latest, _off) = shared_reverie();
+        let root = temp_path("nobase-hermit");
+        init_fixture_repo(&root);
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{old}\" }}\n"
+            ),
+        )
+        .expect("write manifest");
+        assert!(git_in(&root, &["add", "Cargo.toml"]).unwrap().status.success());
+
+        let undeclared = run_with_config(Config {
+            repo: Some(root.clone()),
+            remote: Some(remote.to_string_lossy().into_owned()),
+            ..Config::default() // base_ref defaults to origin/main, which does not exist here
+        });
+        assert!(
+            undeclared.is_err(),
+            "an unresolvable monotonicity base must be a CHECKER ERROR, not a pass: {undeclared:?}"
+        );
+
+        let declared = run_with_config(Config {
+            repo: Some(root.clone()),
+            remote: Some(remote.to_string_lossy().into_owned()),
+            no_base: true,
+            ..Config::default()
+        })
+        .expect("a DECLARED absence of base is allowed");
+        assert_eq!(declared, 0, "--no-base is an intended skip and must pass");
+
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]
@@ -1784,6 +1874,9 @@ mod tests {
         let code = run_with_config(Config {
             repo: Some(root.clone()),
             remote: Some(remote.to_string_lossy().into_owned()),
+            // Isolated fixture: there is genuinely no base ref here, so the
+            // skip is DECLARED rather than stumbled into.
+            no_base: true,
             ..Config::default()
         })
         .expect("checker should classify the planted inconsistency");
