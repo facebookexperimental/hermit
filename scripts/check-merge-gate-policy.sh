@@ -11,6 +11,10 @@ set -euo pipefail
 
 ROOT_DIR=${1:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}
 WORKFLOW="$ROOT_DIR/.github/workflows/merge-gate.yml"
+PRODUCER_AUTHORITY_REF=660981eba98d578ae1397be2a4fb784df58deda8
+RECEIPT_VERIFIER_SHA256=1b0792415134afed7066ee70e1bc35319a204c5192cac69d33a8ca96b2f01082
+QUALIFYING_RECEIPT_SHA256=09f01dd1435ac7cd6ebbcf28b619ff9ff739587b19bf88f1dd23a53f5c881760
+PRODUCER_DEFINITION_SHA256=e87d2d927262de2fd65e60b9ab2a00312019dffe8307aa7428d6d92d4585198f
 
 fail() {
     echo "check-merge-gate-policy.sh: $*" >&2
@@ -56,8 +60,16 @@ grep -Fq -- '--select-latest-rollup --head-sha "$MAIN_FULL_SHA"' "$ROOT_DIR/scri
     fail "duplicate jq status classifier must not exist"
 [[ ! -e $ROOT_DIR/scripts/check_status_outcome.py ]] ||
     fail "duplicate Hermit status adapter must not exist"
-grep -Fq 'e4d24084056b0080d94d99b48a4a9a0df65df372f5321f35b76781fc0ece1f79' "$WORKFLOW" ||
-    fail "gate must content-pin the parent receipt verifier"
+[[ $(grep -Fc "REGISTRY_REF: $PRODUCER_AUTHORITY_REF" "$WORKFLOW") -eq 2 ]] ||
+    fail "both gate legs must pin the producer registries to the parent authority commit"
+[[ $(grep -Fc "VERIFIER_REF: $PRODUCER_AUTHORITY_REF" "$WORKFLOW") -eq 2 ]] ||
+    fail "both gate legs must pin the receipt verifier to the parent authority commit"
+[[ $(grep -Fc "$RECEIPT_VERIFIER_SHA256" "$WORKFLOW") -eq 2 ]] ||
+    fail "both gate legs must content-pin the parent receipt verifier"
+[[ $(grep -Fc "$QUALIFYING_RECEIPT_SHA256" "$WORKFLOW") -eq 2 ]] ||
+    fail "both gate legs must content-pin the qualifying-receipt registry"
+[[ $(grep -Fc "$PRODUCER_DEFINITION_SHA256" "$WORKFLOW") -eq 2 ]] ||
+    fail "both gate legs must content-pin the producer-definition registry"
 grep -Fq '"$RECEIPT_VERIFIER"' "$WORKFLOW" ||
     fail "local alternate leg must call the parent receipt verifier"
 if grep -Eq 'scripts/(check|verify)-local-validation' "$WORKFLOW"; then
