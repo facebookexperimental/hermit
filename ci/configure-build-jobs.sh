@@ -66,11 +66,12 @@ if [[ -v CI_DAG_REVERIE_DBT_MAX_BUILD_JOB_SECONDS ]]; then
     return 2
 fi
 
-# The calibration below is valid only for Reverie ab44bbf. The calibration itself is unchanged; see the carry chain below. The portable wrapper
-# obtains the repository's recorded pin through the canonical checker and
-# carries it here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ab44bbf7351e2329a0de5270d22a02a0c8142f4a ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie ab44bbf7351e2329a0de5270d22a02a0c8142f4a" >&2
+# The calibration below is valid only for Reverie 0384d673. The calibration
+# itself is unchanged; see the carry chain below. The portable wrapper obtains
+# the repository's recorded pin through the canonical checker and carries it
+# here; a pin bump cannot silently retain the old clamp or threshold.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 0384d673319bf139cf7d71fda820245a9266364d ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie 0384d673319bf139cf7d71fda820245a9266364d" >&2
     return 2
 fi
 
@@ -322,6 +323,19 @@ fi
 # 9f4fa6c0 edits reverie-syscalls/src/args/sysinfo.rs, and reverie-syscalls is
 # one of the crates hermit compiles. So this bump requires REAL revalidation --
 # a prior receipt cannot be reused even though the DBT budget is untouched.
+#
+# CARRY TO 0384d673 (2026-08-08). The calibration carries unchanged because
+# neither input to source_recipe_key() changed across ab44bbf7..0384d673:
+#
+#   git diff --name-status ab44bbf7..0384d673 -- reverie-dbt -> no output
+#   git rev-parse ab44bbf7:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse 0384d673:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse ab44bbf7:reverie-dbt/build.rs -> byte-identical to 0384d673
+#
+# The three intervening commits change LiteInst, ptrace, and RPC transport,
+# none of which can affect the DynamoRIO content-key miss measured by this
+# budget. They remain build-relevant and therefore require fresh validation;
+# this carry does not authorize receipt reuse.
 REVERIE_DBT_MAX_PARALLEL_JOBS=16
 REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS=1050
 REVERIE_DBT_EFFECTIVE_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS
