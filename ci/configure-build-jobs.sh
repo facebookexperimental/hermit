@@ -66,11 +66,11 @@ if [[ -v CI_DAG_REVERIE_DBT_MAX_BUILD_JOB_SECONDS ]]; then
     return 2
 fi
 
-# The calibration below is valid only for Reverie 5bf9e0b. The portable wrapper
+# The calibration below is valid only for Reverie ab44bbf. The calibration itself is unchanged; see the carry chain below. The portable wrapper
 # obtains the repository's recorded pin through the canonical checker and
 # carries it here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != fb963d90dc6c5a136cfff23d3e898ab06f8cb265 ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie fb963d90dc6c5a136cfff23d3e898ab06f8cb265" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ab44bbf7351e2329a0de5270d22a02a0c8142f4a ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie ab44bbf7351e2329a0de5270d22a02a0c8142f4a" >&2
     return 2
 fi
 
@@ -294,6 +294,34 @@ fi
 # The subtree differs only because fb963d90 is "Finish DBT rename across
 # rebased native client", i.e. native/client.c -- which is NOT a
 # source_recipe_key() input. So 019b7967 is the correct key at this pin.
+#
+# CARRY TO ab44bbf7 (2026-08-08). THE CALIBRATION DECISION IS STATED, NOT
+# DEFAULTED: the budget carries UNCHANGED, and this is the widest carry in the
+# chain -- the entire reverie-dbt subtree is the SAME TREE OBJECT at both pins.
+#
+#   git log --oneline fb963d90..ab44bbf7  -> ab44bbf7 validate.sh: name the writer in every ledger row
+#                                            7d87ba30 Use short host names in benchmark evidence
+#                                            9f4fa6c0 Convert SysInfo to libc::sysinfo field-wise
+#   git diff --name-only fb963d90..ab44bbf7 -> benchmarks/counter2-shootout/INITIAL_RESULTS.md
+#                                              benchmarks/counter2-shootout/results/.../metadata.json
+#                                              reverie-syscalls/src/args/sysinfo.rs
+#                                              validate.sh          (reverie's own, not hermit's)
+#   git rev-parse fb963d90:reverie-dbt                  -> 7cf124ac7a88...
+#   git rev-parse ab44bbf7:reverie-dbt                  -> 7cf124ac7a88...  IDENTICAL (whole subtree)
+#   git rev-parse ab44bbf7:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse ab44bbf7:reverie-dbt/build.rs         -> af2faa442335...
+#
+# Nothing under reverie-dbt changed at all, so both source_recipe_key() file
+# inputs are byte-identical, the recipe identity remains
+# sha256:019b79670b3572c1afc2690932dd3fbbf70bbc9d0d96b5086ea121422de4bbb9, the
+# MAX_PARALLEL_JOBS=16 clamp still applies, and the measured MISS cost cannot
+# have moved. Budget values (1050 effective-job-seconds, 263/66 max-elapsed)
+# carry unchanged. The >=5-clean-Hermit-lane-samples replacement bar is unmet.
+#
+# BUILD-RELEVANT ANYWAY, and that is a separate axis from the budget:
+# 9f4fa6c0 edits reverie-syscalls/src/args/sysinfo.rs, and reverie-syscalls is
+# one of the crates hermit compiles. So this bump requires REAL revalidation --
+# a prior receipt cannot be reused even though the DBT budget is untouched.
 REVERIE_DBT_MAX_PARALLEL_JOBS=16
 REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS=1050
 REVERIE_DBT_EFFECTIVE_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS
