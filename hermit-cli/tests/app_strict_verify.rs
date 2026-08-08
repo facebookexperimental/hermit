@@ -263,6 +263,243 @@ fn assert_l2_under_strict_verify(program: &Path, args: &[&str]) {
     );
 }
 
+const PYTHON_HOST_ENV_SENTINEL: &str = "HERMIT_APP_STRICT_VERIFY_HOST_SENTINEL";
+
+/// Build a native Python command with no ambient host environment.
+fn sanitized_native_python(program: &Path, home: &Path) -> Command {
+    let mut command = Command::new(program);
+    command
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C")
+        .env("LC_ALL", "C");
+    command
+}
+
+/// Return the versioned user-site directory that CPython derives below `home`.
+fn python_user_site(program: &Path, home: &Path) -> PathBuf {
+    let mut command = sanitized_native_python(program, home);
+    let output = command
+        // Isolated mode ignores Python-specific environment switches, while
+        // `-S` prevents site initialization during fixture discovery.
+        .args([
+            "-I",
+            "-S",
+            "-c",
+            "import sys; print(f'python{sys.version_info.major}.{sys.version_info.minor}')",
+        ])
+        .output()
+        .expect("failed to query the Python runtime version");
+    assert!(
+        output.status.success(),
+        "failed to query Python runtime version: status={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let version = String::from_utf8(output.stdout)
+        .expect("Python runtime version is valid UTF-8")
+        .trim()
+        .to_owned();
+    assert!(
+        version.starts_with("python") && !version.contains('/') && !version.contains('\\'),
+        "unexpected Python runtime version directory: {version:?}",
+    );
+    home.join(".local")
+        .join("lib")
+        .join(version)
+        .join("site-packages")
+}
+
+/// Plant an observable user-site startup hook in a fresh, visible home.
+///
+/// The `.pth` hook imports a module that writes a marker. Ordinary startup also
+/// writes that module's `.pyc`, giving the native negative control two positive
+/// observations. Keeping the home below Cargo's target temp directory (rather
+/// than host `/tmp`, which Hermit hides) makes the fixture visible to the guest.
+fn plant_pristine_python_user_site(
+    program: &Path,
+    prefix: &str,
+) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let home = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create pristine Python home");
+    let site = python_user_site(program, home.path());
+    fs::create_dir_all(&site).expect("failed to create pristine Python user site");
+
+    let marker = site.join("hermit_pristine_user_site.loaded");
+    let module = format!(
+        "with open({:?}, 'w', encoding='utf-8') as marker:\n    marker.write('loaded\\n')\n",
+        marker.to_string_lossy(),
+    );
+    fs::write(site.join("hermit_pristine_user_site.py"), module)
+        .expect("failed to plant Python user-site module");
+    fs::write(
+        site.join("hermit-pristine-user-site.pth"),
+        "import hermit_pristine_user_site\n",
+    )
+    .expect("failed to plant Python user-site startup hook");
+
+    (home, site, marker)
+}
+
+fn python_bytecode_exists(source_dir: &Path) -> bool {
+    let cache = source_dir.join("__pycache__");
+    match fs::read_dir(&cache) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(error) => panic!("failed to inspect Python bytecode cache: {error}"),
+    }
+    .map(|entry| {
+        entry
+            .expect("failed to inspect Python bytecode cache entry")
+            .path()
+    })
+    .any(|path| path.extension().is_some_and(|extension| extension == "pyc"))
+}
+
+/// Assert canonical full-INFO parity for a hermetic Python arithmetic case.
+///
+/// Each isolation mechanism has a separate observable: `-I` suppresses a
+/// planted user-site hook, `-B` suppresses bytecode for an explicitly imported
+/// source module, and `--base-env=minimal` suppresses a host-only sentinel that
+/// makes the guest fail if inherited. The native negative control proves that
+/// the user-site fixture is live and bytecode-capable before the Hermit run.
+fn assert_python_arithmetic_canonical_parity(program: &Path) {
+    let _guard = hermit_run_lock();
+
+    let (negative_home, negative_site, negative_marker) =
+        plant_pristine_python_user_site(program, "python-user-site-negative-");
+    let mut negative_command = sanitized_native_python(program, negative_home.path());
+    let negative = negative_command
+        .args(["-c", "print(sum(range(1000)))"])
+        .output()
+        .expect("failed to run Python user-site negative control");
+    assert!(
+        negative.status.success(),
+        "Python user-site negative control failed: status={} stderr={}",
+        negative.status,
+        String::from_utf8_lossy(&negative.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&negative.stdout).trim(),
+        "499500",
+        "Python user-site negative control did not run the arithmetic workload",
+    );
+    assert!(
+        negative_marker.is_file(),
+        "Python user-site negative control was inert: startup hook did not run",
+    );
+    assert!(
+        python_bytecode_exists(&negative_site),
+        "Python user-site negative control was inert: no bytecode was written",
+    );
+
+    let (positive_home, _, positive_marker) =
+        plant_pristine_python_user_site(program, "python-user-site-positive-");
+    let bound_source = positive_home.path().join("bound-source");
+    fs::create_dir_all(&bound_source).expect("failed to create bound Python source directory");
+    fs::write(
+        bound_source.join("hermit_bound_probe.py"),
+        "VALUE = 271828\n",
+    )
+    .expect("failed to plant bound Python source module");
+
+    let guest = format!(
+        r#"import os, sys
+if os.environ.get({sentinel:?}) is not None:
+    raise SystemExit("host environment leaked into minimal guest environment")
+sys.path.insert(0, {bound_source:?})
+import hermit_bound_probe
+print(hermit_bound_probe.VALUE + sum(range(1000)))
+"#,
+        sentinel = PYTHON_HOST_ENV_SENTINEL,
+        bound_source = bound_source.to_string_lossy(),
+    );
+    let report_path = positive_home.path().join("verify.json");
+    let mut command = Command::new("timeout");
+    command
+        // This reaches Hermit itself. The guest must not inherit it through
+        // the explicitly selected minimal base environment.
+        .env(
+            PYTHON_HOST_ENV_SENTINEL,
+            format!("must-not-leak: {}", positive_home.path().display()),
+        )
+        .args(["--kill-after", HERMIT_VERIFY_KILL_AFTER])
+        .arg(hermit_verify_timeout())
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+        ])
+        .arg(format!("--verify-json={}", report_path.display()))
+        .arg("--base-env=minimal")
+        .arg(format!("--env=HOME={}", positive_home.path().display()))
+        .args([
+            // The test does not assert CPUID or PMU behavior; these flags keep
+            // it portable without weakening strict determinism.
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+        ])
+        .arg(program)
+        .args(["-I", "-B", "-c"])
+        .arg(guest);
+
+    let rendered = format!("{command:?}");
+    let output = run_hermit_command(command);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !positive_marker.exists(),
+        "isolated Python loaded the planted user site for {rendered}",
+    );
+    assert!(
+        !python_bytecode_exists(&bound_source),
+        "no-bytecode Python wrote the explicitly imported module cache for {rendered}",
+    );
+    assert!(
+        output.status.success(),
+        "hermit canonical Python verification failed for {rendered}\n\
+         status: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status,
+    );
+    assert!(
+        stdout.lines().any(|line| line.trim() == "771328"),
+        "Python did not import the bound source module and complete arithmetic for {rendered}\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+
+    let report_bytes = fs::read(&report_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read verification report {} for {rendered}: {error}",
+            report_path.display(),
+        )
+    });
+    let report: serde_json::Value =
+        serde_json::from_slice(&report_bytes).expect("Hermit verification report is valid JSON");
+    assert!(
+        report["verdict"] == "matched"
+            && report["verified"] == true
+            && report["bitwise_parity"] == true
+            && report["comparison"]["strictness"] == "canonical"
+            && report["comparison"]["log_scope"] == "info"
+            && report["comparison"]["full_trace"] == true
+            && report["compared_log_messages"]["left"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+            && report["compared_log_messages"]["right"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+        "verification report was not nonempty canonical bitwise parity: {report}",
+    );
+}
+
 /// Like [`assert_l2_under_strict_verify`], but keeps Hermit's default RCB-based
 /// preemption enabled (it does **not** pass `--max-timeslice=disabled`).
 ///
@@ -583,7 +820,7 @@ fn run_once_under_strict(program: &Path, args: &[&str]) -> Output {
 #[ignore = "e2e: requires hermit + mount namespaces + Python 3"]
 fn python_arithmetic_is_deterministic_under_strict_verify() {
     let python = required_app("python3", &["/usr/local/bin/python3", "/usr/bin/python3"]);
-    assert_l2_under_strict_verify(&python, &["-c", "print(sum(range(1000)))"]);
+    assert_python_arithmetic_canonical_parity(&python);
 }
 
 #[test]
