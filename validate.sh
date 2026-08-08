@@ -1226,7 +1226,6 @@ readonly DEFAULT_STRICT_COMPAT_HERMIT_BIN="$ROOT_DIR/target/release/hermit"
 STRICT_COMPAT_HERMIT_BIN=${STRICT_COMPAT_HERMIT_BIN:-"$DEFAULT_STRICT_COMPAT_HERMIT_BIN"}
 readonly STRICT_COMPAT_HERMIT_BIN
 readonly STRICT_COMPAT_TIMEOUT=60
-readonly BACKEND_COMPAT_RESULTS="$VALIDATION_TMP_DIR/backend-compat-results.tsv"
 readonly COMPAT_SUMMARY_RESULTS="$VALIDATION_TMP_DIR/compat-summary-results.tsv"
 VALIDATE_RESULTS_FILE=${VALIDATE_RESULTS_FILE:-"$ROOT_DIR/target/validate-results.txt"}
 readonly VALIDATE_RESULTS_FILE
@@ -2498,27 +2497,6 @@ function note_backend_skip {
     printf "SKIP: %s backend gate (%s)\n" "$backend" "$reason" >>"$LOG_FILE"
 }
 
-function run_full_backend_gates {
-    local -a backends=(--backend ptrace)
-
-    if kvm_backend_available; then
-        backends+=(--backend kvm)
-    else
-        note_backend_skip "KVM" "/dev/kvm is not readable and writable"
-    fi
-
-    if dbt_backend_available; then
-        backends+=(--backend dbt)
-    else
-        note_backend_skip "DBT" "backend smoke did not complete successfully"
-    fi
-
-    run_check "Real backend compatibility matrix" \
-        python3 tests/backend-parity/run_matrix.py \
-        "${backends[@]}" --probe-gaps --require-backend \
-        --output "$BACKEND_COMPAT_RESULTS"
-}
-
 # AUTONOMOUS-BOT-IMPLEMENTED
 # TODO-HUMAN-REVIEW(#706): Review the canonical cross-backend compatibility summary.
 function compat_summary_backend {
@@ -2607,23 +2585,12 @@ function backend_parity_program_name {
 }
 
 function load_compatibility_results {
-    local test_name
     local backend
-    local _expectation
     local result
-    local _seconds
     local detail
     local program
 
     COMPAT_SUMMARY_CELLS=()
-    if [[ -r $BACKEND_COMPAT_RESULTS ]]; then
-        while IFS=$'\t' read -r test_name backend _expectation result _seconds detail; do
-            [[ $test_name != test_name ]] || continue
-            program=$(backend_parity_program_name "$test_name" || true)
-            [[ -n $program ]] || continue
-            COMPAT_SUMMARY_CELLS["$program:$backend"]=$result
-        done <"$BACKEND_COMPAT_RESULTS"
-    fi
     if [[ -r $COMPAT_SUMMARY_RESULTS ]]; then
         while IFS=$'\t' read -r program backend result detail; do
             [[ $program != program ]] || continue

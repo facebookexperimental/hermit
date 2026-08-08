@@ -933,23 +933,93 @@ def run_case(
     return "PASS", f"{RUNS}/{RUNS} runs matched", time.monotonic() - started
 
 
+# The columns the `--output` TSV carries.  `evidence` is deliberately NOT one of
+# them: it is a nested dict of live parity observations whose home is the outer
+# scorecard (see `append_parent_scorecard`), and a dict has no faithful TSV
+# rendering.  Dropping it here is a decision, not an accident, which is why it is
+# named rather than absorbed by a permissive writer.
+RESULT_COLUMNS = (
+    "test_name",
+    "backend",
+    "expectation",
+    "result",
+    "seconds",
+    "detail",
+)
+# Keys a result row may legitimately carry that are not columns.  Anything
+# outside `RESULT_COLUMNS` and this set is skew nobody anticipated, and the
+# writer must say so instead of guessing.
+NON_COLUMN_RESULT_KEYS = frozenset({"evidence"})
+
+
 def write_results(path: Path, results: list[dict[str, str]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as output:
-        writer = csv.DictWriter(
-            output,
-            fieldnames=(
-                "test_name",
-                "backend",
-                "expectation",
-                "result",
-                "seconds",
-                "detail",
-            ),
-            delimiter="\t",
+    """Write the whole run matrix, or write nothing and name what stopped it.
+
+    `csv.DictWriter` defaults to ``extrasaction="raise"``, so once the row
+    builder learned to carry `evidence` (:1241, unlike the six-key GAP rows at
+    :1214) every executed row raised mid-write.  Because `writerows` streams,
+    the raise left behind a syntactically valid TSV containing the clean PREFIX
+    of the rows -- measured 3 of 10 with realistic GAP-then-executed ordering,
+    and 0 of 10 when the first row was skewed.
+
+    That is the part worth defending against.  The process does exit non-zero
+    (an uncaught `ValueError` exits 1), so the failure is not silent to a caller
+    reading ``$?``; it is silent at the ARTIFACT boundary, because a short file
+    is indistinguishable from a small result set.  A reader cannot tell "the
+    matrix found three cases" from "the matrix found ten and lost seven".
+
+    Two rules, and neither alone is sufficient:
+
+      * a KNOWN non-column key is projected out deliberately, by name;
+      * ANY other skew -- an unexpected extra key, or a missing column -- raises
+        `MatrixError` identifying the row and the key, BEFORE anything is
+        written.
+
+    Validation therefore runs over every row up front, and the file is then
+    written whole through a temporary file and an atomic rename.  A refusal
+    leaves the previous artifact untouched rather than truncated, so there is no
+    state in which a short file can be mistaken for a complete one.
+    """
+    for index, row in enumerate(results):
+        missing = [column for column in RESULT_COLUMNS if column not in row]
+        if missing:
+            raise MatrixError(
+                f"result row {index} ({row.get('backend', '?')}/"
+                f"{row.get('test_name', '?')}) is missing required column(s) "
+                f"{', '.join(missing)}; refusing to write a partial "
+                f"{path} -- {len(results)} row(s) would have been lost"
+            )
+        unexpected = sorted(
+            set(row) - set(RESULT_COLUMNS) - NON_COLUMN_RESULT_KEYS
         )
-        writer.writeheader()
-        writer.writerows(results)
+        if unexpected:
+            raise MatrixError(
+                f"result row {index} ({row['backend']}/{row['test_name']}) "
+                f"carries unexpected field(s) {', '.join(unexpected)} that "
+                f"{path} has no column for; declare them in RESULT_COLUMNS or "
+                f"in NON_COLUMN_RESULT_KEYS. Refusing to write a partial file "
+                f"-- {len(results)} row(s) would have been lost"
+            )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.partial")
+    try:
+        with temporary.open("w", newline="", encoding="utf-8") as output:
+            writer = csv.DictWriter(
+                output,
+                fieldnames=RESULT_COLUMNS,
+                delimiter="\t",
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+            writer.writerows(results)
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    # The count travels with the artifact: a consumer that sees this line and a
+    # file with a different number of data rows knows the two disagree.
+    print(f"TRACKING: wrote {len(results)} result row(s) to {path}")
 
 
 def discover_parent_scorecard() -> Path | None:
