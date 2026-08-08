@@ -17,7 +17,9 @@ VALIDATE = ROOT / "validate.sh"
 TEST_ROOTS: list[Path] = []
 
 
-def stop_test_env(tmpdir: Path, ledger: Path) -> dict[str, str]:
+def stop_test_env(
+    tmpdir: Path, ledger: Path, *, lock_proven: bool = False
+) -> dict[str, str]:
     TEST_ROOTS.append(tmpdir)
     env = os.environ.copy()
     env.update(
@@ -28,6 +30,17 @@ def stop_test_env(tmpdir: Path, ledger: Path) -> dict[str, str]:
         VALIDATE_STOP_TEST_TMP_ROOT=str(tmpdir / "validation"),
         TMPDIR=str(tmpdir),
     )
+    if lock_proven:
+        owner_file = tmpdir / "validate-lock.owner"
+        owner_file.write_text(f"pid={os.getpid()}\n")
+        env.update(
+            CI_HUB_VALIDATE_LOCK_OWNER_PID=str(os.getpid()),
+            CI_HUB_VALIDATE_LOCK_OWNER_FILE=str(owner_file),
+            # Plant the weaker legacy observation too. Canonical owner ancestry
+            # must win; otherwise parked stop-test fixtures make every genuine
+            # admitted schema-5 receipt unqualifiable.
+            CI_HUB_VALIDATE_CONCURRENT="true",
+        )
     return env
 
 
@@ -42,14 +55,34 @@ def wait_for_text(log: Path, text: str, process: subprocess.Popen[bytes]) -> Non
     raise AssertionError(f"validate stop-test hook did not emit {text!r}")
 
 
+def assert_schema5_contract(row: dict, *, admitted: bool = False) -> None:
+    """A current writer never escapes strict evidence by downgrading schema."""
+    assert row["schema_version"] == 5, row
+    assert row["repo"] == "hermit", row
+    assert row["producer"] == "hermit-validate-sh", row
+    if admitted:
+        assert row["admission"] == "ci-hub-validate-lock", row
+        assert row["concurrent_validates"] == 0, row
+        assert row["concurrency_proof"] == "validate_lock_owner_ancestry", row
+    else:
+        # These direct stop-path tests do not run through validate-lock, so their
+        # honest admission result is unknown. A schema-4 fallback would incorrectly
+        # grandfather that absence; schema 5 plus null is correctly unqualifiable.
+        assert row["admission"] is None, row
+
+
 def run_signal(
-    sig: signal.Signals, expect_record: bool, *, prior_failure: bool = False
+    sig: signal.Signals,
+    expect_record: bool,
+    *,
+    prior_failure: bool = False,
+    lock_proven: bool = False,
 ) -> None:
     with tempfile.TemporaryDirectory(prefix=f"validate-stop-{sig.name.lower()}-") as tmp:
         tmpdir = Path(tmp)
         ledger = tmpdir / "ledger.jsonl"
         log = tmpdir / "validate.log"
-        env = stop_test_env(tmpdir, ledger)
+        env = stop_test_env(tmpdir, ledger, lock_proven=lock_proven)
         env.update(
             VALIDATE_STOP_TEST_PRIOR_FAILURE="1" if prior_failure else "0",
         )
@@ -75,6 +108,7 @@ def run_signal(
         assert rc == 130, (sig.name, rc, log.read_text(errors="replace"))
         assert len(rows) == 1, (sig.name, rows)
         row = rows[0]
+        assert_schema5_contract(row, admitted=lock_proven)
         assert row["result"] == ("fail" if prior_failure else "no_result"), row
         assert row["raw_result"] == "fail", row
         assert row["gates_run"] == row["checks"] == 2, row
@@ -102,6 +136,7 @@ def run_incomplete_exit() -> None:
         rows = [json.loads(line) for line in ledger.read_text().splitlines()]
         assert len(rows) == 1, rows
         row = rows[0]
+        assert_schema5_contract(row)
         # An ordinary early exit is not an operator stop. It remains a raw
         # failure unless the producer carries an explicit interruption signal.
         assert row["result"] == "fail", row
@@ -146,6 +181,7 @@ def run_cleanup_signal_race() -> None:
         rows = [json.loads(line) for line in ledger.read_text().splitlines()]
         assert rc == 1, (rc, log.read_text(errors="replace"))
         assert len(rows) == 1, rows
+        assert_schema5_contract(rows[0])
         assert rows[0]["result"] == "fail", rows[0]
         assert rows[0]["interruption_signal"] is None, rows[0]
 
@@ -155,6 +191,7 @@ def main() -> None:
         run_signal(sig, expect_record=True)
     run_signal(signal.SIGKILL, expect_record=False)
     run_signal(signal.SIGTERM, expect_record=True, prior_failure=True)
+    run_signal(signal.SIGTERM, expect_record=True, lock_proven=True)
     run_incomplete_exit()
     run_cleanup_signal_race()
     leaked = [path for path in TEST_ROOTS if path.exists()]

@@ -1550,6 +1550,7 @@ function append_validation_ledger {
     local finished_at result raw_result gates_json gate_result line
     local count_helper counts executed_tests_json=null filtered_tests_json=null
     local commit_anchored_json tree_dirty_json concurrent_validates_json concurrency_proof_json gates_run
+    local admission_json=null
     local evidence_helper evidence_json failed_substeps_json='[]' flaky_failed_substeps_json='[]'
     local known_flaky_failure_json=null solo_rerun_confirmation_json=false
     local solo_rerun_of_json=null
@@ -1577,13 +1578,19 @@ function append_validation_ledger {
         result=$raw_result
     fi
 
-    if [[ -r $VALIDATION_CONCURRENT_MARKER ]]; then
+    # The process-bound box-global lock is the stronger authority. The legacy
+    # process-group observer also sees parked stop-test fixtures and other
+    # unadmitted validate.sh processes, so it cannot override a live canonical
+    # owner whose PID is proven in this shell's ancestry. Keep the observer as
+    # fail-closed evidence for direct, non-admitted runs only.
+    if validate_lock_exclusivity_proven; then
+        concurrent_validates_json=0
+        concurrency_proof_json='"validate_lock_owner_ancestry"'
+        admission_json='"ci-hub-validate-lock"'
+    elif [[ -r $VALIDATION_CONCURRENT_MARKER ]]; then
         concurrent_validates_json=$(<"$VALIDATION_CONCURRENT_MARKER")
         [[ $concurrent_validates_json =~ ^[1-9][0-9]*$ ]] || concurrent_validates_json=null
         concurrency_proof_json='"process_group_overlap_monitor"'
-    elif validate_lock_exclusivity_proven; then
-        concurrent_validates_json=0
-        concurrency_proof_json='"validate_lock_owner_ancestry"'
     else
         # A bare run with no observed peer is UNKNOWN, not proven exclusive.
         concurrent_validates_json=null
@@ -1674,23 +1681,20 @@ function append_validation_ledger {
         [[ $filtered_tests_json =~ ^(null|[0-9]+)$ ]] || filtered_tests_json=null
     fi
 
-    # schema_version 5 per-node COVERAGE obligation. Completeness is a COVERAGE
-    # question, not an executed-test COUNT (`executed_tests` above is DIAGNOSTIC
-    # ONLY -- one commit can carry several different aggregate counts). The single
-    # coverage computer is finalize_receipt.build_coverage; we call it here rather
-    # than re-implementing the per-node parse, so writer and the landing-time
-    # `--scan` minter share ONE definition. It reads THIS run's log plus the DAG
-    # manifests at the exact commit (`git show <sha>:ci/dag/*.json`) and returns
-    # coverage{planned_test_nodes,executed_test_nodes,zero_executed_nodes,
-    # absent_nodes}. We bump the row to schema 5 ONLY when a REAL judgement exists
-    # (coverage non-null AND planned_test_nodes>0): then the consumer classifies on
-    # coverage. When the finalizer, python3, jq, or the manifests are unavailable
-    # the judgement is UNRESOLVABLE -- coverage stays null / the row stays schema 4
-    # so the existing grandfather (executed_tests) still stands and absence is
-    # NEVER read as incomplete. The emitted row shape is identical to the schema-5
-    # rows finalize_receipt.py --scan already mints, so no consumer is disturbed.
+    # Schema 5 is the COMPLETE coverage + base + admission contract. This writer
+    # must never downgrade a new row to grandfathered schema 4 when a helper or
+    # proof is unavailable: that would turn absent evidence into authority. Emit
+    # schema 5 with explicit nulls instead, so the canonical predicate refuses it.
+    #
+    # The single coverage/base computer is finalize_receipt.py. It reads THIS
+    # run's log plus manifests at the exact commit and returns both per-node
+    # coverage and the Hermit/Reverie base identities. Keep every returned proof;
+    # extracting only `.coverage` was the regression that made 53/53 schema-5
+    # rows unqualifiable even though 38 were otherwise positive candidates.
     local coverage_helper coverage_out coverage_json=null coverage_planned=0
-    local ledger_schema=4
+    local base_sha_json=null base_tree_json=null
+    local reverie_base_sha_json=null reverie_base_tree_json=null
+    local ledger_schema=5
     coverage_helper="$DEV_HERMIT_PARENT/ci-hub/validate/finalize_receipt.py"
     if [[ -n $DEV_HERMIT_PARENT && -r $coverage_helper && -n $VALIDATION_COMMIT ]] \
         && command -v python3 >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
@@ -1699,17 +1703,16 @@ function append_validation_ledger {
             --emit-only 2>>"$LOG_FILE"); then
             coverage_json=$(jq -c '.coverage // empty' <<<"$coverage_out" 2>/dev/null)
             [[ -n $coverage_json ]] || coverage_json=null
+            base_sha_json=$(jq -c '.base_sha // null' <<<"$coverage_out" 2>/dev/null) || base_sha_json=null
+            base_tree_json=$(jq -c '.base_tree // null' <<<"$coverage_out" 2>/dev/null) || base_tree_json=null
+            reverie_base_sha_json=$(jq -c '.reverie_base_sha // null' <<<"$coverage_out" 2>/dev/null) || reverie_base_sha_json=null
+            reverie_base_tree_json=$(jq -c '.reverie_base_tree // null' <<<"$coverage_out" 2>/dev/null) || reverie_base_tree_json=null
             if [[ $coverage_json != null ]]; then
                 coverage_planned=$(jq -r '.planned_test_nodes // 0' <<<"$coverage_json" 2>/dev/null)
                 [[ $coverage_planned =~ ^[0-9]+$ ]] || coverage_planned=0
-                if ((coverage_planned > 0)); then
-                    # A real per-node judgement -> activate the schema-5 contract.
-                    ledger_schema=5
-                else
-                    # planned==0: manifests not derivable at this commit -> the
-                    # judgement is UNRESOLVABLE, not "complete". Emit null (as the
-                    # --scan minter reports no-manifest and skips) and stay schema 4
-                    # so the grandfather/named-gate path decides, never a false red.
+                if ((coverage_planned == 0)); then
+                    # No manifest-derived judgement: explicit unknown, never an
+                    # empty-coverage success and never a schema-4 downgrade.
                     coverage_json=null
                 fi
             fi
@@ -1725,7 +1728,9 @@ function append_validation_ledger {
     # the parent ledger aggregator reads via .get() and is
     # unaffected until it is taught to surface them. (warm-vs-cold is already
     # recorded as cache_state, so this does not duplicate it.)
-    line="{\"schema_version\":$ledger_schema,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
+    line="{\"schema_version\":$ledger_schema,\"repo\":\"hermit\","
+    line+="\"producer\":\"hermit-validate-sh\",\"admission\":$admission_json,"
+    line+="\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
     line+="\"finished_at\":$(json_quote "$finished_at"),\"host\":$(json_quote "$VALIDATION_HOST"),"
     line+="\"toolchain\":$(json_quote "$VALIDATION_TOOLCHAIN"),"
     line+="\"slot\":$(json_quote "$VALIDATION_SLOT"),\"cwd\":$(json_quote "$ROOT_DIR"),"
@@ -1737,6 +1742,9 @@ function append_validation_ledger {
     line+="\"git_depth\":$VALIDATION_GIT_DEPTH,"
     line+="\"git_ahead\":$VALIDATION_GIT_AHEAD,\"git_behind\":$VALIDATION_GIT_BEHIND,"
     line+="\"commit_anchored\":$commit_anchored_json,\"tree_dirty\":$tree_dirty_json,"
+    line+="\"base_sha\":$base_sha_json,\"base_tree\":$base_tree_json,"
+    line+="\"reverie_base_sha\":$reverie_base_sha_json,"
+    line+="\"reverie_base_tree\":$reverie_base_tree_json,"
     line+="\"reverie_pin_current\":$reverie_pin_current_json,"
     line+="\"result\":\"$result\",\"raw_result\":\"$raw_result\",\"exit_code\":$exit_status,"
     line+="\"checks\":$checks,\"failures\":$failures,"
@@ -1938,7 +1946,9 @@ trap cleanup EXIT
 trap 'interrupted INT' INT
 trap 'interrupted TERM' TERM
 trap 'interrupted HUP' HUP
-if ((VALIDATION_NESTED == 0)); then
+if ((VALIDATION_NESTED == 0)) && ! \
+   [[ ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} == 1 && \
+      ${VALIDATE_STOP_TEST_SKIP_CONCURRENCY_MONITOR:-0} == 1 ]]; then
     start_validation_concurrency_monitor
 fi
 
