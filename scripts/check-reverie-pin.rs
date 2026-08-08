@@ -361,14 +361,158 @@ fn rewrite_manifest_pins(scan: &PinScan, main: &str) -> Result<(usize, usize), S
     Ok((changed_files, changed_entries))
 }
 
+/// The one site that records a JUDGEMENT rather than a reference.
+///
+/// This wrapper binds a *measured* build clamp and threshold to one exact
+/// Reverie revision on purpose -- its own comment says the check "prevents a pin
+/// bump from silently reusing an earlier revision's clamp and measured
+/// threshold". Rewriting it asserts that the measurement still applies, which is
+/// not something this tool can establish. Everything else that names the pin
+/// outside Cargo metadata merely RESTATES this value and is carried mechanically.
+const BUDGET_CALIBRATION_SITE: &str = "ci/run-with-reverie-dbt-budget.sh";
+
+/// The revision the DBT build budget is currently calibrated for.
+fn calibrated_pin(root: &Path) -> Result<Option<String>, String> {
+    let path = root.join(BUDGET_CALIBRATION_SITE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    for line in text.lines() {
+        if let Some(value) = line.trim().strip_prefix("expected_pin=") {
+            let value = value.trim().trim_matches(['"', '\''].as_slice());
+            if is_full_sha(value) {
+                return Ok(Some(value.to_string()));
+            }
+            return Err(format!(
+                "{}: expected_pin= is not an exact 40-hex revision: {value:?}",
+                path.display()
+            ));
+        }
+    }
+    Err(format!(
+        "{}: no expected_pin= line found; the calibration site moved and this \
+         tool can no longer find the decision it must not skip",
+        path.display()
+    ))
+}
+
+/// Carry `old` -> `main` across every tracked non-Cargo site that merely
+/// RESTATES the pin, leaving [`BUDGET_CALIBRATION_SITE`] untouched.
+///
+/// Derived by search rather than from a hard-coded list, so a site added or
+/// removed later is picked up without editing this function. Returns the files
+/// touched and the number of occurrences rewritten.
+fn carry_derived_pin_sites(
+    root: &Path,
+    old: &str,
+    main: &str,
+) -> Result<(Vec<PathBuf>, usize), String> {
+    let output = git_in(
+        root,
+        &[
+            "grep",
+            "-l",
+            "--fixed-strings",
+            old,
+            "--",
+            ":!*Cargo.toml",
+            ":!*Cargo.lock",
+            &format!(":!{BUDGET_CALIBRATION_SITE}"),
+        ],
+    )?;
+    // `git grep -l` exits 1 with no output when nothing matches; that is "no
+    // derived sites", not a failure.
+    if !output.status.success() && !output.stdout.is_empty() {
+        return Err(format!(
+            "git grep for derived pin sites failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut touched = Vec::new();
+    let mut rewritten = 0;
+    for relative in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+    {
+        let path = root.join(relative);
+        let original = fs::read_to_string(&path)
+            .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+        let occurrences = original.matches(old).count();
+        if occurrences == 0 {
+            continue;
+        }
+        let updated = original.replace(old, main);
+        // Report only work that actually happened: a no-op substitution must not
+        // be counted as a carry, and must not rewrite the file's mtime either.
+        if updated == original {
+            continue;
+        }
+        fs::write(&path, updated)
+            .map_err(|error| format!("could not update {}: {error}", path.display()))?;
+        rewritten += occurrences;
+        touched.push(path);
+    }
+    touched.sort();
+    Ok((touched, rewritten))
+}
+
+/// Refuse to report success while the calibration decision is unmade.
+///
+/// Deliberately NOT a value this tool guesses. A bump that silently rewrote the
+/// wrapper would assert a measured budget still applies, report success, and
+/// look exactly like a fix -- which is worse than the hand-carry it replaced.
+fn calibration_decision_required(old: &str, main: &str) -> String {
+    format!(
+        "\n\
+         ======================================================================\n\
+         REVERIE PIN: DBT BUILD-BUDGET CALIBRATION DECISION REQUIRED\n\
+         ======================================================================\n\
+         Cargo metadata and every derived CI site now name {main}.\n\
+         {BUDGET_CALIBRATION_SITE} still names {old}, and this tool will not\n\
+         change it for you: that line asserts a MEASURED build clamp and\n\
+         threshold still apply, which is a judgement, not a lookup.\n\
+         \n\
+         Decide whether the budget carries. It governs one quantity: the elapsed\n\
+         time reverie-dbt/build.rs reports for a DynamoRIO content-key miss,\n\
+         hashed over {{reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs,\n\
+         $CMAKE, $CMAKE_GENERATOR}}. In a Reverie checkout:\n\
+         \n\
+         \x20 git -C <reverie> diff {old}:reverie-dbt/build.rs \\\n\
+         \x20     {main}:reverie-dbt/build.rs\n\
+         \x20 git -C <reverie> rev-parse {old}:reverie-dbt/vendor/dynamorio \\\n\
+         \x20     {main}:reverie-dbt/vendor/dynamorio\n\
+         \n\
+         Changed bytes do NOT by themselves mean recalibration: judge whether the\n\
+         diff can affect build TIME. A pure rename cannot. Note the DBI->DBT\n\
+         rename also MOVED these paths, so a query at an older revision can\n\
+         return nothing rather than a difference -- absent is not unchanged.\n\
+         \n\
+         If it carries: set expected_pin={main} in {BUDGET_CALIBRATION_SITE} and\n\
+         append a `CARRY TO` block to ci/configure-build-jobs.sh stating the\n\
+         evidence. If it does not: recalibrate and record the measurement.\n\
+         Then re-run this checker; it will report the tree current.\n\
+         \n\
+         Nothing above needs redoing -- the Cargo sites and the derived CI sites\n\
+         are already written.\n"
+    )
+}
+
 fn update_to_latest(root: &Path, scan: &PinScan, main: &str) -> Result<(), String> {
+    // Read the calibration BEFORE any rewrite: once the derived sites move, the
+    // wrapper is the only remaining record of the revision we are carrying from.
+    let calibrated = calibrated_pin(root)?;
+
     if scan
         .occurrences
         .iter()
         .all(|occurrence| occurrence.rev == main)
     {
-        println!("Reverie pin is already current: {main}");
-        return Ok(());
+        // Cargo metadata is current, but the CI sites are a separate scope and
+        // may still be mid-carry -- finish them rather than reporting success
+        // over a narrower scope than the caller means by "the pin".
+        return finish_ci_pin_sites(root, calibrated.as_deref(), main, true);
     }
 
     let (changed_files, changed_entries) = rewrite_manifest_pins(scan, main)?;
@@ -402,10 +546,50 @@ fn update_to_latest(root: &Path, scan: &PinScan, main: &str) -> Result<(), Strin
         ));
     }
     println!(
-        "Reverie pin updated to latest main {main} across {} derived revision entries.",
+        "Reverie pin updated to latest main {main} across {} derived Cargo revision entries.",
         updated.occurrences.len()
     );
-    Ok(())
+    finish_ci_pin_sites(root, calibrated.as_deref(), main, false)
+}
+
+/// Carry the derived CI sites, then refuse to claim success if the one
+/// calibration decision is still open.
+///
+/// Split out so the already-current path takes it too: "Cargo metadata is
+/// current" is a narrower fact than "the pin is carried", and reporting the
+/// former as the latter is what let 16 CI sites go stale behind a success
+/// message three times in one day.
+fn finish_ci_pin_sites(
+    root: &Path,
+    calibrated: Option<&str>,
+    main: &str,
+    cargo_already_current: bool,
+) -> Result<(), String> {
+    let Some(old) = calibrated else {
+        if cargo_already_current {
+            println!("Reverie pin is already current: {main}");
+        }
+        return Ok(());
+    };
+    if old == main {
+        // The decision is settled and the derived sites restate this same value,
+        // so there is nothing left to carry. Counting the already-correct sites
+        // here would report work that did not happen.
+        if cargo_already_current {
+            println!("Reverie pin is already current: {main}");
+        }
+        return Ok(());
+    }
+
+    let (touched, rewritten) = carry_derived_pin_sites(root, old, main)?;
+    println!(
+        "Carried {rewritten} derived CI pin occurrence(s) from {old} in {} file(s):",
+        touched.len()
+    );
+    for path in &touched {
+        println!("  {}", path.display());
+    }
+    Err(calibration_decision_required(old, main))
 }
 
 fn loud_header(title: &str) {
@@ -679,6 +863,94 @@ mod tests {
         assert!(is_full_sha("0123456789abcdef0123456789abcdef01234567"));
         assert!(!is_full_sha("01234567"));
         assert!(!is_full_sha("z123456789abcdef0123456789abcdef01234567"));
+    }
+
+    /// A tree where the calibration site names `old` and one derived site does
+    /// too, so a carry has something real to move and something real to refuse.
+    fn calibration_fixture(label: &str, old: &str) -> PathBuf {
+        let root = temp_path(label);
+        fs::create_dir_all(root.join("ci")).expect("mkdir ci");
+        fs::write(
+            root.join(BUDGET_CALIBRATION_SITE),
+            format!("#!/bin/bash\nexpected_pin={old}\n"),
+        )
+        .expect("write wrapper");
+        fs::write(
+            root.join("ci/configure-build-jobs.sh"),
+            format!("# bound to {old}\ncheck {old}\n"),
+        )
+        .expect("write derived");
+        init_fixture_repo(&root);
+        git_in(&root, &["add", "-A"]).expect("stage fixture");
+        git_in(&root, &["commit", "-q", "-m", "fixture"]).expect("commit fixture");
+        root
+    }
+
+    /// NEGATIVE. The one judgement must never be defaulted.
+    ///
+    /// Automating the 15 derived sites while silently guessing the 16th would be
+    /// worse than the hand-carry it replaces, because the tool's own success
+    /// would be what hides it. So: carry the derived sites, leave the
+    /// calibration exactly as found, and refuse.
+    #[test]
+    fn refuses_to_guess_the_budget_calibration_and_leaves_it_untouched() {
+        let old = "1".repeat(40);
+        let main = "2".repeat(40);
+        let root = calibration_fixture("carry-refuse", &old);
+
+        let refusal = finish_ci_pin_sites(&root, Some(&old), &main, false)
+            .expect_err("an unsettled calibration must refuse, not succeed");
+        assert!(refusal.contains("CALIBRATION DECISION REQUIRED"), "{refusal}");
+        // Actionable, not merely negative: it must name the file to edit and the
+        // value to write, or the operator is back to rediscovering the step.
+        assert!(refusal.contains(BUDGET_CALIBRATION_SITE), "{refusal}");
+        assert!(refusal.contains(&format!("expected_pin={main}")), "{refusal}");
+
+        let wrapper = fs::read_to_string(root.join(BUDGET_CALIBRATION_SITE)).expect("read wrapper");
+        assert!(
+            wrapper.contains(&old) && !wrapper.contains(&main),
+            "the calibration was rewritten instead of being left as the decision: {wrapper}"
+        );
+        let derived = fs::read_to_string(root.join("ci/configure-build-jobs.sh")).expect("derived");
+        assert!(
+            derived.contains(&main) && !derived.contains(&old),
+            "the derived site should have been carried: {derived}"
+        );
+    }
+
+    /// POSITIVE. Once the decision is settled the tool completes, and reports no
+    /// work it did not do -- an earlier draft counted already-correct sites and
+    /// claimed to have carried them.
+    #[test]
+    fn settled_calibration_completes_without_reporting_phantom_carries() {
+        let main = "2".repeat(40);
+        let root = calibration_fixture("carry-settled", &main);
+
+        finish_ci_pin_sites(&root, Some(&main), &main, true)
+            .expect("a settled calibration must complete");
+
+        let (touched, rewritten) =
+            carry_derived_pin_sites(&root, &main, &main).expect("no-op carry");
+        assert_eq!(rewritten, 0, "a no-op substitution must not count as a carry");
+        assert!(touched.is_empty(), "no file should be rewritten: {touched:?}");
+    }
+
+    /// The calibration site is the tool's anchor for what it must not decide.
+    /// If it moves and we silently read "no pin" as "nothing to settle", the
+    /// refusal disappears and the tool starts succeeding over a missing check --
+    /// absence reading as agreement, which is the defect this tool exists to fix.
+    #[test]
+    fn a_calibration_site_without_the_marker_is_an_error_not_an_absence() {
+        let root = temp_path("carry-marker");
+        fs::create_dir_all(root.join("ci")).expect("mkdir ci");
+        fs::write(
+            root.join(BUDGET_CALIBRATION_SITE),
+            "#!/bin/bash\n# the expected_pin line was moved or renamed\n",
+        )
+        .expect("write wrapper");
+
+        let error = calibrated_pin(&root).expect_err("a marker-less calibration site must error");
+        assert!(error.contains("no expected_pin="), "{error}");
     }
 
     #[test]
