@@ -66,11 +66,11 @@ if [[ -v CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS ]]; then
     return 2
 fi
 
-# The calibration below is valid only for Reverie 108f9ab. The portable wrapper
+# The calibration below is valid only for Reverie 5bf9e0b. The portable wrapper
 # obtains the repository's recorded pin through the canonical checker and
 # carries it here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 108f9ab47605a7a2e8ae40353fde21f8a8b2310c ]]; then
-    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 108f9ab47605a7a2e8ae40353fde21f8a8b2310c" >&2
+if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf ]]; then
+    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf" >&2
     return 2
 fi
 
@@ -247,6 +247,31 @@ fi
 # effective-job-seconds and would fail the portable lane on its first genuine
 # cold miss. The replacement bar stated above -- >=5 clean Hermit-lane samples
 # -- is unchanged and still unmet.
+#
+# CARRY TO 5bf9e0b (2026-08-08, second bump of the day). Narrower than the
+# 108f9ab carry and evidenced the same way -- tree identity, not a timing run.
+# 108f9ab..5bf9e0b is a SINGLE commit touching exactly two files, both in
+# reverie-ptrace (timer.rs, vdso.rs: making two DEBUG log sites reproducible
+# across identical runs). No C, no build script, no vendored source, and
+# nothing under reverie-dbi at all:
+#
+#   git log --oneline 108f9ab..5bf9e0b   -> 5bf9e0b reverie-ptrace: make two
+#                                           DEBUG log sites reproducible
+#   git diff --name-only 108f9ab..5bf9e0b -> reverie-ptrace/src/timer.rs
+#                                            reverie-ptrace/src/vdso.rs
+#   git rev-parse 108f9ab:reverie-dbi                  -> 5c15596f739710b48aaafe6f90b9dc6f5f1a4b8a
+#   git rev-parse 5bf9e0b:reverie-dbi                  -> 5c15596f739710b48aaafe6f90b9dc6f5f1a4b8a
+#   git rev-parse 108f9ab:reverie-dbi/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse 5bf9e0b:reverie-dbi/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse 108f9ab:reverie-dbi/build.rs         -> 9e35e1b699b76d8b9f8a6adacc21c7a095f4f8f7
+#   git rev-parse 5bf9e0b:reverie-dbi/build.rs         -> 9e35e1b699b76d8b9f8a6adacc21c7a095f4f8f7
+#
+# All four source_recipe_key() inputs are unchanged, so the recipe identity
+# remains sha256:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d,
+# the MAX_PARALLEL_JOBS=16 clamp still applies, and the measured MISS cost
+# cannot have moved because no DBI build input differs between the pins.
+# Budget values (1050 effective-job-seconds, 263/66 max-elapsed-seconds) carry
+# unchanged. The >=5-clean-Hermit-lane-samples replacement bar is still unmet.
 REVERIE_DBI_MAX_PARALLEL_JOBS=16
 REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS=1050
 REVERIE_DBI_EFFECTIVE_BUILD_JOBS=$REVERIE_DBI_RAW_BUILD_JOBS
