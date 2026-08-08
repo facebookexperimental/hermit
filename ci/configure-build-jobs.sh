@@ -69,8 +69,8 @@ fi
 # The calibration below is valid only for Reverie 5bf9e0b. The portable wrapper
 # obtains the repository's recorded pin through the canonical checker and
 # carries it here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie 5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != fb963d90dc6c5a136cfff23d3e898ab06f8cb265 ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie fb963d90dc6c5a136cfff23d3e898ab06f8cb265" >&2
     return 2
 fi
 
