@@ -87,9 +87,19 @@
                "hard_mem_max_bytes": 17179869184, "classification": "cpu-bound"}
     },
     {
+      "group": "setup", "job": "manifest_plan",
+      "desc": "Build the manifest-plan binaries the metadata validation runs",
+      "description": "MOVED OUT OF e2e.metadata 2026-08-08. e2e.metadata is a DAG ROOT whose first action is `cargo run -p hermit-manifest-plan` -- twice: load_tests uses the default bin, audit_test_footprints uses generate-test-footprints. It therefore COMPILES, upstream of every build node, inside a node declared `light` with a 60s budget. That made it BIMODAL: 16.5s warm, 57s cold, 2 slow in 9 sampled CI runs, and it timed out on main at >60s. Cache state alone is the whole factor -- measured on the identical command, cold target dir 5.9s vs warm 0.15s (39x); on CI the cold phase measured 49.4-52.1s while every step after it matched to a tenth of a second. The compile now happens HERE under a build-shaped budget and e2e.metadata inherits a warm artifact. Raising e2e.metadata's timeout was deliberately REJECTED: it would have kept a build inside a test node and merely moved the intermittent failure to a higher threshold. 180s is ~3.6x the worst measured CI cold compile.",
+      "cmd": "cargo build -p hermit-manifest-plan --bins",
+      "timeout": 180,
+      "hint": {"est_duration_s": 60, "rss_baseline_bytes": 536870912,
+               "hard_mem_max_bytes": 2147483648, "classification": "cpu-bound"}
+    },
+    {
       "group": "e2e", "job": "metadata",
       "desc": "Validate E2E metadata, generated test footprints, and required-cell plan",
       "cmd": "./ci/test_harness.sh validate",
+      "deps": ["setup.manifest_plan"],
       "timeout": 60,
       "hint": {"est_duration_s": 30, "rss_baseline_bytes": 268435456,
                "hard_mem_max_bytes": 1073741824, "classification": "light"}

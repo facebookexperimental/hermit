@@ -36,6 +36,7 @@
         "doc.rustdoc",
         "lint.clippy",
         "lint.rustfmt",
+        "setup.manifest_plan",
         "test.regular_crates"
       ],
       "paths": [
