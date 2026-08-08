@@ -342,25 +342,23 @@ fn reverie_graph(root: &Path, remote: &str) -> Result<PathBuf, String> {
     // fatal), which is exactly how the fixture suite exercises this code. So
     // try filtered first for the real remote, and fall back to a plain fetch
     // rather than letting a transport limitation read as a pin violation.
-    // DECIDE UP FRONT, DO NOT TRY-THEN-FALL-BACK. A failed `--filter` attempt
-    // still writes promisor configuration into the cache, which then poisons
-    // the retry -- observed as an INTERMITTENT failure of the lagging-pin
-    // bracket under the harness's 4-way concurrent self-test (1 of 4), passing
-    // standalone every time. A partial filter is only meaningful over a real
-    // transport anyway: a local-path remote rejects it outright.
-    let filtered = remote.contains("://");
-    let mut args = vec!["fetch"];
-    if filtered {
-        args.push("--filter=blob:none");
-    }
-    args.extend([
-        "--no-tags",
-        "--quiet",
-        "--force",
-        remote,
-        "+refs/heads/main:refs/heads/main",
-    ]);
-    let fetch = git_in(&cache, &args)?;
+    // NO `--filter`. A blob-filtered fetch is smaller (1.3 MB vs 12 MB) but it
+    // is a SECOND FAILURE MODE for 0.4s of saving: a local-path remote rejects
+    // it outright, and a failed attempt writes promisor configuration that then
+    // poisons any retry. Both were observed -- the promisor poisoning as an
+    // intermittent bracket failure. Measured unfiltered: 1.4s / 12 MB, far
+    // inside this node's 120s timeout. A gate should buy robustness with that.
+    let fetch = git_in(
+        &cache,
+        &[
+            "fetch",
+            "--no-tags",
+            "--quiet",
+            "--force",
+            remote,
+            "+refs/heads/main:refs/heads/main",
+        ],
+    )?;
     if !fetch.status.success() {
         return Err(format!(
             "could not fetch the Reverie commit graph from {remote}: {}",
@@ -388,11 +386,22 @@ fn reverie_graph(root: &Path, remote: &str) -> Result<PathBuf, String> {
 /// checker crash; treating it as "not reachable" is both true and fail-closed.
 /// Anything else is still a real error and is still raised.
 fn is_ancestor(graph: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
-    for rev in [ancestor, descendant] {
-        let present = git_in(graph, &["cat-file", "-e", &format!("{rev}^{{commit}}")])?;
-        if !present.status.success() {
-            return Ok(false);
-        }
+    // ABSENT ANCESTOR is a genuine verdict: the graph has main, and the pin is
+    // not in it, so the pin is not reachable. ABSENT DESCENDANT is NOT a
+    // verdict -- it means the graph we fetched does not even contain main, so
+    // we cannot tell, and answering "false" there produces a FALSE REFUSAL.
+    // That bug was live: the harness reported "Hermit pin: X / Latest main: X"
+    // -- identical -- while claiming X was not reachable from main.
+    let main_present = git_in(graph, &["cat-file", "-e", &format!("{descendant}^{{commit}}")])?;
+    if !main_present.status.success() {
+        return Err(format!(
+            "the fetched Reverie graph does not contain {descendant}; cannot judge \
+             reachability (incomplete fetch, not a pin violation)"
+        ));
+    }
+    let pin_present = git_in(graph, &["cat-file", "-e", &format!("{ancestor}^{{commit}}")])?;
+    if !pin_present.status.success() {
+        return Ok(false);
     }
     let output = git_in(graph, &["merge-base", "--is-ancestor", ancestor, descendant])?;
     match output.status.code() {
@@ -1471,6 +1480,23 @@ mod tests {
         fs::remove_dir_all(remote).expect("remove Reverie fixture repository");
     }
 
+    /// ONE shared Reverie fixture per test process, built once.
+    ///
+    /// It is READ-ONLY after construction, so every test that needs a Reverie
+    /// history can share it. Building a fresh 3-commit repo per test cost ~15
+    /// git subprocesses each; with 4 test binaries pinned to ONE CPU in the
+    /// harness's concurrency bracket that fork pressure made the suite
+    /// intermittently flaky. Measured: it is the TEST work, not compilation --
+    /// rustc peak RSS only moved 170.7 MB -> 178.2 MB (+4.4%) and 0.29s ->
+    /// 0.35s, so 4 concurrent compiles stay far under the node's 1 GiB cap.
+    /// Deliberately not removed: a shared fixture that one test deletes while
+    /// another reads it is exactly the race this replaces.
+    fn shared_reverie() -> &'static (PathBuf, String, String, String) {
+        static SHARED: std::sync::OnceLock<(PathBuf, String, String, String)> =
+            std::sync::OnceLock::new();
+        SHARED.get_or_init(|| reverie_history_fixture("shared"))
+    }
+
     /// Build a Reverie fixture with `main` = old -> latest, plus a commit on an
     /// abandoned side branch that `main` never contains. Returns
     /// (remote, old, latest, offhistory).
@@ -1526,7 +1552,7 @@ mod tests {
         // ACCEPT this: `old` is a perfectly good ancestor of main. Only
         // monotonicity catches a pin walked BACKWARDS -- which is exactly what a
         // Cargo.lock conflict resolved to the older side produces.
-        let (remote, old, latest, _off) = reverie_history_fixture("regress-reverie");
+        let (remote, old, latest, _off) = shared_reverie();
         let root = hermit_fixture("regress-hermit", &latest, &old);
         let code = run_with_config(Config {
             repo: Some(root.clone()),
@@ -1537,7 +1563,6 @@ mod tests {
         .expect("regressed pin should be classified");
         assert_eq!(code, 1, "a pin that REGRESSES below its base must be REFUSED");
         fs::remove_dir_all(root).expect("remove Hermit fixture repository");
-        fs::remove_dir_all(remote).expect("remove Reverie fixture repository");
     }
 
     #[test]
@@ -1546,7 +1571,7 @@ mod tests {
         // NOT contain. Note this cannot be checked by object PRESENCE: a fetch
         // of main alone still lands such objects, so presence would wrongly
         // accept. Only reachability refuses it.
-        let (remote, old, _latest, offhistory) = reverie_history_fixture("offhist-reverie");
+        let (remote, old, _latest, offhistory) = shared_reverie();
         let root = hermit_fixture("offhist-hermit", &old, &offhistory);
         let code = run_with_config(Config {
             repo: Some(root.clone()),
@@ -1560,7 +1585,6 @@ mod tests {
             "a pin not reachable from reverie/main must be REFUSED even though it is a real commit"
         );
         fs::remove_dir_all(root).expect("remove Hermit fixture repository");
-        fs::remove_dir_all(remote).expect("remove Reverie fixture repository");
     }
 
     /// Drive the pre-commit advisory: HEAD pins `head_pin`, the worktree stages
@@ -1598,14 +1622,12 @@ mod tests {
         // CI-config change touching zero Cargo files.
         let (remote, old, _latest, _off) = reverie_history_fixture("adv1-reverie");
         assert_eq!(advisory("adv1-hermit", &remote, &old, &old), 0);
-        fs::remove_dir_all(remote).expect("remove Reverie fixture");
     }
 
     #[test]
     fn advisory_case2_bump_all_the_way_is_silent() {
-        let (remote, old, latest, _off) = reverie_history_fixture("adv2-reverie");
+        let (remote, old, latest, _off) = shared_reverie();
         assert_eq!(advisory("adv2-hermit", &remote, &old, &latest), 0);
-        fs::remove_dir_all(remote).expect("remove Reverie fixture");
     }
 
     #[test]
@@ -1641,7 +1663,6 @@ mod tests {
             1,
             "a forward bump that stops short of master must ASK for acknowledgement"
         );
-        fs::remove_dir_all(remote).expect("remove Reverie fixture");
     }
 
     #[test]
@@ -1649,20 +1670,19 @@ mod tests {
         // Case 4 belongs to CI's monotonicity refusal. Prompting for a soft
         // acknowledgement here would train people to acknowledge past a hard
         // refusal, so this surface stays quiet.
-        let (remote, old, latest, _off) = reverie_history_fixture("adv4-reverie");
+        let (remote, old, latest, _off) = shared_reverie();
         assert_eq!(
             advisory("adv4-hermit", &remote, &latest, &old),
             0,
             "a regression must be SILENT on the advisory surface -- CI refuses it"
         );
-        fs::remove_dir_all(remote).expect("remove Reverie fixture");
     }
 
     #[test]
     fn forward_advance_from_a_base_passes() {
         // The monotonic-forward case, so bracket 3 cannot pass vacuously by
         // refusing every base comparison.
-        let (remote, old, latest, _off) = reverie_history_fixture("advance-reverie");
+        let (remote, old, latest, _off) = shared_reverie();
         let root = hermit_fixture("advance-hermit", &old, &latest);
         let code = run_with_config(Config {
             repo: Some(root.clone()),
@@ -1673,7 +1693,6 @@ mod tests {
         .expect("forward advance should be classified");
         assert_eq!(code, 0, "advancing the pin forward must PASS");
         fs::remove_dir_all(root).expect("remove Hermit fixture repository");
-        fs::remove_dir_all(remote).expect("remove Reverie fixture repository");
     }
 
     #[test]

@@ -609,7 +609,12 @@ if [[ \${1:-} == ls-remote ]]; then
     printf '%s\trefs/heads/main\n' '$current' 
     exit 0
 fi
-if [[ \${1:-} == fetch || \${2:-} == fetch ]]; then
+# `git -C <dir> fetch ...` puts the subcommand in \$3, not \$1 -- a positional
+# check silently passes the fetch through to the REAL remote, which both breaks
+# hermeticity and makes the graph disagree with the stubbed ls-remote tip.
+is_fetch=0
+for arg in "\$@"; do [[ \$arg == fetch ]] && { is_fetch=1; break; }; done
+if ((is_fetch)); then
     rewritten=()
     for arg in "\$@"; do
         if [[ \$arg == https://github.com/*/reverie.git ]]; then
