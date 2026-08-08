@@ -1172,6 +1172,28 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     // (2) MONOTONIC: the pin may not regress below the base this change lands
     // on. Equal is fine (the overwhelmingly common no-op case); forward is the
     // point; backward is refused.
+    // ENSURE THE BASE EXISTS BEFORE REFUSING FOR ITS ABSENCE.
+    //
+    // The refusal below is correct -- an unevaluated monotonicity check is
+    // indistinguishable from a passing one -- but a bare actions/checkout@v4 is
+    // depth 1 with no origin/main, so it fired in the `preflight` job and turned
+    // main RED. Fetching it here fixes every caller at once; patching each
+    // workflow job that happens to run this node is whack-a-mole.
+    //
+    // ONLY WHEN ABSENT, and this scoping is the point: a shared checkout is used
+    // concurrently by many agents, and ADVANCING an existing origin/main under
+    // them is exactly the moving-reference hazard removed elsewhere today. If
+    // the ref resolves we do not touch it.
+    if base_ref == DEFAULT_BASE_REF
+        && !git_in(&root, &["rev-parse", "--verify", "--quiet", base_ref])
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    {
+        let _ = git_in(
+            &root,
+            &["fetch", "--no-tags", "--quiet", "origin", "main:refs/remotes/origin/main"],
+        );
+    }
     let resolved_base = base_pin(&root, base_ref);
     if resolved_base.is_none() && !config.no_base {
         return Err(format!(
