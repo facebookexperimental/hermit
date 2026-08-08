@@ -66,11 +66,11 @@ if [[ -v CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS ]]; then
     return 2
 fi
 
-# The calibration below is valid only for Reverie 038e993. The portable wrapper
+# The calibration below is valid only for Reverie 108f9ab. The portable wrapper
 # obtains the repository's recorded pin through the canonical checker and
 # carries it here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 038e993926e45514264d30367b70df9b6ac3b9b8 ]]; then
-    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 038e993926e45514264d30367b70df9b6ac3b9b8" >&2
+if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 108f9ab47605a7a2e8ae40353fde21f8a8b2310c ]]; then
+    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 108f9ab47605a7a2e8ae40353fde21f8a8b2310c" >&2
     return 2
 fi
 
@@ -220,6 +220,26 @@ fi
 # sha256:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d, the
 # MAX_PARALLEL_JOBS=16 clamp still applies, and the measured MISS cost is
 # unaffected by a client.c edit.
+#
+# CARRY TO 108f9ab (2026-08-08). This is the WIDEST carry argument of the set,
+# not the narrowest: 038e993..108f9ab is a SINGLE commit that touches exactly
+# one file, AGENTS.md (+22/-0, documentation only). No Rust, no C, no build
+# script, no vendored source. Evidenced by tree identity, not a timing run:
+#
+#   git diff --name-only 038e993..108f9ab            -> AGENTS.md
+#   git rev-parse 038e993:reverie-dbi                -> 5c15596f739710b48aaafe6f90b9dc6f5f1a4b8a
+#   git rev-parse 108f9ab:reverie-dbi                -> 5c15596f739710b48aaafe6f90b9dc6f5f1a4b8a
+#   git rev-parse 038e993:reverie-dbi/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse 108f9ab:reverie-dbi/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse 038e993:reverie-dbi/build.rs       -> 9e35e1b699b76d8b9f8a6adacc21c7a095f4f8f7
+#   git rev-parse 108f9ab:reverie-dbi/build.rs       -> 9e35e1b699b76d8b9f8a6adacc21c7a095f4f8f7
+#
+# The whole reverie-dbi subtree is byte-identical (same tree object), so unlike
+# the 038e993 carry there is no client.c caveat to reason around. All four
+# source_recipe_key() inputs are unchanged, the recipe identity remains
+# sha256:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d, the
+# MAX_PARALLEL_JOBS=16 clamp still applies, and the measured MISS cost cannot
+# have moved because no DBI build input exists that differs between the pins.
 #
 # Those 2026-08-05 samples deliberately do NOT replace 1050. They come from a
 # development host whose cores finish the identical work ~3.3x faster than the

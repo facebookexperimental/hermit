@@ -698,9 +698,9 @@ function audit_ci_correspondence {
         die "DBI wrapper must select the explicit portable child-budget mode"
     [[ $(grep -Fxc '    "$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR" --print-pin' "$budget_wrapper") == 1 ]] ||
         die "DBI wrapper must bind its calibration through the canonical local-pin verifier"
-    [[ $(grep -Fc '038e993926e45514264d30367b70df9b6ac3b9b8' "$budget_wrapper") == 1 ]] ||
+    [[ $(grep -Fc '108f9ab47605a7a2e8ae40353fde21f8a8b2310c' "$budget_wrapper") == 1 ]] ||
         die "DBI wrapper must name exactly one calibrated Reverie pin"
-    [[ $(grep -Fc '038e993926e45514264d30367b70df9b6ac3b9b8' "$budget_config") == 2 ]] ||
+    [[ $(grep -Fc '108f9ab47605a7a2e8ae40353fde21f8a8b2310c' "$budget_config") == 2 ]] ||
         die "DBI derivation must independently require and diagnose the calibrated Reverie pin"
     # shellcheck disable=SC2016
     local budget_record='reverie-dbi-budget={pin:$REVERIE_DBI_BUDGET_BOUND_PIN,source:$REVERIE_DBI_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBI_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBI_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBI_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBI_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBI_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBI_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d}'
@@ -817,14 +817,14 @@ function audit_ci_correspondence {
         budget_probe='source "$1" reverie-dbi-budget-child; printf "%s %s %s %s %s %s %s %s %s %s\n" "$REVERIE_DBI_BUILD_JOBS_SOURCE" "$REVERIE_DBI_RAW_BUILD_JOBS" "$CARGO_BUILD_JOBS" "$THIRD_PARTY_BUILD_JOBS" "$REVERIE_DBI_EFFECTIVE_CPUS_SOURCE" "$REVERIE_DBI_EFFECTIVE_CPUS" "$REVERIE_DBI_MAX_PARALLEL_JOBS" "$REVERIE_DBI_EFFECTIVE_BUILD_JOBS" "$REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS" "$REVERIE_DBI_MAX_BUILD_SECONDS"'
         budget_tuple=$(
             PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
-                REVERIE_DBI_BUDGET_BOUND_PIN=038e993926e45514264d30367b70df9b6ac3b9b8 \
+                REVERIE_DBI_BUDGET_BOUND_PIN=108f9ab47605a7a2e8ae40353fde21f8a8b2310c \
                 CARGO_BUILD_JOBS=8 bash -c "$budget_probe" _ "$budget_config"
         )
         [[ $budget_tuple == 'inherited-launch-cargo-build-jobs 8 8 8 child-nproc 4 16 4 1050 263' ]] ||
             die "hosted j8/child-CPU4 budget tuple drifted: $budget_tuple"
         budget_tuple=$(
             PATH="$scratch/nproc-64:$PATH" "${clean_budget_env[@]}" \
-                REVERIE_DBI_BUDGET_BOUND_PIN=038e993926e45514264d30367b70df9b6ac3b9b8 \
+                REVERIE_DBI_BUDGET_BOUND_PIN=108f9ab47605a7a2e8ae40353fde21f8a8b2310c \
                 SAFE_CI_IN_SCOPE=1 CARGO_BUILD_JOBS=32 \
                 bash -c "$budget_probe" _ "$budget_config"
         )
@@ -835,19 +835,19 @@ function audit_ci_correspondence {
             PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
                 CARGO_BUILD_JOBS=8 "$budget_wrapper" true 2>&1
         )
-        [[ $hosted_wrapper_log == *'pin:038e993926e45514264d30367b70df9b6ac3b9b8,source:inherited-launch-cargo-build-jobs,raw-build-jobs:8,effective-cpus-source:child-nproc,effective-cpus:4,reverie-max-jobs:16,effective-native-jobs:4,effective-job-seconds:1050,max-elapsed-seconds:263'* ]] ||
+        [[ $hosted_wrapper_log == *'pin:108f9ab47605a7a2e8ae40353fde21f8a8b2310c,source:inherited-launch-cargo-build-jobs,raw-build-jobs:8,effective-cpus-source:child-nproc,effective-cpus:4,reverie-max-jobs:16,effective-native-jobs:4,effective-job-seconds:1050,max-elapsed-seconds:263'* ]] ||
             die "production wrapper did not log the bound hosted tuple: $hosted_wrapper_log"
         boxed_wrapper_log=$(
             PATH="$scratch/nproc-64:$PATH" "${clean_budget_env[@]}" \
                 SAFE_CI_IN_SCOPE=1 CARGO_BUILD_JOBS=32 "$budget_wrapper" true 2>&1
         )
-        [[ $boxed_wrapper_log == *'pin:038e993926e45514264d30367b70df9b6ac3b9b8,source:runner-child-cargo-build-jobs,raw-build-jobs:32,effective-cpus-source:child-nproc,effective-cpus:64,reverie-max-jobs:16,effective-native-jobs:16,effective-job-seconds:1050,max-elapsed-seconds:66'* ]] ||
+        [[ $boxed_wrapper_log == *'pin:108f9ab47605a7a2e8ae40353fde21f8a8b2310c,source:runner-child-cargo-build-jobs,raw-build-jobs:32,effective-cpus-source:child-nproc,effective-cpus:64,reverie-max-jobs:16,effective-native-jobs:16,effective-job-seconds:1050,max-elapsed-seconds:66'* ]] ||
             die "production wrapper did not log the bound boxed tuple: $boxed_wrapper_log"
 
         clamp_boundaries=$(
             for requested in 15 16 17 64; do
                 PATH="$scratch/nproc-64:$PATH" "${clean_budget_env[@]}" \
-                    REVERIE_DBI_BUDGET_BOUND_PIN=038e993926e45514264d30367b70df9b6ac3b9b8 \
+                    REVERIE_DBI_BUDGET_BOUND_PIN=108f9ab47605a7a2e8ae40353fde21f8a8b2310c \
                     CARGO_BUILD_JOBS=$requested bash -c "$budget_probe" _ "$budget_config"
             done
         )
@@ -855,10 +855,10 @@ function audit_ci_correspondence {
             die "Reverie clamp boundary did not hold W at 16: $clamp_boundaries"
         cpu_boundaries=$(
             PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
-                REVERIE_DBI_BUDGET_BOUND_PIN=038e993926e45514264d30367b70df9b6ac3b9b8 \
+                REVERIE_DBI_BUDGET_BOUND_PIN=108f9ab47605a7a2e8ae40353fde21f8a8b2310c \
                 CARGO_BUILD_JOBS=17 bash -c "$budget_probe" _ "$budget_config"
             PATH="$scratch/nproc-2:$PATH" "${clean_budget_env[@]}" \
-                REVERIE_DBI_BUDGET_BOUND_PIN=038e993926e45514264d30367b70df9b6ac3b9b8 \
+                REVERIE_DBI_BUDGET_BOUND_PIN=108f9ab47605a7a2e8ae40353fde21f8a8b2310c \
                 CARGO_BUILD_JOBS=8 bash -c "$budget_probe" _ "$budget_config"
         )
         [[ $cpu_boundaries == $'inherited-launch-cargo-build-jobs 17 17 17 child-nproc 4 16 4 1050 263\ninherited-launch-cargo-build-jobs 8 8 8 child-nproc 2 16 2 1050 525' ]] ||
@@ -904,23 +904,23 @@ function audit_ci_correspondence {
             die "child derivation accepted an uncalibrated Reverie pin"
         fi
         if PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
-            REVERIE_DBI_BUDGET_BOUND_PIN=038e993926e45514264d30367b70df9b6ac3b9b8 \
+            REVERIE_DBI_BUDGET_BOUND_PIN=108f9ab47605a7a2e8ae40353fde21f8a8b2310c \
             CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS=1050 CARGO_BUILD_JOBS=8 \
             bash -c 'source "$1" reverie-dbi-budget-child' _ "$budget_config" 2>/dev/null; then
             die "child derivation accepted a retired unconditioned DBI threshold"
         fi
         if PATH="$scratch/nproc-zero:$PATH" "${clean_budget_env[@]}" \
-            REVERIE_DBI_BUDGET_BOUND_PIN=038e993926e45514264d30367b70df9b6ac3b9b8 CARGO_BUILD_JOBS=8 \
+            REVERIE_DBI_BUDGET_BOUND_PIN=108f9ab47605a7a2e8ae40353fde21f8a8b2310c CARGO_BUILD_JOBS=8 \
             bash -c 'source "$1" reverie-dbi-budget-child' _ "$budget_config" 2>/dev/null; then
             die "child derivation accepted nproc=0"
         fi
         if PATH="$scratch/nproc-invalid:$PATH" "${clean_budget_env[@]}" \
-            REVERIE_DBI_BUDGET_BOUND_PIN=038e993926e45514264d30367b70df9b6ac3b9b8 CARGO_BUILD_JOBS=8 \
+            REVERIE_DBI_BUDGET_BOUND_PIN=108f9ab47605a7a2e8ae40353fde21f8a8b2310c CARGO_BUILD_JOBS=8 \
             bash -c 'source "$1" reverie-dbi-budget-child' _ "$budget_config" 2>/dev/null; then
             die "child derivation accepted a noninteger nproc observation"
         fi
         if PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
-            REVERIE_DBI_BUDGET_BOUND_PIN=038e993926e45514264d30367b70df9b6ac3b9b8 CARGO_BUILD_JOBS=0 \
+            REVERIE_DBI_BUDGET_BOUND_PIN=108f9ab47605a7a2e8ae40353fde21f8a8b2310c CARGO_BUILD_JOBS=0 \
             bash -c 'source "$1" reverie-dbi-budget-child' _ "$budget_config" 2>/dev/null; then
             die "child derivation accepted a zero Cargo width"
         fi
