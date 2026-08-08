@@ -1592,7 +1592,10 @@ function execute_attempt {
                 --data-dir "$cell_dir/recording" --record-timeout "$timeout_seconds" -- "${guest_command[@]}")
             ;;
         chaos)
-            command=("$HERMIT_BIN" --log=off run --backend "$backend" --strict --chaos
+            # Chaos seeds are witnesses for a guest schedule, so the guest's initial
+            # stack must not inherit run-specific host variables such as RESULT_ROOT.
+            # Keep the witness independent of the harness run id and checkout path.
+            command=("$HERMIT_BIN" --log=off run --base-env=minimal --backend "$backend" --strict --chaos
                 --sched-heuristic=random "--seed=$seed" "${profile[@]}" -- "${guest_command[@]}")
             ;;
         custom)
@@ -1658,7 +1661,7 @@ function append_result {
             ;;
         chaos)
             effective_args=$(jq -cn --arg backend "$backend" \
-                '["--log=off","run",("--backend=" + $backend),"--strict","--chaos","--sched-heuristic=random"]')
+                '["--log=off","run","--base-env=minimal",("--backend=" + $backend),"--strict","--chaos","--sched-heuristic=random"]')
             log_level=off
             ;;
         custom)

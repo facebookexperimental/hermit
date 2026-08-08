@@ -1033,7 +1033,9 @@ dependencies = [
 name = "hermit-manifest-plan"
 version = "0.2.0"
 dependencies = [
+ "serde",
  "serde_json",
+ "sha2",
  "toml",
 ]
 

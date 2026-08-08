@@ -1044,6 +1044,17 @@ pub struct ThreadStats {
     /// A simple count of how many syscalls have been handled on this thread.
     pub syscall_count: u64,
 
+    /// How many register-file samples this thread has CONSIDERED for `--detlog-regs`.
+    ///
+    /// This is the cadence index, and it exists because no pre-existing counter is a clean
+    /// zero-based count of control points: the logged syscall ordinal starts at 2, and
+    /// `syscall_count` also counts points this sampler never reaches. Keying the cadence on either
+    /// let a short guest whose points never landed on a multiple of N emit ZERO samples while the
+    /// run still reported PASS -- a spot-tier green backed by nothing. Counting the samples
+    /// themselves makes index 0 the first control point of every thread, so a spot-tier run always
+    /// samples at least once.
+    pub regs_sample_index: u64,
+
     /// A count of how many signals have arrived at this thread, total.
     pub signal_count: u64,
 

@@ -132,6 +132,8 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     no_rcb_time: false,
     detlog_heap: false,
     detlog_stack: false,
+    detlog_regs: false,
+    detlog_regs_cadence: 1,
     sysinfo_uptime_offset: 60,
     memory: 1024 * 1024 * 1024, //1 GiB
     interrupt_at: vec![],
@@ -208,6 +210,8 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     no_rcb_time: false,
     detlog_heap: false,
     detlog_stack: false,
+    detlog_regs: false,
+    detlog_regs_cadence: 1,
     sysinfo_uptime_offset: 60,
     memory: 1024 * 1024 * 1024, //1 GiB
     interrupt_at: vec![],
@@ -284,6 +288,8 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     no_rcb_time: false,
     detlog_heap: false,
     detlog_stack: false,
+    detlog_regs: false,
+    detlog_regs_cadence: 1,
     sysinfo_uptime_offset: 60,
     memory: 1024 * 1024 * 1024, //1 GiB
     interrupt_at: vec![],

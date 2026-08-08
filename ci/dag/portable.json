@@ -449,7 +449,7 @@
     {
       "group": "test", "job": "dbi_parity",
       "desc": "DynamoRIO DBI strict backend parity matrix",
-      "cmd": "python3 tests/backend-parity/run_matrix.py --hermit target/release/hermit --backend dbi --strict --require-backend",
+      "cmd": "python3 tests/backend-parity/run_matrix.py --hermit target/release/hermit --backend dbi --strict --require-backend --no-parent-scorecard",
       "deps": ["build.runtime_release"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 180,

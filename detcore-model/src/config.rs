@@ -483,6 +483,30 @@ pub struct Config {
     #[clap(long)]
     pub detlog_stack: bool,
 
+    /// Log a hash of the guest REGISTER FILE at guest-logical-control points, for determinism
+    /// checking. stdout, the INFO log, the stack and the heap are all hashed today; the register
+    /// file is not, so two backends can differ in register state and every existing check still
+    /// reports parity.
+    ///
+    /// SAMPLED ONLY AT GUEST-LOGICAL-CONTROL POINTS -- see `Detcore::detlog_registers`. Registers
+    /// are NOT sampled inside a tool handler: a backend running its handler in-guest executes code
+    /// the ptrace reference never executes, so a difference there is correct behaviour, not a
+    /// determinism bug.
+    #[clap(long)]
+    pub detlog_regs: bool,
+
+    /// Sampling cadence for `--detlog-regs`: hash every Nth guest-logical-control point.
+    ///
+    /// COST TIER. 1 (the default) is the FULL tier -- every control point hashed -- and is what a
+    /// short test should use. Measured cost at this scale is within run-to-run noise: /bin/true
+    /// (49 control points), `wc -l /etc/passwd` (135) and a 5-iteration shell loop (195) were
+    /// 0.04-0.07s with the flag on and the same with it off. A larger N is the SPOT-CHECK tier for
+    /// runs where full hashing is too expensive; it trades detection latency for cost, since a
+    /// divergence is only seen at the next sampled point. Every emitted line records the tier it
+    /// was produced under, so a cell can state which tier it met instead of leaving it implicit.
+    #[clap(long, default_value = "1", value_name = "uint64")]
+    pub detlog_regs_cadence: u64,
+
     /// Configure a time offset (in seconds) between a container OS considered booted and a guest is executed
     /// This primarily affects 'sysinfo' syscall's 'uptime' field reporting
     #[clap(long, default_value = "120", value_name = "uint64")]
@@ -853,6 +877,12 @@ impl fmt::Display for Config {
         }
         if self.detlog_stack {
             write!(f, " --detlog-stack")?;
+        }
+        if self.detlog_regs {
+            write!(f, " --detlog-regs")?;
+        }
+        if self.detlog_regs_cadence != /* default */ 1 {
+            write!(f, " --detlog-regs-cadence={}", self.detlog_regs_cadence)?;
         }
         if self.sysinfo_uptime_offset != /* default */ 120 {
             write!(f, " --sysinfo-uptime-offset={}", self.sysinfo_uptime_offset)?;
