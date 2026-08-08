@@ -455,7 +455,56 @@ fn ledger_path(root: &Path) -> PathBuf {
                 .join("validate-run-ledger.jsonl");
         }
     }
+    // The env var being unset does NOT mean there is no parent -- far more often it means a run
+    // inside a dev-hermit slot that simply did not export it. Measured 2026-08-08: 111 real rows
+    // sat in two slots' `.hermit-validate-ledger.jsonl` for exactly that reason, and
+    // `ci-hub validate-status` could not see one of them. So look for the parent before falling
+    // back, because a discoverable parent makes the fallback a bug rather than a choice.
+    if let Some(found) = discover_parent_ledger(root) {
+        eprintln!(
+            "validate.rs: {PARENT_ENV} is unset; recording to the DISCOVERED parent ledger {}",
+            found.display()
+        );
+        return found;
+    }
     root.join(LOCAL_LEDGER_BASENAME)
+}
+
+/// Walk up from `root` for a dev-hermit parent workspace that already has a run ledger.
+///
+/// Deliberately keyed on the ledger FILE existing, not on a directory name: the point is to find
+/// the location a reader actually queries, and a `ignored/` directory with no ledger in it is not
+/// that. Returns `None` for a genuinely standalone checkout, which is the only case the
+/// checkout-local fallback is meant to serve.
+fn discover_parent_ledger(root: &Path) -> Option<PathBuf> {
+    let mut dir = root.parent();
+    while let Some(candidate) = dir {
+        let ledger = candidate.join("ignored").join("validate-run-ledger.jsonl");
+        if ledger.is_file() {
+            return Some(ledger);
+        }
+        dir = candidate.parent();
+    }
+    None
+}
+
+/// Say plainly that a row is not going anywhere a reader will look.
+///
+/// A writer that SUCCEEDS into a location no consumer reads reports success and attests nothing --
+/// the same shape as a `locally-validated` label with no backing run. This does not fail the run,
+/// because a standalone checkout must still be able to validate; it makes the invisibility
+/// impossible to miss, so "silent success" stops being the failure mode.
+fn warn_if_unreadable_ledger(ledger: &Path) {
+    if ledger.file_name().and_then(|n| n.to_str()) != Some(LOCAL_LEDGER_BASENAME) {
+        return;
+    }
+    eprintln!(
+        "validate.rs: WARNING: this row is going to the CHECKOUT-LOCAL ledger {}, which NO reader \
+         queries -- `ci-hub validate-status` will report NOT-VALIDATED for this commit even though \
+         the run passed. Set {PARENT_ENV} to the dev-hermit workspace (or {LEDGER_ENV} to an \
+         explicit file) if this row is meant to count.",
+        ledger.display()
+    );
 }
 
 fn utc_now() -> String {
@@ -591,6 +640,7 @@ fn write_ledger_record(
                 );
             } else {
                 eprintln!("validate.rs: ledger record appended to {}", ledger.display());
+                warn_if_unreadable_ledger(ledger);
             }
         }
         Err(e) => eprintln!(
