@@ -1045,11 +1045,42 @@ async fn run_sabre(
     command.env_remove("SABRE_BINARY");
     command.env_remove("SABRE_PLUGIN");
 
+    // THE SOCKET PATH IS DELIBERATELY RANDOM AND MUST NOT BE COMPARED.
+    //
+    // `tempfile` appends a random 6-character suffix to the directory above, so
+    // the absolute path differs on every launch by design -- that is what keeps
+    // concurrent hermit invocations on a shared host from binding the same
+    // coordinator socket. Emitting it at INFO put per-launch randomness into the
+    // INFO stream, which `--verify-strict` compares:
+    //
+    //   Mismatch at log messages 2 (run 1) and 2 (run 2):
+    //   < socket=/tmp/hermit-sabre-rpc-Gw6tUi/coordinator.sock
+    //   > socket=/tmp/hermit-sabre-rpc-7SZ94p/coordinator.sock
+    //
+    // That fails EVERY SaBRe verify cell before the guest executes an
+    // instruction, for a host-side value with no guest-visible content. The
+    // defect was in the oracle, not the backend.
+    //
+    // WHY THE VALUE IS DROPPED FROM INFO RATHER THAN MADE DETERMINISTIC: the two
+    // `--verify` runs execute in SEPARATE CHILD PROCESSES, so any path stable
+    // across both would have to be derived from state shared between them. That
+    // trades `tempfile`'s guaranteed-fresh directory for a reused one, and a
+    // run1 that dies holding the socket would then make run2 fail to bind -- a
+    // real new failure mode in exchange for a cosmetic field. The path keeps its
+    // randomness; only the compared stream stops carrying it.
+    //
+    // This is NOT a comparator relaxation. No normalization envelope is widened,
+    // so any future randomness leaking into this banner still fails the
+    // comparison. The full path remains available one level down.
+    tracing::debug!(
+        target: "hermit::sabre",
+        socket = %socket_path.display(),
+        "SaBRe coordinator RPC socket (per-launch temp path, deliberately not at INFO)",
+    );
     tracing::info!(
         target: "hermit::sabre",
         guest = %program.display(),
         plugin = %plugin.display(),
-        socket = %socket_path.display(),
         "launching Detcore guest through SaBRe with coordinator RPC",
     );
 
