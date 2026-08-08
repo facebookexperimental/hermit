@@ -17,6 +17,7 @@
     "lint.rustfmt"
   ],
   "build_debug_nodes": [
+    "setup.manifest_plan",
     "e2e.metadata",
     "setup.nextest",
     "build.workspace",
@@ -29,18 +30,87 @@
     "build.liteinst_runtime_release"
   ],
   "debug_shards": [
-    { "slug": "unit",          "nodes": ["test.hermit_unit", "test.detcore_unit", "test.detcore_misc"] },
-    { "slug": "unit-parallel", "nodes": ["test.detcore_parallel", "test.regular_crates"] },
-    { "slug": "integration",   "nodes": ["test.hermit_integration", "test.cli", "test.arbitrary_binaries", "test.applications_e2e"] },
-    { "slug": "modes",         "nodes": ["test.hermit_modes", "test.app_strict_verify"] },
-    { "slug": "strict-verify", "nodes": ["test.command_strict_verify", "test.ignored_syscall_regressions", "test.envelope_levels", "test.rr_suite_contract"] },
-    { "slug": "clippy",        "nodes": ["lint.clippy"] },
-    { "slug": "docs",          "nodes": ["doc.doctests", "doc.rustdoc"] },
-    { "slug": "strict-compat", "nodes": ["test.strict_compat"] }
+    {
+      "slug": "unit",
+      "nodes": [
+        "test.hermit_unit",
+        "test.detcore_unit",
+        "test.detcore_misc"
+      ]
+    },
+    {
+      "slug": "unit-parallel",
+      "nodes": [
+        "test.detcore_parallel",
+        "test.regular_crates"
+      ]
+    },
+    {
+      "slug": "integration",
+      "nodes": [
+        "test.hermit_integration",
+        "test.cli",
+        "test.arbitrary_binaries",
+        "test.applications_e2e"
+      ]
+    },
+    {
+      "slug": "modes",
+      "nodes": [
+        "test.hermit_modes",
+        "test.app_strict_verify"
+      ]
+    },
+    {
+      "slug": "strict-verify",
+      "nodes": [
+        "test.command_strict_verify",
+        "test.ignored_syscall_regressions",
+        "test.envelope_levels",
+        "test.rr_suite_contract"
+      ]
+    },
+    {
+      "slug": "clippy",
+      "nodes": [
+        "lint.clippy"
+      ]
+    },
+    {
+      "slug": "docs",
+      "nodes": [
+        "doc.doctests",
+        "doc.rustdoc"
+      ]
+    },
+    {
+      "slug": "strict-compat",
+      "nodes": [
+        "test.strict_compat"
+      ]
+    }
   ],
   "release_shards": [
-    { "slug": "dbt-parity", "needs": "dbt", "nodes": ["test.dbt_parity"] },
-    { "slug": "sabre",      "needs": "dbt", "nodes": ["test.sabre_examples"] },
-    { "slug": "liteinst",   "needs": "aux", "nodes": ["test.liteinst_strict"] }
+    {
+      "slug": "dbt-parity",
+      "needs": "dbt",
+      "nodes": [
+        "test.dbt_parity"
+      ]
+    },
+    {
+      "slug": "sabre",
+      "needs": "dbt",
+      "nodes": [
+        "test.sabre_examples"
+      ]
+    },
+    {
+      "slug": "liteinst",
+      "needs": "aux",
+      "nodes": [
+        "test.liteinst_strict"
+      ]
+    }
   ]
 }
