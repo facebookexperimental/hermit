@@ -436,8 +436,21 @@ $direct_references"
         die "Makefile lint must use the canonical Reverie-pin launcher"
     [[ $(grep -Fxc 'checker="$root/ci/run-reverie-pin-check.sh"' "$ROOT_DIR/.githooks/pre-commit") == 1 ]] ||
         die "pre-commit hook must use the canonical Reverie-pin launcher"
-    [[ $(grep -Fxc '"${proxy[@]}" "$checker" --repo "$root" || exit 1' "$ROOT_DIR/.githooks/pre-commit") == 1 ]] ||
-        die "pre-commit hook must bind the launcher to the exact repository"
+    # Both hook invocations must bind the launcher to the exact repository
+    # rather than relying on cwd -- that is the original intent of this
+    # assertion, preserved across the 2026-08-08 relaxation.
+    [[ $(grep -Fc -- '--repo "$root"' "$ROOT_DIR/.githooks/pre-commit") == 2 ]] ||
+        die "pre-commit hook must bind the launcher to the exact repository (both invocations)"
+    # The OFFLINE leg is the only hard blocker: local incoherence never needs
+    # the network and is never fixed by waiting.
+    [[ $(grep -Fxc '"$checker" --repo "$root" --offline || exit 1' "$ROOT_DIR/.githooks/pre-commit") == 1 ]] ||
+        die "pre-commit hook must block on the offline local-coherence leg"
+    # The ADVISORY leg must NOT be a hard refusal. Owner ruling 2026-08-08: this
+    # surface is awareness only; enforcement is CI's check.reverie_pin. If this
+    # ever regains `|| exit 1` it is a hard blocker again and the CI-config
+    # commit that touched zero Cargo files starts being refused once more.
+    [[ $(grep -Fxc '"${proxy[@]}" "$checker" --repo "$root" --staged-pin-advisory || advisory_status=$?' "$ROOT_DIR/.githooks/pre-commit") == 1 ]] ||
+        die "pre-commit advisory leg must capture its status, never propagate it as a refusal"
     [[ $(grep -Fc '"$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR"' "$ROOT_DIR/validate.sh") == 2 ]] ||
         die "both validate Reverie-pin gates must use the exact-repository launcher"
     [[ $(grep -Fxc '    "$root_dir/ci/run-reverie-pin-check.sh" --repo "$root_dir" --print-pin' "$liteinst_stage") == 1 ]] ||
@@ -464,7 +477,7 @@ $direct_references"
     (
         local scratch isolated_path race_path shared_compile_dir fixture
         local real_git current stale status
-        local fake_cargo staged_runtime direct_status
+        local fake_cargo staged_runtime direct_status reverie_fixture old_pin
         local allowed_cpu parallel_index parallel_failures shared_failures
         local -a checker_pids
         scratch=$(mktemp -d)
@@ -472,9 +485,24 @@ $direct_references"
         isolated_path="$scratch/bin"
         fixture="$scratch/hermit"
         real_git=$(command -v git)
-        current=0123456789abcdef0123456789abcdef01234567
+        # A real local Reverie history: `old` then `current` on main, so the
+        # ancestry bracket has genuine reachability to judge. `stale` stays a
+        # synthetic SHA that is on NO history -- the off-history negative.
+        reverie_fixture="$scratch/reverie"
         stale=89abcdef0123456789abcdef0123456789abcdef
-        mkdir -p "$isolated_path" "$fixture"
+        mkdir -p "$isolated_path" "$fixture" "$reverie_fixture"
+        "$real_git" -C "$reverie_fixture" init -q
+        "$real_git" -C "$reverie_fixture" config user.email pin@harness.local
+        "$real_git" -C "$reverie_fixture" config user.name "Pin Harness"
+        printf 'old\n' >"$reverie_fixture/revision"
+        "$real_git" -C "$reverie_fixture" add revision
+        "$real_git" -C "$reverie_fixture" commit -qm old
+        old_pin=$("$real_git" -C "$reverie_fixture" rev-parse HEAD)
+        printf 'current\n' >"$reverie_fixture/revision"
+        "$real_git" -C "$reverie_fixture" add revision
+        "$real_git" -C "$reverie_fixture" commit -qm current
+        "$real_git" -C "$reverie_fixture" branch -M main
+        current=$("$real_git" -C "$reverie_fixture" rev-parse HEAD)
         ln -s "$(command -v rustc)" "$isolated_path/rustc"
         if PATH="$isolated_path:/usr/bin:/bin" command -v rust-script >/dev/null; then
             die "rust-script unexpectedly present in isolated checker PATH"
@@ -573,9 +601,24 @@ EOF
 
         cat >"$isolated_path/git" <<EOF
 #!/usr/bin/env bash
+# ls-remote fakes the authority tip, as before. fetch is ALSO redirected now:
+# ancestry and monotonicity need Reverie's COMMIT GRAPH, not just a tip, so the
+# checker fetches one. Redirecting it to a local fixture keeps this bracket
+# hermetic -- it must not reach the network to decide a pin question.
 if [[ \${1:-} == ls-remote ]]; then
-    printf '%s\trefs/heads/main\n' '$current'
+    printf '%s\trefs/heads/main\n' '$current' 
     exit 0
+fi
+if [[ \${1:-} == fetch || \${2:-} == fetch ]]; then
+    rewritten=()
+    for arg in "\$@"; do
+        if [[ \$arg == https://github.com/*/reverie.git ]]; then
+            rewritten+=('$reverie_fixture')
+        else
+            rewritten+=("\$arg")
+        fi
+    done
+    exec '$real_git' "\${rewritten[@]}"
 fi
 exec '$real_git' "\$@"
 EOF
@@ -595,7 +638,16 @@ EOF
             status=$?
         fi
         [[ $status == 1 ]] ||
-            die "rustc checker stale-pin bracket returned $status instead of 1"
+            die "rustc checker off-history-pin bracket returned $status instead of 1"
+
+        # ANCESTRY: a pin LAGGING behind main must now PASS. This assertion is
+        # deliberately the inverse of the pre-2026-08-08 rule -- lagging is what
+        # a pin is FOR, and requiring equality made the verdict depend on when
+        # you looked rather than on the tree.
+        printf '[dependencies]\nreverie = { git = "https://github.com/rrnewton/reverie.git", rev = "%s" }\n' \
+            "$old_pin" >"$fixture/Cargo.toml"
+        PATH="$isolated_path:/usr/bin:/bin" "$runner" --repo "$fixture" >/dev/null ||
+            die "rustc checker lagging-pin bracket must PASS under ancestry"
 
         # Reproduce the hosted release-build failure signature, then exercise
         # the real LiteInst staging script through the canonical launcher. A

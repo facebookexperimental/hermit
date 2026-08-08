@@ -6,13 +6,25 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-//! Block Hermit testing when its Reverie dependency pin is not exactly
-//! `rrnewton/reverie:main`.
+//! Judge Hermit's recorded Reverie pin by ANCESTRY and MONOTONICITY.
 //!
-//! The recorded SHA makes historical Hermit builds reproducible. It is not
-//! permission to test against an old Reverie: every testing path requires the
-//! recorded SHA to equal the live `main` tip. All Reverie revisions across
-//! tracked Cargo dependency metadata must also be identical.
+//! OWNER-APPROVED RULE, 2026-08-08, replacing equality-to-the-tip:
+//!
+//!   1. ANCESTRY   -- the pin must be an ancestor of `rrnewton/reverie:main`,
+//!                    not equal to its tip. Lagging is legitimate; a pin that
+//!                    must equal the tip is not a pin, and made the verdict a
+//!                    property of WHEN you looked rather than of the tree.
+//!   2. MONOTONIC  -- the pin may only advance. Ancestry ALONE would accept a
+//!                    pin walked backwards, because an ancient commit is also
+//!                    an ancestor.
+//!   3. CONFLICTS TAKE THE NEWER PIN -- enforced BY rule 2 rather than by a
+//!                    separate mechanism: resolving a Cargo.toml/Cargo.lock
+//!                    conflict to the older side regresses the pin below the
+//!                    base, which rule 2 refuses. Conflict resolution is
+//!                    exactly where a silent regression would otherwise land.
+//!
+//! All Reverie revisions across tracked Cargo dependency metadata must also be
+//! identical to each other; that is decided offline and always blocks.
 //!
 //! Scope is derived with `git ls-files`: every tracked `Cargo.toml` and
 //! `Cargo.lock` is inspected, including tracked vendored paths. Untracked or
@@ -44,13 +56,43 @@ use std::process::Command;
 
 const DEFAULT_REMOTE: &str = "https://github.com/rrnewton/reverie.git";
 const MAIN_REF: &str = "refs/heads/main";
-#[derive(Default)]
+const DEFAULT_BASE_REF: &str = "origin/main";
 struct Config {
     repo: Option<PathBuf>,
     #[cfg(test)]
     remote: Option<String>,
     print_pin: bool,
     update_to_latest: bool,
+    /// Skip every NETWORKED judgement (ancestry, monotonicity, and the
+    /// main-tip query) and decide only what is decidable offline: that the
+    /// tracked manifests agree with each other, and that the LiteInst cache
+    /// keys track the pin. Used by the pre-commit hook, which the owner has
+    /// ruled must not be a hard blocker on pin currency.
+    offline: bool,
+    /// Pre-commit advisory. Judges the STAGED pin against HEAD's and against
+    /// Reverie master, and speaks in exactly one of four cases (see
+    /// `staged_pin_advisory`). Never a hard refusal: case 3 is an
+    /// ACKNOWLEDGEMENT, cleared by HERMIT_PIN_BELOW_MASTER_ACK=1.
+    staged_advisory: bool,
+    /// Revision whose recorded pin is the monotonicity floor. Defaults to
+    /// `origin/main`: the base a PR would land on. A caller with no such ref
+    /// (a fresh clone, an isolated fixture) simply gets no floor asserted.
+    base_ref: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            repo: None,
+            #[cfg(test)]
+            remote: None,
+            print_pin: false,
+            update_to_latest: false,
+            offline: false,
+            staged_advisory: false,
+            base_ref: DEFAULT_BASE_REF.to_string(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -72,6 +114,9 @@ fn usage() -> &'static str {
        --repo PATH                         Hermit checkout (default: git root)\n\
        --print-pin                         Print the single locally recorded pin; no network\n\
        --update-to-latest                  Update every derived Cargo pin site to latest main\n\
+       --base-ref REF                      Monotonicity floor (default: origin/main)\n\
+       --offline                           Local consistency only; no network, no currency\n\
+       --staged-pin-advisory               Pre-commit advisory on a STAGED pin edit\n\
        -h, --help                          Show this help\n\
      \n\
      Scope: every tracked Cargo.toml and Cargo.lock from git ls-files.\n\
@@ -93,6 +138,9 @@ fn parse_args() -> Result<Config, String> {
         match args[i].as_str() {
             "--repo" => config.repo = Some(PathBuf::from(take_value(&args, &mut i, "--repo")?)),
             "--print-pin" => config.print_pin = true,
+            "--base-ref" => config.base_ref = take_value(&args, &mut i, "--base-ref")?,
+            "--offline" => config.offline = true,
+            "--staged-pin-advisory" => config.staged_advisory = true,
             "--update-to-latest" => config.update_to_latest = true,
             "-h" | "--help" => {
                 println!("{}", usage());
@@ -254,6 +302,212 @@ fn read_pins(root: &Path) -> Result<PinScan, String> {
         occurrences: pins,
         tracked_files,
     })
+}
+
+/// Materialize enough of Reverie's COMMIT GRAPH to answer ancestry, and return
+/// the bare repository holding it.
+///
+/// `git ls-remote` returns a tip and nothing else, so it can answer "is the pin
+/// EQUAL to main" and no other question. Ancestry and monotonicity are both
+/// reachability questions, so they need the graph. A blobless bare fetch of the
+/// single branch is the cheap way to get one: measured 2026-08-08 against
+/// rrnewton/reverie at 1 second and 1.3 MB, inside this node's 120s timeout and
+/// its 5s estimate. Cargo's git db also has the graph, but Preflight runs before
+/// any cargo fetch, so depending on it would be order-dependent.
+///
+/// The cache is reused across invocations and re-fetched every time: a stale
+/// cache would silently answer with an old main, which is the failure mode this
+/// whole change exists to remove.
+fn reverie_graph(root: &Path, remote: &str) -> Result<PathBuf, String> {
+    let cache = root.join("target/ci/reverie-graph.git");
+    if !cache.join("HEAD").is_file() {
+        fs::create_dir_all(cache.parent().unwrap_or(&cache))
+            .map_err(|error| format!("could not create the Reverie graph cache: {error}"))?;
+        let init = Command::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .arg(&cache)
+            .output()
+            .map_err(|error| format!("could not run git init: {error}"))?;
+        if !init.status.success() {
+            return Err(format!(
+                "git init --bare failed: {}",
+                String::from_utf8_lossy(&init.stderr).trim()
+            ));
+        }
+    }
+    // `--filter=blob:none` is a BANDWIDTH optimization, not a correctness
+    // requirement: ancestry needs commits, never blobs. It is also not
+    // universally supported -- a local-PATH remote rejects it outright
+    // ("promisor remote name cannot begin with '/'", then a missing-blob
+    // fatal), which is exactly how the fixture suite exercises this code. So
+    // try filtered first for the real remote, and fall back to a plain fetch
+    // rather than letting a transport limitation read as a pin violation.
+    // DECIDE UP FRONT, DO NOT TRY-THEN-FALL-BACK. A failed `--filter` attempt
+    // still writes promisor configuration into the cache, which then poisons
+    // the retry -- observed as an INTERMITTENT failure of the lagging-pin
+    // bracket under the harness's 4-way concurrent self-test (1 of 4), passing
+    // standalone every time. A partial filter is only meaningful over a real
+    // transport anyway: a local-path remote rejects it outright.
+    let filtered = remote.contains("://");
+    let mut args = vec!["fetch"];
+    if filtered {
+        args.push("--filter=blob:none");
+    }
+    args.extend([
+        "--no-tags",
+        "--quiet",
+        "--force",
+        remote,
+        "+refs/heads/main:refs/heads/main",
+    ]);
+    let fetch = git_in(&cache, &args)?;
+    if !fetch.status.success() {
+        return Err(format!(
+            "could not fetch the Reverie commit graph from {remote}: {}",
+            String::from_utf8_lossy(&fetch.stderr).trim()
+        ));
+    }
+    Ok(cache)
+}
+
+/// Is `ancestor` reachable from `descendant`?
+///
+/// REACHABILITY, NOT PRESENCE. A blobless fetch of one branch also lands objects
+/// that are NOT reachable from it -- measured: after fetching only `main`,
+/// `git cat-file -t 88363a56` (a commit that lives solely on an abandoned,
+/// later-rebased feature branch) SUCCEEDS. So an object-presence test would
+/// wrongly ACCEPT a pin that is not on Reverie's history, which is exactly the
+/// case this predicate has to refuse. Only `merge-base --is-ancestor` answers it.
+/// ABSENT ALSO MEANS "NOT AN ANCESTOR", and it must be answered rather than
+/// raised. Two distinct real-world shapes reach here for an off-history pin:
+///   * the commit is PRESENT in the pack but unreachable from main (measured:
+///     88363a56, which lives only on an abandoned, later-rebased branch), and
+///   * the commit is ABSENT entirely, where `merge-base` exits non-zero with
+///     "fatal: Not a valid commit name".
+/// Treating the second as an ERROR would turn a genuine violation into a
+/// checker crash; treating it as "not reachable" is both true and fail-closed.
+/// Anything else is still a real error and is still raised.
+fn is_ancestor(graph: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
+    for rev in [ancestor, descendant] {
+        let present = git_in(graph, &["cat-file", "-e", &format!("{rev}^{{commit}}")])?;
+        if !present.status.success() {
+            return Ok(false);
+        }
+    }
+    let output = git_in(graph, &["merge-base", "--is-ancestor", ancestor, descendant])?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git merge-base --is-ancestor {ancestor} {descendant} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+/// The pin recorded on the base this change would land on, for the monotonicity
+/// comparison. `None` when there is no base to compare against (a fresh repo, a
+/// detached probe, an unavailable ref) -- in which case monotonicity is not
+/// asserted rather than being assumed satisfied.
+fn base_pin(root: &Path, base_ref: &str) -> Option<String> {
+    // NO `:(glob)` PATHSPEC HERE. `git ls-tree` rejects pathspec magic outright
+    // -- "pathspec magic not supported by this command: 'glob'" -- so passing
+    // the same spec `ls-files` accepts makes the whole call FAIL, which would
+    // return None and silently skip the monotonicity assertion entirely. That
+    // is a fail-OPEN hole, and it is what the regression bracket caught before
+    // this shipped. List the flat tree and filter by basename instead, the same
+    // way the parent's primary_checkout.py does for the same reason.
+    let listed = git_in(root, &["ls-tree", "-r", "-z", "--name-only", base_ref]).ok()?;
+    if !listed.status.success() {
+        return None;
+    }
+    let mut found: BTreeSet<String> = BTreeSet::new();
+    for name in String::from_utf8_lossy(&listed.stdout)
+        .split('\0')
+        .filter(|name| !name.is_empty() && name.ends_with("Cargo.toml"))
+    {
+        let blob = git_in(root, &["cat-file", "blob", &format!("{base_ref}:{name}")]).ok()?;
+        if !blob.status.success() {
+            continue;
+        }
+        for line in String::from_utf8_lossy(&blob.stdout).lines() {
+            if is_reverie_git_source(line) {
+                if let Some(rev) = extract_rev(line) {
+                    if is_full_sha(&rev) {
+                        found.insert(rev);
+                    }
+                }
+            }
+        }
+    }
+    // An incoherent base cannot define a floor; refuse to invent one.
+    (found.len() == 1).then(|| found.into_iter().next().unwrap_or_default())
+}
+
+/// Environment acknowledgement that clears the case-3 advisory.
+const ACK_ENV: &str = "HERMIT_PIN_BELOW_MASTER_ACK";
+
+/// PRE-COMMIT ADVISORY. Exactly four cases, owner-specified 2026-08-08:
+///
+///   1. the commit does NOT touch pin entries          -> SILENT, exit 0.
+///   2. it touches them and bumps ALL THE WAY to master -> SILENT, exit 0.
+///   3. it touches them and bumps but STOPS SHORT       -> surface + require
+///      acknowledgement. "Why update but leave it stale?" Deliberately touching
+///      the pin and stopping short is a smell: either go to master, or say why
+///      not. PROCEEDABLE, NOT BLOCKING -- pinning below a known-bad newer
+///      commit, or a master that does not build yet, are legitimate.
+///   4. it REGRESSES the pin                            -> SILENT here. That is
+///      the CI check's monotonicity refusal, a hard refusal, and duplicating it
+///      as a soft prompt would teach people to acknowledge past it.
+///
+/// CASE 1 IS THE LOAD-BEARING SILENCE. A commit touching zero Cargo files was
+/// being refused outright today; anything printed on that path is a regression
+/// of this design, so it is bracketed explicitly.
+///
+/// Rarity is where this gets its power: it fires only on deliberate pin edits,
+/// so it stays readable instead of decaying into a reflex flag. Do not widen it.
+fn staged_pin_advisory(root: &Path, remote: &str) -> Result<i32, String> {
+    let staged = read_pins(root)?;
+    let candidate = match unique_pin(&staged) {
+        Ok(pin) => pin.to_string(),
+        // Inconsistent manifests are a different, always-blocking defect that
+        // the normal path reports; the advisory stays quiet rather than
+        // second-guessing it.
+        Err(_) => return Ok(0),
+    };
+    let Some(head) = base_pin(root, "HEAD") else {
+        return Ok(0);
+    };
+    if head == candidate {
+        return Ok(0); // CASE 1: no pin edit in this commit.
+    }
+    let main = query_main(remote)?;
+    if candidate == main {
+        return Ok(0); // CASE 2: bumped all the way.
+    }
+    let graph = reverie_graph(root, remote)?;
+    if !is_ancestor(&graph, &head, &candidate)? {
+        return Ok(0); // CASE 4: regression (or off-history) -- CI refuses it.
+    }
+    if env::var(ACK_ENV).map(|value| value == "1").unwrap_or(false) {
+        return Ok(0); // CASE 3, acknowledged.
+    }
+    let behind = git_in(&graph, &["rev-list", "--count", &format!("{candidate}..{main}")])?;
+    let lag = String::from_utf8_lossy(&behind.stdout).trim().to_string();
+    loud_header("REVERIE PIN BUMPED, BUT NOT TO MASTER");
+    eprintln!("Previous pin: {head}");
+    eprintln!("This commit:  {candidate}");
+    eprintln!("Reverie main: {main}  ({lag} commit(s) ahead of this commit's pin)");
+    eprintln!();
+    eprintln!("You are deliberately moving the pin but stopping short of Reverie master.");
+    eprintln!("That is allowed -- pinning below a known-bad newer commit, or below a master");
+    eprintln!("that does not build yet, are legitimate reasons -- but it should be a choice,");
+    eprintln!("not an accident.");
+    eprintln!();
+    eprintln!("Go all the way:      with-proxy ./ci/run-reverie-pin-check.sh --update-to-latest");
+    eprintln!("Or acknowledge:      {ACK_ENV}=1 git commit ...");
+    eprintln!("  (acknowledging states you know Hermit will be on a non-master Reverie.)");
+    Ok(1)
 }
 
 fn query_main(remote: &str) -> Result<String, String> {
@@ -732,6 +986,14 @@ fn run_with_config(config: Config) -> Result<i32, String> {
         return Ok(0);
     }
 
+    if config.staged_advisory {
+        #[cfg(not(test))]
+        let advisory_remote = DEFAULT_REMOTE;
+        #[cfg(test)]
+        let advisory_remote = config.remote.as_deref().unwrap_or(DEFAULT_REMOTE);
+        return staged_pin_advisory(&root, advisory_remote);
+    }
+
     let tracked_manifests = scan
         .tracked_files
         .iter()
@@ -774,6 +1036,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     let remote = DEFAULT_REMOTE;
     #[cfg(test)]
     let remote = config.remote.as_deref().unwrap_or(DEFAULT_REMOTE);
+    let base_ref = config.base_ref.as_str();
     let main_result = query_main(remote);
 
     let main = match main_result {
@@ -809,21 +1072,98 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     let entries = pins.len();
     let pin_files = pinned_file_count.len();
 
-    if pin == main {
+    // OFFLINE STOPS HERE, having decided everything that does not need the
+    // network: the manifests agree with each other (checked above via
+    // unique_pin) and the LiteInst cache keys track the pin. Those are real,
+    // offline-decidable defects that no amount of waiting fixes, so they stay
+    // BLOCKING for every caller. What offline deliberately does NOT judge is
+    // currency -- see the pre-commit hook for why that must not block.
+    if config.offline {
         println!(
-            "Reverie pin is current: {pin} ({entries} revision entries across {pin_files} tracked Cargo metadata files)"
+            "Reverie pin is locally consistent: {pin} ({entries} revision entries across \
+             {pin_files} tracked Cargo metadata files; currency not evaluated, --offline)"
         );
-        Ok(0)
-    } else {
-        loud_header("REVERIE PIN DOES NOT EQUAL LATEST MAIN - BLOCKED");
+        return Ok(0);
+    }
+
+    // OWNER-APPROVED RULE (2026-08-08): ANCESTRY + MONOTONICITY, not equality.
+    //
+    // Equality made the comparand a LIVE MOVING REF, so the verdict was a
+    // property of the tree AND THE INSTANT YOU LOOKED: two runs over a
+    // byte-identical tree disagreed with nothing changed locally, and the pin
+    // went stale whenever anyone pushed to Reverie (~16.6 commits/day). A pin
+    // that must equal the tip is not a pin.
+    //
+    // ANCESTRY ALONE IS NOT ENOUGH, and this is the hole the owner caught: an
+    // ANCIENT commit is also an ancestor, so ancestry by itself would happily
+    // accept a pin walked BACKWARDS. Hence the second clause.
+    //
+    // CONFLICTS TAKE THE NEWER PIN is enforced HERE rather than by a separate
+    // mechanism: resolving a Cargo.toml/Cargo.lock conflict to the older side
+    // regresses the pin below the base, which MONOTONIC refuses. That is the
+    // whole point of pairing them -- conflict resolution is precisely where a
+    // silent regression would otherwise land unnoticed.
+    if !is_full_sha(&main) {
+        return Err(format!("refusing to judge against invalid main {main:?}"));
+    }
+    let graph = reverie_graph(&root, remote)?;
+
+    // (1) ANCESTRY: the pin must be on Reverie's main history. This refuses a
+    // dead, abandoned, or rewritten commit -- the case a tip-equality check
+    // never even asked about.
+    if !is_ancestor(&graph, pin, &main)? {
+        loud_header("REVERIE PIN IS NOT ON reverie/main HISTORY - BLOCKED");
         eprintln!("Hermit pin:  {pin}");
         eprintln!("Latest main: {main}");
+        eprintln!(
+            "The pin is not reachable from rrnewton/reverie:main. It names a commit that was\n\
+             abandoned, rewritten, or never merged -- so nothing on main contains it and no\n\
+             amount of waiting will make it current."
+        );
         eprintln!(
             "Affected metadata: {entries} revision entries across {pin_files} tracked Cargo files."
         );
         blocked_instructions();
-        Ok(1)
+        return Ok(1);
     }
+
+    // (2) MONOTONIC: the pin may not regress below the base this change lands
+    // on. Equal is fine (the overwhelmingly common no-op case); forward is the
+    // point; backward is refused.
+    if let Some(base) = base_pin(&root, base_ref) {
+        if base != pin && !is_ancestor(&graph, &base, pin)? {
+            let direction = if is_ancestor(&graph, pin, &base)? {
+                "REGRESSES to an older commit"
+            } else {
+                "moves sideways onto a commit that does not contain"
+            };
+            loud_header("REVERIE PIN REGRESSION - BLOCKED");
+            eprintln!("Base ({base_ref}) pin: {base}");
+            eprintln!("This change's pin:    {pin}");
+            eprintln!("The pin {direction} the base pin.");
+            eprintln!(
+                "The pin may only advance. If this came from resolving a Cargo.toml or\n\
+                 Cargo.lock conflict, RESOLVE TO THE NEWER SIDE -- taking the older side is\n\
+                 exactly the silent regression this refusal exists to catch."
+            );
+            blocked_instructions();
+            return Ok(1);
+        }
+    }
+
+    let behind = git_in(&graph, &["rev-list", "--count", &format!("{pin}..{main}")])?;
+    let lag = String::from_utf8_lossy(&behind.stdout).trim().to_string();
+    if pin == main {
+        println!(
+            "Reverie pin is current: {pin} ({entries} revision entries across {pin_files} tracked Cargo metadata files)"
+        );
+    } else {
+        println!(
+            "Reverie pin is on main history and does not regress: {pin} ({lag} commit(s) behind \
+             {main}; {entries} revision entries across {pin_files} tracked Cargo metadata files)"
+        );
+    }
+    Ok(0)
 }
 
 fn run() -> Result<i32, String> {
@@ -1051,7 +1391,11 @@ mod tests {
     }
 
     #[test]
-    fn ancestor_behind_latest_fails() {
+    fn lagging_pin_on_main_history_passes() {
+        // BRACKET 1 of 4. This assertion is DELIBERATELY INVERTED from what it
+        // was: it previously required a behind-but-valid pin to fail closed,
+        // which is precisely the equality rule the owner replaced. Deliberately
+        // lagging an upstream is what a pin IS.
         let root = temp_path("behind-hermit");
         let remote = temp_path("behind-reverie");
         init_fixture_repo(&root);
@@ -1117,8 +1461,217 @@ mod tests {
             ..Config::default()
         })
         .expect("behind pin should be classified");
-        assert_eq!(code, 1, "an ancestor behind latest main must fail closed");
+        assert_eq!(
+            code, 0,
+            "a pin that is an ANCESTOR of main and does not regress must PASS: lagging is the \
+             normal, intended state under ancestry+monotonicity"
+        );
 
+        fs::remove_dir_all(root).expect("remove Hermit fixture repository");
+        fs::remove_dir_all(remote).expect("remove Reverie fixture repository");
+    }
+
+    /// Build a Reverie fixture with `main` = old -> latest, plus a commit on an
+    /// abandoned side branch that `main` never contains. Returns
+    /// (remote, old, latest, offhistory).
+    fn reverie_history_fixture(label: &str) -> (PathBuf, String, String, String) {
+        let remote = temp_path(label);
+        init_fixture_repo(&remote);
+        let head = |dir: &Path| {
+            String::from_utf8_lossy(&git_in(dir, &["rev-parse", "HEAD"]).unwrap().stdout)
+                .trim()
+                .to_string()
+        };
+        let commit = |dir: &Path, body: &str, msg: &str| {
+            fs::write(dir.join("revision"), body).expect("write Reverie fixture");
+            assert!(git_in(dir, &["add", "revision"]).unwrap().status.success());
+            assert!(git_in(dir, &["commit", "-qm", msg]).unwrap().status.success());
+        };
+        commit(&remote, "old\n", "old");
+        let old = head(&remote);
+        commit(&remote, "latest\n", "latest");
+        let latest = head(&remote);
+        assert!(git_in(&remote, &["branch", "-M", "main"]).unwrap().status.success());
+        // An abandoned branch off `old`: reachable as an object, NOT reachable
+        // from main. This is the shape of a rebased-away or never-merged commit.
+        assert!(git_in(&remote, &["checkout", "-q", "-b", "abandoned", &old]).unwrap().status.success());
+        commit(&remote, "abandoned\n", "abandoned");
+        let offhistory = head(&remote);
+        assert!(git_in(&remote, &["checkout", "-q", "main"]).unwrap().status.success());
+        (remote, old, latest, offhistory)
+    }
+
+    /// Write a Hermit fixture pinning `pin`, commit it, and record `base_pin`
+    /// on a `base` ref so monotonicity has a floor to compare against.
+    fn hermit_fixture(label: &str, base_pin: &str, pin: &str) -> PathBuf {
+        let root = temp_path(label);
+        init_fixture_repo(&root);
+        let manifest = |rev: &str| {
+            format!(
+                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{rev}\" }}\n"
+            )
+        };
+        fs::write(root.join("Cargo.toml"), manifest(base_pin)).expect("write base manifest");
+        assert!(git_in(&root, &["add", "Cargo.toml"]).unwrap().status.success());
+        assert!(git_in(&root, &["commit", "-qm", "base"]).unwrap().status.success());
+        assert!(git_in(&root, &["branch", "-f", "basefixture"]).unwrap().status.success());
+        fs::write(root.join("Cargo.toml"), manifest(pin)).expect("write candidate manifest");
+        assert!(git_in(&root, &["add", "Cargo.toml"]).unwrap().status.success());
+        root
+    }
+
+    #[test]
+    fn regressed_pin_is_refused() {
+        // BRACKET 3 of 4, AND THE ONE THAT CLOSES THE HOLE. Ancestry alone would
+        // ACCEPT this: `old` is a perfectly good ancestor of main. Only
+        // monotonicity catches a pin walked BACKWARDS -- which is exactly what a
+        // Cargo.lock conflict resolved to the older side produces.
+        let (remote, old, latest, _off) = reverie_history_fixture("regress-reverie");
+        let root = hermit_fixture("regress-hermit", &latest, &old);
+        let code = run_with_config(Config {
+            repo: Some(root.clone()),
+            remote: Some(remote.to_string_lossy().into_owned()),
+            base_ref: "basefixture".to_string(),
+            ..Config::default()
+        })
+        .expect("regressed pin should be classified");
+        assert_eq!(code, 1, "a pin that REGRESSES below its base must be REFUSED");
+        fs::remove_dir_all(root).expect("remove Hermit fixture repository");
+        fs::remove_dir_all(remote).expect("remove Reverie fixture repository");
+    }
+
+    #[test]
+    fn pin_not_on_main_history_is_refused() {
+        // BRACKET 4 of 4. The pin names a real, fetchable object that main does
+        // NOT contain. Note this cannot be checked by object PRESENCE: a fetch
+        // of main alone still lands such objects, so presence would wrongly
+        // accept. Only reachability refuses it.
+        let (remote, old, _latest, offhistory) = reverie_history_fixture("offhist-reverie");
+        let root = hermit_fixture("offhist-hermit", &old, &offhistory);
+        let code = run_with_config(Config {
+            repo: Some(root.clone()),
+            remote: Some(remote.to_string_lossy().into_owned()),
+            base_ref: "basefixture".to_string(),
+            ..Config::default()
+        })
+        .expect("off-history pin should be classified");
+        assert_eq!(
+            code, 1,
+            "a pin not reachable from reverie/main must be REFUSED even though it is a real commit"
+        );
+        fs::remove_dir_all(root).expect("remove Hermit fixture repository");
+        fs::remove_dir_all(remote).expect("remove Reverie fixture repository");
+    }
+
+    /// Drive the pre-commit advisory: HEAD pins `head_pin`, the worktree stages
+    /// `staged_pin`. Returns (exit code, stderr-was-produced).
+    fn advisory(label: &str, remote: &Path, head_pin: &str, staged_pin: &str) -> i32 {
+        let root = temp_path(label);
+        init_fixture_repo(&root);
+        let manifest = |rev: &str| {
+            format!(
+                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{rev}\" }}\n"
+            )
+        };
+        fs::write(root.join("Cargo.toml"), manifest(head_pin)).expect("write HEAD manifest");
+        assert!(git_in(&root, &["add", "Cargo.toml"]).unwrap().status.success());
+        assert!(git_in(&root, &["commit", "-qm", "head"]).unwrap().status.success());
+        if staged_pin != head_pin {
+            fs::write(root.join("Cargo.toml"), manifest(staged_pin)).expect("stage manifest");
+            assert!(git_in(&root, &["add", "Cargo.toml"]).unwrap().status.success());
+        }
+        let code = run_with_config(Config {
+            repo: Some(root.clone()),
+            remote: Some(remote.to_string_lossy().into_owned()),
+            staged_advisory: true,
+            ..Config::default()
+        })
+        .expect("advisory should classify");
+        fs::remove_dir_all(root).expect("remove fixture");
+        code
+    }
+
+    #[test]
+    fn advisory_case1_no_pin_touch_is_silent() {
+        // THE LOAD-BEARING SILENCE. A commit that does not touch pin entries
+        // must produce NOTHING -- this is the case that was refusing a
+        // CI-config change touching zero Cargo files.
+        let (remote, old, _latest, _off) = reverie_history_fixture("adv1-reverie");
+        assert_eq!(advisory("adv1-hermit", &remote, &old, &old), 0);
+        fs::remove_dir_all(remote).expect("remove Reverie fixture");
+    }
+
+    #[test]
+    fn advisory_case2_bump_all_the_way_is_silent() {
+        let (remote, old, latest, _off) = reverie_history_fixture("adv2-reverie");
+        assert_eq!(advisory("adv2-hermit", &remote, &old, &latest), 0);
+        fs::remove_dir_all(remote).expect("remove Reverie fixture");
+    }
+
+    #[test]
+    fn advisory_case3_bump_short_of_master_asks_for_acknowledgement() {
+        // Needs a 3-commit history so a bump can land strictly between.
+        let remote = temp_path("adv3-reverie");
+        init_fixture_repo(&remote);
+        let head = |d: &Path| {
+            String::from_utf8_lossy(&git_in(d, &["rev-parse", "HEAD"]).unwrap().stdout)
+                .trim()
+                .to_string()
+        };
+        for (body, msg) in [("a\n", "a"), ("b\n", "b"), ("c\n", "c")] {
+            fs::write(remote.join("revision"), body).expect("write");
+            assert!(git_in(&remote, &["add", "revision"]).unwrap().status.success());
+            assert!(git_in(&remote, &["commit", "-qm", msg]).unwrap().status.success());
+        }
+        assert!(git_in(&remote, &["branch", "-M", "main"]).unwrap().status.success());
+        let tip = head(&remote);
+        let first = String::from_utf8_lossy(
+            &git_in(&remote, &["rev-parse", "main~2"]).unwrap().stdout,
+        )
+        .trim()
+        .to_string();
+        let middle = String::from_utf8_lossy(
+            &git_in(&remote, &["rev-parse", "main~1"]).unwrap().stdout,
+        )
+        .trim()
+        .to_string();
+        assert_ne!(middle, tip);
+        assert_eq!(
+            advisory("adv3-hermit", &remote, &first, &middle),
+            1,
+            "a forward bump that stops short of master must ASK for acknowledgement"
+        );
+        fs::remove_dir_all(remote).expect("remove Reverie fixture");
+    }
+
+    #[test]
+    fn advisory_case4_regression_is_silent_here() {
+        // Case 4 belongs to CI's monotonicity refusal. Prompting for a soft
+        // acknowledgement here would train people to acknowledge past a hard
+        // refusal, so this surface stays quiet.
+        let (remote, old, latest, _off) = reverie_history_fixture("adv4-reverie");
+        assert_eq!(
+            advisory("adv4-hermit", &remote, &latest, &old),
+            0,
+            "a regression must be SILENT on the advisory surface -- CI refuses it"
+        );
+        fs::remove_dir_all(remote).expect("remove Reverie fixture");
+    }
+
+    #[test]
+    fn forward_advance_from_a_base_passes() {
+        // The monotonic-forward case, so bracket 3 cannot pass vacuously by
+        // refusing every base comparison.
+        let (remote, old, latest, _off) = reverie_history_fixture("advance-reverie");
+        let root = hermit_fixture("advance-hermit", &old, &latest);
+        let code = run_with_config(Config {
+            repo: Some(root.clone()),
+            remote: Some(remote.to_string_lossy().into_owned()),
+            base_ref: "basefixture".to_string(),
+            ..Config::default()
+        })
+        .expect("forward advance should be classified");
+        assert_eq!(code, 0, "advancing the pin forward must PASS");
         fs::remove_dir_all(root).expect("remove Hermit fixture repository");
         fs::remove_dir_all(remote).expect("remove Reverie fixture repository");
     }
