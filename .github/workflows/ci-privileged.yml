@@ -25,8 +25,8 @@ env:
 
 jobs:
   # GitHub Actions supports timeout-minutes on jobs, not at workflow scope.
-  # This workflow has one independent ten-minute job, so its job timeout is
-  # also stronger than the requested 60-minute workflow ceiling.
+  # This workflow has one independent job, so its job timeout is also stronger
+  # than the requested 60-minute workflow ceiling.
   # This scarce lane is a sub-five-minute privileged capability smoke only:
   #   * retired-conditional-branch PMU timer delivery,
   #   * CPUID faulting used to mask RDRAND/RDSEED, and
@@ -51,7 +51,18 @@ jobs:
         )
       }}
     runs-on: [Linux, X64, hermit, pmu]
-    timeout-minutes: 10
+    # This is a WALL, not an expected duration: a green run of this job measured
+    # 126s end to end on 2026-08-08 (run 31282467953). The wall must still cover
+    # the case where every budgeted step spends its whole allowance, which is
+    # 600s (DAG launcher) + 330s (30s locks + 60s submodule init + 30s hardware
+    # capabilities + 210s occasional KVM probes) + an allowance for the steps
+    # that carry no `timeout` of their own (job setup, checkout, and the two
+    # artifact uploads measured 7s warm, but a cold checkout and a large
+    # artifact upload are far slower). ci/test_harness.sh derives all of those
+    # terms from THIS FILE and fails closed if this number is too small, so
+    # raise the step budgets and rerun `./ci/test_harness.sh validate` rather
+    # than guessing here.
+    timeout-minutes: 18
     env:
       DETCORE_TEST_RUST_LOG: "off"
 
@@ -97,7 +108,13 @@ jobs:
       # --user scope; without this flag the skipped-boxing path would fail-close
       # this self-hosted lane. Opt out to best-effort UNBOXED (process-group
       # teardown only) — the pre-pin behavior — rather than regress the lane RED.
-      run: timeout --foreground --kill-after=10s 360s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
+      # 600s, raised from 360s on 2026-08-08. This number is the SINGLE AUTHOR
+      # of the inner DAG budget: ci/test_harness.sh reads it back out of this
+      # line instead of keeping its own copy, so it cannot drift out of sync
+      # with the guard that checks it. It must exceed the privileged DAG's
+      # critical path plus 30s of runner overhead; the harness recomputes that
+      # path from ci/dag/privileged.json and fails closed.
+      run: timeout --foreground --kill-after=10s 600s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
     - name: Run non-gating occasional KVM probes
       id: kvm_occasional
       continue-on-error: true

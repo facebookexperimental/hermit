@@ -265,6 +265,41 @@ function workflow_job_timeout_minutes {
     ' "$workflow"
 }
 
+# READ the inner DAG-launcher budget out of the workflow instead of keeping a
+# second copy of the number here.
+#
+# A hand-copied constant IS a derived identity, and a silent duplicate of one is
+# how a raised budget keeps a guard that still validates the value nobody
+# deploys. This function existed as `local privileged_inner_timeout_seconds=360`
+# until 2026-08-08; raising the workflow to 600s while leaving that line at 360
+# would have left the launcher/critical-path bound checking a number absent from
+# the repository, and it would have passed. Derive, never transcribe.
+function workflow_dag_launcher_timeout_seconds {
+    local workflow=$1 lane=$2
+    sed -n \
+        "s|.*timeout --foreground --kill-after=[0-9]*s \([0-9]*\)s env SAFE_CI_DAG_RUNNER=.*ci/run-dag\.sh $lane .*|\1|p" \
+        "$workflow" | head -1
+}
+
+# Everything ELSE the job can spend, summed from the workflow's own step
+# budgets, so the outer wall is checked against what this job may actually
+# consume rather than a hand-picked overhead constant that nobody rechecks.
+# Adding another budgeted step automatically raises the required job timeout.
+function workflow_non_dag_step_budget_seconds {
+    local workflow=$1
+    awk '
+        /SAFE_CI_DAG_RUNNER/ { next }
+        match($0, /timeout --foreground --kill-after=[0-9]+s [0-9]+s/) {
+            segment = substr($0, RSTART, RLENGTH)
+            fields = split(segment, parts, " ")
+            budget = parts[fields]
+            sub(/s$/, "", budget)
+            total += budget
+        }
+        END { print total + 0 }
+    ' "$workflow"
+}
+
 function assert_parallel_portable_workflow {
     local workflow=$1
     local run_dag_count run_node_count debug_inner_path release_inner_path
@@ -1003,7 +1038,7 @@ function audit_ci_correspondence {
     # This is a literal workflow expression, not a local expansion.
     # shellcheck disable=SC2016
     assert_workflow_entrypoint privileged "$ROOT_DIR/.github/workflows/ci-privileged.yml" \
-        'timeout --foreground --kill-after=10s 360s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
+        'timeout --foreground --kill-after=10s 600s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
     assert_privileged_diagnostics "$ROOT_DIR/.github/workflows/ci-privileged.yml"
     # shellcheck disable=SC2016
     assert_validate_entrypoint portable run_portable_only_suite \
@@ -1041,20 +1076,39 @@ function audit_ci_correspondence {
             die "$lane e2e.metadata must carry the measured validation workload and 60s/1GiB bounds"
     done
 
+    # Three budgets are nested here, and every term is DERIVED from the file
+    # that authors it -- the DAG for the critical path, the workflow for both
+    # timeouts. Nothing below is a transcription of a number kept elsewhere.
+    local privileged_workflow="$ROOT_DIR/.github/workflows/ci-privileged.yml"
     local privileged_critical_path privileged_job_timeout_minutes
-    local privileged_inner_timeout_seconds=360
+    local privileged_inner_timeout_seconds privileged_non_dag_step_budget
     local privileged_runner_overhead_seconds=30
+    # Job setup, checkout, and the artifact uploads carry no `timeout` of their
+    # own; they measured 7s total on a warm green run (31282467953, 2026-08-08).
+    # A cold checkout and a large artifact upload are much slower, so allow 120s.
+    local privileged_unbudgeted_step_allowance_seconds=120
     privileged_critical_path=$(dag_critical_path_seconds "$DAG_ROOT/privileged.json")
+    privileged_inner_timeout_seconds=$(workflow_dag_launcher_timeout_seconds \
+        "$privileged_workflow" privileged)
+    privileged_non_dag_step_budget=$(workflow_non_dag_step_budget_seconds \
+        "$privileged_workflow")
     privileged_job_timeout_minutes=$(workflow_job_timeout_minutes \
-        "$ROOT_DIR/.github/workflows/ci-privileged.yml" privileged)
+        "$privileged_workflow" privileged)
     [[ $privileged_critical_path =~ ^[0-9]+$ ]] ||
         die "privileged DAG critical path is not an integer: $privileged_critical_path"
+    [[ $privileged_inner_timeout_seconds =~ ^[1-9][0-9]*$ ]] ||
+        die "privileged workflow has no numeric inner DAG launcher timeout"
+    [[ $privileged_non_dag_step_budget =~ ^[0-9]+$ ]] ||
+        die "privileged workflow non-DAG step budget is not an integer: $privileged_non_dag_step_budget"
     [[ $privileged_job_timeout_minutes =~ ^[1-9][0-9]*$ ]] ||
         die "privileged workflow has no numeric outer job timeout"
     ((privileged_inner_timeout_seconds > privileged_critical_path + privileged_runner_overhead_seconds)) ||
-        die "privileged DAG launcher must exceed ${privileged_critical_path}s critical path plus ${privileged_runner_overhead_seconds}s runner overhead"
-    ((privileged_job_timeout_minutes * 60 > privileged_inner_timeout_seconds + 180)) ||
-        die "privileged job timeout must exceed ${privileged_inner_timeout_seconds}s DAG launcher plus 180s workflow overhead"
+        die "privileged DAG launcher (${privileged_inner_timeout_seconds}s) must exceed ${privileged_critical_path}s critical path plus ${privileged_runner_overhead_seconds}s runner overhead"
+    local privileged_job_floor_seconds=$((privileged_inner_timeout_seconds
+        + privileged_non_dag_step_budget
+        + privileged_unbudgeted_step_allowance_seconds))
+    ((privileged_job_timeout_minutes * 60 > privileged_job_floor_seconds)) ||
+        die "privileged job timeout (${privileged_job_timeout_minutes}m) must exceed ${privileged_inner_timeout_seconds}s DAG launcher plus ${privileged_non_dag_step_budget}s of other budgeted steps plus ${privileged_unbudgeted_step_allowance_seconds}s for unbudgeted steps (${privileged_job_floor_seconds}s)"
 
     [[ -f $EXPECTED_PLAN ]] || die "missing E2E denominator ratchet: ${EXPECTED_PLAN#"$ROOT_DIR/"}"
     jq -e '.schema == 1 and (.cells | type == "array" and length > 0)' "$EXPECTED_PLAN" >/dev/null ||
