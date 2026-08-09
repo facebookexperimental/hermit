@@ -749,6 +749,22 @@ cleared-caps refusal names {} starved step(s)",
                 return Err(format!("full-plan bracket: fused plan lost {required}"));
             }
         }
+        let privileged_build = full
+            .cfg
+            .steps
+            .iter()
+            .find(|s| s.tag() == "privileged-build.privileged_tests")
+            .ok_or("full-plan bracket: privileged focused build disappeared")?;
+        if !privileged_build
+            .deps
+            .iter()
+            .any(|d| d == "portable-build.workspace")
+        {
+            return Err(
+                "full-plan bracket: privileged build can race the portable artifact producer"
+                    .into(),
+            );
+        }
         let sequential_args = parse_argv(&[
             "full".into(),
             "--sequential-lanes".into(),
@@ -1899,6 +1915,26 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     let removed = dedupe_identical(&mut steps);
     if !removed.is_empty() {
         eprintln!("validate: fused lanes; deduped {} identical node(s): {}", removed.len(), removed.join(", "));
+    }
+    if lanes.len() == 2 {
+        // Sequential full validation implicitly warmed the privileged focused
+        // build with portable-build.workspace. Preserve that artifact ordering
+        // explicitly in the fused graph: running both cold Cargo builds at once
+        // duplicates compilation, contends on Cargo locks, and measured a
+        // 120.03 s timeout versus 6.32 s on the warm sequential baseline.
+        let producer = "portable-build.workspace";
+        let consumer = "privileged-build.privileged_tests";
+        if !steps.iter().any(|s| s.tag() == producer) {
+            return Err(format!("fused artifact producer disappeared: {producer}"));
+        }
+        let privileged_build = steps
+            .iter_mut()
+            .find(|s| s.tag() == consumer)
+            .ok_or_else(|| format!("fused artifact consumer disappeared: {consumer}"))?;
+        if !privileged_build.deps.iter().any(|d| d == producer) {
+            privileged_build.deps.push(producer.to_string());
+            privileged_build.deps.sort();
+        }
     }
     // Fusing lanes means one config for both. Their default wall timeouts differ,
     // but every shipped/synthesized node has an explicit wall timeout and the
