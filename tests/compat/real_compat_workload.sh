@@ -5,7 +5,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Functional compatibility workloads for validate.sh's strict L2 matrix.
+# Functional compatibility workloads for scripts/validate.rs's strict L2 matrix.
 
 set -euo pipefail
 

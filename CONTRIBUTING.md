@@ -26,10 +26,10 @@ Every change must be **locally validated before it is pushed**. The single
 entry point is:
 
 ```bash
-./validate.sh
+./scripts/validate.rs
 ```
 
-`validate.sh portable-only` is the local mirror of the required
+`scripts/validate.rs portable-only` is the local mirror of the required
 `.github/workflows/ci-portable.yml` workflow: it runs the same build, lint,
 format, documentation, and test matrix. The focused privileged capability
 contract is reproduced with `ci/run-dag.sh privileged -j 2`.
@@ -37,31 +37,31 @@ The exact step-by-step mapping between the two — and any sanctioned
 host-capability differences — is documented in
 [`docs/ci-validate-alignment.md`](docs/ci-validate-alignment.md). Do not add a
 test to only one side: a test that gates CI must be reproducible with
-`validate.sh`, and vice versa.
+`scripts/validate.rs`, and vice versa.
 
 For a predictable portable iteration loop that mirrors GitHub-managed portable CI, run:
 
 ```bash
-VALIDATE_LEVEL=portable-only ./validate.sh
+VALIDATE_LEVEL=portable-only ./scripts/validate.rs
 ```
 
-`./validate.sh --portable` is equivalent, while `./validate.sh --quick` selects
+`./scripts/validate.rs --portable` is equivalent, while `./scripts/validate.rs --quick` selects
 the smaller ptrace smoke suite. These modes provide fast feedback; use `full`
 for the complete hardware-dependent local gate when the host supports it.
 
 Protocol for every PR:
 
-1. Run `./validate.sh` on your branch and make it pass. The final line reads
+1. Run `./scripts/validate.rs` on your branch and make it pass. The final line reads
    `✅ Validation summary (N passed, 0 failed; …)`. If a check cannot run on
    your host (for example, tests that require PMU access or mount namespaces),
    say so explicitly in the PR description — state the command, the host
    limitation, and what you observed. Never silently skip a check or weaken a
    hardware-sensitive assertion to make a local VM green.
-2. When you add, remove, or rename a test, update `validate.sh` and the
+2. When you add, remove, or rename a test, update `scripts/validate.rs` and the
    owning CI workflow in the same PR so they stay in lockstep, and update the
    mapping table in `docs/ci-validate-alignment.md`. See the "Reconciliation
    checklist for test-adding PRs" in that document.
-3. A full green `validate.sh` delegates to `ci-hub apply-local-label` after its
+3. A full green `scripts/validate.rs` delegates to `ci-hub apply-local-label` after its
    ledger row is written. Do not add **`locally-validated`** by hand: the applier
    re-reads the counted exact-head row, hashes its log, publishes an immutable
    receipt, and only then comments and labels. The command can also be run

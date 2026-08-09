@@ -15,7 +15,7 @@
 # Output: a human-readable summary by default; machine-readable JSON with
 # --json (and/or written to a file with --out FILE).
 #
-# The assurance probes deliberately mirror validate.sh's host-capability-matched
+# The assurance probes deliberately mirror scripts/validate.rs's host-capability-matched
 # flags (NOT full --strict): --base-env=minimal --no-virtualize-cpuid
 # --max-timeslice=disabled. This runs on hosts without PMU access or CPUID
 # faulting, so the counts are comparable to the working-envelope rubric.

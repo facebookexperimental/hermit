@@ -10,7 +10,7 @@
 # This entrypoint is the shared local/GitHub execution path for the centralized
 # portable and privileged CI plans. Each gate is an independently boxed node
 # with explicit dependencies and resource limits (see ci/dag/README.md).
-# validate.sh and GitHub Actions both consume these exact DAG files.
+# scripts/validate.rs and GitHub Actions both consume these exact DAG files.
 #
 # Usage:
 #   ci/run-dag.sh <lane> [runner-args...]
@@ -27,7 +27,7 @@
 # Environment:
 #   SAFE_CI_DAG_RUNNER     override the runner executable to use.
 #   RUN_DAG_FILE_OVERRIDE  run this exact DAG file instead of ci/dag/<lane>.json.
-#                          Used by validate.sh --selective to feed a subset DAG
+#                          Used by scripts/validate.rs --selective to feed a subset DAG
 #                          (a dependency-closed slice of the lane) while keeping
 #                          the lane argument for runner labeling. The override
 #                          must exist and be readable, or run-dag.sh fails closed.

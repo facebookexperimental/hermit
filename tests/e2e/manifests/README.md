@@ -142,7 +142,7 @@ known-green envelope, use all three exact cell filters:
 the bounded expansion path: a passing probe is evidence for a later manifest
 ratchet, not an implicit promotion into the regression envelope.
 Callers that combine explicit mode/backend filters with CI policy must add
-`--ci-only`. This is how `validate.sh quick` avoids expanding the manual C
+`--ci-only`. This is how `scripts/validate.rs quick` avoids expanding the manual C
 inventory.
 
 ## Inventory and validation
@@ -175,7 +175,7 @@ cargo run -p hermit-manifest-plan -- --format text
 ./ci/test_harness.sh run --mode naked --test system-utils/random-device
 ```
 
-Both GitHub workflows and `validate.sh` execute the same portable and
+Both GitHub workflows and `scripts/validate.rs` execute the same portable and
 privileged DAG files. Each DAG has a manifest guest-build barrier followed by
 one structured selector per bucket. `audit-ci` fails if either caller stops
 delegating to the shared plans, a bucket node disappears, a command diverges

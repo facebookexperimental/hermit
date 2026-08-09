@@ -19,9 +19,9 @@ implementation issue and link it here.
 > environment-independent subset only, not the PMU- and namespace-dependent
 > integration matrix.
 
-## `validate.sh` levels
+## `scripts/validate.rs` levels
 
-`./validate.sh` accepts one optional validation level. With no level argument,
+`./scripts/validate.rs` accepts one optional validation level. With no level argument,
 it runs `full` for backward compatibility.
 
 | Level | Typical estimate | Coverage |
@@ -35,9 +35,9 @@ Select a level positionally or with `VALIDATE_LEVEL`. The long-form aliases are
 useful in scripts and make the intended capability tier explicit:
 
 ```sh
-./validate.sh --quick
-./validate.sh --portable
-VALIDATE_LEVEL=portable-only ./validate.sh
+./scripts/validate.rs --quick
+./scripts/validate.rs --portable
+VALIDATE_LEVEL=portable-only ./scripts/validate.rs
 ```
 
 `--quick` is an alias for `quick`; `--portable` and `--portable-only` are aliases

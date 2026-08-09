@@ -69,10 +69,8 @@ prune-stale-release: ## Remove target/release/hermit if stale (not built from cu
 	rm -f "$$bin"; \
 	echo "make: removed stale $$bin ($$reason); run 'make release-core' to rebuild it" >&2
 
-# NOTE: `validate` MUST stay a .PHONY target with an explicit recipe. Without it,
-# GNU Make's built-in implicit rule "%: %.sh" (cat $< >$@; chmod a+x $@) fires
-# against validate.sh and merely COPIES it to a file named `validate` instead of
-# running validation. .PHONY + this recipe overrides that implicit rule.
+# Keep `validate` as an explicit .PHONY convenience target for the sole Rust
+# validation entrypoint.
 validate: check-submodules ## Run the full validation suite (Rust driver; pass flags via ARGS)
 	./scripts/validate.rs $(ARGS)
 

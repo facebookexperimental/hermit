@@ -72,8 +72,9 @@ found, say so explicitly; do not invent work to satisfy the checklist.
 
 ## Canonical Catch
 
-`validate.sh -h` once exited successfully but printed every comment from the
-script, including `TODO-HUMAN-REVIEW` and `AUTONOMOUS-BOT-IMPLEMENTED` markers.
+The retired shell entrypoint's `-h` path once exited successfully but printed
+every source comment, including `TODO-HUMAN-REVIEW` and
+`AUTONOMOUS-BOT-IMPLEMENTED` markers.
 A pass/fail test saw exit 0. A UX test read the output and correctly reported:
 
 ```text

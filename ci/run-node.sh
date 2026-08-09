@@ -17,7 +17,7 @@
 # execution engine that diverged from the runner: it ignored each node's
 # jobs_flag, timeout, cpu_timeout, and cgroup boxing. This rewrite kills that
 # divergence — every node now runs through the SAME `safe-ci-dag-runner run`
-# entrypoint that validate.sh and run-dag.sh use, so ci/dag/<lane>.json is the
+# entrypoint that scripts/validate.rs and run-dag.sh use, so ci/dag/<lane>.json is the
 # single source of truth for both the command AND its resource policy.
 #
 # REQUIRES the pinned agent-utils runner to support `run --only` (added upstream

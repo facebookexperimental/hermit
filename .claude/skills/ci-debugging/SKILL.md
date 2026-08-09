@@ -33,12 +33,12 @@ to identify the failing tag, build prerequisites once, and then iterate only on
 that tag:
 
 ```bash
-./validate.sh --only portable test.sabre_examples
+./scripts/validate.rs --only portable test.sabre_examples
 ci/run-node.sh portable test.sabre_examples
 ci/run-node.sh portable e2e.manifest_backend_parity_c,test.dbt_parity
 ```
 
-Prefer `validate.sh --only` as the user-facing entrypoint. `ci/run-node.sh` is
+Prefer `scripts/validate.rs --only` as the user-facing entrypoint. `ci/run-node.sh` is
 useful when debugging the node runner itself. Do not rerun the full profile for
 every edit, and do not claim a focused node pass as full validation.
 

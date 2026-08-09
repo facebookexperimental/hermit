@@ -1743,20 +1743,20 @@
     {
       "disposition": "special-driver",
       "path": "tests/compat/complex_shell_workload.sh",
-      "runner": "validate.sh compatibility partitions",
-      "why": "tests/compat/complex_shell_workload.sh is owned by validate.sh compatibility partitions: The `complex_shell_workload` compatibility driver prepares or executes a heterogeneous command workload used by strict, DBT, SaBRe, LiteInst, or record/replay ratchets. validate.sh owns tool discovery and per-command expectations, so this is orchestration rather than one guest program."
+      "runner": "scripts/validate.rs compatibility partitions",
+      "why": "tests/compat/complex_shell_workload.sh is owned by scripts/validate.rs compatibility partitions: The `complex_shell_workload` compatibility driver prepares or executes a heterogeneous command workload used by strict, DBT, SaBRe, LiteInst, or record/replay ratchets. scripts/validate.rs owns tool discovery and per-command expectations, so this is orchestration rather than one guest program."
     },
     {
       "disposition": "special-driver",
       "path": "tests/compat/prepare_real_compat_fixtures.sh",
-      "runner": "validate.sh compatibility partitions",
-      "why": "tests/compat/prepare_real_compat_fixtures.sh is owned by validate.sh compatibility partitions: The `prepare_real_compat_fixtures` compatibility driver prepares or executes a heterogeneous command workload used by strict, DBT, SaBRe, LiteInst, or record/replay ratchets. validate.sh owns tool discovery and per-command expectations, so this is orchestration rather than one guest program."
+      "runner": "scripts/validate.rs compatibility partitions",
+      "why": "tests/compat/prepare_real_compat_fixtures.sh is owned by scripts/validate.rs compatibility partitions: The `prepare_real_compat_fixtures` compatibility driver prepares or executes a heterogeneous command workload used by strict, DBT, SaBRe, LiteInst, or record/replay ratchets. scripts/validate.rs owns tool discovery and per-command expectations, so this is orchestration rather than one guest program."
     },
     {
       "disposition": "special-driver",
       "path": "tests/compat/real_compat_workload.sh",
-      "runner": "validate.sh compatibility partitions",
-      "why": "tests/compat/real_compat_workload.sh is owned by validate.sh compatibility partitions: The `real_compat_workload` compatibility driver prepares or executes a heterogeneous command workload used by strict, DBT, SaBRe, LiteInst, or record/replay ratchets. validate.sh owns tool discovery and per-command expectations, so this is orchestration rather than one guest program."
+      "runner": "scripts/validate.rs compatibility partitions",
+      "why": "tests/compat/real_compat_workload.sh is owned by scripts/validate.rs compatibility partitions: The `real_compat_workload` compatibility driver prepares or executes a heterogeneous command workload used by strict, DBT, SaBRe, LiteInst, or record/replay ratchets. scripts/validate.rs owns tool discovery and per-command expectations, so this is orchestration rather than one guest program."
     },
     {
       "disposition": "guest-fixture",
@@ -1785,8 +1785,8 @@
     {
       "disposition": "special-driver",
       "path": "tests/debugger/run_debugger_tests.sh",
-      "runner": "validate.sh privileged debugger gate",
-      "why": "tests/debugger/run_debugger_tests.sh is owned by validate.sh privileged debugger gate: This driver allocates gdbserver sessions and runs four GDB/LLDB live/replay Python cases with shared cleanup. The privileged multi-process protocol cannot be reduced to the generic single-program manifest lifecycle."
+      "runner": "scripts/validate.rs privileged debugger gate",
+      "why": "tests/debugger/run_debugger_tests.sh is owned by scripts/validate.rs privileged debugger gate: This driver allocates gdbserver sessions and runs four GDB/LLDB live/replay Python cases with shared cleanup. The privileged multi-process protocol cannot be reduced to the generic single-program manifest lifecycle."
     },
     {
       "disposition": "guest-fixture",
@@ -2529,26 +2529,26 @@
     {
       "disposition": "special-driver",
       "path": "tests/qemu-boot/smoke_test.sh",
-      "runner": "validate.sh QEMU_L2_ONLY or the direct QEMU suite",
-      "why": "tests/qemu-boot/smoke_test.sh is owned by validate.sh QEMU_L2_ONLY or the direct QEMU suite: The `smoke_test` QEMU driver builds an initramfs, manages QMP/serial processes, and asserts guest boot or network state. Its nested VM lifecycle and downloaded kernel artifacts require dedicated orchestration outside the userspace program manifest."
+      "runner": "scripts/validate.rs QEMU_L2_ONLY or the direct QEMU suite",
+      "why": "tests/qemu-boot/smoke_test.sh is owned by scripts/validate.rs QEMU_L2_ONLY or the direct QEMU suite: The `smoke_test` QEMU driver builds an initramfs, manages QMP/serial processes, and asserts guest boot or network state. Its nested VM lifecycle and downloaded kernel artifacts require dedicated orchestration outside the userspace program manifest."
     },
     {
       "disposition": "special-driver",
       "path": "tests/qemu-boot/strict_l2_network_test.sh",
-      "runner": "validate.sh QEMU_L2_ONLY or the direct QEMU suite",
-      "why": "tests/qemu-boot/strict_l2_network_test.sh is owned by validate.sh QEMU_L2_ONLY or the direct QEMU suite: The `strict_l2_network_test` QEMU driver builds an initramfs, manages QMP/serial processes, and asserts guest boot or network state. Its nested VM lifecycle and downloaded kernel artifacts require dedicated orchestration outside the userspace program manifest."
+      "runner": "scripts/validate.rs QEMU_L2_ONLY or the direct QEMU suite",
+      "why": "tests/qemu-boot/strict_l2_network_test.sh is owned by scripts/validate.rs QEMU_L2_ONLY or the direct QEMU suite: The `strict_l2_network_test` QEMU driver builds an initramfs, manages QMP/serial processes, and asserts guest boot or network state. Its nested VM lifecycle and downloaded kernel artifacts require dedicated orchestration outside the userspace program manifest."
     },
     {
       "disposition": "special-driver",
       "path": "tests/qemu-boot/strict_l2_test.sh",
-      "runner": "validate.sh QEMU_L2_ONLY or the direct QEMU suite",
-      "why": "tests/qemu-boot/strict_l2_test.sh is owned by validate.sh QEMU_L2_ONLY or the direct QEMU suite: The `strict_l2_test` QEMU driver builds an initramfs, manages QMP/serial processes, and asserts guest boot or network state. Its nested VM lifecycle and downloaded kernel artifacts require dedicated orchestration outside the userspace program manifest."
+      "runner": "scripts/validate.rs QEMU_L2_ONLY or the direct QEMU suite",
+      "why": "tests/qemu-boot/strict_l2_test.sh is owned by scripts/validate.rs QEMU_L2_ONLY or the direct QEMU suite: The `strict_l2_test` QEMU driver builds an initramfs, manages QMP/serial processes, and asserts guest boot or network state. Its nested VM lifecycle and downloaded kernel artifacts require dedicated orchestration outside the userspace program manifest."
     },
     {
       "disposition": "special-driver",
       "path": "tests/qemu-boot/strict_l2_userspace_test.sh",
-      "runner": "validate.sh QEMU_L2_ONLY or the direct QEMU suite",
-      "why": "tests/qemu-boot/strict_l2_userspace_test.sh is owned by validate.sh QEMU_L2_ONLY or the direct QEMU suite: The `strict_l2_userspace_test` QEMU driver builds an initramfs, manages QMP/serial processes, and asserts guest boot or network state. Its nested VM lifecycle and downloaded kernel artifacts require dedicated orchestration outside the userspace program manifest."
+      "runner": "scripts/validate.rs QEMU_L2_ONLY or the direct QEMU suite",
+      "why": "tests/qemu-boot/strict_l2_userspace_test.sh is owned by scripts/validate.rs QEMU_L2_ONLY or the direct QEMU suite: The `strict_l2_userspace_test` QEMU driver builds an initramfs, manages QMP/serial processes, and asserts guest boot or network state. Its nested VM lifecycle and downloaded kernel artifacts require dedicated orchestration outside the userspace program manifest."
     },
     {
       "disposition": "guest-fixture",
@@ -3003,8 +3003,8 @@
     {
       "disposition": "integration-helper",
       "path": "tests/util/chaos_stress_wrapper.sh",
-      "runner": "validate.sh or Hermit integration targets",
-      "why": "tests/util/chaos_stress_wrapper.sh is owned by validate.sh or Hermit integration targets: The `chaos_stress_wrapper` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
+      "runner": "scripts/validate.rs or Hermit integration targets",
+      "why": "tests/util/chaos_stress_wrapper.sh is owned by scripts/validate.rs or Hermit integration targets: The `chaos_stress_wrapper` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
     },
     {
       "disposition": "special-driver",
@@ -3021,8 +3021,8 @@
     {
       "disposition": "integration-helper",
       "path": "tests/util/hermit_analyze_test.sh",
-      "runner": "validate.sh or Hermit integration targets",
-      "why": "tests/util/hermit_analyze_test.sh is owned by validate.sh or Hermit integration targets: The `hermit_analyze_test` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
+      "runner": "scripts/validate.rs or Hermit integration targets",
+      "why": "tests/util/hermit_analyze_test.sh is owned by scripts/validate.rs or Hermit integration targets: The `hermit_analyze_test` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
     },
     {
       "disposition": "special-driver",
@@ -3033,8 +3033,8 @@
     {
       "disposition": "integration-helper",
       "path": "tests/util/perf_supported.sh",
-      "runner": "validate.sh or Hermit integration targets",
-      "why": "tests/util/perf_supported.sh is owned by validate.sh or Hermit integration targets: The `perf_supported` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
+      "runner": "scripts/validate.rs or Hermit integration targets",
+      "why": "tests/util/perf_supported.sh is owned by scripts/validate.rs or Hermit integration targets: The `perf_supported` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
     },
     {
       "disposition": "manifest-test",
@@ -3045,14 +3045,14 @@
     {
       "disposition": "integration-helper",
       "path": "tests/util/simplest_server.py",
-      "runner": "validate.sh or Hermit integration targets",
-      "why": "tests/util/simplest_server.py is owned by validate.sh or Hermit integration targets: The `simplest_server` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
+      "runner": "scripts/validate.rs or Hermit integration targets",
+      "why": "tests/util/simplest_server.py is owned by scripts/validate.rs or Hermit integration targets: The `simplest_server` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
     },
     {
       "disposition": "integration-helper",
       "path": "tests/util/ssl_server.py",
-      "runner": "validate.sh or Hermit integration targets",
-      "why": "tests/util/ssl_server.py is owned by validate.sh or Hermit integration targets: The `ssl_server` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
+      "runner": "scripts/validate.rs or Hermit integration targets",
+      "why": "tests/util/ssl_server.py is owned by scripts/validate.rs or Hermit integration targets: The `ssl_server` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
     },
     {
       "disposition": "special-driver",

@@ -50,7 +50,7 @@ explicitly listed as inert policy.
 A change is a set of changed files. Each file is classified:
 
 - **force_full** — a file whose blast radius cannot be reasoned about locally
-  (build config, toolchain, the CI harness itself, `validate.sh`). Any such file
+  (build config, toolchain, the CI harness itself, `scripts/validate.rs`). Any such file
   ⇒ run the entire suite.
 - **footprint** — a file matching a `paths` glob contributes that entry's
   `nodes` (unioned across all matching entries).
@@ -139,7 +139,7 @@ differently in the two places CI runs:
 | Context | Delta | Invocation |
 | --- | --- | --- |
 | **GitHub PR** | the PR's own contribution vs the target branch | `ci/select-tests.rs --base origin/main` (uses `origin/main...HEAD`, the merge-base) |
-| **Local `validate.sh`** | dirty working copy + commits since the last known-green commit | `ci/select-tests.rs --since-green --baseline <sha>` |
+| **Local `scripts/validate.rs`** | dirty working copy + commits since the last known-green commit | `ci/select-tests.rs --since-green --baseline <sha>` |
 
 `--since-green` computes `committed-since-baseline ∪ staged ∪ unstaged ∪
 untracked`. The baseline SHA comes from `--baseline` or the
@@ -156,11 +156,11 @@ consequences:
 2. **The baseline SHA is supplied by the validate-run-ledger.** This tool is
    storage-agnostic: it does not decide what "green" means or remember past
    runs. The [`validate-run-ledger`](../../CLAUDE.md) records, per slot, the last
-   commit whose validate run was green; a `validate.sh` wrapper reads that SHA
+   commit whose validate run was green; a `scripts/validate.rs` wrapper reads that SHA
    and passes it in. See "Integration contract" below.
 
 > **Known blocker.** A robustly-green baseline does not yet exist on developer
-> hosts: full `validate.sh` cannot exit 0 on a devserver (host-sensitive detcore
+> hosts: full `scripts/validate.rs` cannot exit 0 on a devserver (host-sensitive detcore
 > tests — futex-absolute-timeout, RDRAND/RDSEED — plus the DynamoRIO
 > cold-checkout failure). Until that is resolved the *local* baseline is
 > untrustworthy and `--since-green` correctly falls back to full. The GitHub
@@ -221,7 +221,7 @@ Two honesty caveats are built into the output:
 The selector consumes exactly one fact from the ledger: **the last-known-green
 commit SHA for the current slot**. The interface is intentionally minimal:
 
-- The ledger (or a `validate.sh` wrapper over it) exports
+- The ledger (or a `scripts/validate.rs` wrapper over it) exports
   `HERMIT_LAST_GREEN_SHA=<40-hex>` or passes `--baseline <40-hex>`.
 - If that SHA is absent or empty, the selector returns **full** (fail-safe).
 - The selector does not write to the ledger and does not define "green"; the

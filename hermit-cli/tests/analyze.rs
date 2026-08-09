@@ -17,7 +17,7 @@
 //! The search bisects over chaos schedules and relies on PMU branch counters
 //! plus working user/mount namespaces, so the tests are `#[ignore]`d by default
 //! (like the `chaos_buck_*` cases in `hermit_modes.rs`) and are exercised
-//! explicitly by `validate.sh`. Run them with:
+//! explicitly by `scripts/validate.rs`. Run them with:
 //!
 //! ```text
 //! cargo test -p hermit --test analyze -- --ignored

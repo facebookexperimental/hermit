@@ -47,7 +47,7 @@ if [[ $build_job_context == launcher ]]; then
     unset REVERIE_DBT_BUDGET_CHILD
 
     # Cargo converts this explicit pool width into build-script NUM_JOBS. Keep
-    # the nested native-build knob identical so validate.sh cannot widen it.
+    # the nested native-build knob identical so the Rust validator cannot widen it.
     export CARGO_BUILD_JOBS=$CI_DAG_BUILD_JOBS
     export THIRD_PARTY_BUILD_JOBS=$CI_DAG_BUILD_JOBS
     return 0

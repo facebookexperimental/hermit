@@ -31,7 +31,7 @@ on:
 #
 # This required check is the SOLE required status check on main (branch ruleset
 # "main no-bypass gate", 2026-08-02): it accepts an exact PR head when EITHER a
-# fully green local validate.sh run recorded exact-head evidence and then applied
+# fully green local scripts/validate.rs run recorded exact-head evidence and then applied
 # the locally-validated label, OR the
 # GitHub-Actions leg is green -- and GitHub-Actions-green now means the portable
 # job AND the privileged job both succeeded, not the portable job alone. The

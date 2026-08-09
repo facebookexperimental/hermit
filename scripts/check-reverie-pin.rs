@@ -954,7 +954,7 @@ fn extract_cache_key_shas(line: &str) -> Vec<String> {
 /// short forms to each other, bind each to the pin the manifests already agree
 /// on: its short SHA MUST be a prefix of the full 40-hex rev. That also makes
 /// them mutually consistent (all prefixes of one rev). Hard, offline (no
-/// network), and shared by all three enforcement paths (hook, validate.sh, CI)
+/// network), and shared by all three enforcement paths (hook, scripts/validate.rs, CI)
 /// because every consumer already invokes this one checker.
 fn check_liteinst_cache_keys(root: &Path, pin: &str) -> Result<i32, String> {
     // Exclude this checker's own source: it embeds deliberately-drifted example

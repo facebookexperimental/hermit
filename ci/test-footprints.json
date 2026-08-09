@@ -609,7 +609,7 @@
     "rust-toolchain.toml",
     ".cargo/**",
     "ci/**",
-    "validate.sh",
+    "scripts/validate.rs",
     "scripts/lib/**",
     ".github/workflows/ci-portable.yml",
     ".github/workflows/merge-gate.yml",

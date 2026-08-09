@@ -38,7 +38,7 @@ cargo test -p hermit --test rr_suite -- --ignored          # all
 cargo test -p hermit --test rr_suite -- --ignored rr_hello # one
 ```
 
-`validate.sh` runs the full suite as its "rr syscall suite" check.
+`scripts/validate.rs` runs the full suite as its "rr syscall suite" check.
 
 ## Coverage
 

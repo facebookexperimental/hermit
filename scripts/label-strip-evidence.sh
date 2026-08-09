@@ -80,7 +80,7 @@ if [[ -z $PR ]]; then
     exit 0
 fi
 
-# gh on Meta devservers needs the forward proxy; mirror validate.sh.
+# gh on Meta devservers needs the forward proxy; mirror scripts/validate.rs.
 gh_cmd=(gh)
 if command -v with-proxy >/dev/null 2>&1; then
     gh_cmd=(with-proxy gh)
@@ -122,7 +122,7 @@ if [[ -n $prior_evidence ]]; then
     quoted="$(printf '%s\n' "$prior_evidence" | sed 's/^/> /')"
     evidence_block=$'**Preserved prior validation evidence (add-time comment):**\n\n'"$quoted"
 else
-    evidence_block=$'**Preserved prior validation evidence:** none found on this PR — the label may have been applied outside `validate.sh`. The validated commit is recorded above so the record is not wholly lost.'
+    evidence_block=$'**Preserved prior validation evidence:** none found on this PR — the label may have been applied outside `scripts/validate.rs`. The validated commit is recorded above so the record is not wholly lost.'
 fi
 
 actor_line=""

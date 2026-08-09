@@ -35,7 +35,7 @@ leading mode to trailing modes**.
 3. **App matrix**: one row per identical program/workload, columns for strict
    verify, R/R, DBT, and KVM. Include at least a trivial ELF, a file-processing
    tool, an interpreter, a concurrent pipeline, and a toolchain frontend.
-4. **Repository health**: `cargo test`, `validate.sh`, the working-envelope
+4. **Repository health**: `cargo test`, `scripts/validate.rs`, the working-envelope
    vector, focused R/R suite, and live main CI. Preserve incomplete-run status.
 5. **Gaps and next actions**: order by the first mode where support drops.
 6. **Unlanded footnote**: at most three bullets with links; no unlanded result
@@ -97,8 +97,8 @@ and successful round trip.
 ```bash
 cargo test 2>&1 | tee /tmp/progress-cargo-test.log
 cargo test -p hermit --test record_replay -- --test-threads=1
-./validate.sh 2>&1 | tee /tmp/progress-validate.log
-ENVELOPE_JSON=/tmp/progress-envelope.json ./validate.sh --envelope-only
+./scripts/validate.rs 2>&1 | tee /tmp/progress-validate.log
+ENVELOPE_JSON=/tmp/progress-envelope.json ./scripts/validate.rs --envelope-only
 with-proxy gh run list -R rrnewton/hermit --branch main --limit 6
 ```
 

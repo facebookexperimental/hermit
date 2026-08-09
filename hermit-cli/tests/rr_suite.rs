@@ -29,7 +29,7 @@
 //!
 //! The programs are ptrace-heavy and rely on PMU branch counters plus working
 //! user/mount namespaces, so like the other Hermit integration suites these are
-//! `#[ignore]`d by default and exercised explicitly (e.g. from `validate.sh`):
+//! `#[ignore]`d by default and exercised explicitly (e.g. from `scripts/validate.rs`):
 //!
 //! ```text
 //! cargo test -p hermit --test rr_suite -- --ignored

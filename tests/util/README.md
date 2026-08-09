@@ -24,7 +24,7 @@ The reported margin is twice the largest observed skid, with a minimum of 100
 RCBs. It is an empirical starting point rather than a hardware guarantee; run
 the tool repeatedly under representative host load before changing a margin.
 
-`validate.sh` runs this calibration before every PMU-dependent analyze test and
+`scripts/validate.rs` runs this calibration before every PMU-dependent analyze test and
 passes the result through `HERMIT_ANALYZE_SKID_MARGIN`. Analyze uses the larger
 of the calibrated recommendation and a conservative 20,000-RCB floor, because
 short idle-host probes did not capture a 10,366-RCB tail observed while

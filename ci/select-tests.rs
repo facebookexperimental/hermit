@@ -644,7 +644,7 @@ fn local_changed_files(baseline: &str) -> Vec<String> {
 ///
 /// Contract with `validate-run-ledger` (237b): the ledger owns the authoritative
 /// "last commit whose validate run was green in this slot" record. This tool
-/// stays storage-agnostic — the caller (a validate.sh wrapper) resolves the SHA
+/// stays storage-agnostic — the caller (a scripts/validate.rs wrapper) resolves the SHA
 /// from the ledger and passes it via `--baseline`, or exports it as
 /// `HERMIT_LAST_GREEN_SHA`. If neither is present, there is NO trustworthy
 /// baseline, so selection MUST fall back to the full suite (never skip on an

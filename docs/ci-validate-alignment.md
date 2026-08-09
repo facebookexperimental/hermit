@@ -6,14 +6,14 @@ This source code is licensed under the BSD-style license found in the
 LICENSE file in the root directory of this source tree.
 -->
 
-# CI and validate.sh alignment
+# CI and scripts/validate.rs alignment
 
 Hermit CI is partitioned by host capability, not by test duration:
 
 | Lane | Workflow and runner | Local command | Capability contract |
 | --- | --- | --- | --- |
-| Portable | `ci-portable.yml`, `ubuntu-latest` | `./validate.sh portable-only --no-label-pr` | No PMU counters, CPUID faulting, or KVM |
-| Privileged | `ci-privileged.yml`, `[Linux, X64, hermit, pmu]` | `./validate.sh --privileged-only --no-label-pr` | PMU overflow delivery, CPUID faulting, and read/write `/dev/kvm` |
+| Portable | `ci-portable.yml`, `ubuntu-latest` | `./scripts/validate.rs portable-only --no-label-pr` | No PMU counters, CPUID faulting, or KVM |
+| Privileged | `ci-privileged.yml`, `[Linux, X64, hermit, pmu]` | `./scripts/validate.rs --privileged-only --no-label-pr` | PMU overflow delivery, CPUID faulting, and read/write `/dev/kvm` |
 
 The portable workflow is the required broad product gate. The privileged
 workflow is a focused capability sentinel and must finish in less than five
@@ -86,7 +86,7 @@ The DAG's longest configured timeout path is 240 seconds (120-second build plus
 120-second KVM E2E), and the manifest audit fails if later edits exceed the
 outer bound.
 
-Both `validate.sh` and GitHub Actions execute these exact DAG files. Use
+Both `scripts/validate.rs` and GitHub Actions execute these exact DAG files. Use
 `ci/run-dag.sh portable ascii` or `ci/run-dag.sh privileged ascii` to audit the
 dependency layers without running tests. `ci/test_harness.sh audit-ci` hashes
 the ordered step IDs and commands and verifies both callers still delegate to

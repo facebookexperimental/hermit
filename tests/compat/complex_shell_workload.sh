@@ -14,7 +14,7 @@ export LC_ALL=C
 export PATH=/usr/bin:/bin
 
 # Work directory: prefer a caller-supplied, per-invocation-unique path ($1) so
-# concurrent `validate.sh` runs never collide on a shared directory under
+# concurrent `scripts/validate.rs` runs never collide on a shared directory under
 # `--verify` (which shares the real host FS between run 1 and run 2). Fall back
 # to a fresh `mktemp -d` when invoked standalone. A fixed path is unsafe: two
 # concurrent `hermit --verify` processes writing the same tree perturb each

@@ -14,7 +14,7 @@ Build e9patch and point Hermit at both executables:
 ```bash
 HERMIT_E9TOOL=/path/to/e9tool \
 HERMIT_E9PATCH_BACKEND=/path/to/e9patch \
-./validate.sh --e9patch-compat-only
+./scripts/validate.rs --e9patch-compat-only
 ```
 
 The mode runs the 155 semantic installed-program probes in the compatibility

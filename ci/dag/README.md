@@ -7,7 +7,7 @@ with explicit dependencies and resource limits, so the scheduler can run
 independent gates concurrently. On hosts with delegated cgroup v2 support, it
 can also box each node for memory limits and full process-subtree teardown.
 
-- [`portable.json`](portable.json) — drives `validate.sh`'s **`--portable-only`**
+- [`portable.json`](portable.json) — drives `scripts/validate.rs`'s **`--portable-only`**
   lane and the GitHub-managed portable `regular` job in
   [`.github/workflows/ci-portable.yml`](../../.github/workflows/ci-portable.yml).
   No PMU / CPUID interception required.
@@ -31,7 +31,7 @@ ci/run-dag.sh portable   ascii                   # visualize instead of run
 the merge-gate contract stay unchanged; only the internal scheduler changes (the
 former outer PMU `flock` was retired — see below). The DAG files are the
 load-bearing source of truth
-for individual gate commands; `validate.sh` delegates to them.
+for individual gate commands; `scripts/validate.rs` delegates to them.
 
 The privileged DAG is limited to the focused build, CPUID faulting, PMU skid,
 manifest validation, and KVM E2E cells so the required self-hosted smoke stays
@@ -80,9 +80,9 @@ every required run so estimates can be replaced with measurements.
 
 ## How gates map onto the DAG
 
-`validate.sh` already encodes a hand-rolled DAG:
+`scripts/validate.rs` already encodes a hand-rolled DAG:
 
-| `validate.sh` construct        | DAG equivalent                                   |
+| `scripts/validate.rs` construct        | DAG equivalent                                   |
 | ------------------------------ | ------------------------------------------------ |
 | `run_check NAME cmd…`          | one node (serial via a shared scarce resource)   |
 | `start_check NAME cmd…`        | one node with no scarce resource (parallelizes)  |
@@ -110,14 +110,14 @@ runtime output.
 
 ### Command fidelity
 
-Node `cmd`s are the **verbatim** commands `validate.sh` runs, with three
+Node `cmd`s are the **verbatim** commands `scripts/validate.rs` runs, with three
 deliberate exceptions, chosen to avoid duplicating script logic that has many
 moving parts:
 
-- **Composite envelope gates reuse `validate.sh`'s own standalone entrypoints**
+- **Composite envelope gates reuse `scripts/validate.rs`'s own standalone entrypoints**
   so there is one source of truth: `test.strict_compat` runs
-  `./validate.sh --portable-strict-compat-only`, and (privileged) `rr.compat_baseline`
-  runs `./validate.sh --rr-compat-only`. The privileged selector builds release;
+  `./scripts/validate.rs --portable-strict-compat-only`, and (privileged) `rr.compat_baseline`
+  runs `./scripts/validate.rs --rr-compat-only`. The privileged selector builds release;
   portable strict compatibility reuses `STRICT_COMPAT_HERMIT_BIN` from the
   preceding workspace build. Without that override, the strict flag builds
   release as before.
@@ -134,8 +134,8 @@ moving parts:
   and per-case `timeout`s to preserve fail-fast hardware isolation.
 - **The portable `envelope_levels` gate is inlined** (L1–L4 over the three
   `ENVELOPE_PROBES`: `true`, `echo`, `date`) because it has no standalone
-  `validate.sh` flag. It mirrors `run_portable_envelope_levels` in `validate.sh`.
-  If `ENVELOPE_PROBES` changes in `validate.sh`, update this node.
+  `scripts/validate.rs` flag. It mirrors `run_portable_envelope_levels` in `scripts/validate.rs`.
+  If `ENVELOPE_PROBES` changes in `scripts/validate.rs`, update this node.
 
 ## Resource model (outer + inner limits)
 
@@ -182,7 +182,7 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
 
 ## Conservatism and how to relax it
 
-The `hermit_guest: 1` serialization faithfully reproduces `validate.sh`, which
+The `hermit_guest: 1` serialization faithfully reproduces `scripts/validate.rs`, which
 ran these gates strictly one-after-another. It is intentionally conservative: as
 individual guest gates are shown to be safe to co-run (e.g. distinct scratch
 directories, no shared fixture), drop their `resources` hint (or raise the cap)

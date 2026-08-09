@@ -419,9 +419,8 @@ function assert_privileged_diagnostics {
         die "GitHub occasional KVM diagnostics must publish structured results"
 }
 
-# The production validation driver is scripts/validate.rs. validate.sh is only a
-# historical compatibility shim; Make, workflows, and DAGs must call Rust
-# directly so the removed shell implementation cannot return to production.
+# The production validation driver is scripts/validate.rs. The retired shell
+# entrypoint must stay absent; Make, workflows, and DAGs call Rust directly.
 #
 # These assertions replace the former `assert_validate_entrypoint` audits over
 # bash function bodies. The property audited is unchanged and is the one that
@@ -433,13 +432,10 @@ function assert_validate_driver_entrypoint {
     local plan_src="$ROOT_DIR/scripts/lib/validate_plan.rs"
     local driver="$ROOT_DIR/scripts/validate.rs"
 
-    [[ -x $shim && -x $driver ]] ||
-        die "validate.sh and scripts/validate.rs must both be executable entrypoints"
-    # A shim, not a second implementation: exactly one non-comment, non-blank line.
-    [[ $(grep -Ecv '^[[:space:]]*(#|$)' "$shim") == 1 ]] ||
-        die "validate.sh must remain a shim: it may contain exactly one executable line"
-    grep -Fqx 'exec "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/scripts/validate.rs" "$@"' "$shim" ||
-        die "validate.sh must exec scripts/validate.rs and forward every argument untouched"
+    [[ ! -e $shim ]] ||
+        die "the retired shell validation entrypoint must remain deleted"
+    [[ -x $driver ]] ||
+        die "scripts/validate.rs must be the executable validation entrypoint"
     ! jq -r '.steps[].cmd' "$ROOT_DIR/ci/dag/portable.json" | grep -Fq './validate.sh' ||
         die "the portable DAG must invoke the Rust validation driver directly"
     [[ $(grep -Fc 'run: ./scripts/validate.rs' "$ROOT_DIR/.github/workflows/validation-levels.yml") == 3 ]] ||

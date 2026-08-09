@@ -7,11 +7,8 @@
 //!
 //! validate.rs — Hermit's validation driver.
 //!
-//! This is THE driver. `validate.sh` is a five-line shim that `exec`s this file;
-//! there is no second implementation. The shim exists only so that `validate.sh`
-//! remains a valid entrypoint name at every commit, which is what lets `git
-//! bisect`, `ci-hub`, and historical replay invoke one command across the
-//! refactor boundary. A shim is a STABLE NAME, not a second version.
+//! This is the sole validation driver. Every production caller invokes it
+//! directly; the former shell entrypoint has been removed.
 //!
 //! # Contract
 //!
@@ -35,10 +32,10 @@
 //!
 //! # CLI
 //!
-//! The flag surface is `validate.sh`'s, verbatim, because the shim forwards `"$@"`
-//! untouched and because in-tree callers already depend on it — notably
+//! The flag surface preserves the former driver's CLI because in-tree callers
+//! depend on it — notably
 //! `ci/dag/portable.json`'s `test.strict_compat` node, which invokes
-//! `./validate.sh --portable-strict-compat-only`, plus
+//! `./scripts/validate.rs --portable-strict-compat-only`, plus
 //! `.github/workflows/validation-levels.yml`, three `Makefile` targets, and
 //! `hermit-cli/tests/{analyze,rr_suite}.rs`. Changing the surface would have
 //! required touching all of them in the same change.
@@ -448,7 +445,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                 let nodes = argv.get(i + 2).cloned().unwrap_or_default();
                 if lane.is_empty() || nodes.is_empty() {
                     eprintln!("validate: --only needs <lane> <group.job>[,<group.job>...]");
-                    eprintln!("          e.g. ./validate.sh --only portable test.sabre_examples");
+                    eprintln!("          e.g. ./scripts/validate.rs --only portable test.sabre_examples");
                     return Err(2);
                 }
                 focused.push(Focused::Only { lane, nodes });
@@ -972,7 +969,7 @@ fn super_plan_bracket() -> Result<(), String> {
 /// Assert the `--envelope-only` / `--envelope-compare FILE` surface, and that it
 /// actually plans the envelope measurement.
 ///
-/// `scripts/progress-report.sh:102` runs `./validate.sh --envelope-only` and the
+/// `scripts/progress-report.sh:102` runs `./scripts/validate.rs --envelope-only` and the
 /// progress-rubric skill runs it with `ENVELOPE_JSON=...`. Those callers break
 /// silently if the flag stops being accepted or starts meaning something else.
 /// The parser and planner are exercised in-process, so the bracket measures the
@@ -3448,7 +3445,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // ---- re-entrancy (validate.sh:460) ---------------------------------------
     //
     // `ci/dag/portable.json`'s `test.strict_compat` node runs
-    // `./validate.sh --portable-strict-compat-only`, so re-entry is a DESIGNED
+    // `./scripts/validate.rs --portable-strict-compat-only`, so re-entry is a DESIGNED
     // path. What must never happen is a full driver inside a full driver: it pays
     // the whole preamble twice, appends a SECOND ledger row, and can publish a
     // SECOND receipt for one logical run. A nested FOCUSED invocation is a

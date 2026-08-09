@@ -10,7 +10,7 @@ The required status is `merge-gate-v4`. Its job passes when either:
   `.github/workflows/ci-privileged.yml` runs for the exact pull request head
   both completed successfully; or
 - the pull request has the `locally-validated` label and an exact-head receipt
-  whose immutable content proves a counted, clean, full `./validate.sh` pass.
+  whose immutable content proves a counted, clean, full `./scripts/validate.rs` pass.
 
 Every check reader uses three outcomes:
 
@@ -84,7 +84,7 @@ Replace `REPOSITORY` with `hermit` or `reverie`.
 
 ## Local validation
 
-A full green `./validate.sh` run writes its local ledger row on exit and then
+A full green `./scripts/validate.rs` run writes its local ledger row on exit and then
 delegates to the parent `ci-hub apply-local-label`. The applier requires that
 exact head to have a clean, commit-anchored, full-selection PASS with a nonzero
 executed-test count, hashes the referenced log, and publishes the selected row
@@ -93,7 +93,7 @@ exists does it post the binding comment and apply `locally-validated`.
 Publication or GitHub failures fail closed; the command can be run manually to
 backfill a validated head.
 
-Use `./validate.sh --no-label-pr` or `VALIDATE_LABEL_PR=0 ./validate.sh`
+Use `./scripts/validate.rs --no-label-pr` or `VALIDATE_LABEL_PR=0 ./scripts/validate.rs`
 when a green run must not update GitHub.
 
 The label is an alternate merge admission signal, not a partial-test waiver.
