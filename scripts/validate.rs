@@ -777,6 +777,27 @@ cleared-caps refusal names {} starved step(s)",
                     .into(),
             );
         }
+        if privileged_build.cmd.contains("cargo ")
+            || !privileged_build.cmd.contains("target/debug/hermit")
+            || !privileged_build.cmd.contains("tests_misc-*")
+        {
+            return Err(
+                "full-plan bracket: privileged build did not become an exact artifact assertion"
+                    .into(),
+            );
+        }
+        let cpuid = full
+            .cfg
+            .steps
+            .iter()
+            .find(|s| s.tag() == "privileged-cpuid.faulting")
+            .ok_or("full-plan bracket: privileged CPUID node disappeared")?;
+        if cpuid.cmd.contains("cargo ") || !cpuid.cmd.contains("rdrand_rdseed_is_masked") {
+            return Err(
+                "full-plan bracket: CPUID test does not directly execute the prebuilt binary"
+                    .into(),
+            );
+        }
         let sequential_args = parse_argv(&[
             "full".into(),
             "--sequential-lanes".into(),
@@ -1943,10 +1964,31 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             .iter_mut()
             .find(|s| s.tag() == consumer)
             .ok_or_else(|| format!("fused artifact consumer disappeared: {consumer}"))?;
+        let expected_build = "CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run";
+        if privileged_build.cmd != expected_build {
+            return Err(format!(
+                "fused privileged build command drifted; re-prove that portable-build.workspace is a superset: {}",
+                privileged_build.cmd
+            ));
+        }
         if !privileged_build.deps.iter().any(|d| d == producer) {
             privileged_build.deps.push(producer.to_string());
             privileged_build.deps.sort();
         }
+        privileged_build.cmd = "test -x target/debug/hermit && count=0; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ]; then count=$((count + 1)); fi; done; test \"$count\" -eq 1".to_string();
+
+        let cpuid = steps
+            .iter_mut()
+            .find(|s| s.tag() == "privileged-cpuid.faulting")
+            .ok_or("fused prebuilt CPUID consumer disappeared")?;
+        let expected_cpuid = "timeout 30 cargo test -p hermit-detcore --test tests_misc rdrand_rdseed_is_masked -- --exact";
+        if cpuid.cmd != expected_cpuid {
+            return Err(format!(
+                "fused CPUID command drifted; re-prove direct prebuilt invocation: {}",
+                cpuid.cmd
+            ));
+        }
+        cpuid.cmd = "bins=(); for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ]; then bins+=(\"$f\"); fi; done; ((${#bins[@]} == 1)); timeout 30 \"${bins[0]}\" rdrand_rdseed_is_masked --exact".to_string();
     }
     // Fusing lanes means one config for both. Their default wall timeouts differ,
     // but every shipped/synthesized node has an explicit wall timeout and the
