@@ -162,7 +162,8 @@ workflow.
 
 The `main` branch rulesets must:
 
-1. contain no `required_status_checks` rule—hosted checks are advisory;
+1. keep the legacy check-gating ruleset rule-empty—hosted checks and PR state
+   are advisory;
 2. disallow non-fast-forward updates; and
 3. disallow branch deletion.
 
@@ -172,12 +173,14 @@ Verify the live rule without mutating it:
 with-proxy scripts/configure-merge-gate-ruleset.sh --check
 ```
 
-That checker refuses any required-status-check rule and `--apply` removes such
-rules while preserving every unrelated field. The separate history-protection
-ruleset remains the authority for non-fast-forward and deletion refusal.
+That checker refuses any rule in the check-gating ruleset and `--apply` empties
+its rule list while preserving the ruleset envelope. The separate
+history-protection ruleset remains the authority for non-fast-forward and
+deletion refusal.
 
-If a stale writer reintroduces hosted-check gating, run `--apply`; it removes
-every required-status-check rule and verifies the complete normalized result.
+If a stale writer reintroduces a landing rule, run `--apply`; it removes every
+rule from the legacy check-gating ruleset and verifies the complete normalized
+result.
 Each full-object PUT is preceded by a fresh equality check, which detects
 policy drift already visible before the write. GitHub exposes no conditional
 PUT for this endpoint, so a narrow read-to-write TOCTOU window remains; the

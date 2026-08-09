@@ -93,13 +93,13 @@ positive=0
 write_gated_ruleset
 
 if run_configure --check >"$tmp/check-gated.out" 2>&1; then
-    echo "FAIL: a required hosted status check was accepted" >&2
+    echo "FAIL: pull-request and hosted-check landing rules were accepted" >&2
     exit 1
-elif grep -Fq 'contexts=merge-gate-v4' "$tmp/check-gated.out"; then
+elif grep -Fq 'types=pull_request,required_status_checks' "$tmp/check-gated.out"; then
     negative=$((negative + 1))
 else
     cat "$tmp/check-gated.out" >&2
-    echo "FAIL: refusal did not name the required hosted context" >&2
+    echo "FAIL: refusal did not name both prohibited landing rules" >&2
     exit 1
 fi
 
@@ -118,7 +118,7 @@ fi
 
 write_gated_ruleset
 run_configure --apply >"$tmp/apply.out"
-[[ $(jq '[.rules[].type] == ["pull_request"]' "$tmp/state/ruleset.json") == true ]]
+[[ $(jq '.rules == []' "$tmp/state/ruleset.json") == true ]]
 [[ $(jq '.bypass_actors == [{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}]' \
     "$tmp/state/ruleset.json") == true ]]
 [[ $(<"$tmp/state/put-count") == 1 ]]
@@ -134,4 +134,4 @@ positive=$((positive + 1))
 printf 'NEGATIVE refusals: %d/2   POSITIVE acceptances: %d/2\n' \
     "$negative" "$positive"
 [[ $negative == 2 && $positive == 2 ]]
-echo "PASS: hosted checks are advisory and unrelated ruleset policy is preserved"
+echo "PASS: the check-gating ruleset is inert and its envelope is preserved"

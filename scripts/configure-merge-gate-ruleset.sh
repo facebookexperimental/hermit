@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Keep Hermit's main-branch check ruleset advisory.  Owner policy permits an
+# Keep Hermit's legacy main-branch check ruleset inert.  Owner policy permits an
 # exact-head green branch to land by fast-forward without waiting for hosted
 # GitHub checks; deletion and non-fast-forward updates remain prohibited by the
 # separate "main history protection" ruleset.
@@ -18,9 +18,8 @@ usage() {
 Usage: scripts/configure-merge-gate-ruleset.sh MODE [options]
 
 Modes:
-  --check          Verify that hosted status checks are advisory (default).
-  --apply          Remove every required-status-check rule while preserving all
-                   other ruleset fields.
+  --check          Verify that the check-gating ruleset has no rules (default).
+  --apply          Remove every rule while preserving the ruleset envelope.
 
 Options:
   --repo R         Repository (default: rrnewton/hermit).
@@ -74,24 +73,21 @@ policy_fingerprint() {
     normalized_policy | sha256sum | awk '{print $1}'
 }
 
-required_status_rule_count() {
-    jq '[.rules[] | select(.type == "required_status_checks")] | length'
+landing_rule_count() {
+    jq '.rules | length'
 }
 
 current=$(read_ruleset)
-required_count=$(required_status_rule_count <<<"$current")
+rule_count=$(landing_rule_count <<<"$current")
 
 if [[ $mode == check ]]; then
-    if [[ $required_count != 0 ]]; then
-        contexts=$(jq -r '[.rules[]
-          | select(.type == "required_status_checks")
-          | .parameters.required_status_checks[]?.context] | unique | join(",")' \
-          <<<"$current")
-        printf 'FAIL: ruleset %s has %s required-status-check rule(s) (contexts=%s); hosted checks must remain advisory.\n' \
-            "$ruleset_id" "$required_count" "${contexts:-none}" >&2
+    if [[ $rule_count != 0 ]]; then
+        rule_types=$(jq -r '[.rules[].type] | unique | join(",")' <<<"$current")
+        printf 'FAIL: ruleset %s has %s landing rule(s) (types=%s); only the separate history ruleset may restrict main.\n' \
+            "$ruleset_id" "$rule_count" "${rule_types:-none}" >&2
         exit 1
     fi
-    printf 'PASS: ruleset %s has no required status checks; hosted checks are advisory.\n' \
+    printf 'PASS: ruleset %s has no landing rules; hosted checks and PR state are advisory.\n' \
         "$ruleset_id"
     exit 0
 fi
@@ -102,7 +98,7 @@ desired=$(jq '
     target,
     enforcement,
     conditions,
-    rules: [.rules[] | select(.type != "required_status_checks")],
+    rules: [],
     bypass_actors
   }
 ' <<<"$current")
@@ -121,12 +117,12 @@ if [[ $(policy_fingerprint <<<"$current") != $(policy_fingerprint <<<"$desired")
 fi
 
 updated=$(read_ruleset)
-updated_required_count=$(required_status_rule_count <<<"$updated")
+updated_rule_count=$(landing_rule_count <<<"$updated")
 if [[ $(policy_fingerprint <<<"$updated") != $(policy_fingerprint <<<"$desired") ]] ||
-   [[ $updated_required_count != 0 ]]; then
+   [[ $updated_rule_count != 0 ]]; then
     printf 'configure-merge-gate-ruleset: GitHub accepted reconciliation but verification failed\n' >&2
     exit 1
 fi
 
-printf 'APPLIED: ruleset %s has no required status checks; all unrelated policy is unchanged.\n' \
+printf 'APPLIED: ruleset %s has no landing rules; the ruleset envelope is unchanged.\n' \
     "$ruleset_id"
