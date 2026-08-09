@@ -761,6 +761,21 @@ cleared-caps refusal names {} starved step(s)",
                 return Err(format!("full-plan bracket: fused plan lost {required}"));
             }
         }
+        let portable_build = full
+            .cfg
+            .steps
+            .iter()
+            .find(|s| s.tag() == "portable-build.workspace")
+            .ok_or("full-plan bracket: portable fat build disappeared")?;
+        if !portable_build.cmd.contains("cargo build --workspace --all-targets")
+            || !portable_build.cmd.contains("cargo build -p hermit")
+            || !portable_build.cmd.contains("--bin hermit")
+        {
+            return Err(
+                "full-plan bracket: fat build does not finish target/debug/hermit before fanout"
+                    .into(),
+            );
+        }
         let privileged_build = full
             .cfg
             .steps
@@ -1951,15 +1966,29 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     }
     if lanes.len() == 2 {
         // Sequential full validation implicitly warmed the privileged focused
-        // build with portable-build.workspace. Preserve that artifact ordering
-        // explicitly in the fused graph: running both cold Cargo builds at once
-        // duplicates compilation, contends on Cargo locks, and measured a
-        // 120.03 s timeout versus 6.32 s on the warm sequential baseline.
+        // build with portable-build.workspace. `cargo build --all-targets`
+        // emits the Hermit bin target as a test harness under target/debug/deps,
+        // not as target/debug/hermit. Finish that producer with the warm,
+        // ordinary bin build before releasing its dependents: otherwise an E2E
+        // bucket can observe the absent executable. Keeping both invocations in
+        // the producer also prevents the warm build from starving behind all of
+        // the other Cargo consumers once the fat build releases the graph.
         let producer = "portable-build.workspace";
         let consumer = "privileged-build.privileged_tests";
-        if !steps.iter().any(|s| s.tag() == producer) {
-            return Err(format!("fused artifact producer disappeared: {producer}"));
+        let portable_build = steps
+            .iter_mut()
+            .find(|s| s.tag() == producer)
+            .ok_or_else(|| format!("fused artifact producer disappeared: {producer}"))?;
+        let expected_fat_build = "./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends";
+        if portable_build.cmd != expected_fat_build {
+            return Err(format!(
+                "fused artifact producer command drifted; re-prove the bin completion: {}",
+                portable_build.cmd
+            ));
         }
+        portable_build.cmd.push_str(
+            " && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit",
+        );
         let privileged_build = steps
             .iter_mut()
             .find(|s| s.tag() == consumer)
