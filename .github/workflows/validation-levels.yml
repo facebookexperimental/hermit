@@ -66,7 +66,7 @@ jobs:
       - name: Rust components
         run: rustup component add clippy rustfmt
       - name: GitHub-managed portable test lane
-        run: ./validate.sh --portable-only --no-label-pr
+        run: ./scripts/validate.rs --portable-only --no-label-pr
       - name: Upload nextest JUnit report
         if: always()
         uses: actions/upload-artifact@v4
@@ -138,7 +138,7 @@ jobs:
         # (pre-pin behavior) so this self-hosted lane does not regress RED.
         run: env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
       - name: Record/replay compatibility ratchet (139 programs)
-        run: ./validate.sh --rr-compat-only --no-label-pr --verbose
+        run: ./scripts/validate.rs --rr-compat-only --no-label-pr --verbose
       - name: Upload privileged DAG performance report
         if: always()
         uses: actions/upload-artifact@v4
@@ -205,4 +205,4 @@ jobs:
           unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
       - name: Repeated and long-form privileged validation
         # No flock: retired with the disproven PMU counter-exhaustion premise.
-        run: ./validate.sh super --no-label-pr
+        run: ./scripts/validate.rs super --no-label-pr

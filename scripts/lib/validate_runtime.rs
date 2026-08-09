@@ -406,6 +406,44 @@ fn is_ancestor(want: i32, start: i32) -> bool {
     false
 }
 
+/// Read a process's kernel identity `(state, start_ticks)` from `/proc`.
+pub fn process_identity(pid: i32) -> Option<(char, u64)> {
+    if pid <= 1 {
+        return None;
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = stat.rfind(')')?;
+    let fields: Vec<&str> = stat.get(close + 1..)?.split_whitespace().collect();
+    let state = fields.first()?.chars().next()?;
+    // `fields[0]` is stat field 3 (state), so field 22 is index 19.
+    let start_ticks = fields.get(19)?.parse::<u64>().ok()?;
+    Some((state, start_ticks))
+}
+
+/// Bind an ancestor PID to its start ticks so PID reuse cannot satisfy proof.
+pub fn identity_in_ancestry(want: i32, want_start_ticks: u64) -> bool {
+    let mut cur = std::process::id() as i32;
+    for _ in 0..256 {
+        if cur == want {
+            return process_identity(cur).is_some_and(|(state, ticks)| {
+                !matches!(state, 'Z' | 'T' | 't') && ticks == want_start_ticks
+            });
+        }
+        if cur <= 1 {
+            return false;
+        }
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{cur}/status")) else {
+            return false;
+        };
+        let Some(line) = status.lines().find(|line| line.starts_with("PPid:")) else {
+            return false;
+        };
+        let Ok(parent) = line[5..].trim().parse::<i32>() else { return false };
+        cur = parent;
+    }
+    false
+}
+
 /// Decide whether this invocation is a NESTED payload of an outer validate.
 ///
 /// `ci/dag/portable.json`'s `test.strict_compat` node runs

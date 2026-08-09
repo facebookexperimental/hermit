@@ -68,7 +68,7 @@
     {
       "group": "build", "job": "runtime_release",
       "desc": "Build release Hermit and all runtime backend artifacts in one Cargo invocation",
-      "description": "ONE-FAT-BUILD 2026-08-04: this is the dependency-driven exception to the debug fat build. DBT, SaBRe, and LiteInst tests require target/release/hermit and release plugins, while ordinary tests consume debug targets. One release Cargo invocation now sees hermit, detcore-dbt, detcore-sabre, and hermit-install together; the former serial dbt_release+sabre_release invocations are gone. preferred_inner_jobs=32 is measured on a cold empty target at hermit@846baeca: 185.423s, cgroup-recorded peak=9006452736 bytes. The copied binary lets the strict-compat DAG node use validate.sh's existing explicit-prebuilt contract rather than rebuilding the same release profile.",
+      "description": "ONE-FAT-BUILD 2026-08-04: this is the dependency-driven exception to the debug fat build. DBT, SaBRe, and LiteInst tests require target/release/hermit and release plugins, while ordinary tests consume debug targets. One release Cargo invocation now sees hermit, detcore-dbt, detcore-sabre, and hermit-install together; the former serial dbt_release+sabre_release invocations are gone. preferred_inner_jobs=32 is measured on a cold empty target at hermit@846baeca: 185.423s, cgroup-recorded peak=9006452736 bytes. The copied binary lets the strict-compat DAG node use the Rust driver's explicit-prebuilt contract rather than rebuilding the same release profile.",
       "cmd": "HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-runtime ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbt -p detcore-sabre -p hermit-install && mkdir -p target/ci && install -m 755 target/release/hermit target/ci/hermit-strict && sha256sum target/install_pkg/rsrcs/sabre && cat target/install_pkg/rsrcs/sabre.revision",
       "deps": ["e2e.metadata"],
       "timeout": 1200,
@@ -468,7 +468,7 @@
     },
     {
       "group": "test", "job": "envelope_levels",
-      "desc": "Portable working-envelope levels (L1-L4 over true/echo/date; mirrors run_portable_envelope_levels, validate.sh:2573)",
+      "desc": "Portable working-envelope levels (L1-L4 over true/echo/date; implemented by scripts/validate.rs)",
       "cmd": "set -e; HERMIT=target/debug/hermit; ARGS='run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled'; REPS=${L4_REPS:-20}; run_probe() { local c=\"$1\"; timeout 30s $HERMIT $ARGS --strict -- $c </dev/null; timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null; timeout 30s $HERMIT $ARGS --strict --verify --detlog-heap --detlog-stack -- $c </dev/null; local i; for ((i=0;i<REPS;i++)); do timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null; done; }; run_probe '/bin/true'; run_probe '/bin/echo hermit-envelope'; run_probe '/bin/date -u +%Y'",
       "deps": ["build.workspace"],
       "timeout": 900,
@@ -479,7 +479,7 @@
     {
       "group": "test", "job": "strict_compat",
       "desc": "Portable strict compatibility envelope (blocking L2 matrix with bounded diagnostics)",
-      "cmd": "STRICT_COMPAT_HERMIT_BIN=$PWD/target/ci/hermit-strict ./validate.sh --portable-strict-compat-only --no-label-pr --verbose",
+      "cmd": "acf=(); if [ -n \"${GITHUB_ACTIONS:-}\" ] || [ -n \"${CI:-}\" ]; then acf=(--allow-cgroup-failure); fi; STRICT_COMPAT_HERMIT_BIN=$PWD/target/ci/hermit-strict ./scripts/validate.rs --portable-strict-compat-only --no-label-pr --verbose \"${acf[@]}\"",
       "deps": ["build.runtime_release", "lint.clippy", "doc.doctests", "doc.rustdoc",
                "test.regular_crates",
                "test.hermit_unit", "test.detcore_unit", "test.rr_suite_contract"],

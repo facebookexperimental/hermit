@@ -102,15 +102,13 @@ use safe_ci_dag_runner::scheduler::BoxedCgroups;
 
 use validate_plan::CompatMode;
 
-/// Ledger schema emitted when no real per-node coverage judgement exists.
-const LEGACY_LEDGER_SCHEMA_VERSION: i64 = 4;
-
-/// Ledger schema that promises a real per-node coverage judgement.
+/// Current receipt schema. Missing evidence is represented by explicit nulls;
+/// a new writer must never downgrade itself into the schema-4 grandfather.
 const COVERAGE_LEDGER_SCHEMA_VERSION: i64 = 5;
 
 /// Recorded in each row so a version-aware reader can tell which driver produced
 /// it without inference.
-const LEDGER_PRODUCER: &str = "validate.rs";
+const LEDGER_PRODUCER: &str = "hermit-validate-rs";
 
 /// The Reverie-pin preflight node's tag. Named once so the plan that creates it
 /// and the fail-closed assertion that requires it cannot drift apart.
@@ -256,7 +254,7 @@ struct Args {
 }
 
 fn usage() -> &'static str {
-    "Usage: ./validate.sh [LEVEL] [OPTIONS]        (validate.sh execs scripts/validate.rs)\n\
+    "Usage: ./scripts/validate.rs [LEVEL] [OPTIONS]\n\
      \n\
      Run Hermit's local validation suite. Every gate executes as a boxed\n\
      safe-ci-dag-runner DAG node; nothing runs outside the runner.\n\
@@ -714,12 +712,10 @@ cleared-caps refusal names {} starved step(s)",
     Ok(())
 }
 
-/// Bind the ledger schema to the evidence the row actually carries.
+/// Bind the current schema to the evidence the row actually carries.
 ///
-/// Schema 5 promises a real per-node judgement, which requires a nonzero
-/// planned set. Anything else is unresolved coverage: preserve the schema-4
-/// grandfather but erase the unusable object to `null`, so a schema-4 row can
-/// never claim per-node evidence its version does not define.
+/// A missing or malformed coverage judgement stays explicit `null`. It must not
+/// cause a new row to masquerade as a grandfathered schema-4 receipt.
 fn ledger_schema_and_coverage(
     coverage: serde_json::Value,
 ) -> (i64, serde_json::Value) {
@@ -730,7 +726,7 @@ fn ledger_schema_and_coverage(
     if has_real_judgement {
         (COVERAGE_LEDGER_SCHEMA_VERSION, coverage)
     } else {
-        (LEGACY_LEDGER_SCHEMA_VERSION, serde_json::Value::Null)
+        (COVERAGE_LEDGER_SCHEMA_VERSION, serde_json::Value::Null)
     }
 }
 
@@ -755,14 +751,14 @@ fn coverage_schema_bracket() -> Result<(), String> {
         serde_json::json!({"planned_test_nodes": "4"}),
     ] {
         let (schema, carried) = ledger_schema_and_coverage(unresolved);
-        if schema != LEGACY_LEDGER_SCHEMA_VERSION || !carried.is_null() {
+        if schema != COVERAGE_LEDGER_SCHEMA_VERSION || !carried.is_null() {
             return Err(
-                "coverage schema: schema 4 must carry null, never a coverage claim".into(),
+                "coverage schema: unresolved evidence must remain schema 5 with null coverage".into(),
             );
         }
     }
     println!(
-        "  coverage schema: 1/1 real judgement -> schema 5; 4/4 unresolved shapes -> schema 4/null"
+        "  coverage schema: 1/1 real judgement -> schema 5; 4/4 unresolved shapes -> schema 5/null"
     );
     Ok(())
 }
@@ -1511,6 +1507,7 @@ struct Plan {
     profile: String,
     selection_mode: &'static str,
     /// `test.*` nodes the profile PLANNED to run, for the coverage record.
+    #[allow(dead_code)]
     planned_test_nodes: BTreeSet<String>,
     /// Set when this profile is a compatibility matrix, so the ratchet and the
     /// per-program summary are evaluated afterwards.
@@ -2742,6 +2739,14 @@ struct LedgerCtx {
     commit_anchored: bool,
     tree_dirty: bool,
     dag_jobs: i64,
+    /// Only the canonical validate-lock owner ancestry establishes admission.
+    admission: Option<&'static str>,
+    /// Exact base identities from the parent's single receipt finalizer. Each
+    /// stays null when that proof cannot be computed.
+    base_sha: serde_json::Value,
+    base_tree: serde_json::Value,
+    reverie_base_sha: serde_json::Value,
+    reverie_base_tree: serde_json::Value,
     /// Peak number of OTHER top-level validates that were provably live AND
     /// burning CPU beside this run. `None` means UNKNOWN (never 0-by-default): a
     /// bare run with no registry is not proven exclusive.
@@ -2764,6 +2769,152 @@ struct LedgerCtx {
     /// libtest counts parsed from the durable log; `None` is UNKNOWN.
     executed_tests: Option<i64>,
     filtered_tests: Option<i64>,
+}
+
+struct ReceiptEvidence {
+    coverage: serde_json::Value,
+    base_sha: serde_json::Value,
+    base_tree: serde_json::Value,
+    reverie_base_sha: serde_json::Value,
+    reverie_base_tree: serde_json::Value,
+}
+
+impl Default for ReceiptEvidence {
+    fn default() -> Self {
+        Self {
+            coverage: serde_json::Value::Null,
+            base_sha: serde_json::Value::Null,
+            base_tree: serde_json::Value::Null,
+            reverie_base_sha: serde_json::Value::Null,
+            reverie_base_tree: serde_json::Value::Null,
+        }
+    }
+}
+
+/// Ask the parent's single receipt finalizer for coverage and base identities.
+/// Any missing helper, failed command, or malformed output stays explicit null;
+/// the schema-5 consumer then refuses qualification.
+fn receipt_evidence(
+    parent: Option<&Path>,
+    root: &Path,
+    log: &Path,
+    commit: &str,
+) -> ReceiptEvidence {
+    let Some(parent) = parent else { return ReceiptEvidence::default() };
+    let helper = parent.join("ci-hub/validate/finalize_receipt.py");
+    if !helper.is_file() || log.as_os_str().is_empty() || commit.is_empty() {
+        return ReceiptEvidence::default();
+    }
+    let Ok(out) = Command::new("python3")
+        .arg(&helper)
+        .arg("--log")
+        .arg(log)
+        .arg("--sha")
+        .arg(commit)
+        .arg("--hermit-checkout")
+        .arg(root)
+        .arg("--emit-only")
+        .output()
+    else {
+        return ReceiptEvidence::default();
+    };
+    if !out.status.success() {
+        return ReceiptEvidence::default();
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return ReceiptEvidence::default();
+    };
+    let coverage = value.get("coverage").cloned().unwrap_or(serde_json::Value::Null);
+    let (_, coverage) = ledger_schema_and_coverage(coverage);
+    let field = |name: &str| value.get(name).cloned().unwrap_or(serde_json::Value::Null);
+    ReceiptEvidence {
+        coverage,
+        base_sha: field("base_sha"),
+        base_tree: field("base_tree"),
+        reverie_base_sha: field("reverie_base_sha"),
+        reverie_base_tree: field("reverie_base_tree"),
+    }
+}
+
+/// Ask the canonical parent lock authority whether this exact run is admitted.
+/// Production never trusts caller-supplied owner PIDs or sidecar paths. The
+/// stop-test JSON seam is confined to an intrinsically non-qualifying fixture.
+fn canonical_validate_lock_admission(
+    parent: Option<&Path>,
+    commit: &str,
+    host: &str,
+) -> bool {
+    fn object_string<'a>(
+        object: &'a serde_json::Map<String, serde_json::Value>,
+        key: &str,
+    ) -> Option<&'a str> {
+        object.get(key).and_then(serde_json::Value::as_str)
+    }
+    let status = if env_flag("HERMIT_VALIDATE_STOP_TEST_MODE", "1") {
+        let Ok(fixture) = std::env::var("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON") else {
+            return false;
+        };
+        fixture.into_bytes()
+    } else {
+        let Some(parent) = parent else { return false };
+        let ci_hub = parent.join("ci-hub/ci-hub");
+        if !ci_hub.is_file() {
+            return false;
+        }
+        let Ok(output) = Command::new(ci_hub)
+            .args(["validate-lock", "authority-status", "--json"])
+            .output()
+        else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        output.stdout
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&status) else {
+        return false;
+    };
+    let Some(holder) = value.get("holder").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    let Some(owner) = value.get("owner").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    if value.get("schema_version").and_then(serde_json::Value::as_i64) != Some(1)
+        || value.get("admissible").and_then(serde_json::Value::as_bool) != Some(true)
+        || value.get("state").and_then(serde_json::Value::as_str) != Some("held")
+        || !value.get("reason_code").is_some_and(serde_json::Value::is_null)
+        || value.get("canonical_anchor_held").and_then(serde_json::Value::as_bool) != Some(true)
+        || !matches!(
+            value.get("cleanup_state").and_then(serde_json::Value::as_str),
+            Some("none" | "active-bound")
+        )
+        || object_string(holder, "kind") != Some("validate")
+        || object_string(holder, "target") != Some(commit)
+        || object_string(holder, "host") != Some(host)
+        || object_string(owner, "host") != Some(host)
+        || object_string(owner, "liveness") != Some("alive")
+    {
+        return false;
+    }
+    let Some(pid64) = owner.get("pid").and_then(serde_json::Value::as_i64) else {
+        return false;
+    };
+    let Some(start_ticks) = owner.get("start_ticks").and_then(serde_json::Value::as_u64) else {
+        return false;
+    };
+    let Ok(pid) = i32::try_from(pid64) else { return false };
+    if pid <= 1 || start_ticks == 0 {
+        return false;
+    }
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|id| id.trim().to_string());
+    if boot_id.as_deref() != object_string(owner, "boot_id") {
+        return false;
+    }
+    validate_runtime::identity_in_ancestry(pid, start_ticks)
 }
 
 /// Parse the libtest `executed` / `filtered` counts out of the durable log.
@@ -2857,7 +3008,9 @@ fn write_ledger(
         .collect();
     let record = serde_json::json!({
         "schema_version": ledger_schema,
+        "repo": "hermit",
         "producer": LEDGER_PRODUCER,
+        "admission": ctx.admission,
         // Immutable-row identity. `corrects` is null here; a correcting row
         // repeats this shape with `corrects` set to the id it supersedes.
         "record_id": record_id,
@@ -2877,6 +3030,10 @@ fn write_ledger(
         "git_behind": ctx.git_behind,
         "commit_anchored": ctx.commit_anchored,
         "tree_dirty": ctx.tree_dirty,
+        "base_sha": ctx.base_sha,
+        "base_tree": ctx.base_tree,
+        "reverie_base_sha": ctx.reverie_base_sha,
+        "reverie_base_tree": ctx.reverie_base_tree,
         "reverie_pin_current": ctx.reverie_pin_current,
         "result": result,
         "raw_result": raw_result,
@@ -3824,24 +3981,10 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         );
     }
 
-    // Coverage in the consumer's exact CoverageRow shape. NODE-RAN granularity:
-    // zero_executed_nodes is always empty and means "not determinable here", not
-    // "verified none" — a node that ran while executing zero test cases is only
-    // visible in the log banners, which is finalize_receipt.py --scan's job.
-    let executed_nodes: BTreeSet<String> = outcomes
-        .iter()
-        .filter(|o| !o.aborted)
-        .map(|o| o.tag.clone())
-        .filter(|t| plan.planned_test_nodes.contains(t))
-        .collect();
-    let absent: Vec<&String> =
-        plan.planned_test_nodes.iter().filter(|t| !executed_nodes.contains(*t)).collect();
-    let coverage = serde_json::json!({
-        "planned_test_nodes": plan.planned_test_nodes.len(),
-        "executed_test_nodes": executed_nodes.len(),
-        "zero_executed_nodes": Vec::<String>::new(),
-        "absent_nodes": absent,
-    });
+    // Coverage and base identities come from the parent's single finalizer. A
+    // local reconstruction here would create a second receipt authority.
+    let receipt = receipt_evidence(parent.as_deref(), &root, &log_path, &commit);
+    let coverage = receipt.coverage.clone();
 
     let behind_ahead = sh("git", &["rev-list", "--left-right", "--count", "origin/main...HEAD"])
         .unwrap_or_else(|| "0 0".into());
@@ -3852,6 +3995,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let commit_anchored = commit != "unknown" && !dirty_now;
     // Observed, not inferred: did the pin gate actually run and pass in THIS run?
     let pin_gate_passed = outcomes.iter().any(|o| o.tag == PIN_GATE_TAG && o.ok);
+    let lock_admitted = canonical_validate_lock_admission(parent.as_deref(), &commit, &host);
     let ctx = LedgerCtx {
         started_at,
         host: host.clone(),
@@ -3868,9 +4012,18 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         commit_anchored,
         tree_dirty: dirty_now,
         dag_jobs: jobs,
+        admission: lock_admitted.then_some("ci-hub-validate-lock"),
+        base_sha: receipt.base_sha,
+        base_tree: receipt.base_tree,
+        reverie_base_sha: receipt.reverie_base_sha,
+        reverie_base_tree: receipt.reverie_base_tree,
         reverie_pin_current: pin_gate_passed,
-        concurrent_validates: peak_active,
-        concurrency_proof: peak_active.map(|_| "live_flock_registry_cpu_delta"),
+        concurrent_validates: if lock_admitted { Some(0) } else { peak_active },
+        concurrency_proof: if lock_admitted {
+            Some("validate_lock_owner_ancestry")
+        } else {
+            peak_active.map(|_| "live_flock_registry_cpu_delta")
+        },
         interruption: interruption.clone(),
         cpu_user,
         cpu_sys,
@@ -4265,28 +4418,36 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     let (cpu_user, cpu_sys) = validate_runtime::process_cpu_seconds();
     let wall = started.elapsed().as_secs_f64();
     let ledger = ledger_path(root);
+    let host = short_hostname();
+    let commit = git_sha();
+    let lock_admitted = canonical_validate_lock_admission(parent, &commit, &host);
     let ctx = LedgerCtx {
         started_at,
-        host: short_hostname(),
+        host,
         toolchain: sh("rustc", &["--version"]).unwrap_or_else(|| "unknown".into()),
         slot: slot_name(root, parent),
         cwd: root.to_string_lossy().into(),
         profile: profile.to_string(),
         selection_mode: "full".into(),
         cache_state: cache_state(root).into(),
-        commit: git_sha(),
+        commit,
         tree: git_tree(),
         git_ahead: 0,
         git_behind: 0,
         commit_anchored: false,
         tree_dirty: tree_dirty(),
         dag_jobs: 0,
+        admission: lock_admitted.then_some("ci-hub-validate-lock"),
+        base_sha: serde_json::Value::Null,
+        base_tree: serde_json::Value::Null,
+        reverie_base_sha: serde_json::Value::Null,
+        reverie_base_tree: serde_json::Value::Null,
         // The fixture runs no gates at all, so it never observed the pin gate.
         reverie_pin_current: false,
         // The fixture never registers as a top-level driver, so it can neither
         // observe peers nor be counted as one.
-        concurrent_validates: None,
-        concurrency_proof: None,
+        concurrent_validates: lock_admitted.then_some(0),
+        concurrency_proof: lock_admitted.then_some("validate_lock_owner_ancestry"),
         interruption: interruption.clone(),
         cpu_user,
         cpu_sys,

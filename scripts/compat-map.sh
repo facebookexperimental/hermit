@@ -10,7 +10,7 @@
 #     because those download/build or take minutes).
 #
 # It is intentionally FAST (a handful of tiny guest runs) so it can be run
-# on-demand. For the authoritative determinism envelope use ./validate.sh.
+# on-demand. For the authoritative determinism envelope use scripts/validate.rs.
 #
 # Output: a human-readable summary by default; machine-readable JSON with
 # --json (and/or written to a file with --out FILE).
@@ -23,7 +23,7 @@
 #   L1  deterministic run            run ... -- PROG
 #   L2  bitwise-identical repeat     run ... --verify -- PROG
 #   L3  memory determinism           run ... --verify --detlog-heap --detlog-stack -- PROG
-#   L4  stress-hardened              not measured here (see ./validate.sh)
+#   L4  stress-hardened              not measured here (see scripts/validate.rs)
 
 set -uo pipefail
 
@@ -362,7 +362,7 @@ echo "System binaries (ptrace backend) — pass/total per assurance level"
 printf '  L1 deterministic run        %d/%d\n' "${pass[L1]}" "$sysbin_total"
 printf '  L2 bitwise-identical repeat %d/%d\n' "${pass[L2]}" "$sysbin_total"
 printf '  L3 memory determinism       %d/%d\n' "${pass[L3]}" "$sysbin_total"
-printf '  L4 stress-hardened          (not measured here; run ./validate.sh)\n'
+printf '  L4 stress-hardened          (not measured here; run ./scripts/validate.rs)\n'
 if [[ ${#sysbin_detail[@]} -gt 0 ]]; then
     echo "  per-binary (L1 L2 L3):"
     for entry in "${sysbin_detail[@]}"; do
@@ -383,5 +383,5 @@ fi
 printf '  oss apps   %d catalogued (inventory-only): %s\n' "$oss_count" "${oss_apps[*]:-none}"
 hr
 echo "Note: assurance probes use host-matched flags (no --strict/PMU); this is a"
-echo "quick map, not the full envelope. Use ./validate.sh for L4 and strict gates."
+echo "quick map, not the full envelope. Use ./scripts/validate.rs for L4 and strict gates."
 echo

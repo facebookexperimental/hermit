@@ -37,7 +37,7 @@ on:
   # NO `pull_request` trigger (owner directive 2026-08-03). This is the ONLY lane
   # on GitHub's shared public hosted-runner pool (runs-on: ubuntu-latest); auto-
   # firing its ~34-min build on every PR push flooded that pool and throttled our
-  # own queue (runs sat queued for hours). PRs are validated via local validate.sh
+  # own queue (runs sat queued for hours). PRs are validated via the Rust driver
   # (the `locally-validated` label -> merge-gate), NOT a hosted PR build. Run a
   # hosted build on a PR MANUALLY via `workflow_dispatch` when actually needed.
   # The self-hosted privileged/demo lanes are handled separately.
@@ -536,8 +536,8 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-      # The strict-compat node runs `./validate.sh`, which is a shim that
-      # `exec`s `scripts/validate.rs` through `#!/usr/bin/env rust-script`. No
+      # The strict-compat node runs `scripts/validate.rs` directly through
+      # `#!/usr/bin/env rust-script`. No
       # runner image ships that interpreter, and no workflow installed it, so
       # the exec fails with status 127 before any test runs -- a step that dies
       # in 0.1s having measured nothing, which reads like a product failure.
@@ -563,7 +563,7 @@ jobs:
         if: matrix.slug == 'strict-compat'
         run: |
           if ! command -v rust-script >/dev/null; then
-            echo "::error::rust-script is not on PATH; ./validate.sh execs scripts/validate.rs through it and would die at exec with status 127."
+            echo "::error::rust-script is not on PATH; scripts/validate.rs would die at exec with status 127."
             exit 1
           fi
           echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"

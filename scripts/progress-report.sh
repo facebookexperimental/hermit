@@ -99,7 +99,7 @@ fi
 # 2. Working-envelope vector (L1-L4 + rr)
 # ---------------------------------------------------------------------------
 echo "-- working-envelope vector"
-./validate.sh --envelope-only >"$ENVELOPE_LOG" 2>&1
+./scripts/validate.rs --envelope-only >"$ENVELOPE_LOG" 2>&1
 ENV_JSON=$(grep -E '^\{"l1_pass"' "$ENVELOPE_LOG" | tail -n1)
 [[ -z "$ENV_JSON" && -f "$ROOT_DIR/envelope.json" ]] && ENV_JSON=$(cat "$ROOT_DIR/envelope.json")
 
@@ -159,7 +159,7 @@ PRS=$(git log --oneline -40 | grep -iE 'Merge pull request' | head -12 \
   echo "| Suite | Command | Result |"
   echo "| --- | --- | --- |"
   echo "| Strict / fail-closed | scripts/test-fail-closed.sh | $STRICT_STATUS |"
-  echo "| Working-envelope L1-L4+rr | validate.sh --envelope-only | $ENV_JSON |"
+  echo "| Working-envelope L1-L4+rr | scripts/validate.rs --envelope-only | $ENV_JSON |"
   echo "| Record/replay | cargo test -p hermit --test record_replay | ${REC_P:-?} passed, ${REC_F:-?} failed, ${REC_I:-?} ignored |"
   for t in sqlite_veryquick redis_strict python_stdlib language_runtime_determinism; do
     echo "| App: $t | cargo test -p hermit --test $t | ${APP_P[$t]} passed, ${APP_F[$t]} failed, ${APP_I[$t]} ignored |"

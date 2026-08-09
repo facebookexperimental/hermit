@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise validate.sh's real signal traps and ledger writer without a build."""
+"""Exercise the Rust validate driver's signal traps and ledger writer without a build."""
 
 from __future__ import annotations
 
@@ -7,18 +7,23 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import tempfile
 import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VALIDATE = ROOT / "validate.sh"
+VALIDATE = ROOT / "scripts" / "validate.rs"
 TEST_ROOTS: list[Path] = []
 
 
 def stop_test_env(
-    tmpdir: Path, ledger: Path, *, lock_proven: bool = False
+    tmpdir: Path,
+    ledger: Path,
+    *,
+    lock_proven: bool = False,
+    forged_owner: bool = False,
 ) -> dict[str, str]:
     TEST_ROOTS.append(tmpdir)
     env = os.environ.copy()
@@ -31,15 +36,45 @@ def stop_test_env(
         TMPDIR=str(tmpdir),
     )
     if lock_proven:
-        owner_file = tmpdir / "validate-lock.owner"
-        owner_file.write_text(f"pid={os.getpid()}\n")
+        stat_fields = Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(")", 1)[1].split()
+        start_ticks = int(stat_fields[19])
+        host = socket.gethostname().split(".", 1)[0]
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+        ).strip()
+        authority = {
+            "schema_version": 1,
+            "admissible": True,
+            "state": "held",
+            "reason_code": None,
+            "canonical_anchor_held": True,
+            "cleanup_state": "none",
+            "holder": {
+                "kind": "validate",
+                "target": commit,
+                "host": host,
+            },
+            "owner": {
+                "host": host,
+                "liveness": "alive",
+                "pid": os.getpid(),
+                "start_ticks": start_ticks,
+                "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+            },
+        }
         env.update(
-            CI_HUB_VALIDATE_LOCK_OWNER_PID=str(os.getpid()),
-            CI_HUB_VALIDATE_LOCK_OWNER_FILE=str(owner_file),
+            VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON=json.dumps(authority),
             # Plant the weaker legacy observation too. Canonical owner ancestry
             # must win; otherwise parked stop-test fixtures make every genuine
             # admitted schema-5 receipt unqualifiable.
             CI_HUB_VALIDATE_CONCURRENT="true",
+        )
+    if forged_owner:
+        owner_file = tmpdir / "caller-chosen.owner"
+        owner_file.write_text(f"pid={os.getpid()}\n")
+        env.update(
+            CI_HUB_VALIDATE_LOCK_OWNER_PID=str(os.getpid()),
+            CI_HUB_VALIDATE_LOCK_OWNER_FILE=str(owner_file),
         )
     return env
 
@@ -59,7 +94,7 @@ def assert_schema5_contract(row: dict, *, admitted: bool = False) -> None:
     """A current writer never escapes strict evidence by downgrading schema."""
     assert row["schema_version"] == 5, row
     assert row["repo"] == "hermit", row
-    assert row["producer"] == "hermit-validate-sh", row
+    assert row["producer"] == "hermit-validate-rs", row
     if admitted:
         assert row["admission"] == "ci-hub-validate-lock", row
         assert row["concurrent_validates"] == 0, row
@@ -77,12 +112,15 @@ def run_signal(
     *,
     prior_failure: bool = False,
     lock_proven: bool = False,
+    forged_owner: bool = False,
 ) -> None:
     with tempfile.TemporaryDirectory(prefix=f"validate-stop-{sig.name.lower()}-") as tmp:
         tmpdir = Path(tmp)
         ledger = tmpdir / "ledger.jsonl"
         log = tmpdir / "validate.log"
-        env = stop_test_env(tmpdir, ledger, lock_proven=lock_proven)
+        env = stop_test_env(
+            tmpdir, ledger, lock_proven=lock_proven, forged_owner=forged_owner
+        )
         env.update(
             VALIDATE_STOP_TEST_PRIOR_FAILURE="1" if prior_failure else "0",
         )
@@ -192,13 +230,16 @@ def main() -> None:
     run_signal(signal.SIGKILL, expect_record=False)
     run_signal(signal.SIGTERM, expect_record=True, prior_failure=True)
     run_signal(signal.SIGTERM, expect_record=True, lock_proven=True)
+    # The retired shell contract trusted these caller-selected values. Rust must
+    # ignore them: only the canonical authority query can establish admission.
+    run_signal(signal.SIGTERM, expect_record=True, forged_owner=True)
     run_incomplete_exit()
     run_cleanup_signal_race()
     leaked = [path for path in TEST_ROOTS if path.exists()]
     assert not leaked, f"stop-path test residue: {leaked}"
     print(
         "PASS: TERM/INT/HUP => NO-RESULT; KILL => no record; "
-        "prior failure remains fail; cleanup is signal-atomic"
+        "prior failure remains fail; forged owner path is unadmitted; cleanup is signal-atomic"
     )
 
 

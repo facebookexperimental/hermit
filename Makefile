@@ -73,8 +73,8 @@ prune-stale-release: ## Remove target/release/hermit if stale (not built from cu
 # GNU Make's built-in implicit rule "%: %.sh" (cat $< >$@; chmod a+x $@) fires
 # against validate.sh and merely COPIES it to a file named `validate` instead of
 # running validation. .PHONY + this recipe overrides that implicit rule.
-validate: check-submodules ## Run the full multi-backend validation suite (pass extra flags via ARGS="--help")
-	./validate.sh $(ARGS)
+validate: check-submodules ## Run the full validation suite (Rust driver; pass flags via ARGS)
+	./scripts/validate.rs $(ARGS)
 
 validate-plan: ## Print the boxed DAG plan (nodes, wall/CPU/memory caps, deps) without running it
 	./scripts/validate.rs --show-plan $(ARGS)
@@ -126,7 +126,7 @@ help: ## Show this help (the list of make targets)
 	@printf '  validate-sabre     SaBRe corpus          (needs HERMIT_SABRE_BINARY) ~10-20 min\n'
 	@printf '  validate-liteinst  LiteInst strict corpus                            ~5-15 min\n'
 	@printf '  validate-e9patch   e9patch corpus        (needs HERMIT_E9PATCH_BACKEND) ~5-20 min\n'
-	@printf '\nThe full multi-backend suite is ./validate.sh (see ./validate.sh --help).\n'
+	@printf '\nThe full multi-backend suite is ./scripts/validate.rs (see ./scripts/validate.rs --help).\n'
 
 # Detect the native build toolchain (cmake + a C and C++ compiler) that the
 # third-party backends need. reverie-dbt's build.rs CMake-configures DynamoRIO
@@ -212,8 +212,8 @@ check-submodules: checkout-all ## Verify every pinned submodule is checked out a
 # They wrap the pre-existing mechanisms rather than adding new ones:
 #   * KVM and DBT (real Detcore backends) -> the backend-parity matrix,
 #     scoped to one backend with `run_matrix.py --backend <backend>`, exactly
-#     as validate.sh's full "Real backend compatibility matrix" gate invokes it.
-#   * SaBRe / LiteInst / e9patch          -> validate.sh's focused
+#     as the Rust validation driver's full backend-compatibility gate invokes it.
+#   * SaBRe / LiteInst / e9patch          -> the Rust driver's focused
 #     `--<backend>-compat-only` profiles, which self-build the release binary
 #     and any backend artifacts.
 # ---------------------------------------------------------------------------
@@ -227,10 +227,10 @@ validate-dbt: check-submodules ## Run ONLY the DBT backend parity corpus (third-
 	$(RUN_MATRIX) --hermit $(HERMIT_DEBUG_BIN) --backend dbt --probe-gaps --require-backend
 
 validate-sabre: check-submodules ## Run ONLY the SaBRe compatibility corpus (needs HERMIT_SABRE_BINARY)
-	./validate.sh --sabre-compat-only
+	./scripts/validate.rs --sabre-compat-only
 
 validate-liteinst: check-submodules ## Run ONLY the LiteInst strict compatibility corpus
-	./validate.sh --liteinst-compat-only
+	./scripts/validate.rs --liteinst-compat-only
 
 validate-e9patch: check-submodules ## Run ONLY the e9patch (ptrace-preprocessing) compat corpus (needs HERMIT_E9PATCH_BACKEND)
-	./validate.sh --e9patch-compat-only
+	./scripts/validate.rs --e9patch-compat-only
