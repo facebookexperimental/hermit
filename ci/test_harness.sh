@@ -1080,25 +1080,26 @@ function audit_ci_correspondence {
     # This is a literal workflow expression, not a local expansion.
     # shellcheck disable=SC2016
     assert_workflow_entrypoint privileged "$ROOT_DIR/.github/workflows/ci-privileged.yml" \
-        'timeout --foreground --kill-after=10s 600s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
+        'timeout --foreground --kill-after=10s 720s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
     assert_privileged_diagnostics "$ROOT_DIR/.github/workflows/ci-privileged.yml"
     assert_validate_driver_entrypoint
 
-    # This validation command contains real concurrent rustc probes. Keep both
-    # lane copies on the measured 30s workload class and the same 60s cap so a
-    # shorter privileged proxy cannot reject work that passed the portable gate.
+    # This validation command contains real concurrent rustc probes. Three warm
+    # samples measured 71.44-73.84s wall, with 58.36-60.38s CPU. Keep both lane
+    # copies on the measured 75s workload class and the same 180s cap so a shorter
+    # privileged proxy cannot reject work that passed the portable gate.
     for lane in portable privileged; do
         jq -e '
             [.steps[] | select(
                 .group == "e2e"
                 and .job == "metadata"
                 and .cmd == "./ci/test_harness.sh validate"
-                and .timeout == 60
-                and .hint.est_duration_s == 30
+                and .timeout == 180
+                and .hint.est_duration_s == 75
                 and .hint.hard_mem_max_bytes == 1073741824
             )] | length == 1
         ' "$DAG_ROOT/$lane.json" >/dev/null ||
-            die "$lane e2e.metadata must carry the measured validation workload and 60s/1GiB bounds"
+            die "$lane e2e.metadata must carry the measured validation workload and 180s/1GiB bounds"
     done
 
     # Three budgets are nested here, and every term is DERIVED from the file

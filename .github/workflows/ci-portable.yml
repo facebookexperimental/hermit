@@ -270,9 +270,10 @@ jobs:
     needs: select
     if: needs.select.outputs.build_debug != 'false'
     runs-on: ubuntu-latest
-    # The selected debug DAG has a 1260s critical path. Keep the hosted job
+    # The selected debug DAG has a 1560s critical path after e2e.metadata's
+    # measured budget rose from 60s to 180s. Keep the hosted job
     # outside that path plus at least 300s for setup and artifact overhead.
-    timeout-minutes: 30
+    timeout-minutes: 35
     outputs:
       e2e_matrix: ${{ steps.cells.outputs.matrix }}
       e2e_count: ${{ steps.cells.outputs.count }}
