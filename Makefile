@@ -15,7 +15,8 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 .DEFAULT_GOAL := build
 
 .PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
-	install-build-tools check-submodules check-skill-discovery validate lint \
+	install-build-tools check-submodules check-skill-discovery validate validate-plan \
+	validate-self-test lint \
 	validate-kvm validate-dbt validate-sabre validate-liteinst validate-e9patch
 
 build: prune-stale-release install-deps ## Build the development Hermit binary with every backend
@@ -74,6 +75,12 @@ prune-stale-release: ## Remove target/release/hermit if stale (not built from cu
 # running validation. .PHONY + this recipe overrides that implicit rule.
 validate: check-submodules ## Run the full multi-backend validation suite (pass extra flags via ARGS="--help")
 	./validate.sh $(ARGS)
+
+validate-plan: ## Print the boxed DAG plan (nodes, wall/CPU/memory caps, deps) without running it
+	./scripts/validate.rs --show-plan $(ARGS)
+
+validate-self-test: ## Run the validate driver's inert policy/quoting/corpus brackets
+	./scripts/validate.rs --self-test
 
 check-skill-discovery: ## Verify Claude and stock Codex discover the same product skills
 	./scripts/check-skill-discovery.rs

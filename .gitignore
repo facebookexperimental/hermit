@@ -35,3 +35,9 @@ envelope.json
 # validation") -- a slot self-poisons after exactly one validation. The profiles
 # are useful output, so ignore them in place rather than relocating them.
 /.safe-ci-dag-runner/
+
+# Validate ledger shards: one append-only JSONL per (team, short-machine).
+# Machine-scoped BY DESIGN so concurrent writers never collide, and each row
+# records absolute cwd/log_file paths -- so a tracked shard can never satisfy
+# scripts/check-portable-paths.sh. Kept in-tree for locality, never committed.
+ci/validate-ledger/

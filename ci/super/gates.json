@@ -1,0 +1,571 @@
+{
+  "_comment": [
+    "MECHANICALLY EXTRACTED from validate.sh's run_super_suite. Do not hand-edit.",
+    "Method: a COPY of validate.sh had run_check / run_check_with_timeout replaced by a",
+    "recorder that dumped (timeout, label, argv) instead of executing, AFTER the real bash",
+    "had evaluated every mode gate, variable expansion, and conditional. run_super_suite was",
+    "then called. 32 rows were dumped; that is the complete super gate set.",
+    "timeout 0 means the row used run_check, i.e. validate.sh's GATE_TIMEOUT_SECONDS default",
+    "(600s, validate.sh:400). Absolute paths were tokenized to {{ROOT_DIR}}.",
+    "A `synthetic` row is a bash FUNCTION the driver expands into its own boxed nodes;",
+    "its argv is the function's remaining arguments."
+  ],
+  "extracted_from": "validate.sh run_super_suite (validate.sh:4702) + run_super_diagnostic_suite (validate.sh:4631)",
+  "default_gate_timeout_seconds": 600,
+  "rows": [
+    {
+      "job": "build_workspace",
+      "label": "Build workspace",
+      "timeout": 0,
+      "argv": [
+        "cargo",
+        "build",
+        "--workspace",
+        "--features",
+        "third-party-backends"
+      ]
+    },
+    {
+      "job": "build_release_hermit",
+      "label": "Build release Hermit",
+      "timeout": 0,
+      "argv": [
+        "cargo",
+        "build",
+        "--release",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends"
+      ]
+    },
+    {
+      "job": "relaxed_hermit_flag_matrix",
+      "label": "Relaxed Hermit flag matrix",
+      "timeout": 1800,
+      "argv": [
+        "env",
+        "HERMIT_FLAG_MATRIX_REPORT={{ROOT_DIR}}/target/relaxed-flag-matrix/results.tsv",
+        "cargo",
+        "test",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "relaxed_flag_matrix",
+        "meaningful_flag_combinations_run_without_crashing",
+        "--",
+        "--exact",
+        "--ignored",
+        "--test-threads=1",
+        "--nocapture"
+      ]
+    },
+    {
+      "job": "portable_slow_strict_compatibility_diagnostics",
+      "label": "Portable slow strict compatibility diagnostics",
+      "timeout": 600,
+      "synthetic": "portable_slow_strict_diagnostics",
+      "argv": []
+    },
+    {
+      "job": "weekly_pmu_parallel_memory_diagnostic_mem_race_bottom_detcore",
+      "label": "Weekly PMU parallel memory diagnostic: mem_race::bottom_detcore",
+      "timeout": 600,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit-detcore",
+        "--test",
+        "tests_parallelism",
+        "mem_race::bottom_detcore",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "weekly_pmu_parallel_memory_diagnostic_mem_race_default_detcore",
+      "label": "Weekly PMU parallel memory diagnostic: mem_race::default_detcore",
+      "timeout": 600,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit-detcore",
+        "--test",
+        "tests_parallelism",
+        "mem_race::default_detcore",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "weekly_pmu_parallel_memory_diagnostic_mem_race_middle_detcore",
+      "label": "Weekly PMU parallel memory diagnostic: mem_race::middle_detcore",
+      "timeout": 600,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit-detcore",
+        "--test",
+        "tests_parallelism",
+        "mem_race::middle_detcore",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "weekly_pmu_parallel_memory_diagnostic_mem_race_top_detcore",
+      "label": "Weekly PMU parallel memory diagnostic: mem_race::top_detcore",
+      "timeout": 600,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit-detcore",
+        "--test",
+        "tests_parallelism",
+        "mem_race::top_detcore",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "pselect_signal_interruption_diagnostic",
+      "label": "Pselect signal-interruption diagnostic",
+      "timeout": 300,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "pselect6_simulation",
+        "--",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "record_replay_matrix_diagnostic",
+      "label": "Record/replay matrix diagnostic",
+      "timeout": 300,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "record_replay",
+        "record_replay_matrix",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "managed_jvm_strict_verify_diagnostics",
+      "label": "Managed JVM strict-verify diagnostics",
+      "timeout": 300,
+      "argv": [
+        "env",
+        "HERMIT_APP_VERIFY_TIMEOUT=20s",
+        "RUST_BACKTRACE=1",
+        "cargo",
+        "test",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "app_strict_verify",
+        "java",
+        "--",
+        "--ignored",
+        "--test-threads=1",
+        "--nocapture"
+      ]
+    },
+    {
+      "job": "post_fork_scheduling_diagnostics",
+      "label": "Post-fork scheduling diagnostics",
+      "timeout": 180,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit-detcore",
+        "--test",
+        "tests_misc",
+        "ordinary_clone_",
+        "--",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "network_syscall_determinism_diagnostic",
+      "label": "Network syscall determinism diagnostic",
+      "timeout": 180,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit-detcore",
+        "--test",
+        "tests_misc",
+        "network_syscalls_are_deterministic_across_five_runs",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "ipc_determinism_diagnostic",
+      "label": "IPC determinism diagnostic",
+      "timeout": 180,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "ipc_determinism",
+        "ipc_patterns_are_deterministic_across_five_runs",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "random_source_determinism_diagnostic",
+      "label": "Random-source determinism diagnostic",
+      "timeout": 180,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "random_determinism",
+        "random_sources_repeat_across_runs_and_change_with_seed",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "threaded_integration_matrix_diagnostic",
+      "label": "Threaded integration matrix diagnostic",
+      "timeout": 300,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "integration_matrix",
+        "--",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "liteinst_python3_verify_diagnostics",
+      "label": "LiteInst python3 verify diagnostics",
+      "timeout": 300,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "cli",
+        "--",
+        "run_liteinst_rejects_non_fork_clone",
+        "run_liteinst_handles_inherited_ignored_sigchld",
+        "run_liteinst_verifies_forked_guest",
+        "run_liteinst_verifies_raw_fork_guest",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "chaos_hello_race_verification_diagnostic",
+      "label": "Chaos hello-race verification diagnostic",
+      "timeout": 300,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "hermit_modes",
+        "hello_race_chaos_verify",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "dbi_pipe_backpressure_diagnostic",
+      "label": "DBI pipe backpressure diagnostic",
+      "timeout": 300,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "cli",
+        "run_dbi_verifies_pipe_backpressure",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "dbi_failed_exec_recovery_diagnostic",
+      "label": "DBI failed-exec recovery diagnostic",
+      "timeout": 180,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "cli",
+        "run_dbi_recovers_after_failed_exec",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "dbi_unsupported_syscall_aggregation_diagnostic",
+      "label": "DBI unsupported-syscall aggregation diagnostic",
+      "timeout": 180,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "cli",
+        "run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "dbi_strict_blocked_stdin_teardown_diagnostic",
+      "label": "DBI strict blocked-stdin teardown diagnostic",
+      "timeout": 30,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "cli",
+        "run_dbi_strict_returns_with_blocked_stdin_source",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "dbi_guest_stderr_isolation_diagnostic",
+      "label": "DBI guest-stderr isolation diagnostic",
+      "timeout": 120,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "cli",
+        "run_dbi_keeps_diagnostics_out_of_guest_stderr",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "super_repeated_determinism_probes",
+      "label": "Super repeated determinism probes",
+      "timeout": 0,
+      "synthetic": "super_stress_suite",
+      "argv": []
+    },
+    {
+      "job": "weekly_relaxed_default_mode_cases",
+      "label": "Weekly relaxed default-mode cases",
+      "timeout": 0,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "hermit_modes",
+        "default_",
+        "--",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "weekly_portable_chaos_cases",
+      "label": "Weekly portable chaos cases",
+      "timeout": 0,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "stress_suite",
+        "--",
+        "--skip",
+        "slow_cas_search_and_replay",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "weekly_ignored_portable_chaos_cases",
+      "label": "Weekly ignored portable chaos cases",
+      "timeout": 0,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "stress_suite",
+        "--",
+        "--ignored",
+        "--skip",
+        "slow_cas_search_and_replay",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "pmu_buck_chaos_cases",
+      "label": "PMU Buck chaos cases",
+      "timeout": 0,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "hermit_modes",
+        "chaos_buck_",
+        "--",
+        "--ignored",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "pmu_analyze_hello_race_stress_calibrated_skid",
+      "label": "PMU analyze hello-race stress (calibrated skid)",
+      "timeout": 0,
+      "synthetic": "calibrated_analyze_tests",
+      "argv": [
+        "analyze_hello_race",
+        "--",
+        "--exact",
+        "--ignored",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "build_pinned_leveldb_super_fixture",
+      "label": "Build pinned LevelDB super fixture",
+      "timeout": 0,
+      "argv": [
+        "./hermit-cli/tests/prepare_leveldb.sh",
+        "{{ROOT_DIR}}/target/hermit-leveldb-super",
+        "{{ROOT_DIR}}/target/hermit-leveldb-build-super"
+      ]
+    },
+    {
+      "job": "full_leveldb_strict_determinism",
+      "label": "Full LevelDB strict determinism",
+      "timeout": 0,
+      "argv": [
+        "env",
+        "HERMIT_LEVELDB_BUILD_DIR={{ROOT_DIR}}/target/hermit-leveldb-build-super",
+        "cargo",
+        "test",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "leveldb",
+        "full_leveldb_suite_is_deterministic_under_strict",
+        "--",
+        "--exact",
+        "--ignored",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "job": "sqlite_veryquick_strict_determinism",
+      "label": "SQLite veryquick strict determinism",
+      "timeout": 0,
+      "argv": [
+        "cargo",
+        "test",
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "sqlite_veryquick",
+        "sqlite_veryquick_is_deterministic_under_strict_hermit",
+        "--",
+        "--exact",
+        "--ignored",
+        "--test-threads=1"
+      ]
+    }
+  ]
+}
