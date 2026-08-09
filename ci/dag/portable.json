@@ -10,8 +10,8 @@
       "desc": "Require Hermit's recorded Reverie revision to be an ANCESTOR of rrnewton/reverie:main and to never regress below the base pin",
       "cmd": "./ci/run-reverie-pin-check.sh",
       "timeout": 120,
-      "hint": {"est_duration_s": 5, "rss_baseline_bytes": 67108864,
-               "hard_mem_max_bytes": 536870912, "classification": "light"}
+      "hint": {"est_duration_s": 5, "rss_baseline_bytes": 268435456,
+               "hard_mem_max_bytes": 1073741824, "classification": "light"}
     },
     {
       "group": "check", "job": "skill_discovery",
