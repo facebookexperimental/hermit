@@ -1,10 +1,10 @@
-# Main branch merge queue
+# Main branch landing signals
 
-Pull requests into `main` land through GitHub's merge queue. The queue creates
-a temporary commit against the current `main` tip, preventing a stale pull
-request head from bypassing changes that landed ahead of it.
+An exact-head green branch may land directly by fast-forward. GitHub's merge
+queue and the `merge-gate-v4` workflow remain available as advisory signals,
+but neither is a required main-branch status check.
 
-The required status is `merge-gate-v4`. Its job passes when either:
+The advisory `merge-gate-v4` job passes when either:
 
 - the authoritative jobs in the latest `.github/workflows/ci-portable.yml` and
   `.github/workflows/ci-privileged.yml` runs for the exact pull request head
@@ -14,18 +14,17 @@ The required status is `merge-gate-v4`. Its job passes when either:
 
 Every check reader uses three outcomes:
 
-- **PASSED**: a terminal success result. This is the only hosted state that can
-  satisfy the gate.
+- **PASSED**: a terminal success result. This is the only hosted state reported
+  as green.
 - **FAILED**: a terminal `failure`, `timed_out`, `error`, or `startup_failure`.
-  Exact-head local evidence cannot override it.
+  It is an attributable hosted red, not a server-side veto of an independently
+  qualifying local-green fast-forward.
 - **NO_RESULT**: cancelled, skipped, neutral, stale, action-required, active,
-  absent, or unknown. It blocks landing without being counted as a failure. The
-  gate re-dispatches a terminal/absent workflow and records its own required
-  context as cancelled until a real result exists.
+  absent, or unknown. It prevents an advisory green without blocking an
+  independently qualifying local-green fast-forward.
 
-An exact-head full local PASSED record is a separate admission leg, not a rule
-that converts hosted NO_RESULT into success. The P0 demo gate has no local
-substitute.
+An exact-head full local PASSED record is landing authority under the owner
+policy; it does not rewrite or reinterpret hosted results.
 
 ## Status consumer inventory
 
@@ -40,11 +39,11 @@ decision surface:
 
 - `.github/workflows/merge-gate.yml` classifies portable, privileged, demo,
   review-protocol, and validation-invalidation results before admission.
-- `scripts/pr_status.py` reports required-check rollups and main workflow
+- `scripts/pr_status.py` reports advisory-check rollups and main workflow
   history without counting NO_RESULT as red or green.
-- `scripts/pr-dag-health.sh` and the pinned `agent-utils` landing planner use
-  the live required `merge-gate-v4` context; an absent context is never
-  `landable-now`.
+- `scripts/pr-dag-health.sh` and the pinned `agent-utils` landing planner report
+  `merge-gate-v4` as supplemental hosted evidence; direct fast-forward landing
+  follows the exact-head local authority instead.
 - Parent `ci-hub` uses its canonical `check_outcome.py` model in landing,
   validate-status, health, remediation, and history consumers.
 
@@ -63,9 +62,9 @@ lost.
 
 The job first verifies that its workflow file has the exact Git blob registered
 in the server-side `MERGE_GATE_V4_BLOB` variable. This rejects accidental drift
-that retains the guard. The context name is versioned as well: every semantic
-gate tightening must bump it and move the ruleset, so an unmodified
-pre-tightening branch cannot emit the context currently required by `main`.
+inside the advisory workflow. The context name remains versioned so consumers
+can distinguish incompatible classifier semantics; it is not required by the
+main-branch ruleset.
 
 This is not a cryptographic attestation of PR-owned YAML. A deliberate workflow
 edit can delete the blob-check step while retaining the v4 job name, and both
@@ -136,16 +135,14 @@ Known strip paths — all must leave the trail:
    so the evidence is preserved. The `--remove` flag also strips the label.
 3. **Evidence mutation.** Editing or deleting a PR comment revalidates the
    current exact-head receipt. If no dereferenceable receipt remains, the
-   workflow first publishes failing `merge-gate-v4` and transitional
-   `merge-gate-v3` checks at the exact head, then removes `locally-validated`.
-   Publishing both contexts keeps invalidation authoritative before and after
-   the ruleset migration. Same-repository branches explicitly dispatch a new
-   exact-head gate because label changes made with `GITHUB_TOKEN` do not
-   recursively trigger another workflow. A dispatch failure therefore remains
-   blocked by the already-published failures. Fork heads cannot be used as
-   base-repository workflow-dispatch refs; their failing checks remain until a
-   new receipt and label re-fire the pull-request gate. There remains a narrow
-   race if a merge completes before the edit/delete event is processed.
+   workflow publishes failing `merge-gate-v4` and retired `merge-gate-v3`
+   checks at the exact head, then removes `locally-validated`. The checks keep
+   advisory history truthful but are not branch-protection requirements.
+   Same-repository branches explicitly dispatch a new exact-head gate because
+   label changes made with `GITHUB_TOKEN` do not recursively trigger another
+   workflow. Fork heads cannot be used as base-repository workflow-dispatch
+   refs; their advisory checks remain until a new receipt and label re-fire the
+   pull-request gate.
 
 The receipt is remotely readable from every gate runner and immutable at its
 referenced commit, unlike a devbig014-local ledger path. The local applier reads
@@ -163,14 +160,11 @@ workflow.
 
 ## Repository settings
 
-The `main` branch ruleset must:
+The `main` branch rulesets must:
 
-1. require pull requests and linear history;
-2. require the current versioned Merge Gate context (`merge-gate-v4`) from the
-   GitHub Actions integration, with `MERGE_GATE_V4_BLOB` equal to the workflow
-   blob on `main` and `MERGE_GATE_LEGACY_CONTEXT=false`;
-3. require GitHub's merge queue; and
-4. disallow force pushes and branch deletion.
+1. contain no `required_status_checks` rule—hosted checks are advisory;
+2. disallow non-fast-forward updates; and
+3. disallow branch deletion.
 
 Verify the live rule without mutating it:
 
@@ -178,25 +172,17 @@ Verify the live rule without mutating it:
 with-proxy scripts/configure-merge-gate-ruleset.sh --check
 ```
 
-That checker covers the versioned context, its GitHub Actions integration ID,
-the bound main blob, and the disabled transition shim. It does not attest the
-repository's separate merge-queue or history-protection settings.
+That checker refuses any required-status-check rule and `--apply` removes such
+rules while preserving every unrelated field. The separate history-protection
+ruleset remains the authority for non-fast-forward and deletion refusal.
 
-Before landing a gate-version transition, run `--prepare <feature-ref>`. It
-enables the temporary legacy-context shim, adds v4 alongside the v3 required
-context, and only then binds the candidate blob. The overlap means a stale v3
-branch cannot land during the transition: both v3 and v4 must pass.
-After the workflow lands, the coordinator runs `--apply`; it binds the `main`
-blob, removes the v3 required context, disables the shim, and verifies the
-full resulting ruleset plus all three server-side values. Each full-object PUT
-is preceded by a fresh equality check, which detects policy drift already
-visible before the write. GitHub exposes no conditional PUT for this endpoint,
-so a narrow read-to-write TOCTOU window remains; the full post-state check
-detects the resulting mismatch but does not make the update atomic. The ordered
-overlap transition is fail-closed, not a cross-resource transaction. GitHub
-required-workflow rules would avoid this transition, but they are available
-only to organization/enterprise rulesets; `rrnewton/hermit` is user-owned.
+If a stale writer reintroduces hosted-check gating, run `--apply`; it removes
+every required-status-check rule and verifies the complete normalized result.
+Each full-object PUT is preceded by a fresh equality check, which detects
+policy drift already visible before the write. GitHub exposes no conditional
+PUT for this endpoint, so a narrow read-to-write TOCTOU window remains; the
+full post-state check detects the resulting mismatch but cannot make the
+update atomic.
 
-Enable auto-merge in the repository so `gh pr merge --auto --merge` can queue
-eligible pull requests. Do not require the host-dependent CI job separately;
-the gate owns the documented CI-or-local-validation policy.
+GitHub's merge queue may still be used as a convenience, but it does not
+supersede the owner-authorized direct fast-forward path.
