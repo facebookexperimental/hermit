@@ -109,7 +109,7 @@ impl MatrixExecutor {
         cmd.arg("run");
 
         // Add mode-specific args
-        for arg in mode.args() {
+        for arg in scenario.hermit_mode.args() {
             cmd.arg(arg);
         }
 
@@ -432,7 +432,12 @@ impl MatrixExecutor {
         let executor = Arc::new(self.clone());
 
         let mut handles = Vec::new();
-        let semaphore = Arc::new(std::sync::Semaphore::new(max_concurrent));
+        // Simple semaphore using a channel for limiting concurrency
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..max_concurrent {
+            tx.send(()).unwrap();
+        }
+        let semaphore = Arc::new((tx, rx));
 
         for name in names.iter() {
             let name = *name;
@@ -441,7 +446,9 @@ impl MatrixExecutor {
             let semaphore = semaphore.clone();
 
             let handle = thread::spawn(move || {
-                let _permit = semaphore.acquire().unwrap();
+                // Acquire semaphore permit
+                let (_tx, ref rx) = *semaphore;
+                let _permit = rx.recv().unwrap();
                 let result = executor.run_case(name, &[], HermitMode::Default);
                 results.lock().unwrap().push(result);
             });
