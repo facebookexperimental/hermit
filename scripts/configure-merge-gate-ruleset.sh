@@ -97,25 +97,43 @@ rule_types() {
     jq -r '[.rules[].type] | sort | join(",")'
 }
 
+scope_state() {
+    jq -r '[.target, (.conditions | tojson)] | join(" / ")'
+}
+
+scope_is_default_branch() {
+    jq -e '
+      .target == "branch" and
+      .conditions == {
+        ref_name: {exclude: [], include: ["~DEFAULT_BRANCH"]}
+      }
+    ' >/dev/null
+}
+
 current_gate=$(read_ruleset "$gate_ruleset_id")
 current_history=$(read_ruleset "$history_ruleset_id")
 gate_rule_count=$(jq '.rules | length' <<<"$current_gate")
+gate_bypass_count=$(jq '.bypass_actors | length' <<<"$current_gate")
+gate_enforcement=$(jq -r '.enforcement' <<<"$current_gate")
 history_types=$(rule_types <<<"$current_history")
 history_bypass_count=$(jq '.bypass_actors | length' <<<"$current_history")
 history_enforcement=$(jq -r '.enforcement' <<<"$current_history")
 
 if [[ $mode == check ]]; then
     failed=0
-    if [[ $gate_rule_count != 0 ]]; then
-        printf 'FAIL: check-gating ruleset %s has %s rule(s) (types=%s); it must be inert.\n' \
-            "$gate_ruleset_id" "$gate_rule_count" "$(rule_types <<<"$current_gate")" >&2
+    if [[ $gate_rule_count != 0 || $gate_bypass_count != 0 ||
+          $gate_enforcement != active ]] || ! scope_is_default_branch <<<"$current_gate"; then
+        printf 'FAIL: check-gating ruleset %s has types=%s enforcement=%s bypass_count=%s scope=%s; expected no rules / active / 0 / branch default-only.\n' \
+            "$gate_ruleset_id" "$(rule_types <<<"$current_gate")" "$gate_enforcement" \
+            "$gate_bypass_count" "$(scope_state <<<"$current_gate")" >&2
         failed=1
     fi
     if [[ $history_types != deletion,non_fast_forward ||
-          $history_bypass_count != 0 || $history_enforcement != active ]]; then
-        printf 'FAIL: history ruleset %s has types=%s enforcement=%s bypass_count=%s; expected deletion,non_fast_forward / active / 0.\n' \
+          $history_bypass_count != 0 || $history_enforcement != active ]] ||
+       ! scope_is_default_branch <<<"$current_history"; then
+        printf 'FAIL: history ruleset %s has types=%s enforcement=%s bypass_count=%s scope=%s; expected deletion,non_fast_forward / active / 0 / branch default-only.\n' \
             "$history_ruleset_id" "${history_types:-none}" "$history_enforcement" \
-            "$history_bypass_count" >&2
+            "$history_bypass_count" "$(scope_state <<<"$current_history")" >&2
         failed=1
     fi
     if ((failed != 0)); then
@@ -127,14 +145,21 @@ if [[ $mode == check ]]; then
 fi
 
 desired_gate=$(jq '
-  {name, target, enforcement, conditions, rules: [], bypass_actors}
+  {
+    name,
+    target: "branch",
+    enforcement: "active",
+    conditions: {ref_name: {exclude: [], include: ["~DEFAULT_BRANCH"]}},
+    rules: [],
+    bypass_actors: []
+  }
 ' <<<"$current_gate")
 desired_history=$(jq '
   {
     name,
-    target,
+    target: "branch",
     enforcement: "active",
-    conditions,
+    conditions: {ref_name: {exclude: [], include: ["~DEFAULT_BRANCH"]}},
     rules: [.rules[] | select(.type == "deletion" or .type == "non_fast_forward")],
     bypass_actors: []
   }
