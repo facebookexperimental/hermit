@@ -70,8 +70,8 @@ fi
 # itself is unchanged; see the carry chain below. The portable wrapper obtains
 # the repository's recorded pin through the canonical checker and carries it
 # here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 0384d673319bf139cf7d71fda820245a9266364d ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie 0384d673319bf139cf7d71fda820245a9266364d" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 8f4eb9efcaee74b56671ff3a7687fea1a3fb759b ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie 8f4eb9efcaee74b56671ff3a7687fea1a3fb759b" >&2
     return 2
 fi
 
@@ -336,6 +336,20 @@ fi
 # none of which can affect the DynamoRIO content-key miss measured by this
 # budget. They remain build-relevant and therefore require fresh validation;
 # this carry does not authorize receipt reuse.
+#
+# CARRY TO 8f4eb9ef (2026-08-09). The calibration carries unchanged because
+# neither input to source_recipe_key() changed across 0384d673..8f4eb9ef:
+#
+#   git diff --name-status 0384d673..8f4eb9ef -- reverie-dbt -> no output
+#   git rev-parse 0384d673:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse 8f4eb9ef:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse 0384d673:reverie-dbt/build.rs -> af2faa442335c1914f24a633d9cf2aa12820034b
+#   git rev-parse 8f4eb9ef:reverie-dbt/build.rs -> af2faa442335c1914f24a633d9cf2aa12820034b
+#
+# The 14 intervening commits are build-relevant but cannot affect the
+# DynamoRIO content-key miss measured by this budget. MAX_PARALLEL_JOBS=16 and
+# the 1050 effective-job-second threshold carry unchanged. Fresh validation is
+# still required; this carry does not authorize receipt reuse.
 REVERIE_DBT_MAX_PARALLEL_JOBS=16
 REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS=1050
 REVERIE_DBT_EFFECTIVE_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS
