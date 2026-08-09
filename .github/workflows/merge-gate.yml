@@ -200,16 +200,14 @@ jobs:
       pull-requests: read
     steps:
       - name: Fetch the trusted receipt verifier
-        # Transition phase: provision the two registry files before deploying
-        # the verifier revision that requires them.  VERIFIER_REF deliberately
-        # stays on the self-contained verifier; the registry files are inert to
-        # that revision.  After the compatible parent producer stack lands,
-        # advance BOTH refs and all three digests together, then register this
-        # workflow's new blob in MERGE_GATE_V4_BLOB in the same operation.
+        # Fetch the verifier and both registries from one immutable parent
+        # revision.  Advance both refs and all three digests together, and
+        # register this workflow blob in MERGE_GATE_V4_BLOB in the same landing
+        # operation.
         env:
           GH_TOKEN: ${{ github.token }}
-          REGISTRY_REF: 1973c801f46a4bceda9f108e4ae6cd7f3f65fdc0
-          VERIFIER_REF: 4b78d727f35bc8612ac460a6e270dda5f5df304c
+          REGISTRY_REF: cb78bf76a498809c7b24b1a973574e7c863d5109
+          VERIFIER_REF: cb78bf76a498809c7b24b1a973574e7c863d5109
         run: |
           set -euo pipefail
           verifier="$RUNNER_TEMP/verify-local-validation-receipt.sh"
@@ -226,11 +224,11 @@ jobs:
           }
 
           fetch ci-hub/validation/verify_receipt.sh "$verifier" \
-            e4d24084056b0080d94d99b48a4a9a0df65df372f5321f35b76781fc0ece1f79
+            1b0792415134afed7066ee70e1bc35319a204c5192cac69d33a8ca96b2f01082
           fetch ci-hub/validate/qualifying-receipt.json "$predicate" \
             09f01dd1435ac7cd6ebbcf28b619ff9ff739587b19bf88f1dd23a53f5c881760
           fetch ci-hub/validate/producer-definition.json "$producer" \
-            5567b73c7390918bc29b1de41f0eb5cbacffc7b0fc99291c06e60c21c45ba0e9
+            fab77f72485776a4bbd00e8674e0315d26443177d80d6a715743846814b5546c
 
           chmod +x "$verifier"
           echo "RECEIPT_VERIFIER=$verifier" >>"$GITHUB_ENV"
@@ -591,16 +589,14 @@ jobs:
           fi
           echo "Gate definition is registered v4 blob ${actual_blob}."
       - name: Fetch the trusted receipt verifier
-        # Transition phase: provision the two registry files before deploying
-        # the verifier revision that requires them.  VERIFIER_REF deliberately
-        # stays on the self-contained verifier; the registry files are inert to
-        # that revision.  After the compatible parent producer stack lands,
-        # advance BOTH refs and all three digests together, then register this
-        # workflow's new blob in MERGE_GATE_V4_BLOB in the same operation.
+        # Fetch the verifier and both registries from one immutable parent
+        # revision.  Advance both refs and all three digests together, and
+        # register this workflow blob in MERGE_GATE_V4_BLOB in the same landing
+        # operation.
         env:
           GH_TOKEN: ${{ github.token }}
-          REGISTRY_REF: 1973c801f46a4bceda9f108e4ae6cd7f3f65fdc0
-          VERIFIER_REF: 4b78d727f35bc8612ac460a6e270dda5f5df304c
+          REGISTRY_REF: cb78bf76a498809c7b24b1a973574e7c863d5109
+          VERIFIER_REF: cb78bf76a498809c7b24b1a973574e7c863d5109
         run: |
           set -euo pipefail
           verifier="$RUNNER_TEMP/verify-local-validation-receipt.sh"
@@ -617,11 +613,11 @@ jobs:
           }
 
           fetch ci-hub/validation/verify_receipt.sh "$verifier" \
-            e4d24084056b0080d94d99b48a4a9a0df65df372f5321f35b76781fc0ece1f79
+            1b0792415134afed7066ee70e1bc35319a204c5192cac69d33a8ca96b2f01082
           fetch ci-hub/validate/qualifying-receipt.json "$predicate" \
             09f01dd1435ac7cd6ebbcf28b619ff9ff739587b19bf88f1dd23a53f5c881760
           fetch ci-hub/validate/producer-definition.json "$producer" \
-            5567b73c7390918bc29b1de41f0eb5cbacffc7b0fc99291c06e60c21c45ba0e9
+            fab77f72485776a4bbd00e8674e0315d26443177d80d6a715743846814b5546c
 
           chmod +x "$verifier"
           echo "RECEIPT_VERIFIER=$verifier" >>"$GITHUB_ENV"
