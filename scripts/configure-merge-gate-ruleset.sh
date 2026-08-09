@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Reconcile Hermit's main rulesets with the owner policy: green branches may
-# land by fast-forward; only branch deletion and non-fast-forward updates are
-# prohibited. Hosted checks, PR state, and linear-history shape are advisory.
+# land by fast-forward; branch deletion, non-fast-forward updates, and nonlinear
+# history are prohibited. Hosted checks and PR state remain advisory.
 
 set -euo pipefail
 
@@ -20,8 +20,8 @@ Usage: scripts/configure-merge-gate-ruleset.sh MODE [options]
 
 Modes:
   --check          Verify the exact owner policy without changing GitHub.
-  --apply          Empty the check-gating ruleset and retain only zero-bypass
-                   deletion + non-fast-forward history rules.
+  --apply          Empty the check-gating ruleset and enforce zero-bypass
+                   deletion + non-fast-forward + linear-history rules.
 
 Options:
   --repo R                  Repository (default: rrnewton/hermit).
@@ -128,10 +128,10 @@ if [[ $mode == check ]]; then
             "$gate_bypass_count" "$(scope_state <<<"$current_gate")" >&2
         failed=1
     fi
-    if [[ $history_types != deletion,non_fast_forward ||
+    if [[ $history_types != deletion,non_fast_forward,required_linear_history ||
           $history_bypass_count != 0 || $history_enforcement != active ]] ||
        ! scope_is_default_branch <<<"$current_history"; then
-        printf 'FAIL: history ruleset %s has types=%s enforcement=%s bypass_count=%s scope=%s; expected deletion,non_fast_forward / active / 0 / branch default-only.\n' \
+        printf 'FAIL: history ruleset %s has types=%s enforcement=%s bypass_count=%s scope=%s; expected deletion,non_fast_forward,required_linear_history / active / 0 / branch default-only.\n' \
             "$history_ruleset_id" "${history_types:-none}" "$history_enforcement" \
             "$history_bypass_count" "$(scope_state <<<"$current_history")" >&2
         failed=1
@@ -139,7 +139,7 @@ if [[ $mode == check ]]; then
     if ((failed != 0)); then
         exit 1
     fi
-    printf 'PASS: check-gating ruleset %s is inert; history ruleset %s enforces only zero-bypass deletion + non-fast-forward.\n' \
+    printf 'PASS: check-gating ruleset %s is inert; history ruleset %s enforces zero-bypass deletion + non-fast-forward + linear history.\n' \
         "$gate_ruleset_id" "$history_ruleset_id"
     exit 0
 fi
@@ -160,7 +160,11 @@ desired_history=$(jq '
     target: "branch",
     enforcement: "active",
     conditions: {ref_name: {exclude: [], include: ["~DEFAULT_BRANCH"]}},
-    rules: [.rules[] | select(.type == "deletion" or .type == "non_fast_forward")],
+    rules: [
+      {type: "deletion"},
+      {type: "non_fast_forward"},
+      {type: "required_linear_history"}
+    ],
     bypass_actors: []
   }
 ' <<<"$current_history")
@@ -197,5 +201,5 @@ if [[ $(policy_fingerprint <<<"$updated_gate") != $(policy_fingerprint <<<"$desi
     exit 1
 fi
 
-printf 'APPLIED: check-gating ruleset %s is inert; history ruleset %s enforces only zero-bypass deletion + non-fast-forward.\n' \
+printf 'APPLIED: check-gating ruleset %s is inert; history ruleset %s enforces zero-bypass deletion + non-fast-forward + linear history.\n' \
     "$gate_ruleset_id" "$history_ruleset_id"

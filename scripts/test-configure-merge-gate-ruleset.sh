@@ -145,7 +145,10 @@ jq '.rules = [] | .bypass_actors = []' "$tmp/state/gate.json" >"$tmp/state/rules
 mv "$tmp/state/ruleset.next" "$tmp/state/gate.json"
 jq '
   .enforcement = "active" |
-  .rules = [.rules[] | select(.type == "deletion" or .type == "non_fast_forward")] |
+  .rules = [.rules[] | select(
+    .type == "deletion" or .type == "non_fast_forward" or
+    .type == "required_linear_history"
+  )] |
   .bypass_actors = [] |
   .conditions.ref_name.include = ["refs/heads/not-main"]
 ' "$tmp/state/history.json" >"$tmp/state/ruleset.next"
@@ -162,6 +165,30 @@ else
     exit 1
 fi
 
+# All three history rules are load-bearing. A rule-empty gate does not make a
+# default-branch history policy correct when linear-history enforcement is
+# missing.
+write_drifted_policy
+jq '.rules = [] | .bypass_actors = []' "$tmp/state/gate.json" >"$tmp/state/ruleset.next"
+mv "$tmp/state/ruleset.next" "$tmp/state/gate.json"
+jq '
+  .enforcement = "active" |
+  .rules = [.rules[] | select(.type != "required_linear_history")] |
+  .bypass_actors = []
+' "$tmp/state/history.json" >"$tmp/state/ruleset.next"
+mv "$tmp/state/ruleset.next" "$tmp/state/history.json"
+if run_configure --check >"$tmp/check-no-linear.out" 2>&1; then
+    echo "FAIL: missing linear-history protection was accepted" >&2
+    exit 1
+elif grep -Fq 'types=deletion,non_fast_forward' "$tmp/check-no-linear.out" &&
+     grep -Fq 'required_linear_history' "$tmp/check-no-linear.out"; then
+    negative=$((negative + 1))
+else
+    cat "$tmp/check-no-linear.out" >&2
+    echo "FAIL: missing-linear refusal did not report the exact policy delta" >&2
+    exit 1
+fi
+
 write_drifted_policy
 run_configure --apply >"$tmp/apply.out"
 [[ $(jq '.rules == []' "$tmp/state/gate.json") == true ]]
@@ -169,7 +196,7 @@ run_configure --apply >"$tmp/apply.out"
   .target == "branch" and .enforcement == "active" and (.bypass_actors == []) and
   .conditions == {"ref_name":{"exclude":[],"include":["~DEFAULT_BRANCH"]}}
 ' "$tmp/state/gate.json") == true ]]
-[[ $(jq '[.rules[].type] | sort == ["deletion","non_fast_forward"]' \
+[[ $(jq '[.rules[].type] | sort == ["deletion","non_fast_forward","required_linear_history"]' \
     "$tmp/state/history.json") == true ]]
 [[ $(jq '
   .target == "branch" and .enforcement == "active" and (.bypass_actors == []) and
@@ -186,7 +213,7 @@ run_configure --apply >"$tmp/apply-idempotent.out"
 [[ $(<"$tmp/state/put-count") == 2 ]]
 positive=$((positive + 1))
 
-printf 'NEGATIVE refusals: %d/3   POSITIVE acceptances: %d/2\n' \
+printf 'NEGATIVE refusals: %d/4   POSITIVE acceptances: %d/2\n' \
     "$negative" "$positive"
-[[ $negative == 3 && $positive == 2 ]]
-echo "PASS: only zero-bypass deletion and non-fast-forward rules remain active"
+[[ $negative == 4 && $positive == 2 ]]
+echo "PASS: zero-bypass deletion, non-fast-forward, and linear-history rules remain active"

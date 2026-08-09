@@ -165,7 +165,8 @@ The `main` branch rulesets must:
 1. keep the legacy check-gating ruleset rule-empty—hosted checks and PR state
    are advisory;
 2. disallow non-fast-forward updates; and
-3. disallow branch deletion.
+3. require linear history (reject merge commits); and
+4. disallow branch deletion.
 
 Verify the live rule without mutating it:
 
@@ -176,7 +177,7 @@ with-proxy scripts/configure-merge-gate-ruleset.sh --check
 That checker refuses any rule in the check-gating ruleset and `--apply` empties
 its rule list while preserving the ruleset envelope. The separate
 history-protection ruleset remains the authority for non-fast-forward and
-deletion refusal.
+deletion refusal plus linear-history enforcement.
 
 If a stale writer reintroduces a landing rule, run `--apply`; it removes every
 rule from the legacy check-gating ruleset and verifies the complete normalized
