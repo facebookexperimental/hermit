@@ -31,6 +31,7 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::process::Command;
 
 /// A qualifying prior run, with enough context that the printed banner cannot
 /// misdescribe what was reused.
@@ -48,14 +49,45 @@ pub struct CacheHit {
     pub producer: String,
 }
 
-/// Read a JSONL ledger into rows, skipping unparseable lines.
+/// Read the one logical ledger into rows, skipping unparseable lines.
 ///
-/// A malformed line is skipped rather than fatal: the shard is append-only and
-/// unioned across machines, so one bad line must not blind the reader to the
-/// rest — but it also must never be counted, which is why it is skipped and not
-/// defaulted.
+/// In an admitted dev-hermit run, `ledger` is the parent's logical `ledger/`
+/// root.  The parent adapter owns sharding and union semantics; opening one
+/// shard (or the retired raw shadow file) here would create a second receipt
+/// authority.  An ordinary file remains supported only for isolated fixtures
+/// and genuinely standalone checkouts.
 pub fn read_rows(ledger: &Path) -> Vec<serde_json::Value> {
-    let Ok(text) = std::fs::read_to_string(ledger) else { return Vec::new() };
+    let explicit = std::env::var("HERMIT_VALIDATE_LEDGER")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| Path::new(&value) == ledger);
+    let text = if !explicit && ledger.file_name().is_some_and(|name| name == "ledger") {
+        let Some(parent) = ledger.parent() else { return Vec::new() };
+        let adapter = parent.join("ci-hub/ledger/validate_rows.py");
+        let Ok(output) = Command::new("python3").arg(&adapter).arg("rows").output() else {
+            eprintln!(
+                "validate: warning: cannot launch canonical ledger reader {}",
+                adapter.display()
+            );
+            return Vec::new();
+        };
+        if !output.status.success() {
+            eprintln!(
+                "validate: warning: canonical ledger reader {} refused: {}",
+                adapter.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            return Vec::new();
+        }
+        let Ok(text) = String::from_utf8(output.stdout) else {
+            eprintln!("validate: warning: canonical ledger reader emitted non-UTF-8 data");
+            return Vec::new();
+        };
+        text
+    } else {
+        let Ok(text) = std::fs::read_to_string(ledger) else { return Vec::new() };
+        text
+    };
     text.lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())

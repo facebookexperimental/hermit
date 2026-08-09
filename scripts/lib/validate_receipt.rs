@@ -10,8 +10,8 @@
 //! # This module never decides that a run was green
 //!
 //! It publishes FROM the ledger record, it does not assert one. `ci-hub
-//! apply-local-label` is handed `--ledger <path>` and re-derives the receipt
-//! itself; this driver only supplies the PR number and the shard path. That
+//! apply-local-label` re-reads the one canonical ledger union itself; this
+//! driver supplies only the PR number and the fixed repository. That
 //! separation is the point: the label is a CACHE of a ledger fact, and the
 //! authority that mints it must dereference the ledger rather than trust a
 //! caller's "it passed".
@@ -35,7 +35,6 @@
 //! about porting the driver changes it, and pulling it in here would put a
 //! GitHub-mutating side effect on the validation hot path.
 
-use std::path::Path;
 use std::process::Command;
 
 /// Repository the label is applied to. Hard-coded in the bash and kept hard-coded
@@ -130,10 +129,14 @@ fn resolve_pr() -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+fn apply_local_label_args(pr: &str) -> [&str; 5] {
+    ["apply-local-label", "--pr", pr, "--repo", LABEL_REPO]
+}
+
 /// Publish the receipt and apply `locally-validated`, FROM the ledger record.
 ///
 /// Always returns; never fails the run.
-pub fn publish(ledger: &Path) -> Publication {
+pub fn publish() -> Publication {
     let Some(ci_hub) = ci_hub_path() else {
         let msg = "the ci-hub receipt publisher is unavailable (no CI_HUB_APPLY_LOCAL_LABEL and no DEV_HERMIT_PARENT)";
         eprintln!("⚠️  counted validation recorded, but {msg}; not applying locally-validated");
@@ -154,13 +157,12 @@ pub fn publish(ledger: &Path) -> Publication {
         eprintln!("⚠️  counted validation recorded, but no PR was found; not applying locally-validated");
         return Publication::Unavailable("no PR was found".into());
     };
-    let status = Command::new(&ci_hub)
-        .args(["apply-local-label", "--pr", &pr, "--repo", LABEL_REPO, "--ledger"])
-        .arg(ledger)
-        .status();
+    let status = Command::new(&ci_hub).args(apply_local_label_args(&pr)).status();
     match status {
         Ok(s) if s.success() => {
-            println!("📎 receipt published; locally-validated applied to {LABEL_REPO}#{pr} from {}", ledger.display());
+            println!(
+                "📎 receipt published; locally-validated applied to {LABEL_REPO}#{pr} from the canonical ledger"
+            );
         }
         _ => {
             eprintln!(
@@ -178,6 +180,15 @@ pub fn publish(ledger: &Path) -> Publication {
 /// planted a real `locally-validated` label would itself be the authorization it
 /// claims to test.
 pub fn self_test() -> Result<String, String> {
+    // The canonical consumer deliberately has no caller-selected ledger path.
+    // Reintroducing `--ledger` would let this producer point the verifier at a
+    // retired or forged shadow and recreate the drift this bracket closes.
+    let invocation = apply_local_label_args("123");
+    if invocation != ["apply-local-label", "--pr", "123", "--repo", LABEL_REPO]
+        || invocation.contains(&"--ledger")
+    {
+        return Err("receipt: publisher must use the fixed canonical ledger consumer".into());
+    }
     // Positive: exactly one qualifying combination must be ACCEPTED, so the
     // predicate is not vacuously restrictive.
     eligible(0, 0, true, true, false, "full")

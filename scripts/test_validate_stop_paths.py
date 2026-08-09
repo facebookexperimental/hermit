@@ -157,7 +157,10 @@ def run_signal(
 def run_incomplete_exit() -> None:
     with tempfile.TemporaryDirectory(prefix="validate-stop-incomplete-") as tmp:
         tmpdir = Path(tmp)
-        ledger = tmpdir / "ledger.jsonl"
+        # A fixture path named exactly `ledger` must remain an explicit file;
+        # basename matching alone must never redirect a caller-selected path to
+        # a sibling adapter.
+        ledger = tmpdir / "ledger"
         env = stop_test_env(tmpdir, ledger)
         env.update(
             VALIDATE_STOP_TEST_EXIT_EARLY="1",
@@ -180,6 +183,68 @@ def run_incomplete_exit() -> None:
         assert row["result"] == "fail", row
         assert row["gates_run"] == 2 and row["gates_expected"] is None, row
         assert row["interruption_signal"] is None, row
+
+
+def run_canonical_adapter_contract(*, refuse: bool) -> None:
+    """Production-shaped writes use the parent adapter, never a raw shadow."""
+    with tempfile.TemporaryDirectory(prefix="validate-canonical-adapter-") as tmp:
+        tmpdir = Path(tmp)
+        canonical_root = tmpdir / "canonical-root"
+        if refuse:
+            parent = tmpdir / "parent"
+            adapter = parent / "ci-hub" / "ledger" / "validate_rows.py"
+            adapter.parent.mkdir(parents=True)
+            adapter.write_text(
+                "import sys\n"
+                "sys.stdin.read()\n"
+                "print('planted refusal', file=sys.stderr)\n"
+                "raise SystemExit(2)\n"
+            )
+        else:
+            # Exercise the REAL parent adapter, redirected only through its
+            # explicit stop-test root. This proves the producer/consumer
+            # contract without appending the machine's authoritative ledger.
+            parent = next(
+                candidate
+                for candidate in ROOT.parents
+                if (candidate / "ci-hub" / "ledger" / "validate_rows.py").is_file()
+            )
+        raw_shadow = parent / "ignored" / "validate-run-ledger.jsonl"
+        raw_before = raw_shadow.read_bytes() if raw_shadow.exists() else None
+        env = os.environ.copy()
+        env.update(
+            HERMIT_VALIDATE_STOP_TEST_MODE="1",
+            DEV_HERMIT_PARENT=str(parent),
+            CI_HUB_VALIDATE_LEDGER_TEST_ROOT=str(canonical_root),
+            VALIDATE_RUN_ON_DIRTY_TREE="1",
+            VALIDATE_STOP_TEST_TMP_ROOT=str(tmpdir / "validation"),
+            VALIDATE_STOP_TEST_EXIT_EARLY="1",
+            TMPDIR=str(tmpdir),
+        )
+        env.pop("HERMIT_VALIDATE_LEDGER", None)
+        process = subprocess.run(
+            [str(VALIDATE), "full"],
+            cwd=ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        output = process.stdout.decode(errors="replace")
+        assert process.returncode == 1, output
+        raw_after = raw_shadow.read_bytes() if raw_shadow.exists() else None
+        assert raw_after == raw_before, "canonical write touched the retired raw shadow"
+        if refuse:
+            assert not list(canonical_root.glob("ledger/**/*.jsonl")), output
+            assert "canonical ledger writer" in output and "refused" in output, output
+        else:
+            shards = list(canonical_root.glob("ledger/hermit/*/*.jsonl"))
+            assert len(shards) == 1, (shards, output)
+            events = [json.loads(line) for line in shards[0].read_text().splitlines()]
+            assert len(events) == 1, events
+            assert events[0]["schema"] == "validate-ledger/v1", events[0]
+            assert_schema5_contract(events[0]["legacy_row"])
+            assert "canonical ledger record appended" in output, output
 
 
 def run_cleanup_signal_race() -> None:
@@ -234,12 +299,15 @@ def main() -> None:
     # ignore them: only the canonical authority query can establish admission.
     run_signal(signal.SIGTERM, expect_record=True, forged_owner=True)
     run_incomplete_exit()
+    run_canonical_adapter_contract(refuse=False)
+    run_canonical_adapter_contract(refuse=True)
     run_cleanup_signal_race()
     leaked = [path for path in TEST_ROOTS if path.exists()]
     assert not leaked, f"stop-path test residue: {leaked}"
     print(
         "PASS: TERM/INT/HUP => NO-RESULT; KILL => no record; "
-        "prior failure remains fail; forged owner path is unadmitted; cleanup is signal-atomic"
+        "prior failure remains fail; forged owner path is unadmitted; canonical adapter "
+        "accept/refuse bracketed; cleanup is signal-atomic"
     )
 
 

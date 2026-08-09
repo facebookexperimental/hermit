@@ -114,14 +114,11 @@ const PIN_GATE_TAG: &str = "pre.reverie_pin";
 const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
 const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
 
-/// In-repo ledger directory. One append-only JSONL SHARD per (team, machine).
+/// Standalone-only in-repo ledger directory.
 ///
-/// Sharding is what makes the ledger committable. A single shared file would
-/// conflict on every concurrent append across machines; one file per
-/// (team, short-machine) means each writer owns its own file, appends never
-/// collide, and a reader UNIONS the shards locally. Rows are IMMUTABLE — a
-/// correction appends a new row carrying `corrects: <record_id>` rather than
-/// editing history, so the ledger stays append-only and auditable.
+/// Admitted runs never write here: they send their HistoryRow to the parent's
+/// canonical adapter. This fallback exists only for a checkout with no
+/// dev-hermit parent and is deliberately not a qualifying receipt authority.
 const LEDGER_DIR: &str = "ci/validate-ledger";
 
 /// Fleet/team identity component of the shard name. Overridable so a different
@@ -2952,7 +2949,7 @@ fn libtest_counts(parent: Option<&Path>, log: &Path) -> (Option<i64>, Option<i64
     (parse(it.next()), parse(it.next()))
 }
 
-/// Write one JSONL ledger record.
+/// Write one validation record through the single configured authority.
 ///
 /// Every qualification is written HERE, at the single write point, so no
 /// downstream reader can pair a bare `pass` with inferred coverage. Field names
@@ -3080,6 +3077,63 @@ fn write_ledger(
         "coverage": coverage,
         "gates": gates,
     });
+    let line = format!("{}\n", serde_json::to_string(&record).unwrap());
+    let explicit = std::env::var(LEDGER_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| Path::new(&value) == ledger);
+    if !explicit && ledger.file_name().is_some_and(|name| name == "ledger") {
+        let Some(parent) = ledger.parent() else {
+            eprintln!("validate: warning: canonical ledger root has no parent: {}", ledger.display());
+            return;
+        };
+        let adapter = parent.join("ci-hub/ledger/validate_rows.py");
+        let mut child = match Command::new("python3")
+            .arg(&adapter)
+            .arg("record")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                eprintln!(
+                    "validate: warning: cannot launch canonical ledger writer {}: {e}",
+                    adapter.display()
+                );
+                return;
+            }
+        };
+        use std::io::Write;
+        let write_error = child
+            .stdin
+            .take()
+            .and_then(|mut stdin| stdin.write_all(line.as_bytes()).err());
+        let output = child.wait_with_output();
+        if let Some(error) = write_error {
+            eprintln!("validate: warning: cannot send row to canonical ledger writer: {error}");
+            return;
+        }
+        match output {
+            Ok(output) if output.status.success() => eprintln!(
+                "validate: canonical ledger record appended via {}: {}",
+                adapter.display(),
+                String::from_utf8_lossy(&output.stdout).trim()
+            ),
+            Ok(output) => eprintln!(
+                "validate: warning: canonical ledger writer {} refused: {}",
+                adapter.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Err(e) => eprintln!(
+                "validate: warning: cannot wait for canonical ledger writer {}: {e}",
+                adapter.display()
+            ),
+        }
+        return;
+    }
+
     if let Some(dir) = ledger.parent() {
         if !dir.as_os_str().is_empty() {
             if let Err(e) = std::fs::create_dir_all(dir) {
@@ -3089,16 +3143,17 @@ fn write_ledger(
         }
     }
     use std::io::Write;
-    let line = format!("{}\n", serde_json::to_string(&record).unwrap());
     match std::fs::OpenOptions::new().create(true).append(true).open(ledger) {
-        Ok(mut f) => {
-            if let Err(e) = f.write_all(line.as_bytes()) {
-                eprintln!("validate: warning: cannot append ledger {}: {e}", ledger.display());
-            } else {
-                eprintln!("validate: ledger record appended to {}", ledger.display());
+        Ok(mut f) => match f.write_all(line.as_bytes()) {
+            Ok(()) => {
+                eprintln!(
+                    "validate: fixture/standalone ledger record appended to {}",
+                    ledger.display()
+                );
                 warn_if_unreadable_ledger(ledger);
             }
-        }
+            Err(e) => eprintln!("validate: warning: cannot append ledger {}: {e}", ledger.display()),
+        },
         Err(e) => eprintln!("validate: warning: cannot open ledger {}: {e}", ledger.display()),
     }
 }
@@ -3117,11 +3172,11 @@ fn short_hostname() -> String {
     raw.split('.').next().unwrap_or("unknown").to_string()
 }
 
-/// Resolve the ledger shard. Precedence:
-///   1. `$HERMIT_VALIDATE_LEDGER` — explicit file (existing consumers rely on it).
-///   2. `$DEV_HERMIT_PARENT/ignored/validate-run-ledger.jsonl` — the parent
-///      workspace ledger `ci-hub` already aggregates.
-///   3. The in-repo per-(team, machine) shard.
+/// Resolve the logical ledger authority. Precedence:
+///   1. `$HERMIT_VALIDATE_LEDGER` — explicit fixture/standalone file.
+///   2. `$DEV_HERMIT_PARENT/ledger` — the canonical adapter-backed union.
+///   3. A discovered dev-hermit parent's canonical union.
+///   4. The standalone in-repo diagnostic shard.
 fn ledger_path(root: &Path) -> PathBuf {
     if let Ok(explicit) = std::env::var(LEDGER_ENV) {
         if !explicit.is_empty() {
@@ -3130,7 +3185,7 @@ fn ledger_path(root: &Path) -> PathBuf {
     }
     if let Ok(parent) = std::env::var(PARENT_ENV) {
         if !parent.is_empty() {
-            return PathBuf::from(parent).join("ignored").join("validate-run-ledger.jsonl");
+            return PathBuf::from(parent).join("ledger");
         }
     }
     let team = std::env::var(LEDGER_TEAM_ENV)
@@ -3160,18 +3215,16 @@ fn ledger_path(root: &Path) -> PathBuf {
         .join(format!("{}.{}.jsonl", sanitize(&team), sanitize(&short_hostname())))
 }
 
-/// Walk up from `root` for a dev-hermit parent workspace that already has a run ledger.
+/// Walk up from `root` for the dev-hermit parent that owns the canonical adapter.
 ///
-/// Deliberately keyed on the ledger FILE existing, not on a directory name: the point is to find
-/// the location a reader actually queries, and a `ignored/` directory with no ledger in it is not
-/// that. Returns `None` for a genuinely standalone checkout, which is the only case the
-/// checkout-local fallback is meant to serve.
+/// Deliberately keyed on the executable contract, not a directory name or a
+/// retired raw file. Returns `None` only for a genuinely standalone checkout.
 fn discover_parent_ledger(root: &Path) -> Option<PathBuf> {
     let mut dir = root.parent();
     while let Some(candidate) = dir {
-        let ledger = candidate.join("ignored").join("validate-run-ledger.jsonl");
-        if ledger.is_file() {
-            return Some(ledger);
+        let adapter = candidate.join("ci-hub/ledger/validate_rows.py");
+        if adapter.is_file() {
+            return Some(candidate.join("ledger"));
         }
         dir = candidate.parent();
     }
@@ -4256,7 +4309,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         &plan.profile,
     ) {
         Ok(()) => {
-            let _ = validate_receipt::publish(&ledger);
+            let _ = validate_receipt::publish();
         }
         Err(why) => {
             if args.verbose {
