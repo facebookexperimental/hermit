@@ -744,6 +744,18 @@ cleared-caps refusal names {} starved step(s)",
                 "full-plan bracket: exact-tree manifest audit was not deduped to gate.manifest: {manifest_nodes:?}"
             ));
         }
+        let pin_nodes: Vec<String> = full
+            .cfg
+            .steps
+            .iter()
+            .filter(|s| s.cmd.contains("ci/run-reverie-pin-check.sh"))
+            .map(|s| s.tag())
+            .collect();
+        if pin_nodes != vec![PIN_GATE_TAG] {
+            return Err(format!(
+                "full-plan bracket: pin authority was not deduped to the observed preflight: {pin_nodes:?}"
+            ));
+        }
         for required in ["portable-test.strict_compat", "privileged-cpuid.faulting"] {
             if !full.cfg.steps.iter().any(|s| s.tag() == required) {
                 return Err(format!("full-plan bracket: fused plan lost {required}"));
@@ -798,7 +810,7 @@ cleared-caps refusal names {} starved step(s)",
             return Err("full-plan bracket: nested reuse accepted a label-capable invocation".into());
         }
         println!(
-            "  full plan: {} fused node(s), 1 exact-tree manifest audit; sequential fallback + nested no-label reuse bracketed",
+            "  full plan: {} fused node(s), 1 exact-tree manifest audit + 1 pin authority; sequential fallback + nested no-label reuse bracketed",
             full.cfg.steps.len()
         );
     }
@@ -2238,21 +2250,41 @@ fn selective_plan(
 /// Remove later steps whose semantic work exactly matches an earlier step's,
 /// and repoint every dependency onto the survivor. Returns the removed tags.
 ///
-/// Most nodes require both job and command to match. The manifest audit is the
-/// deliberate exception: preflight calls it `gate.manifest`, lane DAGs call it
-/// `e2e.metadata`, but the byte-identical command audits the byte-identical tree.
+/// Most nodes require both job and command to match. Deliberate exceptions are
+/// the manifest audit (different tags, byte-identical command/tree) and the
+/// Reverie-pin authority (preflight passes `--repo`, lane nodes rely on the same
+/// root cwd). The observed preflight node survives in both cases.
 fn dedupe_identical(steps: &mut Vec<safe_ci_dag_runner::model::Step>) -> Vec<String> {
     let mut seen: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut remap: BTreeMap<String, String> = BTreeMap::new();
     let mut keep = Vec::with_capacity(steps.len());
     let mut removed = Vec::new();
     for s in steps.drain(..) {
-        let semantic_job = if s.cmd == "./ci/test_harness.sh validate" {
-            "exact-tree-manifest-audit".to_string()
+        let tag = s.tag();
+        let key = if s.cmd == "./ci/test_harness.sh validate" {
+            (
+                "exact-tree-manifest-audit".to_string(),
+                "./ci/test_harness.sh validate".to_string(),
+            )
+        } else if [
+            "pre.reverie_pin",
+            "portable-check.reverie_pin",
+            "privileged-check.reverie_pin",
+        ]
+        .contains(&tag.as_str())
+            && s.cmd.contains("ci/run-reverie-pin-check.sh")
+        {
+            // The preflight spells the repository explicitly while lane nodes
+            // rely on the same root cwd. They invoke the same single pin
+            // authority; retaining the preflight observation also keeps
+            // `reverie_pin_current` evidence-derived.
+            (
+                "reverie-pin-authority".to_string(),
+                "current-repository-pin".to_string(),
+            )
         } else {
-            s.job.clone()
+            (s.job.clone(), s.cmd.clone())
         };
-        let key = (semantic_job, s.cmd.clone());
         match seen.get(&key) {
             Some(surv) => {
                 remap.insert(s.tag(), surv.clone());
