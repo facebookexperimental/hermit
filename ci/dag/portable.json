@@ -480,7 +480,7 @@
     {
       "group": "test", "job": "strict_compat",
       "desc": "Portable strict compatibility envelope (blocking L2 matrix with bounded diagnostics)",
-      "cmd": "acf=(); if [ -n \"${GITHUB_ACTIONS:-}\" ] || [ -n \"${CI:-}\" ]; then acf=(--allow-cgroup-failure); fi; STRICT_COMPAT_HERMIT_BIN=$PWD/target/ci/hermit-strict ./scripts/validate.rs --portable-strict-compat-only --no-label-pr --verbose \"${acf[@]}\"",
+      "cmd": "acf=(); if [ -n \"${GITHUB_ACTIONS:-}\" ] || [ -n \"${CI:-}\" ]; then acf=(--allow-cgroup-failure); fi; STRICT_COMPAT_HERMIT_BIN=$PWD/target/ci/hermit-strict ./scripts/validate.rs --portable-strict-compat-only --reuse-parent-manifest-gate --no-label-pr --verbose \"${acf[@]}\"",
       "deps": ["build.runtime_release", "lint.clippy", "doc.doctests", "doc.rustdoc",
                "test.regular_crates",
                "test.hermit_unit", "test.detcore_unit", "test.rr_suite_contract"],

@@ -243,6 +243,7 @@ struct Args {
     keep_going: bool,
     allow_cgroup_failure: bool,
     merge_lanes: bool,
+    reuse_parent_manifest_gate: bool,
     self_test: bool,
     show_plan: bool,
 }
@@ -289,8 +290,8 @@ fn usage() -> &'static str {
      \x20 -j N             Scheduler width (default: host_cpus/8, floor 2, cap 16).\n\
      \x20 -k, --keep-going Do not eager-exit on the first failure.\n\
      \x20 --allow-cgroup-failure  Downgrade to an UNBOXED run instead of failing closed.\n\
-     \x20 --merge-lanes    EXPERIMENT: fuse the portable and privileged lanes into one\n\
-     \x20                  DAG so they overlap instead of running back to back.\n\
+     \x20 --merge-lanes    Fuse the portable and privileged lanes (the full default).\n\
+     \x20 --sequential-lanes  Diagnostic fallback: run full lanes back to back.\n\
      \x20 --show-plan      Print the boxed DAG plan (nodes, caps, deps) and exit.\n\
      \x20 --self-test      Run the driver's inert policy/quoting brackets and exit.\n\
      \x20 -h, --help       Show this help and exit.\n\
@@ -347,7 +348,8 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         jobs: None,
         keep_going: false,
         allow_cgroup_failure: false,
-        merge_lanes: false,
+        merge_lanes: true,
+        reuse_parent_manifest_gate: false,
         self_test: false,
         show_plan: false,
     };
@@ -414,6 +416,12 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
             "--no-label-pr" => args.label_pr = false,
             "--verbose" => args.verbose = true,
             "--merge-lanes" => args.merge_lanes = true,
+            "--sequential-lanes" => args.merge_lanes = false,
+            // Internal nested-payload optimization. The outer full DAG has
+            // already run the exact same manifest command and structurally
+            // gates this node on it. The nested payload still reruns submodule
+            // and Reverie-pin checks, so `reverie_pin_current` remains observed.
+            "--reuse-parent-manifest-gate" => args.reuse_parent_manifest_gate = true,
             "--self-test" => args.self_test = true,
             "-k" | "--keep-going" => args.keep_going = true,
             "--allow-cgroup-failure" => args.allow_cgroup_failure = true,
@@ -475,6 +483,15 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
     }
     args.show_plan = show_plan;
     args.focused = focused.pop();
+    if args.reuse_parent_manifest_gate
+        && (!matches!(args.focused, Some(Focused::PortableStrictCompat)) || args.label_pr)
+    {
+        eprintln!(
+            "validate: --reuse-parent-manifest-gate is internal to the no-label \
+             portable-strict payload of the full DAG"
+        );
+        return Err(2);
+    }
     // `--privileged-only` and `--portable-only` are spelled as focused flags but
     // one of them is a LEVEL in validate.sh. Preserve that: --portable-only sets
     // the level, --privileged-only stays focused (validate.sh:169,189).
@@ -701,6 +718,73 @@ fn self_test() -> Result<(), String> {
 cleared-caps refusal names {} starved step(s)",
                      base.resource_caps.len(), base.default_step_timeout, starved.len());
         }
+    }
+    // The full hot path is one fused DAG and pays the exact-tree manifest audit
+    // once. Bracket the positive shape and both diagnostic escape hatches: a
+    // sequential plan still exists, while the nested audit reuse is accepted
+    // only for the no-label portable-strict payload.
+    {
+        let root = repo_root();
+        let tmp = std::env::temp_dir().join(format!("validate-plan-selftest-{}", std::process::id()));
+        let full_args = parse_argv(&["full".into(), "--no-label-pr".into()])
+            .map_err(|rc| format!("full-plan bracket: parser refused positive form rc={rc}"))?;
+        let full = build_plan(&root, &full_args, &tmp)?;
+        if full.second.is_some() {
+            return Err("full-plan bracket: default full plan is still sequential".into());
+        }
+        let manifest_nodes: Vec<String> = full
+            .cfg
+            .steps
+            .iter()
+            .filter(|s| s.cmd == "./ci/test_harness.sh validate")
+            .map(|s| s.tag())
+            .collect();
+        if manifest_nodes != vec!["gate.manifest"] {
+            return Err(format!(
+                "full-plan bracket: exact-tree manifest audit was not deduped to gate.manifest: {manifest_nodes:?}"
+            ));
+        }
+        for required in ["portable-test.strict_compat", "privileged-cpuid.faulting"] {
+            if !full.cfg.steps.iter().any(|s| s.tag() == required) {
+                return Err(format!("full-plan bracket: fused plan lost {required}"));
+            }
+        }
+        let sequential_args = parse_argv(&[
+            "full".into(),
+            "--sequential-lanes".into(),
+            "--no-label-pr".into(),
+        ])
+        .map_err(|rc| format!("full-plan bracket: sequential diagnostic refused rc={rc}"))?;
+        if build_plan(&root, &sequential_args, &tmp)?.second.is_none() {
+            return Err("full-plan bracket: --sequential-lanes did not preserve the fallback".into());
+        }
+        let nested_args = parse_argv(&[
+            "--portable-strict-compat-only".into(),
+            "--reuse-parent-manifest-gate".into(),
+            "--no-label-pr".into(),
+        ])
+        .map_err(|rc| format!("full-plan bracket: nested positive form refused rc={rc}"))?;
+        let nested = build_plan(&root, &nested_args, &tmp)?;
+        if nested.cfg.steps.iter().any(|s| s.tag() == "gate.manifest")
+            || !nested.cfg.steps.iter().any(|s| s.tag() == PIN_GATE_TAG)
+        {
+            return Err(
+                "full-plan bracket: nested reuse did not remove only manifest while retaining the pin gate"
+                    .into(),
+            );
+        }
+        if parse_argv(&[
+            "--portable-strict-compat-only".into(),
+            "--reuse-parent-manifest-gate".into(),
+        ])
+        .is_ok()
+        {
+            return Err("full-plan bracket: nested reuse accepted a label-capable invocation".into());
+        }
+        println!(
+            "  full plan: {} fused node(s), 1 exact-tree manifest audit; sequential fallback + nested no-label reuse bracketed",
+            full.cfg.steps.len()
+        );
     }
 
     Ok(())
@@ -1597,9 +1681,19 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             shell_build_dir: &shell_build.to_string_lossy(),
         };
         let mut steps = pre;
+        let compat_gate = if args.reuse_parent_manifest_gate {
+            // The outer node is reachable only after its real gate.manifest
+            // passed. Avoid rerunning that ~75 s exact-tree audit inside the
+            // nested payload, but retain the cheap, independently observed
+            // submodule and pin gates.
+            steps.retain(|s| s.tag() != gate);
+            PIN_GATE_TAG
+        } else {
+            gate
+        };
         // The corpus needs a release Hermit and the functional fixtures; both are
         // DAG nodes so they are boxed and timed like everything else.
-        steps.push(build_release_hermit_node(gate, &hermit_bin));
+        steps.push(build_release_hermit_node(compat_gate, &hermit_bin));
         steps.push(prepare_fixtures_node("compatprep.fixtures", &fixtures));
         if mode == CompatMode::E9patch {
             steps.push(nsswitch_fixture_node(&nsswitch));
@@ -1797,32 +1891,27 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         let prefix = if lanes.len() > 1 { format!("{lane}-") } else { String::new() };
         steps.extend(validate_plan::lane_nodes(root, lane, &prefix, gate)?);
     }
-    // Fusing lanes can duplicate identical work (both lanes ship check.reverie_pin
-    // and e2e.metadata with byte-identical commands). Drop the later duplicate and
-    // repoint its dependents, so the fused DAG does not pay for the same node
-    // twice — the dedup is recorded rather than silent.
+    // Fusing lanes can duplicate identical work. In particular, the always-on
+    // gate.manifest and both lane e2e.metadata nodes run the exact same
+    // `test_harness.sh validate` tree audit. Drop later duplicates and repoint
+    // their dependents, so one full run pays that ~75 s audit exactly once. The
+    // dedup is exact-command based for this one audited command and is reported.
     let removed = dedupe_identical(&mut steps);
     if !removed.is_empty() {
         eprintln!("validate: fused lanes; deduped {} identical node(s): {}", removed.len(), removed.join(", "));
     }
-    // Fusing lanes means one config for both, but their configs DISAGREE
-    // (portable default_step_timeout=600 vs privileged=120). Any single value
-    // silently loosens one lane or tightens the other, so refuse rather than
-    // guess; resource_caps are disjoint and merge cleanly.
+    // Fusing lanes means one config for both. Their default wall timeouts differ,
+    // but every shipped/synthesized node has an explicit wall timeout and the
+    // fail-closed undeclared-node audit below enforces that invariant. Therefore
+    // the default is unreachable; retain the stricter value as defense in depth.
+    // Resource caps are disjoint and merge cleanly.
     let bases: Vec<DagConfig> = lanes
         .iter()
         .map(|l| validate_plan::lane_config(root, l))
         .collect::<Result<_, _>>()?;
     let mut fused = bases[0].clone();
-    for (b, lane) in bases.iter().zip(lanes.iter()).skip(1) {
-        if b.default_step_timeout != fused.default_step_timeout {
-            return Err(format!(
-                "--merge-lanes refused: lane {} declares default_step_timeout={} but {} declares {}; \
-                 one fused value would loosen one lane or tighten the other. Run the lanes \
-                 sequentially (the default) so each keeps its own.",
-                lane, b.default_step_timeout, lanes[0], fused.default_step_timeout
-            ));
-        }
+    for b in bases.iter().skip(1) {
+        fused.default_step_timeout = fused.default_step_timeout.min(b.default_step_timeout);
         for (r, n) in &b.resource_caps {
             if let Some(prev) = fused.resource_caps.get(r) {
                 if prev != n {
@@ -2110,15 +2199,24 @@ fn selective_plan(
     })
 }
 
-/// Remove later steps whose (job, cmd) exactly matches an earlier step's, and
-/// repoint every dependency onto the survivor. Returns the removed tags.
+/// Remove later steps whose semantic work exactly matches an earlier step's,
+/// and repoint every dependency onto the survivor. Returns the removed tags.
+///
+/// Most nodes require both job and command to match. The manifest audit is the
+/// deliberate exception: preflight calls it `gate.manifest`, lane DAGs call it
+/// `e2e.metadata`, but the byte-identical command audits the byte-identical tree.
 fn dedupe_identical(steps: &mut Vec<safe_ci_dag_runner::model::Step>) -> Vec<String> {
     let mut seen: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut remap: BTreeMap<String, String> = BTreeMap::new();
     let mut keep = Vec::with_capacity(steps.len());
     let mut removed = Vec::new();
     for s in steps.drain(..) {
-        let key = (s.job.clone(), s.cmd.clone());
+        let semantic_job = if s.cmd == "./ci/test_harness.sh validate" {
+            "exact-tree-manifest-audit".to_string()
+        } else {
+            s.job.clone()
+        };
+        let key = (semantic_job, s.cmd.clone());
         match seen.get(&key) {
             Some(surv) => {
                 remap.insert(s.tag(), surv.clone());
