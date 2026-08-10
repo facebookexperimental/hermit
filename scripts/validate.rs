@@ -91,6 +91,8 @@ use std::sync::Arc;
 use safe_ci_dag_runner::cgroup::install_scope_teardown;
 use safe_ci_dag_runner::cgroup::is_in_scope;
 use safe_ci_dag_runner::cgroup::attempt_scope_reexec;
+use safe_ci_dag_runner::cgroup::expected_scope_runtime_max_s;
+use safe_ci_dag_runner::cgroup::verify_scope_runtime_max;
 use safe_ci_dag_runner::cgroup::CgroupManager;
 use safe_ci_dag_runner::cgroup::Cgroups;
 use safe_ci_dag_runner::model::DagConfig;
@@ -100,6 +102,8 @@ use safe_ci_dag_runner::perflog::append_step_profiles;
 use safe_ci_dag_runner::scheduler::run_dag_boxed_deadline;
 use safe_ci_dag_runner::scheduler::steps_violating_run_timeout;
 use safe_ci_dag_runner::scheduler::BoxedCgroups;
+use safe_ci_dag_runner::scheduler::monotonic_now_ns;
+use safe_ci_dag_runner::scheduler::STEP_STARTED_MONOTONIC_NS_ENV;
 
 use validate_plan::CompatMode;
 
@@ -117,6 +121,7 @@ const PIN_GATE_TAG: &str = "pre.reverie_pin";
 
 const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
 const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
+const OWN_SCOPE_DEADLINE_ENV: &str = "HERMIT_VALIDATE_SCOPE_DEADLINE_MONOTONIC_NS";
 
 /// Standalone-only in-repo ledger directory.
 ///
@@ -567,6 +572,53 @@ fn self_test() -> Result<(), String> {
     }
     if scope_grace_s(600) != 60 || 600 + scope_grace_s(600) >= 720 {
         return Err("run-timeout scope backstop no longer satisfies 600 < 660 < 720".into());
+    }
+    // The nested deadline must be derived from the scheduler's epoch, never a fresh clock. Both
+    // missing and future/forged epochs are refused; the real positive spends elapsed setup time.
+    let saved_epoch = std::env::var_os(STEP_STARTED_MONOTONIC_NS_ENV);
+    std::env::remove_var(STEP_STARTED_MONOTONIC_NS_ENV);
+    if invocation_deadline_ns(Some(600), true).is_ok() {
+        return Err("nested timeout accepted a missing scheduler-owned start epoch".into());
+    }
+    let now_ns = monotonic_now_ns().ok_or("CLOCK_MONOTONIC unavailable in self-test")?;
+    std::env::set_var(
+        STEP_STARTED_MONOTONIC_NS_ENV,
+        (now_ns + 1_000_000_000).to_string(),
+    );
+    if invocation_deadline_ns(Some(600), true).is_ok() {
+        return Err("nested timeout accepted a future scheduler-owned start epoch".into());
+    }
+    std::env::set_var(
+        STEP_STARTED_MONOTONIC_NS_ENV,
+        now_ns.saturating_sub(5_000_000_000).to_string(),
+    );
+    let inherited_deadline = invocation_deadline_ns(Some(600), true)?;
+    if !matches!(remaining_budget_s(inherited_deadline), Some(594 | 595)) {
+        return Err("nested timeout did not charge five elapsed setup seconds".into());
+    }
+    match saved_epoch {
+        Some(v) => std::env::set_var(STEP_STARTED_MONOTONIC_NS_ENV, v),
+        None => std::env::remove_var(STEP_STARTED_MONOTONIC_NS_ENV),
+    }
+    let saved_scope_deadline = std::env::var_os(OWN_SCOPE_DEADLINE_ENV);
+    for non_owner in [None, Some(""), Some("0"), Some("99"), Some("malformed")] {
+        match non_owner {
+            Some(v) => std::env::set_var(OWN_SCOPE_DEADLINE_ENV, v),
+            None => std::env::remove_var(OWN_SCOPE_DEADLINE_ENV),
+        }
+        if owns_scope_request(Some(100)) {
+            return Err(format!(
+                "scope request ownership accepted non-owner marker {non_owner:?}"
+            ));
+        }
+    }
+    std::env::set_var(OWN_SCOPE_DEADLINE_ENV, "100");
+    if !owns_scope_request(Some(100)) || owns_scope_request(None) {
+        return Err("scope request ownership failed its exact positive bracket".into());
+    }
+    match saved_scope_deadline {
+        Some(v) => std::env::set_var(OWN_SCOPE_DEADLINE_ENV, v),
+        None => std::env::remove_var(OWN_SCOPE_DEADLINE_ENV),
     }
 
     // Positive: the one qualifying case must be ACCEPTED (guards against a
@@ -1285,12 +1337,49 @@ fn scope_grace_s(run_timeout_s: i64) -> i64 {
     60.max(run_timeout_s / 10)
 }
 
+fn owns_scope_request(deadline_ns: Option<u64>) -> bool {
+    deadline_ns.is_some_and(|deadline| {
+        std::env::var(OWN_SCOPE_DEADLINE_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            == Some(deadline)
+    })
+}
+
 /// Establish two-level cgroup-v2 boxing, mirroring the runner's own
 /// `resolve_cgroups` policy. Returns the manager (`None` = intentional unboxed
 /// run) or `Err(exit_code)`. On the default path this re-execs into a transient
 /// `systemd --user` scope and does not return on success.
-fn resolve_cgroups(allow_failure: bool, run_timeout_s: Option<i64>) -> Result<BoxedCgroups, u8> {
+fn resolve_cgroups(
+    allow_failure: bool,
+    run_timeout_s: Option<i64>,
+    deadline_ns: Option<u64>,
+) -> Result<BoxedCgroups, u8> {
     if is_in_scope() {
+        // A RuntimeMaxSec request is only this invocation's backstop when the marker carries this
+        // invocation's absolute deadline. Nested validates inherit an outer scope and its env;
+        // treating that inherited request as the nested 660s rung would compare unrelated clocks.
+        if owns_scope_request(deadline_ns) {
+            let verified = expected_scope_runtime_max_s()
+                .is_some_and(verify_scope_runtime_max);
+            if !verified {
+                let msg = "this invocation's outer RuntimeMaxSec readback failed; the requested \
+                           scope backstop is not proven on the live unit";
+                if allow_failure {
+                    eprintln!(
+                        "validate: WARNING: {msg}; running UNBOXED (--allow-cgroup-failure)."
+                    );
+                    return Ok(None);
+                }
+                eprintln!("validate: ERROR: {msg}.");
+                return Err(3);
+            }
+        } else if run_timeout_s.is_some() {
+            eprintln!(
+                "validate: inherited cgroup scope has no invocation-owned RuntimeMaxSec rung; \
+                 the anchored in-process deadline remains inside the enclosing DAG node limit"
+            );
+        }
         let mgr = Cgroups::new();
         if mgr.enabled() {
             install_scope_teardown();
@@ -1317,11 +1406,15 @@ fn resolve_cgroups(allow_failure: bool, run_timeout_s: Option<i64>) -> Result<Bo
         );
         return Ok(None);
     }
-    let attempt = attempt_scope_reexec(
-        None,
-        None,
-        run_timeout_s.map(|s| s + scope_grace_s(s)),
-    );
+    let scope_runtime_s = run_timeout_s.and_then(|run| {
+        remaining_budget_s(deadline_ns).map(|remaining| remaining + scope_grace_s(run))
+    });
+    if let Some(deadline) = deadline_ns {
+        std::env::set_var(OWN_SCOPE_DEADLINE_ENV, deadline.to_string());
+    } else {
+        std::env::remove_var(OWN_SCOPE_DEADLINE_ENV);
+    }
+    let attempt = attempt_scope_reexec(None, None, scope_runtime_s);
     let detail = attempt.describe();
     eprintln!(
         "validate: ERROR: cgroup boxing could not be established: {detail}. Resource boxing is \
@@ -2964,14 +3057,52 @@ fn forward_step_profiles(result: &RunResult, jobs: i64) {
     }
 }
 
-/// Seconds left on one shared invocation clock.
-fn remaining_budget_s(deadline: Option<std::time::Instant>) -> Option<i64> {
-    let deadline = deadline?;
-    let now = std::time::Instant::now();
-    Some(if now >= deadline {
+/// Absolute monotonic deadline for one logical invocation.
+///
+/// A nested validate must spend from the enclosing scheduler step's clock. Starting a new
+/// `Instant` after re-exec and setup made `600 < 720` numerically true but temporally false.
+fn invocation_deadline_ns(run_timeout_s: Option<i64>, nested: bool) -> Result<Option<u64>, String> {
+    let Some(timeout_s) = run_timeout_s else {
+        return Ok(None);
+    };
+    let now_ns = monotonic_now_ns().ok_or_else(|| "CLOCK_MONOTONIC is unavailable".to_string())?;
+    let start_ns = if nested {
+        std::env::var(STEP_STARTED_MONOTONIC_NS_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .ok_or_else(|| {
+                format!(
+                    "nested timed validate lacks the scheduler-owned {STEP_STARTED_MONOTONIC_NS_ENV}; \
+                     refusing to start a fresh clock that could outlive its enclosing node"
+                )
+            })?
+    } else {
+        now_ns
+    };
+    if start_ns > now_ns {
+        return Err(format!(
+            "scheduler-owned {STEP_STARTED_MONOTONIC_NS_ENV} is in the future"
+        ));
+    }
+    let allowance_ns = (timeout_s as u64)
+        .checked_mul(1_000_000_000)
+        .ok_or_else(|| format!("run timeout {timeout_s}s overflows the monotonic deadline"))?;
+    start_ns
+        .checked_add(allowance_ns)
+        .map(Some)
+        .ok_or_else(|| format!("run timeout {timeout_s}s overflows the monotonic deadline"))
+}
+
+/// Seconds left on one shared invocation clock, floored so a child cannot outlive it.
+fn remaining_budget_s(deadline_ns: Option<u64>) -> Option<i64> {
+    let deadline_ns = deadline_ns?;
+    // Clock-read failure cannot turn a bounded invocation into `None` (unbounded). Expire it in
+    // the safe direction instead.
+    let now_ns = monotonic_now_ns().unwrap_or(deadline_ns);
+    Some(if now_ns >= deadline_ns {
         0
     } else {
-        (deadline - now).as_secs() as i64
+        ((deadline_ns - now_ns) / 1_000_000_000) as i64
     })
 }
 
@@ -3005,9 +3136,22 @@ fn run_lane_with_env_retries(
     verbosity: i64,
     cgroups: BoxedCgroups,
     log_path: &Path,
-    deadline: Option<std::time::Instant>,
+    deadline: Option<u64>,
 ) -> LaneResult {
     let max = validate_runtime::env_block_max_retries();
+    if remaining_budget_s(deadline) == Some(0) {
+        eprintln!(
+            "validate: whole-run budget expired during setup; no DAG node will be started \
+             unbounded, and every planned node is recorded as not attempted"
+        );
+        return LaneResult {
+            outcomes: Vec::new(),
+            skipped: cfg.steps.iter().map(|s| s.tag()).collect(),
+            ok: false,
+            env_retries: 0,
+            run_timed_out: true,
+        };
+    }
     let first = run_dag_boxed_deadline(
         cfg,
         jobs,
@@ -3999,6 +4143,29 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         return stop_test_seam(&root, &profile_name, parent.as_deref());
     }
 
+    // Anchor the logical run before locks, freshness checks, plan construction, cgroup re-exec,
+    // durable-log setup, and registration.  A nested focused payload inherits the enclosing
+    // safe-ci step's scheduler-owned epoch; a top-level run owns its epoch here.
+    let run_timeout = args
+        .run_timeout
+        .or_else(|| env_positive("HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS"));
+    let deadline_ns = if args.show_plan {
+        None
+    } else {
+        match invocation_deadline_ns(run_timeout, nesting.nested) {
+            Ok(deadline) => deadline,
+            Err(msg) => {
+                eprintln!("validate: REFUSED — {msg}");
+                return RunSummary::refused(
+                    3,
+                    &profile_name,
+                    "the shared timeout epoch",
+                    vec![msg],
+                );
+            }
+        }
+    };
+
     // ---- concurrent invocation (validate.sh:492) -----------------------------
     //
     // A second validate in the SAME checkout is unambiguously wrong: both drive
@@ -4179,10 +4346,6 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // The whole-run budget is the first boundary able to stop cumulative cost
     // while preserving evidence. Per-node caps cannot bound a sequence of legal
     // nodes, and the hosted job kill discards the diagnostic tail.
-    let run_timeout = args
-        .run_timeout
-        .or_else(|| env_positive("HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS"));
-
     // Refuse an inverted ladder before even `--show-plan` succeeds. A node with
     // an allowance at least as large as the run budget can only be cut by the
     // less-specific outer clock, losing attribution to the node.
@@ -4338,33 +4501,34 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         ),
     }
 
-    let cgroups: BoxedCgroups = match resolve_cgroups(args.allow_cgroup_failure, run_timeout) {
-        Ok(c) => {
-            // Claim the re-entrancy marker HERE, not before resolve_cgroups.
-            // On the default path resolve_cgroups re-execs into a transient
-            // systemd scope and does not return, so the process that reaches
-            // this line is the one that will actually drive the run -- and it is
-            // the only one whose pid a nested payload should see. Claiming
-            // earlier made the driver read its own boxing re-exec as a nested
-            // invocation and refuse itself.
-            validate_runtime::claim_active_marker();
-            c
-        }
-        Err(code) => {
-            return RunSummary::refused(
-                code,
-                &plan.profile,
-                "cgroup boxing (fail-closed)",
-                vec![
-                    "two-level cgroup-v2 boxing could not be established; see the message above"
-                        .into(),
-                    "resource boxing is this tool's primary purpose — re-run with \
-                     --allow-cgroup-failure to accept an UNBOXED run"
-                        .into(),
-                ],
-            )
-        }
-    };
+    let cgroups: BoxedCgroups =
+        match resolve_cgroups(args.allow_cgroup_failure, run_timeout, deadline_ns) {
+            Ok(c) => {
+                // Claim the re-entrancy marker HERE, not before resolve_cgroups.
+                // On the default path resolve_cgroups re-execs into a transient
+                // systemd scope and does not return, so the process that reaches
+                // this line is the one that will actually drive the run -- and it is
+                // the only one whose pid a nested payload should see. Claiming
+                // earlier made the driver read its own boxing re-exec as a nested
+                // invocation and refuse itself.
+                validate_runtime::claim_active_marker();
+                c
+            }
+            Err(code) => {
+                return RunSummary::refused(
+                    code,
+                    &plan.profile,
+                    "cgroup boxing (fail-closed)",
+                    vec![
+                        "two-level cgroup-v2 boxing could not be established; see the message above"
+                            .into(),
+                        "resource boxing is this tool's primary purpose — re-run with \
+                         --allow-cgroup-failure to accept an UNBOXED run"
+                            .into(),
+                    ],
+                )
+            }
+        };
 
     let commit = git_sha();
     match setup_durable_log(&root, &plan.profile, &commit) {
@@ -4463,8 +4627,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 
     // One clock for the whole invocation. Sequential lanes and retries spend
     // from the same allowance rather than each receiving a fresh 600 seconds.
-    let deadline = run_timeout
-        .map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s as u64));
+    let deadline = deadline_ns;
     let lane = |cfg: &DagConfig| -> LaneResult {
         run_lane_with_env_retries(
             cfg,

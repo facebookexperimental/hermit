@@ -328,6 +328,11 @@ function assert_strict_compat_budget_ladder {
         die "strict-compat heavy prep must retain its measured 420s inner bound"
     grep -Fq 'run_dag_boxed_deadline' "$ROOT_DIR/scripts/validate.rs" ||
         die "strict-compat whole-run budget has no in-process deadline consumer"
+    grep -Fq 'STEP_STARTED_MONOTONIC_NS_ENV' "$ROOT_DIR/scripts/validate.rs" ||
+        die "strict-compat starts a fresh inner clock instead of inheriting the outer node epoch"
+    grep -Fq 'expected_scope_runtime_max_s' "$ROOT_DIR/scripts/validate.rs" &&
+        grep -Fq 'verify_scope_runtime_max' "$ROOT_DIR/scripts/validate.rs" ||
+        die "strict-compat requests a scope RuntimeMaxSec without reading the live value back"
     grep -Fq 'forward_step_profiles(&first, jobs)' "$ROOT_DIR/scripts/validate.rs" ||
         die "strict-compat inner rows are not forwarded to the hosted artifact directory"
     [[ $cmd == *'SAFE_CI_DAG_RUNNER_LOG_DIR="${RUN_NODE_PERF_DIR:-$PWD/ignored/ci/perf/strict-compat}/logs"'* ]] ||
