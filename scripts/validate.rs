@@ -3602,7 +3602,7 @@ struct LedgerCtx {
     /// row itself so a reader never has to infer from a bare `pass` that the
     /// archival pin was proved current; the receipt verifier keys on it.
     reverie_pin_current: bool,
-    /// libtest counts parsed from the durable log; `None` is UNKNOWN.
+    /// Libtest counts aggregated from typed step outcomes; `None` is UNKNOWN.
     executed_tests: Option<i64>,
     filtered_tests: Option<i64>,
 }
@@ -3918,8 +3918,8 @@ fn write_ledger(
         // because the host was retried must be distinguishable from a first-pass
         // green.
         "env_block_retries": ctx.env_block_retries,
-        // LIBTEST counts parsed from the durable log by the parent's single-
-        // sourced banner parser, exactly as validate.sh:1671 recorded them.
+        // LIBTEST counts aggregated from the runner's typed step outcomes before
+        // verbosity filters their human-facing presentation.
         // `null` is UNKNOWN and stays UNKNOWN: the receipt publisher fails closed
         // rather than turning missing evidence into a zero or a pass. These are
         // the counts every downstream `is_clean_full_pass` predicate keys on, so
@@ -3936,7 +3936,8 @@ fn write_ledger(
         // NODE counts, deliberately NOT named executed_tests/filtered_tests: a
         // schema<5 consumer keys is_clean_full_pass on those libtest-count names,
         // and a ~47-NODE DAG run must never be readable as a 47-TEST pass. The
-        // counted receipt is minted by finalize_receipt.py --scan off the log.
+        // counted receipt consumes the explicit test fields above rather than
+        // treating this node count as test evidence.
         "executed_nodes": gates_run,
         "real_seconds": wall_s,
         "log_file": log_file,
@@ -5345,8 +5346,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
     match executed_tests {
         Some(n) => detail.push(format!(
-            "{n} test(s) executed, {} filtered (parsed from the durable log by the parent's \
-             single-sourced banner parser)",
+            "{n} test(s) executed, {} filtered (aggregated from typed step outcomes)",
             filtered_tests.map(|f| f.to_string()).unwrap_or_else(|| "unknown".into())
         )),
         None => detail.push(

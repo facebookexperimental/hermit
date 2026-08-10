@@ -8,20 +8,21 @@
 //! (`cache_lookup_record`, validate.sh:620) and the runtime ESTIMATE
 //! (`history_estimate`, validate.sh:936).
 //!
-//! # The cache predicate must match the PRODUCER, not a fixed field name
+//! # The cache predicate must match the PRODUCER and its evidence
 //!
-//! `validate.sh`'s cache required `.executed_tests != null and > 0`. The Rust
-//! driver deliberately does **not** write `executed_tests` — it writes
-//! `executed_nodes`, because a ~47-NODE DAG run must never be readable as a
-//! 47-TEST pass (see `write_ledger` in `validate.rs`). Porting the bash
-//! predicate verbatim would therefore make every Rust-produced row permanently
-//! uncacheable — the cache would look implemented and never fire.
+//! Both producers require `executed_tests > 0`: a missing count and a measured
+//! zero are distinct facts, but neither proves that a test-bearing run completed.
+//! The Rust driver carries that count from typed step outcomes, independently of
+//! human-facing log verbosity. It also writes `executed_nodes`, because a
+//! ~47-NODE DAG run must never be readable as a 47-TEST pass (see `write_ledger`
+//! in `validate.rs`).
 //!
 //! So the predicate is dispatched on the row's own `producer` field: a
-//! `validate.rs` row must carry `executed_nodes > 0` **and** a satisfied
-//! coverage record; a bash row must carry `executed_tests > 0`. That is one
-//! verifier per authority rather than one generic field test, and neither branch
-//! can be satisfied by the other's counter.
+//! `validate.rs` row must carry `executed_tests > 0`, `executed_nodes > 0`,
+//! **and** a satisfied coverage record; a bash row must carry
+//! `executed_tests > 0`. That is one verifier per authority rather than one
+//! generic field test, and a Rust row cannot substitute its node count for test
+//! evidence.
 //!
 //! # Fail-open, never fail-hit
 //!
@@ -138,6 +139,9 @@ fn pass_row_qualifies(row: &serde_json::Value) -> bool {
     }
     match s(row, "producer") {
         "validate.rs" => {
+            if i(row, "executed_tests").unwrap_or(0) <= 0 {
+                return false;
+            }
             if i(row, "executed_nodes").unwrap_or(0) <= 0 {
                 return false;
             }
@@ -153,7 +157,8 @@ fn pass_row_qualifies(row: &serde_json::Value) -> bool {
                 }
             }
         }
-        // Anything else is a validate.sh-era row: its counter is executed_tests.
+        // A validate.sh-era row has no typed node/coverage evidence, so its
+        // positive test count is the producer-specific execution proof.
         "" | "validate.sh" => i(row, "executed_tests").unwrap_or(0) > 0,
         _ => false,
     }
@@ -368,7 +373,8 @@ pub fn self_test() -> Result<String, String> {
     // POSITIVE, both producers. A predicate that refuses everything would look
     // correct with negatives alone, so each authority gets a counted accept.
     let rs_pass = base(serde_json::json!({
-        "producer": "validate.rs", "executed_nodes": 47, "gates_expected": 47, "gates_run": 47,
+        "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 47,
+        "gates_expected": 47, "gates_run": 47,
         "coverage": {"planned_test_nodes": 20, "executed_test_nodes": 20, "absent_nodes": []},
     }));
     let sh_pass = base(serde_json::json!({
@@ -386,18 +392,20 @@ pub fn self_test() -> Result<String, String> {
     // the positive row with exactly one field spoiled, so a refusal is
     // attributable to that field and nothing else.
     let negatives: Vec<(&str, serde_json::Value)> = vec![
-        ("different tree", base(serde_json::json!({"tree": "OTHER", "producer": "validate.rs", "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
-        ("different profile", base(serde_json::json!({"profile": "quick", "producer": "validate.rs", "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
-        ("different host", base(serde_json::json!({"host": "h2", "producer": "validate.rs", "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
-        ("different toolchain", base(serde_json::json!({"toolchain": "rustc 2.0", "producer": "validate.rs", "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
-        ("selective run", base(serde_json::json!({"selection_mode": "selective", "producer": "validate.rs", "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
-        ("not commit-anchored", base(serde_json::json!({"commit_anchored": false, "producer": "validate.rs", "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
-        ("dirty tree", base(serde_json::json!({"tree_dirty": true, "producer": "validate.rs", "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
-        ("nonzero failures", base(serde_json::json!({"failures": 1, "producer": "validate.rs", "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
-        ("zero executed nodes", base(serde_json::json!({"producer": "validate.rs", "executed_nodes": 0, "coverage": {"executed_test_nodes": 0, "absent_nodes": []}}))),
-        ("absent coverage block", base(serde_json::json!({"producer": "validate.rs", "executed_nodes": 5}))),
-        ("planned node never ran", base(serde_json::json!({"producer": "validate.rs", "executed_nodes": 5, "coverage": {"executed_test_nodes": 4, "absent_nodes": ["test.x"]}}))),
-        ("gates_run below gates_expected", base(serde_json::json!({"producer": "validate.rs", "executed_nodes": 5, "gates_expected": 47, "gates_run": 12, "coverage": {"executed_test_nodes": 5, "absent_nodes": []}}))),
+        ("different tree", base(serde_json::json!({"tree": "OTHER", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
+        ("different profile", base(serde_json::json!({"profile": "quick", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
+        ("different host", base(serde_json::json!({"host": "h2", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
+        ("different toolchain", base(serde_json::json!({"toolchain": "rustc 2.0", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
+        ("selective run", base(serde_json::json!({"selection_mode": "selective", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
+        ("not commit-anchored", base(serde_json::json!({"commit_anchored": false, "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
+        ("dirty tree", base(serde_json::json!({"tree_dirty": true, "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
+        ("nonzero failures", base(serde_json::json!({"failures": 1, "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
+        ("validate.rs row with no executed_tests", base(serde_json::json!({"producer": "validate.rs", "executed_nodes": 47, "gates_expected": 47, "gates_run": 47, "coverage": {"planned_test_nodes": 20, "executed_test_nodes": 20, "absent_nodes": []}}))),
+        ("validate.rs row with zero executed_tests", base(serde_json::json!({"producer": "validate.rs", "executed_tests": 0, "executed_nodes": 47, "gates_expected": 47, "gates_run": 47, "coverage": {"planned_test_nodes": 20, "executed_test_nodes": 20, "absent_nodes": []}}))),
+        ("zero executed nodes", base(serde_json::json!({"producer": "validate.rs", "executed_tests": 873, "executed_nodes": 0, "coverage": {"executed_test_nodes": 0, "absent_nodes": []}}))),
+        ("absent coverage block", base(serde_json::json!({"producer": "validate.rs", "executed_tests": 873, "executed_nodes": 5}))),
+        ("planned node never ran", base(serde_json::json!({"producer": "validate.rs", "executed_tests": 873, "executed_nodes": 5, "coverage": {"executed_test_nodes": 4, "absent_nodes": ["test.x"]}}))),
+        ("gates_run below gates_expected", base(serde_json::json!({"producer": "validate.rs", "executed_tests": 873, "executed_nodes": 5, "gates_expected": 47, "gates_run": 12, "coverage": {"executed_test_nodes": 5, "absent_nodes": []}}))),
         ("bash row with zero executed_tests", base(serde_json::json!({"producer": "validate.sh", "executed_tests": 0}))),
         ("bash row with no executed_tests", base(serde_json::json!({"producer": "validate.sh"}))),
         // The cross-producer trap this module exists to close: a validate.rs row
