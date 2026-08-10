@@ -173,10 +173,6 @@ pub struct FutexWaiter {
     bitset: u32,
 }
 
-/// Deterministically pick one element from `choices` using the supplied PRNG,
-/// returning `None` for an empty slice. This is the single random-selection
-/// primitive used by the targeted-chaos scheduling points, so their choices stay
-/// reproducible under a fixed `--fuzz-seed`.
 /// Render an already-sorted thread list for a diagnostic, or `none`.
 fn render_tid_list(tids: &[DetTid]) -> String {
     if tids.is_empty() {
@@ -189,6 +185,10 @@ fn render_tid_list(tids: &[DetTid]) -> String {
     }
 }
 
+/// Deterministically pick one element from `choices` using the supplied PRNG,
+/// returning `None` for an empty slice. This is the single random-selection
+/// primitive used by the targeted-chaos scheduling points, so their choices stay
+/// reproducible under a fixed `--fuzz-seed`.
 fn chaos_pick<T: Copy>(prng: &mut Pcg64Mcg, choices: &[T]) -> Option<T> {
     choices.choose(prng).copied()
 }
@@ -2474,6 +2474,33 @@ impl Scheduler {
         }
     }
 
+    /// Name every blocked class that is actually holding the run.
+    ///
+    /// Derived from state rather than passed in by the caller, so the headline
+    /// cannot contradict the body it sits above. Branch order alone would
+    /// mis-file a genuine futex deadlock that merely has a saturated timer
+    /// registered: `step2d_handle_empty_queue` reaches the indefinite arm
+    /// whenever *any* timed waiter exists, so a caller-supplied headline would
+    /// read "waiting indefinitely" while the futex pool is the real story. The
+    /// body always listed both; the headline is what lands in a bug report.
+    fn describe_terminal_waiters(&self) -> String {
+        let mut classes: Vec<&str> = Vec::new();
+        if !self.blocked.no_futex_waiters() {
+            classes.push("thread(s) waiting on futex");
+        }
+        if !self.blocked.timed_waiters.is_empty() {
+            classes.push(
+                "thread(s) waiting indefinitely (pause, or a timer beyond the end of logical time)",
+            );
+        }
+        if classes.is_empty() {
+            // Defensive: every caller fires with at least one class present.
+            "thread(s) blocked with no possible wake".to_owned()
+        } else {
+            classes.join(", and ")
+        }
+    }
+
     /// Build the deadlock report. **Must be byte-identical across runs of the
     /// same program**: this text reaches stderr, and emitting a
     /// host-dependent string from a deterministic execution engine is a defect
@@ -2496,10 +2523,10 @@ impl Scheduler {
     /// guest-level identities are printed: dettids, resource ids, futex keys and
     /// logical deadlines, all of which Detcore already guarantees to be
     /// deterministic. No host pointer is emitted.
-    fn format_terminal_deadlock(&self, waiters: &str) -> String {
+    fn format_terminal_deadlock(&self) -> String {
         let mut out = format!(
             "Deadlock detected: {}, but no runnable threads left.\n",
-            waiters
+            self.describe_terminal_waiters()
         );
         let _ = writeln!(
             out,
@@ -2620,8 +2647,8 @@ impl Scheduler {
     /// `Ivar<SchedResponse>` only the scheduler could fill, so the process hangs
     /// until an external timeout kills it. Unwinding out of
     /// `do_a_turn_blocking` would also poison the scheduler mutex.
-    fn report_terminal_deadlock(&mut self, waiters: &str) -> SkipTurn {
-        let report = self.format_terminal_deadlock(waiters);
+    fn report_terminal_deadlock(&mut self) -> SkipTurn {
+        let report = self.format_terminal_deadlock();
         // Keep the first verdict: it names the state that actually wedged.
         self.terminal_deadlock.get_or_insert(report);
         SkipTurn
@@ -2657,7 +2684,7 @@ impl Scheduler {
                 info!("scheduler (step2_process_blocked): zero threads left anywhere, fizzling.");
                 return Err(SkipTurn);
             } else if !futex_empty && timed_empty && blockers_empty {
-                return Err(self.report_terminal_deadlock("thread(s) waiting on futex"));
+                return Err(self.report_terminal_deadlock());
             } else if !timed_empty {
                 // Only a *reachable* deadline justifies fast-forwarding the clock.
                 // `LogicalTime::INDEFINITE` is the sentinel a `pause(2)` (or a
@@ -2685,9 +2712,7 @@ impl Scheduler {
                         std::thread::yield_now();
                         return Err(SkipTurn);
                     }
-                    return Err(self.report_terminal_deadlock(
-                        "thread(s) waiting indefinitely (pause, or a timer beyond the end of logical time)",
-                    ));
+                    return Err(self.report_terminal_deadlock());
                 }
                 debug!(
                     "[scheduler] Deadlock avoidance! Empty run-queue, so waking next timed event."
@@ -5378,10 +5403,8 @@ mod test {
     #[test]
     fn deadlock_report_is_deterministic_and_carries_no_host_pointer() {
         let config = Config::default();
-        let forward = deadlocked_scheduler(&config, false)
-            .format_terminal_deadlock("thread(s) waiting on futex");
-        let reversed = deadlocked_scheduler(&config, true)
-            .format_terminal_deadlock("thread(s) waiting on futex");
+        let forward = deadlocked_scheduler(&config, false).format_terminal_deadlock();
+        let reversed = deadlocked_scheduler(&config, true).format_terminal_deadlock();
 
         // Same logical state built in two insertion orders must render
         // identically: no HashMap/HashSet iteration order may leak.
@@ -5399,7 +5422,11 @@ mod test {
         // The report is still substantive: it names every blocked thread, the
         // futex keys, and the indefinite deadline.
         for expected in [
-            "Deadlock detected: thread(s) waiting on futex, but no runnable threads left.",
+            // This fixture holds BOTH pools, so the state-derived headline must
+            // name both rather than whichever branch happened to fire.
+            "Deadlock detected: thread(s) waiting on futex, and thread(s) waiting \
+             indefinitely (pause, or a timer beyond the end of logical time), but no \
+             runnable threads left.",
             "dtid 3",
             "dtid 9",
             "0x404100",
@@ -5445,6 +5472,96 @@ mod test {
         assert!(scheduler.take_terminal_deadlock().is_none());
         assert_eq!(global_time.lock().unwrap().as_nanos(), initial_time);
         assert!(!scheduler.blocked.timed_waiters.is_empty());
+    }
+
+    /// The `SignalEvt` arm is the sub-case whose behaviour this change actually
+    /// alters, and it is reachable with no `pause` anywhere.
+    ///
+    /// `handle_timer_settime` adds a guest-supplied duration to now, and
+    /// `LogicalTime`'s `Add` saturates, so an absurdly far-future POSIX timer
+    /// (issue #219, the Java case) lands on `LogicalTime::INDEFINITE` and
+    /// `register_posix_timer` inserts it verbatim. Previously `step2d` popped it,
+    /// fast-forwarded the clock ~584 years, and dispatched to `fire_alarm`, which
+    /// -- unlike the `ThreadEvt` arm -- does NOT abort: it delivered a bogus
+    /// year-2554 signal and the guest carried on. That is now a terminal
+    /// deadlock, which is the faithful answer, because Linux will not fire that
+    /// timer either and those threads genuinely hang.
+    #[test]
+    fn saturated_posix_timer_alone_is_a_deadlock_not_a_bogus_signal() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let initial_time = global_time.lock().unwrap().as_nanos();
+        let process = DetPid::from_raw(100);
+
+        // The real production entry point, with the deadline a saturating add
+        // produces. No `pause`, no `ThreadEvt`.
+        scheduler.register_posix_timer(
+            process,
+            process,
+            7,
+            Some(LogicalTime::MAX - LogicalTime::from_nanos(0)),
+            LogicalTime::ZERO,
+            Signal::SIGALRM,
+        );
+        assert_eq!(
+            scheduler.blocked.timed_waiters.next_deadline(),
+            Some(LogicalTime::INDEFINITE),
+            "a saturated timer must land on the no-deadline sentinel"
+        );
+
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+
+        let report = scheduler
+            .take_terminal_deadlock()
+            .expect("a saturated timer with nothing runnable is a terminal deadlock");
+        assert!(
+            report.contains("thread(s) waiting indefinitely"),
+            "unexpected report:\n{report}"
+        );
+        // The signal was NOT delivered and the clock did NOT jump to the end of
+        // logical time: both are what the old fast-forward did here.
+        assert_eq!(global_time.lock().unwrap().as_nanos(), initial_time);
+        assert!(scheduler.run_queue.is_empty());
+        assert!(!scheduler.blocked.timed_waiters.is_empty());
+    }
+
+    /// The headline is derived from state, not from the branch that fired, so a
+    /// genuine futex deadlock that merely has a saturated timer registered names
+    /// both classes rather than being filed as an indefinite-wait bug.
+    #[test]
+    fn a_futex_deadlock_holding_a_saturated_timer_names_both_classes() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let mm = MmId::initial(DetTid::from_raw(3));
+        scheduler
+            .blocked
+            .futex_waiters
+            .entry(FutexID::private(mm, 0x404100))
+            .or_default()
+            .push(futex_waiter(3, u32::MAX));
+        scheduler.register_posix_timer(
+            DetPid::from_raw(100),
+            DetPid::from_raw(100),
+            7,
+            Some(LogicalTime::INDEFINITE),
+            LogicalTime::ZERO,
+            Signal::SIGALRM,
+        );
+
+        // Branch order sends this to the indefinite arm, because a timed waiter
+        // exists; the headline must still say the futex pool is blocked.
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        let report = scheduler.take_terminal_deadlock().expect("terminal");
+        let headline = report.lines().next().expect("a headline");
+        assert_eq!(
+            headline,
+            "Deadlock detected: thread(s) waiting on futex, and thread(s) waiting \
+             indefinitely (pause, or a timer beyond the end of logical time), but no \
+             runnable threads left.",
+            "full report:\n{report}"
+        );
     }
 
     /// The futex class shares `report_terminal_deadlock`, so it must record a

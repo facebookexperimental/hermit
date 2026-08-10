@@ -19,8 +19,12 @@
  * and resume `pause()` as an interruption.
  *
  * The negative half -- an indefinite wait with no signal that can ever arrive --
- * is a guest that never terminates, so it is covered by the scheduler unit tests
- * in detcore/src/scheduler.rs rather than by an e2e guest.
+ * lives in the scheduler unit tests in detcore/src/scheduler.rs, not here.
+ * Not because such a guest would hang: Hermit now reports that deadlock and
+ * exits nonzero promptly (measured 0.02-1.3s). The blocker is the harness, which
+ * passes a verify cell only on exit status 0 and has no way for a manifest to
+ * declare an expected nonzero status, so a "must exit 1" cell cannot be
+ * expressed today.
  */
 
 #define _POSIX_C_SOURCE 200809L
