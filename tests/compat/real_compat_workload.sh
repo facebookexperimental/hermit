@@ -65,12 +65,12 @@ function verify_archive_roundtrip {
 function fetch_localhost_payload {
     (
         local client=$1
-        local nc_help
+        local nc_bin nc_help
         local response_bytes
         local server_pid=
         local server_status=0
         local status=0
-        local -a nc_args=(-l 127.0.0.1 18765)
+        local -a nc_args=(--send-only -l 127.0.0.1 18765)
 
         trap 'if [[ -n $server_pid ]]; then kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; fi' EXIT
         prepare_archive_fixture
@@ -81,17 +81,24 @@ function fetch_localhost_payload {
             cat "$WORK_DIR/source/payload.txt"
         } >"$WORK_DIR/response.http"
 
-        nc_help=$(/usr/bin/nc -h 2>&1 || true)
-        if grep -q -- '--send-only' <<<"$nc_help"; then
-            nc_args=(--send-only "${nc_args[@]}")
-        elif grep -Eq -- '(^|[[:space:]])-N([[:space:],]|$)' <<<"$nc_help"; then
-            nc_args=(-N "${nc_args[@]}")
+        if [[ -x /usr/bin/ncat ]]; then
+            nc_bin=/usr/bin/ncat
         else
-            printf 'nc lacks a send-only/shutdown-after-EOF option\n' >&2
+            nc_help=$(/usr/bin/nc -h 2>&1 || true)
+            if grep -q -- '--send-only' <<<"$nc_help"; then
+                nc_bin=/usr/bin/nc
+            else
+                printf 'wget/curl localhost fixture requires Ncat --send-only\n' >&2
+                return 1
+            fi
+        fi
+        nc_help=$("$nc_bin" -h 2>&1 || true)
+        if ! grep -q -- '--send-only' <<<"$nc_help"; then
+            printf '%s does not advertise required --send-only support\n' "$nc_bin" >&2
             return 1
         fi
 
-        /usr/bin/nc "${nc_args[@]}" \
+        "$nc_bin" "${nc_args[@]}" \
             <"$WORK_DIR/response.http" >"$WORK_DIR/server.log" 2>&1 &
         server_pid=$!
 
