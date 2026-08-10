@@ -4905,6 +4905,9 @@ occasional = false
 program = "tests/backend-parity/fixtures/host_identity.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
+  [test.build]
+  cflags = ["-D_GNU_SOURCE"]
+
 [test.modes.verify]
 ci = true
 backends_enabled = ["ptrace", "dbt"]

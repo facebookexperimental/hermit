@@ -2221,6 +2221,12 @@
       "why": "tests/e2e/lib/applications/sqlite_on_disk.sh is owned by tests/e2e/lib/applications/run_all.sh: The `sqlite_on_disk` scenario is one named case inside the applications aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
     },
     {
+      "disposition": "special-driver",
+      "path": "tests/e2e/lib/applications/test_verdict_discrimination.sh",
+      "runner": "tests/e2e/lib/applications maintainers (standalone self-test; run directly)",
+      "why": "tests/e2e/lib/applications/test_verdict_discrimination.sh is owned by tests/e2e/lib/applications maintainers (standalone self-test; run directly): Standalone self-test that brackets run_hermit_verify's verdict reader from BOTH sides using synthetic --verify-json reports and a fake Hermit: one positive strict-parity case proves the reader still accepts genuine success, and seven negative cases prove it refuses a stripped banner match, zero or null compared counts, a missing result stamp, divergence, launch refusal and malformed JSON. It drives no real guest and is not a manifest-discovered program."
+    },
+    {
       "disposition": "suite-helper",
       "path": "tests/e2e/lib/data-handling/archive.sh",
       "runner": "tests/e2e/lib/data-handling/run.sh",
