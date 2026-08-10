@@ -130,6 +130,25 @@ impl LogicalTime {
     /// The maximum representable integer nanoseconds.
     pub const MAX: LogicalTime = LogicalTime(u64::MAX);
 
+    /// The sentinel deadline for a wait that has *no* deadline.
+    ///
+    /// A `pause(2)` blocks until a signal arrives and can never time out, so it
+    /// registers this value rather than a real deadline. The saturating `Add`
+    /// impls below also land here when a guest arms an absurdly far-future timer
+    /// (issue #219), which is the same situation: a deadline that can never be
+    /// reached while virtual time remains representable.
+    ///
+    /// Callers that fast-forward virtual time to a pending deadline must check
+    /// [`LogicalTime::is_indefinite`] first. Jumping the global clock onto this
+    /// value would both destroy the continuity of virtual time (a ~584-year
+    /// step) and wake a waiter that Linux would have left blocked.
+    pub const INDEFINITE: LogicalTime = LogicalTime::MAX;
+
+    /// Is this the [`LogicalTime::INDEFINITE`] sentinel, i.e. "no deadline"?
+    pub fn is_indefinite(&self) -> bool {
+        *self == LogicalTime::INDEFINITE
+    }
+
     /// Returns the total number of whole microseconds contained by this `LogicalTime`.
     pub fn as_micros(&self) -> u64 {
         self.0 / NANOS_PER_MICRO
@@ -335,6 +354,18 @@ fn subsecond_units_are_converted_from_nanoseconds() {
     let timeval: Timeval = time.into();
     assert_eq!(timeval.tv_sec, 2);
     assert_eq!(timeval.tv_usec, 345_678);
+}
+
+#[test]
+fn indefinite_is_recognized_and_nothing_else_is() {
+    assert!(LogicalTime::INDEFINITE.is_indefinite());
+    assert!(!LogicalTime::ZERO.is_indefinite());
+    assert!(!LogicalTime::from_secs(1_767_225_600).is_indefinite());
+    assert!(!LogicalTime(u64::MAX - 1).is_indefinite());
+
+    // A saturated far-future deadline (issue #219) lands on the same sentinel,
+    // and is equally unreachable, so the scheduler must treat it the same way.
+    assert!((LogicalTime(u64::MAX - 10) + LogicalTime::from_secs(1)).is_indefinite());
 }
 
 #[test]

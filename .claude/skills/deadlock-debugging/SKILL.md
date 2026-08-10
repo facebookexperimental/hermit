@@ -282,7 +282,8 @@ verification, so confirm the deadline comparison eventually fires.
 | Final pattern | Meaning | Next check |
 | --- | --- | --- |
 | `Deadlock detected: thread(s) waiting on futex, but no runnable threads left` | Futex waiters exist, with no runnable, timed, or external event. | Pair every wait with its expected wake; compare native. |
-| `Deadlock avoidance!` then `Skipping global time ahead` | Not itself a deadlock; step2d advances to a timer. | Require a time-based wake and later COMMIT. |
+| `Deadlock detected: thread(s) waiting indefinitely (pause, ...)` | Only deadline-less waiters remain: a `pause(2)`, or a timer that saturated `LogicalTime::MAX`. Nothing can ever signal them. | Native Linux hangs here too, so compare against a host `timeout`, not a clean exit. Otherwise find the signal/`alarm` that never arrives. |
+| `Deadlock avoidance!` then `Skipping global time ahead` | Not itself a deadlock; step2d advances to a timer. | Require a time-based wake and later COMMIT. Never fires for an indefinite deadline: jumping the clock to the end of logical time would wake a `pause` with no signal. |
 | `zero threads left anywhere, fizzling` near exit | No runnable or blocked threads remain. | Check guest exit/lifecycle, not futex logic. |
 | `external IO ... SPINNING` with fixed dtids | Only host-driven blocking remains. | Identify syscall/fd and compare native readiness. |
 | Repeated `Scheduler wait for full quiescense, on <same ivar>` | A thread has not parked/checkpointed. | Find its last event; distinguish host block from busy loop. |

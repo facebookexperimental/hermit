@@ -1082,6 +1082,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/pause_alarm_interrupt.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI)",
+      "why": "tests/c/pause_alarm_interrupt.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and runs in blocking GitHub CI; it asserts that pause(2) blocks until SIGALRM and then fails with EINTR, so the scheduler must reach the alarm deadline rather than satisfy the deadline-less wait by fast-forwarding virtual time"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/perf_event_hardware_enosys.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
       "why": "tests/c/perf_event_hardware_enosys.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"

@@ -2370,6 +2370,28 @@ impl Scheduler {
         }
     }
 
+    /// Report a permanently blocked guest and abort the run.
+    ///
+    /// Reached only when the run queue is empty *and* every remaining thread is
+    /// blocked on something no future scheduler turn can supply. In a
+    /// sequentialized deterministic run the scheduler is the only source of
+    /// wakeups, so "no thread can be woken now" is also "no thread can ever be
+    /// woken": the condition is permanent, not transient. Linux would leave such
+    /// a process hung forever; reporting it is strictly more useful than
+    /// reproducing the hang, and it is the established Detcore behaviour for the
+    /// futex case (`docs/ERROR_CATALOG.md`).
+    ///
+    /// `waiters` names *what* is blocked; the caller-independent tail of the
+    /// message and the state dump are shared so every deadlock class prints the
+    /// same shape.
+    fn report_terminal_deadlock(&self, waiters: &str) -> ! {
+        panic!(
+            "Deadlock detected: {}, but no runnable threads left.\n \
+             queue: {:?}\n  next_turns: {:?}\n  blocked: {:?} \n",
+            waiters, self.run_queue, self.next_turns, self.blocked
+        )
+    }
+
     fn step2d_handle_empty_queue(
         &mut self,
         global_time: &Arc<Mutex<GlobalTime>>,
@@ -2395,12 +2417,38 @@ impl Scheduler {
                 info!("scheduler (step2_process_blocked): zero threads left anywhere, fizzling.");
                 return Err(SkipTurn);
             } else if !futex_empty && timed_empty && blockers_empty {
-                panic!(
-                    "Deadlock detected: thread(s) waiting on futex, but no runnable threads left.\n \
-                 queue: {:?}\n  next_turns: {:?}\n  blocked: {:?} \n",
-                    self.run_queue, self.next_turns, self.blocked
-                )
+                self.report_terminal_deadlock("thread(s) waiting on futex")
             } else if !timed_empty {
+                // Only a *reachable* deadline justifies fast-forwarding the clock.
+                // `LogicalTime::INDEFINITE` is the sentinel a `pause(2)` (or a
+                // far-future timer that saturated the clock) registers to mean "no
+                // deadline; wake me on a signal". Because the map is ordered, an
+                // indefinite front entry means every pending timed event is
+                // indefinite, so no amount of virtual time can fire any of them.
+                // Popping it anyway would jump global virtual time by ~584 years and
+                // grant the sleep as a `ResumeStatus::Normal` wake, which is exactly
+                // the internal violation `Detcore::handle_pause` refuses to accept.
+                let next_deadline = self
+                    .blocked
+                    .timed_waiters
+                    .next_deadline()
+                    .expect("internal error: no timed events found");
+                if next_deadline.is_indefinite() {
+                    if !blockers_empty {
+                        // Blocking external IO may still complete and produce the
+                        // signal/wake the indefinite waiter needs, so this is not a
+                        // deadlock yet. Spin as step2c does for the same reason.
+                        trace!(
+                            "[scheduler] empty run-queue with only indefinite waiters, but external IO is outstanding for dtids {:?}. SPINNING!",
+                            &self.blocked.external_io_blockers
+                        );
+                        std::thread::yield_now();
+                        return Err(SkipTurn);
+                    }
+                    self.report_terminal_deadlock(
+                        "thread(s) waiting indefinitely (pause, or a timer beyond the end of logical time)",
+                    )
+                }
                 debug!(
                     "[scheduler] Deadlock avoidance! Empty run-queue, so waking next timed event."
                 );
@@ -2409,6 +2457,7 @@ impl Scheduler {
                     .timed_waiters
                     .pop()
                     .expect("internal error: no timed events found");
+                debug_assert_eq!(event_ns, next_deadline);
                 info!("[scheduler] Skipping global time ahead to {}.", event_ns);
                 {
                     let mut gt = global_time.lock().unwrap();
@@ -5022,6 +5071,98 @@ mod test {
         assert!(scheduler.pending_physical_process_exits.is_empty());
         assert!(!scheduler.complete_physical_process_exit(process));
         assert_eq!(scheduler.release_all_physical_process_exits(), 0);
+    }
+
+    /// A `pause(2)` registers `LogicalTime::INDEFINITE`, which is a sentinel for
+    /// "no deadline", not a deadline. With nothing else left to run, the guest is
+    /// permanently blocked and must be reported as such -- never woken.
+    #[test]
+    #[should_panic(expected = "thread(s) waiting indefinitely")]
+    fn indefinite_waiter_alone_is_reported_as_a_deadlock() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::INDEFINITE, DetTid::from_raw(100));
+
+        let _ = scheduler.step2d_handle_empty_queue(&global_time);
+    }
+
+    /// The positive half of the bracket: refusing to fast-forward onto an
+    /// indefinite waiter must not make the fast-forward machinery inert. A real
+    /// deadline still fires, the clock still advances to exactly that deadline
+    /// (not to the end of logical time), and the indefinite waiter stays parked.
+    #[test]
+    fn finite_deadline_still_fast_forwards_alongside_an_indefinite_waiter() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let initial_time = global_time.lock().unwrap().as_nanos();
+        let alarm_deadline = initial_time + LogicalTime::from_nanos(1_000);
+        let process = DetPid::from_raw(100);
+        let pauser = DetTid::from_raw(200);
+
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::INDEFINITE, pauser);
+        scheduler.register_alarm(
+            process,
+            process,
+            initial_time,
+            LogicalTime::from_nanos(1_000),
+            LogicalTime::ZERO,
+            Signal::SIGALRM,
+        );
+
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        assert_eq!(global_time.lock().unwrap().as_nanos(), alarm_deadline);
+        assert_eq!(
+            scheduler
+                .blocked
+                .timed_waiters
+                .iter()
+                .collect::<Vec<(LogicalTime, TimedEvent)>>(),
+            vec![(LogicalTime::INDEFINITE, TimedEvent::ThreadEvt(pauser))]
+        );
+    }
+
+    /// Outstanding blocking external IO can still deliver the signal an
+    /// indefinite waiter is waiting for, so the deadlock verdict must be
+    /// deferred rather than reported. `step2c` does not cover this case: it only
+    /// spins when `timed_waiters` is *empty*, and an indefinite waiter is an
+    /// entry.
+    #[test]
+    fn outstanding_external_io_defers_the_indefinite_wait_verdict() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let initial_time = global_time.lock().unwrap().as_nanos();
+        let pauser = DetTid::from_raw(100);
+        let io_thread = DetTid::from_raw(101);
+
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::INDEFINITE, pauser);
+        scheduler
+            .blocked
+            .external_io_blockers
+            .insert(io_thread, ExternalOpId::new(io_thread, 0));
+
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        assert_eq!(global_time.lock().unwrap().as_nanos(), initial_time);
+        assert_eq!(
+            scheduler
+                .blocked
+                .timed_waiters
+                .iter()
+                .collect::<Vec<(LogicalTime, TimedEvent)>>(),
+            vec![(LogicalTime::INDEFINITE, TimedEvent::ThreadEvt(pauser))]
+        );
     }
 
     #[test]

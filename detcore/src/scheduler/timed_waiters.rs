@@ -313,6 +313,15 @@ impl TimedEvents {
         self.pop_if_before(LogicalTime::MAX)
     }
 
+    /// The target time of the earliest pending event, without removing it.
+    ///
+    /// Callers that decide whether virtual time may be fast-forwarded need to
+    /// inspect the deadline *before* committing to popping it; a
+    /// [`LogicalTime::is_indefinite`] deadline is not a real deadline.
+    pub fn next_deadline(&self) -> Option<LogicalTime> {
+        self.map.first_key_value().map(|(time_ns, _)| *time_ns)
+    }
+
     /// Are there no timed events waiting?
     pub fn is_empty(&self) -> bool {
         // Here we rely on the invariant that there are no entries with empty sets on the RHS:
@@ -365,6 +374,30 @@ mod test {
     }
     fn at(ns: u64) -> LogicalTime {
         LogicalTime::from_nanos(ns)
+    }
+
+    /// `next_deadline` must report the earliest pending deadline without
+    /// consuming it: the scheduler inspects it to decide whether fast-forwarding
+    /// virtual time is legitimate at all, and an indefinite front entry must stay
+    /// parked rather than be popped.
+    #[test]
+    fn next_deadline_peeks_without_removing() {
+        let mut ev = TimedEvents::default();
+        assert_eq!(ev.next_deadline(), None);
+
+        ev.insert(LogicalTime::INDEFINITE, tid(101));
+        assert_eq!(ev.next_deadline(), Some(LogicalTime::INDEFINITE));
+        assert!(ev.next_deadline().expect("nonempty").is_indefinite());
+
+        // A real deadline sorts ahead of the indefinite sentinel.
+        ev.insert(at(1000), tid(100));
+        assert_eq!(ev.next_deadline(), Some(at(1000)));
+        assert!(!ev.next_deadline().expect("nonempty").is_indefinite());
+
+        // Peeking is non-destructive: both entries are still queued.
+        assert_eq!(ev.iter().count(), 2);
+        assert_eq!(ev.pop(), Some((at(1000), TimedEvent::ThreadEvt(tid(100)))));
+        assert_eq!(ev.next_deadline(), Some(LogicalTime::INDEFINITE));
     }
 
     /// Regression: an alarm that fires (is popped) must clear its timer

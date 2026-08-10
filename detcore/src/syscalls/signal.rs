@@ -193,7 +193,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Pause,
     ) -> Result<i64, Error> {
         if guest.config().sequentialize_threads {
-            let req = Self::sleep_request_abs(guest, LogicalTime::from_nanos(u64::MAX)).await;
+            // `pause` has no deadline: it returns only when a signal is delivered.
+            // `LogicalTime::INDEFINITE` records that, and the scheduler refuses to
+            // fast-forward virtual time onto it (see `step2d_handle_empty_queue`),
+            // so the `Normal` arm below stays unreachable.
+            let req = Self::sleep_request_abs(guest, LogicalTime::INDEFINITE).await;
             match resource_request(guest, req).await {
                 ResumeStatus::Normal => {
                     panic!(

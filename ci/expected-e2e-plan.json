@@ -131,6 +131,13 @@
       "category": "c-programs",
       "lane": "portable",
       "mode": "verify",
+      "test": "c-programs/pause-alarm-interrupt"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
       "test": "c-programs/random-sources"
     },
     {
