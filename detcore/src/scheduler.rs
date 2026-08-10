@@ -177,6 +177,18 @@ pub struct FutexWaiter {
 /// returning `None` for an empty slice. This is the single random-selection
 /// primitive used by the targeted-chaos scheduling points, so their choices stay
 /// reproducible under a fixed `--fuzz-seed`.
+/// Render an already-sorted thread list for a diagnostic, or `none`.
+fn render_tid_list(tids: &[DetTid]) -> String {
+    if tids.is_empty() {
+        "none".to_owned()
+    } else {
+        tids.iter()
+            .map(|t| format!("dtid {}", t))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 fn chaos_pick<T: Copy>(prng: &mut Pcg64Mcg, choices: &[T]) -> Option<T> {
     choices.choose(prng).copied()
 }
@@ -492,6 +504,17 @@ pub struct Scheduler {
 
     /// Child-TID futexes whose kernel clear may still be racing a guest join.
     cleared_child_tids: HashMap<FutexID, DetTid>,
+
+    /// The rendered report for a terminal deadlock, once one has been detected.
+    ///
+    /// Set instead of panicking, and consumed by `sched_loop_inner`, which
+    /// prints it and exits the container. Panicking here does not end the run:
+    /// the scheduler is a `tokio::spawn`ed task, so its panic is captured by the
+    /// task harness while every guest stays parked on an
+    /// `Ivar<SchedResponse>` that only the (now dead) scheduler could fill --
+    /// the run then hangs until an external timeout. Unwinding would also
+    /// poison the scheduler mutex on the way out.
+    terminal_deadlock: Option<String>,
 
     /// Whether exit-group teardown must explicitly cancel parked backend RPCs.
     cancel_killed_thread_rpcs: bool,
@@ -957,6 +980,19 @@ async fn sched_loop_inner(
         // Otherwise we trust the turn function to either choose a runnable thread or wait
         // until something blocked is ready to run again.
         last_res = do_a_turn_blocking(sched.clone(), timer.clone(), &last_res).await;
+
+        // A terminal deadlock ends the run here, alongside the two
+        // `--stop-after-*` exits above, rather than by panicking out of the
+        // scheduler task (see `report_terminal_deadlock`).
+        //
+        // Printed with `eprintln!` rather than `tracing::error!` on purpose: the
+        // tracing writer prefixes a real wall-clock timestamp, and this report
+        // is required to be byte-identical across runs of the same program.
+        if let Some(report) = sched.lock().unwrap().take_terminal_deadlock() {
+            eprintln!("{}", report);
+            immediate_fatal_exit(); // We don't want a backtrace of this thread.
+        }
+
         if last_res.is_ok() && !observed_turn {
             if let Some(observer) = &observer {
                 observer("completed a deterministic scheduling turn");
@@ -1183,6 +1219,7 @@ impl Scheduler {
             pending_run_queue_admissions: Default::default(),
             pending_run_queue_removals: Default::default(),
             cleared_child_tids: Default::default(),
+            terminal_deadlock: None,
             cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
             logically_killed_threads: Default::default(),
             exec_incarnations: Default::default(),
@@ -2370,6 +2407,197 @@ impl Scheduler {
         }
     }
 
+    /// Render one blocked thread's pending request, with a stable resource order.
+    ///
+    /// `Resources::resources` is a `HashMap`, so its iteration order is not
+    /// reproducible; sort the rendered entries. Reads the `Ivar`'s contents
+    /// rather than `Debug`-printing the `Ivar`, whose parked `Waker` carries raw
+    /// host pointers.
+    fn render_pending_request(req: &Ivar<SchedRequest>) -> String {
+        match req.try_read() {
+            None => "<no request pending>".to_owned(),
+            Some(Err(ThreadExited)) => "<thread exited>".to_owned(),
+            Some(Ok(rsrc)) => {
+                let mut held: Vec<String> = rsrc
+                    .resources
+                    .iter()
+                    .map(|(rid, perm)| match rid {
+                        // Spell the sentinel out. Its derived `Debug` is
+                        // `SleepUntil(LogicalTime(18446744073709551615))`, and a
+                        // reader who has to decode that number by hand is
+                        // exactly the reader this report failed.
+                        ResourceID::SleepUntil(deadline) if deadline.is_indefinite() => {
+                            format!("SleepUntil(INDEFINITE): {:?}", perm)
+                        }
+                        _ => format!("{:?}: {:?}", rid, perm),
+                    })
+                    .collect();
+                held.sort();
+                let mut rendered = if held.is_empty() {
+                    "<no resources>".to_owned()
+                } else {
+                    held.join(", ")
+                };
+                if rsrc.poll_attempt != 0 {
+                    let _ = write!(rendered, " (poll_attempt {})", rsrc.poll_attempt);
+                }
+                if !rsrc.fyi.is_empty() {
+                    let _ = write!(rendered, " (fyi {:?})", rsrc.fyi);
+                }
+                rendered
+            }
+        }
+    }
+
+    /// Render a futex key with its guest address in hex.
+    ///
+    /// `FutexID`'s derived `Debug` prints the address in decimal, which is
+    /// deterministic but unusable: a reader has to match it against a guest
+    /// symbol or a `futex(...)` line in the DETLOG, and both are hex.
+    fn render_futex_id(futex_id: &FutexID) -> String {
+        match futex_id {
+            FutexID::Private { mm, address } => {
+                format!("private {:?} address {:#x}", mm, address)
+            }
+            FutexID::Shared { object, offset } => {
+                format!("shared {:?} offset {:#x}", object, offset)
+            }
+        }
+    }
+
+    /// Render a `LogicalTime` deadline, naming the no-deadline sentinel.
+    fn render_deadline(deadline: LogicalTime) -> String {
+        if deadline.is_indefinite() {
+            "INDEFINITE (no deadline)".to_owned()
+        } else {
+            deadline.to_string()
+        }
+    }
+
+    /// Build the deadlock report. **Must be byte-identical across runs of the
+    /// same program**: this text reaches stderr, and emitting a
+    /// host-dependent string from a deterministic execution engine is a defect
+    /// in its own right, whether or not any comparator currently catches it.
+    ///
+    /// The obvious implementation -- `{:?}` of `run_queue`, `next_turns` and
+    /// `blocked` -- is *not* reproducible. Three independent sources of
+    /// run-to-run variation hide in those structures:
+    ///
+    /// 1. `ThreadNextTurn` and `FutexWaiter` hold [`Ivar`]s whose `Debug` prints
+    ///    the parked waker as `Waker { data: 0x55.., vtable: 0x55.. }` -- raw
+    ///    host pointers that move with ASLR on every run.
+    /// 2. `BlockedPool::futex_waiters` is a `HashMap` and
+    ///    `timed_out_futex_waiters` a `HashSet`, so both iterate in a
+    ///    randomized order whenever they hold more than one entry.
+    /// 3. `Resources::resources` is itself a `HashMap`, so even a single
+    ///    thread's resource list is unordered.
+    ///
+    /// So every collection below is sorted on a stable key, and only
+    /// guest-level identities are printed: dettids, resource ids, futex keys and
+    /// logical deadlines, all of which Detcore already guarantees to be
+    /// deterministic. No host pointer is emitted.
+    fn format_terminal_deadlock(&self, waiters: &str) -> String {
+        let mut out = format!(
+            "Deadlock detected: {}, but no runnable threads left.\n",
+            waiters
+        );
+        let _ = writeln!(
+            out,
+            "  turn {}, committed time {}",
+            self.turn, self.committed_time
+        );
+        let _ = writeln!(out, "  run queue: {} runnable", self.run_queue.len());
+
+        let _ = writeln!(out, "  threads ({}), by dettid:", self.next_turns.len());
+        // `next_turns` is a BTreeMap, so this walk is already ordered.
+        for (dettid, next_turn) in self.next_turns.iter() {
+            let _ = writeln!(
+                out,
+                "    dtid {}: {}",
+                dettid,
+                Self::render_pending_request(&next_turn.req)
+            );
+        }
+
+        let mut futexes: Vec<String> = self
+            .blocked
+            .futex_waiters
+            .iter()
+            .filter(|(_, waiters)| !waiters.is_empty())
+            .map(|(futex_id, waiters)| {
+                let mut parked: Vec<String> = waiters
+                    .iter()
+                    .map(|w| format!("dtid {} (bitset {:#010x})", w.dettid, w.bitset))
+                    .collect();
+                parked.sort();
+                format!(
+                    "    {}: {}",
+                    Self::render_futex_id(futex_id),
+                    parked.join(", ")
+                )
+            })
+            .collect();
+        futexes.sort();
+        if futexes.is_empty() {
+            let _ = writeln!(out, "  futex waiters: none");
+        } else {
+            let _ = writeln!(out, "  futex waiters ({}), by futex:", futexes.len());
+            for line in futexes {
+                let _ = writeln!(out, "{}", line);
+            }
+        }
+
+        let mut timed_out: Vec<DetTid> = self
+            .blocked
+            .timed_out_futex_waiters
+            .iter()
+            .copied()
+            .collect();
+        timed_out.sort();
+        let _ = writeln!(
+            out,
+            "  timed-out futex waiters: {}",
+            render_tid_list(&timed_out)
+        );
+
+        let timed: Vec<(LogicalTime, TimedEvent)> = self.blocked.timed_waiters.iter().collect();
+        if timed.is_empty() {
+            let _ = writeln!(out, "  timed waiters: none");
+        } else {
+            // `TimedEvents` is backed by a BTreeMap keyed on the deadline, so
+            // this is already in deadline order.
+            let _ = writeln!(out, "  timed waiters ({}), by deadline:", timed.len());
+            for (deadline, evt) in timed {
+                let _ = writeln!(out, "    {}: {}", Self::render_deadline(deadline), evt);
+            }
+        }
+
+        if self.blocked.external_io_blockers.is_empty() {
+            let _ = writeln!(out, "  external IO blockers: none");
+        } else {
+            // BTreeMap: already ordered by dettid.
+            let _ = writeln!(
+                out,
+                "  external IO blockers ({}), by dettid:",
+                self.blocked.external_io_blockers.len()
+            );
+            for (dettid, op) in self.blocked.external_io_blockers.iter() {
+                let _ = writeln!(out, "    dtid {}: {:?}", dettid, op);
+            }
+        }
+
+        // Both are BTreeSets, so already ordered.
+        let deferred: Vec<DetTid> = self.blocked.sigchld_deferred.iter().copied().collect();
+        let ready: Vec<DetTid> = self.blocked.sigchld_ready.iter().copied().collect();
+        let _ = writeln!(
+            out,
+            "  sigchld deferred: {}; sigchld ready: {}",
+            render_tid_list(&deferred),
+            render_tid_list(&ready)
+        );
+        out
+    }
+
     /// Report a permanently blocked guest and abort the run.
     ///
     /// Reached only when the run queue is empty *and* every remaining thread is
@@ -2381,15 +2609,27 @@ impl Scheduler {
     /// reproducing the hang, and it is the established Detcore behaviour for the
     /// futex case (`docs/ERROR_CATALOG.md`).
     ///
-    /// `waiters` names *what* is blocked; the caller-independent tail of the
-    /// message and the state dump are shared so every deadlock class prints the
-    /// same shape.
-    fn report_terminal_deadlock(&self, waiters: &str) -> ! {
-        panic!(
-            "Deadlock detected: {}, but no runnable threads left.\n \
-             queue: {:?}\n  next_turns: {:?}\n  blocked: {:?} \n",
-            waiters, self.run_queue, self.next_turns, self.blocked
-        )
+    /// `waiters` names *what* is blocked; everything else is shared, so every
+    /// deadlock class prints the same reproducible shape.
+    ///
+    /// Records the report and returns [`SkipTurn`] rather than panicking.
+    /// `sched_loop_inner` picks it up and exits the container, next to the two
+    /// existing `--stop-after-*` fatal exits. A panic here would NOT end the
+    /// run: the scheduler is a `tokio::spawn`ed task whose panic the harness
+    /// captures, leaving every guest thread parked forever on an
+    /// `Ivar<SchedResponse>` only the scheduler could fill, so the process hangs
+    /// until an external timeout kills it. Unwinding out of
+    /// `do_a_turn_blocking` would also poison the scheduler mutex.
+    fn report_terminal_deadlock(&mut self, waiters: &str) -> SkipTurn {
+        let report = self.format_terminal_deadlock(waiters);
+        // Keep the first verdict: it names the state that actually wedged.
+        self.terminal_deadlock.get_or_insert(report);
+        SkipTurn
+    }
+
+    /// Take the pending terminal-deadlock report, if the scheduler produced one.
+    fn take_terminal_deadlock(&mut self) -> Option<String> {
+        self.terminal_deadlock.take()
     }
 
     fn step2d_handle_empty_queue(
@@ -2417,7 +2657,7 @@ impl Scheduler {
                 info!("scheduler (step2_process_blocked): zero threads left anywhere, fizzling.");
                 return Err(SkipTurn);
             } else if !futex_empty && timed_empty && blockers_empty {
-                self.report_terminal_deadlock("thread(s) waiting on futex")
+                return Err(self.report_terminal_deadlock("thread(s) waiting on futex"));
             } else if !timed_empty {
                 // Only a *reachable* deadline justifies fast-forwarding the clock.
                 // `LogicalTime::INDEFINITE` is the sentinel a `pause(2)` (or a
@@ -2445,9 +2685,9 @@ impl Scheduler {
                         std::thread::yield_now();
                         return Err(SkipTurn);
                     }
-                    self.report_terminal_deadlock(
+                    return Err(self.report_terminal_deadlock(
                         "thread(s) waiting indefinitely (pause, or a timer beyond the end of logical time)",
-                    )
+                    ));
                 }
                 debug!(
                     "[scheduler] Deadlock avoidance! Empty run-queue, so waking next timed event."
@@ -5073,22 +5313,165 @@ mod test {
         assert_eq!(scheduler.release_all_physical_process_exits(), 0);
     }
 
+    /// Populate a scheduler with a deadlock's worth of blocked state, inserting
+    /// each collection in the caller's chosen order.
+    ///
+    /// `reverse` exists so the same logical state can be built two ways: the
+    /// report must not depend on insertion order, because `futex_waiters` is a
+    /// `HashMap`, `timed_out_futex_waiters` a `HashSet`, and
+    /// `Resources::resources` a `HashMap`.
+    fn deadlocked_scheduler(config: &Config, reverse: bool) -> Scheduler {
+        let mut scheduler = Scheduler::new(config);
+        let mm = MmId::initial(DetTid::from_raw(3));
+        let mut futexes = vec![
+            (FutexID::private(mm, 0x404100), 5),
+            (FutexID::private(mm, 0x404200), 7),
+            (FutexID::private(mm, 0x404300), 9),
+        ];
+        let mut tids = vec![3, 5, 7, 9];
+        if reverse {
+            futexes.reverse();
+            tids.reverse();
+        }
+
+        for (futex_id, dettid) in futexes {
+            scheduler
+                .blocked
+                .futex_waiters
+                .entry(futex_id)
+                .or_default()
+                .push(futex_waiter(dettid, u32::MAX));
+        }
+        for dettid in tids {
+            let dettid = DetTid::from_raw(dettid);
+            // A request carrying several resources: `Resources::resources` is a
+            // HashMap, so an unsorted render would vary here too.
+            let mut resources = Resources::new(dettid);
+            resources.insert(ResourceID::FutexWait, Permission::R);
+            resources.insert(ResourceID::MemAddrSpace(dettid), Permission::RW);
+            scheduler.next_turns.insert(
+                dettid,
+                ThreadNextTurn {
+                    dettid,
+                    child_tid_addr: 0,
+                    // A FULL ivar: `Debug` on this prints the parked waker's raw
+                    // host pointers, which is exactly what must not reach stderr.
+                    req: Ivar::full(Ok(resources)),
+                    resp: Ivar::new(),
+                },
+            );
+            scheduler.blocked.timed_out_futex_waiters.insert(dettid);
+        }
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::INDEFINITE, DetTid::from_raw(11));
+        scheduler
+    }
+
+    /// The deadlock report reaches stderr, so it must be byte-identical across
+    /// runs of the same program. Codex measured the unguarded `{:?}` dump
+    /// emitting `Waker { data: 0x557e90a74680, .. }` in one run and
+    /// `Waker { data: 0x5654e2b08680, .. }` in the next: raw host pointers that
+    /// move with ASLR. Assert the render carries no host pointer and no
+    /// insertion-order dependence.
+    #[test]
+    fn deadlock_report_is_deterministic_and_carries_no_host_pointer() {
+        let config = Config::default();
+        let forward = deadlocked_scheduler(&config, false)
+            .format_terminal_deadlock("thread(s) waiting on futex");
+        let reversed = deadlocked_scheduler(&config, true)
+            .format_terminal_deadlock("thread(s) waiting on futex");
+
+        // Same logical state built in two insertion orders must render
+        // identically: no HashMap/HashSet iteration order may leak.
+        assert_eq!(forward, reversed);
+
+        // No `Debug` of an Ivar/Waker, and so no host pointer.
+        for banned in ["Waker", "Ivar", "vtable", "Mutex", "poisoned"] {
+            assert!(
+                !forward.contains(banned),
+                "deadlock report leaked {banned:?}; it must print only guest-level \
+                 identities.\n{forward}"
+            );
+        }
+
+        // The report is still substantive: it names every blocked thread, the
+        // futex keys, and the indefinite deadline.
+        for expected in [
+            "Deadlock detected: thread(s) waiting on futex, but no runnable threads left.",
+            "dtid 3",
+            "dtid 9",
+            "0x404100",
+            "0x404300",
+            "INDEFINITE (no deadline)",
+            "FutexWait: R, MemAddrSpace(DetPid(3)): RW",
+        ] {
+            assert!(
+                forward.contains(expected),
+                "deadlock report lost {expected:?}:\n{forward}"
+            );
+        }
+    }
+
     /// A `pause(2)` registers `LogicalTime::INDEFINITE`, which is a sentinel for
     /// "no deadline", not a deadline. With nothing else left to run, the guest is
     /// permanently blocked and must be reported as such -- never woken.
     #[test]
-    #[should_panic(expected = "thread(s) waiting indefinitely")]
     fn indefinite_waiter_alone_is_reported_as_a_deadlock() {
         let config = Config::default();
         let mut scheduler = Scheduler::new(&config);
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let initial_time = global_time.lock().unwrap().as_nanos();
 
         scheduler
             .blocked
             .timed_waiters
             .insert(LogicalTime::INDEFINITE, DetTid::from_raw(100));
 
-        let _ = scheduler.step2d_handle_empty_queue(&global_time);
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+
+        // Asserting the verdict by value, not by catching a panic: the report is
+        // recorded for `sched_loop_inner` to print and exit on, so the text is
+        // checkable here rather than only through `#[should_panic]`.
+        let report = scheduler
+            .take_terminal_deadlock()
+            .expect("an indefinite waiter with nothing runnable is a terminal deadlock");
+        assert!(
+            report.contains("thread(s) waiting indefinitely"),
+            "unexpected report:\n{report}"
+        );
+        // Taking it is destructive, and the indefinite waiter is never woken.
+        assert!(scheduler.take_terminal_deadlock().is_none());
+        assert_eq!(global_time.lock().unwrap().as_nanos(), initial_time);
+        assert!(!scheduler.blocked.timed_waiters.is_empty());
+    }
+
+    /// The futex class shares `report_terminal_deadlock`, so it must record a
+    /// verdict too -- otherwise fixing the teardown for one class silently
+    /// leaves the other wedged.
+    #[test]
+    fn futex_deadlock_records_the_same_terminal_verdict() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let mm = MmId::initial(DetTid::from_raw(3));
+        scheduler
+            .blocked
+            .futex_waiters
+            .entry(FutexID::private(mm, 0x404100))
+            .or_default()
+            .push(futex_waiter(3, u32::MAX));
+
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+
+        let report = scheduler
+            .take_terminal_deadlock()
+            .expect("futex waiters with nothing runnable is a terminal deadlock");
+        assert!(
+            report.contains("thread(s) waiting on futex"),
+            "unexpected report:\n{report}"
+        );
     }
 
     /// The positive half of the bracket: refusing to fast-forward onto an

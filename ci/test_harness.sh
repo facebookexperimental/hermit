@@ -1647,6 +1647,44 @@ function prepare_test {
     fi
 }
 
+# Does this test's verify mode opt into the L2 parity assertion?
+function verify_asserts_bitwise_parity {
+    local metadata=$1
+    jq -r '.modes.verify.assert.bitwise_parity // false' <<<"$metadata"
+}
+
+# Where a verify attempt writes its machine-readable verdict.
+function verify_verdict_path {
+    local cell_dir=$1 attempt=$2
+    printf '%s/verify-%s.json\n' "$cell_dir" "$attempt"
+}
+
+# Fail closed on anything short of a full parity verdict: a missing, unparsable,
+# or non-parity verdict is NOT a pass. Echoes a reason on failure.
+function assert_bitwise_parity_verdict {
+    local verdict=$1
+    if [[ ! -f $verdict ]]; then
+        printf 'verify wrote no parity verdict to %s\n' "${verdict##*/}"
+        return 1
+    fi
+    local summary
+    if ! summary=$(jq -er '
+        "verified=\(.verified) bitwise_parity=\(.bitwise_parity) "
+        + "verdict=\(.verdict) strictness=\(.comparison.strictness // "none") "
+        + "compared=\(.comparison.compare_logs // false) "
+        + "messages=\(.compared_log_messages.left // 0)/\(.compared_log_messages.right // 0)"
+    ' "$verdict" 2>/dev/null); then
+        printf 'verify parity verdict %s is not readable JSON\n' "${verdict##*/}"
+        return 1
+    fi
+    if [[ $(jq -r '(.verified == true) and (.bitwise_parity == true)' "$verdict") != true ]]; then
+        printf 'verify did not reach L2 parity: %s\n' "$summary"
+        return 1
+    fi
+    printf 'L2 parity: %s\n' "$summary"
+    return 0
+}
+
 function execute_attempt {
     local test=$1
     local metadata=$2
@@ -1721,8 +1759,20 @@ function execute_attempt {
             command=("${guest_command[@]}")
             ;;
         verify)
+            # Plain `--strict --verify` runs the LOSSY `Stripped` comparator,
+            # which normalizes numbers/addresses/paths away wholesale and so
+            # "cannot establish L2" (AGENTS.md). A cell that opts into
+            # `assert = { bitwise_parity = true }` is upgraded to the canonical
+            # parity comparator and made to emit a machine-readable verdict, which
+            # run_cell then checks -- otherwise the cell would be justified by a
+            # parity measurement it never actually performs.
+            local verify_strict_flags=()
+            if [[ $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
+                verify_strict_flags=(--verify-strict --verify-json
+                    "$(verify_verdict_path "$cell_dir" "$attempt")")
+            fi
             command=("$HERMIT_BIN" --log=info run --backend "$backend" --strict --verify
-                "${profile[@]}" -- "${guest_command[@]}")
+                "${verify_strict_flags[@]}" "${profile[@]}" -- "${guest_command[@]}")
             ;;
         replay)
             command=("$HERMIT_BIN" --log=info --backend "$backend" record start --strict --verify
@@ -1787,8 +1837,13 @@ function append_result {
             log_level=
             ;;
         verify)
+            # The receipt must record the flags that actually ran. Reporting a
+            # bare `--strict --verify` for a cell that ran the parity comparator
+            # (or vice versa) is how an L1 cell gets mistaken for an L2 one.
             effective_args=$(jq -cn --arg backend "$backend" \
-                '["--log=info","run",("--backend=" + $backend),"--strict","--verify"]')
+                --argjson strict "$(verify_asserts_bitwise_parity "${METADATA_BY_ID[$test_id]}")" \
+                '["--log=info","run",("--backend=" + $backend),"--strict","--verify"]
+                 + (if $strict then ["--verify-strict","--verify-json"] else [] end)')
             log_level=info
             ;;
         replay)
@@ -1935,6 +1990,18 @@ function run_cell {
         if [[ $status != 0 ]]; then
             outcome=FAIL
             reason="$mode exited with status $status"
+        elif [[ $mode == verify && $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
+            # A zero exit only means the comparator this run used was satisfied.
+            # For an L2 cell, read the verdict the run itself published and
+            # require full parity; anything else is a FAIL, not a PASS.
+            local parity_reason
+            if parity_reason=$(assert_bitwise_parity_verdict \
+                "$(verify_verdict_path "$cell_dir" 1)"); then
+                reason=$parity_reason
+            else
+                outcome=FAIL
+                reason=$parity_reason
+            fi
         fi
     fi
 

@@ -45,12 +45,29 @@ relaxations: none):
 
 ```text
 $ timeout 10s target/release/hermit run --strict -- ./robust_futex_test
-thread 'main' (1) panicked at detcore/src/scheduler.rs:1631:17:
 Deadlock detected: thread(s) waiting on futex, but no runnable threads left.
+  turn 11, committed time 1_767_225_600.010_326_205s
+  run queue: 0 runnable
+  threads (2), by dettid:
+    dtid 3: FutexWait: R
+    dtid 7: FutexWait: R
+  futex waiters (2), by futex:
+    private MmId { creator: DetPid(3), generation: 1 } address 0x404100: dtid 7 (bitset 0xffffffff)
+    private MmId { creator: DetPid(3), generation: 1 } address 0x7ffff73fe910: dtid 3 (bitset 0xffffffff)
+  ...
+Error: Sandbox container exited unexpectedly
+     > Process exited with code: Exited(1)
 ```
 
-The host timeout exits 124 because the scheduler panic does not terminate all
-stopped tracees. A DEBUG capture makes the missing bridge explicit:
+The run now ends promptly with a nonzero status (measured 0.02s). It previously
+reported the same deadlock as a scheduler *panic* and then hung, so a host
+`timeout` exited 124 with the tracees still stopped: the scheduler is a spawned
+task, so its panic was captured by the task harness while every guest thread
+stayed parked on a scheduler response that could no longer arrive. The verdict
+is now returned to `sched_loop_inner`, which prints it and exits the container
+alongside the existing `--stop-after-*` exits.
+
+A DEBUG capture makes the missing bridge explicit:
 
 ```bash
 timeout 20s target/release/hermit --log debug run --strict -- \

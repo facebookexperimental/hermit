@@ -3730,6 +3730,10 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 [test.modes.verify]
 ci = true
 backends_enabled = ["ptrace"]
+# Run the canonical parity comparator and require the run's own verdict to
+# report it. Plain `--verify` is the lossy Stripped comparator and would leave
+# this cell asserting L1 while its justification claims L2.
+assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "pause(2) scheduler interaction is qualified against the ptrace reference first; qualify DBT separately"
 kvm = "pause(2) scheduler interaction is qualified against the ptrace reference first; qualify KVM separately"
