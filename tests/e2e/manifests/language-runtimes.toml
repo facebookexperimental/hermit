@@ -502,30 +502,6 @@ kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 
-# Power/weight 2026-08-06 @ Hermit 96d18cbad, ptrace verify, debug build,
-# devbig014 (portable profile: --log=info --strict --verify,
-# no-virtualize-cpuid, max-timeslice=disabled):
-# 9231 ms = 16% of the 56.2s ptrace cell corpus -- the SINGLE most expensive
-# cell. VERDICT: KEEP AS IS, do NOT pin the interpreter.
-# The cost is NOT this test's logic. `python3` resolves through PATH to
-# /usr/local/fbcode/platform010/bin/fbpython, not /usr/bin/python3.9 (native
-# startup 99ms vs 18ms). Measured syscall surface of the two interpreters on
-# an identical trivial program: fbpython 70 syscall types / 19742 calls vs
-# system python3 32 types / 1586 calls. fbpython UNIQUELY reaches 40 types
-# including the socket family (socket/bind/connect/send*/recv*/getsockopt),
-# epoll (create/create1/ctl/wait), eventfd2, clone3, timer_create/settime,
-# poll, pipe2, madvise/process_madvise, membarrier and sched_yield.
-# So the 10x cost buys 12.4x syscall volume and 2.2x syscall types: high
-# power-to-weight, not low. Pinning /usr/bin/python3 would be a ~10x speedup
-# that SILENTLY DROPS 40 syscall types -- rejected by the shrink acceptance
-# gate, and the inverse of the `java -version` trap.
-# CAVEAT worth fixing separately: that surface is ACCIDENTAL, UNDECLARED and
-# HOST-DEPENDENT. `requires` says only "python3"; on a host without fbpython
-# on PATH this cell silently becomes ~10x cheaper and loses the socket/epoll
-# surface with no signal. Make the interpreter explicit rather than leaving
-# it to PATH. See the sibling python-hash-determinism, which pins
-# /usr/bin/python3 and therefore runs 908 ms with the SMALL surface -- the
-# corpus currently has an undeclared, PATH-determined surface split.
 [[test]]
 id = "language-runtimes/python-io-subprocess-time"
 description = "Python file I/O, subprocess capture, hashing, and time repeat under Hermit"
@@ -863,24 +839,6 @@ sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
 
 
-# Power/weight 2026-08-06 @ Hermit 96d18cbad, ptrace verify, debug build:
-# 8818 ms = 16% of the 56.2s ptrace cell corpus (rank 3 of 60).
-# VERDICT: KEEP the cell, but this is the corpus's clearest power/weight
-# ANOMALY and it is worth an owner decision.
-# Its guest is a ONE-LINER (a 7-element set, one hash(), and
-# sum(i*i for i in range(1,101))) yet it costs 8818 ms, while the sibling
-# python-hash-determinism runs an equally trivial program in 908 ms -- 9.7x
-# cheaper. The ONLY material difference is the interpreter: this cell execs
-# `python3` (PATH -> fbpython), the sibling execs `/usr/bin/python3`.
-# So ~all of this cell's 8818 ms is interpreter startup, not test content.
-# Do NOT simply pin the path: measured, fbpython reaches 40 syscall types
-# the system interpreter never does (sockets, epoll, eventfd2, clone3,
-# timers). Pinning is a 9.7x speedup that drops real surface.
-# The two interpreters also produce DIFFERENT observables for this exact
-# program (set order and hash() differ even at PYTHONHASHSEED=0). The cell
-# still passes because --verify self-compares two runs of the SAME
-# interpreter, but its observable is host-determined. Decide explicitly
-# which interpreter this contract is about and declare it.
 [[test]]
 id = "language-runtimes/python-hashseed"
 description = "Python string hash and set iteration order vary natively and repeat under Hermit"
@@ -936,14 +894,6 @@ dbt = "No edge-case Hermit arguments are required"
 kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
-# Power/weight 2026-08-06 @ Hermit 96d18cbad, ptrace verify, debug build:
-# 9008 ms = 16% of the 56.2s ptrace cell corpus (rank 2 of 60).
-# VERDICT: KEEP AS IS. Same fbpython-via-PATH cost driver as
-# python-io-subprocess-time (see that entry for the measured interpreter
-# surface comparison: 70 vs 32 syscall types, 19742 vs 1586 calls).
-# The in-manifest timeout comment below claiming ~90s startup is STALE by
-# ~9x against this measurement; it was the stated reason for
-# timeout_seconds=120.
 [[test]]
 id = "language-runtimes/python-dict-hash-iteration"
 description = "Python string-hash randomization (set/dict iteration order, hash(str)) plus file I/O and subprocess repeat under Hermit"
