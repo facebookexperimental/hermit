@@ -573,32 +573,71 @@ fn self_test() -> Result<(), String> {
     if scope_grace_s(600) != 60 || 600 + scope_grace_s(600) >= 720 {
         return Err("run-timeout scope backstop no longer satisfies 600 < 660 < 720".into());
     }
-    // The nested deadline must be derived from the scheduler's epoch, never a fresh clock. Both
-    // missing and future/forged epochs are refused; the real positive spends elapsed setup time.
-    let saved_epoch = std::env::var_os(STEP_STARTED_MONOTONIC_NS_ENV);
-    std::env::remove_var(STEP_STARTED_MONOTONIC_NS_ENV);
-    if invocation_deadline_ns(Some(600), true).is_ok() {
+    // All three legitimate deadline sources share one pure precedence rule. The standalone boxed
+    // re-exec must preserve D1 exactly; a scheduler epoch applies even when validate is top-level;
+    // missing, future, and contradictory sources are refused.
+    let now_ns = 10_000_000_000u64;
+    let started_ns = 5_000_000_000u64;
+    let allowance_ns = 600_000_000_000u64;
+    let d1 = started_ns + allowance_ns;
+    if deadline_from_sources(Some(600), true, false, None, None, now_ns).is_ok() {
         return Err("nested timeout accepted a missing scheduler-owned start epoch".into());
     }
-    let now_ns = monotonic_now_ns().ok_or("CLOCK_MONOTONIC unavailable in self-test")?;
-    std::env::set_var(
-        STEP_STARTED_MONOTONIC_NS_ENV,
-        (now_ns + 1_000_000_000).to_string(),
-    );
-    if invocation_deadline_ns(Some(600), true).is_ok() {
+    if deadline_from_sources(
+        Some(600),
+        true,
+        false,
+        Some(now_ns + 1),
+        None,
+        now_ns,
+    )
+    .is_ok()
+    {
         return Err("nested timeout accepted a future scheduler-owned start epoch".into());
     }
-    std::env::set_var(
-        STEP_STARTED_MONOTONIC_NS_ENV,
-        now_ns.saturating_sub(5_000_000_000).to_string(),
-    );
-    let inherited_deadline = invocation_deadline_ns(Some(600), true)?;
-    if !matches!(remaining_budget_s(inherited_deadline), Some(594 | 595)) {
-        return Err("nested timeout did not charge five elapsed setup seconds".into());
+    for nested in [false, true] {
+        if deadline_from_sources(
+            Some(600),
+            nested,
+            false,
+            Some(started_ns),
+            None,
+            now_ns,
+        )? != Some(d1)
+        {
+            return Err("scheduler epoch did not bind both top-level and nested deadlines".into());
+        }
     }
-    match saved_epoch {
-        Some(v) => std::env::set_var(STEP_STARTED_MONOTONIC_NS_ENV, v),
-        None => std::env::remove_var(STEP_STARTED_MONOTONIC_NS_ENV),
+    if deadline_from_sources(
+        Some(600),
+        true,
+        true,
+        Some(started_ns),
+        Some(d1 - 1),
+        now_ns,
+    )? != Some(d1)
+    {
+        return Err("nested payload consumed its parent's scope deadline marker".into());
+    }
+    if deadline_from_sources(Some(600), false, true, None, Some(d1), now_ns)? != Some(d1) {
+        return Err("boxed re-exec reset D1 instead of preserving it".into());
+    }
+    if deadline_from_sources(
+        Some(600),
+        false,
+        true,
+        Some(started_ns),
+        Some(d1 + 1),
+        now_ns,
+    )
+    .is_ok()
+    {
+        return Err("contradictory scheduler and scope deadline sources were accepted".into());
+    }
+    if deadline_from_sources(Some(600), false, false, None, Some(d1), now_ns)?
+        != Some(now_ns + allowance_ns)
+    {
+        return Err("an out-of-scope marker forged deadline ownership".into());
     }
     let saved_scope_deadline = std::env::var_os(OWN_SCOPE_DEADLINE_ENV);
     for non_owner in [None, Some(""), Some("0"), Some("99"), Some("malformed")] {
@@ -3061,36 +3100,86 @@ fn forward_step_profiles(result: &RunResult, jobs: i64) {
 ///
 /// A nested validate must spend from the enclosing scheduler step's clock. Starting a new
 /// `Instant` after re-exec and setup made `600 < 720` numerically true but temporally false.
-fn invocation_deadline_ns(run_timeout_s: Option<i64>, nested: bool) -> Result<Option<u64>, String> {
+fn env_u64(name: &str) -> Result<Option<u64>, String> {
+    let Some(raw) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let text = raw
+        .to_str()
+        .ok_or_else(|| format!("{name} is not valid UTF-8"))?;
+    text.parse::<u64>()
+        .map(Some)
+        .map_err(|_| format!("{name}={text:?} is not an unsigned integer"))
+}
+
+fn deadline_from_sources(
+    run_timeout_s: Option<i64>,
+    nested: bool,
+    in_scope: bool,
+    step_started_ns: Option<u64>,
+    owned_scope_deadline_ns: Option<u64>,
+    now_ns: u64,
+) -> Result<Option<u64>, String> {
     let Some(timeout_s) = run_timeout_s else {
         return Ok(None);
     };
-    let now_ns = monotonic_now_ns().ok_or_else(|| "CLOCK_MONOTONIC is unavailable".to_string())?;
-    let start_ns = if nested {
-        std::env::var(STEP_STARTED_MONOTONIC_NS_ENV)
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .ok_or_else(|| {
-                format!(
-                    "nested timed validate lacks the scheduler-owned {STEP_STARTED_MONOTONIC_NS_ENV}; \
-                     refusing to start a fresh clock that could outlive its enclosing node"
-                )
-            })?
-    } else {
-        now_ns
-    };
-    if start_ns > now_ns {
-        return Err(format!(
-            "scheduler-owned {STEP_STARTED_MONOTONIC_NS_ENV} is in the future"
-        ));
-    }
     let allowance_ns = (timeout_s as u64)
         .checked_mul(1_000_000_000)
         .ok_or_else(|| format!("run timeout {timeout_s}s overflows the monotonic deadline"))?;
-    start_ns
+    let scheduler_deadline = match step_started_ns {
+        Some(start) if start > now_ns => {
+            return Err(format!(
+                "scheduler-owned {STEP_STARTED_MONOTONIC_NS_ENV} is in the future"
+            ));
+        }
+        Some(start) => Some(
+            start
+                .checked_add(allowance_ns)
+                .ok_or_else(|| format!("run timeout {timeout_s}s overflows the monotonic deadline"))?,
+        ),
+        None => None,
+    };
+    // Only the top-level same-logical-run re-exec owns this marker. A nested focused payload
+    // inherits its parent's scope marker but owns the scheduler epoch for its own enclosing node.
+    if in_scope && !nested {
+        if let Some(owned) = owned_scope_deadline_ns {
+            let latest = now_ns
+                .checked_add(allowance_ns)
+                .ok_or_else(|| format!("run timeout {timeout_s}s overflows the monotonic deadline"))?;
+            if owned > latest {
+                return Err("invocation-owned scope deadline exceeds a fresh full allowance".into());
+            }
+            if scheduler_deadline.is_some_and(|scheduler| scheduler != owned) {
+                return Err("scheduler epoch and invocation-owned scope deadline disagree".into());
+            }
+            return Ok(Some(owned));
+        }
+    }
+    if let Some(deadline) = scheduler_deadline {
+        return Ok(Some(deadline));
+    }
+    if nested {
+        return Err(format!(
+            "nested timed validate lacks the scheduler-owned {STEP_STARTED_MONOTONIC_NS_ENV}; \
+             refusing to start a fresh clock that could outlive its enclosing node"
+        ));
+    }
+    now_ns
         .checked_add(allowance_ns)
         .map(Some)
         .ok_or_else(|| format!("run timeout {timeout_s}s overflows the monotonic deadline"))
+}
+
+fn invocation_deadline_ns(run_timeout_s: Option<i64>, nested: bool) -> Result<Option<u64>, String> {
+    let now_ns = monotonic_now_ns().ok_or_else(|| "CLOCK_MONOTONIC is unavailable".to_string())?;
+    deadline_from_sources(
+        run_timeout_s,
+        nested,
+        is_in_scope(),
+        env_u64(STEP_STARTED_MONOTONIC_NS_ENV)?,
+        env_u64(OWN_SCOPE_DEADLINE_ENV)?,
+        now_ns,
+    )
 }
 
 /// Seconds left on one shared invocation clock, floored so a child cannot outlive it.
