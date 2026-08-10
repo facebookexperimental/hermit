@@ -195,10 +195,11 @@ impl Default for LogDiffOpts {
 /// But as that is a work-in-progress, this utility strips known-nondeterministic
 /// information from logs.
 ///
-/// INPUT: `full_container` bool flag, which specifies whether we should expect that the
-/// log message was generated from a full run of hermit/detcore against a standalone
-/// binary, with all the setup that entails. N.B.: this should be *false* for `spawn_fn_*`
-/// variants which fork from another process, not having a true process tree of their own.
+/// This erasure is deliberately lossy and is NOT a parity claim: it backs the
+/// `Stripped` comparator only (`bitwise_parity: false`). `BitwiseInfoV1`
+/// canonicalizes rather than erases -- see [`canonicalize_addresses_in_line`].
+/// Lossy as it is, each pattern must still erase only what it names: erasing a
+/// neighbouring field turns a real divergence into a reported match.
 ///
 /// Example input/output:
 ///   `Input:  COMMIT turn 3, dettid 231635 using resources Resources { tid: DetPid { inner: 231635 }, resources: {Path("/proc/231635/fd/1"): W} }`
@@ -213,18 +214,25 @@ pub fn strip_log_entry(log: &str) -> String {
     // post-facto processing all of these into new virtual addresses based on the order they're seen.
     static RE0: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b0[xX][A-Fa-f0-9]+\b").unwrap());
 
-    // The basic reason for treating spawn_fn style tests differently is that using
-    // detcore for these forked function calls is really a *partial* version of detcore,
-    // not the full and proper setup.  In contrast, for all command tests, and for `hermit
-    // run` itself, the full contents of the COMMIT line should be deterministic and this
-    // hack should not be needed.
-    // Include common duration suffixes so fractional timing jitter is not left behind.
+    // Every number, plus common duration suffixes so fractional timing jitter is
+    // not left behind. This one is terrible overkill: for `hermit run` itself and
+    // for all command tests the full contents of a COMMIT line should already be
+    // deterministic, so nothing here should need erasing. It is retained for
+    // `spawn_fn_*` variants, which fork from another process and so exercise only
+    // a *partial* detcore setup without a true process tree of their own.
+    //
+    // N.B. RE4 must run BEFORE this pattern, or `800.709_180s` is consumed here as
+    // a bare number and never reaches the duration rule.
     static RE1: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\b[\d][\d_]*(?:\.[\d][\d_]*)?(?:ns|us|µs|ms)?\b").unwrap()); // This one is terrible overkill.
+        LazyLock::new(|| Regex::new(r"\b[\d][\d_]*(?:\.[\d][\d_]*)?(?:ns|us|µs|ms)?\b").unwrap());
 
+    // A quoted /tmp path. `[^"]*` stops at the path's OWN closing quote: a greedy
+    // `.*` here ran to the last quote on the line and erased every field after the
+    // path, so two entries differing only downstream of a /tmp path compared equal.
+    //
     // TODO: only strip this information if the config specified to the host /tmp through.
     // Otherwise we can determinize /tmp access fully.
-    static RE2: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"/tmp/.*""#).unwrap());
+    static RE2: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"/tmp/[^"]*""#).unwrap());
 
     // TODO: only strip this one if we're allowing through the host /proc or failing to determinize tids/pids:
     static RE3: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"/proc/[\d]+/").unwrap());
@@ -237,7 +245,7 @@ pub fn strip_log_entry(log: &str) -> String {
     let log = RE3.replace_all(&log, "/proc/<PID>/");
     let log = RE0.replace_all(&log, "<ADDR>");
     let log = RE1.replace_all(&log, "<NUM>");
-    let log = RE2.replace_all(&log, "/tmp/<somewhere>");
+    let log = RE2.replace_all(&log, "/tmp/<somewhere>\"");
     String::from(log)
 }
 
@@ -1641,6 +1649,48 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
                 "COMMIT turn 66, dettid 2 using resources {Path(\"/proc/2/fd/1\"): W} at time 946_684_800.709_180_000s"
             ),
             "COMMIT turn <NUM>, dettid <NUM> using resources {Path(\"/proc/<PID>/fd/<NUM>\"): W} at time <NANOSECONDS>"
+        );
+    }
+
+    /// Erasing a `/tmp` path must consume the path and nothing else.
+    ///
+    /// The pattern was previously `/tmp/.*"`, whose greedy `.*` ran to the LAST
+    /// quote on the line rather than the path's own closing quote. Every field
+    /// after the path was therefore erased too, so two entries differing only
+    /// downstream of a `/tmp` path compared EQUAL under the stripped
+    /// comparator -- a divergence silently reported as a match.
+    #[test]
+    fn strip_tmp_path_does_not_swallow_rest_of_line() {
+        let read = super::strip_log_entry(r#"open path="/tmp/scratch" flags="O_RDONLY""#);
+        let write = super::strip_log_entry(r#"open path="/tmp/scratch" flags="O_WRONLY""#);
+
+        assert_eq!(read, r#"open path="/tmp/<somewhere>" flags="O_RDONLY""#);
+        assert_eq!(write, r#"open path="/tmp/<somewhere>" flags="O_WRONLY""#);
+        assert_ne!(
+            read, write,
+            "entries differing after a /tmp path must not collapse to equal"
+        );
+    }
+
+    /// The narrowed pattern must still do its job: two entries whose only
+    /// difference is the host-chosen `/tmp` path still compare equal, which is
+    /// the whole reason this erasure exists.
+    #[test]
+    fn strip_tmp_path_still_erases_a_differing_tmp_path() {
+        assert_eq!(
+            super::strip_log_entry(r#"open path="/tmp/hermit-aaaa/f" flags="O_RDONLY""#),
+            super::strip_log_entry(r#"open path="/tmp/hermit-bbbb/f" flags="O_RDONLY""#),
+        );
+    }
+
+    /// Two distinct `/tmp` paths on one line are each erased individually,
+    /// rather than the first one swallowing the second along with everything
+    /// between them.
+    #[test]
+    fn strip_tmp_path_erases_each_path_separately() {
+        assert_eq!(
+            super::strip_log_entry(r#"rename from="/tmp/a" to="/tmp/b" ok="1""#),
+            r#"rename from="/tmp/<somewhere>" to="/tmp/<somewhere>" ok="<NUM>""#
         );
     }
 }
