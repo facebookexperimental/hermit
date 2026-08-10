@@ -2020,7 +2020,31 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             privileged_build.deps.push(producer.to_string());
             privileged_build.deps.sort();
         }
-        privileged_build.cmd = "test -x target/debug/hermit && count=0; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ]; then count=$((count + 1)); fi; done; test \"$count\" -eq 1".to_string();
+        // SELECT THE NEWEST, DO NOT REQUIRE EXACTLY ONE.
+        //
+        // This assertion used to end `test "$count" -eq 1`, and that made the
+        // owner's `make validate` fail EVERY TIME while passing in every agent
+        // worktree. Cargo writes one hash-suffixed `tests_misc-<hash>` per build
+        // and never prunes the old ones, so the count is 1 only in a FRESH or
+        // just-`cargo clean`ed tree. Measured 2026-08-10: 9 executables in
+        // ~/work/dev-hermit/hermit versus 1 in a cleaned slot. `test 9 -eq 1`
+        // exits 1 instantly and the shell builtin prints nothing -- which is
+        // exactly the "0s, exit 1" with an empty detail block seen in both
+        // failing runs at 2b38d8e6. It is not flaky and it is not a timeout:
+        // once a working tree accumulates a second binary it can never pass
+        // again. We validated only in clean clones, i.e. the one condition
+        // where the defect cannot appear.
+        //
+        // Fixing the CHECK rather than the user's working directory is
+        // deliberate: this must work in any checkout, including a dirty one,
+        // and validate must not delete a developer's build artifacts.
+        //
+        // Newest-by-mtime is what cargo itself would run. Deliberately NOT
+        // relaxed to `-ge 1`: the CPUID consumer below executes the binary it
+        // selects, so "any one of nine" would let it silently test a STALE
+        // artifact -- a check that passes while measuring the wrong thing,
+        // which is worse than failing loudly. Zero binaries still fails.
+        privileged_build.cmd = "test -x target/debug/hermit || exit 1; newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"".to_string();
 
         let cpuid = steps
             .iter_mut()
@@ -2033,7 +2057,13 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
                 cpuid.cmd
             ));
         }
-        cpuid.cmd = "bins=(); for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ]; then bins+=(\"$f\"); fi; done; ((${#bins[@]} == 1)); timeout 30 \"${bins[0]}\" rdrand_rdseed_is_masked --exact".to_string();
+        // Same defect, same fix: `((${#bins[@]} == 1))` failed for exactly the
+        // reason above, so this node could never run in a long-lived checkout
+        // either. It EXECUTES the binary it picks, which is precisely why the
+        // selection must be the NEWEST rather than an arbitrary survivor of a
+        // `-ge 1` relaxation -- running a stale `tests_misc` would report a
+        // CPUID verdict about an artifact that is not the one under test.
+        cpuid.cmd = "newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"; timeout 30 \"$newest\" rdrand_rdseed_is_masked --exact".to_string();
     }
     // Fusing lanes means one config for both. Their default wall timeouts differ,
     // but every shipped/synthesized node has an explicit wall timeout and the
