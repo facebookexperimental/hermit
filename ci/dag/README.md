@@ -97,8 +97,16 @@ The centralized manifests use an explicit build barrier before execution:
 
 1. `e2e.metadata` validates schema, inventory, generated test-footprint freshness,
    and CI correspondence.
-2. `build.manifest_guests` prepares every `ci=true` program once.
-3. One `e2e.manifest_<bucket>` node per TOML bucket runs with `--prebuilt`.
+2. `build.e2e_artifact` waits for both initial Cargo producers, verifies and
+   hash-binds the debug Hermit plus the dereferenced `install_pkg` resource
+   tree, then atomically publishes a content-addressed bundle. Every later
+   shared-target Cargo writer waits on this barrier.
+3. `build.manifest_guests` prepares every `ci=true` program once. One
+   `e2e.manifest_<bucket>` node per TOML bucket declares both producers and runs
+   through `run-with-hermit-e2e-artifact.sh`, which re-verifies identity before
+   exporting exact `HERMIT_BIN` and `HERMIT_INSTALL_DIR` paths. Parallel Cargo
+   tests may then relink `target/debug/hermit` or restage `target/install_pkg`
+   without invalidating a running bucket.
 
 Every run node carries a structured `manifest` selector as well as its command.
 `ci/test_harness.sh audit-ci` derives the expected bucket set from the TOMLs,

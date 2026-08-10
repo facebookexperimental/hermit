@@ -913,10 +913,58 @@ cleared-caps refusal names {} starved step(s)",
             || !portable_build.cmd.contains("cargo build -p hermit")
             || !portable_build.cmd.contains("--bin hermit")
         {
+            return Err("full-plan bracket: fat build does not finish the debug Hermit producer".into());
+        }
+        let artifact = full
+            .cfg
+            .steps
+            .iter()
+            .find(|s| s.tag() == "build.e2e_artifact")
+            .ok_or("full-plan bracket: verified E2E artifact publisher disappeared")?;
+        if !artifact.cmd.contains("ci/publish-hermit-e2e-artifact.sh")
+            || !artifact.cmd.ends_with(" target/install_pkg")
+            || !["build.workspace", "build.runtime_release"]
+                .iter()
+                .all(|dep| artifact.deps.iter().any(|actual| actual == dep))
+        {
             return Err(
-                "full-plan bracket: fat build does not finish target/debug/hermit before fanout"
+                "full-plan bracket: E2E publisher is not a complete binary+resource barrier"
                     .into(),
             );
+        }
+        let manifest_consumers: Vec<_> = full
+            .cfg
+            .steps
+            .iter()
+            .filter(|s| s.cmd.contains("./ci/test_harness.sh run --lane "))
+            .collect();
+        if manifest_consumers.is_empty() {
+            return Err("full-plan bracket: no manifest consumers were inspected".into());
+        }
+        for consumer in manifest_consumers {
+            if !consumer.cmd.starts_with("./ci/run-with-hermit-e2e-artifact.sh ") {
+                return Err(format!(
+                    "full-plan bracket: {} still consumes a mutable Hermit path: {}",
+                    consumer.tag(), consumer.cmd
+                ));
+            }
+            let producer = if consumer.cmd.contains("--lane portable ") {
+                if !consumer.cmd.contains("--require-install") {
+                    return Err(format!(
+                        "full-plan bracket: portable consumer {} did not require the backend-resource bundle",
+                        consumer.tag()
+                    ));
+                }
+                "build.e2e_artifact"
+            } else {
+                "privileged-build.privileged_tests"
+            };
+            if !consumer.deps.iter().any(|d| d == producer) {
+                return Err(format!(
+                    "full-plan bracket: {} does not declare immutable artifact producer {producer}",
+                    consumer.tag()
+                ));
+            }
         }
         let privileged_build = full
             .cfg
@@ -927,7 +975,7 @@ cleared-caps refusal names {} starved step(s)",
         if !privileged_build
             .deps
             .iter()
-            .any(|d| d == "build.workspace")
+            .any(|d| d == "build.e2e_artifact")
         {
             return Err(
                 "full-plan bracket: privileged build can race the portable artifact producer"
@@ -935,7 +983,9 @@ cleared-caps refusal names {} starved step(s)",
             );
         }
         if privileged_build.cmd.contains("cargo ")
-            || !privileged_build.cmd.contains("target/debug/hermit")
+            || !privileged_build
+                .cmd
+                .contains("verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path")
             || !privileged_build.cmd.contains("tests_misc-*")
         {
             return Err(
@@ -2166,35 +2216,45 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         eprintln!("validate: fused lanes; deduped {} identical node(s): {}", removed.len(), removed.join(", "));
     }
     if lanes.len() == 2 {
-        // Sequential full validation implicitly warmed the privileged focused
-        // build with build.workspace. `cargo build --all-targets`
-        // emits the Hermit bin target as a test harness under target/debug/deps,
-        // not as target/debug/hermit. Finish that producer with the warm,
-        // ordinary bin build before releasing its dependents: otherwise an E2E
-        // bucket can observe the absent executable. Keeping both invocations in
-        // the producer also prevents the warm build from starving behind all of
-        // the other Cargo consumers once the fat build releases the graph.
-        let producer = "build.workspace";
+        // The artifact barrier waits for both initial Cargo producers, verifies
+        // binary and resource identities, then publishes a content-addressed
+        // bundle. Every later Cargo writer and manifest consumer runs only after
+        // that barrier, so no writer can mutate either source during publication
+        // and no consumer reads a mutable Cargo path afterward.
+        let producer = "build.e2e_artifact";
+        let debug_producer = "build.workspace";
         let consumer = "privileged-build.privileged_tests";
         let portable_build = steps
-            .iter_mut()
-            .find(|s| s.tag() == producer)
-            .ok_or_else(|| format!("fused artifact producer disappeared: {producer}"))?;
-        let expected_fat_build = "./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends";
+            .iter()
+            .find(|s| s.tag() == debug_producer)
+            .ok_or_else(|| format!("fused debug producer disappeared: {debug_producer}"))?;
+        let expected_fat_build = "./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit";
         if portable_build.cmd != expected_fat_build {
             return Err(format!(
-                "fused artifact producer command drifted; re-prove the bin completion: {}",
+                "fused debug producer command drifted; re-prove the artifact barrier: {}",
                 portable_build.cmd
             ));
         }
-        portable_build.cmd.push_str(
-            " && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit",
-        );
+        let artifact = steps
+            .iter()
+            .find(|s| s.tag() == producer)
+            .ok_or_else(|| format!("fused artifact producer disappeared: {producer}"))?;
+        let expected_artifact = "./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path target/install_pkg";
+        if artifact.cmd != expected_artifact
+            || ![debug_producer, "build.runtime_release"]
+                .iter()
+                .all(|dep| artifact.deps.iter().any(|actual| actual == dep))
+        {
+            return Err(format!(
+                "fused artifact barrier drifted; re-prove binary+resource publication: {} deps={:?}",
+                artifact.cmd, artifact.deps
+            ));
+        }
         let privileged_build = steps
             .iter_mut()
             .find(|s| s.tag() == consumer)
             .ok_or_else(|| format!("fused artifact consumer disappeared: {consumer}"))?;
-        let expected_build = "CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run";
+        let expected_build = "CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run";
         if privileged_build.cmd != expected_build {
             return Err(format!(
                 "fused privileged build command drifted; re-prove that build.workspace is a superset: {}",
@@ -2229,7 +2289,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // selects, so "any one of nine" would let it silently test a STALE
         // artifact -- a check that passes while measuring the wrong thing,
         // which is worse than failing loudly. Zero binaries still fails.
-        privileged_build.cmd = "test -x target/debug/hermit || exit 1; newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"".to_string();
+        privileged_build.cmd = "./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null || exit 1; newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"".to_string();
 
         let cpuid = steps
             .iter_mut()
