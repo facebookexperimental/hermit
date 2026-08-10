@@ -850,10 +850,19 @@ function audit_ci_correspondence {
         )] | length == 2
     ' "$DAG_ROOT/portable.json" >/dev/null ||
         die "portable DBT builds must derive inside the child and allow 1050s DBT + 150s overhead"
+    # The point of this assertion is that the portable-only DBT budget override
+    # never leaks into the privileged lane -- it pins the privileged node's own
+    # command and its own budget, whatever those are, so a portable edit cannot
+    # silently move them. The expected timeout was 120 until 2026-08-10; it is
+    # now 199 because the node was re-budgeted against a MEASURED cold build
+    # (69s + 30s = 99s idle, i.e. 83% of the old 120s before any contention),
+    # not because the DBT override touched it. Update this number deliberately
+    # alongside the DAG when the privileged budget is re-derived; do not relax
+    # the equality into a >=, which would let an override raise it unnoticed.
     jq -e '
         [.steps[] | select(
             .group == "build" and .job == "privileged_tests"
-            and .timeout == 120
+            and .timeout == 199
             and .cmd == "CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run"
         )] | length == 1
     ' "$DAG_ROOT/privileged.json" >/dev/null ||
