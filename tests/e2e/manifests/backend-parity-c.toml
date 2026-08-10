@@ -4671,10 +4671,46 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 ci = false
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
-dbi = "Not buildable on the authoring host (cmake absent); qualify DBI separately"
+dbt = "Not buildable on the authoring host (cmake absent); qualify DBT separately"
 kvm = "KVM does not complete a guest on the authoring host; qualify KVM separately"
 sabre = "Not buildable on the authoring host (cmake absent); qualify SaBRe separately"
 liteinst = "LiteInst preload handshake fails on the authoring host; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "A native run necessarily differs from itself: unvirtualized st_ino/st_dev come from the real host filesystem and the timestamps are wall-clock, so native is a useful smoke check but not a discriminating oracle for a contract whose whole claim is that those fields are virtualized and repeatable"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from strict verification"
+dbt = "Record/replay is unsupported by DBT"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "File metadata is filesystem- and virtual-clock-derived, not schedule-derived; chaos adds no discriminating power for a single-threaded guest"
+dbt = "Chaos scheduling is unsupported by DBT"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbt = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [[test]]
 id = "backend-parity-c/mmap-layout-pointer-order"
@@ -4686,11 +4722,14 @@ occasional = false
 program = "tests/backend-parity/fixtures/mmap_layout_pointer_order.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
+  [test.build]
+  cflags = ["-D_GNU_SOURCE"]
+
 [test.modes.verify]
 ci = false
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
-dbi = "DBI is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake, absent), so no witness could be recorded; qualify DBI separately -- this guest is a PRIORITY for DBI once it builds, since layout divergence is exactly what it detects"
+dbt = "DBI is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake, absent), so no witness could be recorded; qualify DBI separately -- this guest is a PRIORITY for DBI once it builds, since layout divergence is exactly what it detects"
 kvm = "KVM livelocks at guest startup on the current host; qualify KVM separately -- also a priority for this guest"
 sabre = "SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately"
 liteinst = "LiteInst preload runtime libreverie_liteinst.so is not built beside the binary; qualify LiteInst separately"
@@ -4706,7 +4745,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from strict verification"
-dbi = "Record/replay is unsupported by DBI"
+dbt = "Record/replay is unsupported by DBI"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
@@ -4716,7 +4755,7 @@ ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Memory layout is allocation-policy derived, not schedule-derived; chaos adds no discriminating power for a single-threaded guest"
-dbi = "Chaos scheduling is unsupported by DBI"
+dbt = "Chaos scheduling is unsupported by DBI"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
 liteinst = "Chaos scheduling is unsupported by LiteInst"
@@ -4726,7 +4765,7 @@ ci = false
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
-dbi = "No custom edge-case arguments have been calibrated for this C guest"
+dbt = "No custom edge-case arguments have been calibrated for this C guest"
 kvm = "No custom edge-case arguments have been calibrated for this C guest"
 sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
