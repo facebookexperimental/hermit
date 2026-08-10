@@ -479,12 +479,12 @@
     },
     {
       "group": "test", "job": "strict_compat",
-      "desc": "Portable strict compatibility envelope (blocking L2 matrix with bounded diagnostics)",
-      "cmd": "acf=(); if [ -n \"${GITHUB_ACTIONS:-}\" ] || [ -n \"${CI:-}\" ]; then acf=(--allow-cgroup-failure); fi; STRICT_COMPAT_HERMIT_BIN=$PWD/target/ci/hermit-strict ./scripts/validate.rs --portable-strict-compat-only --reuse-parent-manifest-gate --no-label-pr --verbose \"${acf[@]}\"",
+      "desc": "Portable strict compatibility envelope (420s prep < 480s gate < 600s run < 660s local scope when available < 720s node < 900s job; timeout preserves named probe evidence)",
+      "cmd": "acf=(); if [ -n \"${GITHUB_ACTIONS:-}\" ] || [ -n \"${CI:-}\" ]; then acf=(--allow-cgroup-failure); fi; VALIDATE_GATE_TIMEOUT_SECONDS=480 HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS=600 SAFE_CI_DAG_RUNNER_LOG_DIR=\"${RUN_NODE_PERF_DIR:-$PWD/ignored/ci/perf/strict-compat}/logs\" STRICT_COMPAT_HERMIT_BIN=$PWD/target/ci/hermit-strict ./scripts/validate.rs --portable-strict-compat-only --reuse-parent-manifest-gate --no-label-pr --verbose \"${acf[@]}\"",
       "deps": ["build.runtime_release", "lint.clippy", "doc.doctests", "doc.rustdoc",
                "test.regular_crates",
                "test.hermit_unit", "test.detcore_unit", "test.rr_suite_contract"],
-      "timeout": 1800,
+      "timeout": 720,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 600,
                "rss_baseline_bytes": 12884901888, "hard_mem_max_bytes": 25769803776,
                "classification": "latency-bound"}

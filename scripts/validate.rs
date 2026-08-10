@@ -14,8 +14,9 @@
 //!
 //! * **Everything runs as a `safe-ci-dag-runner` node.** Preflight, the manifest
 //!   gate, every CI-lane node, and every compatibility probe. The driver makes
-//!   exactly one kind of call — `run_dag_boxed_ordered` — and never spawns a gate
-//!   itself. See `lib/validate_plan.rs` for why that rule is load-bearing and for
+//!   exactly one kind of call — `run_dag_boxed_deadline` (unbounded when no
+//!   whole-run budget is supplied) — and never spawns a gate itself. See
+//!   `lib/validate_plan.rs` for why that rule is load-bearing and for
 //!   the measured evidence that an undeclared node is unboxed.
 //! * **Boxing is fail-closed.** Default path re-execs into a transient
 //!   `systemd --user` scope; if two-level cgroup-v2 boxing cannot be established
@@ -89,12 +90,15 @@ use std::sync::Arc;
 
 use safe_ci_dag_runner::cgroup::install_scope_teardown;
 use safe_ci_dag_runner::cgroup::is_in_scope;
-use safe_ci_dag_runner::cgroup::reexec_in_scope;
+use safe_ci_dag_runner::cgroup::attempt_scope_reexec;
 use safe_ci_dag_runner::cgroup::CgroupManager;
 use safe_ci_dag_runner::cgroup::Cgroups;
 use safe_ci_dag_runner::model::DagConfig;
+use safe_ci_dag_runner::model::RunResult;
 use safe_ci_dag_runner::model::StepOutcome;
-use safe_ci_dag_runner::scheduler::run_dag_boxed_ordered;
+use safe_ci_dag_runner::perflog::append_step_profiles;
+use safe_ci_dag_runner::scheduler::run_dag_boxed_deadline;
+use safe_ci_dag_runner::scheduler::steps_violating_run_timeout;
 use safe_ci_dag_runner::scheduler::BoxedCgroups;
 
 use validate_plan::CompatMode;
@@ -242,6 +246,8 @@ struct Args {
     jobs: Option<i64>,
     keep_going: bool,
     allow_cgroup_failure: bool,
+    /// Wall budget for the whole validate invocation, across lanes and retries.
+    run_timeout: Option<i64>,
     merge_lanes: bool,
     reuse_parent_manifest_gate: bool,
     self_test: bool,
@@ -288,6 +294,10 @@ fn usage() -> &'static str {
      \x20 --no-label-pr    Disable the non-fatal receipt publication and label update.\n\
      \x20 --ignore-cache   Force a real run even on a tree-keyed cache hit.\n\
      \x20 -j N             Scheduler width (default: host_cpus/8, floor 2, cap 16).\n\
+     \x20 --run-timeout SEC  Wall budget for the WHOLE invocation (across lanes and\n\
+     \x20                  retries). On breach, in-flight nodes are cut and the run still\n\
+     \x20                  reports instead of being killed externally. Also sets a later\n\
+     \x20                  systemd-scope backstop. Env: HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS.\n\
      \x20 -k, --keep-going Do not eager-exit on the first failure.\n\
      \x20 --allow-cgroup-failure  Downgrade to an UNBOXED run instead of failing closed.\n\
      \x20 --merge-lanes    Fuse the portable and privileged lanes (the full default).\n\
@@ -348,6 +358,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         jobs: None,
         keep_going: false,
         allow_cgroup_failure: false,
+        run_timeout: None,
         merge_lanes: true,
         reuse_parent_manifest_gate: false,
         self_test: false,
@@ -425,6 +436,16 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
             "--self-test" => args.self_test = true,
             "-k" | "--keep-going" => args.keep_going = true,
             "--allow-cgroup-failure" => args.allow_cgroup_failure = true,
+            "--run-timeout" => {
+                i += 1;
+                match argv.get(i).and_then(|v| v.parse::<i64>().ok()) {
+                    Some(v) if v > 0 => args.run_timeout = Some(v),
+                    _ => {
+                        eprintln!("validate: --run-timeout needs a positive number of SECONDS");
+                        return Err(2);
+                    }
+                }
+            }
             "--baseline" => {
                 i += 1;
                 match argv.get(i) {
@@ -526,6 +547,28 @@ fn force_full_policy_allows(force_full: bool, level: Level, focused: Option<&str
 /// on every invocation (validate.sh:308); here they are a `--self-test` subcommand
 /// so the cost is not paid on the hot path.
 fn self_test() -> Result<(), String> {
+    // CLI bracket: a real positive budget reaches the typed field, while zero,
+    // negative, malformed, and missing values are all refused.
+    let parsed = parse_argv(&["--run-timeout".into(), "600".into(), "--self-test".into()])
+        .map_err(|code| format!("run-timeout parser refused 600s with exit {code}"))?;
+    if parsed.run_timeout != Some(600) {
+        return Err(format!(
+            "run-timeout parser produced {:?}, expected 600s",
+            parsed.run_timeout
+        ));
+    }
+    for bad in ["0", "-1", "not-seconds"] {
+        if parse_argv(&["--run-timeout".into(), bad.into(), "--self-test".into()]).is_ok() {
+            return Err(format!("run-timeout parser accepted invalid value {bad:?}"));
+        }
+    }
+    if parse_argv(&["--run-timeout".into()]).is_ok() {
+        return Err("run-timeout parser accepted a missing value".into());
+    }
+    if scope_grace_s(600) != 60 || 600 + scope_grace_s(600) >= 720 {
+        return Err("run-timeout scope backstop no longer satisfies 600 < 660 < 720".into());
+    }
+
     // Positive: the one qualifying case must be ACCEPTED (guards against a
     // predicate that refuses everything and looks correct).
     if !force_full_policy_allows(true, Level::Full, None) {
@@ -1232,11 +1275,21 @@ fn default_jobs() -> i64 {
 
 // --------------------------------------------------------------------------- boxing
 
+/// How much longer than validate's own budget the scope may live.
+///
+/// The scope is only a backstop for the driver itself wedging. Validate needs
+/// this later window to reap nodes and flush its rows, so it must not be the
+/// level that normally fires. At the strict-compat 600s run budget this is 60s,
+/// establishing the configured 600 < 660 portion of the nesting ladder.
+fn scope_grace_s(run_timeout_s: i64) -> i64 {
+    60.max(run_timeout_s / 10)
+}
+
 /// Establish two-level cgroup-v2 boxing, mirroring the runner's own
 /// `resolve_cgroups` policy. Returns the manager (`None` = intentional unboxed
 /// run) or `Err(exit_code)`. On the default path this re-execs into a transient
 /// `systemd --user` scope and does not return on success.
-fn resolve_cgroups(allow_failure: bool) -> Result<BoxedCgroups, u8> {
+fn resolve_cgroups(allow_failure: bool, run_timeout_s: Option<i64>) -> Result<BoxedCgroups, u8> {
     if is_in_scope() {
         let mgr = Cgroups::new();
         if mgr.enabled() {
@@ -1264,12 +1317,12 @@ fn resolve_cgroups(allow_failure: bool) -> Result<BoxedCgroups, u8> {
         );
         return Ok(None);
     }
-    let reexeced_or_skipped = reexec_in_scope(None, None);
-    let detail = if reexeced_or_skipped {
-        "boxing was skipped (e.g. CI without a systemd --user scope)"
-    } else {
-        "cgroup-v2 + a working systemd --user scope are unavailable"
-    };
+    let attempt = attempt_scope_reexec(
+        None,
+        None,
+        run_timeout_s.map(|s| s + scope_grace_s(s)),
+    );
+    let detail = attempt.describe();
     eprintln!(
         "validate: ERROR: cgroup boxing could not be established: {detail}. Resource boxing is \
          this tool's primary purpose; re-run with --allow-cgroup-failure to run UNBOXED."
@@ -2426,6 +2479,15 @@ fn dedupe_identical(steps: &mut Vec<safe_ci_dag_runner::model::Step>) -> Vec<Str
     removed
 }
 
+/// Heavy compatibility preparation is the innermost bound in the validation ladder:
+///
+/// `420 prep < 480 gate clamp < 600 whole run < 660 local scope < 720 node < 900 job`.
+///
+/// A 3600s preparation allowance inside a 900s job was unreachable by
+/// construction. This bound fires while the scheduler can still name the node
+/// and flush its profile row.
+const COMPAT_DIAGNOSTIC_WALL_S: i64 = 420;
+
 fn build_release_hermit_node(gate: &str, bin: &str) -> safe_ci_dag_runner::model::Step {
     let default = bin.ends_with("target/release/hermit");
     let cmd = if default {
@@ -2436,7 +2498,16 @@ fn build_release_hermit_node(gate: &str, bin: &str) -> safe_ci_dag_runner::model
         // for a reason that has nothing to do with compatibility.
         format!("test -x {}", validate_plan::shell_quote(bin))
     };
-    step_with_caps("compatprep", "hermit_release", "Release Hermit for compatibility", cmd, vec![gate.to_string()], 3600, 7200, 16 * 1024 * 1024 * 1024)
+    step_with_caps(
+        "compatprep",
+        "hermit_release",
+        "Release Hermit for compatibility",
+        cmd,
+        vec![gate.to_string()],
+        COMPAT_DIAGNOSTIC_WALL_S,
+        COMPAT_DIAGNOSTIC_WALL_S * 2,
+        16 * 1024 * 1024 * 1024,
+    )
 }
 
 fn prepare_fixtures_node(_tag: &str, fixtures: &Path) -> safe_ci_dag_runner::model::Step {
@@ -2461,8 +2532,8 @@ fn prepare_fixtures_node_dep(
             validate_plan::shell_quote(&fixtures.to_string_lossy())
         ),
         vec![dep.to_string()],
-        900,
-        900,
+        COMPAT_DIAGNOSTIC_WALL_S,
+        COMPAT_DIAGNOSTIC_WALL_S,
         4 * 1024 * 1024 * 1024,
     )
 }
@@ -2826,6 +2897,8 @@ struct LaneResult {
     /// that only survived because the host was retried is never mistaken for a
     /// green that passed first time.
     env_retries: usize,
+    /// The whole-invocation deadline expired during this lane.
+    run_timed_out: bool,
 }
 
 /// Read the durable log once it has stopped growing.
@@ -2851,6 +2924,55 @@ fn read_log_settled(path: &Path) -> String {
         last = now;
     }
     std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Forward nested scheduler rows to the directory uploaded by the hosted shard.
+///
+/// `validate.rs` invokes the scheduler as a library, bypassing the runner CLI's
+/// profile writer. Without this explicit forwarding an inner deadline can name
+/// the cut probe on stdout yet leave no per-probe artifact. The workflow uploads
+/// `$RUN_NODE_PERF_DIR` under `if: always()`, so these rows survive a red job.
+fn forward_step_profiles(result: &RunResult, jobs: i64) {
+    let Ok(dir) = std::env::var("RUN_NODE_PERF_DIR") else {
+        return;
+    };
+    if dir.is_empty() || result.step_profile_rows.is_empty() {
+        return;
+    }
+    let git_sha = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    match append_step_profiles(
+        Path::new(&dir),
+        &result.step_profile_rows,
+        &git_sha,
+        jobs,
+        None,
+        "unverified",
+        "validate.rs",
+    ) {
+        Some(path) => eprintln!(
+            "validate: wrote {} inner step profile row(s) to {}",
+            result.step_profile_rows.len(),
+            path.display()
+        ),
+        None => eprintln!("validate: could not write inner step profile rows to {dir}"),
+    }
+}
+
+/// Seconds left on one shared invocation clock.
+fn remaining_budget_s(deadline: Option<std::time::Instant>) -> Option<i64> {
+    let deadline = deadline?;
+    let now = std::time::Instant::now();
+    Some(if now >= deadline {
+        0
+    } else {
+        (deadline - now).as_secs() as i64
+    })
 }
 
 /// Run one lane, auto-retrying nodes whose failure is an ENVIRONMENTAL block.
@@ -2883,9 +3005,21 @@ fn run_lane_with_env_retries(
     verbosity: i64,
     cgroups: BoxedCgroups,
     log_path: &Path,
+    deadline: Option<std::time::Instant>,
 ) -> LaneResult {
     let max = validate_runtime::env_block_max_retries();
-    let first = run_dag_boxed_ordered(cfg, jobs, keep_going, verbosity, cgroups.clone(), None, None);
+    let first = run_dag_boxed_deadline(
+        cfg,
+        jobs,
+        keep_going,
+        verbosity,
+        cgroups.clone(),
+        None,
+        None,
+        remaining_budget_s(deadline),
+    );
+    forward_step_profiles(&first, jobs);
+    let mut run_timed_out = first.run_timed_out;
     let mut order: Vec<String> = first.outcomes.iter().map(|o| o.tag.clone()).collect();
     let mut by_tag: BTreeMap<String, StepOutcome> =
         first.outcomes.iter().map(|o| (o.tag.clone(), o.clone())).collect();
@@ -2949,8 +3083,28 @@ fn run_lane_with_env_retries(
         retry_cfg.description =
             format!("{} — environmental retry {env_retries}/{max}", cfg.description);
         retry_cfg.steps = steps;
-        let again =
-            run_dag_boxed_ordered(&retry_cfg, jobs, keep_going, verbosity, cgroups.clone(), None, None);
+        // Retries draw down the same clock. Giving every retry a fresh budget
+        // would turn a bounded invocation back into an unbounded one.
+        if remaining_budget_s(deadline) == Some(0) {
+            eprintln!(
+                "validate: whole-run budget exhausted; NOT starting environmental retry \
+                 {env_retries}/{max}."
+            );
+            run_timed_out = true;
+            break;
+        }
+        let again = run_dag_boxed_deadline(
+            &retry_cfg,
+            jobs,
+            keep_going,
+            verbosity,
+            cgroups.clone(),
+            None,
+            None,
+            remaining_budget_s(deadline),
+        );
+        forward_step_profiles(&again, jobs);
+        run_timed_out = run_timed_out || again.run_timed_out;
         for o in &again.outcomes {
             if !by_tag.contains_key(&o.tag) {
                 order.push(o.tag.clone());
@@ -2980,8 +3134,11 @@ fn run_lane_with_env_retries(
 
     let outcomes: Vec<StepOutcome> =
         order.iter().filter_map(|t| by_tag.get(t).cloned()).collect();
-    let ok = outcomes.iter().all(|o| o.ok || o.aborted);
-    LaneResult { outcomes, skipped, ok, env_retries }
+    // Eager-exit aborts after a genuine peer failure are neutral, but steps cut
+    // by the whole-run clock are not a green. Without the typed run bit here an
+    // entirely aborted tail satisfies `ok || aborted` and can falsely pass.
+    let ok = !run_timed_out && outcomes.iter().all(|o| o.ok || o.aborted);
+    LaneResult { outcomes, skipped, ok, env_retries, run_timed_out }
 }
 
 /// Nodes the runner reported as killed by their wall or CPU budget. The runner's
@@ -4019,6 +4176,42 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         );
     }
 
+    // The whole-run budget is the first boundary able to stop cumulative cost
+    // while preserving evidence. Per-node caps cannot bound a sequence of legal
+    // nodes, and the hosted job kill discards the diagnostic tail.
+    let run_timeout = args
+        .run_timeout
+        .or_else(|| env_positive("HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS"));
+
+    // Refuse an inverted ladder before even `--show-plan` succeeds. A node with
+    // an allowance at least as large as the run budget can only be cut by the
+    // less-specific outer clock, losing attribution to the node.
+    if let Some(secs) = run_timeout {
+        let mut bad = steps_violating_run_timeout(&plan.cfg, secs);
+        if let Some(second) = &plan.second {
+            bad.extend(steps_violating_run_timeout(second, secs));
+        }
+        if !bad.is_empty() {
+            bad.sort();
+            bad.dedup();
+            return RunSummary::refused(
+                3,
+                &plan.profile,
+                "whole-run budget is not larger than every node budget",
+                std::iter::once(format!(
+                    "{} node(s) declare a wall budget >= the {secs}s whole-run budget:",
+                    bad.len()
+                ))
+                .chain(bad.iter().take(8).map(|(tag, t)| format!("  {tag} ({t}s)")))
+                .chain(std::iter::once(
+                    "lower the named node budgets so each can diagnose itself before the whole-run boundary"
+                        .to_string(),
+                ))
+                .collect(),
+            );
+        }
+    }
+
     // Print the plan and exit. This makes "what will actually run, and under what
     // caps" reviewable without spending a validate slot — and it is how the
     // declared-caps claim above can be checked by eye rather than trusted.
@@ -4136,7 +4329,16 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
     }
 
-    let cgroups: BoxedCgroups = match resolve_cgroups(args.allow_cgroup_failure) {
+    match run_timeout {
+        Some(secs) => eprintln!(
+            "validate: whole-run budget {secs}s across lanes and retries; in-flight nodes are cut and rows flushed on breach"
+        ),
+        None => eprintln!(
+            "validate: WARNING: no whole-run budget (--run-timeout / HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS); per-node caps do not bound cumulative wall time"
+        ),
+    }
+
+    let cgroups: BoxedCgroups = match resolve_cgroups(args.allow_cgroup_failure, run_timeout) {
         Ok(c) => {
             // Claim the re-entrancy marker HERE, not before resolve_cgroups.
             // On the default path resolve_cgroups re-execs into a transient
@@ -4259,15 +4461,29 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let mut ok = true;
     let mut env_retries = 0usize;
 
+    // One clock for the whole invocation. Sequential lanes and retries spend
+    // from the same allowance rather than each receiving a fresh 600 seconds.
+    let deadline = run_timeout
+        .map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s as u64));
     let lane = |cfg: &DagConfig| -> LaneResult {
-        run_lane_with_env_retries(cfg, jobs, keep_going, verbosity, cgroups.clone(), &log_path)
+        run_lane_with_env_retries(
+            cfg,
+            jobs,
+            keep_going,
+            verbosity,
+            cgroups.clone(),
+            &log_path,
+            deadline,
+        )
     };
+    let mut run_timed_out = false;
 
     let r = lane(&plan.cfg);
     outcomes.extend(r.outcomes.iter().cloned());
     skipped.extend(r.skipped.iter().cloned());
     ok = ok && r.ok;
     env_retries += r.env_retries;
+    run_timed_out = run_timed_out || r.run_timed_out;
 
     if let Some(second) = &plan.second {
         if ok || keep_going {
@@ -4276,12 +4492,21 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             skipped.extend(r2.skipped.iter().cloned());
             ok = ok && r2.ok;
             env_retries += r2.env_retries;
+            run_timed_out = run_timed_out || r2.run_timed_out;
         } else {
             eprintln!("validate: first lane failed; skipping the second lane (eager exit).");
         }
     }
 
     let wall = (epoch_now() - started_epoch) as f64;
+    if run_timed_out {
+        println!(
+            "⏱ VALIDATE RUN BUDGET EXCEEDED after {wall:.0}s (budget {}s): remaining work was \
+             cut so its node identities and rows could still be reported. This is an incomplete \
+             judgement, not a product verdict.",
+            run_timeout.unwrap_or(0)
+        );
+    }
     print_cost_table(&outcomes, &skipped);
 
     // ---- the single cleanup / evidence-commit point (validate.sh:1812) -------

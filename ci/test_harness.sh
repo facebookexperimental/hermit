@@ -300,6 +300,45 @@ function workflow_non_dag_step_budget_seconds {
     ' "$workflow"
 }
 
+# The strict-compat lane used to permit 1800s internally inside a 900s hosted
+# job. The external kill necessarily won, leaving neither a named probe nor its
+# per-probe rows. Assert the deployed values, not hand-copied policy numbers.
+function assert_strict_compat_budget_ladder {
+    local workflow=$1
+    local cmd gate_seconds run_seconds node_seconds job_seconds
+    cmd=$(jq -r '.steps[] | select(.group == "test" and .job == "strict_compat") | .cmd' \
+        "$DAG_ROOT/portable.json")
+    gate_seconds=$(sed -n 's/.*VALIDATE_GATE_TIMEOUT_SECONDS=\([0-9][0-9]*\).*/\1/p' <<<"$cmd")
+    run_seconds=$(sed -n 's/.*HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS=\([0-9][0-9]*\).*/\1/p' <<<"$cmd")
+    node_seconds=$(jq -r '.steps[] | select(.group == "test" and .job == "strict_compat") | .timeout' \
+        "$DAG_ROOT/portable.json")
+    job_seconds=$(( $(workflow_job_timeout_minutes "$workflow" test-debug) * 60 ))
+
+    [[ $gate_seconds =~ ^[1-9][0-9]*$ && $run_seconds =~ ^[1-9][0-9]*$ && \
+       $node_seconds =~ ^[1-9][0-9]*$ && $job_seconds =~ ^[1-9][0-9]*$ ]] ||
+        die "strict-compat must expose numeric gate/run/node/job budgets"
+    ((gate_seconds < run_seconds && run_seconds < node_seconds && node_seconds < job_seconds)) ||
+        die "strict-compat budget ladder must satisfy gate < whole-run < node < hosted job; got ${gate_seconds} < ${run_seconds} < ${node_seconds} < ${job_seconds}"
+
+    # The scope backstop is derived as run + max(60, run/10), so the deployed
+    # 600s run yields 660s. Keep that strictly below the 720s node boundary.
+    ((run_seconds + 60 < node_seconds)) ||
+        die "strict-compat scope backstop must fit between whole-run and node budgets"
+    [[ $(grep -Fxc 'const COMPAT_DIAGNOSTIC_WALL_S: i64 = 420;' "$ROOT_DIR/scripts/validate.rs") == 1 ]] ||
+        die "strict-compat heavy prep must retain its measured 420s inner bound"
+    grep -Fq 'run_dag_boxed_deadline' "$ROOT_DIR/scripts/validate.rs" ||
+        die "strict-compat whole-run budget has no in-process deadline consumer"
+    grep -Fq 'forward_step_profiles(&first, jobs)' "$ROOT_DIR/scripts/validate.rs" ||
+        die "strict-compat inner rows are not forwarded to the hosted artifact directory"
+    [[ $cmd == *'SAFE_CI_DAG_RUNNER_LOG_DIR="${RUN_NODE_PERF_DIR:-$PWD/ignored/ci/perf/strict-compat}/logs"'* ]] ||
+        die "strict-compat per-probe logs are not routed into the always-uploaded shard artifact"
+    [[ $(grep -Fxc '        if: always()' "$workflow") -ge 1 ]] ||
+        die "portable workflow must upload diagnostic artifacts on failed shards"
+    grep -Fq 'pub fn run_dag_boxed_deadline' \
+        "$ROOT_DIR/agent-utils/rs/safe-ci-dag-runner/src/scheduler.rs" ||
+        die "the pinned safe-ci runner does not implement the whole-run deadline"
+}
+
 function assert_parallel_portable_workflow {
     local workflow=$1
     local run_dag_count run_node_count debug_inner_path release_inner_path
@@ -312,6 +351,8 @@ function assert_parallel_portable_workflow {
         die "GitHub portable workflow must not retain the serial ci/run-dag.sh entrypoint"
     ((run_node_count == 5)) ||
         die "GitHub portable workflow must have five audited ci/run-node.sh entrypoints"
+
+    assert_strict_compat_budget_ladder "$workflow"
 
     # The hosted job is the outer kill boundary. Compute the critical path for
     # each exact run-node selection, retaining dependencies among selected nodes
