@@ -756,16 +756,24 @@ cleared-caps refusal names {} starved step(s)",
                 "full-plan bracket: pin authority was not deduped to the observed preflight: {pin_nodes:?}"
             ));
         }
-        for required in ["portable-test.strict_compat", "privileged-cpuid.faulting"] {
+        for required in ["test.strict_compat", "privileged-cpuid.faulting"] {
             if !full.cfg.steps.iter().any(|s| s.tag() == required) {
                 return Err(format!("full-plan bracket: fused plan lost {required}"));
             }
+        }
+        let canonical_test_tags = test_nodes_of(&validate_plan::lane_config(&root, "portable")?);
+        let fused_test_tags = test_nodes_of(&full.cfg);
+        if fused_test_tags != canonical_test_tags {
+            return Err(format!(
+                "full-plan bracket: fused tags changed the receipt coverage denominator: \
+                 canonical={canonical_test_tags:?}, fused={fused_test_tags:?}"
+            ));
         }
         let portable_build = full
             .cfg
             .steps
             .iter()
-            .find(|s| s.tag() == "portable-build.workspace")
+            .find(|s| s.tag() == "build.workspace")
             .ok_or("full-plan bracket: portable fat build disappeared")?;
         if !portable_build.cmd.contains("cargo build --workspace --all-targets")
             || !portable_build.cmd.contains("cargo build -p hermit")
@@ -785,7 +793,7 @@ cleared-caps refusal names {} starved step(s)",
         if !privileged_build
             .deps
             .iter()
-            .any(|d| d == "portable-build.workspace")
+            .any(|d| d == "build.workspace")
         {
             return Err(
                 "full-plan bracket: privileged build can race the portable artifact producer"
@@ -1952,7 +1960,15 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
 
     let mut steps = pre;
     for lane in &lanes {
-        let prefix = if lanes.len() > 1 { format!("{lane}-") } else { String::new() };
+        // Keep the portable lane's shipped tags byte-identical: the
+        // main-reachable receipt finalizer derives its coverage denominator
+        // from those manifest tags. Prefix only the additional lane, which is
+        // sufficient to disambiguate every collision in the fused graph.
+        let prefix = if lanes.len() > 1 && *lane != "portable" {
+            format!("{lane}-")
+        } else {
+            String::new()
+        };
         steps.extend(validate_plan::lane_nodes(root, lane, &prefix, gate)?);
     }
     // Fusing lanes can duplicate identical work. In particular, the always-on
@@ -1966,14 +1982,14 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     }
     if lanes.len() == 2 {
         // Sequential full validation implicitly warmed the privileged focused
-        // build with portable-build.workspace. `cargo build --all-targets`
+        // build with build.workspace. `cargo build --all-targets`
         // emits the Hermit bin target as a test harness under target/debug/deps,
         // not as target/debug/hermit. Finish that producer with the warm,
         // ordinary bin build before releasing its dependents: otherwise an E2E
         // bucket can observe the absent executable. Keeping both invocations in
         // the producer also prevents the warm build from starving behind all of
         // the other Cargo consumers once the fat build releases the graph.
-        let producer = "portable-build.workspace";
+        let producer = "build.workspace";
         let consumer = "privileged-build.privileged_tests";
         let portable_build = steps
             .iter_mut()
@@ -1996,7 +2012,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         let expected_build = "CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run";
         if privileged_build.cmd != expected_build {
             return Err(format!(
-                "fused privileged build command drifted; re-prove that portable-build.workspace is a superset: {}",
+                "fused privileged build command drifted; re-prove that build.workspace is a superset: {}",
                 privileged_build.cmd
             ));
         }
@@ -2339,7 +2355,7 @@ fn dedupe_identical(steps: &mut Vec<safe_ci_dag_runner::model::Step>) -> Vec<Str
             )
         } else if [
             "pre.reverie_pin",
-            "portable-check.reverie_pin",
+            "check.reverie_pin",
             "privileged-check.reverie_pin",
         ]
         .contains(&tag.as_str())
