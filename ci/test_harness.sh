@@ -1102,7 +1102,6 @@ function audit_ci_correspondence {
         die "run-node.sh must source ordinary build-job configuration exactly once"
     local budget_config="$ROOT_DIR/ci/configure-build-jobs.sh"
     local budget_wrapper="$ROOT_DIR/ci/run-with-reverie-dbt-budget.sh"
-    local rustdoc_width_contract
     [[ -x $budget_wrapper ]] || die "DBT child-budget wrapper must be executable"
     [[ $(grep -Fc 'reverie-dbt-budget=portable-build-child-only' "$ROOT_DIR/ci/run-dag.sh") == 1 ]] ||
         die "run-dag.sh must identify the DBT budget as portable-child-only"
@@ -1130,23 +1129,49 @@ function audit_ci_correspondence {
         )] | length == 2
     ' "$DAG_ROOT/portable.json" >/dev/null ||
         die "portable DBT builds must derive inside the child and allow 1050s DBT + 150s overhead"
-    # CARGO_BUILD_JOBS alone controls Cargo/NUM_JOBS but does not declare the
-    # step's width to safe-ci. Without preferred_inner_jobs, declarations-first
-    # boxing applies cpu.max=1 core while the DBT wrapper derives its ratchet
-    # from eight workers. Bind the two values at the deployed rustdoc node.
-    rustdoc_width_contract='[
-        .steps[] | select(
-            .group == "doc" and .job == "rustdoc"
-            and (.cmd | startswith("CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo doc "))
-            and .hint.preferred_inner_jobs == 8
-        )
-    ] | length == 1'
-    jq -e "$rustdoc_width_contract" "$DAG_ROOT/portable.json" >/dev/null ||
-        die "doc.rustdoc must bind its eight-worker DBT budget to an eight-core safe-ci declaration"
-    if jq '(.steps[] | select(.group == "doc" and .job == "rustdoc") | .hint) |= del(.preferred_inner_jobs)' \
-        "$DAG_ROOT/portable.json" | jq -e "$rustdoc_width_contract" >/dev/null; then
-        die "doc.rustdoc CPU-width contract accepted a planted missing preferred_inner_jobs"
-    fi
+    # A leading `CARGO_BUILD_JOBS=<N>` prefix is the step's REQUESTED build width, but it
+    # reaches only Cargo -- it declares nothing to safe-ci. Since agent-utils ada564d the
+    # runner boxes an UNDECLARED step at DEFAULT_SMALL_CPU_COUNT=1 core, so such a step asks
+    # for N workers and is granted one, while ci/run-with-reverie-dbt-budget.sh still derives
+    # its DynamoRIO ratchet from N. That mismatch is what reddened doc.rustdoc on 2026-08-10.
+    #
+    # Enforce the pairing as a RULE over every step with that prefix, not as per-step cases,
+    # so a step added tomorrow is covered without editing this audit. Two halves:
+    #   preferred_inner_jobs == N  -- grant the cores the command asks for.
+    #   jobs_flag == ""            -- keep the declaration cgroup-only. The width is already
+    #                                 in the environment prefix, and the runner would
+    #                                 otherwise APPEND `-j N` to the command; on three of
+    #                                 these steps that lands after `--` and reaches libtest
+    #                                 or rustc, and on the nextest step `-j` means
+    #                                 test-execution threads rather than build jobs.
+    local width_rule width_contract width_population width_steps plant
+    width_rule='[ .steps[]
+        | select((.cmd // "") | test("^CARGO_BUILD_JOBS=[0-9]+ "))
+        | . as $s
+        | (($s.cmd | capture("^CARGO_BUILD_JOBS=(?<n>[0-9]+) ").n | tonumber) as $n
+           | select($s.hint.preferred_inner_jobs != $n or $s.jobs_flag != "")
+           | "\($s.group).\($s.job)")
+    ]'
+    width_contract="($width_rule | length) == 0"
+    width_population='[.steps[] | select((.cmd // "") | test("^CARGO_BUILD_JOBS=[0-9]+ "))] | length'
+    # Non-vacuity floor. This is the half of the bracket that stops a step ESCAPING the rule:
+    # dropping the CARGO_BUILD_JOBS prefix would silently remove a step from the rule's
+    # population and return it to the one-core default, so the count may grow but not shrink.
+    width_steps=$(jq "$width_population" "$DAG_ROOT/portable.json")
+    [[ $width_steps -ge 7 ]] ||
+        die "CARGO_BUILD_JOBS width rule inspected only $width_steps step(s); expected at least 7"
+    jq -e "$width_contract" "$DAG_ROOT/portable.json" >/dev/null ||
+        die "every step whose command starts with CARGO_BUILD_JOBS=<N> must declare hint.preferred_inner_jobs == N and jobs_flag \"\"; offenders: $(jq -c "$width_rule" "$DAG_ROOT/portable.json")"
+    # Negative brackets: each plant is a well-shaped violation the rule must refuse.
+    for plant in \
+        '(.steps[] | select((.cmd // "") | test("^CARGO_BUILD_JOBS=[0-9]+ ")) | .hint) |= del(.preferred_inner_jobs)' \
+        '(.steps[] | select((.cmd // "") | test("^CARGO_BUILD_JOBS=[0-9]+ ")) | .hint.preferred_inner_jobs) |= 4' \
+        '(.steps[] | select((.cmd // "") | test("^CARGO_BUILD_JOBS=[0-9]+ ")) | .jobs_flag) |= "-j"'
+    do
+        if jq "$plant" "$DAG_ROOT/portable.json" | jq -e "$width_contract" >/dev/null; then
+            die "CARGO_BUILD_JOBS width rule accepted a planted violation: $plant"
+        fi
+    done
     jq -e '
         [.steps[] | select(
             .group == "build" and .job == "privileged_tests"

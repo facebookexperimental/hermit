@@ -288,30 +288,35 @@
     {
       "group": "lint", "job": "clippy",
       "desc": "Clippy (cargo clippy --workspace --all-targets -D warnings)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> clippy's build phase defaulted to nproc). rss_baseline=measured_peak@j8=4.0GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=5.5GiB (was 8GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> clippy's build phase defaulted to nproc). rss_baseline=measured_peak@j8=4.0GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=5.5GiB (was 8GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 mirrors the leading CARGO_BUILD_JOBS=8 prefix. See doc.rustdoc for the shared derivation; jobs_flag is empty because appending '-j 8' here would land after '--' and reach rustc, which has no -j.",
       "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo clippy --workspace --all-targets -- -D warnings",
       "deps": ["build.e2e_artifact"],
       "timeout": 1200,
+      "jobs_flag": "",
       "hint": {"est_duration_s": 300, "rss_baseline_bytes": 8589934592,
-               "hard_mem_max_bytes": 17179869184, "classification": "cpu-bound"}
+               "hard_mem_max_bytes": 17179869184, "classification": "cpu-bound",
+               "preferred_inner_jobs": 8}
     },
     {
       "group": "doc", "job": "doctests",
       "desc": "Test workspace documentation (cargo test --workspace --features third-party-backends --doc)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> cargo defaulted the build phase to nproc). rss_baseline=measured_peak@j8=208MiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=2.0GiB (was 5GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> cargo defaulted the build phase to nproc). rss_baseline=measured_peak@j8=208MiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=2.0GiB (was 5GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 mirrors the leading CARGO_BUILD_JOBS=8 prefix. See doc.rustdoc for the shared derivation; jobs_flag is empty so the declaration sizes the cgroup box only and never edits argv.",
       "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo test --workspace --features third-party-backends --doc",
       "deps": ["build.e2e_artifact"],
       "timeout": 900,
+      "jobs_flag": "",
       "hint": {"est_duration_s": 180, "rss_baseline_bytes": 218103808,
-               "hard_mem_max_bytes": 2147483648, "classification": "cpu-bound"}
+               "hard_mem_max_bytes": 2147483648, "classification": "cpu-bound",
+               "preferred_inner_jobs": 8}
     },
     {
       "group": "doc", "job": "rustdoc",
       "desc": "Documentation (cargo doc --workspace --no-deps)",
-      "description": "MEM/CPU DERIVATION 2026-08-10 (tasks memory-caps-must-scale-with-job-count and fix_doc_rustdoc_dynamorio): pinned_jobs=8 via both CARGO_BUILD_JOBS=8 and preferred_inner_jobs=8. The explicit preferred width is load-bearing: safe-ci's declarations-first default otherwise boxes this eight-worker cold DynamoRIO build to cpu.max=1 core while the DBT ratchet derives 132s from eight effective workers. That mismatch measured 178.71s at Hermit 21b22c2b (1429.68 effective job-seconds) versus five retained same-recipe cold builds at 16.06-40.54s; the median 21.09s * 8 = 168.72s predicts the one-core failure within 5.9%. The 132s ratchet is unchanged. rss_baseline=measured_peak@j8=1.1GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm Rust artifacts but a distinct cargo-doc reverie-dbt build-script OUT_DIR can still cold-build DynamoRIO; hermit@21b22c2b. headroom=+1.9GiB additive -> hard_mem_max_bytes=3.0GiB. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "description": "MEM/CPU DERIVATION 2026-08-10 (tasks memory-caps-must-scale-with-job-count, fix_doc_rustdoc_dynamorio and p0_dynamorio_build_cache): pinned_jobs=8 via both CARGO_BUILD_JOBS=8 and preferred_inner_jobs=8. THIS NODE CARRIES THE SHARED DERIVATION for every step whose command starts with a CARGO_BUILD_JOBS=<N> prefix; ci/test_harness.sh enforces the pairing as a rule over all such steps. The explicit preferred width is load-bearing: safe-ci's declarations-first default (agent-utils DEFAULT_SMALL_CPU_COUNT=1) otherwise boxes this eight-worker cold DynamoRIO build to cpu.max=1 core while the DBT ratchet derives 132s from eight effective workers. ROOT CAUSE, measured: hermit ab4a8c08 advanced the agent-utils gitlink a6f4232 ('make the SMALL default cap OPT-IN, default OFF') -> 1d893fbc, which contains ada564d ('activate small undeclared-step caps'); every head that failed pins the activated runner and both heads that passed pin a6f4232. LIVE CGROUP READ with the runner built at the pinned SHA, each step reporting its own /proc/self/cgroup -> cpu.max: an undeclared step gets '100000 100000' (1 core) and a preferred_inner_jobs=8 step gets '800000 100000' (8 cores). A/B ON THE IDENTICAL DynamoRIO cmake build --parallel 8 (316-core validation host, load avg 46): unboxed 15.37s wall / 102.51 CPU-s at 666% CPU, versus CPUQuota=100% 112.23s wall / 112.01 CPU-s at 99% CPU; cmake configure is a further 3.65s serial. 112s at one core is already 85% of the 132s budget for the build alone, and sharing that core with the node's concurrent rustdoc/cargo work produced the observed 185.51/187.79/188.06/286.70s. CONTROL: build.workspace and build.runtime_release were the only steps that already declared a width (32) and were the only cpu-bound steps that did not regress (91s -> 88s), while undeclared test.detcore_unit went 34s -> 103s. The 132s ratchet is UNCHANGED and stays fully live: 15.4s observed against 132s once eight cores are actually delivered. jobs_flag is empty so the declaration sizes the cgroup box only; CARGO_BUILD_JOBS already conveys the width to Cargo, and appending '-j 8' would edit argv (harmless here, but it would reach libtest or rustc on three sibling steps). rss_baseline=measured_peak@j8=1.1GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm Rust artifacts but a distinct cargo-doc reverie-dbt build-script OUT_DIR can still cold-build DynamoRIO; hermit@21b22c2b. headroom=+1.9GiB additive -> hard_mem_max_bytes=3.0GiB. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
       "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo doc --workspace --no-deps",
       "deps": ["build.e2e_artifact"],
       "timeout": 900,
+      "jobs_flag": "",
       "hint": {"est_duration_s": 150, "rss_baseline_bytes": 1181116006,
                "hard_mem_max_bytes": 3221225472, "classification": "cpu-bound",
                "preferred_inner_jobs": 8}
@@ -319,34 +324,38 @@
     {
       "group": "test", "job": "regular_crates",
       "desc": "Test regular workspace crates (nextest, excludes hermit-detcore/hermit/flaky)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (build phase; nextest execution threads stay default). rss_baseline=measured_peak@j8=2.0GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); measured on a 316-core box with nextest's default (nproc) test-thread parallelism, so this peak already reflects full execution-thread fan-out; hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=3.5GiB (was 6GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (build phase; nextest execution threads stay default). rss_baseline=measured_peak@j8=2.0GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); measured on a 316-core box with nextest's default (nproc) test-thread parallelism, so this peak already reflects full execution-thread fan-out; hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=3.5GiB (was 6GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 mirrors the leading CARGO_BUILD_JOBS=8 prefix. See doc.rustdoc for the shared derivation; jobs_flag is empty because nextest's -j sets TEST-EXECUTION threads, not build jobs, so appending it would silently change what this step measures.",
       "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo nextest run ${CI:+--profile ci} --workspace --exclude hermit-detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests",
       "deps": ["build.e2e_artifact", "setup.nextest"],
       "timeout": 900,
+      "jobs_flag": "",
       "hint": {"est_duration_s": 200, "rss_baseline_bytes": 2147483648,
-               "hard_mem_max_bytes": 3758096384, "classification": "cpu-bound"}
+               "hard_mem_max_bytes": 3758096384, "classification": "cpu-bound",
+               "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "hermit_unit",
       "desc": "Test Hermit unit and binary targets (-p hermit --lib --bins)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (build phase; test execution already --test-threads=1). rss_baseline=measured_peak@j8=4.6GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. NOTE the old 5GiB cap left only ~0.4GiB over the warm peak -> it was too tight; headroom=+1.9GiB additive -> hard_mem_max_bytes RAISED to 6.5GiB. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (build phase; test execution already --test-threads=1). rss_baseline=measured_peak@j8=4.6GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. NOTE the old 5GiB cap left only ~0.4GiB over the warm peak -> it was too tight; headroom=+1.9GiB additive -> hard_mem_max_bytes RAISED to 6.5GiB. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 mirrors the leading CARGO_BUILD_JOBS=8 prefix and applies to the BUILD phase only; test execution stays --test-threads=1. See doc.rustdoc for the shared derivation; jobs_flag is empty because appending '-j 8' here would land after '--' and reach libtest, which rejects it.",
       "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo test -p hermit --features third-party-backends --lib --bins -- --test-threads=1",
       "deps": ["build.e2e_artifact"],
       "timeout": 900,
+      "jobs_flag": "",
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
                "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
-               "classification": "cpu-bound"}
+               "classification": "cpu-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "detcore_unit",
       "desc": "Test Detcore unit and binary targets (-p hermit-detcore --lib --bins)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> build phase defaulted to nproc). rss_baseline=measured_peak@j8=1.8GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.7GiB additive -> hard_mem_max_bytes=3.5GiB (was 5GiB). NOTE: cpu_timeout intentionally NOT set here or on the sibling test.detcore_misc node -- detcore_misc currently livelocks under load (reverie#355 is the established fix; a cpu_timeout derived from pre-355 hang behaviour would be wrong). cpu_timeout derivation is out of scope for this memory-cap change. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> build phase defaulted to nproc). rss_baseline=measured_peak@j8=1.8GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.7GiB additive -> hard_mem_max_bytes=3.5GiB (was 5GiB). NOTE: cpu_timeout intentionally NOT set here or on the sibling test.detcore_misc node -- detcore_misc currently livelocks under load (reverie#355 is the established fix; a cpu_timeout derived from pre-355 hang behaviour would be wrong). cpu_timeout derivation is out of scope for this memory-cap change. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 mirrors the leading CARGO_BUILD_JOBS=8 prefix. This node is the cleanest measured case of the one-core default: 34s at agent-utils a6f4232 (caps OFF) versus 103s at d2fdfc83 (caps ON), a 3.0x regression against a flat build.runtime_release control that already declared its width. See doc.rustdoc for the shared derivation; jobs_flag is empty so the declaration sizes the cgroup box only and never edits argv.",
       "cmd": "CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --lib --bins",
       "deps": ["build.e2e_artifact"],
       "timeout": 900,
+      "jobs_flag": "",
       "hint": {"est_duration_s": 120,
                "rss_baseline_bytes": 1932735283, "hard_mem_max_bytes": 3758096384,
-               "classification": "cpu-bound"}
+               "classification": "cpu-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "detcore_misc",
@@ -461,12 +470,14 @@
     {
       "group": "test", "job": "rr_suite_contract",
       "desc": "rr suite source contract (scratch dirs fresh and cleaned)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which capped the OTHER compile-bearing nodes but MISSED this one): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> the test binary's build phase defaulted to nproc, and under the full portable profile that cc1plus fan-out blew the old 2.0GiB cap -> OOM; the job-pin is the actual fix). rss_baseline=measured_peak@j8=3.5GiB; method=cgroup-RECORDED (safe-ci-dag-runner step_profiles peak_bytes == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@b384187e. CAVEAT: peak_bytes is cap-influenced because compile page-cache is reclaimable (a negative-control run at a 512MiB cap PASSED via reclaim, oom_kills=0) -> the true non-reclaimable working set at j8 is well under this figure; the cap is conservative headroom, the pin is the fix. headroom=+1.5GiB additive -> hard_mem_max_bytes=5.0GiB (was 2.0GiB, which was too tight once the node was left unpinned). classification light->cpu-bound (compile-bearing).",
+      "description": "MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which capped the OTHER compile-bearing nodes but MISSED this one): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> the test binary's build phase defaulted to nproc, and under the full portable profile that cc1plus fan-out blew the old 2.0GiB cap -> OOM; the job-pin is the actual fix). rss_baseline=measured_peak@j8=3.5GiB; method=cgroup-RECORDED (safe-ci-dag-runner step_profiles peak_bytes == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@b384187e. CAVEAT: peak_bytes is cap-influenced because compile page-cache is reclaimable (a negative-control run at a 512MiB cap PASSED via reclaim, oom_kills=0) -> the true non-reclaimable working set at j8 is well under this figure; the cap is conservative headroom, the pin is the fix. headroom=+1.5GiB additive -> hard_mem_max_bytes=5.0GiB (was 2.0GiB, which was too tight once the node was left unpinned). classification light->cpu-bound (compile-bearing). CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 mirrors the leading CARGO_BUILD_JOBS=8 prefix. See doc.rustdoc for the shared derivation; jobs_flag is empty because appending '-j 8' here would land after '--' and reach libtest, which rejects it.",
       "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo test -p hermit --features third-party-backends --test rr_suite rr_scratch_directories_are_fresh_and_cleaned -- --exact",
       "deps": ["build.e2e_artifact"],
       "timeout": 300,
+      "jobs_flag": "",
       "hint": {"est_duration_s": 30, "rss_baseline_bytes": 3758096384,
-               "hard_mem_max_bytes": 5368709120, "classification": "cpu-bound"}
+               "hard_mem_max_bytes": 5368709120, "classification": "cpu-bound",
+               "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "dbt_parity",
