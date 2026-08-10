@@ -1358,6 +1358,24 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
     let args = parse_argv(&["full".into(), "--no-label-pr".into()])
         .map_err(|code| format!("verbosity: full-plan argv refused with exit {code}"))?;
     let mut plan = build_plan(root, &args, &std::env::temp_dir().join("validate-verbosity-bracket"))?;
+    let envelope = plan
+        .cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == "test.envelope_levels")
+        .ok_or("verbosity: full plan lost test.envelope_levels")?;
+    for fixture in [
+        "run_probe true '/bin/true'",
+        "run_probe echo '/bin/echo hermit-envelope'",
+        "run_probe date '/bin/date -u +%Y'",
+    ] {
+        if !envelope.cmd.contains(fixture) {
+            return Err(format!("verbosity: envelope lost stable identity fixture {fixture:?}"));
+        }
+    }
+    if envelope.cmd.matches("\"$id\"").count() != 2 {
+        return Err("verbosity: envelope START/END must use the same whitespace-free identity".into());
+    }
     propagate_verbosity(&mut plan, 5);
     let missing = plan
         .cfg
