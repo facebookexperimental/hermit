@@ -121,24 +121,12 @@ else
     exit 0
 fi
 
-# ---- 3C FIRST, on probe-root, which holds no processes so the delegation rule cannot bite.
-got=""
-for c in memory cpu pids; do
-    if echo "+$c" > "$root/cgroup.subtree_control" 2>/dev/null; then got="$got $c"; fi
-done
-echo "controllers_available_to_us=$(cat "$root/cgroup.controllers" 2>/dev/null)"
-echo "controllers_enabled_by_us=[${got# }]"
-case " $got " in
-    *" memory "*) case " $got " in
-        *" cpu "*) echo "FACT3C_CONTROLLERS_DELEGABLE=YES (memory+cpu: full per-step caps possible)" ;;
-        *) echo "FACT3C_CONTROLLERS_DELEGABLE=PARTIAL (memory but no cpu: memory caps only)" ;;
-    esac ;;
-    *) if [ -n "$got" ]; then
-           echo "FACT3C_CONTROLLERS_DELEGABLE=PARTIAL (only [${got# }]; neither memory nor cpu, so no per-step resource caps)"
-       else
-           echo "FACT3C_CONTROLLERS_DELEGABLE=NO (subtree_control write refused for memory/cpu/pids)"
-       fi ;;
-esac
+# ORDER IS LOAD-BEARING: 3B RUNS FIRST, BEFORE ANY subtree_control WRITE.
+# Enabling a controller on the parent makes it a cgroup that delegates while still holding this
+# job's own processes, and cgroup-v2 then refuses to move a process into any of its children --
+# so 3B's escapee could no longer enter the victim cgroup and would report a false NO. Measured
+# exactly that when 3C ran first: escapee_moved_into_victim=NO and FACT3B=NO, on a machine where
+# both had just been YES. Measure the kill path on an untouched hierarchy, then perturb it.
 
 # ---- 3B: does cgroup.kill reach a setsid escapee in a per-step child? cgroup.kill is a CORE v2
 #          file needing no controller delegation, so this can pass even when 3C does not.
@@ -169,7 +157,52 @@ else
         echo "FACT3B_ESCAPEE_KILLED_NO_SYSTEMD=YES"
     fi
 fi
+
+# ---- 3C: delegation is a TWO-LEVEL question and the level matters.
+# A cgroup's children receive ONLY the controllers its PARENT lists in cgroup.subtree_control.
+# The previous revision wrote probe-root/cgroup.subtree_control -- which governs probe-root's
+# CHILDREN -- and never the parent, so probe-root itself had no controllers to hand down and the
+# NO was guaranteed regardless of what this machine permits. Enable on the PARENT first, re-read
+# what probe-root actually received, and only then delegate one level further.
+#
+# Each controller is written SEPARATELY: an atomic multi-controller write fails wholesale, so a
+# single refused controller would otherwise hide the ones that would have been granted.
+parent_before=$(cat "$b/cgroup.subtree_control" 2>/dev/null)
+echo "parent_subtree_control_before=[$parent_before]"
+parent_got=""
+for c in memory cpu pids; do
+    if echo "+$c" > "$b/cgroup.subtree_control" 2>/dev/null; then parent_got="$parent_got $c"; fi
+done
+echo "parent_enabled_by_us=[${parent_got# }]"
+echo "probe_root_controllers_after_parent_write=$(cat "$root/cgroup.controllers" 2>/dev/null)"
+
+# Now the child level: what can probe-root hand to a per-step cgroup beneath it?
+child_got=""
+for c in memory cpu pids; do
+    if echo "+$c" > "$root/cgroup.subtree_control" 2>/dev/null; then child_got="$child_got $c"; fi
+done
+echo "probe_root_enabled_for_children=[${child_got# }]"
+
+# Per-step CAPS need memory and cpu specifically; `pids` alone is not resource capping.
+case " $child_got " in
+    *" memory "*) case " $child_got " in
+        *" cpu "*) echo "FACT3C_CONTROLLERS_DELEGABLE=YES (memory+cpu reach a per-step cgroup: full caps possible without systemd)" ;;
+        *) echo "FACT3C_CONTROLLERS_DELEGABLE=PARTIAL (memory but no cpu)" ;;
+    esac ;;
+    *) if [ -n "$child_got" ]; then
+           echo "FACT3C_CONTROLLERS_DELEGABLE=PARTIAL (only [${child_got# }]; no memory/cpu, so no per-step resource caps)"
+       else
+           echo "FACT3C_CONTROLLERS_DELEGABLE=NO (nothing reached a per-step cgroup even after writing the parent)"
+       fi ;;
+esac
+
 rmdir "$root/victim" 2>/dev/null
+# RESTORE the parent exactly as found, then prove it. Leaving a controller enabled is what made an
+# earlier revision report a confident wrong FACT3B=NO on its second invocation.
+for c in $parent_got; do
+    case " $parent_before " in *" $c "*) : ;; *) echo "-$c" > "$b/cgroup.subtree_control" 2>/dev/null ;; esac
+done
+echo "parent_subtree_control_restored=[$(cat "$b/cgroup.subtree_control" 2>/dev/null)] (was [$parent_before])"
 rmdir "$root" 2>/dev/null   # leave no trace in the caller's cgroup
 F3_EOF
 
