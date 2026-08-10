@@ -82,24 +82,50 @@ def _load(path: Path) -> dict:
     return doc
 
 
+def default_repo_root() -> Path:
+    """Locate the repository to enumerate.
+
+    Prefer the checkout the caller is standing in, so the script keeps working
+    when it is invoked through a copy outside the tree (a rebase helper, a
+    scratch checkout). Fall back to the location of the script itself.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return Path(result.stdout.strip())
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return Path(__file__).resolve().parent.parent
+
+
 def existing_test_files(repo_root: Path) -> set:
     """Enumerate files under tests/ the same way audit_inventory does."""
-    result = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(repo_root),
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "--",
-            "tests",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "--",
+                "tests",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(
+            f"test-inventory: cannot enumerate tests/ under {repo_root}: "
+            f"{exc.stderr.strip() or 'git failed'}\n"
+            "Pruning needs a real checkout; pass --repo-root, or run from inside one."
+        ) from exc
     return {line for line in result.stdout.splitlines() if line}
 
 
@@ -259,8 +285,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument(
         "--repo-root",
         type=Path,
-        default=Path(__file__).resolve().parent.parent,
-        help="repository root used to enumerate existing test files",
+        default=None,
+        help="repository root used to enumerate existing test files "
+        "(default: the checkout containing the current directory)",
     )
     parser.add_argument(
         "--no-prune",
@@ -274,16 +301,17 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         "keeping the first and reporting it",
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
+    repo_root = args.repo_root if args.repo_root is not None else default_repo_root()
 
     if args.self_test:
         return _self_test()
     if args.check is not None:
-        return check(args.check, args.repo_root)
+        return check(args.check, repo_root)
     if not args.inputs:
         parser.error("give at least one inventory, or --check / --self-test")
 
     docs = [_load(path) for path in args.inputs]
-    present = None if args.no_prune else existing_test_files(args.repo_root)
+    present = None if args.no_prune else existing_test_files(repo_root)
     entries, pruned, overrides = merge(docs, present)
 
     if overrides and args.strict:
