@@ -171,15 +171,22 @@ parent_before=$(cat "$b/cgroup.subtree_control" 2>/dev/null)
 echo "parent_subtree_control_before=[$parent_before]"
 parent_got=""
 for c in memory cpu pids; do
-    if echo "+$c" > "$b/cgroup.subtree_control" 2>/dev/null; then parent_got="$parent_got $c"; fi
+    err=$(sh -c "printf '%s' '+$c' > '$b/cgroup.subtree_control'" 2>&1); rc=$?
+    if [ $rc -eq 0 ]; then parent_got="$parent_got $c"; else echo "  parent +$c REFUSED: ${err##*: }"; fi
 done
 echo "parent_enabled_by_us=[${parent_got# }]"
 echo "probe_root_controllers_after_parent_write=$(cat "$root/cgroup.controllers" 2>/dev/null)"
 
 # Now the child level: what can probe-root hand to a per-step cgroup beneath it?
+# Remove the leftover victim cgroup first: an existing child is one plausible reason a
+# subtree_control write is refused, and leaving it in place would confound the answer.
+rmdir "$root/victim" 2>/dev/null
+echo "probe_root_children_before_delegate=[$(ls -d "$root"/*/ 2>/dev/null | wc -l)]"
+echo "probe_root_procs=[$(tr '\n' ' ' < "$root/cgroup.procs" 2>/dev/null)]"
 child_got=""
 for c in memory cpu pids; do
-    if echo "+$c" > "$root/cgroup.subtree_control" 2>/dev/null; then child_got="$child_got $c"; fi
+    err=$(sh -c "printf '%s' '+$c' > '$root/cgroup.subtree_control'" 2>&1); rc=$?
+    if [ $rc -eq 0 ]; then child_got="$child_got $c"; else echo "  probe-root +$c REFUSED: ${err##*: }"; fi
 done
 echo "probe_root_enabled_for_children=[${child_got# }]"
 
