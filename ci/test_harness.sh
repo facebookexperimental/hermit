@@ -524,6 +524,187 @@ function workflow_dag_launcher_timeout_seconds {
         "$workflow" | head -1
 }
 
+# --------------------------------------------------------------------------
+# A DECLARED BUDGET THAT CANNOT FIRE IS NOT A BUDGET; IT IS DOCUMENTATION.
+#
+# A node whose wall budget is >= the kill of the job that runs it can NEVER time
+# out on its own terms. The job dies first, every time, and the node is never
+# blamed -- by its own declaration it had not overrun. That is not a cosmetic
+# mis-ordering: it is a structural reason a slow node cannot be identified. Hours
+# were spent trying to pin an overrun in the portable lane before anyone noticed
+# that seventeen of its twenty-two sharded nodes were in exactly this state, and
+# that the only timeout able to fire there was GitHub's, which names nothing.
+#
+# The predicate is `>=`, not `>`. A node whose budget EQUALS the job kill still
+# cannot fire first, because the node starts only after checkout, build and setup
+# -- measured at 108s into one such job -- so the job's clock always wins.
+#
+# DERIVED, NEVER TRANSCRIBED, like every other bound in this file: the node set
+# comes from the audited shard map, the budgets from the audited DAG, and the
+# kills from the workflow's own timeout-minutes and launcher wrappers. Nothing
+# here holds a second copy of a number that lives somewhere else.
+# --------------------------------------------------------------------------
+
+# "<node>\t<effective wall seconds>" for every step in a lane DAG.
+function dag_node_budgets {
+    local dag=$1
+    jq -r '(.default_step_timeout // 0) as $d
+           | .steps[]
+           | "\(.group).\(.job)\t\(.timeout // $d)"' "$dag"
+}
+
+# "<node>\t<job>" for the portable lane, from the audited shard map. Portable
+# fans its DAG across jobs, so a node's enclosing kill is its SHARD's job, not
+# one lane-wide number.
+function portable_node_jobs {
+    local shards=$1
+    jq -r '(.debug_shards[]?   | .nodes[] | . + "\ttest-debug"),
+           (.release_shards[]? | .nodes[] | . + "\ttest-release")' "$shards"
+}
+
+# Emit "<node> <declared>s >= <bound>s (<what bounds it>)" for every inversion.
+#
+# TAKES THE TREE AS AN ARGUMENT rather than reading $ROOT_DIR, so the bracket below can point it
+# at a temp copy. $ROOT_DIR and $DAG_ROOT are `readonly` (see the declaration near the top of this
+# file), and bash refuses to reassign a readonly variable even inside a subshell -- so a bracket
+# that tried to rebind them could never run at all, and its CONTROL case would die before
+# exercising anything. An untestable guard is the thing this whole section exists to prevent.
+function budget_inversions {
+    local root=${1:-$ROOT_DIR}
+    local dags=${2:-$DAG_ROOT}
+    local workflow_portable="$root/.github/workflows/ci-portable.yml"
+    local workflow_privileged="$root/.github/workflows/ci-privileged.yml"
+    local shards="$root/ci/portable-shards.json"
+
+    local debug_kill release_kill
+    debug_kill=$(( $(workflow_job_timeout_minutes "$workflow_portable" test-debug) * 60 ))
+    release_kill=$(( $(workflow_job_timeout_minutes "$workflow_portable" test-release) * 60 ))
+    (( debug_kill > 0 && release_kill > 0 )) ||
+        die "could not read test-debug/test-release timeout-minutes from ci-portable.yml"
+
+    join -t $'\t' \
+        <(portable_node_jobs "$shards" | sort) \
+        <(dag_node_budgets "$dags/portable.json" | sort) |
+        awk -F'\t' -v dk="$debug_kill" -v rk="$release_kill" '
+            { bound = ($2 == "test-debug") ? dk : rk }
+            $3 >= bound { printf "%s %ss >= %ss (job %s timeout-minutes)\n", $1, $3, bound, $2 }
+        '
+
+    # Privileged runs its whole DAG inside one launcher wrapper, which is a
+    # TIGHTER bound than the job -- so the wrapper is what must be beaten.
+    local launcher
+    launcher=$(workflow_dag_launcher_timeout_seconds "$workflow_privileged" privileged)
+    [[ -n $launcher ]] ||
+        die "could not read the privileged DAG launcher timeout from ci-privileged.yml"
+    dag_node_budgets "$dags/privileged.json" |
+        awk -F'\t' -v bound="$launcher" '
+            $2 >= bound { printf "%s %ss >= %ss (privileged launcher wrapper)\n", $1, $2, bound }
+        '
+}
+
+# Fail on any inversion that is not in the recorded baseline, and on any baseline
+# entry that has been fixed.
+#
+# WHY A BASELINE AND NOT A FLAT REFUSAL. The inversions are real and present, and
+# whether to fix them by raising a job's timeout-minutes or by lowering node
+# budgets is a CI policy decision with real consequences that this guard does not
+# get to make. Refusing outright would block every PR on someone else's decision;
+# recording the inventory adopts the gate now, keeps each entry visible with both
+# numbers, and makes the count monotonically DECREASE -- a fixed node that stays
+# listed fails too, so the list cannot rot into permanent permission.
+function assert_node_budgets_fit_their_job_kill {
+    local root=${1:-$ROOT_DIR}
+    local dags=${2:-$DAG_ROOT}
+    local baseline="$root/ci/budget-inversions-baseline.txt"
+    [[ -f $baseline ]] || die "missing budget-inversion baseline: ${baseline#"$root/"}"
+
+    local -a current=() expected=() unlisted=() fixed=()
+    mapfile -t current < <(budget_inversions "$root" "$dags" | sort)
+    mapfile -t expected < <(grep -Ev '^[[:space:]]*(#|$)' "$baseline" | sort)
+
+    mapfile -t unlisted < <(comm -23 <(printf '%s\n' "${current[@]}") <(printf '%s\n' "${expected[@]}"))
+    mapfile -t fixed    < <(comm -13 <(printf '%s\n' "${current[@]}") <(printf '%s\n' "${expected[@]}"))
+
+    if ((${#unlisted[@]})); then
+        printf 'NEW budget inversion (a node that can never fire its own timeout):\n' >&2
+        printf '  %s\n' "${unlisted[@]}" >&2
+        die "declared node budget is >= the kill of the job that runs it; lower the node budget, or raise that job's timeout-minutes and record the decision"
+    fi
+    if ((${#fixed[@]})); then
+        printf 'budget inversion(s) FIXED but still listed in the baseline:\n' >&2
+        printf '  %s\n' "${fixed[@]}" >&2
+        die "remove them from ci/budget-inversions-baseline.txt so the list can only shrink"
+    fi
+    # NO SILENT COVERAGE. The join can only judge nodes whose enclosing job is knowable from a
+    # tracked file: the portable TEST shards and the whole privileged lane. Nodes dispatched by a
+    # matrix computed at run time (the e2e fan-out) have no static job mapping, so they are NOT
+    # checked -- say how many, rather than let a partial audit read as a complete one.
+    local checked total
+    checked=$(( $(portable_node_jobs "$root/ci/portable-shards.json" | wc -l) \
+                + $(dag_node_budgets "$dags/privileged.json" | wc -l) ))
+    total=$(( $(dag_node_budgets "$dags/portable.json" | wc -l) \
+              + $(dag_node_budgets "$dags/privileged.json" | wc -l) ))
+    printf 'budget ordering: %d node(s) still declare a budget >= their job kill (baseline; each can never be blamed for its own overrun); %d of %d DAG nodes have a statically knowable job kill and were checked\n' \
+        "${#current[@]}" "$checked" "$total"
+}
+
+# TWO-SIDED BRACKET FOR THE GUARD ABOVE, run inert against COPIES in a temp tree.
+#
+# A refusal that fires on everything is as useless as one that fires on nothing, so both
+# directions are exercised: a planted inversion must be REFUSED with its numbers, a
+# correctly-ordered stack must PASS, and a baseline entry that no longer inverts must also be
+# refused so the list cannot rot into permanent permission. Nothing here touches the real DAGs,
+# workflows or baseline.
+function assert_budget_guard_brackets {
+    local tmp
+    tmp=$(mktemp -d) || die "budget guard bracket: mktemp failed"
+    mkdir -p "$tmp/ci/dag" "$tmp/.github/workflows"
+    cp "$ROOT_DIR/ci/portable-shards.json" "$tmp/ci/portable-shards.json"
+    cp "$DAG_ROOT/portable.json" "$tmp/ci/dag/portable.json"
+    cp "$DAG_ROOT/privileged.json" "$tmp/ci/dag/privileged.json"
+    cp "$ROOT_DIR/.github/workflows/ci-portable.yml" "$tmp/.github/workflows/ci-portable.yml"
+    cp "$ROOT_DIR/.github/workflows/ci-privileged.yml" "$tmp/.github/workflows/ci-privileged.yml"
+    cp "$ROOT_DIR/ci/budget-inversions-baseline.txt" "$tmp/ci/budget-inversions-baseline.txt"
+
+    # Run the guard against the temp tree, reporting only its exit status.
+    #
+    # The tree is PASSED as arguments, not rebound: $ROOT_DIR/$DAG_ROOT are readonly and bash
+    # refuses to reassign a readonly variable even inside a subshell.
+    #
+    # The SUBSHELL is still load-bearing and must stay: `die` is `exit 2`, so a refusal invoked
+    # directly would terminate the whole harness instead of returning a status this bracket can
+    # assert on. Subshell for containment, arguments for redirection -- both, not either.
+    _budget_guard_in() (
+        assert_node_budgets_fit_their_job_kill "$tmp" "$tmp/ci/dag" >/dev/null 2>&1
+    )
+
+    # CONTROL: the copies are consistent with their own baseline, so this must PASS. Without it,
+    # the two refusals below are satisfiable by a guard that rejects everything.
+    _budget_guard_in || die "budget guard bracket: an unmodified copy must pass"
+
+    # POSITIVE: plant ONE new inversion by raising a node that currently fits. The guard must
+    # refuse, because that node could no longer be blamed for its own overrun.
+    local planted="$tmp/ci/dag/portable.json"
+    jq '(.steps[] | select(.group == "test" and .job == "detcore_misc") | .timeout) = 5400' \
+        "$planted" > "$planted.new" && mv "$planted.new" "$planted"
+    ! _budget_guard_in || die "budget guard bracket: a planted 5400s node under a 900s job must be REFUSED"
+    # ...and it must NAME it, with both numbers, or the refusal is unactionable.
+    local report
+    report=$( (assert_node_budgets_fit_their_job_kill "$tmp" "$tmp/ci/dag") 2>&1 || true)
+    [[ $report == *"test.detcore_misc 5400s >= 900s"* ]] ||
+        die "budget guard bracket: the refusal must name the node and both numbers, got: $report"
+    cp "$DAG_ROOT/portable.json" "$planted"
+
+    # NEGATIVE, the other rot direction: a baseline entry that no longer inverts must ALSO be
+    # refused, so a fix must delete its line and the inventory can only shrink.
+    printf 'fictional.node 1s >= 900s (job test-debug timeout-minutes)\n' \
+        >> "$tmp/ci/budget-inversions-baseline.txt"
+    ! _budget_guard_in || die "budget guard bracket: a stale baseline entry must be REFUSED"
+
+    rm -rf "$tmp"
+    unset -f _budget_guard_in
+}
+
 # Everything ELSE the job can spend, summed from the workflow's own step
 # budgets, so the outer wall is checked against what this job may actually
 # consume rather than a hand-picked overhead constant that nobody rechecks.
@@ -1462,6 +1643,8 @@ EOF
         'timeout --foreground --kill-after=10s 720s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
     assert_privileged_diagnostics "$ROOT_DIR/.github/workflows/ci-privileged.yml"
     assert_validate_driver_entrypoint
+    assert_node_budgets_fit_their_job_kill
+    assert_budget_guard_brackets
 
     # This validation command contains real concurrent rustc probes. Three warm
     # samples measured 71.44-73.84s wall, with 58.36-60.38s CPU. Keep both lane

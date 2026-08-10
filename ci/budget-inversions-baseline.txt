@@ -1,0 +1,43 @@
+# Nodes whose declared wall budget is >= the kill of the job that runs them.
+#
+# EACH LINE IS A NODE THAT CAN NEVER FIRE ITS OWN TIMEOUT. The job's clock always
+# wins, so the node is never named as the overrun; the lane reports only that
+# "CI timed out". This file is the inventory of that condition as it stands, not
+# permission for it.
+#
+# The guard (ci/test_harness.sh assert_node_budgets_fit_their_job_kill) fails on
+# any inversion NOT listed here, and equally on any entry here that no longer
+# inverts -- so the list can only shrink, and a fix must delete its line.
+#
+# HOW TO REMOVE A LINE, and this is a real decision rather than a formality:
+#   * lower the node's wall in ci/dag/<lane>.json so it fits inside the job, which
+#     may make a node that has always silently overrun start failing visibly --
+#     that is newly EXPOSED, not newly broken; or
+#   * raise that job's timeout-minutes, which is a cap increase and needs the
+#     explicit approval that class of change requires.
+# Both are CI policy calls. The guard deliberately does not choose.
+#
+# Format: <node> <declared>s >= <bound>s (<what bounds it>)
+doc.doctests 900s >= 900s (job test-debug timeout-minutes)
+doc.rustdoc 900s >= 900s (job test-debug timeout-minutes)
+lint.clippy 1200s >= 900s (job test-debug timeout-minutes)
+test.app_strict_verify 900s >= 900s (job test-debug timeout-minutes)
+test.arbitrary_binaries 900s >= 900s (job test-debug timeout-minutes)
+test.cli 900s >= 900s (job test-debug timeout-minutes)
+test.command_strict_verify 900s >= 900s (job test-debug timeout-minutes)
+test.dbt_parity 900s >= 900s (job test-release timeout-minutes)
+test.detcore_unit 900s >= 900s (job test-debug timeout-minutes)
+test.envelope_levels 900s >= 900s (job test-debug timeout-minutes)
+test.hermit_integration 1200s >= 900s (job test-debug timeout-minutes)
+test.hermit_modes 900s >= 900s (job test-debug timeout-minutes)
+test.hermit_unit 900s >= 900s (job test-debug timeout-minutes)
+test.liteinst_strict 900s >= 900s (job test-release timeout-minutes)
+test.regular_crates 900s >= 900s (job test-debug timeout-minutes)
+test.sabre_examples 900s >= 900s (job test-release timeout-minutes)
+#
+# REMOVED 2026-08-10, and this is what a shrink looks like:
+#   test.strict_compat 1800s >= 900s (job test-debug timeout-minutes)
+# ab4a8c085e5e9e856fdfad7e3f6711f3478e0db5 (PR #2080) LOWERED that node 1800s ->
+# 720s so it now fits inside its own 900s job. The line is deleted rather than
+# amended because the node no longer inverts at all -- and leaving it would trip
+# this guard's own "fixed but still listed" refusal. 17 -> 16.
