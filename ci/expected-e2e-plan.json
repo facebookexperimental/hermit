@@ -5,7 +5,42 @@
       "category": "applications",
       "lane": "portable",
       "mode": "verify",
+      "test": "applications/c-toolchain-workflow"
+    },
+    {
+      "backend": "ptrace",
+      "category": "applications",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "applications/git-repository-workflow"
+    },
+    {
+      "backend": "ptrace",
+      "category": "applications",
+      "lane": "portable",
+      "mode": "verify",
       "test": "applications/timed-progress-bar"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/event-delivery-ordering"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/file-io-roundtrip"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/fork-exec-pipeline"
     },
     {
       "backend": "dbt",
@@ -27,6 +62,20 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/personality-domain"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/short-io-split-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/signal-delivery-sequence"
     },
     {
       "backend": "dbt",
@@ -240,6 +289,13 @@
     },
     {
       "backend": "ptrace",
+      "category": "data-handling",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "data-handling/zstd-multithread"
+    },
+    {
+      "backend": "ptrace",
       "category": "determinism-stress",
       "lane": "portable",
       "mode": "chaos",
@@ -362,6 +418,13 @@
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "verify",
+      "test": "language-runtimes/node-v8-jit"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
       "test": "language-runtimes/perl-hash-order"
     },
     {
@@ -461,6 +524,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "system-utils/clock-determinism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/clock-exec-continuity"
     },
     {
       "backend": "ptrace",
