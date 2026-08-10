@@ -21,7 +21,7 @@
 //!
 //! # Two deliberate, documented departures from the bash
 //!
-//! **1. The KVM and DBI stress probes were DEAD CODE in `validate.sh`.**
+//! **1. The KVM and DBT stress probes were DEAD CODE in `validate.sh`.**
 //! `run_super_stress_suite` guards them with
 //! `if backend_selector_supported && kvm_backend_available`, and
 //! `backend_selector_supported` **is not defined anywhere in the repository**
@@ -32,7 +32,7 @@
 //! DEPEND on: when the backend is unavailable the availability node fails and
 //! its 20 dependents are *skipped*, which the runner reports as skipped rather
 //! than failed — structurally the same "SKIP" the bash printed. And because
-//! these rows have never been measured, [`stress_verdict`] classifies KVM/DBI
+//! these rows have never been measured, [`stress_verdict`] classifies KVM/DBT
 //! stress failures as NONBLOCKING and says so: a first-ever measurement must
 //! arrive as data, not as an unratcheted gate that turns the suite red.
 //!
@@ -174,7 +174,7 @@ pub enum StressProbe {
     PtracePipeline,
     PtraceRecordReplay,
     KvmVerify,
-    DbiVerify,
+    DbtVerify,
 }
 
 impl StressProbe {
@@ -184,7 +184,7 @@ impl StressProbe {
             StressProbe::PtracePipeline => "ptrace-pipeline",
             StressProbe::PtraceRecordReplay => "ptrace-record-replay",
             StressProbe::KvmVerify => "kvm-verify",
-            StressProbe::DbiVerify => "dbi-verify",
+            StressProbe::DbtVerify => "dbt-verify",
         }
     }
 
@@ -196,7 +196,7 @@ impl StressProbe {
     fn availability_job(self) -> Option<&'static str> {
         match self {
             StressProbe::KvmVerify => Some("kvm_available"),
-            StressProbe::DbiVerify => Some("dbi_available"),
+            StressProbe::DbtVerify => Some("dbt_available"),
             _ => None,
         }
     }
@@ -204,10 +204,10 @@ impl StressProbe {
     /// True when a failure of this probe must NOT turn the suite red.
     ///
     /// See the module doc: `backend_selector_supported` is undefined, so KVM and
-    /// DBI stress have never actually been measured by `validate.sh`. Their
+    /// DBT stress have never actually been measured by `validate.sh`. Their
     /// first measurement is reported, not ratcheted.
     pub fn nonblocking(self) -> bool {
-        matches!(self, StressProbe::KvmVerify | StressProbe::DbiVerify)
+        matches!(self, StressProbe::KvmVerify | StressProbe::DbtVerify)
     }
 
     /// One repetition's shell command, reproducing `super_probe_command`
@@ -239,8 +239,8 @@ impl StressProbe {
             StressProbe::KvmVerify => format!(
                 "{dbg} run --backend kvm --verify -- /bin/echo hermit-super-kvm-{iteration} </dev/null"
             ),
-            StressProbe::DbiVerify => format!(
-                "{dbg} run --backend dbi --verify -- /bin/echo hermit-super-dbi-{iteration} </dev/null"
+            StressProbe::DbtVerify => format!(
+                "{dbg} run --backend dbt --verify -- /bin/echo hermit-super-dbt-{iteration} </dev/null"
             ),
         }
     }
@@ -251,13 +251,13 @@ pub const STRESS_PROBES: &[StressProbe] = &[
     StressProbe::PtracePipeline,
     StressProbe::PtraceRecordReplay,
     StressProbe::KvmVerify,
-    StressProbe::DbiVerify,
+    StressProbe::DbtVerify,
 ];
 
 /// The two backend-availability nodes.
 ///
 /// `kvm_backend_available` (validate.sh:2272) is a readable+writable `/dev/kvm`;
-/// `dbi_backend_available` (validate.sh:2276) is a real probe run, which is why
+/// `dbt_backend_available` (validate.sh:2276) is a real probe run, which is why
 /// it must be a node — at plan time the debug binary does not exist yet.
 fn availability_nodes(debug_bin: &str, build_dep: &str) -> Vec<Step> {
     let dbg = shell_quote(debug_bin);
@@ -274,11 +274,11 @@ fn availability_nodes(debug_bin: &str, build_dep: &str) -> Vec<Step> {
         ),
         node(
             "superstress",
-            "dbi_available",
-            "DBI backend availability (gates the DBI stress rows)",
+            "dbt_available",
+            "DBT backend availability (gates the DBT stress rows)",
             format!(
-                "{dbg} --log=info run --backend dbi --strict --verify -- \
-                 /bin/echo hermit-dbi-probe </dev/null >/dev/null 2>&1"
+                "{dbg} --log=info run --backend dbt --strict --verify -- \
+                 /bin/echo hermit-dbt-probe </dev/null >/dev/null 2>&1"
             ),
             vec![build_dep.to_string()],
             60,
@@ -302,7 +302,7 @@ pub fn stress_nodes(
     for probe in STRESS_PROBES {
         let stem = probe.job_stem();
         let base_dep = match probe {
-            StressProbe::KvmVerify | StressProbe::DbiVerify => debug_dep,
+            StressProbe::KvmVerify | StressProbe::DbtVerify => debug_dep,
             _ => release_dep,
         };
         let mut deps = vec![base_dep.to_string()];
@@ -367,7 +367,7 @@ pub fn stress_rates(outcomes: &[StepOutcome], reps: i64) -> Vec<ProbeRate> {
 /// Print the pass-rate table and return the BLOCKING failure count.
 ///
 /// A probe is blocking iff it is a ptrace probe (the three the bash actually
-/// measured) and it did not pass every planned repetition. KVM/DBI rates are
+/// measured) and it did not pass every planned repetition. KVM/DBT rates are
 /// printed with the reason they are nonblocking, so the number is visible
 /// without silently becoming a gate on its first appearance.
 pub fn stress_verdict(rates: &[ProbeRate], reps: i64, jobs: i64, host_cpus: usize) -> usize {
@@ -400,7 +400,7 @@ pub fn stress_verdict(rates: &[ProbeRate], reps: i64, jobs: i64, host_cpus: usiz
 
 /// Tags of every stress node whose failure must not turn the suite red.
 pub fn nonblocking_tags(reps: i64) -> Vec<String> {
-    let mut out = vec!["superstress.kvm_available".to_string(), "superstress.dbi_available".to_string()];
+    let mut out = vec!["superstress.kvm_available".to_string(), "superstress.dbt_available".to_string()];
     for probe in STRESS_PROBES.iter().filter(|p| p.nonblocking()) {
         let stem = probe.job_stem();
         for i in 1..=reps {

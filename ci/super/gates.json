@@ -325,8 +325,8 @@
       ]
     },
     {
-      "job": "dbi_pipe_backpressure_diagnostic",
-      "label": "DBI pipe backpressure diagnostic",
+      "job": "dbt_pipe_backpressure_diagnostic",
+      "label": "DBT pipe backpressure diagnostic",
       "timeout": 300,
       "argv": [
         "cargo",
@@ -337,15 +337,15 @@
         "third-party-backends",
         "--test",
         "cli",
-        "run_dbi_verifies_pipe_backpressure",
+        "run_dbt_verifies_pipe_backpressure",
         "--",
         "--exact",
         "--test-threads=1"
       ]
     },
     {
-      "job": "dbi_failed_exec_recovery_diagnostic",
-      "label": "DBI failed-exec recovery diagnostic",
+      "job": "dbt_failed_exec_recovery_diagnostic",
+      "label": "DBT failed-exec recovery diagnostic",
       "timeout": 180,
       "argv": [
         "cargo",
@@ -356,15 +356,15 @@
         "third-party-backends",
         "--test",
         "cli",
-        "run_dbi_recovers_after_failed_exec",
+        "run_dbt_recovers_after_failed_exec",
         "--",
         "--exact",
         "--test-threads=1"
       ]
     },
     {
-      "job": "dbi_unsupported_syscall_aggregation_diagnostic",
-      "label": "DBI unsupported-syscall aggregation diagnostic",
+      "job": "dbt_unsupported_syscall_aggregation_diagnostic",
+      "label": "DBT unsupported-syscall aggregation diagnostic",
       "timeout": 180,
       "argv": [
         "cargo",
@@ -375,15 +375,15 @@
         "third-party-backends",
         "--test",
         "cli",
-        "run_dbi_aggregates_unsupported_syscalls_and_strict_rejects_them",
+        "run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them",
         "--",
         "--exact",
         "--test-threads=1"
       ]
     },
     {
-      "job": "dbi_strict_blocked_stdin_teardown_diagnostic",
-      "label": "DBI strict blocked-stdin teardown diagnostic",
+      "job": "dbt_strict_blocked_stdin_teardown_diagnostic",
+      "label": "DBT strict blocked-stdin teardown diagnostic",
       "timeout": 30,
       "argv": [
         "cargo",
@@ -394,15 +394,15 @@
         "third-party-backends",
         "--test",
         "cli",
-        "run_dbi_strict_returns_with_blocked_stdin_source",
+        "run_dbt_strict_returns_with_blocked_stdin_source",
         "--",
         "--exact",
         "--test-threads=1"
       ]
     },
     {
-      "job": "dbi_guest_stderr_isolation_diagnostic",
-      "label": "DBI guest-stderr isolation diagnostic",
+      "job": "dbt_guest_stderr_isolation_diagnostic",
+      "label": "DBT guest-stderr isolation diagnostic",
       "timeout": 120,
       "argv": [
         "cargo",
@@ -413,7 +413,7 @@
         "third-party-backends",
         "--test",
         "cli",
-        "run_dbi_keeps_diagnostics_out_of_guest_stderr",
+        "run_dbt_keeps_diagnostics_out_of_guest_stderr",
         "--",
         "--exact",
         "--test-threads=1"
