@@ -102,9 +102,14 @@ mount namespaces are available.
 This metric is a lower bound on unsupported-syscall exposure, not a claim of
 complete fail-closed enforcement. Optimized Detcore runs subscribe to selected
 syscalls. An unsubscribed syscall executes in the kernel without reaching the
-unsupported-syscall panic. The current coverage audit identifies 291 such
+unsupported-syscall panic. A 2026-07-21 coverage audit identified 291 such
 missing release entries; see
-[`ai_docs/syscall-coverage-map.md`](../ai_docs/syscall-coverage-map.md).
+[`ai_docs/syscall-coverage-map.md`](../ai_docs/syscall-coverage-map.md) (a
+dated snapshot). That count is now stale: several syscall families it marked
+`MISSING` (for example the SysV IPC, Landlock, and `cachestat` groups) have
+since gained `Determinized` entries in `detcore/src/syscall_classification.rs`.
+Re-derive the current missing-entry count from that file rather than citing
+291 as current.
 
 A future true fail-closed mode must subscribe to all syscalls (or install an
 equivalent deny policy). Until then, the ratchet prevents regressions in the
