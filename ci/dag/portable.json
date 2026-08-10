@@ -480,7 +480,7 @@
     {
       "group": "test", "job": "envelope_levels",
       "desc": "Portable working-envelope levels (L1-L4 over true/echo/date; implemented by scripts/validate.rs)",
-      "cmd": "set -e; HERMIT=target/debug/hermit; ARGS='run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled'; REPS=${L4_REPS:-20}; run_probe() { local c=\"$1\"; timeout 30s $HERMIT $ARGS --strict -- $c </dev/null; timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null; timeout 30s $HERMIT $ARGS --strict --verify --detlog-heap --detlog-stack -- $c </dev/null; local i; for ((i=0;i<REPS;i++)); do timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null; done; }; run_probe '/bin/true'; run_probe '/bin/echo hermit-envelope'; run_probe '/bin/date -u +%Y'",
+      "cmd": "set -e; HERMIT=target/debug/hermit; ARGS='run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled'; REPS=${L4_REPS:-20}; run_probe() { local c=\"$1\"; printf '##TEST-START %s\\n' \"$c\"; timeout 30s $HERMIT $ARGS --strict -- $c </dev/null; timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null; timeout 30s $HERMIT $ARGS --strict --verify --detlog-heap --detlog-stack -- $c </dev/null; local i; for ((i=0;i<REPS;i++)); do timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null; done; printf '##TEST-END %s PASS\\n' \"$c\"; }; run_probe '/bin/true'; run_probe '/bin/echo hermit-envelope'; run_probe '/bin/date -u +%Y'",
       "deps": ["build.workspace"],
       "timeout": 900,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 120,
