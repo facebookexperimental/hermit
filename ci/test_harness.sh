@@ -646,20 +646,41 @@ function assert_privileged_diagnostics {
 }
 
 # The production validation driver is scripts/validate.rs. The retired shell
-# entrypoint must stay absent; Make, workflows, and DAGs call Rust directly.
+# implementation must stay absent; the root validate.sh is an exact, behaviorless
+# reminder alias, while Make, workflows, and DAGs call Rust directly.
 #
 # These assertions replace the former `assert_validate_entrypoint` audits over
 # bash function bodies. The property audited is unchanged and is the one that
 # matters: a validate profile's node set comes from the AUDITED DAG FILES and
 # from nowhere else, so no local path can quietly run a different or smaller
 # suite than the one CI runs.
+function validate_reminder_shim_is_exact {
+    local shim=$1
+
+    [[ -f $shim && ! -L $shim && -x $shim ]] || return 1
+    cmp -s "$shim" <(printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        '# The local validation ledger is the landing authority.' \
+        'exec ./scripts/validate.rs "$@"')
+}
+
 function assert_validate_driver_entrypoint {
     local shim="$ROOT_DIR/validate.sh"
+    local mutated_shim
     local plan_src="$ROOT_DIR/scripts/lib/validate_plan.rs"
     local driver="$ROOT_DIR/scripts/validate.rs"
 
-    [[ ! -e $shim ]] ||
-        die "the retired shell validation entrypoint must remain deleted"
+    validate_reminder_shim_is_exact "$shim" ||
+        die "validate.sh must remain the exact executable reminder alias for scripts/validate.rs"
+    mutated_shim=$(mktemp)
+    cp "$shim" "$mutated_shim"
+    printf '%s\n' 'echo unexpected-wrapper-behavior' >>"$mutated_shim"
+    chmod +x "$mutated_shim"
+    if validate_reminder_shim_is_exact "$mutated_shim"; then
+        rm -f "$mutated_shim"
+        die "the validate.sh audit must reject behavior beyond direct Rust-driver delegation"
+    fi
+    rm -f "$mutated_shim"
     [[ -x $driver ]] ||
         die "scripts/validate.rs must be the executable validation entrypoint"
     ! jq -r '.steps[].cmd' "$ROOT_DIR/ci/dag/portable.json" | grep -Fq './validate.sh' ||

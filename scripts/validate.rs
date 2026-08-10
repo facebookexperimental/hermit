@@ -8,7 +8,8 @@
 //! validate.rs — Hermit's validation driver.
 //!
 //! This is the sole validation driver. Every production caller invokes it
-//! directly; the former shell entrypoint has been removed.
+//! directly; the former shell implementation has been removed. The repository-
+//! root `validate.sh` is an audited reminder alias with no independent behavior.
 //!
 //! # Contract
 //!
