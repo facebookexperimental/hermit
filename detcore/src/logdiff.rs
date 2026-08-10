@@ -197,7 +197,7 @@ impl Default for LogDiffOpts {
 ///
 /// This erasure is deliberately lossy and is NOT a parity claim: it backs the
 /// `Stripped` comparator only (`bitwise_parity: false`). `BitwiseInfoV1`
-/// canonicalizes rather than erases -- see [`canonicalize_addresses_in_line`].
+/// canonicalizes rather than erases -- see `canonicalize_addresses_in_line`.
 /// Lossy as it is, each pattern must still erase only what it names: erasing a
 /// neighbouring field turns a real divergence into a reported match.
 ///
