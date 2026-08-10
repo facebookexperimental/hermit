@@ -69,6 +69,38 @@ function die {
     exit 2
 }
 
+# Run one audit probe without letting `set -e` discard the command substitution's
+# captured output.  A probe is allowed to have a nonzero *expected* status (the
+# wrong-pin negative is one), but every mismatch remains fatal after the exact
+# probe name and its stdout/stderr have been surfaced.
+function run_audit_probe_expect_status {
+    local probe_name=$1 expected_status=$2 output_var=$3
+    shift 3
+    local probe_output probe_status
+
+    if probe_output=$("$@" 2>&1); then
+        probe_status=0
+    else
+        probe_status=$?
+    fi
+    if [[ -n $output_var ]]; then
+        printf -v "$output_var" '%s' "$probe_output"
+    fi
+
+    if ((probe_status != expected_status)); then
+        echo "test_harness.sh: audit probe '$probe_name' returned $probe_status (expected $expected_status)" >&2
+        if [[ -n $probe_output ]]; then
+            printf '%s\n' "$probe_output" >&2
+        else
+            echo "test_harness.sh: audit probe '$probe_name' produced no stdout/stderr" >&2
+        fi
+        if ((probe_status == 0)); then
+            return 1
+        fi
+        return "$probe_status"
+    fi
+}
+
 function require_executable_hermit {
     local path=$1
     [[ -x $path ]] || die "Hermit binary is not executable: $path"
@@ -1109,7 +1141,8 @@ function audit_ci_correspondence {
     (
         local scratch fake_runner privileged_env privileged_node_env name
         local budget_probe budget_tuple clamp_boundaries cpu_boundaries
-        local hosted_wrapper_log boxed_wrapper_log wrong_pin_log wrong_pin_status
+        local hosted_wrapper_log boxed_wrapper_log wrong_pin_log
+        local planted_probe_diagnostic planted_probe_status
         local configured_jobs fixture wrong_pin
         local -a clean_budget_env budget_names planted_budget_env
         scratch=$(mktemp -d)
@@ -1212,18 +1245,41 @@ function audit_ci_correspondence {
         [[ $budget_tuple == 'runner-child-cargo-build-jobs 32 32 32 child-nproc 64 16 16 1050 66' ]] ||
             die "boxed j32/child-CPU64 budget tuple drifted: $budget_tuple"
 
-        hosted_wrapper_log=$(
-            PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
-                CARGO_BUILD_JOBS=8 "$budget_wrapper" true 2>&1
-        )
+        run_audit_probe_expect_status hosted-budget-wrapper 0 hosted_wrapper_log \
+            "${clean_budget_env[@]}" PATH="$scratch/nproc-4:$PATH" \
+            CARGO_BUILD_JOBS=8 "$budget_wrapper" true
         [[ $hosted_wrapper_log == *'pin:99437f05e82377a80ad1edb9e501d89a38c91ecb,source:inherited-launch-cargo-build-jobs,raw-build-jobs:8,effective-cpus-source:child-nproc,effective-cpus:4,reverie-max-jobs:16,effective-native-jobs:4,effective-job-seconds:1050,max-elapsed-seconds:263'* ]] ||
             die "production wrapper did not log the bound hosted tuple: $hosted_wrapper_log"
-        boxed_wrapper_log=$(
-            PATH="$scratch/nproc-64:$PATH" "${clean_budget_env[@]}" \
-                SAFE_CI_IN_SCOPE=1 CARGO_BUILD_JOBS=32 "$budget_wrapper" true 2>&1
-        )
+        run_audit_probe_expect_status boxed-budget-wrapper 0 boxed_wrapper_log \
+            "${clean_budget_env[@]}" PATH="$scratch/nproc-64:$PATH" \
+            SAFE_CI_IN_SCOPE=1 CARGO_BUILD_JOBS=32 "$budget_wrapper" true
         [[ $boxed_wrapper_log == *'pin:99437f05e82377a80ad1edb9e501d89a38c91ecb,source:runner-child-cargo-build-jobs,raw-build-jobs:32,effective-cpus-source:child-nproc,effective-cpus:64,reverie-max-jobs:16,effective-native-jobs:16,effective-job-seconds:1050,max-elapsed-seconds:66'* ]] ||
             die "production wrapper did not log the bound boxed tuple: $boxed_wrapper_log"
+
+        # Mutation bracket for the evidence path itself: a Rust-style panic
+        # status must remain fatal while preserving both the sibling identity
+        # and the captured diagnostic.  The two production probes above are the
+        # positive control that expected status 0 still proceeds normally.
+        cat >"$scratch/panicking-audit-probe" <<'EOF'
+#!/usr/bin/env bash
+echo 'planted rust panic detail' >&2
+exit 101
+EOF
+        chmod +x "$scratch/panicking-audit-probe"
+        if planted_probe_diagnostic=$(
+            run_audit_probe_expect_status planted-reverie-pin-panic 0 '' \
+                "$scratch/panicking-audit-probe" 2>&1
+        ); then
+            die "audit probe evidence bracket accepted planted exit 101"
+        else
+            planted_probe_status=$?
+        fi
+        [[ $planted_probe_status == 101 ]] ||
+            die "audit probe evidence bracket returned $planted_probe_status instead of 101"
+        [[ $planted_probe_diagnostic == *"audit probe 'planted-reverie-pin-panic' returned 101 (expected 0)"* ]] ||
+            die "audit probe evidence bracket lost the exact sibling name: $planted_probe_diagnostic"
+        [[ $planted_probe_diagnostic == *'planted rust panic detail'* ]] ||
+            die "audit probe evidence bracket lost captured stderr: $planted_probe_diagnostic"
 
         clamp_boundaries=$(
             for requested in 15 16 17 64; do
@@ -1258,16 +1314,9 @@ function audit_ci_correspondence {
             "$wrong_pin" >"$fixture/Cargo.toml"
         git -C "$fixture" init -q
         git -C "$fixture" add Cargo.toml ci scripts
-        if wrong_pin_log=$(
-            PATH="$scratch/nproc-4:$PATH" CARGO_BUILD_JOBS=8 \
-                "$fixture/ci/run-with-reverie-dbt-budget.sh" true 2>&1
-        ); then
-            wrong_pin_status=0
-        else
-            wrong_pin_status=$?
-        fi
-        [[ $wrong_pin_status == 2 ]] ||
-            die "uncalibrated Reverie pin returned $wrong_pin_status instead of 2: $wrong_pin_log"
+        run_audit_probe_expect_status wrong-pin-budget-wrapper 2 wrong_pin_log \
+            env PATH="$scratch/nproc-4:$PATH" CARGO_BUILD_JOBS=8 \
+            "$fixture/ci/run-with-reverie-dbt-budget.sh" true
         [[ $wrong_pin_log == *"no calibrated budget for Reverie pin $wrong_pin"* ]] ||
             die "uncalibrated Reverie pin refusal lost its binding: $wrong_pin_log"
 
