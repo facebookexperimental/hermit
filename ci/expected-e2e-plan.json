@@ -15,6 +15,13 @@
       "test": "backend-parity-c/personality-domain"
     },
     {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/add-key-enosys"
+    },
+    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -27,6 +34,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/add-key-enosys"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/cachestat-enosys"
     },
     {
       "backend": "ptrace",
@@ -43,6 +57,13 @@
       "test": "c-programs/cachestat-enosys"
     },
     {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/futex-waitv-enosys"
+    },
+    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -55,6 +76,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/futex-waitv-enosys"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/get-robust-list-self"
     },
     {
       "backend": "ptrace",
@@ -71,6 +99,13 @@
       "test": "c-programs/get-robust-list-self"
     },
     {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/ioctl-fioclex"
+    },
+    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -83,6 +118,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/ioctl-fioclex"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/kcmp-eperm"
     },
     {
       "backend": "ptrace",
@@ -99,6 +141,13 @@
       "test": "c-programs/kcmp-eperm"
     },
     {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/keyctl-enosys"
+    },
+    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -111,6 +160,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/keyctl-enosys"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/listmount-enosys"
     },
     {
       "backend": "ptrace",
@@ -163,6 +219,13 @@
     },
     {
       "backend": "ptrace",
+      "category": "data-handling",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "data-handling/sqlite-query-determinism"
+    },
+    {
+      "backend": "ptrace",
       "category": "determinism-stress",
       "lane": "portable",
       "mode": "chaos",
@@ -209,6 +272,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "determinism-stress-c/pid-tid"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress-c/pid-tid-identity"
     },
     {
       "backend": "ptrace",
@@ -299,7 +369,21 @@
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "verify",
+      "test": "language-runtimes/python-dict-hash-iteration"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
       "test": "language-runtimes/python-hash-determinism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/python-hashseed"
     },
     {
       "backend": "ptrace",
@@ -328,6 +412,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "language-runtimes/rust-hashmap-iteration"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/tcl-rand-clock"
     },
     {
       "backend": "liteinst",
@@ -489,97 +580,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "system-utils/uuidgen-random"
-    },
-    {
-      "backend": "ptrace",
-      "category": "data-handling",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "data-handling/sqlite-query-determinism"
-    },
-    {
-      "backend": "ptrace",
-      "category": "language-runtimes",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "language-runtimes/python-dict-hash-iteration"
-    },
-    {
-      "backend": "ptrace",
-      "category": "language-runtimes",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "language-runtimes/python-hashseed"
-    },
-    {
-      "backend": "ptrace",
-      "category": "language-runtimes",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "language-runtimes/tcl-rand-clock"
-    },
-    {
-      "backend": "dbt",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/add-key-enosys"
-    },
-    {
-      "backend": "dbt",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/cachestat-enosys"
-    },
-    {
-      "backend": "dbt",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/futex-waitv-enosys"
-    },
-    {
-      "backend": "dbt",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/get-robust-list-self"
-    },
-    {
-      "backend": "dbt",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/ioctl-fioclex"
-    },
-    {
-      "backend": "dbt",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/kcmp-eperm"
-    },
-    {
-      "backend": "dbt",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/keyctl-enosys"
-    },
-    {
-      "backend": "dbt",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/listmount-enosys"
-    },
-    {
-      "backend": "ptrace",
-      "category": "determinism-stress-c",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "determinism-stress-c/pid-tid-identity"
     }
   ],
   "schema": 1

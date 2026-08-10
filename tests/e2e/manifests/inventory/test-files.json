@@ -662,6 +662,12 @@
     },
     {
       "disposition": "special-driver",
+      "path": "tests/backend-parity/test_run_matrix_output_skew.py",
+      "runner": "tests/backend-parity/run_matrix.py maintainers",
+      "why": "tests/backend-parity/test_run_matrix_output_skew.py is owned by tests/backend-parity/run_matrix.py maintainers: it is a self-contained focused suite over run_matrix.py's --output TSV writer, asserting that the writer emits every row or refuses and names the offending field, and that a refusal leaves any previous artifact byte-for-byte intact rather than truncated. It runs directly as a script and observes no guest program, so it is a driver-side suite rather than a manifest test."
+    },
+    {
+      "disposition": "special-driver",
       "path": "tests/backend-parity/test_scorecard_header_compat.py",
       "runner": "tests/backend-parity/run_matrix.py maintainers",
       "why": "tests/backend-parity/test_scorecard_header_compat.py is owned by tests/backend-parity/run_matrix.py maintainers: it is a self-contained focused suite over run_matrix.py's outer-scorecard writer, asserting that the writer binds to the target file's header so a parent-side column addition cannot refuse every append. It runs directly as a script and observes no guest program, so it is a driver-side suite rather than a manifest test."
@@ -749,6 +755,60 @@
       "path": "tests/c/copy_file_range_refusal_probe.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
       "why": "tests/c/copy_file_range_refusal_probe.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/dbt_copied_tiocgpgrp.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "tests/c/dbt_copied_tiocgpgrp.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/dbt_exec_failure.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "tests/c/dbt_exec_failure.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/dbt_execveat_unsupported.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "tests/c/dbt_execveat_unsupported.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/dbt_mmap_exec.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "tests/c/dbt_mmap_exec.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/dbt_pid_virtualization.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "tests/c/dbt_pid_virtualization.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/dbt_prlimit_self.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "tests/c/dbt_prlimit_self.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/dbt_self_sigqueue.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "tests/c/dbt_self_sigqueue.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/dbt_unsupported_syscall.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "tests/c/dbt_unsupported_syscall.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/dbt_wait_lifecycle.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
+      "why": "tests/c/dbt_wait_lifecycle.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "disposition": "manifest-test",
@@ -3059,66 +3119,6 @@
       "path": "tests/util/ssl_server.py",
       "runner": "scripts/validate.rs or Hermit integration targets",
       "why": "tests/util/ssl_server.py is owned by scripts/validate.rs or Hermit integration targets: The `ssl_server` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
-    },
-    {
-      "disposition": "special-driver",
-      "path": "tests/backend-parity/test_run_matrix_output_skew.py",
-      "runner": "tests/backend-parity/run_matrix.py maintainers",
-      "why": "tests/backend-parity/test_run_matrix_output_skew.py is owned by tests/backend-parity/run_matrix.py maintainers: it is a self-contained focused suite over run_matrix.py's --output TSV writer, asserting that the writer emits every row or refuses and names the offending field, and that a refusal leaves any previous artifact byte-for-byte intact rather than truncated. It runs directly as a script and observes no guest program, so it is a driver-side suite rather than a manifest test."
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/dbt_copied_tiocgpgrp.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/dbt_copied_tiocgpgrp.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/dbt_exec_failure.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/dbt_exec_failure.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/dbt_execveat_unsupported.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/dbt_execveat_unsupported.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/dbt_mmap_exec.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/dbt_mmap_exec.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/dbt_pid_virtualization.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/dbt_pid_virtualization.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/dbt_prlimit_self.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/dbt_prlimit_self.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/dbt_self_sigqueue.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/dbt_self_sigqueue.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/dbt_unsupported_syscall.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/dbt_unsupported_syscall.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/dbt_wait_lifecycle.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/dbt_wait_lifecycle.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     }
   ],
   "schema": 2
