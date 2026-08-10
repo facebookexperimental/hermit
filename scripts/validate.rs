@@ -1376,6 +1376,13 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
     if envelope.cmd.matches("\"$id\"").count() != 2 {
         return Err("verbosity: envelope START/END must use the same whitespace-free identity".into());
     }
+    if envelope.cmd.matches("\"$id\" >&2").count() != 2
+        || envelope.cmd.matches("</dev/null >&2").count() != 4
+    {
+        return Err(
+            "verbosity: envelope markers and Hermit diagnostics must share stderr ordering".into(),
+        );
+    }
     propagate_verbosity(&mut plan, 5);
     let missing = plan
         .cfg
