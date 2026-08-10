@@ -48,6 +48,7 @@
     {
       "slug": "integration",
       "nodes": [
+        "build.e2e_artifact",
         "test.hermit_integration",
         "test.cli",
         "test.arbitrary_binaries",

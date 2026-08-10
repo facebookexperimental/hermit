@@ -17,6 +17,12 @@
 # as the pre-existing ci-portable-fanout.yml already validates. This guard makes
 # it impossible for the parallel workflow to silently cover a different set than
 # the trusted portable DAG.
+#
+# The immutable E2E artifact is deliberately assigned to the integration shard
+# beside test.applications_e2e. Keeping the producer and its protected consumer
+# in one run-node selection preserves their declared DAG edge; assigning the
+# producer to an unrelated bucket would satisfy set coverage while leaving the
+# artifact off the consumer's execution path.
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -70,6 +76,16 @@ fi
 if [[ -n $extra ]]; then
     echo "check-shard-coverage.sh: FAIL — shard map names nodes absent from portable.json (or e2e.manifest_*):" >&2
     printf '  %s\n' $extra >&2
+    status=1
+fi
+
+if ! jq -e '
+    [.debug_shards[] | select(.slug == "integration") | .nodes] as $integration
+    | ($integration | length) == 1
+      and ($integration[0] | index("build.e2e_artifact") != null)
+      and ($integration[0] | index("test.applications_e2e") != null)
+' "$shards" >/dev/null; then
+    echo "check-shard-coverage.sh: FAIL — integration job must run build.e2e_artifact with test.applications_e2e" >&2
     status=1
 fi
 

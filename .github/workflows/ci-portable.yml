@@ -699,7 +699,6 @@ jobs:
       matrix: ${{ fromJSON(needs.build-debug.outputs.e2e_matrix) }}
     env:
       E2E_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slug }}
-      HERMIT_BIN: ${{ github.workspace }}/target/release/hermit
     steps:
       - uses: actions/checkout@v4
       - name: Initialize safe-ci-dag-runner submodule
@@ -731,20 +730,22 @@ jobs:
           tar --zstd -xf "$RELEASE_TARBALL"; rm -f "$RELEASE_TARBALL"
           test -x target/debug/hermit
           test -x target/release/hermit
+      - name: Publish verified immutable Hermit E2E artifact
+        run: ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path target/install_pkg
       - name: Run cell (${{ matrix.mode }} x ${{ matrix.category }} x ${{ matrix.backend }})
         run: |
           set -euo pipefail
           out="ignored/e2e/portable/${{ matrix.slug }}"
+          args=(./ci/test_harness.sh run --lane portable --category "${{ matrix.category }}" \
+            --mode "${{ matrix.mode }}")
           if [[ "${{ matrix.backend }}" == "naked" ]]; then
-            ./ci/test_harness.sh run --lane portable --category "${{ matrix.category }}" \
-              --mode "${{ matrix.mode }}" --ci-only --allow-empty --prebuilt \
-              --results "$out/results.jsonl" --junit "$out/junit.xml"
+            :
           else
-            ./ci/test_harness.sh run --lane portable --category "${{ matrix.category }}" \
-              --mode "${{ matrix.mode }}" --backend "${{ matrix.backend }}" \
-              --ci-only --allow-empty --prebuilt \
-              --results "$out/results.jsonl" --junit "$out/junit.xml"
+            args+=(--backend "${{ matrix.backend }}")
           fi
+          ./ci/run-with-hermit-e2e-artifact.sh --require-install "${args[@]}" \
+            --ci-only --allow-empty --prebuilt \
+            --results "$out/results.jsonl" --junit "$out/junit.xml"
       - name: Pack deterministic parity transport archive
         if: always()
         env:

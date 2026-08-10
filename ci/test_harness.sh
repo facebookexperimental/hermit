@@ -598,6 +598,12 @@ function assert_parallel_portable_workflow {
         die "GitHub portable debug shards must verify the DynamoRIO launcher"
     [[ $(grep -Fxc '          test -f target/install_pkg/rsrcs/libreverie_dbt_client.so' "$workflow") == 1 ]] ||
         die "GitHub portable debug shards must verify the DynamoRIO client"
+    [[ $(grep -Fxc '        run: ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path target/install_pkg' "$workflow") == 1 ]] ||
+        die "GitHub portable e2e cells must publish one verified immutable Hermit artifact after unpack"
+    [[ $(grep -Fxc '          ./ci/run-with-hermit-e2e-artifact.sh --require-install "${args[@]}" \' "$workflow") == 1 ]] ||
+        die "GitHub portable e2e cells must consume the verified immutable Hermit artifact"
+    [[ $(grep -Fxc '      HERMIT_BIN: ${{ github.workspace }}/target/release/hermit' "$workflow") == 1 ]] ||
+        die "only the non-gating SaBRe diagnostic may use the mutable release Hermit directly"
     [[ $(grep -Fxc '      - name: Enable unprivileged user and mount namespaces' "$workflow") == 4 ]] ||
         die "GitHub portable debug, release, e2e, and SaBRe diagnostics must enable user namespaces"
     [[ $(grep -Fxc '            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0' "$workflow") == 4 ]] ||
@@ -619,9 +625,12 @@ function assert_parallel_portable_workflow {
     jq -e '
         .debug_shards[]
         | select(.slug == "integration")
-        | .nodes | index("test.cli") != null
+        | .nodes
+        | index("test.cli") != null
+          and index("build.e2e_artifact") != null
+          and index("test.applications_e2e") != null
     ' "$ROOT_DIR/ci/portable-shards.json" >/dev/null ||
-        die "GitHub portable integration shard must retain the run_dbt_* CLI tests"
+        die "GitHub portable integration shard must retain CLI tests and execute the immutable artifact producer with its applications consumer"
 }
 
 function assert_privileged_diagnostics {
