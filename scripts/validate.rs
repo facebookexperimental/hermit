@@ -835,6 +835,7 @@ fn self_test() -> Result<(), String> {
     // itself, so its refusal predicate is bracketed here rather than assumed.
     verdict_refusal_bracket()?;
     coverage_schema_bracket()?;
+    typed_libtest_count_bracket()?;
     selective_subset_bracket(&root)?;
     self_output_bracket()?;
     // ---- DAG-config carry + ungrantable-resource brackets -------------------
@@ -1319,6 +1320,7 @@ fn super_plan_bracket() -> Result<(), String> {
             timeout: 0,
             cpu_timeout: 0,
             jobs_flag: None,
+            skip_reason: None,
         }],
         "caps-audit negative bracket",
     );
@@ -2895,6 +2897,7 @@ fn step_with_caps(
         timeout,
         cpu_timeout,
         jobs_flag: None,
+        skip_reason: None,
     }
 }
 
@@ -3750,7 +3753,7 @@ fn canonical_validate_lock_admission(
     validate_runtime::identity_in_ancestry(pid, start_ticks)
 }
 
-/// Parse the libtest `executed` / `filtered` counts out of the durable log.
+/// Aggregate libtest `executed` / `filtered` counts from typed step outcomes.
 ///
 /// **This is the field the whole receipt rests on.** A row whose
 /// `executed_tests` is null is a NON-VERDICT: every downstream completeness
@@ -3760,32 +3763,56 @@ fn canonical_validate_lock_admission(
 /// filtered, and a port that cannot reproduce that number has not preserved the
 /// thing validate exists to do.
 ///
-/// Deliberately NOT re-implemented here: the banner parser lives once, in the
-/// parent (`ci-hub/remediation/nonzero_result.py --ledger-fields`), and every
-/// consumer calls that one. A second in-tree parser would be a second authority
-/// that can disagree. A missing helper, an unreadable log, or unparseable output
-/// all yield `None` (UNKNOWN) — never a fabricated zero.
-fn libtest_counts(parent: Option<&Path>, log: &Path) -> (Option<i64>, Option<i64>) {
-    let Some(parent) = parent else { return (None, None) };
-    let helper = parent.join("ci-hub/remediation/nonzero_result.py");
-    if !helper.is_file() || log.as_os_str().is_empty() {
-        return (None, None);
+/// The runner derives these values from each step's COMPLETE captured bytes
+/// before verbosity filters presentation. Thus level 1 can stay O(steps)
+/// without erasing the receipt's evidence. `None` remains UNKNOWN and `Some(0)`
+/// remains a demonstrated vacuous run; neither is coerced.
+fn sum_typed_count(
+    outcomes: &[StepOutcome],
+    select: fn(&StepOutcome) -> Option<u64>,
+) -> Option<i64> {
+    let mut seen = false;
+    let mut total = 0u64;
+    for outcome in outcomes {
+        if let Some(value) = select(outcome) {
+            seen = true;
+            total = total.checked_add(value)?;
+        }
     }
-    let Ok(out) = Command::new("python3")
-        .arg(&helper)
-        .arg("--ledger-fields")
-        .arg(log)
-        .output()
-    else {
-        return (None, None);
+    seen.then(|| i64::try_from(total).ok()).flatten()
+}
+
+fn libtest_counts(outcomes: &[StepOutcome]) -> (Option<i64>, Option<i64>) {
+    (
+        sum_typed_count(outcomes, |o| o.executed_tests),
+        sum_typed_count(outcomes, |o| o.filtered_tests),
+    )
+}
+
+fn typed_libtest_count_bracket() -> Result<(), String> {
+    let outcome = |tag: &str, executed_tests, filtered_tests| StepOutcome {
+        tag: tag.into(),
+        ok: true,
+        duration_s: 0.0,
+        summary: String::new(),
+        executed_tests,
+        filtered_tests,
+        returncode: Some(0),
+        reason: String::new(),
+        aborted: false,
     };
-    if !out.status.success() {
-        return (None, None);
+    let full = vec![outcome("test.a", Some(398), Some(0)), outcome("test.b", Some(475), Some(350))];
+    if libtest_counts(&full) != (Some(873), Some(350)) {
+        return Err("typed libtest counts: complete outcomes did not sum to 873/350".into());
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut it = text.split_whitespace();
-    let parse = |v: Option<&str>| v.and_then(|v| v.parse::<i64>().ok());
-    (parse(it.next()), parse(it.next()))
+    if libtest_counts(&[outcome("test.zero", Some(0), Some(0))]) != (Some(0), Some(0)) {
+        return Err("typed libtest counts: demonstrated zero was not preserved".into());
+    }
+    if libtest_counts(&[outcome("build.only", None, None)]) != (None, None) {
+        return Err("typed libtest counts: unknown bannerless output was coerced".into());
+    }
+    println!("  typed libtest counts: 873/350 complete accepted; 0/0 preserved; unknown stayed null");
+    Ok(())
 }
 
 /// Write one validation record through the single configured authority.
@@ -4955,7 +4982,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // Whole-run CPU, taken once in THIS process (a worker thread would see only
     // its own accounting, exactly as a bash subshell's `times` would).
     let (cpu_user, cpu_sys) = validate_runtime::process_cpu_seconds();
-    let (executed_tests, filtered_tests) = libtest_counts(parent.as_deref(), &log_path);
+    let (executed_tests, filtered_tests) = libtest_counts(&outcomes);
     if executed_tests.is_none() {
         eprintln!(
             "validate: WARNING: libtest counts are UNKNOWN for this run. A ledger row with \
@@ -5377,6 +5404,8 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         ok,
         duration_s: 0.0,
         summary: String::new(),
+        executed_tests: None,
+        filtered_tests: None,
         returncode: Some(if ok { 0 } else { 1 }),
         reason: if ok { String::new() } else { "stop-test synthetic failure".into() },
         aborted: false,
