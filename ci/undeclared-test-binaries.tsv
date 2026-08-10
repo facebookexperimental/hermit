@@ -1,0 +1,85 @@
+# Hermit-cli test binaries that CI does not run, and their recorded disposition.
+#
+# Format: <binary>\t<disposition>\t<reason>
+#
+# This file cannot decide what exists. ci/audit-test-binary-registration.py
+# derives the present set from `git ls-files`, so an unlisted binary is refused.
+# A row here can only account for a binary the tracked tree proves exists.
+#
+# `none-recorded` IS AN HONEST UNKNOWN, NOT AN APPROVAL OR A PASS. These 72 rows
+# preserve the ruling that no omission reason was recorded. They are reported in
+# their own aggregate and excluded from both CI-covered and reason-recorded counts.
+# Discharge a row by registering the binary in ci/dag/*.json and deleting it, or
+# replace `none-recorded` with a concrete disposition and checkable reason.
+analyze	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+arch_prctl	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+block_inflight_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+btrfs_commit_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+btrfs_pinned_bytes_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+btrfs_reservation_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+btrfs_reserved_bytes_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+buddyinfo_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+compression	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+copy_file_range_refusal	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+cppc_feedback_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+cpuidle_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+dbt_copied_tty	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+dentry_state_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+frontier_app_benchmarks	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+getitimer_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+host_kernel_probes	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+host_security_identity	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+integration_matrix	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+io_uring_ring_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+ipc_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+irq_per_cpu_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+kvm_harder	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+language_runtime_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+leveldb	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+liteinst_host_activation	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+madvise	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+meminfo_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+mmap_stress_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+mount_introspection	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+name_to_handle_refusal	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+netlink_table_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+netns_cookie_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+optional_memory_features	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+ppoll_simulation	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+prctl_dumpable_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+privileged_observation	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+proc_fd_link_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+prodcons_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+protocols_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+pselect6_simulation	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+ptrace_refusal	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+random_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+random_uuid_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+record_replay	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+redis_strict	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+relaxed_flag_matrix	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+remap_file_pages_refusal	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+robust_list_queries	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+sched_setattr_noop	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+scheduler_policy_queries	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+sigmask_preemption	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+so_incoming_cpu	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+socket_cookie_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+socket_ioctl_timestamp_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+socket_timestamp_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+sqlite_veryquick	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+stress_suite	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+syscall_file_io	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+syscall_file_metadata	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+syscall_quick_wins	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+sysfs_rtc_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+sysv_legacy_fallbacks	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+tcp_info_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+thread_scheduling_fairness	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+thread_self_procfs_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+thread_sync_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+uevent_seqnum_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+unix_socket_table_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+version_provenance	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+vmstat_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
+writev_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.

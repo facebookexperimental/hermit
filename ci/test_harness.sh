@@ -81,6 +81,7 @@ Usage:
   ci/test_harness.sh audit-gaps [--lane portable|privileged] [--format text|json]
   ci/test_harness.sh audit-inventory
   ci/test_harness.sh audit-test-footprints
+  ci/test_harness.sh audit-test-binary-registration
   ci/test_harness.sh audit-ci
 
 Filters:
@@ -1308,6 +1309,14 @@ function emit_manifest_buckets {
     for test in "${TESTS[@]}"; do
         metadata_json "$test" | jq -c '{lane,category}'
     done | jq -sS 'unique | sort_by(.lane,.category)'
+}
+
+# A tracked hermit-cli test binary absent from both the explicit CI DAG and the
+# omission ledger is unaccounted, not passing. The audit derives existence from
+# the tracked tree, so its ledger cannot certify its own completeness.
+function audit_test_binary_registration {
+    python3 "$ROOT_DIR/ci/audit-test-binary-registration.py" ||
+        die "undeclared hermit-cli test binaries (see above)"
 }
 
 function audit_ci_correspondence {
@@ -2705,6 +2714,7 @@ case "$subcommand" in
     validate)
         (($# == 0)) || true
         audit_immutable_hermit_binary
+        audit_test_binary_registration
         audit_sabre_path_evidence_contract
         audit_test_footprints
         python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
@@ -2733,6 +2743,9 @@ case "$subcommand" in
         ;;
     audit-test-footprints)
         audit_test_footprints
+        ;;
+    audit-test-binary-registration)
+        audit_test_binary_registration
         ;;
     audit-ci)
         audit_ci_correspondence
