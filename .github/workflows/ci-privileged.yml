@@ -101,6 +101,20 @@ jobs:
     # removed. The `pmu-serial` runner label was retired for the same reason:
     # PMU skid is an instruction-space hardware property independent of
     # concurrency, so no determinism argument justifies serializing PMU work.
+    # DIAGNOSTIC ONLY, and deliberately NOT `continue-on-error` — the script always exits 0, and
+    # ci/test_harness.sh asserts this workflow contains exactly one continue-on-error line (the
+    # occasional-KVM one), so a second would fail the DAG correspondence audit.
+    #
+    # Answers a question that has been ASSUMED for weeks rather than measured. safe-ci-dag-runner
+    # skips cgroup boxing whenever $CI or $GITHUB_ACTIONS is set: cgroup.rs reexec_in_scope returns
+    # its SUCCESS value without entering a scope, and the real capability probe sits after that
+    # early return, so it never executes on a runner. This lane therefore passes
+    # --allow-cgroup-failure and runs UNBOXED on the belief that a self-hosted runner cannot box —
+    # a belief nothing has tested. The step prints FACT1_SCOPE_CREATED and FACT2_ESCAPEE_KILLED and
+    # changes no default either way.
+    - name: PROBE — can this runner actually box? (diagnostic, never gates)
+      run: timeout --foreground --kill-after=10s 120s ./ci/probe-runner-boxing.sh
+
     - name: PMU, CPUID-faulting, and KVM smoke DAG
       # --allow-cgroup-failure: at the advanced runner pin, `run` boxes fail-closed
       # (exit 3) by default, but GitHub Actions (hosted AND self-hosted) sets
