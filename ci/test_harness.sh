@@ -1102,6 +1102,7 @@ function audit_ci_correspondence {
         die "run-node.sh must source ordinary build-job configuration exactly once"
     local budget_config="$ROOT_DIR/ci/configure-build-jobs.sh"
     local budget_wrapper="$ROOT_DIR/ci/run-with-reverie-dbt-budget.sh"
+    local rustdoc_width_contract
     [[ -x $budget_wrapper ]] || die "DBT child-budget wrapper must be executable"
     [[ $(grep -Fc 'reverie-dbt-budget=portable-build-child-only' "$ROOT_DIR/ci/run-dag.sh") == 1 ]] ||
         die "run-dag.sh must identify the DBT budget as portable-child-only"
@@ -1129,6 +1130,23 @@ function audit_ci_correspondence {
         )] | length == 2
     ' "$DAG_ROOT/portable.json" >/dev/null ||
         die "portable DBT builds must derive inside the child and allow 1050s DBT + 150s overhead"
+    # CARGO_BUILD_JOBS alone controls Cargo/NUM_JOBS but does not declare the
+    # step's width to safe-ci. Without preferred_inner_jobs, declarations-first
+    # boxing applies cpu.max=1 core while the DBT wrapper derives its ratchet
+    # from eight workers. Bind the two values at the deployed rustdoc node.
+    rustdoc_width_contract='[
+        .steps[] | select(
+            .group == "doc" and .job == "rustdoc"
+            and (.cmd | startswith("CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo doc "))
+            and .hint.preferred_inner_jobs == 8
+        )
+    ] | length == 1'
+    jq -e "$rustdoc_width_contract" "$DAG_ROOT/portable.json" >/dev/null ||
+        die "doc.rustdoc must bind its eight-worker DBT budget to an eight-core safe-ci declaration"
+    if jq '(.steps[] | select(.group == "doc" and .job == "rustdoc") | .hint) |= del(.preferred_inner_jobs)' \
+        "$DAG_ROOT/portable.json" | jq -e "$rustdoc_width_contract" >/dev/null; then
+        die "doc.rustdoc CPU-width contract accepted a planted missing preferred_inner_jobs"
+    fi
     jq -e '
         [.steps[] | select(
             .group == "build" and .job == "privileged_tests"

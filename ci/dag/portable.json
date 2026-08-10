@@ -308,12 +308,13 @@
     {
       "group": "doc", "job": "rustdoc",
       "desc": "Documentation (cargo doc --workspace --no-deps)",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 prefix (was unset -> rustdoc's build phase defaulted to nproc; historical notes show this node has hit >5GiB uncapped/at-nproc, so pinning is the fix). rss_baseline=measured_peak@j8=1.1GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.9GiB additive -> hard_mem_max_bytes=3.0GiB (was 5GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "description": "MEM/CPU DERIVATION 2026-08-10 (tasks memory-caps-must-scale-with-job-count and fix_doc_rustdoc_dynamorio): pinned_jobs=8 via both CARGO_BUILD_JOBS=8 and preferred_inner_jobs=8. The explicit preferred width is load-bearing: safe-ci's declarations-first default otherwise boxes this eight-worker cold DynamoRIO build to cpu.max=1 core while the DBT ratchet derives 132s from eight effective workers. That mismatch measured 178.71s at Hermit 21b22c2b (1429.68 effective job-seconds) versus five retained same-recipe cold builds at 16.06-40.54s; the median 21.09s * 8 = 168.72s predicts the one-core failure within 5.9%. The 132s ratchet is unchanged. rss_baseline=measured_peak@j8=1.1GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm Rust artifacts but a distinct cargo-doc reverie-dbt build-script OUT_DIR can still cold-build DynamoRIO; hermit@21b22c2b. headroom=+1.9GiB additive -> hard_mem_max_bytes=3.0GiB. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
       "cmd": "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh cargo doc --workspace --no-deps",
       "deps": ["build.e2e_artifact"],
       "timeout": 900,
       "hint": {"est_duration_s": 150, "rss_baseline_bytes": 1181116006,
-               "hard_mem_max_bytes": 3221225472, "classification": "cpu-bound"}
+               "hard_mem_max_bytes": 3221225472, "classification": "cpu-bound",
+               "preferred_inner_jobs": 8}
     },
     {
       "group": "test", "job": "regular_crates",
