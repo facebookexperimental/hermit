@@ -18,6 +18,22 @@ const _: () = {
     assert!(Sysno::last().id() == 461);
 };
 
+/// Every syscall in the pinned x86_64 table, including the final entry.
+///
+/// `Sysno::iter()` in `syscalls` 0.6.18 stops one short: its loop bound is
+/// strict, so `Sysno::last()` is never yielded. Any policy sweep written as
+/// `Sysno::iter().filter(..)` therefore silently drops the last row of the
+/// table. That is not hypothetical — it dropped `lsm_list_modules` (id 461,
+/// Determinized and deterministically refused) out of the `passthru_opt`
+/// subscription, letting it execute natively against the host on every
+/// `hermit record` / `hermit replay`.
+///
+/// Use this instead of `Sysno::iter()` for anything that must cover the whole
+/// classification table.
+pub(crate) fn all_pinned_syscalls() -> impl Iterator<Item = Sysno> {
+    Sysno::iter().chain(std::iter::once(Sysno::last()))
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 /// Detcore's execution policy for a named Linux syscall.
 pub(crate) enum SyscallClassification {
@@ -1276,8 +1292,7 @@ mod tests {
     #[test]
     fn every_pinned_sysno_has_an_explicit_classification() {
         let mut counts = [0usize; 3];
-        // syscalls 0.6.18 `Sysno::iter()` omits `last()` due its strict loop bound.
-        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+        for sysno in all_pinned_syscalls() {
             match classify_syscall(sysno) {
                 SyscallClassification::Determinized => counts[0] += 1,
                 SyscallClassification::PassThrough => counts[1] += 1,

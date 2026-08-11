@@ -1920,6 +1920,323 @@ mod tests {
         }
     }
 
+    /// Every `Determinized` syscall that this gate currently lets run natively
+    /// in a copied child under strict execution.
+    ///
+    /// THIS LIST IS AN ACKNOWLEDGED-ESCAPE REGISTER, NOT AN APPROVAL. A copied
+    /// pre-exec child runs no Detcore tool, so each of these executes against
+    /// the host while the ptrace path would have determinized it. `ioprio_get`
+    /// is the clearest live example: `handle_ioprio_get` returns a fixed
+    /// host-independent priority on the ptrace path, and a copied child returns
+    /// the real host I/O priority instead.
+    ///
+    /// It is pinned so the failure mode that produced this list cannot recur
+    /// silently. Reclassifying a syscall from `Unsupported` to `Determinized`
+    /// without giving the copied child a policy adds a row here and FAILS this
+    /// test, forcing an explicit decision at the moment of reclassification
+    /// rather than leaving a host escape to be discovered in review months
+    /// later. That is the whole defect this test exists to prevent: the gate
+    /// was correct for the classification table it was written against, and
+    /// later table rows routed around it.
+    ///
+    /// Shrinking this list is the goal. Do not grow it without a stated reason.
+    const ACKNOWLEDGED_STRICT_COPIED_CHILD_ESCAPES: &[&str] = &[
+        "accept",
+        "accept4",
+        "adjtimex",
+        "alarm",
+        "arch_prctl",
+        "bind",
+        "clock_adjtime",
+        "clock_getres",
+        "clock_gettime",
+        "clock_nanosleep",
+        "clone",
+        "clone3",
+        "close",
+        "close_range",
+        "connect",
+        "creat",
+        "dup",
+        "dup2",
+        "dup3",
+        "epoll_create",
+        "epoll_create1",
+        "epoll_ctl",
+        "epoll_pwait",
+        "epoll_pwait2",
+        "epoll_wait",
+        "epoll_wait_old",
+        "eventfd",
+        "eventfd2",
+        "execve",
+        "execveat",
+        "exit",
+        "exit_group",
+        "fadvise64",
+        "fcntl",
+        "flock",
+        "fork",
+        "fstat",
+        "fstatfs",
+        "futex",
+        "get_mempolicy",
+        "getcpu",
+        "getdents",
+        "getdents64",
+        "getegid",
+        "geteuid",
+        "getgid",
+        "getitimer",
+        "getpeername",
+        "getpriority",
+        "getrandom",
+        "getresgid",
+        "getresuid",
+        "getrlimit",
+        "getrusage",
+        "getsockname",
+        "getsockopt",
+        "gettimeofday",
+        "getuid",
+        "inotify_add_watch",
+        "inotify_init",
+        "inotify_init1",
+        "inotify_rm_watch",
+        "ioprio_get",
+        "ioprio_set",
+        "kill",
+        "listen",
+        "lseek",
+        "lstat",
+        "madvise",
+        "mbind",
+        "membarrier",
+        "memfd_create",
+        "migrate_pages",
+        "mincore",
+        "mmap",
+        "move_pages",
+        "mremap",
+        "munmap",
+        "nanosleep",
+        "newfstatat",
+        "open",
+        "openat",
+        "pause",
+        "pidfd_getfd",
+        "pidfd_open",
+        "pidfd_send_signal",
+        "pipe",
+        "pipe2",
+        "poll",
+        "ppoll",
+        "prctl",
+        "pread64",
+        "preadv",
+        "preadv2",
+        "prlimit64",
+        "process_madvise",
+        "pselect6",
+        "pwrite64",
+        "pwritev",
+        "pwritev2",
+        "read",
+        "readv",
+        "recvfrom",
+        "rt_sigaction",
+        "rt_sigpending",
+        "rt_sigprocmask",
+        "rt_sigqueueinfo",
+        "rt_sigsuspend",
+        "rt_sigtimedwait",
+        "rt_tgsigqueueinfo",
+        "sched_getaffinity",
+        "sched_getattr",
+        "sched_getparam",
+        "sched_getscheduler",
+        "sched_rr_get_interval",
+        "sched_setaffinity",
+        "sched_setattr",
+        "sched_setparam",
+        "sched_setscheduler",
+        "sched_yield",
+        "seccomp",
+        "select",
+        "sendfile",
+        "sendmmsg",
+        "sendmsg",
+        "sendto",
+        "set_mempolicy",
+        "set_mempolicy_home_node",
+        "setfsgid",
+        "setfsuid",
+        "setgid",
+        "setgroups",
+        "setitimer",
+        "setpriority",
+        "setregid",
+        "setresgid",
+        "setresuid",
+        "setreuid",
+        "setrlimit",
+        "setsid",
+        "setsockopt",
+        "setuid",
+        "shutdown",
+        "signalfd",
+        "signalfd4",
+        "socket",
+        "socketpair",
+        "stat",
+        "statfs",
+        "statx",
+        "sysinfo",
+        "syslog",
+        "tgkill",
+        "time",
+        "timer_create",
+        "timer_delete",
+        "timer_getoverrun",
+        "timer_gettime",
+        "timer_settime",
+        "timerfd_create",
+        "timerfd_gettime",
+        "timerfd_settime",
+        "times",
+        "tkill",
+        "uname",
+        "userfaultfd",
+        "utime",
+        "utimensat",
+        "utimes",
+        "vfork",
+        "wait4",
+        "waitid",
+        "write",
+        "writev",
+    ];
+
+    /// Disposition of the three reviewer findings this gate was opened for, so
+    /// the positive side of the bracket is a test rather than a claim.
+    ///
+    /// `perf_event_open` (#876) and `remap_file_pages` (#882) reach the gate and
+    /// are refused. `ioprio_get` / `ioprio_set` (#881) are NOT: they are
+    /// Determinized by emulation rather than by refusal, and this ABI returns
+    /// only native / fail-closed / errno, so it cannot carry the fixed priority
+    /// `handle_ioprio_get` produces on the ptrace path. A copied child therefore
+    /// still reports the host's real I/O priority. Pinned as a known divergence
+    /// so it is visible rather than assumed fixed.
+    #[test]
+    fn copied_child_disposition_of_the_covered_reviewer_findings() {
+        let _guard = COPIED_CHILD_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+        COPIED_PANIC_ON_UNSUPPORTED.store(true, Ordering::Release);
+
+        // Refused before reaching the host.
+        for sysno in [Sysno::perf_event_open, Sysno::remap_file_pages] {
+            assert!(detcore::is_determinized_syscall(sysno));
+            assert_eq!(
+                copied_child_action(sysno.id() as i64),
+                1,
+                "{sysno} must not reach the host from a strict copied child"
+            );
+        }
+
+        // Still diverging: emulated on the ptrace path, native here.
+        for sysno in [Sysno::ioprio_get, Sysno::ioprio_set] {
+            assert!(detcore::is_determinized_syscall(sysno));
+            assert!(!detcore::is_deterministically_refused_syscall(sysno));
+            assert_eq!(
+                copied_child_action(sysno.id() as i64),
+                0,
+                "{sysno} disposition changed; update this test and issue #1793"
+            );
+        }
+
+        COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
+    }
+
+    /// Fails when a `Determinized` syscall gains a silent native escape in a
+    /// strict copied child. See `ACKNOWLEDGED_STRICT_COPIED_CHILD_ESCAPES`.
+    #[test]
+    fn no_new_determinized_syscall_silently_escapes_the_copied_child() {
+        let _guard = COPIED_CHILD_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+        COPIED_PANIC_ON_UNSUPPORTED.store(true, Ordering::Release);
+
+        let observed: Vec<String> = detcore::all_pinned_syscalls()
+            .filter(|sysno| detcore::is_determinized_syscall(*sysno))
+            .filter(|sysno| copied_child_action(sysno.id() as i64) == 0)
+            .map(|sysno| sysno.to_string())
+            .collect();
+
+        COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
+
+        let expected: Vec<String> = ACKNOWLEDGED_STRICT_COPIED_CHILD_ESCAPES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let added: Vec<&String> = observed.iter().filter(|s| !expected.contains(s)).collect();
+        let removed: Vec<&String> = expected.iter().filter(|s| !observed.contains(s)).collect();
+
+        assert!(
+            added.is_empty(),
+            "these Determinized syscalls newly run NATIVELY in a strict copied child, \
+             bypassing Detcore: {added:?}. Give each one a copied-child policy \
+             (fixed errno or fail-closed), or add it to \
+             ACKNOWLEDGED_STRICT_COPIED_CHILD_ESCAPES with a stated reason."
+        );
+        assert!(
+            removed.is_empty(),
+            "these syscalls no longer escape — remove them from \
+             ACKNOWLEDGED_STRICT_COPIED_CHILD_ESCAPES so the register stays exact: {removed:?}"
+        );
+    }
+
+    /// CENSUS (measurement, not a policy assertion): how many `Determinized`
+    /// syscalls does the copied-child gate actually stop before the host?
+    ///
+    /// Printed as N-of-M so a coverage regression is visible as a number rather
+    /// than as an absent test.
+    #[test]
+    fn census_determinized_syscalls_reaching_the_copied_child_gate() {
+        let _guard = COPIED_CHILD_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+
+        for strict in [true, false] {
+            COPIED_PANIC_ON_UNSUPPORTED.store(strict, Ordering::Release);
+            let mut determinized = 0usize;
+            let mut stopped = 0usize;
+            let mut escaping: Vec<String> = Vec::new();
+            for sysno in detcore::all_pinned_syscalls() {
+                if !detcore::is_determinized_syscall(sysno) {
+                    continue;
+                }
+                determinized += 1;
+                if copied_child_action(sysno.id() as i64) == 0 {
+                    escaping.push(sysno.to_string());
+                } else {
+                    stopped += 1;
+                }
+            }
+            println!(
+                "copied-child strict={strict}: {stopped}/{determinized} Determinized syscalls \
+                 stopped before the host; {} run natively",
+                escaping.len()
+            );
+            println!("  escaping: {}", escaping.join(" "));
+        }
+
+        COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
+    }
+
     // TODO-HUMAN-REVIEW(PR-916): Regression for the copied-DBT-child keyring
     // isolation boundary. A copied pre-exec child runs no Rust Detcore Tool, so
     // the gate must refuse the (now Determinized) keyring family in strict mode
