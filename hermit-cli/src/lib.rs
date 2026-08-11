@@ -1106,7 +1106,13 @@ async fn run_sabre(
     // the root process's barrier (and any intentionally unreaped child barriers) before scheduler
     // shutdown; no guest thread remains that could race timer fast-forward here.
     global.release_all_physical_process_exits();
-    let requires_forced_shutdown = !supervised.status.success();
+    // A SaBRe execution in which no guest thread ever reached the coordinator
+    // is an execution in which Detcore was never loaded as a Reverie tool: the
+    // guest ran on bare Linux. Treat it exactly like a failed run so the
+    // scheduler is torn down here instead of blocking forever in `clean_up`
+    // below, waiting for a guest thread that will never register.
+    let detcore_never_engaged = !supervised.path_evidence.guest_rpc_observed;
+    let requires_forced_shutdown = !supervised.status.success() || detcore_never_engaged;
     if requires_forced_shutdown {
         global.force_shutdown_with_error();
     }
@@ -1117,6 +1123,16 @@ async fn run_sabre(
         guest_rpc_observed = supervised.path_evidence.guest_rpc_observed,
         "SaBRe ptrace fallback completed",
     );
+    // Emit one unconditional, machine-readable per-run fact instead of a
+    // free-form warning. SaBRe loads the guest interpreter before the Detcore
+    // plugin, so pre-plugin loader syscalls are structurally absent from its
+    // observation envelope. Versioning that fact lets scorecard consumers
+    // reject old or incomplete records rather than infer coverage from silence.
+    //
+    // This is intentionally observable on the Hermit CLI's stderr. Printing it
+    // for every SaBRe run keeps a missing record distinct from a record whose
+    // counters are zero.
+    eprintln!("{}", sabre_backend_evidence_line(&supervised.path_evidence));
     if let Some(path) = path_evidence_file {
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -1151,8 +1167,68 @@ async fn run_sabre(
     global
         .clean_up(print_summary, print_summary_to_json_file)
         .await;
+    if detcore_never_engaged {
+        return Err(anyhow!(
+            "{}",
+            sabre_uninstrumented_guest_message(&output.status)
+        ));
+    }
     Ok(output)
 }
+
+/// Classify the existing SaBRe reach evidence without collapsing "never
+/// engaged" into the same zero-valued state as a fully exercised run.
+fn sabre_reach_state(guest_rpc_observed: bool, ptrace_fallback_sites: usize) -> &'static str {
+    match (guest_rpc_observed, ptrace_fallback_sites) {
+        (false, _) => "no-detcore-reached",
+        (true, 1..) => "degraded-ptrace-fallback",
+        (true, 0) => "sabre-exercised",
+    }
+}
+
+/// Produce the versioned SaBRe backend fact consumed by compatibility reports.
+///
+/// `preplugin_coverage=absent` is a property of SaBRe's launch order: the guest
+/// interpreter runs before the Detcore plugin is loaded. It is recorded rather
+/// than inferred from counters because the ptrace fallback cannot observe that
+/// interval either.
+fn sabre_backend_evidence_line(evidence: &sabre_ptrace::PathEvidence) -> String {
+    format!(
+        ":: Backend: sabre static rewriting + ptrace runtime; run_mode=run; \
+         evidence_schema={}; preplugin_coverage=absent; ptrace_fallback_sites={}; \
+         trusted_shared_object_sites={}; guest_rpc_observed={}; reach_state={}",
+        evidence.schema,
+        evidence.ptrace_fallback_sites,
+        evidence.trusted_shared_object_sites,
+        evidence.guest_rpc_observed,
+        sabre_reach_state(evidence.guest_rpc_observed, evidence.ptrace_fallback_sites),
+    )
+}
+
+/// Explain a SaBRe run whose guest never reached the Detcore coordinator.
+///
+/// `guest_rpc_observed` is set by the coordinator RPC listener the first time a
+/// SaBRe-loaded guest connects. When it stays false the guest completed without
+/// Detcore intercepting anything, so the run carries no determinism guarantee
+/// whatsoever -- its timing, scheduling, PIDs, and clock reads all came from the
+/// host. Reporting that as a successful `hermit run` would be a fail-open
+/// determinism hole, so the caller turns it into a hard error and this function
+/// supplies the diagnosis.
+///
+/// The dominant cause is a guest whose syscall sites SaBRe never rewrote. A
+/// statically linked ELF is the sharp edge: it has no dynamic loader and no
+/// shared library through which SaBRe could regain control, so an unrewritten
+/// static client runs entirely on bare Linux with no second chance.
+fn sabre_uninstrumented_guest_message(status: &ExitStatus) -> String {
+    format!(
+        "the SaBRe backend finished ({status:?}) without the guest ever reaching the Detcore \
+         coordinator: no syscall was intercepted, so this run applied no determinization at all \
+         and its result is not a Hermit guarantee. This means SaBRe rewrote no syscall site in \
+         the guest -- most often a statically linked ELF, whose syscall sites SaBRe must patch \
+         in the client image itself because there is no dynamic loader to intercept."
+    )
+}
+
 /// Guest-physical memory available to the single-process KVM personality.
 // The KVM personality is a sparse MAP_NORESERVE address space. QEMU needs room
 // for its own ELF mappings in addition to the nested machine's RAM mapping.
@@ -1967,7 +2043,10 @@ mod tests {
     use super::reserve_output_stdin_snapshot;
     use super::resolve_kvm_shebang;
     use super::resolve_sabre_binary_from;
+    use super::sabre_backend_evidence_line;
     use super::sabre_program_needs_neutral_name;
+    use super::sabre_reach_state;
+    use super::sabre_uninstrumented_guest_message;
     use super::shutdown_sabre_rpc;
     use super::stage_sabre_program_in;
     use super::stop_sabre_rpc_server;
@@ -2022,6 +2101,88 @@ mod tests {
         }
         assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(121)));
         assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(128)));
+    }
+
+    /// A SaBRe guest that never reaches the coordinator ran with no Detcore in
+    /// the loop at all. The diagnosis must say so in those terms -- a
+    /// zero-syscall SaBRe run is not a weak result, it is *no* result -- and it
+    /// must name the statically linked ELF case, which is the shape that
+    /// reaches this path in practice because a static client has no dynamic
+    /// loader through which SaBRe could regain control.
+    #[test]
+    fn uninstrumented_sabre_guest_is_reported_as_no_determinization() {
+        let message = sabre_uninstrumented_guest_message(&ExitStatus::Exited(0));
+        assert!(
+            message.contains("no determinization at all"),
+            "must not present an uninstrumented run as a weaker guarantee: {message}"
+        );
+        assert!(
+            message.contains("Detcore coordinator"),
+            "must name the authority that was never reached: {message}"
+        );
+        assert!(
+            message.contains("statically linked ELF"),
+            "must name the dominant cause so the reader can act: {message}"
+        );
+        // The exit status is carried because a successful-looking status is
+        // exactly what makes this failure mode dangerous.
+        assert!(
+            message.contains("Exited(0)"),
+            "must carry the observed status: {message}"
+        );
+        assert!(
+            sabre_uninstrumented_guest_message(&ExitStatus::Exited(139)).contains("Exited(139)"),
+            "must carry a failing status too"
+        );
+    }
+
+    /// The old two-way banner treated both `guest_rpc_observed=false` and an
+    /// engaged zero-fallback run as `sabre-exercised`. Assert the three states
+    /// together so no pair can collapse back onto one value.
+    #[test]
+    fn sabre_reach_states_are_pairwise_distinct() {
+        let no_detcore = sabre_reach_state(false, 0);
+        let degraded = sabre_reach_state(true, 1);
+        let exercised = sabre_reach_state(true, 0);
+
+        assert_eq!(no_detcore, "no-detcore-reached");
+        assert_eq!(degraded, "degraded-ptrace-fallback");
+        assert_eq!(exercised, "sabre-exercised");
+        assert_ne!(no_detcore, degraded);
+        assert_ne!(no_detcore, exercised);
+        assert_ne!(degraded, exercised);
+        assert_eq!(
+            sabre_reach_state(false, 9),
+            "no-detcore-reached",
+            "absence of a guest RPC must dominate any fallback count"
+        );
+    }
+
+    #[test]
+    fn sabre_backend_fact_is_versioned_and_names_preplugin_coverage() {
+        let exercised = super::sabre_ptrace::PathEvidence {
+            schema: 1,
+            guest_rpc_observed: true,
+            ptrace_fallback_sites: 0,
+            trusted_shared_object_sites: 2,
+            trusted_shared_objects: vec!["/usr/lib/libc.so.6".to_owned()],
+        };
+        assert_eq!(
+            sabre_backend_evidence_line(&exercised),
+            ":: Backend: sabre static rewriting + ptrace runtime; run_mode=run; \
+             evidence_schema=1; preplugin_coverage=absent; ptrace_fallback_sites=0; \
+             trusted_shared_object_sites=2; guest_rpc_observed=true; \
+             reach_state=sabre-exercised"
+        );
+
+        let unengaged = super::sabre_ptrace::PathEvidence {
+            guest_rpc_observed: false,
+            ..exercised
+        };
+        let fact = sabre_backend_evidence_line(&unengaged);
+        assert!(fact.contains("preplugin_coverage=absent"));
+        assert!(fact.contains("reach_state=no-detcore-reached"));
+        assert!(!fact.contains("reach_state=sabre-exercised"));
     }
 
     #[test]

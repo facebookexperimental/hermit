@@ -27,6 +27,8 @@ mod image;
 mod instruction_map;
 mod list;
 mod logdiff;
+mod oci;
+mod podman_store;
 mod record;
 mod record_start;
 mod remove;
@@ -176,6 +178,7 @@ use self::bisect::BisectOpts;
 use self::global_opts::GlobalOpts;
 use self::instruction_map::InstructionMapOpts;
 use self::logdiff::LogDiffCLIOpts;
+use self::oci::OciOpts;
 use self::record::RecordOpts;
 use self::replay::ReplayOpts;
 use self::run::RunOpts;
@@ -227,6 +230,10 @@ enum Subcommand {
     /// Generate a JSON map of nondeterministic instructions in an ELF binary.
     #[clap(name = "instruction-map")]
     InstructionMap(InstructionMapOpts),
+
+    /// Discover and run OCI images from the local image store.
+    #[clap(name = "oci")]
+    Oci(Box<OciOpts>),
 }
 
 impl Subcommand {
@@ -234,8 +241,15 @@ impl Subcommand {
         if backend == Some(hermit::Backend::Sabre)
             && !matches!(self, Subcommand::Strace(_) | Subcommand::Run(_))
         {
+            // The predicate admits Strace AND Run, and `run` genuinely works --
+            // measured 2026-08-06 on a 4-thread guest: `hermit --backend sabre run`
+            // exited 0 with the correct deterministic result. The message used to
+            // name only `strace`, so it told users a working path was unsupported
+            // and hid real backend maturity. Message and predicate are now derived
+            // from the same list; if the predicate changes, this text must too.
             anyhow::bail!(
-                "the SaBRe backend is available only through `hermit --backend sabre strace`"
+                "the SaBRe backend is available only through `hermit --backend sabre run` \
+                 and `hermit --backend sabre strace`"
             );
         }
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -310,6 +324,7 @@ impl Subcommand {
             Subcommand::Analyze(x) => x.main(global),
             Subcommand::Bisect(x) => x.main(global),
             Subcommand::InstructionMap(x) => x.main(global),
+            Subcommand::Oci(x) => x.main(global),
         }
     }
 }
@@ -730,6 +745,63 @@ mod tests {
             let parsed = Args::try_parse_from(args).expect("record --strict should parse");
             assert!(matches!(parsed.command, Subcommand::Record(_)));
         }
+    }
+
+    /// The scope PREDICATE and the scope MESSAGE must name the same set.
+    ///
+    /// They drifted apart: the predicate admitted `Strace | Run` while the text
+    /// said "only ... strace", so a working path was documented as unsupported.
+    /// Both directions are asserted, because either half alone is satisfiable by
+    /// a wrong fix -- narrowing the predicate to strace would pass a
+    /// message-only test, and leaving the message alone would pass a
+    /// predicate-only test.
+    #[test]
+    fn sabre_scope_admits_exactly_run_and_strace() {
+        use hermit::Backend;
+
+        // POSITIVE: both admitted subcommands must pass the scope guard.
+        for sub in ["run", "strace"] {
+            let args = Args::try_parse_from([
+                "hermit",
+                "--backend",
+                "sabre",
+                sub,
+                "--",
+                "/bin/echo",
+                "hi",
+            ])
+            .unwrap_or_else(|e| panic!("`--backend sabre {sub}` should parse: {e}"));
+            assert_eq!(args.global.backend, Some(Backend::Sabre));
+            args.command
+                .validate_backend_scope(args.global.backend)
+                .unwrap_or_else(|e| panic!("`--backend sabre {sub}` must be in scope: {e}"));
+        }
+
+        // NEGATIVE: something outside the set is still refused. Without this the
+        // guard could admit everything and still pass the positives above.
+        let args = Args::try_parse_from([
+            "hermit",
+            "--backend",
+            "sabre",
+            "log-diff",
+            "/dev/null",
+            "/dev/null",
+        ])
+        .expect("log-diff should parse");
+        let err = args
+            .command
+            .validate_backend_scope(args.global.backend)
+            .expect_err("`--backend sabre log-diff` must be rejected");
+
+        // And the refusal must NAME both supported forms. A message that omits
+        // `run` is the original defect: it sends a user away from a path that
+        // works.
+        let text = err.to_string();
+        assert!(text.contains("sabre run"), "message must name run: {text}");
+        assert!(
+            text.contains("sabre strace"),
+            "message must name strace: {text}"
+        );
     }
 
     #[test]

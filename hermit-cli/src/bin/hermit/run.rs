@@ -1758,6 +1758,21 @@ fn validate_e9patch_mount_target(path: &Path) -> Result<(), Error> {
 /// Create two logging destinations and two global configs. Returns non-zero exit
 /// status if there was a difference in any component of the output.
 impl RunOpts {
+    /// Point this run at an OCI image rootfs, as `--image` does.
+    ///
+    /// Used by `hermit oci run`, which resolves the user's reference to the
+    /// store's canonical image id first. A tag is a mutable pointer, so passing
+    /// the resolved id — not the reference — is what keeps the rootfs cache from
+    /// aliasing two different images that shared a tag.
+    pub(crate) fn set_image(&mut self, image: String) {
+        self.image = Some(image);
+    }
+
+    /// The `--image` reference this run was given, if any.
+    pub(crate) fn image(&self) -> Option<&str> {
+        self.image.as_deref()
+    }
+
     fn selected_backend(&self) -> Backend {
         self.backend.unwrap_or_default()
     }
