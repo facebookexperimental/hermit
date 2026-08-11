@@ -1003,11 +1003,10 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace", "kvm", "sabre"]
-guest_args = { ptrace = ["multi"], kvm = ["multi"], sabre = ["multi"] }
+backends_enabled = ["ptrace", "kvm", "sabre", "liteinst"]
+guest_args = { ptrace = ["multi"], kvm = ["multi"], sabre = ["multi"], liteinst = ["multi"] }
 [test.modes.verify.backends_disabled]
 dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
-liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
 ci = false
@@ -2916,11 +2915,10 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace", "kvm", "sabre"]
-guest_args = { ptrace = ["multiple"], kvm = ["multiple"], sabre = ["multiple"] }
+backends_enabled = ["ptrace", "kvm", "sabre", "liteinst"]
+guest_args = { ptrace = ["multiple"], kvm = ["multiple"], sabre = ["multiple"], liteinst = ["multiple"] }
 [test.modes.verify.backends_disabled]
 dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
-liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
 ci = false
@@ -7014,13 +7012,12 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace"]
-guest_args = { ptrace = ["v4-us"] }
+backends_enabled = ["ptrace", "liteinst"]
+guest_args = { ptrace = ["v4-us"], liteinst = ["v4-us"] }
 [test.modes.verify.backends_disabled]
 dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
 sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
-liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
 ci = false
