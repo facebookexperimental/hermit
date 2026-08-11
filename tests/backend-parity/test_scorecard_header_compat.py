@@ -47,6 +47,9 @@ LEGACY_19 = (
 CURRENT_20 = LEGACY_19 + ",verify_compare"
 RENAMED_20 = CURRENT_20.replace(",parity,", ",stdout_parity,")
 OPERAND_AWARE_23 = RENAMED_20 + ",ref_output_hash,parity_comparator,parity_tier"
+LEGACY_OPERAND_AWARE_23 = (
+    CURRENT_20 + ",ref_output_hash,parity_comparator,parity_tier"
+)
 
 # A planted matching cell and a planted divergent cell.  Their parity comes from
 # real byte operands, not from the enclosing PASS/FAIL status.  This is the
@@ -267,16 +270,16 @@ check(
 )
 
 
-def run_backend_local_layout(candidate_stdout: bytes):
-    """Exercise a dynamic row whose raw addresses are not a parity contract."""
-    responses = [
-        run_matrix.subprocess.CompletedProcess([], 0, candidate_stdout, b"")
-        for _ in range(run_matrix.RUNS)
-    ]
+def run_backend_local_dynamic(name: str, candidate_stdout: bytes):
+    """Exercise a dynamic row whose raw output is not a parity contract."""
+    commands: list[list[str]] = []
     original = run_matrix.run_with_timeout
 
-    def planted_run(_command):
-        return responses.pop(0)
+    def planted_run(command):
+        commands.append(command)
+        return run_matrix.subprocess.CompletedProcess(
+            command, 0, candidate_stdout, b""
+        )
 
     evidence: dict[str, str] = {}
     try:
@@ -284,23 +287,25 @@ def run_backend_local_layout(candidate_stdout: bytes):
         result = run_matrix.run_case(
             Path("/planted/hermit"),
             "dbt",
-            "anonymous_mmap_layout",
+            name,
             run_matrix.CatalogFixtures(),
             strict=True,
             evidence=evidence,
         )
     finally:
         run_matrix.run_with_timeout = original
-    return result, evidence, responses
+    return result, evidence, commands
 
 
-result, backend_local, remaining = run_backend_local_layout(
-    b"multiple 0x1000 0x2000 0x3000\n"
+result, backend_local, backend_local_commands = run_backend_local_dynamic(
+    "anonymous_mmap_layout", b"multiple 0x1000 0x2000 0x3000\n"
 )
 check(
     "backend-local layout remains a within-backend repeatability contract",
-    result[0] == "PASS" and not remaining,
-    repr((result, remaining)),
+    result[0] == "PASS"
+    and len(backend_local_commands) == run_matrix.RUNS
+    and all("--backend" in command for command in backend_local_commands),
+    repr((result, backend_local_commands)),
 )
 check(
     "backend-local layout does not invent cross-backend operands",
@@ -317,6 +322,163 @@ check(
         "dbt", "anonymous_mmap_layout", None
     ),
 )
+
+clock_result, clock_local, clock_commands = run_backend_local_dynamic(
+    "virtual_clock", b"clock matrix success\n"
+)
+check(
+    "virtual clock remains a within-backend repeatability contract",
+    clock_result[0] == "PASS"
+    and len(clock_commands) == run_matrix.RUNS
+    and all("--backend" in command for command in clock_commands),
+    repr((clock_result, clock_commands)),
+)
+check(
+    "virtual clock performs no ptrace reference or cross-backend verdict",
+    not run_matrix.exact_stdout_parity_contract("dbt", "virtual_clock", None)
+    and clock_local.get("comparison_tier") == "unqualified-no-comparison"
+    and "output_hash" not in clock_local
+    and "ref_output_hash" not in clock_local
+    and "stdout_parity" not in clock_local,
+    repr(clock_local),
+)
+
+
+print("case BACKEND-ARGS — ptrace reference excludes KVM-only guest arguments")
+kvm_commands: list[list[str]] = []
+original = run_matrix.run_with_timeout
+
+
+def planted_memory_advice(command):
+    kvm_commands.append(command)
+    if "--backend" not in command and "--kvm" in command:
+        return run_matrix.subprocess.CompletedProcess(
+            command,
+            14,
+            b"",
+            b"ptrace fixture rejected KVM-only invocation\n",
+        )
+    return run_matrix.subprocess.CompletedProcess(command, 0, b"madvise-ok\n", b"")
+
+
+kvm_evidence: dict[str, str] = {}
+try:
+    run_matrix.run_with_timeout = planted_memory_advice
+    kvm_memory_advice = run_matrix.run_case(
+        Path("/planted/hermit"),
+        "kvm",
+        "memory_advice",
+        run_matrix.CatalogFixtures(),
+        strict=True,
+        evidence=kvm_evidence,
+    )
+finally:
+    run_matrix.run_with_timeout = original
+check(
+    "KVM memory_advice keeps its fixed-output parity contract",
+    kvm_memory_advice[0] == "PASS"
+    and kvm_evidence.get("stdout_parity") == "1",
+    repr((kvm_memory_advice, kvm_evidence)),
+)
+check(
+    "ptrace reference receives the portable fixture invocation",
+    len(kvm_commands) == run_matrix.RUNS + 1
+    and "--backend" not in kvm_commands[0]
+    and "--kvm" not in kvm_commands[0],
+    repr(kvm_commands),
+)
+check(
+    "all KVM candidates retain the required KVM-only fixture argument",
+    len(kvm_commands) == run_matrix.RUNS + 1
+    and all(
+        "--backend" in command and "--kvm" in command
+        for command in kvm_commands[1:]
+    ),
+    repr(kvm_commands),
+)
+
+
+print("case CPUID-BLOCKED — reference capture preserves capability semantics")
+
+
+def run_cpuid_reference(reference_returncode: int, reference_stderr: bytes):
+    commands: list[list[str]] = []
+
+    def planted_cpuid(command):
+        commands.append(command)
+        if len(commands) == 1:
+            return run_matrix.subprocess.CompletedProcess(
+                command,
+                reference_returncode,
+                (
+                    b"CPUID-SUCCESS vendor=GenuineIntel signature=00000663\n"
+                    if reference_returncode == 0
+                    else b""
+                ),
+                reference_stderr,
+            )
+        return run_matrix.subprocess.CompletedProcess(
+            command,
+            0,
+            b"CPUID-SUCCESS vendor=GenuineIntel signature=00000663\n",
+            b"",
+        )
+
+    evidence: dict[str, str] = {}
+    original_run = run_matrix.run_with_timeout
+    try:
+        run_matrix.run_with_timeout = planted_cpuid
+        result = run_matrix.run_case(
+            Path("/planted/hermit"),
+            "ptrace",
+            "cpuid_policy",
+            run_matrix.CatalogFixtures(),
+            strict=True,
+            evidence=evidence,
+        )
+    finally:
+        run_matrix.run_with_timeout = original_run
+    return result, evidence, commands
+
+
+for marker in (
+    b"continuing without CPUID interception\n",
+    b"CPUID faulting is unavailable\n",
+):
+    blocked, blocked_evidence, cpuid_commands = run_cpuid_reference(14, marker)
+    check(
+        f"CPUID capability marker remains BLOCKED: {marker.decode().strip()}",
+        blocked[0] == "BLOCKED"
+        and blocked[1] == "host kernel/CPU lacks CPUID faulting"
+        and len(cpuid_commands) == 1
+        and "stdout_parity" not in blocked_evidence,
+        repr((blocked, blocked_evidence, cpuid_commands)),
+    )
+
+generic_failure, _, generic_commands = run_cpuid_reference(
+    14, b"unrelated ptrace reference failure\n"
+)
+check(
+    "unrelated ptrace reference failure remains FAIL",
+    generic_failure[0] == "FAIL"
+    and "ptrace reference exited 14" in generic_failure[1]
+    and len(generic_commands) == 1,
+    repr((generic_failure, generic_commands)),
+)
+
+cpuid_match, cpuid_evidence, cpuid_commands = run_cpuid_reference(
+    0, b""
+)
+check(
+    "available CPUID path still executes 1 reference plus 3 candidates",
+    cpuid_match[0] == "PASS"
+    and len(cpuid_commands) == run_matrix.RUNS + 1
+    and cpuid_evidence.get("stdout_parity") == "1"
+    and cpuid_evidence.get("output_hash")
+    == cpuid_evidence.get("ref_output_hash"),
+    repr((cpuid_match, cpuid_evidence, cpuid_commands)),
+)
+
 
 original = run_matrix.run_with_timeout
 try:
@@ -437,6 +599,26 @@ if err is None:
         and all(row["parity_tier"] == "stdout-exact" for row in (held, differed)),
     )
 
+print("case LEGACY-OPERAND-AWARE — measured verdict maps into parity")
+path, err = append(LEGACY_OPERAND_AWARE_23)
+check("append is accepted", err is None, repr(err))
+if err is None:
+    got = read_planted(path)
+    held = got["planted-dbt-pass"]
+    differed = got["planted-dbt-diff"]
+    check(
+        "legacy parity carries the measured matching verdict",
+        held.get("parity") == "1"
+        and held.get("output_hash") == held.get("ref_output_hash"),
+        repr(held),
+    )
+    check(
+        "legacy parity carries the measured divergent verdict",
+        differed.get("parity") == "0"
+        and differed.get("output_hash") != differed.get("ref_output_hash"),
+        repr(differed),
+    )
+
 print("case PRESERVE — an existing parent row keeps its verify_compare value")
 seed = (
     "prior-run,@1,abc,unknown,false,regression,portable,backend-parity,"
@@ -482,6 +664,8 @@ with tempfile.TemporaryDirectory(prefix="scorecard-routing-") as td:
     root = Path(td)
     compat = root / "compat-envelope"
     compat.mkdir()
+    compat_alias = root / "compat-alias"
+    compat_alias.symlink_to(compat, target_is_directory=True)
     current = compat / "scorecard.csv"
     current.write_text("sentinel-current-view\n", encoding="utf-8")
     old_root = os.environ.get("DEV_HERMIT_ROOT")
@@ -522,6 +706,27 @@ with tempfile.TemporaryDirectory(prefix="scorecard-routing-") as td:
                 unavailable_parent_refused = False
             except run_matrix.MatrixError as error:
                 unavailable_parent_refused = "refusing to append" in str(error)
+            try:
+                run_matrix.record_parent_observations(
+                    PLANTED,
+                    requested_path=compat_alias / "scorecard.csv",
+                    disabled=False,
+                    strict=True,
+                    verify=False,
+                    probe_gaps=False,
+                )
+                alias_current_refused = False
+            except run_matrix.MatrixError as error:
+                alias_current_refused = "refusing to append" in str(error)
+            alias_observation = compat_alias / "ignored" / "explicit-observation.csv"
+            alias_destination = run_matrix.record_parent_observations(
+                PLANTED,
+                requested_path=alias_observation,
+                disabled=False,
+                strict=True,
+                verify=False,
+                probe_gaps=False,
+            )
         finally:
             run_matrix.discover_compat_envelope = original_discover
         disabled_destination = run_matrix.record_parent_observations(
@@ -549,6 +754,17 @@ with tempfile.TemporaryDirectory(prefix="scorecard-routing-") as td:
     check(
         "tracked current view is refused even when parent discovery is unavailable",
         unavailable_parent_refused,
+    )
+    check(
+        "symlink alias to tracked current is refused without parent discovery",
+        alias_current_refused,
+    )
+    check(
+        "symlinked non-current observation remains writable",
+        alias_destination == alias_observation
+        and alias_observation.resolve().is_file()
+        and alias_observation.resolve().parent == compat / "ignored",
+        repr(alias_destination),
     )
     check(
         "disabled observation routing is side-effect-only",

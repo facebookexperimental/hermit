@@ -711,6 +711,21 @@ def stdout_parity_evidence(
     return evidence
 
 
+CPUID_BLOCK_REASON = "host kernel/CPU lacks CPUID faulting"
+CPUID_BLOCK_DIAGNOSTICS = (
+    "continuing without CPUID interception",
+    "CPUID faulting is unavailable",
+)
+
+
+def cpuid_policy_is_blocked(backend: str, name: str, diagnostic: str) -> bool:
+    return (
+        backend == "ptrace"
+        and name == "cpuid_policy"
+        and any(marker in diagnostic for marker in CPUID_BLOCK_DIAGNOSTICS)
+    )
+
+
 def capture_ptrace_reference(
     hermit: Path,
     guest: list[str],
@@ -718,27 +733,31 @@ def capture_ptrace_reference(
     strict: bool,
     expected_status: int,
     expected_stdout: bytes | None,
-) -> tuple[bytes | None, str]:
+) -> tuple[bytes | None, str, bool]:
     """Capture the plain-run ptrace stdout used as the cross-backend reference."""
     reference = run_with_timeout(
         hermit_command(hermit, "ptrace", guest, name, strict)
     )
     if reference is None:
-        return None, "ptrace reference timed out"
+        return None, "ptrace reference timed out", False
     if reference.returncode != expected_status:
         diagnostic = reference.stderr.decode(errors="replace").strip()
+        if cpuid_policy_is_blocked("ptrace", name, diagnostic):
+            return None, CPUID_BLOCK_REASON, True
         return (
             None,
             f"ptrace reference exited {reference.returncode}, expected "
             f"{expected_status}: {diagnostic[-300:]}",
+            False,
         )
     if expected_stdout is not None and reference.stdout != expected_stdout:
         return (
             None,
             f"ptrace reference stdout={reference.stdout!r}, "
             f"expected={expected_stdout!r}",
+            False,
         )
-    return reference.stdout, ""
+    return reference.stdout, "", False
 
 
 # Two distinct `--verify` success witnesses, and they are NOT the same assurance:
@@ -846,17 +865,10 @@ def run_case_verify(
         return "FAIL", "verify run timed out", time.monotonic() - started
     diagnostic = result.stderr.decode(errors="replace").strip()
     if result.returncode != expected_status:
-        if (
-            backend == "ptrace"
-            and name == "cpuid_policy"
-            and (
-                "continuing without CPUID interception" in diagnostic
-                or "CPUID faulting is unavailable" in diagnostic
-            )
-        ):
+        if cpuid_policy_is_blocked(backend, name, diagnostic):
             return (
                 "BLOCKED",
-                "host kernel/CPU lacks CPUID faulting",
+                CPUID_BLOCK_REASON,
                 time.monotonic() - started,
             )
         return (
@@ -954,11 +966,17 @@ def run_case(
     evidence: dict[str, str] | None = None,
 ) -> tuple[str, str, float]:
     guest, expected_status, expected_stdout = case_command(name, fixtures)
+    reference_guest = [*guest]
     if evidence is not None:
         evidence[COMPARISON_TIER_COLUMN] = COMPARISON_TIER_NO_COMPARISON
     if backend == "dbt" and name == "random_sources":
         guest = [*guest, "--root-only"]
+        # Root-only output is the existing DBT cross-backend contract, so both
+        # operands deliberately receive this shared narrowing argument.
+        reference_guest = guest
     if backend == "kvm" and name == "memory_advice":
+        # This selects the KVM-only fixture path for the candidate.  The ptrace
+        # reference must retain the portable invocation captured above.
         guest = [*guest, "--kvm"]
     if verify:
         return run_case_verify(
@@ -968,21 +986,23 @@ def run_case(
     started = time.monotonic()
     reference_stdout: bytes | None = None
     reference_problem = ""
+    reference_blocked = False
     requires_ptrace_reference = backend == "dbt" and name == "random_sources"
     requires_exact_stdout_parity = exact_stdout_parity_contract(
         backend, name, expected_stdout
     )
     if requires_exact_stdout_parity or requires_ptrace_reference:
-        reference_stdout, reference_problem = capture_ptrace_reference(
-            hermit,
-            guest,
-            name,
-            strict,
-            expected_status,
-            expected_stdout,
+        (
+            reference_stdout,
+            reference_problem,
+            reference_blocked,
+        ) = capture_ptrace_reference(
+            hermit, reference_guest, name, strict, expected_status, expected_stdout
         )
         if evidence is not None:
             evidence.update(stdout_parity_evidence(None, reference_stdout))
+        if reference_blocked:
+            return "BLOCKED", reference_problem, time.monotonic() - started
         # Preserve the pre-existing DBT random-stream contract even when the
         # caller explicitly disables scorecard output.  General stdout parity
         # may remain UNMEASURED when its reference is unavailable; this named
@@ -1022,17 +1042,10 @@ def run_case(
 
         if result.returncode != expected_status:
             diagnostic = result.stderr.decode(errors="replace").strip()
-            if (
-                backend == "ptrace"
-                and name == "cpuid_policy"
-                and (
-                    "continuing without CPUID interception" in diagnostic
-                    or "CPUID faulting is unavailable" in diagnostic
-                )
-            ):
+            if cpuid_policy_is_blocked(backend, name, diagnostic):
                 return (
                     "BLOCKED",
-                    "host kernel/CPU lacks CPUID faulting",
+                    CPUID_BLOCK_REASON,
                     time.monotonic() - started,
                 )
             return (
