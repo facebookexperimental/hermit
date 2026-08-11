@@ -138,5 +138,5 @@ native_second=$(run_redis_workload "$work_root/native")
 assert_native_nondeterminism 'Redis deep workload' "$native_first" "$native_second"
 
 run_hermit_verify 'Redis deep workload' \
-    /bin/bash "$0" --guest "$work_root/verified" >/dev/null
+    /bin/bash "$(readlink -f -- "$0")" --guest "$work_root/verified" >/dev/null
 printf 'redis-deep:verified\n'

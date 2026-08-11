@@ -101,5 +101,5 @@ native_second=$(run_http_workload "$work_root/native" "$port")
 assert_native_nondeterminism 'HTTP server workload' "$native_first" "$native_second"
 
 run_hermit_verify 'HTTP server workload' \
-    /bin/bash "$0" --guest "$work_root/verified" "$port" >/dev/null
+    /bin/bash "$(readlink -f -- "$0")" --guest "$work_root/verified" "$port" >/dev/null
 printf 'http-server:verified\n'

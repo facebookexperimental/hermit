@@ -108,5 +108,5 @@ native_second=$(run_sqlite_workload "$work_root/native")
 assert_native_nondeterminism 'SQLite on-disk workload' "$native_first" "$native_second"
 
 run_hermit_verify 'SQLite on-disk workload' \
-    /bin/bash "$0" --guest "$work_root/verified" >/dev/null
+    /bin/bash "$(readlink -f -- "$0")" --guest "$work_root/verified" >/dev/null
 printf 'sqlite-on-disk:verified:%s\n' "$EXPECTED_ROWS_SHA256"

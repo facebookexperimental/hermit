@@ -69,6 +69,23 @@ function run_hermit_verify {
     local label=$1
     shift
 
+    # Because this helper runs the guest with `--workdir=/tmp` (see below), the
+    # guest's cwd is deliberately NOT the caller's. A relative path handed
+    # through would therefore resolve against the wrong directory and surface as
+    # a confusing "No such file or directory" from inside the guest -- which is
+    # exactly how the `--workdir` change first broke `http_server.sh` when it was
+    # invoked as `./tests/e2e/lib/applications/http_server.sh` and passed a
+    # relative `$0` on to bash. Refuse loudly instead: callers pass absolute
+    # paths (`$(readlink -f -- "$0")`, `$work_root/...`).
+    local arg
+    for arg in "$@"; do
+        if [[ $arg != /* && -e $arg ]]; then
+            printf '%s: refusing relative path argument %s -- this helper sets the guest cwd to /tmp, so paths must be absolute\n' \
+                "$label" "$arg" >&2
+            return 1
+        fi
+    done
+
     local stdout_file stderr_file verdict_file status=0
     stdout_file=$(mktemp "${TMPDIR:-/tmp}/hermit-app-stdout.XXXXXX")
     stderr_file=$(mktemp "${TMPDIR:-/tmp}/hermit-app-stderr.XXXXXX")
@@ -77,9 +94,33 @@ function run_hermit_verify {
     # mistaken for a report it produced.
     rm -f -- "$verdict_file"
 
+    # `--workdir=/tmp` makes the guest's working directory HERMETIC, and that is
+    # a correctness requirement of the comparison, not a convenience.
+    #
+    # Without it the guest inherits this harness's cwd. During a full local
+    # validate that cwd is the throwaway checkout under the parent workspace's
+    # shared `ignored/` tree, which a dozen concurrent agents write to. Bash
+    # validates an inherited `$PWD` at startup by stat()ing EVERY ancestor
+    # component of it, so any nested shell the guest spawns -- including the one
+    # behind a `/usr/local/bin/*` wrapper script -- stats those shared
+    # directories. On btrfs a directory's `st_size` tracks its entries, so a
+    # sibling agent creating one file between run 1 and run 2 changes that
+    # st_size and the `--verify` pair diverges on a real, correctly-reported
+    # difference. Hermit does not make a changing filesystem deterministic; it
+    # is the test's job to present a stable one.
+    #
+    # `/tmp` is the right target because Hermit bind-mounts a fresh private
+    # directory over it, and `--workdir` is resolved AFTER guest mounts are
+    # applied, so this names the guest's isolated view. Both properties matter:
+    # merely `cd`ing to /tmp before launching would bind the cwd to the
+    # *shadowed host* /tmp (62k entries on this box, churning constantly).
+    #
+    # The guest's whole ancestor chain is then `/` plus its own private /tmp,
+    # and every mutation under it is the guest's own -- which Hermit already
+    # makes deterministic.
     timeout "$HERMIT_APPLICATION_TIMEOUT" \
         "$HERMIT_BIN" --log=info run --no-virtualize-cpuid \
-        --max-timeslice=disabled --base-env=minimal --strict \
+        --max-timeslice=disabled --base-env=minimal --strict --workdir=/tmp \
         --verify --verify-strict --verify-json "$verdict_file" -- \
         "$@" >"$stdout_file" 2>"$stderr_file" || status=$?
 
