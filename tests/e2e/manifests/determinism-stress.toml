@@ -341,3 +341,107 @@ dbt = "No edge-case Hermit arguments are required"
 kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
+
+[[test]]
+id = "determinism-stress/thread-interleaving"
+description = "Chaos explores many distinct thread interleavings, not merely two outcome classes"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace","cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/chaos/thread_interleaving.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.build]
+cflags = ["-pthread", "-Wno-unused-parameter"]
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "Native scheduling need not visit a representative set of interleavings in a bounded run"
+
+[test.modes.verify]
+ci = false
+backends_enabled = []
+[test.modes.verify.backends_disabled]
+ptrace = "Chaos mode owns this guest; repeat-identity per seed is already asserted by repeat_mismatches"
+dbi = "DBI coverage is owned by its backend parity partition"
+kvm = "KVM requires the privileged runner"
+sabre = "SaBRe requires its external runtime"
+liteinst = "LiteInst coverage is owned by its backend compatibility partition"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Chaos witness reproduction is the required relation for this deliberately racy guest"
+dbi = "Record/replay is unsupported by DBI"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = true
+# THIS CELL EXISTS TO DESATURATE THE DIVERSITY ORACLE. On
+# determinism-stress/order-violation the guest has exactly two observable
+# outcomes, so `distinct` is pinned at its ceiling and `min_distinct = 2` can
+# only ever catch a TOTAL collapse -- a partial narrowing of schedule
+# diversity passes silently. Here the observation is the thread interleaving:
+# a permutation of 0..3, so the ceiling is 4! = 24 and the count has headroom
+# to fall before it hits the floor.
+#
+# The seed list is the contiguous prefix 0..31, a SAMPLE for the same reason
+# as the order-violation cell: a curated list is a fixture keyed to the build
+# it was curated on.
+#
+# DERIVED FLOORS -- measured, not chosen. ptrace chaos, portable profile
+# (--log=off run --backend ptrace --strict --chaos --sched-heuristic=random
+#  --seed=N --no-virtualize-cpuid --max-timeslice=disabled), 2026-08-06:
+#
+#   healthy baseline, seeds 0..31, THREE independent hermit builds
+#   (f89c69766, 2e97833a1, 01c223266) -- byte-identical on all three:
+#     distinct = 9 of 24   normalized_entropy = 0.5418   histogram
+#     [13,7,4,3,1,1,1,1,1]
+#   eight disjoint 32-seed windows over seeds 0..255, one build:
+#     distinct = 9, 11, 10, 14, 9, 12, 11, 11  (min 9, median 11, max 14)
+#   determinism: repeat_mismatches = 0 of 256 seeds over 512 invocations.
+#
+#   planted PARTIAL narrowing (the workers run as two serialized pairs, so the
+#   reachable permutations drop to perm{0,1} x perm{2,3} while the guest still
+#   has four threads and the declared ceiling stays 24), same three builds,
+#   again byte-identical:
+#     distinct = 4 of 24   normalized_entropy = 0.2967   histogram [22,5,3,2]
+#
+# min_distinct = 6 sits three below the healthy minimum (9) and two above the
+# narrowed state (4). min_normalized_entropy = 0.40 sits 26% below the healthy
+# 0.5418 and 35% above the narrowed 0.2967. Two independent instruments, each
+# with margin on both sides, so neither has to be tight.
+#
+# WHY A DERIVED FLOOR IS SAFE HERE BUT NOT ON order-violation: on the two-class
+# guest the seed-to-class map reshuffles between builds -- even between builds
+# of the SAME source commit -- so its minority_share swings 0.125-0.375 and any
+# floor is a coin flip. This guest's statistics were IDENTICAL on all three
+# builds. The count over a permutation space is a far more stable estimator
+# than the minority share of a two-class split. Re-measure across builds before
+# tightening either floor; widen the prefix rather than raising a floor to
+# chase sensitivity.
+seeds = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]
+outcome_classes = 24
+assert = { min_distinct = 6, min_passes = 1, min_failures = 0, min_normalized_entropy = 0.40 }
+backends_enabled = ["ptrace"]
+[test.modes.chaos.backends_disabled]
+dbi = "Chaos scheduling is unsupported by DBI"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "Chaos mode already supplies the required scheduler arguments"
+dbi = "No edge-case Hermit arguments are required"
+kvm = "No edge-case Hermit arguments are required"
+sabre = "No edge-case Hermit arguments are required"
+liteinst = "No edge-case Hermit arguments are required"

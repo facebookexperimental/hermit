@@ -3027,15 +3027,29 @@ function run_cell {
             diversity_summary+=" entropy=$normalized_entropy ($entropy_bits bits)"
             diversity_summary+=" minority_share=$minority_share classes=[$class_histogram]"
             diversity_summary+=" oracle_saturated=$oracle_saturated"
-            if ((repeat_mismatches > 0 || distinct < min_distinct || passes < min_passes \
-                || failures < min_failures || entropy_short == 1)); then
+            # Name EVERY unmet leg, not just the first or the most recently added.
+            # A chaos cell asserts up to five independent things, and reporting one
+            # while three others are also unmet is how "distinct=1" got read as the
+            # whole story when min_failures was unmet too. The count is stated so a
+            # reader can tell a single-leg failure from a broad one.
+            local -a unmet=()
+            ((repeat_mismatches > 0)) &&
+                unmet+=("repeat_mismatches=$repeat_mismatches (a seed did not reproduce; this is a DETERMINISM failure, not a diversity one)")
+            ((distinct < min_distinct)) &&
+                unmet+=("distinct $distinct < min_distinct $min_distinct")
+            ((passes < min_passes)) && unmet+=("passes $passes < min_passes $min_passes")
+            ((failures < min_failures)) &&
+                unmet+=("failures $failures < min_failures $min_failures")
+            ((entropy_short == 1)) &&
+                unmet+=("normalized entropy $normalized_entropy < min_normalized_entropy $min_normalized_entropy (diversity narrowed without collapsing)")
+            if ((${#unmet[@]} > 0)); then
                 outcome=FAIL
                 reason="chaos $diversity_summary passes=$passes failures=$failures"
                 reason+=" repeat_mismatches=$repeat_mismatches"
-                if ((entropy_short == 1)); then
-                    reason+="; normalized entropy $normalized_entropy below floor"
-                    reason+=" $min_normalized_entropy (diversity narrowed without collapsing)"
-                fi
+                reason+="; ${#unmet[@]} of 5 assertions unmet: "
+                local joined
+                printf -v joined '%s; ' "${unmet[@]}"
+                reason+="${joined%; }"
             else
                 reason="chaos $diversity_summary passes=$passes failures=$failures;"
                 reason+=" every seed reproduced"

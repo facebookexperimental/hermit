@@ -823,6 +823,13 @@
       "backend": "ptrace",
       "category": "determinism-stress",
       "lane": "portable",
+      "mode": "chaos",
+      "test": "determinism-stress/thread-interleaving"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
       "mode": "verify",
       "test": "determinism-stress/thread-output"
     },
