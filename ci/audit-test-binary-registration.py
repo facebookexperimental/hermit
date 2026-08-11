@@ -38,6 +38,57 @@ _HERMIT_INVOCATION_RE = re.compile(r"cargo test -p hermit(?!-)[^\"\n]*")
 _TEST_FLAG_RE = re.compile(r"--test(?:=|\s+)([A-Za-z0-9_]+)")
 _TOP_LEVEL_TEST_RE = re.compile(r"^hermit-cli/tests/([^/]+)\.rs$")
 
+# REGISTRATION MEANS "CI EXECUTES IT", NOT "THE TEXT APPEARS SOMEWHERE".
+#
+# The audit used to regex the whole DAG document, so any string that merely looked
+# like an invocation registered a binary: a `desc` field mentioning one, or the
+# literal command `echo cargo test -p hermit --test zz_probe`, both counted. A
+# binary excused by text that never runs is exactly the blindness this file exists
+# to remove, one level up.
+#
+# So: read only each step's `cmd`, split it into shell command segments, and accept
+# the invocation only when everything preceding `cargo` in its segment is a thing
+# that still leads to cargo running -- an environment assignment or a real wrapper
+# program. Hermit's DAG legitimately uses both (`CARGO_BUILD_JOBS=8 ...`,
+# `./ci/run-with-reverie-dbt-budget.sh cargo test ...`), so a bare command-position
+# rule would reject the real registrations. `echo` and `printf` match nothing in
+# the allowlist and are refused.
+_SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||[;|\n]")
+_ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_KNOWN_RUNNERS = frozenset({"timeout", "env", "nice", "nohup", "xargs", "exec", "command"})
+_DURATION_RE = re.compile(r"^\d+[smhd]?$")
+# `--no-run` compiles the binary and never executes it, so it is not coverage.
+_NO_RUN_RE = re.compile(r"(?<![\w-])--no-run(?![\w-])")
+
+
+def _prefix_still_runs_cargo(prefix: str) -> bool:
+    """Do the tokens before `cargo` leave cargo actually being executed?"""
+    for token in prefix.split():
+        if _ENV_ASSIGNMENT_RE.match(token):
+            continue
+        if "/" in token or token.endswith(".sh"):
+            continue
+        if token in _KNOWN_RUNNERS or token.startswith("-") or _DURATION_RE.match(token):
+            continue
+        return False
+    return True
+
+
+def executed_test_targets(command: str) -> set[str]:
+    """`--test` targets of hermit-cli invocations this command really executes."""
+    found: set[str] = set()
+    for segment in _SEGMENT_SPLIT_RE.split(command):
+        match = _HERMIT_INVOCATION_RE.search(segment)
+        if match is None:
+            continue
+        if not _prefix_still_runs_cargo(segment[: match.start()]):
+            continue
+        invocation = match.group(0)
+        if _NO_RUN_RE.search(invocation):
+            continue
+        found.update(_TEST_FLAG_RE.findall(invocation))
+    return found
+
 
 @dataclass(frozen=True)
 class Declaration:
@@ -79,11 +130,18 @@ def registered_targets(root: Path) -> set[str]:
     registered: set[str] = set()
     for path in dag_paths:
         try:
-            blob = json.dumps(json.loads(path.read_text()))
+            document = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError) as error:
             raise ValueError(f"cannot parse {path.relative_to(root)}: {error}") from error
-        for invocation in _HERMIT_INVOCATION_RE.findall(blob):
-            registered.update(_TEST_FLAG_RE.findall(invocation))
+        steps = document.get("steps")
+        if not isinstance(steps, list):
+            raise ValueError(f"{path.relative_to(root)} has no 'steps' list to read commands from")
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            command = step.get("cmd")
+            if isinstance(command, str):
+                registered.update(executed_test_targets(command))
     return registered
 
 

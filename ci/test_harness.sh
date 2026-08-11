@@ -547,11 +547,20 @@ function workflow_dag_launcher_timeout_seconds {
 # --------------------------------------------------------------------------
 
 # "<node>\t<effective wall seconds>" for every step in a lane DAG.
+#
+# AN UNKNOWN BUDGET IS NOT A SAFE BUDGET. This defaulted a missing `.timeout`
+# AND a missing lane `.default_step_timeout` to 0, and 0 compares as comfortably
+# below every job kill -- so a node whose budget nobody could derive scored as a
+# node that provably fits. That is the "nothing to check became check passed"
+# shape this whole section exists to refuse, one level up from the inversion it
+# was written to catch. Both DAGs currently DO set `default_step_timeout`, so
+# nothing hits it today; that is exactly why it would have rotted unnoticed.
+# Emit a typed marker instead and let the caller refuse.
 function dag_node_budgets {
     local dag=$1
-    jq -r '(.default_step_timeout // 0) as $d
+    jq -r '(.default_step_timeout) as $d
            | .steps[]
-           | "\(.group).\(.job)\t\(.timeout // $d)"' "$dag"
+           | "\(.group).\(.job)\t\(.timeout // $d // "UNDERIVABLE")"' "$dag"
 }
 
 # "<node>\t<job>" for the portable lane, from the audited shard map. Portable
@@ -618,6 +627,21 @@ function assert_node_budgets_fit_their_job_kill {
     local dags=${2:-$DAG_ROOT}
     local baseline="$root/ci/budget-inversions-baseline.txt"
     [[ -f $baseline ]] || die "missing budget-inversion baseline: ${baseline#"$root/"}"
+
+    # REFUSE AN UNDERIVABLE BUDGET BEFORE COMPARING ANYTHING. A node with no
+    # `.timeout` and no lane `.default_step_timeout` cannot be shown to fit its
+    # job kill, and must not be silently counted among the nodes that do.
+    local -a underivable=()
+    mapfile -t underivable < <(
+        { dag_node_budgets "$dags/portable.json"
+          dag_node_budgets "$dags/privileged.json"
+        } | awk -F'\t' '$2 == "UNDERIVABLE" { print $1 }' | sort -u
+    )
+    if ((${#underivable[@]})); then
+        printf 'node(s) with NO derivable wall budget (neither .timeout nor the lane default):\n' >&2
+        printf '  %s\n' "${underivable[@]}" >&2
+        die "an underivable node budget cannot be proven to fit its job kill; set .timeout on the node or .default_step_timeout on the lane"
+    fi
 
     local -a current=() expected=() unlisted=() fixed=()
     mapfile -t current < <(budget_inversions "$root" "$dags" | sort)
@@ -701,6 +725,23 @@ function assert_budget_guard_brackets {
     printf 'fictional.node 1s >= 900s (job test-debug timeout-minutes)\n' \
         >> "$tmp/ci/budget-inversions-baseline.txt"
     ! _budget_guard_in || die "budget guard bracket: a stale baseline entry must be REFUSED"
+    cp "$ROOT_DIR/ci/budget-inversions-baseline.txt" "$tmp/ci/budget-inversions-baseline.txt"
+
+    # NEGATIVE, the UNKNOWN-IS-NOT-SAFE direction: strip a node's own timeout AND the lane
+    # default so no budget can be derived for it. The old code scored that node 0s -- safely
+    # under every job kill -- and passed. It must now be REFUSED and must NAME the node,
+    # otherwise "nobody could work out this node's budget" reads as "this node is fine".
+    jq 'del(.default_step_timeout) | (.steps[] | select(.group == "test" and .job == "detcore_parallel") | .timeout) |= empty' \
+        "$DAG_ROOT/portable.json" > "$tmp/ci/dag/portable.json"
+    ! _budget_guard_in || die "budget guard bracket: a node with NO derivable budget must be REFUSED, not scored 0"
+    report=$( (assert_node_budgets_fit_their_job_kill "$tmp" "$tmp/ci/dag") 2>&1 || true)
+    [[ $report == *"test.detcore_parallel"* && $report == *"UNDERIVABLE"* || $report == *"test.detcore_parallel"* ]] ||
+        die "budget guard bracket: the underivable-budget refusal must name the node, got: $report"
+    cp "$DAG_ROOT/portable.json" "$tmp/ci/dag/portable.json"
+
+    # CONTROL again: with the real files restored the guard must pass, proving the two
+    # refusals above came from the planted conditions and not from a guard stuck refusing.
+    _budget_guard_in || die "budget guard bracket: restored copies must pass again"
 
     rm -rf "$tmp"
     unset -f _budget_guard_in
@@ -2108,13 +2149,27 @@ function emit_failure_reason {
 # harness no-results: no guest observation exists to count as a chaos failure.
 # Carry that distinction alongside the process status instead of asking each
 # mode to infer execution from a nonzero exit code.
+# A REFUSAL IS PROVED BY THE ABSENCE OF THE GUEST, NOT BY A STRING THE GUEST CAN WRITE.
+#
+# Matching the refusal text anywhere in combined stderr let the GUEST forge the
+# classification: a program that really executes, prints `Error: Program application
+# failure` and exits 1 was recorded as LAUNCH_REFUSED -- a real failure downgraded to a
+# no-result, which is the dangerous direction to be wrong in.
+#
+# Hermit emits its refusal BEFORE creating the guest, so a genuine refusal has three
+# properties the forgery cannot have all of: the message is the FIRST line of stderr
+# (nothing ran to print ahead of it), and the guest produced NO stdout at all. Requiring
+# the conjunction keeps every real refusal while rejecting mid-stream guest output.
 function classify_attempt_execution {
     local mode=$1
     local status=$2
     local stderr_file=$3
+    local stdout_file=${4:-/dev/null}
 
     if [[ $mode != naked && $status != 0 ]] &&
-        grep -Eq '^Error: (Program |Could not resolve program )' "$stderr_file"; then
+        [[ ! -s $stdout_file ]] &&
+        head -n 1 "$stderr_file" |
+            grep -Eq '^Error: (Program |Could not resolve program )'; then
         echo LAUNCH_REFUSED
     else
         echo ATTEMPT_RESULT
@@ -2150,6 +2205,33 @@ function audit_guest_launch_classification_contract {
     [[ $(classify_attempt_execution naked 1 "$refusal_stderr") == ATTEMPT_RESULT ]] || {
         rm -rf "$fixture_dir"
         die "native guest stderr must not be mistaken for a Hermit launch refusal"
+    }
+
+    # THE FORGERY LEG. Everything above plants text only Hermit would write; none of it
+    # can fail if the classifier simply trusts any matching line. So plant the refusal
+    # wording as output of a guest that DID run -- it wrote stdout, and its stderr line
+    # is not the first. A real failure must stay countable; downgrading it to a
+    # no-result silently deletes a failing cell from the scorecard.
+    local forged_stderr forged_stdout ran_first_line_stderr
+    forged_stderr="$fixture_dir/forged.stderr"
+    forged_stdout="$fixture_dir/forged.stdout"
+    ran_first_line_stderr="$fixture_dir/forged-first-line.stderr"
+    printf '%s\n' 'starting work' 'Error: Program application failure' >"$forged_stderr"
+    printf '%s\n' 'guest produced real output' >"$forged_stdout"
+    printf '%s\n' 'Error: Program application failure' >"$ran_first_line_stderr"
+
+    [[ $(classify_attempt_execution chaos 1 "$forged_stderr" /dev/null) == ATTEMPT_RESULT ]] || {
+        rm -rf "$fixture_dir"
+        die "a guest failure whose stderr merely CONTAINS the refusal wording must stay countable"
+    }
+    [[ $(classify_attempt_execution chaos 1 "$ran_first_line_stderr" "$forged_stdout") == ATTEMPT_RESULT ]] || {
+        rm -rf "$fixture_dir"
+        die "a guest that produced stdout provably executed; it cannot be a pre-launch refusal"
+    }
+    # ...and the positive must still fire, so the tightening did not just disable the check.
+    [[ $(classify_attempt_execution chaos 1 "$refusal_stderr" /dev/null) == LAUNCH_REFUSED ]] || {
+        rm -rf "$fixture_dir"
+        die "a genuine refusal (first-line message, no guest stdout) must still be a no-result"
     }
     rm -rf "$fixture_dir"
 }
@@ -2498,7 +2580,7 @@ function execute_attempt {
 
     local hash attempt_execution
     hash=$(observation_hash "$metadata" "$status" "$stdout_file" "$stderr_file" "$cell_dir/tmp")
-    attempt_execution=$(classify_attempt_execution "$mode" "$status" "$stderr_file")
+    attempt_execution=$(classify_attempt_execution "$mode" "$status" "$stderr_file" "$stdout_file")
     printf '%s\t%s\t%s\t%s\t%s\n' \
         "$status" "$hash" "$stdout_file" "$stderr_file" "$attempt_execution"
 }

@@ -81,6 +81,61 @@ class RegistrationAuditTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("reason-recorded=1 none-recorded=1 undeclared=0", result.stdout)
 
+    # ------------------------------------------------------------------
+    # FALSE REGISTRATION. Every case above plants a binary that is WHOLLY absent
+    # from the DAG, so all of them pass against an auditor that accepts any text
+    # resembling an invocation. These plant the text WITHOUT the execution: the
+    # binary must still be reported undeclared, or the ledger can be satisfied by
+    # a command that never runs.
+    # ------------------------------------------------------------------
+
+    def _plant_probe_with_dag_command(self, command: str) -> subprocess.CompletedProcess[str]:
+        probe = self.root / "hermit-cli/tests/zz_probe.rs"
+        probe.write_text("#[test]\nfn probe() {}\n")
+        (self.root / "ci/dag/portable.json").write_text(
+            '{"steps":[{"cmd":"cargo test -p hermit --test registered"},'
+            f'{{"cmd":{command!r}}}]}}\n'.replace("'", '"')
+        )
+        subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
+        return self.audit()
+
+    def test_echoed_invocation_does_not_register_a_binary(self) -> None:
+        result = self._plant_probe_with_dag_command(
+            "echo cargo test -p hermit --test zz_probe"
+        )
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("zz_probe", result.stderr)
+
+    def test_no_run_invocation_does_not_register_a_binary(self) -> None:
+        result = self._plant_probe_with_dag_command(
+            "cargo test -p hermit --test zz_probe --no-run"
+        )
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("zz_probe", result.stderr)
+
+    def test_invocation_named_only_in_a_description_does_not_register(self) -> None:
+        probe = self.root / "hermit-cli/tests/zz_probe.rs"
+        probe.write_text("#[test]\nfn probe() {}\n")
+        (self.root / "ci/dag/portable.json").write_text(
+            '{"steps":[{"cmd":"cargo test -p hermit --test registered",'
+            '"desc":"unlike cargo test -p hermit --test zz_probe, which we skip"}]}\n'
+        )
+        subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
+
+        result = self.audit()
+
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("zz_probe", result.stderr)
+
+    def test_wrapper_and_env_prefixed_invocation_still_registers(self) -> None:
+        """The positive leg: the tightening must not reject Hermit's real shapes."""
+        result = self._plant_probe_with_dag_command(
+            "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh "
+            "cargo test -p hermit --features third-party-backends --test zz_probe"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ci-registered=2", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

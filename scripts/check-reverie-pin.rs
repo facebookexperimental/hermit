@@ -746,16 +746,25 @@ fn rewrite_manifest_pins(scan: &PinScan, main: &str) -> Result<(usize, usize), S
         match fs::write(path, updated) {
             Ok(()) => written.push((path, original.as_str())),
             Err(error) => {
+                // RESTORE THE FAILING FILE TOO -- it is the one most likely to be
+                // damaged. `fs::write` truncates before it writes, so a write that
+                // fails partway (ENOSPC is the realistic case) leaves THIS manifest
+                // truncated or half-written. It never entered `written`, so rolling
+                // back only `written` skipped exactly that file while the error text
+                // claimed the tree was no longer partially bumped.
+                let mut restore: Vec<(&Path, &str)> = written.clone();
+                restore.push((path, original.as_str()));
+
                 let mut unrestored = Vec::new();
-                for (done_path, done_original) in &written {
+                for (done_path, done_original) in &restore {
                     if fs::write(done_path, done_original).is_err() {
                         unrestored.push(done_path.display().to_string());
                     }
                 }
-                let restored = written.len() - unrestored.len();
+                let restored = restore.len() - unrestored.len();
                 let mut message = format!(
-                    "could not update {}: {error}; rolled back {restored} already-written \
-                     manifest(s) so the tree is not left partially bumped",
+                    "could not update {}: {error}; restored {restored} manifest(s), including \
+                     the one whose own write failed, so the tree is not left partially bumped",
                     path.display()
                 );
                 if !unrestored.is_empty() {
@@ -2052,6 +2061,65 @@ mod tests {
         let updated = read_pins(&root).expect("rescan updated fixture manifest");
         assert_eq!(unique_pin(&updated).unwrap(), latest);
         fs::remove_dir_all(root).expect("remove fixture repository");
+    }
+
+    /// NEGATIVE LEG: the manifest whose OWN write fails must be restored, and named
+    /// when it cannot be.
+    ///
+    /// `fs::write` truncates before writing, so the file that fails partway is the
+    /// likeliest one in the tree to be damaged -- yet it never enters `written`, so
+    /// a rollback over `written` alone skipped precisely it while the error text
+    /// claimed the tree was no longer partially bumped. Here the failing manifest is
+    /// read-only, so restoring it fails too and it must appear in the by-hand list.
+    /// Before the fix that list was empty and the file went unmentioned entirely.
+    #[test]
+    fn a_manifest_whose_own_write_fails_is_restored_or_named() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_path("rollback-self");
+        init_fixture_repo(&root);
+        let old = "0123456789abcdef0123456789abcdef01234567";
+        let latest = "89abcdef0123456789abcdef0123456789abcdef";
+        let manifest = format!(
+            "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{old}\" }}\n"
+        );
+        fs::create_dir_all(root.join("sub")).expect("create nested manifest dir");
+        fs::write(root.join("Cargo.toml"), &manifest).expect("write first manifest");
+        fs::write(root.join("sub/Cargo.toml"), &manifest).expect("write second manifest");
+        assert!(git_in(&root, &["add", "."]).unwrap().status.success());
+
+        // Make one manifest unwritable so its own fs::write fails.
+        let locked = root.join("sub/Cargo.toml");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o444))
+            .expect("make one manifest read-only");
+        if fs::write(&locked, "probe").is_ok() {
+            // Running with privileges that ignore the mode bit; the condition under
+            // test cannot be produced here, so do not assert a false result.
+            fs::write(&locked, &manifest).expect("restore probe write");
+            fs::remove_dir_all(&root).expect("remove fixture repository");
+            return;
+        }
+
+        let scan = read_pins(&root).expect("scan fixture manifests");
+        let error = rewrite_manifest_pins(&scan, latest)
+            .expect_err("an unwritable manifest must fail the all-or-nothing rewrite");
+        assert!(
+            error.contains("sub/Cargo.toml"),
+            "the failing manifest must be named in the rollback accounting, got: {error}"
+        );
+        assert!(
+            error.contains("restore by hand"),
+            "a manifest that could not be restored must be named for manual repair, got: {error}"
+        );
+
+        // All-or-nothing still holds for the manifest that DID get written.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).expect("unlock");
+        assert_eq!(
+            fs::read_to_string(root.join("Cargo.toml")).expect("reread first manifest"),
+            manifest,
+            "a writable manifest must be rolled back to its original pin"
+        );
+        fs::remove_dir_all(&root).expect("remove fixture repository");
     }
 
     #[test]
