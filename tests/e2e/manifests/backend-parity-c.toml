@@ -5022,6 +5022,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-MEASURED: this cell landed on main in 863a3234 after this PR's 72-cell enablement pass measured the bucket, so there is no measured result here to justify enabling it. Enable it in a follow-up that measures it rather than inheriting an unmeasured default."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "Not buildable on the authoring host (cmake absent); qualify DBT separately"
@@ -5031,12 +5032,14 @@ liteinst = "LiteInst preload handshake fails on the authoring host; qualify Lite
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (by design): a native run necessarily differs from itself here, since unvirtualized st_ino/st_dev come from the real host filesystem and the timestamps are wall-clock, so native is not a discriminating oracle for a contract whose whole claim is that those fields are virtualized."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "A native run necessarily differs from itself: unvirtualized st_ino/st_dev come from the real host filesystem and the timestamps are wall-clock, so native is a useful smoke check but not a discriminating oracle for a contract whose whole claim is that those fields are virtualized and repeatable"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from strict verification and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from strict verification"
@@ -5047,6 +5050,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (by design): file metadata is filesystem- and virtual-clock-derived, not schedule-derived, so chaos adds no discriminating power for this single-threaded guest."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "File metadata is filesystem- and virtual-clock-derived, not schedule-derived; chaos adds no discriminating power for a single-threaded guest"
@@ -5057,6 +5061,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -5080,6 +5085,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-MEASURED: this cell landed on main in ef85e038 after this PR's 72-cell enablement pass measured the bucket, so there is no measured result here to justify enabling it. Enable it in a follow-up that measures it rather than inheriting an unmeasured default."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBI is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake, absent), so no witness could be recorded; qualify DBI separately -- this guest is a PRIORITY for DBI once it builds, since layout divergence is exactly what it detects"
@@ -5089,12 +5095,14 @@ liteinst = "LiteInst preload runtime libreverie_liteinst.so is not built beside 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: Native output is IDENTICAL to Hermit's here (measured), because the probe is relocation-invariant by construction -- so a native run is a useful sanity check but not a discriminating oracle, and gating on it would assert nothing"
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "Native output is IDENTICAL to Hermit's here (measured), because the probe is relocation-invariant by construction -- so a native run is a useful sanity check but not a discriminating oracle, and gating on it would assert nothing"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: Record/replay qualification is separate from strict verification / Record/replay is unsupported by DBI / Record/replay is unsupported by KVM / Record/replay is unsupported by SaBRe / Record/replay is unsupported by LiteInst"
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from strict verification"
@@ -5105,6 +5113,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: Memory layout is allocation-policy derived, not schedule-derived; chaos adds no discriminating power for a single-threaded guest / Chaos scheduling is unsupported by DBI / Chaos scheduling is unsupported by KVM / Chaos scheduling is unsupported by SaBRe / Chaos scheduling is unsupported by LiteInst"
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Memory layout is allocation-policy derived, not schedule-derived; chaos adds no discriminating power for a single-threaded guest"
@@ -5115,6 +5124,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: No custom edge-case arguments have been calibrated for this C guest"
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -5145,6 +5155,7 @@ cflags = ["-D_GNU_SOURCE", "-pthread"]
 # only with the observation that disabled them.
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-MEASURED: this cell landed on main in 0d622ba2 after this PR's 72-cell enablement pass measured the bucket, so there is no measured result here to justify enabling it. Enable it in a follow-up that measures it rather than inheriting an unmeasured default."
 backends_enabled = ["ptrace", "dbt"]
 [test.modes.verify.backends_disabled]
 sabre = "MEASURED HANG 2026-08-06: prints through the sigkill case then never returns from the SIGILL case (killed at 150s). This is the defect the fixture exists to pin; re-enable when SaBRe signal delivery terminates."
@@ -5153,12 +5164,14 @@ liteinst = "Unmeasured for this guest; qualify LiteInst separately"
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: The native run is the reference this fixture is compared against, not a case it asserts"
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "The native run is the reference this fixture is compared against, not a case it asserts"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: Record/replay of signal-terminated children is not part of this contract"
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay of signal-terminated children is not part of this contract"
@@ -5169,6 +5182,7 @@ liteinst = "Record/replay of signal-terminated children is not part of this cont
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: Wait-status identity is a fixed contract; chaos scheduling adds no signal there"
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Wait-status identity is a fixed contract; chaos scheduling adds no signal there"
@@ -5179,6 +5193,7 @@ liteinst = "Wait-status identity is a fixed contract; chaos scheduling adds no s
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: No custom edge-case arguments have been calibrated for this C guest"
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -5206,6 +5221,7 @@ cflags = ["-D_GNU_SOURCE"]
 # that disabled them, not a template default.
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-MEASURED: this cell landed on main in b48aff99 after this PR's 72-cell enablement pass measured the bucket, so there is no measured result here to justify enabling it. Enable it in a follow-up that measures it rather than inheriting an unmeasured default."
 backends_enabled = ["ptrace", "dbt"]
 [test.modes.verify.backends_disabled]
 sabre = "MEASURED 2026-08-06: does not deliver #UD to a child with no handler installed (child runs past ud2 and exits 99), and then HANGS on the hardware #DE case until the harness timeout. Re-enable when both are fixed."
@@ -5214,12 +5230,14 @@ liteinst = "Unmeasured for this guest; qualify LiteInst separately"
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: The native run is the reference this fixture is compared against, not a case it asserts"
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "The native run is the reference this fixture is compared against, not a case it asserts"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: Record/replay of hardware-trap termination is not part of this contract"
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay of hardware-trap termination is not part of this contract"
@@ -5230,6 +5248,7 @@ liteinst = "Record/replay of hardware-trap termination is not part of this contr
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: Trap identity is a fixed contract; chaos scheduling adds no signal there"
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Trap identity is a fixed contract; chaos scheduling adds no signal there"
@@ -5240,6 +5259,7 @@ liteinst = "Trap identity is a fixed contract; chaos scheduling adds no signal t
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: No custom edge-case arguments have been calibrated for this C guest"
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -5271,12 +5291,14 @@ liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst 
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: A native run intentionally FAILS this contract (it sees the real host identity); that is the fixture's negative control, not a CI cell"
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "A native run intentionally FAILS this contract (it sees the real host identity); that is the fixture's negative control, not a CI cell"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: Record/replay qualification is separate from the host-identity contract / Record/replay is unsupported by DBI / Record/replay is unsupported by KVM / Record/replay is unsupported by SaBRe / Record/replay is unsupported by LiteInst"
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the host-identity contract"
@@ -5287,6 +5309,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle / Chaos scheduling is unsupported by DBI / Chaos scheduling is unsupported by KVM / Chaos scheduling is unsupported by SaBRe / Chaos scheduling is unsupported by LiteInst"
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -5297,6 +5320,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: No custom edge-case arguments have been calibrated for this C guest"
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -5329,6 +5353,7 @@ liteinst = "Not yet qualified for the partial-transfer split contract"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: No custom edge-case arguments have been calibrated for this C guest"
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -5339,12 +5364,14 @@ liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: Native is used here as a correctness oracle only: it never splits this transfer (one full write), so repeated native execution is not a split-pattern contract"
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "Native is used here as a correctness oracle only: it never splits this transfer (one full write), so repeated native execution is not a split-pattern contract"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: Record/replay qualification is separate from the strict split-pattern contract / Record/replay is unsupported by DBI / Record/replay is unsupported by KVM / Record/replay is unsupported by SaBRe / Record/replay is unsupported by LiteInst"
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the strict split-pattern contract"
@@ -5355,6 +5382,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: Chaos scheduling would perturb the pipe drain rate and therefore the split itself, which is the observable under contract / Chaos scheduling is unsupported by DBI / Chaos scheduling is unsupported by KVM / Chaos scheduling is unsupported by SaBRe / Chaos scheduling is unsupported by LiteInst"
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling would perturb the pipe drain rate and therefore the split itself, which is the observable under contract"
@@ -5387,12 +5415,14 @@ liteinst = "Not yet qualified for inotify/signalfd event delivery"
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: Measured stable 5/5 natively on this host, so native repetition is not a nondeterminism contract; the value of this entry is cross-backend, not native-vs-hermit"
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "Measured stable 5/5 natively on this host, so native repetition is not a nondeterminism contract; the value of this entry is cross-backend, not native-vs-hermit"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: Record/replay qualification of event delivery is tracked separately / Record/replay is unsupported by DBI / Record/replay is unsupported by KVM / Record/replay is unsupported by SaBRe / Record/replay is unsupported by LiteInst"
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification of event delivery is tracked separately"
@@ -5403,6 +5433,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: Chaos scheduling perturbs the very timing that decides the coalescing under test, so it would change the observable rather than probe it / Chaos scheduling is unsupported by DBI / Chaos scheduling is unsupported by KVM / Chaos scheduling is unsupported by SaBRe / Chaos scheduling is unsupported by LiteInst"
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling perturbs the very timing that decides the coalescing under test, so it would change the observable rather than probe it"
@@ -5413,6 +5444,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: No custom edge-case arguments have been calibrated for this C guest"
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -5442,12 +5474,14 @@ liteinst = "New top-of-funnel coverage is established on the ptrace reference fi
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: This row asserts strict-verify determinism; it does not assert native nondeterminism"
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This row asserts strict-verify determinism; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: Record/replay qualification is separate from strict-verification entry / Record/replay is unsupported by DBI / Record/replay is unsupported by KVM / Record/replay is unsupported by SaBRe / Record/replay is unsupported by LiteInst"
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from strict-verification entry"
@@ -5458,6 +5492,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle / Chaos scheduling is unsupported by DBI / Chaos scheduling is unsupported by KVM / Chaos scheduling is unsupported by SaBRe / Chaos scheduling is unsupported by LiteInst"
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -5468,6 +5503,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: No custom edge-case arguments have been calibrated for this C guest"
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -5497,12 +5533,14 @@ liteinst = "New top-of-funnel coverage is established on the ptrace reference fi
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: This row asserts strict-verify determinism; it does not assert native nondeterminism"
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This row asserts strict-verify determinism; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: Record/replay qualification is separate from strict-verification entry / Record/replay is unsupported by DBI / Record/replay is unsupported by KVM / Record/replay is unsupported by SaBRe / Record/replay is unsupported by LiteInst"
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from strict-verification entry"
@@ -5513,6 +5551,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle / Chaos scheduling is unsupported by DBI / Chaos scheduling is unsupported by KVM / Chaos scheduling is unsupported by SaBRe / Chaos scheduling is unsupported by LiteInst"
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -5523,6 +5562,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: No custom edge-case arguments have been calibrated for this C guest"
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
@@ -5552,12 +5592,14 @@ liteinst = "New top-of-funnel coverage is established on the ptrace reference fi
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: This row asserts strict-verify determinism; it does not assert native nondeterminism"
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This row asserts strict-verify determinism; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: Record/replay qualification is separate from strict-verification entry / Record/replay is unsupported by DBI / Record/replay is unsupported by KVM / Record/replay is unsupported by SaBRe / Record/replay is unsupported by LiteInst"
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from strict-verification entry"
@@ -5568,6 +5610,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle / Chaos scheduling is unsupported by DBI / Chaos scheduling is unsupported by KVM / Chaos scheduling is unsupported by SaBRe / Chaos scheduling is unsupported by LiteInst"
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -5578,6 +5621,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED: No custom edge-case arguments have been calibrated for this C guest"
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"

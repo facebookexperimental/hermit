@@ -366,7 +366,7 @@ ci = false
 backends_enabled = []
 [test.modes.verify.backends_disabled]
 ptrace = "Chaos mode owns this guest; repeat-identity per seed is already asserted by repeat_mismatches"
-dbi = "DBI coverage is owned by its backend parity partition"
+dbt = "DBT coverage is owned by its backend parity partition"
 kvm = "KVM requires the privileged runner"
 sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
@@ -376,7 +376,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Chaos witness reproduction is the required relation for this deliberately racy guest"
-dbi = "Record/replay is unsupported by DBI"
+dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
@@ -431,7 +431,7 @@ outcome_classes = 24
 assert = { min_distinct = 6, min_passes = 1, min_failures = 0, min_normalized_entropy = 0.40 }
 backends_enabled = ["ptrace"]
 [test.modes.chaos.backends_disabled]
-dbi = "Chaos scheduling is unsupported by DBI"
+dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
 liteinst = "Chaos scheduling is unsupported by LiteInst"
@@ -441,7 +441,7 @@ ci = false
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "Chaos mode already supplies the required scheduler arguments"
-dbi = "No edge-case Hermit arguments are required"
+dbt = "No edge-case Hermit arguments are required"
 kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
