@@ -392,3 +392,61 @@ fn rdtsc_deltas() {
         true,
     );
 }
+
+/// A malformed `timespec` must fail EINVAL, not become an indefinite sleep.
+///
+/// Detcore fed `Timespec`'s signed fields through `as u64`, so `tv_sec = -1`
+/// wrapped to `u64::MAX` and produced `SleepUntil(INDEFINITE)`. The only guest
+/// thread then parked with no deadline, the run queue emptied, and the
+/// scheduler deliberately does not jump the clock for an indefinite waiter, so
+/// the container died instead of returning an errno.
+///
+/// Both directions matter here, which is why the past-absolute case is in the
+/// same test: rejecting a malformed field must not also reject an early
+/// deadline. Measured against native Linux on x86_64: all three malformed
+/// shapes give EINVAL, and a past absolute deadline gives 0.
+#[test]
+fn nanosleep_rejects_malformed_timespec_but_not_a_past_deadline() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            // `clock_nanosleep` returns the error directly rather than via errno.
+            let sleep = |sec: i64, nsec: i64, flags: libc::c_int| -> libc::c_int {
+                let ts = libc::timespec {
+                    tv_sec: sec,
+                    tv_nsec: nsec,
+                };
+                unsafe { libc::clock_nanosleep(libc::CLOCK_MONOTONIC, flags, &ts, ptr::null_mut()) }
+            };
+
+            // Malformed: negative seconds is the case that used to hang.
+            assert_eq!(sleep(-1, 0, 0), libc::EINVAL, "relative tv_sec=-1");
+            assert_eq!(sleep(0, -1, 0), libc::EINVAL, "relative tv_nsec=-1");
+            assert_eq!(
+                sleep(0, 1_000_000_000, 0),
+                libc::EINVAL,
+                "relative tv_nsec out of range"
+            );
+            assert_eq!(
+                sleep(-1, 0, libc::TIMER_ABSTIME),
+                libc::EINVAL,
+                "absolute tv_sec=-1"
+            );
+
+            // Well-formed, and must still succeed: a zero interval, and an
+            // absolute deadline already in the past. Neither is an error on
+            // Linux, so a fix that rejected them would be too aggressive.
+            assert_eq!(sleep(0, 0, 0), 0, "zero relative interval");
+            assert_eq!(
+                sleep(1, 0, libc::TIMER_ABSTIME),
+                0,
+                "past absolute deadline"
+            );
+        },
+        config,
+        true,
+    );
+}
