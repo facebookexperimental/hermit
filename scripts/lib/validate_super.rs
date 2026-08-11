@@ -86,6 +86,41 @@ pub struct SuperGate {
     pub synthetic: Option<String>,
 }
 
+/// Translate the mechanically extracted libtest invocation to nextest while
+/// preserving Cargo target selection and libtest filters. The table remains a
+/// provenance artifact; this is the versioned execution-policy layer that adds
+/// per-individual-test termination.
+fn apply_innermost_timeout_runner(argv: &mut Vec<String>, root: &str) -> bool {
+    let Some(cargo) = argv.windows(2).position(|w| w == ["cargo", "test"]) else {
+        return false;
+    };
+    argv[cargo] = format!("{root}/ci/run-nextest-counted.sh");
+    argv.remove(cargo + 1);
+
+    let mut jobs = None;
+    let mut no_capture = false;
+    argv.retain(|arg| {
+        if let Some(value) = arg.strip_prefix("--test-threads=") {
+            jobs = Some(value.to_string());
+            false
+        } else if arg == "--nocapture" {
+            no_capture = true;
+            false
+        } else {
+            true
+        }
+    });
+    let split = argv.iter().position(|arg| arg == "--").unwrap_or(argv.len());
+    if let Some(jobs) = jobs {
+        argv.splice(split..split, ["-j".to_string(), jobs]);
+    }
+    if no_capture {
+        let split = argv.iter().position(|arg| arg == "--").unwrap_or(argv.len());
+        argv.insert(split, "--no-capture".to_string());
+    }
+    true
+}
+
 impl SuperGate {
     /// Resolved wall budget: the row's own, or the `run_check` default.
     pub fn wall(&self) -> i64 {
@@ -128,6 +163,7 @@ pub fn load_gates(root: &Path) -> Result<Vec<SuperGate>, String> {
             })?;
             argv.push(s.replace("{{ROOT_DIR}}", &root_s));
         }
+        apply_innermost_timeout_runner(&mut argv, &root_s);
         let synthetic = get_str("synthetic");
         if synthetic.is_none() && argv.is_empty() {
             return Err(format!("{} row {i} ({label}): empty argv", file.display()));
@@ -152,7 +188,13 @@ fn mem_for(argv: &[String]) -> i64 {
 
 /// Build a plain (non-synthetic) super gate node.
 pub fn gate_node(g: &SuperGate, deps: Vec<String>) -> Step {
-    let wall = g.wall();
+    // The slow-test override is 600 s plus 30 s termination grace. Keep the
+    // cgroup node comfortably outside it so nextest always prints the test name.
+    let wall = if g.argv.windows(3).any(|w| w == ["cargo", "nextest", "run"]) {
+        g.wall().max(720)
+    } else {
+        g.wall()
+    };
     node(
         "super",
         &g.job,
@@ -420,7 +462,16 @@ pub fn nonblocking_tags(reps: i64) -> Vec<String> {
 /// nodes, and the runner has no such channel. Every knob the bash exposed as an
 /// environment override is preserved verbatim.
 pub fn calibrated_analyze_node(g: &SuperGate, deps: Vec<String>) -> Step {
-    let test_args = shell_join(&g.argv);
+    // The extracted synthetic row carries libtest's thread flag after `--`.
+    // Nextest owns process concurrency with `-j 1`, so do not forward an
+    // emulation flag it deliberately does not support.
+    let test_args = shell_join(
+        &g.argv
+            .iter()
+            .filter(|arg| !arg.starts_with("--test-threads="))
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
     let cmd = format!(
         r#"set -u
 iters=${{ANALYZE_SKID_CALIBRATION_ITERATIONS:-64}}
@@ -448,7 +499,7 @@ margin=$rec
 if [ "$margin" -lt "$floor" ]; then margin=$floor; fi
 printf 'Analyze PMU skid margin: calibrated=%s RCB, conservative floor=%s RCB, using=%s RCB\n' \
     "$rec" "$floor" "$margin"
-HERMIT_ANALYZE_SKID_MARGIN=$margin cargo test -p hermit --features third-party-backends --test analyze {test_args}"#
+HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test analyze -j 1 {test_args}"#
     );
     let wall = g.wall();
     node("super", &g.job, &g.label, cmd, deps, wall, (wall * 2).min(7200), TEST_MEM_BYTES)
@@ -474,6 +525,35 @@ pub fn self_test(root: &Path) -> Result<String, String> {
         return Err(format!(
             "super gate table has only {} rows; the mechanical extraction produced 32",
             gates.len()
+        ));
+    }
+    let nextest_rows = gates
+        .iter()
+        .filter(|g| {
+            g.argv
+                .iter()
+                .any(|arg| arg.ends_with("/ci/run-nextest-counted.sh"))
+        })
+        .count();
+    if nextest_rows < 20
+        || gates
+            .iter()
+            .any(|g| g.argv.windows(2).any(|w| w == ["cargo", "test"]))
+    {
+        return Err(format!(
+            "super innermost timeout conversion incomplete: {nextest_rows} nextest rows"
+        ));
+    }
+    let analyze = gates
+        .iter()
+        .find(|g| g.synthetic.as_deref() == Some("calibrated_analyze_tests"))
+        .ok_or("super gate table lost calibrated_analyze_tests")?;
+    let analyze_cmd = calibrated_analyze_node(analyze, vec!["probe.dep".into()]).cmd;
+    if !analyze_cmd.contains("./ci/run-nextest-counted.sh")
+        || analyze_cmd.contains("--test-threads=")
+    {
+        return Err(format!(
+            "calibrated analyze did not normalize libtest arguments: {analyze_cmd}"
         ));
     }
     // Negative: a table whose rows are not an array, or whose row lacks argv,
@@ -539,7 +619,7 @@ pub fn self_test(root: &Path) -> Result<String, String> {
         return Err("stress verdict: a KVM repetition failure must stay NONBLOCKING".into());
     }
     Ok(format!(
-        "super: {} gate rows ({} synthetic), {refused} malformed tables refused, \
+        "super: {} gate rows ({} synthetic, {nextest_rows} cargo-nextest + calibrated analyze), {refused} malformed tables refused, \
          stress verdict bracketed 1 accept / 1 blocking-refusal / 1 nonblocking",
         gates.len(),
         synth.len()

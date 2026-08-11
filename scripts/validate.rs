@@ -80,7 +80,7 @@ mod validate_receipt;
 mod validate_runtime;
 
 #[path = "lib/validate_super.rs"]
-mod validate_super;
+mod validate_super; // Normalizes and audits extracted Cargo tests/synthetic args onto nextest.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -2056,6 +2056,18 @@ fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
         .collect()
 }
 
+/// Reuse the versioned nextest installer verbatim in focused plans instead of
+/// copying its pinned version or network fallback into a second source.
+fn nextest_setup_node(
+    root: &Path,
+    gate: &str,
+) -> Result<safe_ci_dag_runner::model::Step, String> {
+    validate_plan::lane_nodes(root, "portable", "", gate)?
+        .into_iter()
+        .find(|step| step.tag() == "setup.nextest")
+        .ok_or_else(|| "portable DAG lost setup.nextest".to_string())
+}
+
 /// Build the execution plan for the selected level/mode.
 fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     let with_proxy = has_cmd("with-proxy");
@@ -2140,6 +2152,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     // Focused liteinst matrix (validate.sh:4815): three ordered gates.
     if matches!(args.focused, Some(Focused::LiteinstCompat)) {
         let mut steps = pre;
+        steps.push(nextest_setup_node(root, gate)?);
         steps.push(step_with_caps("liteinst", "hermit_release", "Release Hermit for LiteInst compatibility",
             "cargo build --release --locked -p hermit --features third-party-backends".into(),
             vec![gate.to_string()], 1200, 3600, 16 * 1024 * 1024 * 1024));
@@ -2147,8 +2160,8 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             "./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build".into(),
             vec!["liteinst.hermit_release".into()], 900, 1800, 8 * 1024 * 1024 * 1024));
         steps.push(step_with_caps("liteinst", "strict", "Portable CI liteinst_strict",
-            "HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit cargo test -p hermit --features third-party-backends --test liteinst_advanced -- --test-threads=1".into(),
-            vec!["liteinst.runtime".into()], 900, 1800, 8 * 1024 * 1024 * 1024));
+            "HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test liteinst_advanced -j 1".into(),
+            vec!["liteinst.runtime".into(), "setup.nextest".into()], 900, 1800, 8 * 1024 * 1024 * 1024));
         let cfg = validate_plan::config_from(steps, "liteinst compatibility");
         return Ok(Plan { planned_test_nodes: test_nodes_of(&cfg), cfg, second: None,
             profile: args.focused.as_ref().unwrap().profile(), selection_mode: "full",
@@ -2178,22 +2191,23 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         let marker = "hermit-validation-smoke";
         let run_args = "run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled";
         let mut steps = pre;
-        let mut add = |job: &str, desc: &str, cmd: String, dep: &str, t: i64, mem: i64| {
-            steps.push(step_with_caps("quick", job, desc, cmd, vec![dep.to_string()], t, t * 2, mem));
+        steps.push(nextest_setup_node(root, gate)?);
+        let mut add = |job: &str, desc: &str, cmd: String, deps: Vec<String>, t: i64, mem: i64| {
+            steps.push(step_with_caps("quick", job, desc, cmd, deps, t, t * 2, mem));
         };
-        add("build", "Build workspace", "cargo build --workspace --features third-party-backends".into(), gate, 3600, 16 * 1024 * 1024 * 1024);
-        add("e2e_metadata", "Portable E2E metadata", "./ci/test_harness.sh validate".into(), "quick.build", 600, 4 * 1024 * 1024 * 1024);
-        add("e2e_verify", "Portable ptrace E2E verification", "./ci/test_harness.sh run --lane portable --mode verify --backend ptrace --ci-only".into(), "quick.build", 1800, 8 * 1024 * 1024 * 1024);
-        add("detcore_unit", "Detcore core unit tests", "cargo test -p hermit-detcore --lib".into(), "quick.build", 1800, 8 * 1024 * 1024 * 1024);
+        add("build", "Build workspace", "cargo build --workspace --features third-party-backends".into(), vec![gate.into()], 3600, 16 * 1024 * 1024 * 1024);
+        add("e2e_metadata", "Portable E2E metadata", "./ci/test_harness.sh validate".into(), vec!["quick.build".into()], 600, 4 * 1024 * 1024 * 1024);
+        add("e2e_verify", "Portable ptrace E2E verification", "./ci/test_harness.sh run --lane portable --mode verify --backend ptrace --ci-only".into(), vec!["quick.build".into()], 1800, 8 * 1024 * 1024 * 1024);
+        add("detcore_unit", "Detcore core unit tests", "./ci/run-nextest-counted.sh -p hermit-detcore --lib".into(), vec!["quick.build".into(), "setup.nextest".into()], 1800, 8 * 1024 * 1024 * 1024);
         add("run_smoke", "Hermit run smoke test",
             format!("out=$(timeout 30s {hermit} {run_args} -- /bin/echo {marker}) && test \"$out\" = {marker}"),
-            "quick.build", 120, 4 * 1024 * 1024 * 1024);
+            vec!["quick.build".into()], 120, 4 * 1024 * 1024 * 1024);
         add("verify_smoke", "Hermit verify-mode smoke test",
             format!("timeout 30s {hermit} {run_args} --verify -- /bin/echo {marker}"),
-            "quick.build", 120, 4 * 1024 * 1024 * 1024);
+            vec!["quick.build".into()], 120, 4 * 1024 * 1024 * 1024);
         add("record_replay_smoke", "Hermit record/replay smoke test",
             format!("timeout 30s {hermit} record start --verify -- /bin/echo {marker}"),
-            "quick.build", 180, 4 * 1024 * 1024 * 1024);
+            vec!["quick.build".into()], 180, 4 * 1024 * 1024 * 1024);
         let cfg = validate_plan::config_from(steps, "quick smoke suite");
         return Ok(Plan { planned_test_nodes: test_nodes_of(&cfg), cfg, second: None,
             profile: "quick".into(), selection_mode: "full", ..Default::default() });
@@ -2391,7 +2405,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             .iter_mut()
             .find(|s| s.tag() == "privileged-cpuid.faulting")
             .ok_or("fused prebuilt CPUID consumer disappeared")?;
-        let expected_cpuid = "timeout 30 cargo test -p hermit-detcore --test tests_misc rdrand_rdseed_is_masked -- --exact";
+        let expected_cpuid = "status=0; timeout --kill-after=5s 30s cargo test -p hermit-detcore --test tests_misc rdrand_rdseed_is_masked -- --exact || status=$?; if [ \"$status\" -eq 124 ] || [ \"$status\" -eq 137 ]; then printf 'test hermit-detcore/tests_misc::rdrand_rdseed_is_masked exceeded 30 s (innermost exact Cargo timeout: exit %s)\\n' \"$status\" >&2; fi; exit \"$status\"";
         if cpuid.cmd != expected_cpuid {
             return Err(format!(
                 "fused CPUID command drifted; re-prove direct prebuilt invocation: {}",
@@ -2469,6 +2483,7 @@ fn super_plan(
         .unwrap_or_else(|| root.join("target/release/hermit").to_string_lossy().into_owned());
 
     let mut steps = pre;
+    steps.push(nextest_setup_node(root, gate)?);
     let mut nonblocking: BTreeSet<String> = BTreeSet::new();
     // `run_exact_detcore_cases` labels its rows "<group>: <case>"; consecutive
     // rows sharing a group prefix are one fail-fast family. Deriving the chain
@@ -2477,13 +2492,16 @@ fn super_plan(
     let mut prev_family: Option<(String, String)> = None; // (family, previous tag)
 
     for g in &gates {
-        let deps = match g.job.as_str() {
+        let mut deps = match g.job.as_str() {
             "build_workspace" | "build_release_hermit" => vec![gate.to_string()],
             "full_leveldb_strict_determinism" => {
                 vec!["super.build_pinned_leveldb_super_fixture".to_string()]
             }
             _ => vec![build_ws.clone()],
         };
+        if g.argv.windows(3).any(|w| w == ["cargo", "nextest", "run"]) {
+            deps.push("setup.nextest".to_string());
+        }
         match g.synthetic.as_deref() {
             Some("portable_slow_strict_diagnostics") => {
                 // The four PORTABLE_STRICT_SUPER_ONLY workloads, run with the
@@ -2518,6 +2536,8 @@ fn super_plan(
                 nonblocking.extend(validate_super::nonblocking_tags(reps));
             }
             Some("calibrated_analyze_tests") => {
+                let mut deps = deps;
+                deps.push("setup.nextest".to_string());
                 steps.push(validate_super::calibrated_analyze_node(g, deps));
             }
             Some(other) => {

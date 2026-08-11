@@ -34,7 +34,10 @@ DAG_GLOB = "ci/dag/*.json"
 
 # Restrict registration to the hermit-cli package.  A similarly named target in
 # hermit-detcore is not evidence that the hermit-cli binary ran.
-_HERMIT_INVOCATION_RE = re.compile(r"cargo test -p hermit(?!-)[^\"\n]*")
+_HERMIT_INVOCATION_RE = re.compile(
+    r"(?:cargo (?:test|nextest run)|\./ci/run-nextest-counted\.sh)"
+    r"[^\"\n]*?-p hermit(?!-)[^\"\n]*"
+)
 _TEST_FLAG_RE = re.compile(r"--test(?:=|\s+)([A-Za-z0-9_]+)")
 _TOP_LEVEL_TEST_RE = re.compile(r"^hermit-cli/tests/([^/]+)\.rs$")
 
@@ -222,7 +225,7 @@ def audit(root: Path) -> int:
         for name in sorted(undeclared):
             print(f"    hermit-cli/tests/{name}.rs", file=sys.stderr)
         print(
-            "Either register each binary with `cargo test -p hermit --test <name>` "
+            "Either register each binary with `./ci/run-nextest-counted.sh -p hermit --test <name>` "
             "in ci/dag/*.json, or add a ledger row naming why it is not run. "
             "Use `none-recorded` only for an honest unknown; it is debt, not approval.",
             file=sys.stderr,

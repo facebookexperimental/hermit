@@ -13,6 +13,11 @@ status-level = "pass"
 final-status-level = "slow"
 failure-output = "immediate-final"
 success-output = "never"
+# Headroom policy: 300 s is at least the complete-node estimate of every normal
+# Cargo batch in ci/dag/portable.json (30-300 s), but applies to one test rather
+# than the batch. Known stress/integration outliers get 600 s below. A single
+# healthy test therefore has batch-sized headroom under load, while 30 s of
+# termination grace still leaves the enclosing node outside the hard kill.
 slow-timeout = { period = "300s", terminate-after = 1, grace-period = "30s" }
 global-timeout = "60m"
 

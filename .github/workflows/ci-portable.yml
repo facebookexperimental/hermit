@@ -657,6 +657,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bc binutils bzip2 clang cmake file g++ gcc git jq libc6-dbg libelf-dev libunwind-dev liblzma-dev make pkg-config procps python3-full time zlib1g-dev zstd
+      # Release shards now execute individual tests through the same pinned
+      # nextest timeout policy as debug shards. The release artifact contains
+      # product binaries, not Cargo subcommand tooling, so provision it here.
+      - name: Install cargo-nextest (release shards)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
       - name: Enable unprivileged user and mount namespaces
         run: |
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then

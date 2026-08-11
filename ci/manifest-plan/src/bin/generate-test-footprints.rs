@@ -241,27 +241,30 @@ fn cargo_command_packages(
 ) -> BTreeSet<String> {
     let tokens = shell_tokens(command);
     let mut result = BTreeSet::new();
-    let mut cargo = 0;
-    while cargo < tokens.len() {
-        if tokens[cargo] != "cargo" {
-            cargo += 1;
+    let mut command_index = 0;
+    while command_index < tokens.len() {
+        let counted_nextest = tokens[command_index].ends_with("/ci/run-nextest-counted.sh");
+        if tokens[command_index] != "cargo" && !counted_nextest {
+            command_index += 1;
             continue;
         }
-        let Some(subcommand) = tokens.get(cargo + 1).map(String::as_str) else {
-            break;
-        };
-        let recognized = matches!(subcommand, "build" | "test" | "clippy" | "fmt" | "doc")
+        let subcommand = tokens
+            .get(command_index + 1)
+            .map(String::as_str)
+            .unwrap_or_default();
+        let recognized = counted_nextest
+            || matches!(subcommand, "build" | "test" | "clippy" | "fmt" | "doc")
             || (subcommand == "nextest"
-                && tokens.get(cargo + 2).map(String::as_str) == Some("run"));
+                && tokens.get(command_index + 2).map(String::as_str) == Some("run"));
         if !recognized {
-            cargo += 1;
+            command_index += 1;
             continue;
         }
 
         let mut workspace = subcommand == "fmt";
         let mut explicit = BTreeSet::new();
         let mut excluded = BTreeSet::new();
-        let mut cursor = cargo + 2;
+        let mut cursor = command_index + if counted_nextest { 1 } else { 2 };
         while cursor < tokens.len() && !matches!(tokens[cursor].as_str(), "&&" | "||" | ";") {
             let token = tokens[cursor].trim_end_matches(';');
             match token {
@@ -306,7 +309,7 @@ fn cargo_command_packages(
             }
         }
         result.extend(targets);
-        cargo = cursor.max(cargo + 1);
+        command_index = cursor.max(command_index + 1);
     }
     result
 }
@@ -634,6 +637,18 @@ mod tests {
                 &defaults
             ),
             BTreeSet::from(["b".into(), "c".into()])
+        );
+        assert_eq!(
+            cargo_command_packages(
+                "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh --workspace --exclude b",
+                &all,
+                &defaults
+            ),
+            BTreeSet::from(["a".into(), "c".into()])
+        );
+        assert_eq!(
+            cargo_command_packages("/tmp/tree/ci/run-nextest-counted.sh -p b", &all, &defaults),
+            BTreeSet::from(["b".into()])
         );
         assert!(cargo_command_packages("cargo nextest show-config", &all, &defaults).is_empty());
     }

@@ -2104,6 +2104,113 @@ function run_capture {
         </dev/null >"$stdout_file" 2>"$stderr_file"
 }
 
+# Give the timeout's owner, not the enclosing DAG node, a durable identity.
+# GNU timeout's 124/137 statuses are otherwise indistinguishable from an
+# arbitrary child exit once execute_attempt returns its compact TSV row.
+function individual_test_timeout_reason {
+    local test_id=$1 mode=$2 backend=$3 attempt=$4 timeout_seconds=$5 status=$6
+    local disposition
+    case $status in
+        124) disposition="deadline reached (exit 124)" ;;
+        137) disposition="SIGKILL after 10 s grace (exit 137)" ;;
+        *) return 1 ;;
+    esac
+    [[ -n $backend ]] || backend=native
+    printf 'test %s/%s/%s exceeded %s s in attempt %s (innermost E2E timeout: %s)' \
+        "$test_id" "$mode" "$backend" "$timeout_seconds" "$attempt" "$disposition"
+}
+
+# Bracket the actual process-group wrapper and the exact message constructor.
+# This runs inside the metadata audit, far below safe-ci-dag-runner's node
+# timeout: the planted 2 s sleeper must be named after 1 s, while a healthy
+# command under the same wrapper must remain unaffected.
+function audit_innermost_e2e_timeout {
+    local scratch status reason expected
+    scratch=$(mktemp -d)
+
+    status=0
+    run_capture "$scratch/hang.stdout" "$scratch/hang.stderr" 1 sleep 2 || status=$?
+    [[ $status == 124 ]] || {
+        rm -rf "$scratch"
+        die "innermost E2E negative bracket returned $status, expected timeout exit 124"
+    }
+    reason=$(individual_test_timeout_reason \
+        timeout-probe/deliberate-hang verify ptrace 1 1 "$status")
+    expected='test timeout-probe/deliberate-hang/verify/ptrace exceeded 1 s in attempt 1 (innermost E2E timeout: deadline reached (exit 124))'
+    [[ $reason == "$expected" ]] || {
+        rm -rf "$scratch"
+        die "innermost E2E negative bracket lost test identity: $reason"
+    }
+
+    status=0
+    run_capture "$scratch/pass.stdout" "$scratch/pass.stderr" 5 true || status=$?
+    rm -rf "$scratch"
+    [[ $status == 0 ]] || die "innermost E2E positive bracket rejected a healthy command: exit $status"
+    printf 'INNERMOST-TIMEOUT negative=1 named: %s\n' "$reason"
+    printf 'INNERMOST-TIMEOUT positive=1 passed within 5 s\n'
+}
+
+# Refuse a future regression from a named individual timeout back to an opaque
+# safe-ci-dag-runner node kill. The 630 s floor is the 600 s slow-test override
+# plus its 30 s grace; ordinary tests retain the much wider 300 s limit.
+function audit_innermost_timeout_coverage {
+    local config="$ROOT_DIR/.config/nextest.toml"
+    "$ROOT_DIR/ci/run-nextest-counted.sh" --self-test ||
+        die "counted nextest wrapper failed its two-sided parser bracket"
+    grep -Fqx 'slow-timeout = { period = "300s", terminate-after = 1, grace-period = "30s" }' "$config" ||
+        die "nextest default must terminate an individual test after 300 s plus 30 s grace"
+    grep -Fqx 'slow-timeout = { period = "600s", terminate-after = 1, grace-period = "30s" }' "$config" ||
+        die "nextest slow-test override must terminate after 600 s plus 30 s grace"
+
+    # cargo-nextest 0.9.100 does not execute rustdoc tests. Keep `--doc` as the
+    # explicit upstream limitation; `--no-run` is compilation, and the single
+    # privileged `--exact` case owns an equivalent named timeout wrapper.
+    jq -s -e '
+        all(.[]; all(.steps[];
+            if ((.cmd // "") | contains("./ci/run-nextest-counted.sh")) then
+                (((.deps // []) | index("setup.nextest")) != null)
+                and (.timeout > 630)
+            elif ((.cmd // "") | contains("cargo nextest run")) then
+                false
+            elif ((.cmd // "") | contains("cargo test")) then
+                ((.cmd | contains("--doc"))
+                 or (.cmd | contains("--no-run"))
+                 or ((.cmd | contains("--exact"))
+                     and (.cmd | contains("innermost exact Cargo timeout"))))
+            else true end))
+    ' "$DAG_ROOT/portable.json" "$DAG_ROOT/privileged.json" >/dev/null ||
+        die "an executing Cargo test lacks a named inner timeout or its DAG node is not outside the 630 s hard-kill bound"
+
+    local id metadata lane category timeout key job outer hard_floor
+    declare -A category_max=()
+    for id in "${!METADATA_BY_ID[@]}"; do
+        metadata=${METADATA_BY_ID[$id]}
+        jq -e '[.modes[] | select(.ci == true)] | length > 0' <<<"$metadata" >/dev/null || continue
+        lane=$(jq -r .lane <<<"$metadata")
+        category=$(jq -r .category <<<"$metadata")
+        timeout=$(jq -r .timeout_seconds <<<"$metadata")
+        key="$lane/$category"
+        if ((timeout > ${category_max[$key]:-0})); then
+            category_max[$key]=$timeout
+        fi
+    done
+    for key in "${!category_max[@]}"; do
+        lane=${key%%/*}
+        category=${key#*/}
+        job="manifest_${category//-/_}"
+        outer=$(jq -r --arg job "$job" \
+            '.steps[] | select(.group == "e2e" and .job == $job) | .timeout' \
+            "$DAG_ROOT/$lane.json")
+        [[ $outer =~ ^[1-9][0-9]*$ ]] ||
+            die "E2E category $key has no numeric DAG-node timeout"
+        hard_floor=$((${category_max[$key]} + 10))
+        ((outer > hard_floor)) ||
+            die "E2E category $key node ${outer}s must exceed its ${category_max[$key]}s individual timeout plus 10s grace"
+    done
+    printf 'INNERMOST-TIMEOUT coverage: Cargo nextest=300/600 s (+30 s grace); E2E categories=%s all nested inside DAG nodes\n' \
+        "${#category_max[@]}"
+}
+
 # Emit WHY a prepare/compile step failed. Guaranteed to write at least one line.
 #
 # The reason is normally the child's own stderr, which is the right answer when
@@ -2397,7 +2504,7 @@ function prepare_test {
         if ((status != 0)); then
             echo "C program compilation failed for ${test#"$ROOT_DIR/"}" >&2
             emit_failure_reason "$status" "$stdout_file" "$stderr_file"
-            return 1
+            return "$status"
         fi
         return 0
     fi
@@ -2409,7 +2516,7 @@ function prepare_test {
         if ((status != 0)); then
             echo "Rust program compilation failed for ${test#"$ROOT_DIR/"}" >&2
             emit_failure_reason "$status" "$stdout_file" "$stderr_file"
-            return 1
+            return "$status"
         fi
         return 0
     fi
@@ -2421,7 +2528,7 @@ function prepare_test {
     if ((status != 0)); then
         echo "prepare failed for ${test#"$TEST_ROOT/"}" >&2
         emit_failure_reason "$status" "$stdout_file" "$stderr_file"
-        return 1
+        return "$status"
     fi
 }
 
@@ -2693,9 +2800,16 @@ function run_cell {
     start_ms=$(date +%s%3N)
 
     local outcome=PASS reason='' error_kind='' path_evidence=null launch_refusal_stderr=''
-    if ! prepare_test "$test" "$cell_dir" "$timeout_seconds"; then
+    local timeout_reason='' prepare_status=0
+    prepare_test "$test" "$cell_dir" "$timeout_seconds" || prepare_status=$?
+    if ((prepare_status != 0)); then
         outcome=ERROR
-        reason="fixture preparation failed"
+        if reason=$(individual_test_timeout_reason \
+            "$id" prepare "$backend" 1 "$timeout_seconds" "$prepare_status"); then
+            :
+        else
+            reason="fixture preparation failed"
+        fi
     elif [[ $mode == naked ]]; then
         local runs min_distinct attempt row status hash _stdout_file _stderr_file attempt_execution
         local failed_runs=0
@@ -2706,11 +2820,19 @@ function run_cell {
             row=$(execute_attempt "$test" "$metadata" "$mode" "" "$cell_dir" "$attempt")
             IFS=$'\t' read -r status hash _stdout_file _stderr_file attempt_execution <<<"$row"
             hashes+=("$hash")
+            if timeout_reason=$(individual_test_timeout_reason \
+                "$id" "$mode" native "$attempt" "$timeout_seconds" "$status"); then
+                break
+            fi
+            timeout_reason=''
             [[ $status == 0 ]] || ((failed_runs += 1))
         done
         local distinct
         distinct=$(printf '%s\n' "${hashes[@]}" | LC_ALL=C sort -u | wc -l)
-        if ((failed_runs > 0)); then
+        if [[ -n $timeout_reason ]]; then
+            outcome=FAIL
+            reason=$timeout_reason
+        elif ((failed_runs > 0)); then
             outcome=FAIL
             reason="naked control had $failed_runs failed native run(s) across $runs attempts"
         elif ((distinct < min_distinct)); then
@@ -2734,12 +2856,22 @@ function run_cell {
                 launch_refusal_stderr=$stderr1
                 break
             fi
+            if timeout_reason=$(individual_test_timeout_reason \
+                "$id" "$mode" "$backend" "seed-$seed-a" "$timeout_seconds" "$status1"); then
+                break
+            fi
+            timeout_reason=''
             row2=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" "seed-$seed-b" "$seed")
             IFS=$'\t' read -r status2 hash2 stdout2 stderr2 execution2 <<<"$row2"
             if [[ $execution2 == LAUNCH_REFUSED ]]; then
                 launch_refusal_stderr=$stderr2
                 break
             fi
+            if timeout_reason=$(individual_test_timeout_reason \
+                "$id" "$mode" "$backend" "seed-$seed-b" "$timeout_seconds" "$status2"); then
+                break
+            fi
+            timeout_reason=''
             hashes+=("$hash1")
             if [[ $status1 == 0 ]]; then
                 ((passes += 1))
@@ -2752,6 +2884,9 @@ function run_cell {
             outcome=ERROR
             error_kind=guest-launch-refused
             reason=$(launch_refusal_reason "$launch_refusal_stderr")
+        elif [[ -n $timeout_reason ]]; then
+            outcome=FAIL
+            reason=$timeout_reason
         else
             local distinct
             distinct=$(printf '%s\n' "${hashes[@]}" | LC_ALL=C sort -u | wc -l)
@@ -2775,6 +2910,11 @@ function run_cell {
                 launch_refusal_stderr=$stderr_file
                 break
             fi
+            if timeout_reason=$(individual_test_timeout_reason \
+                "$id" "$mode" "$backend" "$attempt" "$timeout_seconds" "$status"); then
+                break
+            fi
+            timeout_reason=''
             hashes+=("$hash")
             [[ $status == 0 ]] || ((failed_runs += 1))
         done
@@ -2782,6 +2922,9 @@ function run_cell {
             outcome=ERROR
             error_kind=guest-launch-refused
             reason=$(launch_refusal_reason "$launch_refusal_stderr")
+        elif [[ -n $timeout_reason ]]; then
+            outcome=FAIL
+            reason=$timeout_reason
         else
             local distinct
             distinct=$(printf '%s\n' "${hashes[@]}" | LC_ALL=C sort -u | wc -l)
@@ -2800,6 +2943,9 @@ function run_cell {
             outcome=ERROR
             error_kind=guest-launch-refused
             reason=$(launch_refusal_reason "$stderr_file")
+        elif reason=$(individual_test_timeout_reason \
+            "$id" "$mode" "$backend" 1 "$timeout_seconds" "$status"); then
+            outcome=FAIL
         elif [[ $status != 0 ]]; then
             outcome=FAIL
             reason="$mode exited with status $status"
@@ -2934,6 +3080,8 @@ load_tests
 case "$subcommand" in
     validate)
         (($# == 0)) || true
+        audit_innermost_e2e_timeout
+        audit_innermost_timeout_coverage
         audit_immutable_hermit_binary
         audit_test_binary_registration
         audit_guest_launch_classification_contract

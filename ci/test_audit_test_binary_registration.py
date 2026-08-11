@@ -113,6 +113,21 @@ class RegistrationAuditTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertIn("zz_probe", result.stderr)
 
+    def test_nextest_run_registers_a_binary(self) -> None:
+        result = self._plant_probe_with_dag_command(
+            "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh "
+            "./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --test zz_probe -j 1"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ci-registered=2", result.stdout)
+
+    def test_nextest_no_run_does_not_register_a_binary(self) -> None:
+        result = self._plant_probe_with_dag_command(
+            "cargo nextest run -p hermit --test zz_probe --no-run"
+        )
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("zz_probe", result.stderr)
+
     def test_invocation_named_only_in_a_description_does_not_register(self) -> None:
         probe = self.root / "hermit-cli/tests/zz_probe.rs"
         probe.write_text("#[test]\nfn probe() {}\n")
