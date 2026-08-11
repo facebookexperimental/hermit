@@ -1067,9 +1067,85 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::EpollPwait,
     ) -> Result<i64, Error> {
-        let dettid = guest.thread_state().dettid;
-        resource_request(guest, Resources::new(dettid)).await; // empty request
-        Ok(self.record_or_replay(guest, call).await?)
+        // This used to unconditionally inject the raw
+        // call and wait for it to return. With an infinite timeout under
+        // `--sequentialize-threads` that DEADLOCKS the whole guest: the calling
+        // task holds the scheduler turn while blocked in the kernel, and the
+        // only task that could ever satisfy the wait is sitting in the run queue
+        // waiting for a turn that never comes. Observed as `cmake` configure
+        // hanging forever at zero CPU with a grandchild frozen mid-`openat`;
+        // hermit's own scheduler log ends at `COMMIT turn N, dettid <parent>`
+        // injecting `epoll_pwait(..., -1, NULL, 8)` with `queue len 2`.
+        //
+        // WHO ACTUALLY REACHES THIS, measured rather than assumed. It is NOT
+        // glibc's `epoll_wait(2)` on this architecture: glibc calls
+        // `SYS_epoll_pwait` only where `__NR_epoll_wait` does not exist (arm64
+        // and friends). x86_64 has it, and `strace` on glibc 2.34/x86_64 shows
+        // a plain `epoll_wait` syscall, which `handle_epoll_wait` has always
+        // handled correctly. The callers that land here are programs issuing
+        // `epoll_pwait` DIRECTLY -- libuv does, which is how the original
+        // `cmake` hang was found. With a NULL sigmask the two calls are
+        // semantically identical, so route them together.
+        //
+        // A NON-NULL sigmask keeps the previous behavior: its whole purpose is
+        // to swap the signal mask atomically for the duration of the wait, and
+        // a timeout-0 polling loop cannot reproduce that atomicity. Such calls
+        // remain able to block the scheduler; that is a known remaining gap
+        // rather than something this change silently pretends to fix.
+        if call.sigmask().is_some() {
+            let dettid = guest.thread_state().dettid;
+            resource_request(guest, Resources::new(dettid)).await; // empty request
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+        if self.cfg.recordreplay_modes && call.timeout() == 0 {
+            // Cannot block, but still yield a scheduler turn so a polling thread
+            // cannot monopolize the guest between preemptions.
+            resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
+            Ok(self.record_or_replay(guest, call).await?)
+        } else if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
+            Ok(self
+                .record_or_replay_blocking(guest, Syscall::EpollPwait(call))
+                .await?)
+        } else {
+            self.handle_internal_epoll_pwait(guest, call).await
+        }
+    }
+
+    /// Handle a guest-internal `epoll_pwait` (NULL sigmask) that can be fully
+    /// determinized. Mirrors `handle_internal_epoll_wait`.
+    pub async fn handle_internal_epoll_pwait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::EpollPwait,
+    ) -> Result<i64, Error> {
+        let timeout_millis = call.timeout();
+        if timeout_millis == 0 {
+            // Cannot block, but must still yield a scheduler turn: a
+            // zero-timeout polling loop that never requests a resource can
+            // monopolize the guest between preemptions and starve the producer
+            // it is polling for. `handle_poll` takes a turn for every
+            // sequential mode, and the record/replay arm of `handle_epoll_pwait`
+            // does the same; before this PR routed NULL-sigmask `epoll_pwait`
+            // here, the old handler always made an empty request. Omitting it
+            // only on the plain-strict path would be a scheduling regression,
+            // not a refactor.
+            if self.cfg.sequentialize_threads {
+                let yield_to_peer = self.cfg.discover_live_file_metadata
+                    && guest.thread_state().has_loopback_peer();
+                resource_request(
+                    guest,
+                    zero_timeout_poll_request(guest.thread_state().dettid, yield_to_peer),
+                )
+                .await;
+            }
+            Ok(guest.inject(call).await?) // Already non-blocking.
+        } else {
+            let maybe_timeout_ns = millis_duration_to_absolute_timeout(guest, timeout_millis).await;
+            let mut rsrc = Resources::new(guest.thread_state().dettid);
+            rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
+            rsrc.fyi("epoll_pwait");
+            retry_nonblocking_syscall_with_timeout(guest, call, rsrc, maybe_timeout_ns).await
+        }
     }
 
     /// epoll_pwait2 syscall (MAYHANG).

@@ -871,6 +871,12 @@
       "why": "tests/c/epoll_determinism.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/epoll_pwait_zero_timeout_progress.c",
+      "runner": "hermit-cli/tests/epoll_pwait_zero_timeout_progress.rs",
+      "why": "tests/c/epoll_pwait_zero_timeout_progress.c is owned by hermit-cli/tests/epoll_pwait_zero_timeout_progress.rs: Producer/poller guest covering BOTH epoll_pwait scheduler defects in #1850, selected by an optional argv: no argument runs the zero-timeout case (must not STARVE its producer), 'blocking' runs the infinite-timeout case (must not DEADLOCK the scheduler). The blocking mode is the bracket for the headline fix and was added after review found that reverting the epoll_pwait routing left the whole suite green. The Rust integration test compiles it with cc and runs it under hermit, asserting PROGRESS rather than a syscall return value -- a return-value assertion passes while the producer starves. It issues the raw SYS_epoll_pwait with an explicitly NULL sigmask so it pins that exact routing rather than whatever glibc emits. Driven only by its own integration test, so it is a test-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/file_timestamp_identity.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/system-utils.toml",
