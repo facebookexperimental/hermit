@@ -1046,7 +1046,7 @@ backends_enabled = ["ptrace"]
 {extra}
 
 [backends_disabled]
-dbi = "unsupported"
+dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
@@ -1105,7 +1105,7 @@ backends_enabled = ["ptrace"]
 ci_disabled_reason = "left over from when this was off"
 
 [backends_disabled]
-dbi = "unsupported"
+dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
@@ -1292,7 +1292,7 @@ seeds = [0, 9]
 {outcome_classes}
 
 [backends_disabled]
-dbi = "unsupported"
+dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
