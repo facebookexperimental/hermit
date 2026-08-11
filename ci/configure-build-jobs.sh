@@ -70,8 +70,8 @@ fi
 # itself is unchanged; see the carry chain below. The portable wrapper obtains
 # the repository's recorded pin through the canonical checker and carries it
 # here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 6b62f91c29a5d673a5b3ab4f013dbb8078f5e031 ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie 6b62f91c29a5d673a5b3ab4f013dbb8078f5e031" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c261050cfd41bec67e31bfd0cf6f56be008d0ebb ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie c261050cfd41bec67e31bfd0cf6f56be008d0ebb" >&2
     return 2
 fi
 
@@ -468,6 +468,50 @@ REVERIE_DBT_MAX_BUILD_SECONDS=$((
 # source_recipe_key(), MAX_PARALLEL_JOBS=16, and the measured 1050
 # effective-job-second threshold (263s at 4 jobs; 66s at 16) carry unchanged.
 # Fresh exact-head validation remains required.
+
+#
+# CARRY TO c261050 (2026-08-11, third bump of the day). RECIPE IDENTITY MOVES;
+# THE BUDGET CARRIES. This is the e159d6c case, not the 108f9ab case:
+# reverie-dbt/build.rs CHANGED, so source_recipe_key() necessarily changes, but
+# the work it keys has not.
+#
+#   git rev-parse 5d42e32:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse c261050:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#                                                         IDENTICAL -- the compiled source is the same tree.
+#   git rev-parse 5d42e32:reverie-dbt/build.rs         -> 209bca718ea9b6d026a26abf5cbd8accbd346068
+#   git rev-parse c261050:reverie-dbt/build.rs         -> 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+#
+# The two commits 5d42e32..c261050 are rrnewton/reverie#440 ("Make SaBRe CMake
+# state relocatable" + "Keep the Reverie DBT cleanup lint-clean"). The only
+# reverie-dbt change is a let-chain rewrite of StagingDirectory::drop's error
+# path -- same control flow, same message, no build behaviour. build_dynamorio()
+# still cmake-configures and cmake-builds only vendor/dynamorio, which is
+# byte-identical, so the measured MISS cost cannot have moved.
+#
+# NEW RECIPE IDENTITY, DERIVED NOT GUESSED, exactly as the 3494609 entry above
+# requires. source_recipe_key() was reimplemented from the build.rs at c261050
+# (hash_tree/hash_file/hash_value/hash_name, usize::to_le_bytes framing, CMAKE
+# defaulting to "cmake" and CMAKE_GENERATOR to "<unset>") and FIRST VALIDATED
+# AGAINST THE RECORDED VALUE: fed the same on-disk vendored tree together with
+# the build.rs at 209bca71 it reproduces
+# sha256:63e29544455c901f05e37224b52e7f9734480d7c05914083bdcbd335968e6429
+# exactly -- the identity this chain already records. Only then was it used to
+# derive the value at c261050:
+#   sha256:132d77130980c546c8867fc196d97e664bc4816b1dfa9ea9c18de4a94d109c4d
+# A key computed by a reimplementation that could not reproduce the known answer
+# would be a number, not evidence; the positive control is what makes this one
+# usable. The negative direction was checked too: swapping only build.rs moves
+# the key, so the derivation is not insensitive to the input that changed.
+#
+# NOT confirmed by a real cold build at this pin. The 3494609 entry additionally
+# quoted `cargo:warning=DynamoRIO build cache MISS key=...` from an actual build;
+# that has not been done here, so this identity rests on the validated
+# reimplementation alone. Exact-head validation will exercise the real build.rs
+# and is the check that would surface a disagreement.
+#
+# Budget values (MAX_PARALLEL_JOBS=16, 1050 effective-job-seconds, 263/66
+# max-elapsed) carry unchanged. The >=5-clean-Hermit-lane-samples replacement bar
+# is still unmet, so nothing is recalibrated here.
 
 
 export CARGO_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS
