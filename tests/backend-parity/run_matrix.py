@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
+import shlex
 import signal
 from pathlib import Path
 import shutil
@@ -22,9 +24,12 @@ BACKENDS = ("ptrace", "dbt", "kvm")
 RUNS = 3
 
 # The compatibility scorecard is measurement state, not Hermit source.  When
-# this checkout is nested in dev-hermit, live observations are appended to the
-# outer workspace's canonical scorecard.  Standalone Hermit clones simply skip
-# that side effect unless --parent-scorecard is supplied.
+# this checkout is nested in dev-hermit, live observations are written to one
+# ignored per-run file under compat-envelope/ignored/backend-parity/.  The
+# tracked compat-envelope/scorecard.csv is advanced only by the parent
+# publisher, publish-scorecard.py, so measuring never mutates it.  Standalone
+# Hermit clones simply skip that side effect unless --parent-scorecard is
+# supplied.  Artifact routing never selects or disables a comparison contract.
 SCORECARD_HEADER = (
     "run_id",
     "run_utc",
@@ -40,11 +45,17 @@ SCORECARD_HEADER = (
     "cell_state",
     "outcome",
     "deterministic",
-    "parity",
+    "stdout_parity",
     "output_hash",
     "duration_ms",
     "max_rss_kb",
     "reason",
+    "ref_output_hash",
+    "parity_comparator",
+    "parity_tier",
+    "comparison_tier",
+    "stack_parity",
+    "heap_parity",
     "verify_compare",
     "bitwise_parity",
     "compared_log_messages",
@@ -56,7 +67,7 @@ SCORECARD_HEADER = (
 # The parent renderer already accepts both while `parity` -> `stdout_parity` is
 # in flight.  Accepting both here too is the point of this whole mechanism: the
 # rename must not be able to break this gate the way `verify_compare` did.
-PARITY_COLUMNS = ("parity", "stdout_parity")
+PARITY_COLUMNS = ("stdout_parity", "parity")
 
 # The columns this producer actually fills.  Everything else the file carries is
 # written blank.
@@ -84,6 +95,28 @@ EVIDENCE_COLUMNS = (
     "tier",
 )
 
+# The stdout comparison's condition columns.  New scorecards carry them, while
+# a legacy parent scorecard may not.  They are optional at the file boundary so
+# a parent-side schema addition cannot break Hermit validation; when either
+# operand column is absent, append_parent_scorecard withholds the parity boolean
+# too.  A result without both operands is UNMEASURED, never an inferred pass.
+STDOUT_EVIDENCE_COLUMNS = (
+    "ref_output_hash",
+    "parity_comparator",
+    "parity_tier",
+)
+
+COMPARISON_TIER_COLUMN = "comparison_tier"
+COMPARISON_TIER_STDOUT_ONLY = "unqualified-stdout-only"
+COMPARISON_TIER_SELF_VERIFY_ONLY = "unqualified-self-verify-only"
+COMPARISON_TIER_NO_COMPARISON = "unqualified-no-comparison"
+OPTIONAL_SCORECARD_COLUMNS = (
+    *STDOUT_EVIDENCE_COLUMNS,
+    COMPARISON_TIER_COLUMN,
+    "stack_parity",
+    "heap_parity",
+)
+
 # Recorded as the comparator when the run produced no typed verdict at all, so a
 # reader can tell "no verdict existed" from "a verdict existed and was stripped".
 # A blank would conflate those two, and only one of them is a measurement.
@@ -95,7 +128,11 @@ VERIFY_COMPARE_UNAVAILABLE = "unavailable:no-verify-json"
 BITWISE_CAPABLE_COMPARATORS = ("canonical",)
 
 PRODUCED_COLUMNS = tuple(
-    c for c in SCORECARD_HEADER if c not in EVIDENCE_COLUMNS and c != "parity"
+    c
+    for c in SCORECARD_HEADER
+    if c not in EVIDENCE_COLUMNS
+    and c not in OPTIONAL_SCORECARD_COLUMNS
+    and c not in PARITY_COLUMNS
 )
 
 
@@ -629,6 +666,81 @@ def root_random_output(stdout: bytes) -> bytes:
     )
 
 
+# Dynamic-output rows are cross-backend exact-output contracts only when they
+# already name such a contract explicitly.  The fixed-output rows carry their
+# contract in ``expected_stdout``; virtual_pid is the one marker-only row whose
+# complete output is defined as a virtual identity, and DBT random_sources has
+# a pre-existing ptrace root-stream comparison.  Memory-layout and clock rows
+# deliberately remain repeatability-within-one-backend contracts: their raw
+# addresses/timing deltas are not cross-backend byte oracles.
+DYNAMIC_EXACT_STDOUT_PARITY_CASES = frozenset({"virtual_pid"})
+
+
+def exact_stdout_parity_contract(
+    backend: str, name: str, expected_stdout: bytes | None
+) -> bool:
+    return (
+        expected_stdout is not None
+        or name in DYNAMIC_EXACT_STDOUT_PARITY_CASES
+        or (backend == "dbt" and name == "random_sources")
+    )
+
+
+def stdout_parity_evidence(
+    candidate: bytes | None, reference: bytes | None
+) -> dict[str, str]:
+    """Return the exact operands and their derived stdout-parity verdict.
+
+    ``None`` means that side was not measured.  Empty stdout is deliberately
+    different: ``b""`` is a real operand with the well-known SHA-256 digest and
+    can hold or differ just like any other byte stream.  The verdict is derived
+    only when both operands exist, so this helper cannot manufacture a pass from
+    a missing reference or from the enclosing test's PASS status.
+    """
+    evidence: dict[str, str] = {}
+    if candidate is not None:
+        evidence["output_hash"] = hashlib.sha256(candidate).hexdigest()
+    if reference is not None:
+        evidence["ref_output_hash"] = hashlib.sha256(reference).hexdigest()
+    if candidate is not None and reference is not None:
+        evidence["stdout_parity"] = (
+            "1" if evidence["output_hash"] == evidence["ref_output_hash"] else "0"
+        )
+        evidence["parity_comparator"] = "stdout-sha256-exact-v1"
+        evidence["parity_tier"] = "stdout-exact"
+    return evidence
+
+
+def capture_ptrace_reference(
+    hermit: Path,
+    guest: list[str],
+    name: str,
+    strict: bool,
+    expected_status: int,
+    expected_stdout: bytes | None,
+) -> tuple[bytes | None, str]:
+    """Capture the plain-run ptrace stdout used as the cross-backend reference."""
+    reference = run_with_timeout(
+        hermit_command(hermit, "ptrace", guest, name, strict)
+    )
+    if reference is None:
+        return None, "ptrace reference timed out"
+    if reference.returncode != expected_status:
+        diagnostic = reference.stderr.decode(errors="replace").strip()
+        return (
+            None,
+            f"ptrace reference exited {reference.returncode}, expected "
+            f"{expected_status}: {diagnostic[-300:]}",
+        )
+    if expected_stdout is not None and reference.stdout != expected_stdout:
+        return (
+            None,
+            f"ptrace reference stdout={reference.stdout!r}, "
+            f"expected={expected_stdout!r}",
+        )
+    return reference.stdout, ""
+
+
 # Two distinct `--verify` success witnesses, and they are NOT the same assurance:
 #
 #  * DETLOG-bitwise (ptrace, DBT): hermit re-runs the guest and finds the two
@@ -729,6 +841,7 @@ def run_case_verify(
         )
     if evidence is not None and observed_evidence:
         evidence.update(observed_evidence)
+        evidence[COMPARISON_TIER_COLUMN] = COMPARISON_TIER_SELF_VERIFY_ONLY
     if result is None:
         return "FAIL", "verify run timed out", time.monotonic() - started
     diagnostic = result.stderr.decode(errors="replace").strip()
@@ -776,6 +889,7 @@ def run_case_verify(
                     "bitwise_parity": "0",
                     "compared_log_messages": "",
                     "determinism_unmeasured": "1",
+                    COMPARISON_TIER_COLUMN: COMPARISON_TIER_SELF_VERIFY_ONLY,
                 }
             )
     elif VERIFY_WITNESS_GUEST_VISIBLE in result.stderr:
@@ -792,6 +906,7 @@ def run_case_verify(
                     "bitwise_parity": "0",
                     "compared_log_messages": "",
                     "determinism_unmeasured": "1",
+                    COMPARISON_TIER_COLUMN: COMPARISON_TIER_SELF_VERIFY_ONLY,
                 }
             )
     else:
@@ -839,6 +954,8 @@ def run_case(
     evidence: dict[str, str] | None = None,
 ) -> tuple[str, str, float]:
     guest, expected_status, expected_stdout = case_command(name, fixtures)
+    if evidence is not None:
+        evidence[COMPARISON_TIER_COLUMN] = COMPARISON_TIER_NO_COMPARISON
     if backend == "dbt" and name == "random_sources":
         guest = [*guest, "--root-only"]
     if backend == "kvm" and name == "memory_advice":
@@ -849,26 +966,59 @@ def run_case(
         )
     baseline: bytes | None = None
     started = time.monotonic()
-    ptrace_random: bytes | None = None
-    if backend == "dbt" and name == "random_sources":
-        reference = run_with_timeout(
-            hermit_command(hermit, "ptrace", guest, name, strict)
+    reference_stdout: bytes | None = None
+    reference_problem = ""
+    requires_ptrace_reference = backend == "dbt" and name == "random_sources"
+    requires_exact_stdout_parity = exact_stdout_parity_contract(
+        backend, name, expected_stdout
+    )
+    if requires_exact_stdout_parity or requires_ptrace_reference:
+        reference_stdout, reference_problem = capture_ptrace_reference(
+            hermit,
+            guest,
+            name,
+            strict,
+            expected_status,
+            expected_stdout,
         )
-        if reference is None:
-            return "FAIL", "ptrace reference timed out", time.monotonic() - started
-        if reference.returncode != expected_status:
-            diagnostic = reference.stderr.decode(errors="replace").strip()
-            return (
-                "FAIL",
-                f"ptrace reference exited {reference.returncode}: {diagnostic[-300:]}",
-                time.monotonic() - started,
-            )
-        ptrace_random = root_random_output(reference.stdout)
+        if evidence is not None:
+            evidence.update(stdout_parity_evidence(None, reference_stdout))
+        # Preserve the pre-existing DBT random-stream contract even when the
+        # caller explicitly disables scorecard output.  General stdout parity
+        # may remain UNMEASURED when its reference is unavailable; this named
+        # functional comparison may not.
+        if requires_ptrace_reference and reference_stdout is None:
+            return "FAIL", reference_problem, time.monotonic() - started
+        if requires_exact_stdout_parity and reference_stdout is None:
+            # The requested comparison itself is part of this cell's contract.
+            # A missing side or comparator failure is RED, not an unmeasured
+            # success: no equality verdict exists to support a green row.
+            return "FAIL", reference_problem, time.monotonic() - started
+    ptrace_random = (
+        root_random_output(reference_stdout)
+        if backend == "dbt" and name == "random_sources" and reference_stdout is not None
+        else None
+    )
     for iteration in range(RUNS):
         command = hermit_command(hermit, backend, guest, name, strict)
         result = run_with_timeout(command)
         if result is None:
             return "FAIL", f"run {iteration + 1} timed out", time.monotonic() - started
+
+        # Record the candidate before interpreting its status or expected output.
+        # A real stdout divergence must leave unequal operands and parity=0 in
+        # the row, even though the enclosing test returns FAIL immediately.
+        if iteration == 0 and requires_exact_stdout_parity:
+            comparison = stdout_parity_evidence(result.stdout, reference_stdout)
+            if evidence is not None:
+                evidence.update(comparison)
+                evidence[COMPARISON_TIER_COLUMN] = COMPARISON_TIER_STDOUT_ONLY
+            if comparison.get("stdout_parity") == "0":
+                return (
+                    "FAIL",
+                    "run 1 stdout differed from ptrace reference",
+                    time.monotonic() - started,
+                )
 
         if result.returncode != expected_status:
             diagnostic = result.stderr.decode(errors="replace").strip()
@@ -930,7 +1080,8 @@ def run_case(
                     f"run {iteration + 1} root random stream differed from ptrace",
                     time.monotonic() - started,
                 )
-    return "PASS", f"{RUNS}/{RUNS} runs matched", time.monotonic() - started
+    detail = f"{RUNS}/{RUNS} runs matched"
+    return "PASS", detail, time.monotonic() - started
 
 
 # The columns the `--output` TSV carries.  `evidence` is deliberately NOT one of
@@ -1022,15 +1173,75 @@ def write_results(path: Path, results: list[dict[str, str]]) -> None:
     print(f"TRACKING: wrote {len(results)} result row(s) to {path}")
 
 
-def discover_parent_scorecard() -> Path | None:
+DEFAULT_OBSERVATION_SUBDIR = Path("ignored") / "backend-parity"
+
+
+def discover_compat_envelope() -> Path | None:
     configured = os.environ.get("DEV_HERMIT_ROOT") or os.environ.get("DEV_HERMIT")
     roots = [Path(configured)] if configured else []
     roots.extend((REPOSITORY, *REPOSITORY.parents))
     for root in roots:
         compat_dir = root / "compat-envelope"
         if compat_dir.is_dir():
-            return compat_dir / "scorecard.csv"
+            return compat_dir.resolve()
     return None
+
+
+def make_run_id() -> tuple[str, int]:
+    hermit_sha = git_output("rev-parse", "HEAD") or "unknown"
+    epoch = int(time.time())
+    return f"backend-parity-{hermit_sha[:12]}-{epoch}-{os.getpid()}", epoch
+
+
+def default_observation_path(run_id: str) -> Path | None:
+    compat_dir = discover_compat_envelope()
+    if compat_dir is None:
+        return None
+    return compat_dir / DEFAULT_OBSERVATION_SUBDIR / f"{run_id}.csv"
+
+
+def fold_in_command(compat_dir: Path, observation: Path) -> str:
+    publisher = compat_dir / "publish-scorecard.py"
+    command = (
+        "python3",
+        str(publisher),
+        "--observation",
+        str(observation),
+        "--current",
+        str(compat_dir / "scorecard.csv"),
+        "--history",
+        str(compat_dir / "history" / "scorecard-observations.csv"),
+    )
+    return " ".join(shlex.quote(part) for part in command)
+
+
+def is_tracked_current_scorecard(path: Path, compat_dir: Path | None) -> bool:
+    """Recognize the reviewed current view even without parent discovery.
+
+    ``--parent-scorecard`` exists for a standalone Hermit checkout, where the
+    requested parent may not be an ancestor and ``discover_compat_envelope``
+    legitimately returns ``None``.  The publisher-only rule must still hold in
+    that exact configuration, so the resolved ``compat-envelope/scorecard.csv``
+    shape is itself sufficient.  A discovered parent remains the stronger
+    identity check and also covers a symlinked spelling of the directory.
+    """
+    def has_current_shape(candidate: Path) -> bool:
+        return (
+            candidate.name == "scorecard.csv"
+            and candidate.parent.name == "compat-envelope"
+        )
+
+    # Check the spelling as well as the resolved target.  A standalone caller
+    # may point at a symlinked compat-envelope whose target has a different
+    # directory name; that must not turn the publisher-only current view into
+    # an appendable observation.
+    if has_current_shape(path):
+        return True
+    resolved = path.resolve()
+    if compat_dir is not None:
+        if resolved == (compat_dir / "scorecard.csv").resolve():
+            return True
+    return has_current_shape(resolved)
 
 
 def git_output(*args: str) -> str | None:
@@ -1052,6 +1263,8 @@ def append_parent_scorecard(
     strict: bool,
     verify: bool,
     probe_gaps: bool,
+    run_id: str | None = None,
+    epoch: int | None = None,
 ) -> None:
     # Multiple worktrees can validate concurrently against one outer workspace.
     # Serialize whole-row appends so the shared measurement log remains valid.
@@ -1060,13 +1273,14 @@ def append_parent_scorecard(
     path.parent.mkdir(parents=True, exist_ok=True)
     hermit_sha = git_output("rev-parse", "HEAD") or "unknown"
     dirty = bool(git_output("status", "--porcelain"))
-    epoch = int(time.time())
-    run_id = f"backend-parity-{hermit_sha[:12]}-{epoch}-{os.getpid()}"
+    if run_id is None or epoch is None:
+        run_id, epoch = make_run_id()
     mode = "verify" if verify else "strict" if strict else "repeat"
     rows: list[dict[str, str]] = []
     for result in results:
         status = result["result"]
         passed = status in {"PASS", "XPASS"}
+        stdout_evidence = result.get("evidence") or {}
         outcome = {
             "PASS": "pass",
             "XPASS": "pass",
@@ -1074,7 +1288,9 @@ def append_parent_scorecard(
             "GAP": "gap",
             "BLOCKED": "skip",
         }[status]
-        parity = "1" if passed else "0" if status == "FAIL" else ""
+        # PASS/FAIL is the whole test's outcome, not a stdout comparison.  The
+        # parity boolean is derived solely from the two hashes captured above.
+        parity = stdout_evidence.get("stdout_parity", "")
         detail = result["detail"]
         if verify and result["backend"] == "kvm" and passed:
             detail = (
@@ -1107,11 +1323,15 @@ def append_parent_scorecard(
                     if (result.get("evidence") or {}).get("determinism_unmeasured")
                     else ("1" if passed and strict else "")
                 ),
-                "parity": parity,
-                "output_hash": "",
+                "stdout_parity": parity,
+                "output_hash": stdout_evidence.get("output_hash", ""),
                 "duration_ms": str(round(float(result["seconds"]) * 1000)),
                 "max_rss_kb": "",
                 "reason": detail,
+                **{
+                    column: stdout_evidence.get(column, "")
+                    for column in STDOUT_EVIDENCE_COLUMNS
+                },
                 # The comparison this row's verdict rests on.  `deterministic`
                 # alone is the ambiguous field the audit flagged -- a bare 1
                 # cannot distinguish a stripped match from a bitwise one -- so it
@@ -1119,9 +1339,16 @@ def append_parent_scorecard(
                 # that make the tier falsifiable.  Written only into files that
                 # carry these columns (see EVIDENCE_COLUMNS).
                 **{
-                    column: (result.get("evidence") or {}).get(column, "")
+                    column: stdout_evidence.get(column, "")
                     for column in EVIDENCE_COLUMNS
                 },
+                COMPARISON_TIER_COLUMN: stdout_evidence.get(
+                    COMPARISON_TIER_COLUMN, COMPARISON_TIER_NO_COMPARISON
+                ),
+                # This matrix does not request the L3 memory flags.  For a new
+                # run that fact is known and is false, not historical unknown.
+                "stack_parity": "0",
+                "heap_parity": "0",
             }
         )
 
@@ -1138,9 +1365,14 @@ def append_parent_scorecard(
                 scorecard, fieldnames=fieldnames, lineterminator="\n"
             )
             writer.writeheader()
-        if parity_column != "parity":
+        if "ref_output_hash" not in fieldnames:
+            # A legacy row cannot carry both operands.  Keep its candidate hash,
+            # but never emit an assertion that the row cannot re-derive.
             for row in rows:
-                row[parity_column] = row.pop("parity")
+                row["stdout_parity"] = ""
+        if parity_column != "stdout_parity":
+            for row in rows:
+                row[parity_column] = row.pop("stdout_parity")
         scorecard.seek(0, os.SEEK_END)
         # `restval` fills a column the file HAS and we did not populate;
         # `extrasaction="ignore"` drops evidence we produced that the file does
@@ -1158,7 +1390,51 @@ def append_parent_scorecard(
         writer.writerows(rows)
         scorecard.flush()
         fcntl.flock(scorecard.fileno(), fcntl.LOCK_UN)
-    print(f"TRACKING: appended {len(rows)} rows to outer scorecard {path}")
+    print(f"TRACKING: wrote {len(rows)} observation rows to {path}")
+
+
+def record_parent_observations(
+    results: list[dict[str, str]],
+    *,
+    requested_path: Path | None,
+    disabled: bool,
+    strict: bool,
+    verify: bool,
+    probe_gaps: bool,
+) -> Path | None:
+    if disabled or not results:
+        return None
+    run_id, epoch = make_run_id()
+    explicit = requested_path is not None
+    destination = requested_path or default_observation_path(run_id)
+    if destination is None:
+        print(
+            "TRACKING: no enclosing dev-hermit compat-envelope/ found; "
+            f"{len(results)} observation(s) NOT recorded"
+        )
+        return None
+    compat_dir = discover_compat_envelope()
+    if is_tracked_current_scorecard(destination, compat_dir):
+        raise MatrixError(
+            "refusing to append the tracked current scorecard; write a per-run "
+            "observation and publish it through publish-scorecard.py"
+        )
+    append_parent_scorecard(
+        destination,
+        results,
+        strict=strict,
+        verify=verify,
+        probe_gaps=probe_gaps,
+        run_id=run_id,
+        epoch=epoch,
+    )
+    if not explicit and compat_dir is not None:
+        print(
+            "TRACKING: per-run artifact only; current scorecard unchanged. "
+            "After review, publish with:\n  "
+            + fold_in_command(compat_dir, destination)
+        )
+    return destination
 
 
 def parse_args() -> argparse.Namespace:
@@ -1186,14 +1462,18 @@ def parse_args() -> argparse.Namespace:
         "--parent-scorecard",
         type=Path,
         help=(
-            "append observations to this outer dev-hermit scorecard (default: "
-            "auto-detect compat-envelope/scorecard.csv)"
+            "write observations to this exact artifact (default: one ignored "
+            "per-run file under compat-envelope/ignored/backend-parity/; the "
+            "tracked compat-envelope/scorecard.csv is always refused)"
         ),
     )
     parser.add_argument(
         "--no-parent-scorecard",
         action="store_true",
-        help="disable the outer dev-hermit scorecard side effect",
+        help=(
+            "disable outer dev-hermit observation output without disabling "
+            "any comparison"
+        ),
     )
     parser.add_argument(
         "--probe-gaps",
@@ -1261,7 +1541,10 @@ def main() -> int:
     hermit = args.hermit.resolve()
     if not hermit.is_file() or not os.access(hermit, os.X_OK):
         raise MatrixError(f"Hermit executable is unavailable: {hermit}")
-
+    if args.parent_scorecard and args.no_parent_scorecard:
+        raise MatrixError(
+            "--parent-scorecard and --no-parent-scorecard cannot be used together"
+        )
     results: list[dict[str, str]] = []
     failures = 0
     with tempfile.TemporaryDirectory(prefix="hermit-backend-parity-") as tempdir:
@@ -1322,25 +1605,14 @@ def main() -> int:
 
     if args.output:
         write_results(args.output, results)
-    if args.parent_scorecard and args.no_parent_scorecard:
-        raise MatrixError(
-            "--parent-scorecard and --no-parent-scorecard cannot be used together"
-        )
-    if not args.no_parent_scorecard and results:
-        parent_scorecard = args.parent_scorecard or discover_parent_scorecard()
-        if parent_scorecard is None:
-            print(
-                "TRACKING: outer dev-hermit scorecard not found; "
-                "use --parent-scorecard to select one"
-            )
-        else:
-            append_parent_scorecard(
-                parent_scorecard,
-                results,
-                strict=strict,
-                verify=args.verify,
-                probe_gaps=args.probe_gaps,
-            )
+    record_parent_observations(
+        results,
+        requested_path=args.parent_scorecard,
+        disabled=args.no_parent_scorecard,
+        strict=strict,
+        verify=args.verify,
+        probe_gaps=args.probe_gaps,
+    )
     return 1 if failures else 0
 
 
