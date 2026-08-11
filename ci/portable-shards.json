@@ -12,6 +12,7 @@
     "check.reverie_pin",
     "check.skill_discovery",
     "check.backend_abstraction",
+    "check.backend_parity_mutation",
     "check.portability_paths",
     "check.script_sigpipe",
     "lint.rustfmt"

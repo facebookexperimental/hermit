@@ -3251,6 +3251,30 @@
       "path": "tests/backend-parity/measurements/verify-sweep-6e1b59af0.tsv",
       "runner": "maintainers of tests/e2e/manifests/backend-parity-c.toml",
       "why": "tests/backend-parity/measurements/verify-sweep-6e1b59af0.tsv is owned by maintainers of tests/e2e/manifests/backend-parity-c.toml: This table is the recorded per-cell verify evidence, one row per declared test and backend pair with both sweep verdicts, that every ci = true flag in the backend-parity-c manifest rests on. It is inert recorded data read by reviewers rather than by any runner, and the generic manifest must not schedule it as an executable guest."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/backend-parity/fixtures/parity_probe.h",
+      "runner": "tests/backend-parity/parity_mutation.py",
+      "why": "tests/backend-parity/fixtures/parity_probe.h is owned by tests/backend-parity/parity_mutation.py: This header gives every identity fixture in the family one contract -- check accumulation, a single canonical stdout line, nonzero exit on any failed check, and the parity_mutate_*() seam the harness perturbs. It is compiled into each fixture rather than run, so it is build input to the harness and never an executable guest in its own right."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/backend-parity/fixtures/rlimit_identity.c",
+      "runner": "tests/backend-parity/parity_mutation.py",
+      "why": "tests/backend-parity/fixtures/rlimit_identity.c is owned by tests/backend-parity/parity_mutation.py: This is a family member guest exercised only through the shared mutation harness, which compiles it with the family flags and supplies its declared mutation field. It carries no bespoke verification logic of its own and is not a manifest test, so the generic manifest must not schedule it independently of the harness that gives it meaning."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/backend-parity/fixtures/sched_getaffinity_identity.c",
+      "runner": "tests/backend-parity/parity_mutation.py",
+      "why": "tests/backend-parity/fixtures/sched_getaffinity_identity.c is owned by tests/backend-parity/parity_mutation.py: This is the second family member guest, registered to demonstrate that a new member inherits the shared verification with zero bespoke code. Like its sibling it is compiled and driven exclusively by the mutation harness and is not an independently scheduled manifest test, so the generic manifest must not claim it."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/backend-parity/parity_mutation.py",
+      "runner": "ci/dag/portable.json e2e.parity_mutation",
+      "why": "tests/backend-parity/parity_mutation.py is owned by ci/dag/portable.json e2e.parity_mutation: This is the shared mutation harness for the backend-parity identity family: it proves each declared field is load-bearing and compares every candidate backend against the golden ptrace reference at a recorded strictness tier. It is a driver invoked directly by CI, not a guest, and the generic manifest must not schedule it as one."
     }
   ],
   "schema": 2

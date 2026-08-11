@@ -504,6 +504,7 @@
         "dbt"
       ],
       "nodes": [
+        "check.backend_parity_mutation",
         "e2e.manifest_backend_parity_c",
         "test.dbt_parity"
       ],
