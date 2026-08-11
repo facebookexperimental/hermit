@@ -55,7 +55,11 @@ int main(int argc, char **argv) {
   struct rusage usage;
   const struct rusage zero_usage = {0};
   memset(&usage, 0xa5, sizeof(usage));
-  if (wait4(first, &status, 0, &usage) != first)
+  pid_t wait4_result;
+  do {
+    wait4_result = wait4(first, &status, 0, &usage);
+  } while (wait4_result < 0 && errno == EINTR);
+  if (wait4_result != first)
     fail("wait4");
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 7)
     return 2;
@@ -70,7 +74,11 @@ int main(int argc, char **argv) {
 
   siginfo_t info;
   memset(&info, 0, sizeof(info));
-  if (waitid(P_PID, second, &info, WEXITED) != 0)
+  int waitid_result;
+  do {
+    waitid_result = waitid(P_PID, second, &info, WEXITED);
+  } while (waitid_result != 0 && errno == EINTR);
+  if (waitid_result != 0)
     fail("waitid");
   if (info.si_code != CLD_EXITED || info.si_pid != second ||
       info.si_status != 9)
