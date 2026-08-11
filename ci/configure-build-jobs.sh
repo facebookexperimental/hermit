@@ -70,8 +70,8 @@ fi
 # itself is unchanged; see the carry chain below. The portable wrapper obtains
 # the repository's recorded pin through the canonical checker and carries it
 # here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 99437f05e82377a80ad1edb9e501d89a38c91ecb ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie 99437f05e82377a80ad1edb9e501d89a38c91ecb" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 349460925ee56f2aca686a3392b534e8861ba375 ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie 349460925ee56f2aca686a3392b534e8861ba375" >&2
     return 2
 fi
 
@@ -378,6 +378,58 @@ REVERIE_DBT_MAX_BUILD_SECONDS=$((
         REVERIE_DBT_EFFECTIVE_BUILD_JOBS - 1) /
         REVERIE_DBT_EFFECTIVE_BUILD_JOBS
 ))
+
+# CARRY TO 3494609 (2026-08-10). RECIPE IDENTITY MOVES; THE BUDGET CARRIES.
+# This is the e159d6c case, not the ab44bbf7 case: reverie-dbt/build.rs CHANGED,
+# so source_recipe_key() necessarily changes, but the work it keys has not.
+#
+#   git rev-parse 99437f05:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse 3494609 :reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#                                                          IDENTICAL -- the compiled source is the same tree.
+#
+# The five commits 99437f05..3494609 are DynamoRIO BUILD-CACHE MANAGEMENT:
+#   5dffda1 Share DynamoRIO installs across Cargo fingerprints
+#   1a227a9 Exercise concurrent DynamoRIO cache publication
+#   3d9756a Reject incomplete DynamoRIO cache installs
+#   4664b5e Bind DynamoRIO cache hits to build provenance
+#   3494609 Handle both Cargo OUT_DIR cache layouts
+# They relocate the install under a shared cache root, stage into a temporary
+# directory, quarantine an install that fails a usability check, and rebuild.
+# Every one of them changes whether a build is a HIT or a MISS. NONE changes
+# what a MISS compiles: the vendored tree is byte-identical and the cmake
+# invocation is unchanged. The budget governs exactly one quantity -- the
+# elapsed time of a content-key MISS -- so its worst case is bounded by the same
+# cold DynamoRIO compile as before. The staging copy/rename these commits add is
+# negligible beside that compile, and the added quarantine path leads to the
+# already-budgeted cold build.
+#
+# NEW RECIPE IDENTITY, DERIVED NOT GUESSED. source_recipe_key() was
+# reimplemented from the build.rs at 3494609 (hash_tree/hash_file/hash_value/
+# hash_name, usize::to_le_bytes framing) and FIRST VALIDATED AGAINST THE
+# RECORDED VALUE: fed the vendored tree and build.rs at 99437f05 it reproduces
+# sha256:019b79670b3572c1afc2690932dd3fbbf70bbc9d0d96b5086ea121422de4bbb9
+# exactly -- the identity this chain already recorded. Only then was it used to
+# derive the value at 3494609:
+#   sha256:63e29544455c901f05e37224b52e7f9734480d7c05914083bdcbd335968e6429
+# A key computed by a reimplementation that could not reproduce the known
+# answer would be a number, not evidence; the positive control is what makes
+# this one usable.
+#
+# CONFIRMED BY THE REAL BUILD, not only by the reimplementation. A cold
+# `cargo build --workspace` at this pin ran the actual build.rs at 3494609 and
+# printed its own content key:
+#   cargo:warning=DynamoRIO build cache MISS key=sha256:63e29544455c901f05e37224b52e7f9734480d7c05914083bdcbd335968e6429
+# identical to the derived value. The derivation and the running code agree.
+# This is still NOT a substitute for the hosted-runner calibration, exactly as
+# the e159d6c entry noted for its own identity transition.
+#
+# Budget values (MAX_PARALLEL_JOBS=16, 1050 effective-job-seconds, 263/66
+# max-elapsed) carry unchanged. The >=5-clean-Hermit-lane-samples replacement
+# bar is unmet, so nothing is recalibrated here.
+#
+# BUILD-RELEVANT ANYWAY: reverie-dbt/build.rs is compiled by hermit, so this
+# bump requires REAL revalidation; no prior receipt may be reused.
+
 
 export CARGO_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS
 export THIRD_PARTY_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS
