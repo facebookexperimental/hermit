@@ -1129,10 +1129,14 @@ async fn run_sabre(
     // observation envelope. Versioning that fact lets scorecard consumers
     // reject old or incomplete records rather than infer coverage from silence.
     //
-    // This is intentionally observable on the Hermit CLI's stderr. Printing it
-    // for every SaBRe run keeps a missing record distinct from a record whose
-    // counters are zero.
-    eprintln!("{}", sabre_backend_evidence_line(&supervised.path_evidence));
+    // Keep this in the controller-diagnostic stream rather than writing
+    // directly to the process stderr that also carries captured guest stderr.
+    // WARN is Hermit's default tracing level, and `--log-file` can therefore
+    // separate the unconditional controller fact from guest output without a
+    // comparator exception. A missing record remains distinct from a record
+    // whose counters are zero.
+    let backend_evidence = sabre_backend_evidence_line(&supervised.path_evidence);
+    tracing::warn!(target: "hermit::sabre", "{backend_evidence}");
     if let Some(path) = path_evidence_file {
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -1192,6 +1196,12 @@ fn sabre_reach_state(guest_rpc_observed: bool, ptrace_fallback_sites: usize) -> 
 /// interpreter runs before the Detcore plugin is loaded. It is recorded rather
 /// than inferred from counters because the ptrace fallback cannot observe that
 /// interval either.
+///
+/// Preserve the originating #1725 measurement as provenance for that field:
+/// on its measurement host, `/bin/true` produced 3 COMMITs under SaBRe versus
+/// 14 under ptrace; the 11 absent records were the loader's libc.so.6 path
+/// resolution. The launch-order fact, not that host-specific count, is the
+/// runtime contract.
 fn sabre_backend_evidence_line(evidence: &sabre_ptrace::PathEvidence) -> String {
     format!(
         ":: Backend: sabre static rewriting + ptrace runtime; run_mode=run; \

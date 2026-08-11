@@ -16,6 +16,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 const NON_RACY_EXAMPLES: [&str; 4] = ["date.sh", "devrand.sh", "rand.py", "timed-progress-bar.py"];
+const SABRE_BACKEND_FACT_PREFIX: &str = ":: Backend: sabre static rewriting + ptrace runtime;";
 
 fn hermit_binary() -> PathBuf {
     std::env::var_os("HERMIT_SABRE_TEST_BINARY")
@@ -165,7 +166,7 @@ fn example_command(
     diagnostic_log: Option<&Path>,
 ) -> Command {
     let mut command = Command::new(hermit_binary());
-    command.arg(if verify { "--log=info" } else { "--log=error" });
+    command.arg(if verify { "--log=info" } else { "--log=warn" });
     if let Some(path) = diagnostic_log {
         command.arg("--log-file").arg(path);
     }
@@ -194,11 +195,58 @@ fn parity_run(example: &Path, args: &[&str], backend: Option<&Path>, label: &str
         .prefix("sabre-parity-")
         .tempfile_in(env!("CARGO_TARGET_TMPDIR"))
         .unwrap_or_else(|error| panic!("failed to create {label} diagnostic log: {error}"));
-    run_bounded(
+    let output = run_bounded(
         example_command(example, args, backend, false, Some(diagnostic_log.path())),
         label,
         Some(diagnostic_log.path()),
-    )
+    );
+    let diagnostics = controller_diagnostics(Some(diagnostic_log.path()));
+    let guest_stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Positive control: every SaBRe run emits the structured backend fact into
+    // the controller sidecar. Negative controls: ptrace emits no SaBRe fact,
+    // and neither backend lets that controller fact leak into captured guest
+    // stderr. Guest stderr itself is still compared byte-for-byte below.
+    if backend.is_some() {
+        assert!(
+            diagnostics.contains(SABRE_BACKEND_FACT_PREFIX),
+            "SaBRe controller diagnostics omitted the backend fact for {label}:\n{diagnostics}",
+        );
+    } else {
+        assert!(
+            !diagnostics.contains(SABRE_BACKEND_FACT_PREFIX),
+            "ptrace controller diagnostics unexpectedly carried a SaBRe fact for {label}:\n{diagnostics}",
+        );
+    }
+    assert!(
+        !guest_stderr.contains(SABRE_BACKEND_FACT_PREFIX),
+        "controller backend fact leaked into captured guest stderr for {label}:\n{guest_stderr}",
+    );
+    output
+}
+
+fn assert_controller_diagnostics_do_not_hide_guest_stderr(loader: &Path) {
+    const MARKER: &[u8] = b"guest-stderr-control\n";
+    let args = ["-c", "printf 'guest-stderr-control\\n' >&2"];
+    let ptrace = parity_run(
+        Path::new("/bin/sh"),
+        &args,
+        None,
+        "ptrace controller/guest stderr separation control",
+    );
+    let sabre = parity_run(
+        Path::new("/bin/sh"),
+        &args,
+        Some(loader),
+        "SaBRe controller/guest stderr separation control",
+    );
+
+    assert_eq!(ptrace.stderr, MARKER, "ptrace hid or rewrote guest stderr");
+    assert_eq!(sabre.stderr, MARKER, "SaBRe hid or rewrote guest stderr");
+    assert_eq!(
+        sabre.stderr, ptrace.stderr,
+        "controller-diagnostic routing must not weaken guest stderr parity",
+    );
 }
 
 fn assert_backend_parity_and_sabre_verify(
@@ -306,6 +354,8 @@ fn sabre_root_pid_matches_ptrace() {
     let Some(loader) = sabre_loader() else {
         return;
     };
+
+    assert_controller_diagnostics_do_not_hide_guest_stderr(&loader);
 
     // The SaBRe ptrace safety net must not consume the root guest's namespace PID before launch.
     // `printf` is a shell builtin, so this observes the root shell rather than a forked utility.
