@@ -69,19 +69,57 @@ function run_hermit_verify {
     local label=$1
     shift
 
-    # Because this helper runs the guest with `--workdir=/tmp` (see below), the
-    # guest's cwd is deliberately NOT the caller's. A relative path handed
-    # through would therefore resolve against the wrong directory and surface as
-    # a confusing "No such file or directory" from inside the guest -- which is
-    # exactly how the `--workdir` change first broke `http_server.sh` when it was
-    # invoked as `./tests/e2e/lib/applications/http_server.sh` and passed a
-    # relative `$0` on to bash. Refuse loudly instead: callers pass absolute
-    # paths (`$(readlink -f -- "$0")`, `$work_root/...`).
-    local arg
-    for arg in "$@"; do
-        if [[ $arg != /* && -e $arg ]]; then
-            printf '%s: refusing relative path argument %s -- this helper sets the guest cwd to /tmp, so paths must be absolute\n' \
-                "$label" "$arg" >&2
+    # Because the guest runs from its private /tmp, callers must explicitly name
+    # any guest-argv positions that carry host-resolved paths. Checking whether
+    # an arbitrary token happens to exist in the host cwd would make admission
+    # depend on unrelated directory contents, and it would miss paths that do
+    # not exist yet. Positions are one-based and are checked lexically, before
+    # the guest is launched:
+    #
+    #   run_hermit_verify label --require-absolute-arg 1 \
+    #       --require-absolute-arg 2 -- /bin/bash /abs/script
+    local -a required_absolute_args=()
+    while (($#)); do
+        case $1 in
+            --require-absolute-arg)
+                if (($# < 2)) || [[ ! $2 =~ ^[1-9][0-9]*$ ]]; then
+                    printf '%s: PATH-CONTRACT: --require-absolute-arg needs a positive guest argument position\n' \
+                        "$label" >&2
+                    return 1
+                fi
+                required_absolute_args+=("$2")
+                shift 2
+                ;;
+            --)
+                shift
+                break
+                ;;
+            *)
+                printf '%s: PATH-CONTRACT: expected helper options followed by --, got %s\n' \
+                    "$label" "$1" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    local -a guest_argv=("$@")
+    if ((${#guest_argv[@]} == 0)); then
+        printf '%s: PATH-CONTRACT: missing guest command after --\n' "$label" >&2
+        return 1
+    fi
+
+    local position index path_arg
+    for position in "${required_absolute_args[@]}"; do
+        index=$((position - 1))
+        if ((index >= ${#guest_argv[@]})); then
+            printf '%s: PATH-CONTRACT: guest argument position %s is not present\n' \
+                "$label" "$position" >&2
+            return 1
+        fi
+        path_arg=${guest_argv[index]}
+        if [[ $path_arg != /* ]]; then
+            printf '%s: PATH-CONTRACT: guest argument %s must be absolute because the guest cwd is /tmp: %s\n' \
+                "$label" "$position" "$path_arg" >&2
             return 1
         fi
     done
@@ -122,7 +160,7 @@ function run_hermit_verify {
         "$HERMIT_BIN" --log=info run --no-virtualize-cpuid \
         --max-timeslice=disabled --base-env=minimal --strict --workdir=/tmp \
         --verify --verify-strict --verify-json "$verdict_file" -- \
-        "$@" >"$stdout_file" 2>"$stderr_file" || status=$?
+        "${guest_argv[@]}" >"$stdout_file" 2>"$stderr_file" || status=$?
 
     local failure=""
     if [[ ! -s $verdict_file ]]; then

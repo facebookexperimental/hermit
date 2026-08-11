@@ -52,5 +52,6 @@ native_second=$(run_build_workload "$work_root/native")
 assert_native_nondeterminism 'make/CMake workload' "$native_first" "$native_second"
 
 run_hermit_verify 'make/CMake workload' \
+    --require-absolute-arg 1 --require-absolute-arg 2 --require-absolute-arg 4 -- \
     /bin/bash "$(readlink -f -- "$0")" --guest "$work_root/verified" >/dev/null
 printf 'build-tools:verified\n'

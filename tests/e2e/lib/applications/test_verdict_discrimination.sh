@@ -54,11 +54,17 @@ source "$HERE/common.sh"
 
 function expect {
     local name=$1 want=$2 report=$3 fake_status=$4
+    shift 4
+    local -a invocation=(--require-absolute-arg 1 -- /bin/true)
+    if (($#)); then
+        invocation=("$@")
+    fi
     local out rc=0
     # Exported, not prefixed: `VAR=x out=$(cmd)` is an assignment statement, so
     # the prefix never reaches the command substitution's environment.
     export FAKE_REPORT="$report" FAKE_STATUS="$fake_status"
-    out=$(run_hermit_verify "$name" /bin/true 2>&1) || rc=$?
+    out=$(cd "${EXPECT_CWD:-$PWD}" && \
+        run_hermit_verify "$name" "${invocation[@]}" 2>&1) || rc=$?
     unset FAKE_REPORT FAKE_STATUS
 
     if [[ $want == PASS ]]; then
@@ -89,6 +95,18 @@ printf 'run_hermit_verify verdict discrimination\n'
 # POSITIVE. Without this the negatives prove nothing: a reader that always
 # refused would pass every one of them.
 expect strict-parity PASS "$parity_report" 0
+
+# Ordinary guest data is not a path merely because the host cwd contains an
+# entry with the same spelling.
+touch "$WORK/literal-token"
+EXPECT_CWD=$WORK expect literal-token-is-data PASS "$parity_report" 0 \
+    --require-absolute-arg 1 -- /bin/echo literal-token
+
+# A caller-declared path position is checked lexically, so a relative path that
+# does not exist yet is still refused before the guest launch.
+EXPECT_CWD=$WORK expect nonexistent-relative-path PATH-CONTRACT "$parity_report" 0 \
+    --require-absolute-arg 1 --require-absolute-arg 2 -- \
+    /bin/cat future-relative-path
 
 # The original defect, planted exactly. A stripped match sets verified=true and
 # the fake still prints the old success banner, so the previous banner-grep

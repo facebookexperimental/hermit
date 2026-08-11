@@ -132,5 +132,6 @@ native_second=$(run_deep_workload "$work_root/native")
 assert_native_nondeterminism 'SQLite deep workload' "$native_first" "$native_second"
 
 run_hermit_verify 'SQLite deep workload' \
+    --require-absolute-arg 1 --require-absolute-arg 2 --require-absolute-arg 4 -- \
     /bin/bash "$(readlink -f -- "$0")" --guest "$work_root/verified" >/dev/null
 printf 'sqlite-deep:verified:%s\n' "$EXPECTED_ROWS_SHA256"
