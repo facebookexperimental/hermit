@@ -16,7 +16,7 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 
 .PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
 	install-build-tools check-submodules check-skill-discovery validate validate-plan \
-	validate-self-test lint \
+	validate-self-test validate-timeout-layers-test lint \
 	validate-kvm validate-dbt validate-sabre validate-liteinst validate-e9patch
 
 build: prune-stale-release install-deps ## Build the development Hermit binary with every backend
@@ -79,6 +79,9 @@ validate-plan: ## Print the boxed DAG plan (nodes, wall/CPU/memory caps, deps) w
 
 validate-self-test: ## Run the validate driver's inert policy/quoting/corpus brackets
 	./scripts/validate.rs --self-test
+
+validate-timeout-layers-test: ## Live bracket for step/scope timeouts (requires systemd --user + cgroup v2)
+	./ci/validate-timeout-layers-test.sh
 
 check-skill-discovery: ## Verify Claude and stock Codex discover the same product skills
 	./scripts/check-skill-discovery.rs
