@@ -8,20 +8,44 @@ silently changed by an upstream push).
 
 The pin has two distinct purposes. For an old checkout it is an archival record:
 `cargo build` can reproduce the Reverie revision that checkout used. For current
-testing it is a pointer: it must equal the live `rrnewton/reverie:main` tip.
-Being an ancestor of main is not sufficient. A Hermit validation or pre-land
-test against an older Reverie is blocked because it can miss already-landed
-correctness fixes and produce evidence for a dependency version we no longer
-ship.
+testing it is a pointer, judged by **ancestry and monotonic advance** rather
+than by equality with a live tip:
+
+1. **Ancestry** — the pin must be an ancestor of `rrnewton/reverie:main`.
+   **Lagging is legitimate.** A pin behind the tip is a pin; a pin required to
+   equal the tip is not.
+2. **Monotonic** — the pin may only advance. Ancestry alone would accept a pin
+   walked *backwards*, because an ancient commit is also an ancestor. The floor
+   is the pin recorded at the base the change would land on (`--base-ref`,
+   default `origin/main`).
+3. **A conflict resolves to the newer pin** — and this is enforced *by* rule 2
+   rather than by a separate mechanism. Resolving a `Cargo.lock` conflict to the
+   older side regresses the pin below the base, which rule 2 refuses. Conflict
+   resolution is exactly where a silent regression would otherwise land.
+
+> **Historical, and it was correct when written.** Until 2026-08-08 this
+> document and the checker required the pin to **equal** the live
+> `rrnewton/reverie:main` tip, and said in as many words that being an ancestor
+> was not sufficient. That rule was introduced in `f21b22ed` (2026-08-05) and
+> superseded three days later by `e35594ad`, *"Judge the Reverie pin by ancestry
+> and monotonicity, not tip equality"* (owner-approved, 2026-08-08). It is
+> recorded here rather than deleted because someone reading git history will
+> meet it and deserves to know it was once the rule.
+>
+> Why it was replaced: equality made the comparand a **live moving ref**, so the
+> verdict was a property of the tree *and the instant you looked*. Two runs over
+> a byte-identical tree disagreed with nothing changed locally, and at roughly
+> 16.6 Reverie commits/day the gate fired on nearly every tick.
 
 ## Currency gate
 
 `scripts/check-reverie-pin.rs` is the canonical verifier source. The tracked
 `ci/run-reverie-pin-check.sh` launcher compiles it with `rustc`, derives its
 scope from `git ls-files`, and checks every tracked `Cargo.toml` and
-`Cargo.lock`. Every Reverie revision in that
-tracked Cargo dependency metadata must be identical and must equal the live
-`rrnewton/reverie:main` tip. The checker reports the manifest, lockfile,
+`Cargo.lock`. Every Reverie revision in that tracked Cargo dependency metadata
+must be identical to the others, must be an **ancestor** of
+`rrnewton/reverie:main`, and must not regress below the base's pin.
+The checker reports the manifest, lockfile,
 pinned-file, and revision-entry counts on every run so a green result states its
 coverage.
 Tracked vendored Cargo metadata is included. Untracked/generated files and
@@ -44,8 +68,17 @@ scripts/setup-hooks.sh
 There is no stale-pin override in testing. Local validate, both committed DAGs,
 hosted portable CI, the merge gate, and validate receipt production all invoke
 the same fail-closed rule. Historical source remains buildable at its recorded
-revision; it does not create current validation evidence until rebased and
-updated to latest Reverie main.
+revision; it does not create current validation evidence until its pin
+satisfies ancestry and monotonicity against the base it would land on.
+
+Monotonicity needs a base, and an *unresolvable* base is not a pass. If the
+floor cannot be resolved — no `origin/main`, a depth-1 clone, an incoherent base
+pinning two revisions — the checker must not treat a skipped monotonicity check
+as a passing one. A caller that genuinely has no base declares it with
+`--no-base` rather than letting the check quietly disappear. Ancestry also needs
+Reverie's **commit graph**: `ls-remote` returns only a tip and can answer no
+reachability question, so the checker fetches a blobless bare graph (about 1s
+and 1.3MB) and fails closed if the authority tip cannot be resolved at all.
 
 ## Where the pin lives
 
