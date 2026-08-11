@@ -19,6 +19,7 @@ use std::fs;
 use std::future::Future;
 use std::io;
 use std::os::fd::AsRawFd;
+use std::path::Path;
 use std::path::PathBuf;
 use std::pin::pin;
 use std::process::Command;
@@ -705,6 +706,32 @@ fn lock_native_client_build(directory: &std::path::Path) -> io::Result<fs::File>
     }
 }
 
+fn native_client_source_path_hash(source: &Path) -> u64 {
+    source
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(FNV_OFFSET, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+        })
+}
+
+fn native_client_build_directory(runtime: &Path, source: &Path) -> PathBuf {
+    let source_identity = source
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .unwrap_or_else(|| std::ffi::OsStr::new("source"));
+    runtime
+        .parent()
+        .expect("runtime library path must have a parent")
+        .join(format!(
+            "detcore-dbt-native-{}-{:016x}",
+            source_identity.to_string_lossy(),
+            native_client_source_path_hash(source)
+        ))
+}
+
 /// Builds the DynamoRIO native client against the Detcore runtime if needed.
 // TODO-HUMAN-REVIEW(PR-1002): Review packaged DBT runtime and client discovery.
 pub fn prepare_native_client() -> io::Result<(PathBuf, PathBuf)> {
@@ -725,25 +752,14 @@ pub fn prepare_native_client() -> io::Result<(PathBuf, PathBuf)> {
     }
 
     let runtime = runtime_library_path()?;
-    let source = reverie_dbt::native_client_source_dir();
-    let source_identity = source
-        .parent()
-        .and_then(std::path::Path::parent)
-        .and_then(std::path::Path::file_name)
-        .unwrap_or_else(|| std::ffi::OsStr::new("source"));
-    let directory = runtime
-        .parent()
-        .expect("runtime library path must have a parent")
-        .join(format!(
-            "detcore-dbt-native-{}",
-            source_identity.to_string_lossy()
-        ));
+    let source = fs::canonicalize(reverie_dbt::native_client_source_dir())?;
+    let directory = native_client_build_directory(&runtime, &source);
     fs::create_dir_all(&directory)?;
     let _build_lock = lock_native_client_build(&directory)?;
 
     let configure = Command::new("cmake")
         .arg("-S")
-        .arg(source)
+        .arg(&source)
         .arg("-B")
         .arg(&directory)
         .arg("-DCMAKE_BUILD_TYPE=Release")
@@ -1778,6 +1794,107 @@ mod tests {
         assert_eq!(
             direct,
             std::path::Path::new("/workspace/target/debug/libdetcore_dbt.so")
+        );
+    }
+
+    struct NativeClientCacheTestDir(PathBuf);
+
+    impl NativeClientCacheTestDir {
+        fn new() -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time must follow the Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "detcore-dbt-native-cache-key-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create native-client cache-key test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for NativeClientCacheTestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_native_client_cache_test_project(source: &Path) {
+        fs::create_dir_all(source).expect("create native-client CMake source directory");
+        fs::write(
+            source.join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.15)\nproject(native_client_cache_key NONE)\n",
+        )
+        .expect("write native-client CMake test project");
+    }
+
+    fn configure_and_build_native_client_cache_test_project(
+        source: &Path,
+        build: &Path,
+    ) -> Result<(), String> {
+        let configure = Command::new("cmake")
+            .arg("-S")
+            .arg(source)
+            .arg("-B")
+            .arg(build)
+            .output()
+            .map_err(|error| format!("failed to execute CMake configure: {error}"))?;
+        if !configure.status.success() {
+            return Err(format!(
+                "CMake configure failed: {}",
+                String::from_utf8_lossy(&configure.stderr)
+            ));
+        }
+        let build_result = Command::new("cmake")
+            .arg("--build")
+            .arg(build)
+            .output()
+            .map_err(|error| format!("failed to execute CMake build: {error}"))?;
+        if !build_result.status.success() {
+            return Err(format!(
+                "CMake build failed: {}",
+                String::from_utf8_lossy(&build_result.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_client_cache_misses_changed_source_path_and_hits_unchanged_path() {
+        let temp = NativeClientCacheTestDir::new();
+        let runtime = temp.0.join("target/debug/deps/libdetcore_dbt.so");
+        let source_a = temp
+            .0
+            .join("cargo-a/git/checkouts/reverie/source-rev/reverie-dbt/native");
+        let source_b = temp
+            .0
+            .join("cargo-b/git/checkouts/reverie/source-rev/reverie-dbt/native");
+        write_native_client_cache_test_project(&source_a);
+        write_native_client_cache_test_project(&source_b);
+
+        let first_build = native_client_build_directory(&runtime, &source_a);
+        configure_and_build_native_client_cache_test_project(&source_a, &first_build)
+            .expect("first source path must configure and build");
+        let cache_sentinel = first_build.join("same-source-cache-sentinel");
+        fs::write(&cache_sentinel, b"cache remains reusable")
+            .expect("write same-source cache sentinel");
+
+        let repeated_build = native_client_build_directory(&runtime, &source_a);
+        assert_eq!(repeated_build, first_build);
+        configure_and_build_native_client_cache_test_project(&source_a, &repeated_build)
+            .expect("unchanged source path must reuse its CMake cache");
+        assert!(
+            cache_sentinel.is_file(),
+            "unchanged source path must hit the existing build directory"
+        );
+
+        let changed_build = native_client_build_directory(&runtime, &source_b);
+        configure_and_build_native_client_cache_test_project(&source_b, &changed_build)
+            .expect("changed source path must miss the old CMake cache and build cleanly");
+        assert_ne!(
+            changed_build, first_build,
+            "changed source path must select a distinct CMake cache"
         );
     }
 
