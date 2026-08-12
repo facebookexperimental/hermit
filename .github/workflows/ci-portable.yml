@@ -181,10 +181,10 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "selection: decision=$decision debug_shards=$run_dbg release_shards=$run_rel e2e=$run_e2e backends=[$backends] build_debug=$build_debug build_release=$build_release" >&2
 
-  # Exact dependency currency is part of the authoritative product-test result:
-  # an old Reverie pin cannot produce current Hermit validation evidence.
+  # The Reverie pin is a forward-only pointer into its linear main history.
+  # An off-history or regressing pin cannot produce validation evidence.
   reverie-pin:
-    name: Reverie pin is latest main
+    name: Reverie pin is an ancestor and advances monotonically
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

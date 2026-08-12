@@ -445,7 +445,7 @@ jobs:
           exit "$failed"
 
   reverie-pin:
-    name: reverie-pin-is-latest-main
+    name: reverie-pin-ancestor-and-monotonic
     if: >-
       github.repository == 'rrnewton/hermit' &&
       github.event_name != 'workflow_run'
@@ -464,7 +464,7 @@ jobs:
           path: trusted
           fetch-depth: 1
           persist-credentials: false
-      - name: Require every exact PR head to pin latest Reverie main
+      - name: Require every exact PR head to carry an ancestor-and-monotonic reverie/main pin
         env:
           BASE_REF: ${{ github.event.merge_group.base_ref }}
           EVENT_NAME: ${{ github.event_name }}
@@ -635,7 +635,7 @@ jobs:
           echo '2f1c61d5ec9d98b9697317fd9e66b705161defb69b808d23e6d83384e1e2a1e8  '"$authority" | sha256sum --check
           chmod +x "$authority"
           echo "CHECK_OUTCOME_AUTHORITY=$authority" >>"$GITHUB_ENV"
-      - name: Require the latest-Reverie pin gate
+      - name: Require the Reverie-pin ancestor-and-monotonic gate
         env:
           PIN_RESULT: ${{ needs.reverie-pin.result }}
         run: |

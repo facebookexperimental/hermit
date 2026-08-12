@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Reverie pin, pre-commit. THIS IS NOT A HARD BLOCKER ON PIN CURRENCY.
+# Reverie pin, pre-commit. THIS IS NOT A HARD BLOCKER ON DISTANCE FROM MAIN.
 #
 # It used to be, and it refused commits touching zero Cargo files. Owner ruling
 # 2026-08-08: enforcement belongs to CI (check.reverie_pin, ancestry +
 # monotonicity); this surface is awareness only, in exactly four cases:
 #
 #   1. commit does not touch pin entries           -> SILENT
-#   2. touches them and bumps all the way to master -> SILENT
+#   2. touches them and advances to the main tip    -> SILENT
 #   3. touches them and bumps but STOPS SHORT       -> ask for acknowledgement,
-#      clearable with HERMIT_PIN_BELOW_MASTER_ACK=1. Proceedable, not a refusal.
+#      clearable with the legacy-named HERMIT_PIN_BELOW_MASTER_ACK=1.
+#      Proceedable and policy-compliant, not a refusal.
 #   4. regresses the pin                            -> SILENT; CI hard-refuses it
 #
 # Rarity is the point: it fires only on deliberate pin edits, so it stays
@@ -34,7 +35,7 @@ if command -v with-proxy >/dev/null 2>&1; then
   proxy=(with-proxy)
 fi
 
-# Offline, always-blocking: local coherence only. No network, no currency.
+# Offline, always-blocking: local coherence only. No networked policy checks.
 "$checker" --repo "$root" --offline || exit 1
 
 # Networked, never a hard refusal: the four-case advisory above. A network

@@ -5,7 +5,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Compile the canonical latest-Reverie checker with the installed Rust
+# Compile the canonical Reverie ancestor-and-monotonic checker with the installed Rust
 # toolchain instead of relying on its developer-friendly rust-script shebang.
 # GitHub's portable images provide rustc but intentionally do not install
 # rust-script.  Keep the wrapper dependency-free so every CI DAG lane can run

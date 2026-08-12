@@ -11,9 +11,10 @@
 //! OWNER-APPROVED RULE, 2026-08-08, replacing equality-to-the-tip:
 //!
 //!   1. ANCESTRY   -- the pin must be an ancestor of `rrnewton/reverie:main`,
-//!                    not equal to its tip. Lagging is legitimate; a pin that
-//!                    must equal the tip is not a pin, and made the verdict a
-//!                    property of WHEN you looked rather than of the tree.
+//!                    and tip equality is allowed but not required. A lagging
+//!                    ancestor is legitimate; requiring the tip made the
+//!                    verdict a property of WHEN you looked rather than of
+//!                    the tree.
 //!   2. MONOTONIC  -- the pin may only advance. Ancestry ALONE would accept a
 //!                    pin walked backwards, because an ancient commit is also
 //!                    an ancestor.
@@ -97,14 +98,17 @@ struct Config {
     remote: Option<String>,
     print_pin: bool,
     update_to_latest: bool,
+    /// Skip the post-bump compile check. Store the unsafe choice inverted so
+    /// `Config::default()` structurally keeps verification enabled.
+    skip_verify_build: bool,
     /// Skip every NETWORKED judgement (ancestry, monotonicity, and the
     /// main-tip query) and decide only what is decidable offline: that the
     /// tracked manifests agree with each other, and that the LiteInst cache
     /// keys track the pin. Used by the pre-commit hook, which the owner has
-    /// ruled must not be a hard blocker on pin currency.
+    /// ruled must not be a hard blocker on distance from the main tip.
     offline: bool,
     /// Pre-commit advisory. Judges the STAGED pin against HEAD's and against
-    /// Reverie master, and speaks in exactly one of four cases (see
+    /// Reverie main, and speaks in exactly one of four cases (see
     /// `staged_pin_advisory`). Never a hard refusal: case 3 is an
     /// ACKNOWLEDGEMENT, cleared by HERMIT_PIN_BELOW_MASTER_ACK=1.
     staged_advisory: bool,
@@ -125,6 +129,7 @@ impl Default for Config {
             remote: None,
             print_pin: false,
             update_to_latest: false,
+            skip_verify_build: false,
             offline: false,
             staged_advisory: false,
             no_base: false,
@@ -151,9 +156,10 @@ fn usage() -> &'static str {
      Options:\n\
        --repo PATH                         Hermit checkout (default: git root)\n\
        --print-pin                         Print the single locally recorded pin; no network\n\
-       --update-to-latest                  Update every derived Cargo pin site to latest main\n\
+       --update-to-latest                  Advance every derived Cargo pin site to the main tip\n\
+       --no-verify-build                   Skip the post-bump compile check (UNSAFE)\n\
        --base-ref REF                      Monotonicity floor (default: origin/main)\n\
-       --offline                           Local consistency only; no network, no currency\n\
+       --offline                           Local consistency only; no networked policy checks\n\
        --no-base                           Declare there is no monotonicity base (skip it)\n\
        --staged-pin-advisory               Pre-commit advisory on a STAGED pin edit\n\
        -h, --help                          Show this help\n\
@@ -182,6 +188,7 @@ fn parse_args() -> Result<Config, String> {
             "--no-base" => config.no_base = true,
             "--staged-pin-advisory" => config.staged_advisory = true,
             "--update-to-latest" => config.update_to_latest = true,
+            "--no-verify-build" => config.skip_verify_build = true,
             "-h" | "--help" => {
                 println!("{}", usage());
                 std::process::exit(0);
@@ -192,6 +199,9 @@ fn parse_args() -> Result<Config, String> {
     }
     if config.print_pin && config.update_to_latest {
         return Err("--print-pin and --update-to-latest are mutually exclusive".to_string());
+    }
+    if config.skip_verify_build && !config.update_to_latest {
+        return Err("--no-verify-build requires --update-to-latest".to_string());
     }
     Ok(config)
 }
@@ -500,7 +510,7 @@ fn is_ancestor(graph: &Path, ancestor: &str, descendant: &str) -> Result<bool, S
     // not in it, so the pin is not reachable. ABSENT DESCENDANT is NOT a
     // verdict -- it means the graph we fetched does not even contain main, so
     // we cannot tell, and answering "false" there produces a FALSE REFUSAL.
-    // That bug was live: the harness reported "Hermit pin: X / Latest main: X"
+    // That bug was live: the harness reported "Hermit pin: X / Reverie main: X"
     // -- identical -- while claiming X was not reachable from main.
     let main_present = git_in(graph, &["cat-file", "-e", &format!("{descendant}^{{commit}}")])?;
     if !main_present.status.success() {
@@ -569,12 +579,13 @@ const ACK_ENV: &str = "HERMIT_PIN_BELOW_MASTER_ACK";
 /// PRE-COMMIT ADVISORY. Exactly four cases, owner-specified 2026-08-08:
 ///
 ///   1. the commit does NOT touch pin entries          -> SILENT, exit 0.
-///   2. it touches them and bumps ALL THE WAY to master -> SILENT, exit 0.
+///   2. it touches them and advances to the main tip    -> SILENT, exit 0.
 ///   3. it touches them and bumps but STOPS SHORT       -> surface + require
-///      acknowledgement. "Why update but leave it stale?" Deliberately touching
-///      the pin and stopping short is a smell: either go to master, or say why
-///      not. PROCEEDABLE, NOT BLOCKING -- pinning below a known-bad newer
-///      commit, or a master that does not build yet, are legitimate.
+///      acknowledgement. "Why advance without selecting the tip?" Deliberately
+///      touching the pin and stopping short deserves an explicit choice.
+///      PROCEEDABLE, POLICY-COMPLIANT, NOT BLOCKING -- pinning below a
+///      known-bad newer commit, or a main tip that does not build yet, are
+///      legitimate.
 ///   4. it REGRESSES the pin                            -> SILENT here. That is
 ///      the CI check's monotonicity refusal, a hard refusal, and duplicating it
 ///      as a soft prompt would teach people to acknowledge past it.
@@ -613,19 +624,19 @@ fn staged_pin_advisory(root: &Path, remote: &str) -> Result<i32, String> {
     }
     let behind = git_in(&graph, &["rev-list", "--count", &format!("{candidate}..{main}")])?;
     let lag = String::from_utf8_lossy(&behind.stdout).trim().to_string();
-    loud_header("REVERIE PIN BUMPED, BUT NOT TO MASTER");
+    loud_header("REVERIE PIN ADVANCED BELOW THE MAIN TIP - ACKNOWLEDGEMENT");
     eprintln!("Previous pin: {head}");
     eprintln!("This commit:  {candidate}");
     eprintln!("Reverie main: {main}  ({lag} commit(s) ahead of this commit's pin)");
     eprintln!();
-    eprintln!("You are deliberately moving the pin but stopping short of Reverie master.");
-    eprintln!("That is allowed -- pinning below a known-bad newer commit, or below a master");
-    eprintln!("that does not build yet, are legitimate reasons -- but it should be a choice,");
-    eprintln!("not an accident.");
+    eprintln!("You are deliberately moving the pin but not selecting the Reverie main tip.");
+    eprintln!("That is policy-compliant: the pin is on main history and moves forward.");
+    eprintln!("Pinning below a known-bad newer commit, or below a main tip that does not");
+    eprintln!("build yet, are legitimate reasons; this advisory only asks that it be a choice.");
     eprintln!();
     eprintln!("Go all the way:      with-proxy ./ci/run-reverie-pin-check.sh --update-to-latest");
     eprintln!("Or acknowledge:      {ACK_ENV}=1 git commit ...");
-    eprintln!("  (acknowledging states you know Hermit will be on a non-master Reverie.)");
+    eprintln!("  (The environment variable keeps its historical name for compatibility.)");
     Ok(1)
 }
 
@@ -911,14 +922,19 @@ fn calibration_decision_required(old: &str, main: &str) -> String {
          If it carries: set expected_pin={main} in {BUDGET_CALIBRATION_SITE} and\n\
          append a `CARRY TO` block to ci/configure-build-jobs.sh stating the\n\
          evidence. If it does not: recalibrate and record the measurement.\n\
-         Then re-run this checker; it will report the tree current.\n\
+         Then re-run this checker; it will report the tree policy-compliant.\n\
          \n\
          Nothing above needs redoing -- the Cargo sites and the derived CI sites\n\
          are already written.\n"
     )
 }
 
-fn update_to_latest(root: &Path, scan: &PinScan, main: &str) -> Result<(), String> {
+fn update_to_latest(
+    root: &Path,
+    scan: &PinScan,
+    main: &str,
+    verify_build: bool,
+) -> Result<(), String> {
     // Read the calibration BEFORE any rewrite: once the derived sites move, the
     // wrapper is the only remaining record of the revision we are carrying from.
     let calibrated = calibrated_pin(root)?;
@@ -931,7 +947,7 @@ fn update_to_latest(root: &Path, scan: &PinScan, main: &str) -> Result<(), Strin
         // Cargo metadata is current, but the CI sites are a separate scope and
         // may still be mid-carry -- finish them rather than reporting success
         // over a narrower scope than the caller means by "the pin".
-        return finish_ci_pin_sites(root, calibrated.as_deref(), main, true);
+        return finish_and_verify_pin_update(root, calibrated.as_deref(), main, true, verify_build);
     }
 
     let (changed_files, changed_entries) = rewrite_manifest_pins(scan, main)?;
@@ -965,10 +981,79 @@ fn update_to_latest(root: &Path, scan: &PinScan, main: &str) -> Result<(), Strin
         ));
     }
     println!(
-        "Reverie pin updated to latest main {main} across {} derived Cargo revision entries.",
+        "Reverie pin advanced to main tip {main} across {} derived Cargo revision entries.",
         updated.occurrences.len()
     );
-    finish_ci_pin_sites(root, calibrated.as_deref(), main, false)
+    finish_and_verify_pin_update(root, calibrated.as_deref(), main, false, verify_build)
+}
+
+/// Finish every non-build carry before judging whether the bumped tree builds.
+///
+/// `finish_ci_pin_sites` can still refuse an unsettled DBT calibration. Running
+/// it first preserves that decision boundary and ensures the compile result is
+/// about the complete candidate tree, not a half-carried pin.
+fn finish_and_verify_pin_update(
+    root: &Path,
+    calibrated: Option<&str>,
+    main: &str,
+    cargo_already_current: bool,
+    verify_build: bool,
+) -> Result<(), String> {
+    finish_and_verify_pin_update_with(
+        root,
+        calibrated,
+        main,
+        cargo_already_current,
+        verify_build,
+        Path::new("cargo"),
+        &[],
+    )
+}
+
+fn finish_and_verify_pin_update_with(
+    root: &Path,
+    calibrated: Option<&str>,
+    main: &str,
+    cargo_already_current: bool,
+    verify_build: bool,
+    cargo_program: &Path,
+    cargo_prefix_args: &[&str],
+) -> Result<(), String> {
+    finish_ci_pin_sites(root, calibrated, main, cargo_already_current)?;
+    if verify_build {
+        verify_bumped_tree_builds(root, cargo_program, cargo_prefix_args)
+    } else {
+        eprintln!(
+            "WARNING: --no-verify-build was passed: pin consistency was checked, but pin \
+             viability was not. The bumped tree may not compile."
+        );
+        Ok(())
+    }
+}
+
+/// Compile the complete bumped tree without permitting lockfile re-resolution.
+fn verify_bumped_tree_builds(
+    root: &Path,
+    cargo_program: &Path,
+    cargo_prefix_args: &[&str],
+) -> Result<(), String> {
+    println!(
+        "Verifying the bumped tree compiles (cargo check --locked --workspace --all-targets)..."
+    );
+    let status = Command::new(cargo_program)
+        .current_dir(root)
+        .args(cargo_prefix_args)
+        .args(["check", "--locked", "--workspace", "--all-targets"])
+        .status()
+        .map_err(|error| format!("could not run cargo check for the bumped tree: {error}"))?;
+    if status.success() {
+        println!("Bumped tree compiles.");
+        return Ok(());
+    }
+    Err(format!(
+        "BUMP REFUSED: the pin was updated consistently, but the tree does not compile \
+         against it ({status}). The edits remain on disk for inspection; do not commit them."
+    ))
 }
 
 /// Carry the derived CI sites, then refuse to claim success if the one
@@ -986,7 +1071,7 @@ fn finish_ci_pin_sites(
 ) -> Result<(), String> {
     let Some(old) = calibrated else {
         if cargo_already_current {
-            println!("Reverie pin is already current: {main}");
+            println!("Reverie pin already equals the main tip: {main}");
         }
         return Ok(());
     };
@@ -995,7 +1080,7 @@ fn finish_ci_pin_sites(
         // so there is nothing left to carry. Counting the already-correct sites
         // here would report work that did not happen.
         if cargo_already_current {
-            println!("Reverie pin is already current: {main}");
+            println!("Reverie pin already equals the main tip: {main}");
         }
         return Ok(());
     }
@@ -1019,7 +1104,9 @@ fn loud_header(title: &str) {
 
 fn blocked_instructions() {
     eprintln!();
-    eprintln!("BLOCKED. Testing must use the latest rrnewton/reverie:main.");
+    eprintln!(
+        "BLOCKED. The pin must be on rrnewton/reverie:main history and must not regress the landing base."
+    );
     eprintln!("Update every derived manifest and lockfile site with:");
     eprintln!("  with-proxy ./ci/run-reverie-pin-check.sh --update-to-latest");
     eprintln!("Policy and recovery details: docs/updating-reverie.md");
@@ -1210,7 +1297,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     let main = match main_result {
         Ok(main) => main,
         Err(error) => {
-            loud_header("COULD NOT VERIFY LATEST REVERIE MAIN - BLOCKED");
+            loud_header("COULD NOT VERIFY REVERIE MAIN HISTORY - BLOCKED");
             if let Ok(pin) = unique_pin(&scan) {
                 eprintln!("Hermit pin: {pin}");
             }
@@ -1221,7 +1308,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     };
 
     if config.update_to_latest {
-        update_to_latest(&root, &scan, &main)?;
+        update_to_latest(&root, &scan, &main, !config.skip_verify_build)?;
         let updated = read_pins(&root)?;
         let updated_pin = unique_pin(&updated)?;
         let cache_code = check_liteinst_cache_keys(&root, updated_pin)?;
@@ -1245,19 +1332,21 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     // unique_pin) and the LiteInst cache keys track the pin. Those are real,
     // offline-decidable defects that no amount of waiting fixes, so they stay
     // BLOCKING for every caller. What offline deliberately does NOT judge is
-    // currency -- see the pre-commit hook for why that must not block.
+    // remote-policy compliance -- see the pre-commit hook for why that must not
+    // block.
     if config.offline {
         println!(
             "Reverie pin is locally consistent: {pin} ({entries} revision entries across \
-             {pin_files} tracked Cargo metadata files; currency not evaluated, --offline)"
+             {pin_files} tracked Cargo metadata files; remote policy not evaluated, --offline)"
         );
         return Ok(0);
     }
 
-    // OWNER-APPROVED RULE (2026-08-08): ANCESTRY + MONOTONICITY, not equality.
+    // OWNER-APPROVED RULE (2026-08-08): ANCESTRY + MONOTONICITY; equality is
+    // allowed but not required.
     //
-    // Equality made the comparand a LIVE MOVING REF, so the verdict was a
-    // property of the tree AND THE INSTANT YOU LOOKED: two runs over a
+    // Requiring equality made the comparand a LIVE MOVING REF, so the verdict
+    // was a property of the tree AND THE INSTANT YOU LOOKED: two runs over a
     // byte-identical tree disagreed with nothing changed locally, and the pin
     // went stale whenever anyone pushed to Reverie (~16.6 commits/day). A pin
     // that must equal the tip is not a pin.
@@ -1282,11 +1371,11 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     if !is_ancestor(&graph, pin, &main)? {
         loud_header("REVERIE PIN IS NOT ON reverie/main HISTORY - BLOCKED");
         eprintln!("Hermit pin:  {pin}");
-        eprintln!("Latest main: {main}");
+        eprintln!("Reverie main: {main}");
         eprintln!(
             "The pin is not reachable from rrnewton/reverie:main. It names a commit that was\n\
              abandoned, rewritten, or never merged -- so nothing on main contains it and no\n\
-             amount of waiting will make it current."
+             amount of waiting will put it on main history."
         );
         eprintln!(
             "Affected metadata: {entries} revision entries across {pin_files} tracked Cargo files."
@@ -1355,7 +1444,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     let lag = String::from_utf8_lossy(&behind.stdout).trim().to_string();
     if pin == main {
         println!(
-            "Reverie pin is current: {pin} ({entries} revision entries across {pin_files} tracked Cargo metadata files)"
+            "Reverie pin equals the main tip: {pin} ({entries} revision entries across {pin_files} tracked Cargo metadata files)"
         );
     } else {
         println!(
@@ -1493,11 +1582,148 @@ mod tests {
         assert!(error.contains("no expected_pin="), "{error}");
     }
 
+    fn compile_fixture(label: &str, source: &str) -> PathBuf {
+        let root = temp_path(label);
+        fs::create_dir_all(root.join("src")).expect("create compile fixture");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"pin-build-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write fixture manifest");
+        fs::write(
+            root.join("Cargo.lock"),
+            "# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n[[package]]\nname = \"pin-build-fixture\"\nversion = \"0.0.0\"\n",
+        )
+        .expect("write fixture lockfile");
+        fs::write(root.join("src/lib.rs"), source).expect("write fixture source");
+        root
+    }
+
+    fn fixture_cargo(root: &Path) -> PathBuf {
+        let path = root.join("fixture-cargo");
+        fs::write(
+            &path,
+            "#!/bin/sh\nset -eu\ncase \"${1:-}\" in\n  metadata)\n    test -f Cargo.toml\n    test -f Cargo.lock\n    printf '{\"packages\":[]}\\n'\n    ;;\n  check)\n    test \"$*\" = 'check --locked --workspace --all-targets'\n    mkdir -p target\n    rustc --edition=2021 --crate-type=lib src/lib.rs --out-dir target \\\n      >target/rustc.stdout 2>target/rustc.stderr\n    ;;\n  *) exit 64 ;;\nesac\n",
+        )
+        .expect("write fixture cargo");
+        path
+    }
+
+    #[test]
+    fn post_carry_compile_gate_accepts_one_building_tree_and_refuses_one_nonbuilding_tree() {
+        let main = "2".repeat(40);
+        let building = compile_fixture("building-bump", "pub fn value() -> u8 { 1 }\n");
+        let nonbuilding = compile_fixture(
+            "nonbuilding-bump",
+            "pub fn value() -> u8 { missing_after_resolvable_bump() }\n",
+        );
+        let building_cargo = fixture_cargo(&building);
+        let nonbuilding_cargo = fixture_cargo(&nonbuilding);
+
+        let resolved = Command::new("/bin/sh")
+            .current_dir(&nonbuilding)
+            .arg(&nonbuilding_cargo)
+            .args(["metadata", "--locked", "--format-version", "1"])
+            .output()
+            .expect("run cargo metadata for nonbuilding fixture");
+        assert!(
+            resolved.status.success(),
+            "the negative fixture must resolve successfully before its compile refusal is meaningful: {}",
+            String::from_utf8_lossy(&resolved.stderr)
+        );
+
+        let mut accepted = 0;
+        let mut refused = 0;
+        finish_and_verify_pin_update_with(
+            &building,
+            None,
+            &main,
+            true,
+            true,
+            Path::new("/bin/sh"),
+            &[building_cargo.to_str().expect("UTF-8 fixture cargo path")],
+        )
+            .expect("a complete pin carry whose tree builds must be accepted");
+        accepted += 1;
+
+        let error = finish_and_verify_pin_update_with(
+            &nonbuilding,
+            None,
+            &main,
+            true,
+            true,
+            Path::new("/bin/sh"),
+            &[nonbuilding_cargo
+                .to_str()
+                .expect("UTF-8 fixture cargo path")],
+        )
+        .expect_err("a resolvable pin carry whose tree does not build must be refused");
+        assert!(error.contains("BUMP REFUSED"), "{error}");
+        assert!(error.contains("does not compile"), "{error}");
+        refused += 1;
+
+        assert_eq!((accepted, refused), (1, 1));
+        fs::remove_dir_all(building).expect("remove building fixture");
+        fs::remove_dir_all(nonbuilding).expect("remove nonbuilding fixture");
+    }
+
+    #[test]
+    fn calibration_refusal_precedes_build_verification() {
+        let old = "1".repeat(40);
+        let main = "2".repeat(40);
+        let root = compile_fixture(
+            "finish-before-build",
+            "pub fn value() -> u8 { missing_after_resolvable_bump() }\n",
+        );
+        fs::create_dir_all(root.join("ci")).expect("create CI fixture directory");
+        fs::write(
+            root.join(BUDGET_CALIBRATION_SITE),
+            format!("#!/bin/bash\nexpected_pin={old}\n"),
+        )
+        .expect("write calibration fixture");
+        fs::write(
+            root.join("ci/configure-build-jobs.sh"),
+            format!("# derived pin\ncheck {old}\n"),
+        )
+        .expect("write derived pin fixture");
+        init_fixture_repo(&root);
+        assert!(git_in(&root, &["add", "-A"]).unwrap().status.success());
+
+        let missing_cargo = root.join("must-not-run-cargo");
+        let error =
+            finish_and_verify_pin_update_with(
+                &root,
+                Some(&old),
+                &main,
+                false,
+                true,
+                &missing_cargo,
+                &[],
+            )
+            .expect_err("an unsettled DBT calibration must refuse before cargo check runs");
+        assert!(error.contains("CALIBRATION DECISION REQUIRED"), "{error}");
+        assert!(
+            !error.contains("BUMP REFUSED"),
+            "build verification ran before finish_ci_pin_sites: {error}"
+        );
+        fs::remove_dir_all(root).expect("remove ordering fixture");
+    }
+
+    #[test]
+    fn build_verification_is_enabled_by_default() {
+        assert!(
+            !Config::default().skip_verify_build,
+            "the unsafe opt-out must never be the derived default"
+        );
+    }
+
     #[test]
     fn help_states_the_checker_scope() {
         let help = usage();
         assert!(help.contains("every tracked Cargo.toml and Cargo.lock"));
         assert!(help.contains("Excludes non-Cargo files"));
+        assert!(help.contains("--no-verify-build"));
+        assert!(help.contains("UNSAFE"));
     }
 
     #[test]

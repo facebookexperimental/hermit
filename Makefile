@@ -34,10 +34,12 @@ install-deps: install-hooks check-submodules ## Build and stage all third-party 
 		-p detcore-dbt -p detcore-sabre -p hermit-install
 
 # Install this clone's git pre-commit hooks (core.hooksPath -> .githooks) so a
-# fresh clone/worktree gets the BLOCKING Reverie pin-drift gate without a manual
-# step. core.hooksPath is per-repo local config (not tracked), so it must be set
-# once per checkout; wiring it into install-deps is that step.
-install-hooks: ## Install this checkout's git pre-commit hooks (Reverie pin gate)
+# fresh clone/worktree gets the BLOCKING local pin-consistency check plus the
+# non-blocking forward-advance advisory without a manual step. An ancestral,
+# monotonic pin may remain behind the live Reverie tip. core.hooksPath is
+# per-repo local config (not tracked), so it must be set once per checkout;
+# wiring it into install-deps is that step.
+install-hooks: ## Install this checkout's git pre-commit hooks (Reverie pin policy)
 	@./scripts/setup-hooks.sh
 
 release-core: check-submodules ## Build the lean core-only release binary (ptrace/kvm/liteinst)
@@ -89,14 +91,14 @@ check-skill-discovery: ## Verify Claude and stock Codex discover the same produc
 # `make lint` mirrors the lint gate CI's merge-gate enforces, so a developer can
 # reproduce every lint failure locally before pushing. Cheap checks run first for
 # fast feedback; the compile-heavy clippy pass and the networked Reverie-pin
-# invariant run last. The exact clippy/rustfmt invocations match
+# ancestry/monotonicity policy run last. The exact clippy/rustfmt invocations match
 # ci/dag/portable.json (lint.clippy / lint.rustfmt).
 #
 # shellcheck runs at --severity=error: an enforceable floor that is clean on
 # current main (0/122 tracked scripts fail at error level) while 24 still carry
 # warning/style findings. Ratchet the severity down (warning -> style) as that
 # debt is retired rather than blocking the target on it today.
-lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, reverie pin, nested lockfiles)
+lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, Reverie pin policy, nested lockfiles)
 	./scripts/check-skill-discovery.rs
 	./scripts/test-required-check-outcomes.sh
 	./scripts/test-check-status-outcome.sh

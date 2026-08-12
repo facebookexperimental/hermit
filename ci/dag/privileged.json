@@ -7,7 +7,7 @@
   "steps": [
     {
       "group": "check", "job": "reverie_pin",
-      "desc": "Require Hermit's recorded Reverie revision to equal latest rrnewton/reverie:main",
+      "desc": "Require Hermit's recorded Reverie revision to be an ANCESTOR of rrnewton/reverie:main and to never regress below the base pin",
       "cmd": "./ci/run-reverie-pin-check.sh",
       "timeout": 120,
       "hint": {"est_duration_s": 5, "rss_baseline_bytes": 268435456,

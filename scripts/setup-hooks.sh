@@ -7,5 +7,5 @@ git config core.hooksPath .githooks
 chmod +x .githooks/pre-commit
 
 echo "core.hooksPath -> .githooks"
-echo "Active: Reverie pin freshness pre-commit gate"
+echo "Active: Reverie pin consistency gate and forward-advance advisory"
 echo "Policy: docs/updating-reverie.md"
