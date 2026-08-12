@@ -1279,6 +1279,12 @@ pub struct ThreadState<T> {
     pub(crate) last_accounted_user_time: LogicalTime,
     pub(crate) last_accounted_system_time: LogicalTime,
 
+    /// Absolute logical-clock values at this thread's creation. Child clocks
+    /// inherit the parent's absolute position for scheduler ordering, but Linux
+    /// `RUSAGE_THREAD` starts accounting at the calling thread's own creation.
+    pub(crate) thread_cpu_start_user_time: LogicalTime,
+    pub(crate) thread_cpu_start_system_time: LogicalTime,
+
     /// pseudo random number state
     pub prng: Pcg64Mcg,
 
@@ -1552,11 +1558,11 @@ impl<T> ThreadState<T> {
     /// that [`Self::process_cpu_time`] returns; for a multithreaded guest the two differ and
     /// reporting the aggregate would over-report every thread. Reads the same
     /// `thread_logical_time` counters that `account_process_cpu_time` folds into the process
-    /// total, so the per-thread and process views cannot drift apart.
+    /// total, minus the absolute clock inherited when this thread was created.
     pub(crate) fn thread_cpu_time(&self) -> (LogicalTime, LogicalTime) {
         (
-            self.thread_logical_time.user_cpu_time(),
-            self.thread_logical_time.system_cpu_time(),
+            self.thread_logical_time.user_cpu_time() - self.thread_cpu_start_user_time,
+            self.thread_logical_time.system_cpu_time() - self.thread_cpu_start_system_time,
         )
     }
 
@@ -1641,6 +1647,8 @@ impl<T> ThreadState<T> {
             parent_process_cpu_time: None,
             last_accounted_user_time,
             last_accounted_system_time,
+            thread_cpu_start_user_time: last_accounted_user_time,
+            thread_cpu_start_system_time: last_accounted_system_time,
             clone_flags: None,
             pending_vfork: None,
             // For the root thread, we initialize from the seed in the config:

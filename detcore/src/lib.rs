@@ -1385,6 +1385,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     },
                     last_accounted_user_time,
                     last_accounted_system_time,
+                    thread_cpu_start_user_time: last_accounted_user_time,
+                    thread_cpu_start_system_time: last_accounted_system_time,
                     clone_flags: None,
                     pending_vfork: pts.1.pending_vfork.clone(),
 
@@ -2821,5 +2823,45 @@ mod thread_exit_identity_tests {
             select_thread_exit_detpid(None, process_detpid),
             (process_detpid, true)
         );
+    }
+}
+
+#[cfg(test)]
+mod thread_cpu_time_tests {
+    use super::*;
+
+    #[test]
+    fn cloned_thread_and_fork_child_start_with_zero_thread_cpu() {
+        for clone_flags in [CloneFlags::CLONE_THREAD, CloneFlags::empty()] {
+            let config = Config::default();
+            let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+            let mut parent = ThreadState::new(DetPid::from_raw(1), &config, ());
+
+            // Give the parent nonzero CPU before the child exists. The child's
+            // absolute logical clock inherits this position for scheduler
+            // ordering, but Linux per-thread CPU accounting must not.
+            parent.thread_logical_time.add_rcbs(200);
+            parent.thread_logical_time.add_syscall();
+            parent.clone_flags = Some(clone_flags);
+
+            let mut child = <Detcore as Tool>::init_thread_state(
+                &tool,
+                Tid::from_raw(2),
+                Some((Tid::from_raw(1), &parent)),
+            );
+            assert_eq!(
+                child.thread_cpu_time(),
+                (LogicalTime::ZERO, LogicalTime::ZERO),
+                "clone flags {clone_flags:?} inherited pre-creation CPU"
+            );
+
+            child.thread_logical_time.add_rcbs(4);
+            child.thread_logical_time.add_syscall();
+            let (user, system) = child.thread_cpu_time();
+            assert!(user > LogicalTime::ZERO);
+            assert!(system > LogicalTime::ZERO);
+            assert!(user < parent.thread_logical_time.user_cpu_time());
+            assert!(system <= parent.thread_logical_time.system_cpu_time());
+        }
     }
 }

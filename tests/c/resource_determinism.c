@@ -284,10 +284,15 @@ static void check_prlimit_fork_inheritance(void) {
   puts("prlimit64 fork inheritance deterministic");
 }
 
-// Every rusage field except ru_maxrss must be a deterministic zero. When
-// expect_maxrss is set, ru_maxrss must be positive (the guest's peak RSS);
-// otherwise it must also be zero (e.g. RUSAGE_CHILDREN with no children).
-static void check_rusage(int who, const char* name, int expect_maxrss) {
+// SELF and THREAD CPU accounting must advance from logical execution; CHILDREN
+// is checked before any child is reaped and must therefore remain zero. Every
+// unmodeled field remains a deterministic zero. When expect_maxrss is set,
+// ru_maxrss must be positive (the guest's peak RSS); otherwise it must be zero.
+static void check_rusage(
+    int who,
+    const char* name,
+    int expect_maxrss,
+    int expect_cpu) {
   struct rusage usage;
   memset(&usage, 0xa5, sizeof(usage));
   if (getrusage(who, &usage) != 0) {
@@ -306,6 +311,21 @@ static void check_rusage(int who, const char* name, int expect_maxrss) {
     // Clear the field we allow to be nonzero so the byte scan below can prove
     // everything else is a deterministic zero.
     usage.ru_maxrss = 0;
+  }
+
+  if (expect_cpu) {
+    if (usage.ru_utime.tv_sec < 0 || usage.ru_utime.tv_usec < 0 ||
+        usage.ru_utime.tv_usec >= 1000000 || usage.ru_stime.tv_sec < 0 ||
+        usage.ru_stime.tv_usec < 0 || usage.ru_stime.tv_usec >= 1000000 ||
+        (usage.ru_utime.tv_sec == 0 && usage.ru_utime.tv_usec == 0 &&
+         usage.ru_stime.tv_sec == 0 && usage.ru_stime.tv_usec == 0)) {
+      fprintf(stderr, "getrusage %s did not report valid advancing CPU time\n", name);
+      exit(1);
+    }
+    // Clear only the fields with a logical model. The byte scan below still
+    // proves every page-fault, I/O, signal, and context-switch field is zero.
+    memset(&usage.ru_utime, 0, sizeof(usage.ru_utime));
+    memset(&usage.ru_stime, 0, sizeof(usage.ru_stime));
   }
 
   const unsigned char* bytes = (const unsigned char*)&usage;
@@ -489,10 +509,11 @@ static void check_times(void) {
 int main(void) {
   check_limit_queries();
   check_limit_mutations();
+  // No child has been created or reaped yet, so CHILDREN CPU and RSS are zero.
+  check_rusage(RUSAGE_CHILDREN, "children", 0, 0);
   check_prlimit_fork_inheritance();
-  check_rusage(RUSAGE_SELF, "self", 1);
-  check_rusage(RUSAGE_THREAD, "thread", 1);
-  check_rusage(RUSAGE_CHILDREN, "children", 0);
+  check_rusage(RUSAGE_SELF, "self", 1, 1);
+  check_rusage(RUSAGE_THREAD, "thread", 1, 1);
   check_rusage_errors();
   check_sysinfo();
   check_sysinfo_free_ram_tracks_virtual_size();
