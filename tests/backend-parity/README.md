@@ -13,9 +13,10 @@ runner prints at the end of the run.
 
 ## Current ratchet
 
-The L1 ratchet (`--strict`, run three times, byte-identical stdout) and the L2
-ratchet (`--strict --verify`, hermit's own double-run bitwise comparison) are
-tracked separately, because a contract can hold at L1 yet not at L2.
+The L1 ratchet (`--strict`, run three times, byte-identical stdout) and the
+Stripped verification ratchet (`--strict --verify`, Hermit's double-run
+comparison after selected numeric, address, path, and time fields are stripped)
+are tracked separately. Stripped verification is not L2.
 
 L1 (`hermit run --strict`):
 
@@ -25,22 +26,23 @@ L1 (`hermit run --strict`):
 | DBT | 26/28 | 93% |
 | KVM | 23/28 | 82% |
 
-L2 (`hermit run --strict --verify`):
+Stripped verification (`hermit run --strict --verify`):
 
-| Backend | Verified pairs | L2 kind | Parity vs ptrace |
+| Backend | Verified pairs | Verification kind | Parity vs ptrace |
 | --- | ---: | --- | ---: |
-| ptrace | 28/28 | DETLOG-bitwise | 100% |
-| DBT | 26/28 | DETLOG-bitwise | 93% |
+| ptrace | 28/28 | Stripped DETLOG | 100% |
+| DBT | 26/28 | Stripped DETLOG | 93% |
 | KVM | 22/28 | guest-visible only | 79% |
 
-The two L2 assurance *kinds* are not interchangeable. **DETLOG-bitwise** L2
-(ptrace, DBT) means hermit re-ran the guest and found the two normalized DETLOG
-streams — the full syscall and scheduling trace — bitwise-identical.
-**guest-visible** L2 (KVM) is strictly weaker: reverie-kvm runs concurrently and
+The two verification kinds are not interchangeable. **Stripped DETLOG**
+(ptrace, DBT) means Hermit re-ran the guest and found the two normalized DETLOG
+streams equal after stripping selected fields; it does not mean the full syscall
+and scheduling traces were bitwise-identical and does not establish L2.
+**guest-visible** verification (KVM) is weaker: reverie-kvm runs concurrently and
 declares outright that its internal syscall trace order is not deterministic, so
 `--verify` compares only guest stdout and exit status across the two runs. KVM's
-column is therefore capped at `guest`, never `detlog`. See the L2 subsection
-below for the two contracts that hold at L1 but not L2.
+column is therefore capped at `guest`, never `detlog`. See the verification
+subsection below for the contract that holds at L1 but not under `--verify`.
 
 The task's pre-existing DBT-native baseline is 70/89 tests (78.7%). That number
 measures the backend's own Reverie suite. The 23/24 number above is deliberately
@@ -109,9 +111,9 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 
 ## Cases
 
-Each cell shows the L1 status and, after `/`, the L2 status: `detlog` for
-DETLOG-bitwise L2, `guest` for KVM guest-visible L2, and `gap` where the level
-is not reached.
+Each cell shows the L1 status and, after `/`, the `--verify` status: `detlog`
+for Stripped DETLOG equality, `guest` for KVM guest-visible equality, and `gap`
+where verification does not succeed. Neither successful status is an L2 claim.
 
 | Test | ptrace | DBT | KVM |
 | --- | --- | --- | --- |
@@ -154,7 +156,8 @@ so the guest observes an identical, host-independent result across ptrace, DBT,
 and KVM and across the `--verify` double run.
 
 The authoritative exceptions and their reasons live in `L1_GAPS` and
-`L2_GAPS` in the runner. The runner executes each passing pair three times and
+`L2_GAPS` in the runner; `L2_GAPS` is the existing source identifier, not an L2
+claim. The runner executes each passing pair three times and
 checks exit status, stdout, and (for determinism cases) byte-identical repeated output.
 Cross-backend stdout SHA-256 equality is an exact-byte contract only for rows
 that already define one: fixed `expected_stdout` rows, the dynamic
@@ -175,28 +178,29 @@ Without `--strict`, repeat-run results are compatibility evidence rather than
 an assurance level. With `--strict`, they are L1 strict-mode evidence backed by
 three byte-identical runs. The runner disables PMU timeslicing for portability.
 
-### L2 verification (`--verify`)
+### Stripped verification (`--verify`)
 
-Passing `--verify` lifts every probe to L2: the runner invokes
-`hermit run --strict --verify --verify-allow both`, so hermit itself runs each
-guest twice and asserts a bitwise-identical result. Because `--verify` diverts
-the guest's own stdout into per-run temporary logs, the L2 path cannot re-check
-stdout the way the L1 path does; instead it enforces that the guest exit status
-matches and that hermit's double-run comparison succeeded at *at least* the
-assurance kind expected for the backend. The runner keys on two distinct stderr
-witnesses: `Determinism verified` (DETLOG-bitwise, ptrace and DBT) and
-`guest output and exit status matched` (KVM guest-visible). A DETLOG result
-satisfies a `guest` contract because it is strictly stronger; the reverse fails.
+Passing `--verify` adds a two-run comparison: the runner invokes
+`hermit run --strict --verify --verify-allow both`. For ptrace and DBT, Hermit
+compares DETLOG streams after Stripped normalization; this is not bitwise parity
+and not L2. Because `--verify` diverts the guest's own stdout into per-run
+temporary logs, this path cannot re-check stdout the way the L1 path does;
+instead it enforces that the guest exit status matches and that Hermit's
+double-run comparison succeeded at *at least* the verification kind expected
+for the backend. The runner keys on two stderr witnesses: `Determinism verified`
+(Stripped DETLOG, ptrace and DBT) and `guest output and exit status matched`
+(KVM guest-visible). A DETLOG result satisfies a `guest` contract because it
+compares more observations; the reverse fails.
 
-One contract holds at L1 but not L2 and is recorded as an L2 `gap` with its
-reason in the runner:
+One contract holds at L1 but not under `--verify` and is recorded as a `gap`
+with its reason in the runner:
 
 - **`process_wait_accounting` on KVM.** The `--verify` concurrent double-run
   races child reaping: `waitid` on the already-reaped child returns `ECHILD`
   (`No child processes`), so the second run exits non-zero and verification
   fails. reverie-kvm synchronizes `wait4` child state but not `waitid`. This is
   reproducible across repeated runs; L1's stdout-only, three-run check does not
-  surface it, which is precisely the value of the L2 lift.
+  surface it, which is precisely the additional value of the two-run check.
 
 Hermit's KVM root process enters the shared tool through
 `run_static_elf_with_tool::<Detcore>`, but child process and thread syscalls
@@ -253,16 +257,17 @@ ratcheted by `e9patch_corpus.py` over a freestanding, statically linked,
 raw-`syscall` corpus under `e9patch_corpus/`, where `candidate_sites > 0`.
 
 For each guest that harness enforces exit-status parity, stdout parity, golden
-L2 (`hermit run --strict --verify`), e9patch L2
-(`hermit --backend e9patch run --strict --verify`), full direct-AOT coverage
+Stripped verification (`hermit run --strict --verify`), e9patch Stripped
+verification (`hermit --backend e9patch run --strict --verify`), full direct-AOT
+coverage
 (`mapped_sites == candidate_sites > 0`), no signal fallback (`b0_sites == 0`),
 and guest-syscall DETLOG **tail-match**: the golden guest-syscall sequence
 equals the suffix of the e9patch sequence. Byte-identical DETLOG parity is
 impossible by construction because the e9patch image runs a fixed deterministic
 e9loader prologue (readlink/open/arch_prctl/`N`×mmap/close) before the guest's
 `_start`; that prologue is a pure prefix, so the enforced parity is guest-syscall
-DETLOG identity *modulo* the deterministic prologue, plus L2 and guest-visible
-parity. No strict-detlog-identity claim is made.
+DETLOG identity *modulo* the deterministic prologue, plus Stripped and
+guest-visible equality. No strict-detlog-identity or L2 claim is made.
 
 Like the KVM `/dev/kvm` gate, this harness is `BLOCKED` in CI: it needs a hermit
 built `--features e9patch` and a built e9tool/e9patch pair
@@ -339,9 +344,9 @@ Run KVM on a host with read-write `/dev/kvm` access:
 python3 tests/backend-parity/run_matrix.py --backend kvm --require-backend
 ```
 
-Enforce the L2 ratchet on any backend by adding `--verify` (it implies
-`--strict`); hermit's own double-run then asserts the recorded L2 kind per
-contract:
+Enforce the Stripped verification ratchet on any backend by adding `--verify`
+(it implies `--strict`); Hermit's double-run then asserts the recorded
+verification kind per contract:
 
 ```bash
 python3 tests/backend-parity/run_matrix.py --backend ptrace --verify --require-backend
@@ -351,7 +356,7 @@ python3 tests/backend-parity/run_matrix.py --backend kvm --verify --require-back
 ```
 
 Use `--probe-gaps` to execute documented gaps and report `XPASS` candidates
-(in `--verify` mode the probe reports which L2 kind a gap actually reached).
+(in `--verify` mode the probe reports which verification kind a gap reached).
 Every non-check run auto-discovers an outer dev-hermit checkout and writes its
 observation rows to one ignored per-run file,
 `compat-envelope/ignored/backend-parity/<run-id>.csv`; the tracked

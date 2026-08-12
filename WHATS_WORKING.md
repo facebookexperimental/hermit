@@ -7,24 +7,25 @@ default). Sections 3p-3q add the overnight expansion evidence from batches 3-41 
 real-application matrix. It is meant to be copy-pasteable so you can reproduce the results
 yourself.
 
-> **TL;DR:** On the default ptrace backend, Hermit runs a broad range of real programs
-> bit-for-bit deterministically under `--strict --verify` — all of coreutils, crypto/hashing,
+> **TL;DR:** On the default ptrace backend, a broad range of real programs pass
+> Stripped `--strict --verify` comparison — all of coreutils, crypto/hashing,
 > compression, SQLite, floating-point math, filesystem tools, process trees, and
 > multithreaded C/OpenMP programs whose threads do **not** read wall-clock time.
 > **75 distinct program invocations were exercised in the baseline pass.** The overnight
-> expansion produced **134 clean L2 results as written, or 135 valid L2 results after replacing
+> expansion produced **134 clean Stripped results as written, or 135 valid
+> Stripped results after replacing
 > one malformed socket command with its corrected AF_UNIX form**. A **second expansion (batches
-> 30-41)** added **56 more clean L2 passes** across networking/sockets, signals, time/clock,
+> 30-41)** added **56 more clean Stripped passes** across networking/sockets, signals, time/clock,
 > environment/argv, mmap/memory, epoll/poll, larger CPython, C data-structure apps, Perl, C++,
 > and compiled Rust, plus **five real userland apps** (`bc`, `awk`, `sort`, `sed`, `sqlite3`)
-> verified at L2 (§3q). These batch rows overlap
+> passing Stripped verification (§3q). These batch rows overlap
 > the baseline and each other, so they are not added to 75 as a distinct-program total.
 > Recurring engine gaps include **multithreaded wall-clock reads**, heavy compiler process
 > trees, and blocking FIFO rendezvous. The clock gap is strongly **load-sensitive** (see the
 > box in §3); NSS and `/proc` mismatches additionally expose non-hermetic host state.
 > **New this session:** Hermit wraps a full **QEMU** VMM and boots Linux to userspace with
 > **byte-identical** serial output across two runs under relaxed flags (§3r), and a
-> consolidated **9-language L2 matrix** (C, C++, Rust, Go, Perl, Lua, Node.js, Java, gawk)
+> consolidated **9-language Stripped matrix** (C, C++, Rust, Go, Perl, Lua, Node.js, Java, gawk)
 > verifies clean (§3s).
 
 > ⚠️ **Run conditions matter.** This matrix was captured on a **heavily loaded** host
@@ -66,7 +67,9 @@ $HERMIT run --strict --verify -- <program> [args...]
 
 - `--strict` — full deterministic mode (virtual time, virtualized PIDs/ports, deterministic
   scheduling). It is currently the default; the flag is kept for clarity.
-- `--verify` — run the program twice and confirm the two runs are bit-for-bit identical.
+- `--verify` — run the program twice and compare status, stdout, stderr, and
+  Stripped Detcore logs. Selected numeric, address, path, and time fields are
+  removed before the log comparison, so this is not bit-for-bit parity and not L2.
   On success you get: `:: Success: deterministic. Determinism verified.`
   On failure: `:: Failure: nondeterministic.`
 
@@ -78,7 +81,7 @@ Two useful notes about the sandbox:
 
 ---
 
-## 3. Verified pass/fail matrix (`--strict --verify`, backend = ptrace)
+## 3. Stripped pass/fail matrix (`--strict --verify`, backend = ptrace)
 
 Legend: **PASS** = `Determinism verified` observed. **FLAKY (n/m)** = passed n of m repeat
 runs (load-sensitive). **FAIL** = reproducible `--verify` mismatch. **native rc=1** = the
@@ -270,23 +273,24 @@ fails `--strict --verify` (that checks internal syscall-trace determinism across
 `cc1`/`as`/`ld` pipeline, see §6) — both facts are true and not contradictory: the emitted
 binary is deterministic even though the internal syscall interleaving is not.
 
-### 3p. Overnight expansion batches 3-29 — 135 valid L2 checks
+### 3p. Overnight expansion batches 3-29 — 135 valid Stripped checks
 
 The following results come from the closed batch task notes, not from a single fresh run at
 the current HEAD. The notes explicitly bind several batches to `c88bc0f` and the later batches
 to `21a6813`; other batches identify `main` and `target/debug/hermit` but omit an exact SHA.
 Every row used the default **ptrace** backend, default log level, and no determinism
 relaxations. Batches 19-20 and 27-28 used `--tmp=/tmp` only to expose their host-compiled
-fixture binaries to the guest. `PASS L2` means `hermit run --strict --verify` completed
-with bitwise-identical repeat output.
+fixture binaries to the guest. `PASS Stripped` means `hermit run --strict --verify`
+completed after selected numeric, address, path, and time fields were stripped
+from the compared logs. It is not an L2 result.
 
 The 27 numbered batches contain 141 as-written checks, and the separate interpreter expansion
 contains 6. Of those 147 checks, 134 passed cleanly as written. Batch 13 contained a malformed
 Python socket command; replacing it with the intended AF_UNIX abstract-socket bind passed at
-L2, yielding the 135 valid passing checks catalogued below. Counts are invocation rows, not a
-deduplicated program count.
+Stripped verification, yielding the 135 valid passing checks catalogued below.
+Counts are invocation rows, not a deduplicated program count.
 
-| Category | Batch | Passing commands / workloads | L2 passes |
+| Category | Batch | Passing commands / workloads | Stripped passes |
 |---|---:|---|---:|
 | Shell and text processing | 3 | `echo\|sort`; `sort\|uniq`; `echo\|wc`; `head`; `sed`; `awk`; `bc`; `date +%s`; `env\|head` | 9 |
 | Language interpreters | interpreter expansion | CPython JSON, numeric loop, and PID/PPID probes; Perl hello; Node hello | 5 |
@@ -329,7 +333,7 @@ These results are deliberately excluded from the 135-pass table:
 | Batch | Command / workload | Observed result | Classification |
 |---:|---|---|---|
 | 3 | `id` | 9/10 passed; one verify mismatch | Flaky NSS lookup through the live host `nscd` socket |
-| interpreter expansion | Ruby hello | Default invocation fails natively because RubyGems is broken; `--disable-gems` passes L2 | Host runtime failure; corrected control passes |
+| interpreter expansion | Ruby hello | Default invocation fails natively because RubyGems is broken; `--disable-gems` passes Stripped verification | Host runtime failure; corrected control passes |
 | 4 | `gcc hello.c -o ...` | 2/8 passed; six detlog mismatches | Heavy compiler process-tree/InternalIOPolling divergence |
 | 5 | default-format `stat /etc/passwd` | Intermittent failure, about 1/5 | UID/GID name lookup through `nscd`; numeric format passes 5/5 |
 | 8 | blocking FIFO writer+reader | Hangs in plain strict mode and verify | FIFO-open rendezvous livelock |
@@ -341,19 +345,21 @@ These results are deliberately excluded from the 135-pass table:
 | 18 | `ss -tlnp` | 0/5; detlog mismatch | Reads changing live netlink socket state and `/proc/<pid>/fd` |
 | 21 | `meminfo\|head` | 0/3; stdout mismatch with identical detlogs | Dynamic host memory counters are passed through, not snapshotted |
 
-These classifications matter: a host-state mismatch or invalid command is not a clean L2 pass,
+These classifications matter: a host-state mismatch or invalid command is not
+a clean Stripped pass,
 but it is also not evidence of a missing syscall handler. The reproducible product gaps remain
 the compiler process-tree divergence and FIFO rendezvous livelock; NSS and `/proc` rows require
 additional isolation or virtualization to become deterministic.
 
-### 3q. Second expansion batches 30-41 — 56 clean L2 passes + real-app matrix
+### 3q. Second expansion batches 30-41 — 56 clean Stripped passes + real-app matrix
 
 A second overnight expansion (batches 30-41) probed twelve program families under
 `hermit run --strict --verify` (backend **ptrace**, default log level, **no** determinism
 relaxations). Results come from the closed batch task notes; batches bind to `main` at
 `163333c` / `859970c` / `21a6813` (each note records its SHA). Every row was confirmed both
-deterministic across the two `--verify` sub-runs **and** byte-identical to native stdout under
-a separate `--strict` run. `PASS L2` = `:: Success: deterministic. Determinism verified.`
+successful under the Stripped comparison across the two `--verify` sub-runs
+**and** byte-identical to native stdout under a separate `--strict` run.
+`PASS Stripped` = `:: Success: deterministic. Determinism verified.` and is not L2.
 
 > **Setup note (recurring across these batches):** current `main` **refuses a guest program
 > located under host `/tmp`** (`--strict` errors "Program /tmp/… is under host /tmp … Pass
@@ -377,15 +383,15 @@ a separate `--strict` run. `PASS L2` = `:: Success: deterministic. Determinism v
 | 41 | Compiled Rust | 3/3 | integer compute, 4× `std::thread` join, `HashMap` (seed virtualized) |
 | **Total** |  | **56** |  |
 
-**Real userland applications** (`hermit run --strict --verify -- bash -c '<cmd>'`) — **5/5 PASS L2**:
+**Real userland applications** (`hermit run --strict --verify -- bash -c '<cmd>'`) — **5/5 PASS Stripped**:
 
 | App | Command | Result | Output |
 |-----|---------|--------|--------|
-| bc | `bc -l` pi via `4*a(1)`, scale=20 | PASS L2 | `3.14159265358979323844` |
-| awk | `echo '1 2 3 4 5' \| awk` field sum | PASS L2 | `15` |
-| sort | `printf '3\n1\n4\n1\n5\n' \| sort -n` | PASS L2 | `1 1 3 4 5` |
-| sed | `echo 'hello world' \| sed 's/world/hermit/'` | PASS L2 | `hello hermit` |
-| sqlite3 | CSV `CREATE`/`INSERT 42`/`SELECT` via pipe | PASS L2 | `42` |
+| bc | `bc -l` pi via `4*a(1)`, scale=20 | PASS Stripped | `3.14159265358979323844` |
+| awk | `echo '1 2 3 4 5' \| awk` field sum | PASS Stripped | `15` |
+| sort | `printf '3\n1\n4\n1\n5\n' \| sort -n` | PASS Stripped | `1 1 3 4 5` |
+| sed | `echo 'hello world' \| sed 's/world/hermit/'` | PASS Stripped | `hello hermit` |
+| sqlite3 | CSV `CREATE`/`INSERT 42`/`SELECT` via pipe | PASS Stripped | `42` |
 
 Notable results and honest caveats:
 
@@ -393,7 +399,8 @@ Notable results and honest caveats:
   byte-identical across two independent `--strict` runs (`diff_ns=1010030`) though it varies
   natively; batch 32 pins all clocks to the virtual epoch `1767225600` (2026-01-01 00:00:00 UTC).
 - **Synchronous fault + signal paths are deterministic:** `mprotect(PROT_READ)`→SIGSEGV caught
-  via `sigsetjmp`/`siglongjmp` (batch 34) and `SA_SIGINFO` delivery (batch 31) both verify at L2.
+  via `sigsetjmp`/`siglongjmp` (batch 34) and `SA_SIGINFO` delivery (batch 31)
+  both pass Stripped verification.
 - **Raw-futex and lock-heavy multithreading verify** (batch 39: 3-state Drepper `futex` mutex
   ×40000, `rwlock`, condvars) — deterministic scheduling, no livelock; single-process threads
   are the class Hermit determinizes reliably.
@@ -432,23 +439,24 @@ Notes:
 - Under strict, Hermit prints an explicit VMM warning (mutually-inconsistent RDTSC vs
   virtualized `clock_gettime` can corrupt guest clock calibration).
 
-### 3s. Language-runtime summary — 9 languages verify at L2
+### 3s. Language-runtime summary — 9 languages pass Stripped verification
 
-Consolidated from §3l and batches 36/37/38/40/41, plus a Go check added 2026-07-23. `PASS L2`
+Consolidated from §3l and batches 36/37/38/40/41, plus a Go check added 2026-07-23. `PASS Stripped`
 = `hermit run --strict --verify` reports `:: Success: deterministic. Determinism verified.`
+after Stripped comparison; it is not an L2 claim.
 Sources/binaries kept outside the Hermit-isolated `/tmp`.
 
 | Language | Witness command | Result |
 |---|---|---|
-| C | `gcc hello.c` build + run; batch 37 mini-apps | **PASS L2** |
-| C++ | batch 40: `g++ -std=c++17` vector/map/`std::thread`+atomic ×400000/regex/`chrono` | **PASS L2** (5/5) |
-| Rust | batch 41 + `rustc -O` integer-sum binary | **PASS L2** (3/3 this session) |
-| Go | `go build` integer-sum binary (`go sum: 4950`) | **PASS L2** (3/3 this session) — Go's multithreaded runtime verifies for this compute workload |
+| C | `gcc hello.c` build + run; batch 37 mini-apps | **PASS Stripped** |
+| C++ | batch 40: `g++ -std=c++17` vector/map/`std::thread`+atomic ×400000/regex/`chrono` | **PASS Stripped** (5/5) |
+| Rust | batch 41 + `rustc -O` integer-sum binary | **PASS Stripped** (3/3 this session) |
+| Go | `go build` integer-sum binary (`go sum: 4950`) | **PASS Stripped** (3/3 this session) — Go's multithreaded runtime passes for this compute workload |
 | Perl | `perl -e 'print 42'`; batch 38 (strftime/hash/map/line-count) | **PASS L4 (20/20)** at `96f9953a` under host load averages 146–176. |
-| Lua | `lua -e 'print(6*7)'` | **PASS L2** |
-| Node.js | `node -e 'console.log(6*7)'` | **PASS L2** |
-| Java | `java -version` (OpenJDK 1.8.0_492 Temurin, 5/5) — **requires PR #223** (`saturating_add` `LogicalTime` overflow fix) | **PASS L2** |
-| gawk | `gawk 'BEGIN{print 6*7}'` | **PASS L2** |
+| Lua | `lua -e 'print(6*7)'` | **PASS Stripped** |
+| Node.js | `node -e 'console.log(6*7)'` | **PASS Stripped** |
+| Java | `java -version` (OpenJDK 1.8.0_492 Temurin, 5/5) — **requires PR #223** (`saturating_add` `LogicalTime` overflow fix) | **PASS Stripped** |
+| gawk | `gawk 'BEGIN{print 6*7}'` | **PASS Stripped** |
 | Python 3 | `python3 -c 'print(sum(range(100)))'` | **PASS L4 (20/20)** at `96f9953a` under host load averages 146–181; threaded Python remains a separate gap (§3j). |
 | Ruby | `ruby -e 'puts 6*7'` | **N/A** — host RubyGems broken (fails outside Hermit too), not a determinism result |
 | PHP | `php -r 'echo 6*7;'` | **N/A** — HHVM JIT, too slow to finish twice under load (timeout), not a determinism result |
