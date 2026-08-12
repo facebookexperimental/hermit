@@ -1123,6 +1123,65 @@ impl Config {
 
 /// N.B. we don't want to specify two different notions of "default", so we use the
 /// `Clap` instance above.
+/// Environment variable carrying the coordinator's [`config_wire_fingerprint`]
+/// to an out-of-process plugin.
+///
+/// Named alongside the other `REVERIE_SABRE_HERMIT_*` launch variables so the
+/// two travel together and a reader finds them in one place.
+pub const CONFIG_FINGERPRINT_ENV: &str = "REVERIE_SABRE_HERMIT_CONFIG_FINGERPRINT";
+
+/// A fingerprint of this build's [`Config`] wire payload and named shape, for
+/// detecting a plugin and a coordinator compiled from different definitions of it.
+///
+/// # Why this exists
+///
+/// An out-of-process plugin such as `libdetcore_sabre.so` is a separate Cargo
+/// artifact that lands in the same target directory as `hermit`. Changing
+/// `Config` -- or merely switching branches -- leaves the plugin stale while
+/// everything still *looks* built. `Config` is transferred during the RPC
+/// handshake, so a stale plugin decodes it against the wrong layout and the
+/// failure surfaces as an opaque codec error: measured, one added `bool` field
+/// produced `Decode(InvalidBooleanValue(20))` at connect, which points nowhere
+/// near "your plugin is from a different build" and cost a long diagnosis while
+/// blocking every SaBRe measurement.
+///
+/// # What it measures
+///
+/// Two encodings of `Config::default()` are fingerprinted with separate domains:
+///
+/// - the exact legacy-bincode bytes used by Reverie RPC, which detect changes
+///   such as `u32` to `u64` even when both default to JSON number zero; and
+/// - the JSON encoding, which carries every field name and makes a pure rename
+///   visible even though bincode is positional.
+///
+/// The JSON half is deliberately stricter than the wire format strictly
+/// requires. Refusing a pure rename costs one rebuild; missing a wire-incompatible
+/// retype can make the plugin decode the rest of the handshake at the wrong offsets.
+pub fn config_wire_fingerprint() -> String {
+    let config = Config::default();
+    let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy())
+        .expect("Config::default() must encode with the Reverie RPC bincode configuration");
+    let named_shape = serde_json::to_string(&config)
+        .expect("Config::default() must encode as JSON for field-name checking");
+    fingerprint_of_config_bytes(&wire, &named_shape)
+}
+
+/// Domain-separated FNV-1a over the real wire bytes and the named JSON shape.
+/// This is a mismatch detector, not a security boundary.
+fn fingerprint_of_config_bytes(wire: &[u8], named_shape: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for (domain, bytes) in [(0_u8, wire), (1_u8, named_shape.as_bytes())] {
+        for byte in std::iter::once(&domain)
+            .chain((bytes.len() as u64).to_le_bytes().iter())
+            .chain(bytes.iter())
+        {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+    format!("{hash:016x}")
+}
+
 impl Default for Config {
     fn default() -> Self {
         let v: Vec<String> = vec![];
@@ -1306,6 +1365,73 @@ mod tests {
             ..Default::default()
         };
         config.validate();
+    }
+
+    #[test]
+    fn config_fingerprint_is_stable_and_shape_sensitive() {
+        // STABLE: a build must agree with itself, or the guard would reject a
+        // MATCHED pair -- which would be worse than having no guard at all.
+        assert_eq!(config_wire_fingerprint(), config_wire_fingerprint());
+        assert_eq!(config_wire_fingerprint().len(), 16);
+
+        let config = Config::default();
+        let base = serde_json::to_string(&config).unwrap();
+        let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+        assert_eq!(
+            fingerprint_of_config_bytes(&wire, &base),
+            config_wire_fingerprint()
+        );
+
+        // SHAPE-SENSITIVE, checked on the same mechanism the real function uses.
+        // One added field is exactly the change that caused the outage.
+        let with_extra_field = format!("{},\"a_new_flag\":false}}", &base[..base.len() - 1]);
+        assert_ne!(
+            fingerprint_of_config_bytes(&wire, &with_extra_field),
+            config_wire_fingerprint()
+        );
+        // A removed field.
+        let removed = base.replacen("\"virtualize_time\":true,", "", 1);
+        assert_ne!(
+            fingerprint_of_config_bytes(&wire, &removed),
+            config_wire_fingerprint()
+        );
+        // A pure rename, which bincode would tolerate but which we still refuse.
+        let renamed = base.replacen("\"virtualize_time\"", "\"virtualise_time\"", 1);
+        assert_ne!(
+            fingerprint_of_config_bytes(&wire, &renamed),
+            config_wire_fingerprint()
+        );
+
+        // The counterexample the JSON-only fingerprint missed: serde_json emits
+        // the same text for integer zero regardless of width, but legacy bincode
+        // changes the payload width. A stale peer would decode every following
+        // field at the wrong offset.
+        #[derive(Serialize)]
+        struct U32Field {
+            field: u32,
+        }
+        #[derive(Serialize)]
+        struct U64Field {
+            field: u64,
+        }
+        let u32_value = U32Field { field: 0 };
+        let u64_value = U64Field { field: 0 };
+        let u32_json = serde_json::to_string(&u32_value).unwrap();
+        let u64_json = serde_json::to_string(&u64_value).unwrap();
+        assert_eq!(
+            u32_json, u64_json,
+            "the planted JSON collision must be real"
+        );
+        let u32_wire =
+            bincode::serde::encode_to_vec(&u32_value, bincode::config::legacy()).unwrap();
+        let u64_wire =
+            bincode::serde::encode_to_vec(&u64_value, bincode::config::legacy()).unwrap();
+        assert_ne!(u32_wire, u64_wire, "the planted wire retype must be real");
+        assert_ne!(
+            fingerprint_of_config_bytes(&u32_wire, &u32_json),
+            fingerprint_of_config_bytes(&u64_wire, &u64_json),
+            "a wire-incompatible integer retype must change the fingerprint"
+        );
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

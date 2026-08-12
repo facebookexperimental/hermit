@@ -21,7 +21,10 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+/// Private env var carrying the coordinator's `Config` wire fingerprint.
+pub use detcore::CONFIG_FINGERPRINT_ENV;
 use detcore::Detcore;
+use detcore::config_wire_fingerprint;
 use reverie_memory::LocalMemory;
 use reverie_memory::MemoryAccess;
 use reverie_sabre as sabre;
@@ -196,8 +199,47 @@ struct Plugin {
 }
 
 impl Plugin {
+    /// Refuse to connect when this plugin and the coordinator were built from
+    /// different definitions of `Config`.
+    ///
+    /// This plugin is a separate Cargo artifact that lands in the same target
+    /// directory as `hermit`, so changing `Config` -- or merely switching
+    /// branches -- leaves it stale while everything still looks built. `Config`
+    /// crosses the wire during the handshake, so a stale plugin decodes it
+    /// against the wrong layout. The damage was never the staleness; it was the
+    /// diagnosis cost: one added `bool` field surfaced as
+    /// `Decode(InvalidBooleanValue(20))` at connect, which names no version and
+    /// points nowhere near the plugin, and it blocked every SaBRe measurement
+    /// until someone guessed.
+    ///
+    /// Checked BEFORE the RPC connect so the mismatch is reported instead of
+    /// being re-encountered as a codec error a few frames later.
+    fn check_coordinator_compatibility() {
+        // SAFETY: plugin construction runs before SaBRe starts guest callbacks.
+        let expected = unsafe { sabre::take_private_env(CONFIG_FINGERPRINT_ENV) }
+            .map(|v| v.to_string_lossy().into_owned());
+        let ours = config_wire_fingerprint();
+        match expected {
+            Some(expected) if expected == ours => {}
+            Some(expected) => panic!(
+                "Detcore SaBRe plugin/coordinator MISMATCH: this plugin was built from a \
+                 Config whose shape is {ours}, the coordinator expects {expected}. The plugin \
+                 is a separate artifact in the same target directory and is stale -- rebuild \
+                 it against this coordinator: cargo build -p detcore-sabre"
+            ),
+            // An older coordinator does not publish the fingerprint. Say so and
+            // continue: refusing here would break pairs that are actually fine,
+            // and a guard that rejects matched pairs is worse than no guard.
+            None => eprintln!(
+                "detcore-sabre: coordinator published no Config fingerprint ({CONFIG_FINGERPRINT_ENV} \
+                 unset); proceeding unguarded. This plugin's shape is {ours}."
+            ),
+        }
+    }
+
     fn connect() -> Self {
         init_detlog_forwarder();
+        Self::check_coordinator_compatibility();
         let socket = coordinator_socket().unwrap_or_else(|| panic!("{RPC_SOCKET_ENV} is not set"));
 
         let adapter = RemoteReverieAdapter::connect(socket)

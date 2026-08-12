@@ -1037,6 +1037,14 @@ async fn run_sabre(
     ]);
     command.program(&sabre);
     command.env(SABRE_RPC_SOCKET_ENV, &socket_path);
+    // Publish the shape of the Config this coordinator will send. The plugin is a
+    // separate artifact in the same target directory, so it can be stale without
+    // looking it; comparing here turns an opaque decode failure at connect into a
+    // message that names the mismatch. See detcore_model::config_wire_fingerprint.
+    command.env(
+        detcore::CONFIG_FINGERPRINT_ENV,
+        detcore::config_wire_fingerprint(),
+    );
     command.env_remove(SABRE_PATH_EVIDENCE_ENV);
     command.env_remove(SABRE_DETLOG_FORWARD_ENV);
     if tracing::enabled!(target: "detcore", tracing::Level::INFO) {

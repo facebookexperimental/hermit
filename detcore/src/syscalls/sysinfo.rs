@@ -31,6 +31,24 @@ fn clock_t_from_ticks(ticks: u64) -> libc::clock_t {
     ticks as libc::clock_t
 }
 
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+const NANOS_PER_MICROSECOND: u64 = 1_000;
+
+/// Render a logical CPU duration as the `timeval` `getrusage(2)` reports.
+///
+/// Linux truncates rusage CPU times to microsecond granularity, so the sub-microsecond
+/// remainder of the logical duration is discarded rather than rounded. Truncation (not
+/// rounding) is what keeps the value monotonic: a duration that grows by less than a
+/// microsecond must never make the reported total go backwards, and rounding-to-nearest
+/// on a shrinking remainder can do exactly that.
+fn timeval_from_logical(duration: crate::types::LogicalTime) -> libc::timeval {
+    let nanos = duration.as_nanos();
+    libc::timeval {
+        tv_sec: (nanos / NANOS_PER_SECOND) as libc::time_t,
+        tv_usec: ((nanos % NANOS_PER_SECOND) / NANOS_PER_MICROSECOND) as libc::suseconds_t,
+    }
+}
+
 fn logical_clock_ticks(
     now: crate::types::LogicalTime,
     boot: crate::types::LogicalTime,
@@ -181,15 +199,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         );
         Ok(0)
     }
-    /// Return a deterministic resource-usage snapshot. Host CPU times, page-fault counts, and
-    /// context-switch counts depend on kernel scheduling, so report zero until Detcore models
-    /// those counters using logical execution progress.
+    /// Return a deterministic resource-usage snapshot.
     ///
-    /// `ru_maxrss` is the exception: it is populated with the guest's peak resident set size so
-    /// that programs which require a positive maximum RSS (e.g. rr's `rusage` test) behave like
-    /// they do on Linux. The value comes from the same procfs memory accounting that `sysinfo`'s
-    /// free-memory reporting already relies on, which is deterministic across runs under Detcore's
-    /// fixed schedule.
+    /// `ru_utime`/`ru_stime` come from the SAME logical CPU accounting that backs `times(2)`
+    /// (see [`Self::handle_times`]), not from host scheduler counters. Reporting them as zero,
+    /// as this did previously, was both a fidelity bug and an internal contradiction: a guest
+    /// that called `times(2)` saw advancing CPU time while `getrusage(2)` insisted the same
+    /// process had consumed none. Deriving both from `ProcessCpuSnapshot` makes the two
+    /// syscalls agree by construction rather than by coincidence.
+    ///
+    /// The `who` values report different aggregates, matching Linux:
+    /// - `RUSAGE_SELF` — this process, summed across its threads.
+    /// - `RUSAGE_THREAD` — the calling thread alone. This reads the thread's own logical CPU
+    ///   counters rather than the process totals; substituting the process aggregate would
+    ///   over-report for every multithreaded guest.
+    /// - `RUSAGE_CHILDREN` — reaped children only, which is exactly what the `children_*`
+    ///   fields accumulate on `wait`.
+    ///
+    /// `ru_maxrss` is populated for the process/thread cases with the guest's peak resident set
+    /// size so that programs which require a positive maximum RSS (e.g. rr's `rusage` test)
+    /// behave like they do on Linux. The value comes from the same procfs memory accounting that
+    /// `sysinfo`'s free-memory reporting already relies on, which is deterministic across runs
+    /// under Detcore's fixed schedule.
+    ///
+    /// Page-fault and context-switch counts remain zero: Detcore does not model them, and
+    /// synthesizing a plausible-looking number would be worse than reporting none.
     pub async fn handle_getrusage<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -205,6 +239,21 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         // SAFETY: `libc::rusage` is a plain-old-data C struct that is valid when zero-initialized.
         let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+
+        let (user, system) = match who {
+            libc::RUSAGE_THREAD => guest.thread_state_mut().thread_cpu_time(),
+            libc::RUSAGE_CHILDREN => {
+                let cpu = guest.thread_state_mut().process_cpu_time();
+                (cpu.children_user, cpu.children_system)
+            }
+            // RUSAGE_SELF
+            _ => {
+                let cpu = guest.thread_state_mut().process_cpu_time();
+                (cpu.user, cpu.system)
+            }
+        };
+        usage.ru_utime = timeval_from_logical(user);
+        usage.ru_stime = timeval_from_logical(system);
 
         // RUSAGE_SELF/RUSAGE_THREAD report this process's peak RSS. RUSAGE_CHILDREN aggregates
         // terminated children only; with no such accounting we leave it zero, matching Linux when
@@ -348,6 +397,70 @@ mod tests {
     #[test]
     fn logical_cpu_ticks_exclude_boot_epoch() {
         assert_eq!(clock_ticks(LogicalTime::from_millis(25)), 2);
+    }
+
+    #[test]
+    fn rusage_timeval_splits_seconds_and_microseconds() {
+        let tv = timeval_from_logical(LogicalTime::from_millis(2_500));
+        assert_eq!(tv.tv_sec, 2);
+        assert_eq!(tv.tv_usec, 500_000);
+    }
+
+    #[test]
+    fn rusage_timeval_truncates_sub_microsecond_rather_than_rounding() {
+        // 1_999 ns is a hair under 2us. Truncating yields 1us; rounding to nearest would
+        // yield 2us and could make a later, larger duration report a SMALLER value once its
+        // remainder shrank -- i.e. CPU time going backwards. Pin truncation explicitly.
+        let tv = timeval_from_logical(LogicalTime::from_nanos(1_999));
+        assert_eq!(tv.tv_sec, 0);
+        assert_eq!(tv.tv_usec, 1);
+    }
+
+    #[test]
+    fn rusage_timeval_is_monotonic_in_the_logical_duration() {
+        // The property that matters to a guest: CPU time never goes backwards. Walk a range
+        // of nanosecond durations across microsecond and second boundaries and assert the
+        // rendered timeval is non-decreasing at every step.
+        let mut previous = (0_i64, 0_i64);
+        for nanos in (0..3_000_000u64).step_by(997) {
+            let tv = timeval_from_logical(LogicalTime::from_nanos(nanos));
+            let current = (tv.tv_sec, tv.tv_usec);
+            assert!(
+                current >= previous,
+                "rusage timeval went backwards at {nanos}ns: {previous:?} -> {current:?}"
+            );
+            previous = current;
+        }
+    }
+
+    #[test]
+    fn rusage_zero_cpu_time_renders_as_zero() {
+        let tv = timeval_from_logical(LogicalTime::ZERO);
+        assert_eq!(tv.tv_sec, 0);
+        assert_eq!(tv.tv_usec, 0);
+    }
+
+    #[test]
+    fn rusage_and_times_agree_within_one_clock_tick() {
+        // Both syscalls project the same logical duration, but times(2) is
+        // quantized to USER_HZ while getrusage(2) retains microseconds.
+        for nanos in [0u64, 1_000_000, 300_484_000, 7_000_000_000, 12_345_678_901] {
+            let duration = LogicalTime::from_nanos(nanos);
+            let tv = timeval_from_logical(duration);
+            let rusage_micros = tv.tv_sec as u64 * 1_000_000 + tv.tv_usec as u64;
+            let times_micros = clock_ticks(duration) * (NANOS_PER_CLOCK_TICK / 1_000);
+
+            assert!(rusage_micros >= times_micros);
+            assert!(rusage_micros - times_micros < NANOS_PER_CLOCK_TICK / 1_000);
+
+            // A tick-ALIGNED duration must agree EXACTLY, not merely to within
+            // one tick. The bounds above are satisfied at every sample by an
+            // implementation carrying a constant sub-tick offset, so without
+            // this the suite cannot distinguish that from a correct one.
+            if nanos % NANOS_PER_CLOCK_TICK == 0 {
+                assert_eq!(rusage_micros, times_micros);
+            }
+        }
     }
 
     #[test]

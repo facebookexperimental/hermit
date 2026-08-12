@@ -1546,6 +1546,20 @@ impl<T> ThreadState<T> {
             .snapshot
     }
 
+    /// This thread's own logical (user, system) CPU time.
+    ///
+    /// `getrusage(RUSAGE_THREAD)` needs the per-thread counters, not the process aggregate
+    /// that [`Self::process_cpu_time`] returns; for a multithreaded guest the two differ and
+    /// reporting the aggregate would over-report every thread. Reads the same
+    /// `thread_logical_time` counters that `account_process_cpu_time` folds into the process
+    /// total, so the per-thread and process views cannot drift apart.
+    pub(crate) fn thread_cpu_time(&self) -> (LogicalTime, LogicalTime) {
+        (
+            self.thread_logical_time.user_cpu_time(),
+            self.thread_logical_time.system_cpu_time(),
+        )
+    }
+
     pub(crate) fn record_exited_child_process_cpu_time(&mut self, pid: DetPid) {
         self.account_process_cpu_time();
         let Some(parent) = &self.parent_process_cpu_time else {

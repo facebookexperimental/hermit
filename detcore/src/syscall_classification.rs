@@ -1287,29 +1287,551 @@ pub(crate) const fn is_deterministically_refused_syscall(sysno: Sysno) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
+
+    // ===== REVIEWED CLASSIFICATION MEMBERSHIP =====
+    //
+    // These lists replace a hand-transcribed `[289, 83, 1]` count triple.
+    //
+    // The triple could only see the SIZE of each class, so a COUNT-PRESERVING
+    // SWAP -- moving one syscall out of `Determinized` and another in -- passed
+    // it while changing what Detcore actually determinizes. In a determinism
+    // engine a classification test that ratifies the wrong classification is
+    // close to the worst kind of green.
+    // `census_refuses_a_count_preserving_swap` plants exactly that case and
+    // proves this check refuses it.
+    //
+    // The triple was also a shared mutable counter every reclassification PR had
+    // to re-derive from its own base, which is both a guaranteed merge conflict
+    // and a correctness trap: PR #1933 asserts a two-generations-stale
+    // `[283, 89, 1]`, so it can pass its own census while disagreeing with
+    // `main` about what is determinized. Per-name lists make a reclassification
+    // a ONE-LINE edit in each of two lists, so independent PRs no longer collide
+    // on a single number, and the diff names the syscall that moved.
+    //
+    // To regenerate after an INTENTIONAL reclassification, print
+    // `census_by_class(classify_syscall)` and paste each sorted bucket. Do not
+    // edit a list to make a red test green without saying which policy changed
+    // and why -- that is the failure mode these lists exist to expose.
+
+    /// Syscalls Detcore models, replaces deterministically, or explicitly refuses.
+    const DETERMINIZED_SYSCALLS: &[&str] = &[
+        "_sysctl",
+        "accept",
+        "accept4",
+        "acct",
+        "add_key",
+        "adjtimex",
+        "afs_syscall",
+        "alarm",
+        "arch_prctl",
+        "bind",
+        "bpf",
+        "cachestat",
+        "clock_adjtime",
+        "clock_getres",
+        "clock_gettime",
+        "clock_nanosleep",
+        "clock_settime",
+        "clone",
+        "clone3",
+        "close",
+        "close_range",
+        "connect",
+        "copy_file_range",
+        "creat",
+        "create_module",
+        "delete_module",
+        "dup",
+        "dup2",
+        "dup3",
+        "epoll_create",
+        "epoll_create1",
+        "epoll_ctl",
+        "epoll_ctl_old",
+        "epoll_pwait",
+        "epoll_pwait2",
+        "epoll_wait",
+        "epoll_wait_old",
+        "eventfd",
+        "eventfd2",
+        "execve",
+        "execveat",
+        "exit",
+        "exit_group",
+        "fadvise64",
+        "fanotify_init",
+        "fanotify_mark",
+        "fcntl",
+        "finit_module",
+        "flock",
+        "fork",
+        "fsconfig",
+        "fsmount",
+        "fsopen",
+        "fspick",
+        "fstat",
+        "fstatfs",
+        "futex",
+        "futex_requeue",
+        "futex_wait",
+        "futex_waitv",
+        "futex_wake",
+        "futimesat",
+        "get_kernel_syms",
+        "get_mempolicy",
+        "getcpu",
+        "getdents",
+        "getdents64",
+        "getegid",
+        "geteuid",
+        "getgid",
+        "getitimer",
+        "getpeername",
+        "getpmsg",
+        "getpriority",
+        "getrandom",
+        "getresgid",
+        "getresuid",
+        "getrlimit",
+        "getrusage",
+        "getsockname",
+        "getsockopt",
+        "gettimeofday",
+        "getuid",
+        "init_module",
+        "inotify_add_watch",
+        "inotify_init",
+        "inotify_init1",
+        "inotify_rm_watch",
+        "io_cancel",
+        "io_destroy",
+        "io_getevents",
+        "io_pgetevents",
+        "io_setup",
+        "io_submit",
+        "io_uring_enter",
+        "io_uring_register",
+        "io_uring_setup",
+        "ioctl",
+        "ioperm",
+        "iopl",
+        "ioprio_get",
+        "ioprio_set",
+        "kcmp",
+        "kexec_file_load",
+        "kexec_load",
+        "keyctl",
+        "kill",
+        "landlock_add_rule",
+        "landlock_create_ruleset",
+        "landlock_restrict_self",
+        "listen",
+        "listmount",
+        "lookup_dcookie",
+        "lseek",
+        "lsm_get_self_attr",
+        "lsm_list_modules",
+        "lsm_set_self_attr",
+        "lstat",
+        "madvise",
+        "map_shadow_stack",
+        "mbind",
+        "membarrier",
+        "memfd_create",
+        "memfd_secret",
+        "migrate_pages",
+        "mincore",
+        "mmap",
+        "mount",
+        "mount_setattr",
+        "move_mount",
+        "move_pages",
+        "mq_getsetattr",
+        "mq_notify",
+        "mq_open",
+        "mq_timedreceive",
+        "mq_timedsend",
+        "mq_unlink",
+        "mremap",
+        "msgctl",
+        "msgget",
+        "msgrcv",
+        "msgsnd",
+        "munmap",
+        "name_to_handle_at",
+        "nanosleep",
+        "newfstatat",
+        "nfsservctl",
+        "open",
+        "open_by_handle_at",
+        "open_tree",
+        "openat",
+        "openat2",
+        "pause",
+        "perf_event_open",
+        "pidfd_getfd",
+        "pidfd_open",
+        "pidfd_send_signal",
+        "pipe",
+        "pipe2",
+        "pivot_root",
+        "poll",
+        "ppoll",
+        "prctl",
+        "pread64",
+        "preadv",
+        "preadv2",
+        "prlimit64",
+        "process_madvise",
+        "process_mrelease",
+        "process_vm_readv",
+        "process_vm_writev",
+        "pselect6",
+        "ptrace",
+        "putpmsg",
+        "pwrite64",
+        "pwritev",
+        "pwritev2",
+        "query_module",
+        "quotactl",
+        "quotactl_fd",
+        "read",
+        "readlink",
+        "readlinkat",
+        "readv",
+        "reboot",
+        "recvfrom",
+        "recvmmsg",
+        "recvmsg",
+        "remap_file_pages",
+        "request_key",
+        "rseq",
+        "rt_sigaction",
+        "rt_sigpending",
+        "rt_sigprocmask",
+        "rt_sigqueueinfo",
+        "rt_sigsuspend",
+        "rt_sigtimedwait",
+        "rt_tgsigqueueinfo",
+        "sched_getaffinity",
+        "sched_getattr",
+        "sched_getparam",
+        "sched_getscheduler",
+        "sched_rr_get_interval",
+        "sched_setaffinity",
+        "sched_setattr",
+        "sched_setparam",
+        "sched_setscheduler",
+        "sched_yield",
+        "seccomp",
+        "security",
+        "select",
+        "semctl",
+        "semget",
+        "semop",
+        "semtimedop",
+        "sendfile",
+        "sendmmsg",
+        "sendmsg",
+        "sendto",
+        "set_mempolicy",
+        "set_mempolicy_home_node",
+        "setdomainname",
+        "setfsgid",
+        "setfsuid",
+        "setgid",
+        "setgroups",
+        "sethostname",
+        "setitimer",
+        "setns",
+        "setpriority",
+        "setregid",
+        "setresgid",
+        "setresuid",
+        "setreuid",
+        "setrlimit",
+        "setsid",
+        "setsockopt",
+        "settimeofday",
+        "setuid",
+        "shmat",
+        "shmctl",
+        "shmdt",
+        "shmget",
+        "shutdown",
+        "signalfd",
+        "signalfd4",
+        "socket",
+        "socketpair",
+        "splice",
+        "stat",
+        "statfs",
+        "statmount",
+        "statx",
+        "swapoff",
+        "swapon",
+        "sysfs",
+        "sysinfo",
+        "syslog",
+        "tee",
+        "tgkill",
+        "time",
+        "timer_create",
+        "timer_delete",
+        "timer_getoverrun",
+        "timer_gettime",
+        "timer_settime",
+        "timerfd_create",
+        "timerfd_gettime",
+        "timerfd_settime",
+        "times",
+        "tkill",
+        "tuxcall",
+        "umount2",
+        "uname",
+        "unshare",
+        "uselib",
+        "userfaultfd",
+        "ustat",
+        "utime",
+        "utimensat",
+        "utimes",
+        "vfork",
+        "vhangup",
+        "vmsplice",
+        "vserver",
+        "wait4",
+        "waitid",
+        "write",
+        "writev",
+    ];
+
+    /// Syscalls intentionally forwarded under documented container assumptions.
+    const PASSTHROUGH_SYSCALLS: &[&str] = &[
+        "access",
+        "brk",
+        "capget",
+        "capset",
+        "chdir",
+        "chmod",
+        "chown",
+        "chroot",
+        "faccessat",
+        "faccessat2",
+        "fallocate",
+        "fchdir",
+        "fchmod",
+        "fchmodat",
+        "fchmodat2",
+        "fchown",
+        "fchownat",
+        "fdatasync",
+        "fgetxattr",
+        "flistxattr",
+        "fremovexattr",
+        "fsetxattr",
+        "fsync",
+        "ftruncate",
+        "get_robust_list",
+        "get_thread_area",
+        "getcwd",
+        "getgroups",
+        "getpgid",
+        "getpgrp",
+        "getpid",
+        "getppid",
+        "getsid",
+        "gettid",
+        "getxattr",
+        "lchown",
+        "lgetxattr",
+        "link",
+        "linkat",
+        "listxattr",
+        "llistxattr",
+        "lremovexattr",
+        "lsetxattr",
+        "mkdir",
+        "mkdirat",
+        "mknod",
+        "mknodat",
+        "mlock",
+        "mlock2",
+        "mlockall",
+        "modify_ldt",
+        "mprotect",
+        "msync",
+        "munlock",
+        "munlockall",
+        "personality",
+        "pkey_alloc",
+        "pkey_free",
+        "pkey_mprotect",
+        "readahead",
+        "removexattr",
+        "rename",
+        "renameat",
+        "renameat2",
+        "rmdir",
+        "rt_sigreturn",
+        "sched_get_priority_max",
+        "sched_get_priority_min",
+        "set_robust_list",
+        "set_thread_area",
+        "set_tid_address",
+        "setpgid",
+        "setxattr",
+        "sigaltstack",
+        "symlink",
+        "symlinkat",
+        "sync",
+        "sync_file_range",
+        "syncfs",
+        "truncate",
+        "umask",
+        "unlink",
+        "unlinkat",
+    ];
+
+    /// Syscalls with no deterministic implementation, using the configured fallback.
+    const UNSUPPORTED_SYSCALLS: &[&str] = &["restart_syscall"];
+
+    /// Bucket every pinned syscall by `classify`, sorted by name.
+    ///
+    /// Parameterised on the classifier so the negative brackets below can plant
+    /// a perturbed classification and prove the comparison refuses it. A census
+    /// test that cannot fail is exactly what this replaces.
+    fn census_by_class(classify: impl Fn(Sysno) -> SyscallClassification) -> [Vec<String>; 3] {
+        let mut buckets: [Vec<String>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for sysno in all_pinned_syscalls() {
+            let bucket = match classify(sysno) {
+                SyscallClassification::Determinized => 0,
+                SyscallClassification::PassThrough => 1,
+                SyscallClassification::Unsupported => 2,
+            };
+            buckets[bucket].push(sysno.to_string());
+        }
+        for bucket in buckets.iter_mut() {
+            bucket.sort();
+        }
+        buckets
+    }
+
+    /// Every syscall whose class differs from the reviewed membership, by name.
+    ///
+    /// Returns findings rather than asserting, so the negative brackets can
+    /// assert on exactly which syscalls moved and in which direction.
+    fn census_mismatches(buckets: &[Vec<String>; 3]) -> Vec<String> {
+        let reviewed = [
+            DETERMINIZED_SYSCALLS,
+            PASSTHROUGH_SYSCALLS,
+            UNSUPPORTED_SYSCALLS,
+        ];
+        let class_names = ["Determinized", "PassThrough", "Unsupported"];
+        let mut findings = Vec::new();
+        for index in 0..3 {
+            let actual: BTreeSet<&str> = buckets[index].iter().map(String::as_str).collect();
+            let want: BTreeSet<&str> = reviewed[index].iter().copied().collect();
+            for name in want.difference(&actual) {
+                findings.push(format!("{name}: left {}", class_names[index]));
+            }
+            for name in actual.difference(&want) {
+                findings.push(format!("{name}: entered {}", class_names[index]));
+            }
+        }
+        findings.sort();
+        findings
+    }
 
     #[test]
     fn every_pinned_sysno_has_an_explicit_classification() {
-        let mut counts = [0usize; 3];
-        for sysno in all_pinned_syscalls() {
-            match classify_syscall(sysno) {
-                SyscallClassification::Determinized => counts[0] += 1,
-                SyscallClassification::PassThrough => counts[1] += 1,
-                SyscallClassification::Unsupported => counts[2] += 1,
-            }
-        }
+        let buckets = census_by_class(classify_syscall);
 
-        // pidfd_send_signal and pidfd_getfd moved from Unsupported to Determinized
-        // (see handle_pidfd_send_signal / handle_pidfd_getfd), leaving only
-        // restart_syscall Unsupported.
-        //
-        // #1549 moved the six credential-query syscalls (getuid, geteuid,
-        // getgid, getegid, getresuid, getresgid) from PassThrough to
-        // Determinized, so the census shifts 6 from column 1 to column 0
-        // (283/89 -> 289/83). The total is unchanged and is re-asserted below.
-        assert_eq!(counts, [289, 83, 1]);
-        assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
+        let mismatches = census_mismatches(&buckets);
+        assert!(
+            mismatches.is_empty(),
+            "syscall classification differs from the reviewed membership. Update the \
+             lists deliberately, naming the policy change:\n  {}",
+            mismatches.join("\n  ")
+        );
+
+        // The total is COMPUTED from the census, never transcribed.
+        // `EXPECTED_X86_64_SYSNO_COUNT` is itself bracketed against
+        // `Sysno::count()` by the const assertion at the top of this file, so
+        // this catches a syscalls-crate table change instead of restating a
+        // number the census just produced.
+        let counted: usize = buckets.iter().map(Vec::len).sum();
+        assert_eq!(counted, EXPECTED_X86_64_SYSNO_COUNT);
+
+        // And the reviewed lists must themselves cover the whole table, so a
+        // syscall cannot be dropped from every list and escape classification.
+        let reviewed =
+            DETERMINIZED_SYSCALLS.len() + PASSTHROUGH_SYSCALLS.len() + UNSUPPORTED_SYSCALLS.len();
+        assert_eq!(reviewed, EXPECTED_X86_64_SYSNO_COUNT);
+    }
+
+    #[test]
+    fn census_refuses_a_moved_syscall() {
+        // Plant one reclassification: futex Determinized -> PassThrough.
+        let perturbed = |sysno: Sysno| {
+            if sysno == Sysno::futex {
+                SyscallClassification::PassThrough
+            } else {
+                classify_syscall(sysno)
+            }
+        };
+        let findings = census_mismatches(&census_by_class(perturbed));
+        assert_eq!(
+            findings,
+            vec![
+                "futex: entered PassThrough".to_string(),
+                "futex: left Determinized".to_string(),
+            ],
+            "the census must name the moved syscall and both directions"
+        );
+    }
+
+    #[test]
+    fn census_refuses_a_count_preserving_swap() {
+        // THE CASE THE OLD `[289, 83, 1]` TRIPLE COULD NOT SEE.
+        // Move one syscall out of Determinized and one in from PassThrough:
+        // every class size is unchanged, so the count assertion passed while
+        // Detcore's actual policy for two syscalls had changed.
+        let perturbed = |sysno: Sysno| match sysno {
+            Sysno::futex => SyscallClassification::PassThrough,
+            Sysno::get_robust_list => SyscallClassification::Determinized,
+            other => classify_syscall(other),
+        };
+        let buckets = census_by_class(perturbed);
+
+        // Positive half of the bracket: confirm the swap really is
+        // count-preserving, so this test proves the improvement rather than
+        // just restating the negative above. Sizes come from the reviewed
+        // lists, not from a transcribed triple.
+        assert_eq!(
+            [buckets[0].len(), buckets[1].len(), buckets[2].len()],
+            [
+                DETERMINIZED_SYSCALLS.len(),
+                PASSTHROUGH_SYSCALLS.len(),
+                UNSUPPORTED_SYSCALLS.len(),
+            ],
+            "the planted swap must leave all three class sizes unchanged"
+        );
+
+        // Membership is not preserved, and the census says so by name.
+        let findings = census_mismatches(&buckets);
+        assert_eq!(
+            findings,
+            vec![
+                "futex: entered PassThrough".to_string(),
+                "futex: left Determinized".to_string(),
+                "get_robust_list: entered Determinized".to_string(),
+                "get_robust_list: left PassThrough".to_string(),
+            ]
+        );
     }
 
     #[test]
