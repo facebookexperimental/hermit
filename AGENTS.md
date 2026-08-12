@@ -336,36 +336,18 @@ not use the upstream repository for routine feature branches or CI iteration.
 
 Typical flow for a change:
 
-- Branch from `origin/main`, make one coherent change per branch, and write an
-  imperative, descriptive commit subject that states what changed. Explain the
-  reason and any non-obvious constraints in the body.
-- **End every commit body with a role + team tag**, as its own final line:
-  `[<role>, MODEL] [<team-slug>, <machine>]` — for example
-  `[impl agent, claude-opus-5] [hermit-coord, devbig030]`, where `<machine>` is
-  an exact `devbigNNN` token kept comma-delimited from the team slug (never
-  embedded in it). Role is `impl agent`, `adversarial-reviewer agent`,
-  `coordinator`, or `Human`. The same tag opens the PR description and
-  prefixes any GitHub comment coordinating across teams. This matches the
-  dev-hermit parent's Conventions and its installed
-  `scripts/check_commit_attribution.py` hook, which is what actually enforces
-  this format across every initialized checkout including this one — an older
-  single-bracket `[<full-team-name>]` form (e.g. `[claude-coord-176]`) is
-  rejected by that hook.
-
-  The commit trailer is the load-bearing one. This repository lands PRs by
-  **rebase merge**, which replays the branch commit onto `main` verbatim and adds
-  no pull-request reference to the message — so a tag that lives only in the PR
-  description is invisible in `git log main`, and a properly-reviewed commit is
-  indistinguishable there from one pushed by hand. An audit of the 27 commits
-  landed across `rrnewton/hermit` and `rrnewton/reverie` in the 24 hours to
-  2026-08-07 found all 27 came from pull requests, 26 of 27 PR bodies carried a
-  role tag, and only 2 of 27 named a team: the convention was being followed and
-  still left `main` unattributable.
-
-  When you do need a commit's provenance, the authority is
-  `gh api repos/<owner>/<repo>/commits/<sha>/pulls`, which resolves the source PR
-  even for a rebase merge. Do not conclude from an untagged commit message that a
-  change bypassed review.
+- Branch from `origin/main` and make one coherent change per branch. When the
+  `dev-hermit` parent is available, obtain the exact disclosure with
+  `./ci-hub/bin/who-am-i --tag --role ROLE`; paste it at the start of the commit
+  subject and do not reconstruct it. After the disclosure, write an imperative,
+  descriptive subject that states the substantive change.
+- The first commit-body section is exactly **Plain Language Summary and Project
+  Impact**. Explain what project capability, correctness property, evidence
+  quality, or developer workflow moves forward; connect it to the product
+  vision or owner request; and state the meaningful before/after difference.
+  Administrative history, task bookkeeping, and review mechanics come later.
+  Record `Task: <task-id>` after this opening section when the change implements
+  task work.
 - Run the workspace test, format, and Clippy gates relevant to the change, and
   report the assurance level reached along with the backend, log level, and any
   relaxations.
@@ -394,7 +376,10 @@ into virtual-time/epoch scheduling, is the canonical good example. Routine
 backend-parity work toward the golden ptrace reference does not trigger review
 unless it also meets one of these four criteria.
 
-Every PR description requires **Summary**, **Determinism** (why the change is
+After the mandatory disclosure line, every PR description starts with **Plain
+Language Summary and Project Impact**, giving the substantive outcome and its
+connection to the product vision or owner request rather than administrative
+history. It also requires **Determinism** (why the change is
 deterministic plus a logic or informal proof, not only tests), **Linux
 Semantics** (how the change preserves faithful Linux behavior), and
 **Validation**. KVM changes also require **Relationship to gVisor**. A labeled

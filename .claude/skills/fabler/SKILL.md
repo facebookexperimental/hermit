@@ -15,6 +15,12 @@ the applicable role tag:
 - `[coordinator, MODEL]` for coordinator agents
 - `[Human]` for the human owner
 
+Immediately after the role tag, a PR description MUST start with `## Plain
+Language Summary and Project Impact`, explaining the substantive project
+outcome, how it advances the product vision or owner request, and the meaningful
+before/after difference. This requirement does not apply to ordinary PR
+comments.
+
 Examples: `[impl agent, gpt-5.6-sol]`,
 `[adversarial-reviewer agent, opus-4.8]`.
 

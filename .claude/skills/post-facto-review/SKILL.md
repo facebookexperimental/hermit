@@ -9,6 +9,11 @@ Every bot-authored PR description or comment starts with the applicable
 `[impl agent, MODEL]`, `[adversarial-reviewer agent, MODEL]`, or
 `[coordinator, MODEL]` tag. Human comments use `[Human]`.
 
+Immediately after that disclosure, every PR description starts with `## Plain
+Language Summary and Project Impact`. It states the substantive outcome, its
+connection to the product vision or owner request, and the meaningful
+before/after difference. Administrative history and review mechanics follow.
+
 Apply `post-facto-human-review` if and only if the PR has one of these triggers:
 
 1. New syscall support, with `AUTONOMOUS-BOT-IMPLEMENTED` at the new dispatch or
@@ -33,7 +38,8 @@ reviewer and one Codex-family reviewer. Neither is the author. Role-tagged revie
 comments carrying the full head SHA are authority; numbered review and
 `passed-review-*` labels are caches. Any push invalidates both approvals.
 
-Every PR contains `Summary`, `Determinism`, `Linux Semantics`, and `Validation`.
+Every PR contains `Plain Language Summary and Project Impact` first, then
+`Determinism`, `Linux Semantics`, and `Validation`.
 KVM changes also contain `Relationship to gVisor`; a triggered PR contains
 `Human Review Required` naming the numbered triggers. A determinism proof
 explains the model, not only tests.

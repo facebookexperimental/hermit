@@ -30,7 +30,9 @@ Routine backend parity toward the golden ptrace reference implementation is not
 a trigger merely because it changes a non-ptrace backend. It is labeled only if
 it also meets one of the four triggers.
 
-Every PR description requires `Summary`, mandatory `Determinism` (why the
+Every PR description starts with `Plain Language Summary and Project Impact`,
+stating the substantive outcome and its connection to the product vision or
+owner request. It also requires mandatory `Determinism` (why the
 change is deterministic plus its logic or informal proof), `Linux Semantics`
 (how it matches real Linux kernel behavior, or why a deviation is safe), and
 `Validation`. KVM PRs also require `Relationship to gVisor`. A labeled PR
