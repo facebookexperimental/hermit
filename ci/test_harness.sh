@@ -1832,7 +1832,7 @@ EOF
                 (if $m.lane == "portable"
                  then "./ci/run-with-hermit-e2e-artifact.sh --require-install "
                  else "./ci/run-with-hermit-e2e-artifact.sh " end)
-                + "./ci/test_harness.sh run --lane \($m.lane) --category \($m.category) --ci-only --allow-empty --prebuilt --results ignored/e2e/\($m.lane)/\($m.category)/results.jsonl --junit ignored/e2e/\($m.lane)/\($m.category)/junit.xml";
+                + "./ci/test_harness.sh run --lane \($m.lane) --category \($m.category) --ci-only --allow-empty --prebuilt";
             def artifact_producer($lane):
                 if $lane == "portable" then "build.e2e_artifact" else "build.privileged_tests" end;
             ([.steps[] | select(.cmd | contains("./ci/test_harness.sh run "))] | all(has("manifest")))
@@ -3296,6 +3296,9 @@ case "$subcommand" in
         python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
         audit_inventory
         audit_ci_correspondence
+        "$ROOT_DIR/ci/compat-envelope/scorecard.rs" self-test
+        "$ROOT_DIR/ci/compat-envelope/scorecard.rs" check
+        "$ROOT_DIR/ci/compat-envelope/pressure-test.rs" self-test
         echo "PASS: ${#TESTS[@]} E2E tests have valid syntax and centralized schema-v2 manifests"
         emit_required_plan | jq -s '{tests:(map(.test)|unique|length),required_cells:length,by_mode:(group_by(.mode)|map({key:.[0].mode,value:length})|from_entries)}'
         validate_dag_correspondence

@@ -163,31 +163,14 @@ or reclassifying a `ci=true` cell fails validation until the expected plan is
 updated in the same review.
 
 A `ci = false` cell is never executed **and never compiled**, so its guest can
-rot without any node noticing. `manifest-plan` seals the exact current set of
-enabled backend cells that have neither a non-empty mode-wide
-`ci_disabled_reason` nor an explicit per-backend terminal `cell_verdicts`
-entry. A newly declared cell must provide one or the other. The accepted
-terminal states are `performs-no-comparison-by-design` and
-`unavailable-with-reason`; both require a non-empty reason and a separate
-`comparison_tier` field. The four accepted cell tiers are
-`canonical-bitwise`, `exit-and-stream-equality`,
-`execution-only-self-consistent`, and `declared-but-unverifiable`.
-
-The reason-only form carries its per-backend tiers in `cell_tiers`; the
-terminal form carries `state`, `comparison_tier`, and `reason` as three
-distinct fields inside each `cell_verdicts` entry. A tier alone does not explain
-why a cell is off, and a reason alone does not classify its evidence. The two
-explanation forms are mutually exclusive, and both tier maps cover every
-enabled backend exactly, so a limitation cannot be hidden behind an invented
-mode-wide reason or silently applied to another backend. Exact identity
-baselines independently seal the existing cells without explanations and the
-existing cells without tiers. Improving either population requires shrinking
-its baseline in the same review; adding a new cell requires satisfying both.
-A stale `ci_disabled_reason` on a `ci = true` mode is also refused.
-
-Separately, `./ci/test_harness.sh audit-compile --category <bucket>` compiles
-every C guest the bucket declares regardless of its `ci` flag; it is wired into
-the portable DAG for `backend-parity-c` and fails closed on zero compiled.
+rot without any node noticing. Two mechanisms bound that. In
+`CI_REASON_REQUIRED_BUCKETS` (currently `backend-parity-c`), `manifest-plan`
+rejects `ci = false` without a non-empty `ci_disabled_reason`, and rejects a
+stale reason left behind on a `ci = true` cell — so switching a cell off states
+why, and switching it on deletes the excuse in the same edit. Separately,
+`./ci/test_harness.sh audit-compile --category <bucket>` compiles every C guest
+the bucket declares regardless of its `ci` flag; it is wired into the portable
+DAG for `backend-parity-c` and fails closed on zero compiled.
 
 Use the load-bearing entrypoints:
 

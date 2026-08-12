@@ -368,6 +368,8 @@ and licensing guidelines.
 
 ## More Documentation
 
+- [Compatibility scorecard](SCORECARD.md): the current green/red totals by
+  backend and the commands that verify or pressure-test them.
 - [User Guide](docs/USER_GUIDE.md): modes, flags, examples, and troubleshooting.
 - [Architecture](docs/ARCHITECTURE.md): Reverie, Detcore, scheduling, time, and
   record/replay internals.

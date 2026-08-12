@@ -1654,6 +1654,57 @@ fn durable_log_path(root: &Path, profile: &str, sha: &str) -> PathBuf {
     dir.join(format!("validate-{profile}-{sha12}-{ts}.log"))
 }
 
+/// Give every real validate invocation its own durable E2E result directory.
+///
+/// `ci/test_harness.sh` already emits one schema-3 row per cell, but its local
+/// default is under the checkout. A canonical validate may run in a disposable
+/// scratch tree, so those rows disappeared at cleanup. Deriving the fallback
+/// from the durable log puts both artifacts under the same surviving root. A
+/// caller such as ci-hub may still provide an explicit per-run location.
+fn configure_e2e_result_root(
+    root: &Path,
+    log_path: &Path,
+    temporary_build_root: &Path,
+) -> Result<PathBuf, String> {
+    let path = match std::env::var_os("E2E_RESULT_ROOT") {
+        Some(value) if !value.is_empty() => {
+            let supplied = PathBuf::from(value);
+            if supplied.is_absolute() {
+                supplied
+            } else {
+                root.join(supplied)
+            }
+        }
+        _ => {
+            let log_dir = log_path
+                .parent()
+                .ok_or_else(|| format!("durable log has no parent: {}", log_path.display()))?;
+            let run = log_path
+                .file_stem()
+                .ok_or_else(|| format!("durable log has no file name: {}", log_path.display()))?;
+            log_dir.join("e2e").join(run)
+        }
+    };
+    std::fs::create_dir_all(&path)
+        .map_err(|e| format!("cannot create E2E result directory {}: {e}", path.display()))?;
+    std::env::set_var("E2E_RESULT_ROOT", &path);
+
+    // The harness derives its prebuilt-fixture directory from RESULT_ROOT too,
+    // but build products are not evidence and must not accumulate beside every
+    // retained scorecard. Keep them in validate's ordinary disposable run
+    // directory unless the caller deliberately supplied a build root.
+    if std::env::var_os("E2E_BUILD_ROOT").is_none() {
+        std::fs::create_dir_all(temporary_build_root).map_err(|e| {
+            format!(
+                "cannot create temporary E2E build directory {}: {e}",
+                temporary_build_root.display()
+            )
+        })?;
+        std::env::set_var("E2E_BUILD_ROOT", temporary_build_root);
+    }
+    Ok(path)
+}
+
 /// Establish the self-tee. FAIL-CLOSED: any failure exits loudly rather than
 /// running without a durable receipt. Must be called AFTER `resolve_cgroups`
 /// (which re-execs), so the tee is set up once, in the final boxed process.
@@ -2056,6 +2107,46 @@ fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
         .collect()
 }
 
+/// Add one final node that checks the complete fresh result set and prints the
+/// compatibility table. The existing bucket exits remain authoritative: in
+/// particular, preserving their node identity keeps environmental retry and
+/// precise failure attribution working exactly as before.
+fn attach_compatibility_scorecard(
+    steps: &mut Vec<safe_ci_dag_runner::model::Step>,
+    lanes: &[&str],
+) -> Result<(), String> {
+    let mut deps = Vec::new();
+    for step in steps.iter() {
+        if step.job.starts_with("manifest_")
+            && step.cmd.contains("./ci/test_harness.sh run ")
+            && step.cmd.contains("--ci-only")
+        {
+            deps.push(step.tag());
+        }
+    }
+    if deps.is_empty() {
+        return Err(format!(
+            "cannot attach compatibility scorecard: no manifest result nodes in lanes {}",
+            lanes.join(",")
+        ));
+    }
+    deps.sort();
+    steps.push(step_with_caps(
+        "scorecard",
+        "compatibility",
+        "Verify fresh per-cell results and print the compatibility table",
+        format!(
+            "./ci/compat-envelope/scorecard.rs verify-results --results \"$E2E_RESULT_ROOT\" --lanes {}",
+            lanes.join(",")
+        ),
+        deps,
+        120,
+        120,
+        1024 * 1024 * 1024,
+    ));
+    Ok(())
+}
+
 /// Reuse the versioned nextest installer verbatim in focused plans instead of
 /// copying its pinned version or network fallback into a second source.
 fn nextest_setup_node(
@@ -2278,6 +2369,11 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         for s in b.iter_mut() {
             s.deps.retain(|d| d != gate);
         }
+        attach_compatibility_scorecard(&mut a, &["portable"])?;
+        // The runs are sequential, so when this node runs the portable rows
+        // already exist. Emit the same whole-scorecard answer as the fused
+        // default rather than a second disconnected per-lane claim.
+        attach_compatibility_scorecard(&mut b, &["portable", "privileged"])?;
         // Each lane carries ITS OWN loaded config. They genuinely differ --
         // portable default_step_timeout=600 vs privileged=120, and disjoint
         // resource_caps -- so there is no correct single merged value; running
@@ -2299,6 +2395,9 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             selection_mode,
             planned_test_nodes: planned,
             suite_complete: args.level == Level::Full && args.focused.is_none(),
+            // Validation is also the live compatibility measurement. Reusing
+            // an older tree-keyed receipt would print no fresh per-cell table.
+            cacheable: false,
             ..Default::default()
         });
     }
@@ -2420,6 +2519,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // CPUID verdict about an artifact that is not the one under test.
         cpuid.cmd = "newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"; timeout 30 \"$newest\" rdrand_rdseed_is_masked --exact".to_string();
     }
+    attach_compatibility_scorecard(&mut steps, &lanes)?;
     // Fusing lanes means one config for both. Their default wall timeouts differ,
     // but every shipped/synthesized node has an explicit wall timeout and the
     // fail-closed undeclared-node audit below enforces that invariant. Therefore
@@ -2451,6 +2551,9 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         profile,
         selection_mode,
         suite_complete: args.level == Level::Full && args.focused.is_none(),
+        // Every ordinary lane validation must produce fresh per-cell results;
+        // a cache hit is valid landing evidence but is not a new measurement.
+        cacheable: false,
         ..Default::default()
     })
 }
@@ -4856,6 +4959,24 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // Safe: just assigned. Cloned so the summary and the ledger can both name it
     // without borrowing the live tee handle.
     let log_path = durable_slot.as_ref().map(|d| d.path.clone()).unwrap_or_default();
+    let e2e_result_root =
+        match configure_e2e_result_root(&root, &log_path, &tmp.join("e2e-build")) {
+            Ok(path) => path,
+            Err(message) => {
+                eprintln!("validate: ERROR: {message}");
+                return RunSummary::refused(
+                    4,
+                    &plan.profile,
+                    "durable per-cell result setup",
+                    vec![
+                        message,
+                        "a validate without retained per-cell rows cannot produce the compatibility table"
+                            .into(),
+                    ],
+                );
+            }
+        };
+    eprintln!("validate: per-cell results: {}", e2e_result_root.display());
 
     // ---- box-wide concurrency observation (validate.sh:1499) -----------------
     //
