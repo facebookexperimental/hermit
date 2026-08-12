@@ -284,15 +284,14 @@ static void check_prlimit_fork_inheritance(void) {
   puts("prlimit64 fork inheritance deterministic");
 }
 
-// SELF and THREAD CPU accounting must advance from logical execution; CHILDREN
-// is checked before any child is reaped and must therefore remain zero. Every
-// unmodeled field remains a deterministic zero. When expect_maxrss is set,
-// ru_maxrss must be positive (the guest's peak RSS); otherwise it must be zero.
-static void check_rusage(
+// Read one getrusage snapshot and validate its shape. CPU time is retained in
+// the returned value so callers can compare two snapshots; only a copy is
+// cleared for the byte scan that proves every unmodeled field remains zero.
+static struct rusage read_rusage(
     int who,
     const char* name,
     int expect_maxrss,
-    int expect_cpu) {
+    int allow_cpu) {
   struct rusage usage;
   memset(&usage, 0xa5, sizeof(usage));
   if (getrusage(who, &usage) != 0) {
@@ -308,28 +307,27 @@ static void check_rusage(
           (long)usage.ru_maxrss);
       exit(1);
     }
-    // Clear the field we allow to be nonzero so the byte scan below can prove
-    // everything else is a deterministic zero.
-    usage.ru_maxrss = 0;
   }
 
-  if (expect_cpu) {
+  if (allow_cpu) {
     if (usage.ru_utime.tv_sec < 0 || usage.ru_utime.tv_usec < 0 ||
         usage.ru_utime.tv_usec >= 1000000 || usage.ru_stime.tv_sec < 0 ||
-        usage.ru_stime.tv_usec < 0 || usage.ru_stime.tv_usec >= 1000000 ||
-        (usage.ru_utime.tv_sec == 0 && usage.ru_utime.tv_usec == 0 &&
-         usage.ru_stime.tv_sec == 0 && usage.ru_stime.tv_usec == 0)) {
-      fprintf(stderr, "getrusage %s did not report valid advancing CPU time\n", name);
+        usage.ru_stime.tv_usec < 0 || usage.ru_stime.tv_usec >= 1000000) {
+      fprintf(stderr, "getrusage %s reported invalid CPU time\n", name);
       exit(1);
     }
-    // Clear only the fields with a logical model. The byte scan below still
-    // proves every page-fault, I/O, signal, and context-switch field is zero.
-    memset(&usage.ru_utime, 0, sizeof(usage.ru_utime));
-    memset(&usage.ru_stime, 0, sizeof(usage.ru_stime));
   }
 
-  const unsigned char* bytes = (const unsigned char*)&usage;
-  for (size_t i = 0; i < sizeof(usage); ++i) {
+  struct rusage unmodeled = usage;
+  if (expect_maxrss) {
+    unmodeled.ru_maxrss = 0;
+  }
+  if (allow_cpu) {
+    memset(&unmodeled.ru_utime, 0, sizeof(unmodeled.ru_utime));
+    memset(&unmodeled.ru_stime, 0, sizeof(unmodeled.ru_stime));
+  }
+  const unsigned char* bytes = (const unsigned char*)&unmodeled;
+  for (size_t i = 0; i < sizeof(unmodeled); ++i) {
     if (bytes[i] != 0) {
       fprintf(
           stderr,
@@ -339,7 +337,59 @@ static void check_rusage(
       exit(1);
     }
   }
-  printf("rusage %s %s\n", name, expect_maxrss ? "maxrss" : "zero");
+  printf(
+      "rusage %s %s\n",
+      name,
+      allow_cpu ? "modeled-cpu" : (expect_maxrss ? "maxrss" : "zero"));
+  return usage;
+}
+
+static uint64_t rusage_cpu_micros(const struct rusage* usage) {
+  return (uint64_t)usage->ru_utime.tv_sec * 1000000 +
+      (uint64_t)usage->ru_utime.tv_usec +
+      (uint64_t)usage->ru_stime.tv_sec * 1000000 +
+      (uint64_t)usage->ru_stime.tv_usec;
+}
+
+static uint64_t rusage_system_micros(const struct rusage* usage) {
+  return (uint64_t)usage->ru_stime.tv_sec * 1000000 +
+      (uint64_t)usage->ru_stime.tv_usec;
+}
+
+static int rusage_cpu_equal(
+    const struct rusage* left,
+    const struct rusage* right) {
+  return left->ru_utime.tv_sec == right->ru_utime.tv_sec &&
+      left->ru_utime.tv_usec == right->ru_utime.tv_usec &&
+      left->ru_stime.tv_sec == right->ru_stime.tv_sec &&
+      left->ru_stime.tv_usec == right->ru_stime.tv_usec;
+}
+
+static void check_self_and_thread_rusage_advances(void) {
+  struct rusage self_before = read_rusage(RUSAGE_SELF, "self before", 1, 1);
+  struct rusage thread_before =
+      read_rusage(RUSAGE_THREAD, "thread before", 1, 1);
+
+  for (int i = 0; i < 2048; ++i) {
+    (void)syscall(SYS_getpid);
+  }
+
+  struct rusage self_after = read_rusage(RUSAGE_SELF, "self after", 1, 1);
+  struct rusage thread_after =
+      read_rusage(RUSAGE_THREAD, "thread after", 1, 1);
+  if (rusage_cpu_micros(&self_after) <= rusage_cpu_micros(&self_before) ||
+      rusage_system_micros(&self_after) <=
+          rusage_system_micros(&self_before)) {
+    fprintf(stderr, "getrusage self CPU did not advance across syscall work\n");
+    exit(1);
+  }
+  if (rusage_cpu_micros(&thread_after) <= rusage_cpu_micros(&thread_before) ||
+      rusage_system_micros(&thread_after) <=
+          rusage_system_micros(&thread_before)) {
+    fprintf(stderr, "getrusage thread CPU did not advance across syscall work\n");
+    exit(1);
+  }
+  puts("rusage self and thread logical CPU advances");
 }
 
 static void check_rusage_errors(void) {
@@ -452,6 +502,8 @@ static void check_times(void) {
   }
 
   clock_t child_system_before = second_usage.tms_cstime;
+  struct rusage child_rusage_before =
+      read_rusage(RUSAGE_CHILDREN, "children before fork", 0, 1);
   pid_t child = fork();
   if (child < 0) {
     fail("times fork");
@@ -480,6 +532,12 @@ static void check_times(void) {
     fprintf(stderr, "times child CPU clock advanced before reap\n");
     exit(1);
   }
+  struct rusage child_rusage_before_reap =
+      read_rusage(RUSAGE_CHILDREN, "children before reap", 0, 1);
+  if (!rusage_cpu_equal(&child_rusage_before_reap, &child_rusage_before)) {
+    fprintf(stderr, "getrusage children CPU advanced before reap\n");
+    exit(1);
+  }
   if (waitpid(child, NULL, WUNTRACED) != child) {
     fail("times waitpid");
   }
@@ -489,6 +547,17 @@ static void check_times(void) {
   }
   if (after_child.tms_cstime <= child_system_before) {
     fprintf(stderr, "times child system CPU clock did not include reaped child\n");
+    exit(1);
+  }
+  struct rusage child_rusage_after =
+      read_rusage(RUSAGE_CHILDREN, "children after reap", 0, 1);
+  if (rusage_cpu_micros(&child_rusage_after) <=
+          rusage_cpu_micros(&child_rusage_before) ||
+      rusage_system_micros(&child_rusage_after) <=
+          rusage_system_micros(&child_rusage_before)) {
+    fprintf(
+        stderr,
+        "getrusage children CPU did not include the reaped child\n");
     exit(1);
   }
 
@@ -510,10 +579,9 @@ int main(void) {
   check_limit_queries();
   check_limit_mutations();
   // No child has been created or reaped yet, so CHILDREN CPU and RSS are zero.
-  check_rusage(RUSAGE_CHILDREN, "children", 0, 0);
+  (void)read_rusage(RUSAGE_CHILDREN, "children", 0, 0);
   check_prlimit_fork_inheritance();
-  check_rusage(RUSAGE_SELF, "self", 1, 1);
-  check_rusage(RUSAGE_THREAD, "thread", 1, 1);
+  check_self_and_thread_rusage_advances();
   check_rusage_errors();
   check_sysinfo();
   check_sysinfo_free_ram_tracks_virtual_size();
