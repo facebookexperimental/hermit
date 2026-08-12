@@ -9,10 +9,14 @@ versioned table. The stable per-cell identities behind the totals live in
 [`cells.json`](cells.json). Raw results, logs, durations, timestamps, and host
 data are not versioned; each validate run retains those under `ignored/`.
 
-The denominator is the runnable combinations emitted by
-`hermit-manifest-plan`. A combination listed under `backends_disabled` is
-documentation of an unsupported combination, not a runnable cell, so it is
-outside the table rather than silently counted as green or red.
+The denominator is the complete manifest matrix, not just the combinations
+that happen to be enabled today. Every one of the 336 tests declares four
+Hermit modes across five backends, plus naked execution on native:
+`336 × (4 × 5 + 1) = 7,056` cells. `hermit-manifest-plan --format
+matrix-json` emits both sides of each manifest's required enabled/disabled
+partition. A disabled combination is red; a cell that cannot run is not green.
+The existing `--format json` and text views remain enabled-only because they
+are execution plans rather than scorecards.
 
 ## Ordinary validation
 
@@ -24,7 +28,8 @@ Run:
 
 The path is deliberately direct:
 
-1. `hermit-manifest-plan` enumerates every manifest cell.
+1. `hermit-manifest-plan` validates the complete matrix and emits the enabled
+   execution plan.
 2. `ci/expected-e2e-plan.json` identifies the cells ordinary validation runs.
 3. Each manifest bucket writes schema-3 `results.jsonl` rows to a unique durable
    result directory.
@@ -88,12 +93,13 @@ Run the complete red population from a clean committed checkout with:
 ```
 
 The command reuses the canonical Hermit/resource build nodes, serializes
-fixture preparation, and gives every red cell its own cgroup-boxed node. Each
-cell gets at most the shipped portable DAG's existing 600-second bucket
-allowance; the manifest's smaller timeout still applies inside it. Expected
-FAIL, ERROR, and no-result outcomes stay red but do not stop later cells. A
-missing attempt marker makes the overall pressure run fail rather than claim a
-complete population.
+fixture preparation, and gives every red cell its own cgroup-boxed node.
+Enabled red cells use the ordinary exact-cell selector; disabled red cells use
+the harness's explicit `--probe-disabled` selector. Each cell gets at most the
+shipped portable DAG's existing 600-second bucket allowance; the manifest's
+smaller timeout still applies inside it. Expected FAIL, ERROR, and no-result
+outcomes stay red but do not stop later cells. A missing attempt marker makes
+the overall pressure run fail rather than claim a complete population.
 
 The ignored run directory retains `dag.json`, `run.json`, per-cell rows/logs,
 and `summary.json`. A one-time PASS is printed as a candidate for repeated

@@ -2757,7 +2757,7 @@ function append_result {
     local path_evidence=$9
     local error_kind=${10}
     local diversity=${11:-null}
-    local test_file test_sha256 binary_sha256 effective_args guest_args guest_backend relaxations log_level classification kind
+    local test_file test_sha256 binary_sha256 effective_args guest_args guest_backend relaxations log_level classification kind timeout_seconds custom_effective_args
     test_file=${TEST_BY_ID[$test_id]}
     if [[ -f $test_file ]]; then
         test_sha256=$(sha256sum "$test_file" | cut -d' ' -f1)
@@ -2796,8 +2796,10 @@ function append_result {
             log_level=info
             ;;
         replay)
-            effective_args=$(jq -cn --arg backend "$backend" \
-                '["--log=info",("--backend=" + $backend),"record","start","--strict","--verify"]')
+            timeout_seconds=$(jq -r .timeout_seconds <<<"${METADATA_BY_ID[$test_id]}")
+            effective_args=$(jq -cn --arg backend "$backend" --arg timeout "$timeout_seconds" \
+                '["--log=info",("--backend=" + $backend),"record","start","--strict","--verify",
+                  "--data-dir","<cell-recording-dir>","--record-timeout",$timeout]')
             log_level=info
             ;;
         chaos)
@@ -2806,13 +2808,21 @@ function append_result {
             log_level=off
             ;;
         custom)
+            custom_effective_args=$(jq -c '.modes.custom.args // []' \
+                <<<"${METADATA_BY_ID[$test_id]}")
             effective_args=$(jq -cn --arg backend "$backend" \
-                '["--log=info","run",("--backend=" + $backend),"<manifest-custom-args>"]')
+                --argjson args "$custom_effective_args" \
+                '["--log=info","run",("--backend=" + $backend)] + $args')
             log_level=info
             ;;
     esac
-    if [[ $lane == portable && $mode != naked ]]; then
+    if [[ $lane == portable && ( $mode == verify || $mode == chaos ) ]]; then
         relaxations='["no-virtualize-cpuid","max-timeslice=disabled"]'
+    elif [[ $mode == custom ]]; then
+        relaxations=$(jq -c \
+            '[.modes.custom.args[]? |
+              select(. == "--no-virtualize-cpuid" or startswith("--max-timeslice=")) |
+              ltrimstr("--")]' <<<"${METADATA_BY_ID[$test_id]}")
     fi
     jq -cn \
         --arg run_id "$RUN_ID" \
@@ -3296,6 +3306,7 @@ case "$subcommand" in
         python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
         audit_inventory
         audit_ci_correspondence
+        "$ROOT_DIR/tests/manifest-cli.rs" self-test
         "$ROOT_DIR/ci/compat-envelope/scorecard.rs" self-test
         "$ROOT_DIR/ci/compat-envelope/scorecard.rs" check
         "$ROOT_DIR/ci/compat-envelope/pressure-test.rs" self-test

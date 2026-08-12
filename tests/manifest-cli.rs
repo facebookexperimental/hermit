@@ -50,6 +50,7 @@ use toml::Value;
 
 const MANIFEST_SCHEMA: i64 = 2;
 const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
+const HERMIT_RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 
 fn fail(message: impl AsRef<str>) -> ! {
     eprintln!("manifest-cli: {}", message.as_ref());
@@ -228,6 +229,7 @@ fn hermit_command(
     timeout: i64,
     seed: Option<i64>,
     mode_args: &[String],
+    verify_bitwise_parity: bool,
     log: &str,
     extra: &[String],
     guest: &str,
@@ -242,7 +244,7 @@ fn hermit_command(
         Vec::new()
     };
     let be = shell_quote(backend);
-    let extra_joined = {
+    let run_extra_joined = {
         let mut all: Vec<String> = profile;
         all.extend(extra.iter().map(|x| shell_quote(x)));
         let joined = all.join(" ");
@@ -252,26 +254,47 @@ fn hermit_command(
             format!(" {joined}")
         }
     };
+    let extra_joined = if extra.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " {}",
+            extra
+                .iter()
+                .map(|x| shell_quote(x))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    };
     let command = match mode {
-        "verify" => format!(
-            "{RUN_ENV} \"$hermit_bin\" --log={log} run --backend {be} --strict --verify{extra_joined} -- {guest}"
-        ),
+        "verify" => {
+            let strict = if verify_bitwise_parity {
+                " --verify-strict --verify-json \"$cell/captures/verify.json\""
+            } else {
+                ""
+            };
+            format!(
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --backend {be} --strict --verify{strict}{run_extra_joined} -- {guest}"
+            )
+        }
         "replay" => format!(
-            "{RUN_ENV} \"$hermit_bin\" --log={log} --backend {be} record start --strict --verify{extra_joined} -- {guest}"
+            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} --backend {be} record start --strict --verify --data-dir \"$cell/recording\" --record-timeout {timeout}{extra_joined} -- {guest}"
         ),
         "chaos" => format!(
-            "{RUN_ENV} \"$hermit_bin\" --log={log} run --backend {be} --strict --chaos --sched-heuristic=random --seed={}{extra_joined} -- {guest}",
+            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict --chaos --sched-heuristic=random --seed={}{run_extra_joined} -- {guest}",
             seed.unwrap_or(0)
         ),
         "custom" => {
-            let margs = mode_args
+            let mut args = mode_args.to_vec();
+            args.extend(extra.iter().cloned());
+            let margs = args
                 .iter()
                 .map(|x| shell_quote(x))
                 .collect::<Vec<_>>()
                 .join(" ");
             let sep = if margs.is_empty() { "" } else { " " };
             format!(
-                "{RUN_ENV} \"$hermit_bin\" --log={log} run --backend {be} --strict{sep}{margs}{extra_joined} -- {guest}"
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --backend {be}{sep}{margs} -- {guest}"
             )
         }
         other => fail(format!("unsupported mode `{other}`")),
@@ -610,6 +633,16 @@ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, S
     } else {
         Vec::new()
     };
+    let verify_bitwise_parity = if mode == "verify" {
+        modes_table(test, id)[&mode]
+            .get("assert")
+            .and_then(Value::as_table)
+            .and_then(|assert| assert.get("bitwise_parity"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    } else {
+        false
+    };
     let seed = if mode == "chaos" {
         let modes = modes_table(test, id);
         let seeds = integer_array(
@@ -630,6 +663,7 @@ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, S
             timeout,
             seed,
             &mode_args,
+            verify_bitwise_parity,
             &log,
             &args.passthrough,
             &guest,
@@ -637,6 +671,70 @@ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, S
     };
     let full = format!("{setup} && {run}");
     (full, mode, backend)
+}
+
+fn self_test() -> ExitCode {
+    let replay = hermit_command(
+        "replay",
+        "ptrace",
+        "portable",
+        60,
+        None,
+        &[],
+        false,
+        "info",
+        &[],
+        "guest",
+    );
+    assert!(replay.contains("--data-dir \"$cell/recording\" --record-timeout 60"));
+    assert!(!replay.contains("--no-virtualize-cpuid"));
+
+    let chaos = hermit_command(
+        "chaos",
+        "ptrace",
+        "portable",
+        60,
+        Some(7),
+        &[],
+        false,
+        "off",
+        &[],
+        "guest",
+    );
+    assert!(chaos.contains("run --base-env=minimal"));
+    assert!(chaos.contains("--no-virtualize-cpuid --max-timeslice=disabled"));
+
+    let custom = hermit_command(
+        "custom",
+        "ptrace",
+        "portable",
+        60,
+        None,
+        &["--base-env=minimal".to_owned()],
+        false,
+        "info",
+        &[],
+        "guest",
+    );
+    assert!(custom.contains("run --backend ptrace --base-env=minimal -- guest"));
+    assert!(!custom.contains("--strict"));
+    assert!(!custom.contains("--no-virtualize-cpuid"));
+
+    let verify = hermit_command(
+        "verify",
+        "ptrace",
+        "portable",
+        60,
+        None,
+        &[],
+        true,
+        "info",
+        &[],
+        "guest",
+    );
+    assert!(verify.contains("--verify-strict --verify-json \"$cell/captures/verify.json\""));
+    println!("manifest-cli self-test: PASS");
+    ExitCode::SUCCESS
 }
 
 fn cmd_get(manifests: &Manifests, args: &Args) -> ExitCode {
@@ -743,6 +841,9 @@ fn main() -> ExitCode {
     let sub = argv[0].clone();
     if sub == "-h" || sub == "--help" || sub == "help" {
         usage();
+    }
+    if sub == "self-test" {
+        return self_test();
     }
     let rest = &argv[1..];
     let args = parse_args(rest);

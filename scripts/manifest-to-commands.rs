@@ -36,6 +36,7 @@ use toml::Value;
 
 const MANIFEST_SCHEMA: i64 = 2;
 const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
+const HERMIT_RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 
 fn fail(message: impl AsRef<str>) -> ! {
     eprintln!("manifest-to-commands: {}", message.as_ref());
@@ -244,6 +245,7 @@ fn hermit_command(
     timeout: i64,
     seed: Option<i64>,
     extra: &[String],
+    verify_bitwise_parity: bool,
     guest: &str,
 ) -> String {
     let portable = lane == "portable";
@@ -253,16 +255,23 @@ fn hermit_command(
         ""
     };
     let command = match mode {
-        "verify" => format!(
-            "{RUN_ENV} \"$hermit_bin\" --log=info run --backend {} --strict --verify{profile} -- {guest}",
-            shell_quote(backend)
-        ),
+        "verify" => {
+            let strict = if verify_bitwise_parity {
+                " --verify-strict --verify-json \"$cell/captures/verify.json\""
+            } else {
+                ""
+            };
+            format!(
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --backend {} --strict --verify{strict}{profile} -- {guest}",
+                shell_quote(backend)
+            )
+        }
         "replay" => format!(
-            "{RUN_ENV} \"$hermit_bin\" --log=info --backend {} record start --strict --verify -- {guest}",
+            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info --backend {} record start --strict --verify --data-dir \"$cell/recording\" --record-timeout {timeout} -- {guest}",
             shell_quote(backend)
         ),
         "chaos" => format!(
-            "{RUN_ENV} \"$hermit_bin\" --log=off run --backend {} --strict --chaos --sched-heuristic=random --seed={}{profile} -- {guest}",
+            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=off run --base-env=minimal --backend {} --strict --chaos --sched-heuristic=random --seed={}{profile} -- {guest}",
             shell_quote(backend),
             seed.unwrap_or(0)
         ),
@@ -274,7 +283,7 @@ fn hermit_command(
                 .join(" ");
             let separator = if extra.is_empty() { "" } else { " " };
             format!(
-                "{RUN_ENV} \"$hermit_bin\" --log=info run --backend {} --strict{separator}{extra} -- {guest}",
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --backend {}{separator}{extra} -- {guest}",
                 shell_quote(backend)
             )
         }
@@ -340,6 +349,11 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
             .and_then(|a| a.get("runs"))
             .and_then(Value::as_integer)
             .unwrap_or(1);
+        let verify_bitwise_parity = mode == "verify"
+            && assert
+                .and_then(|a| a.get("bitwise_parity"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
         let seeds = if mode == "chaos" {
             let seeds = integer_array(spec.get("seeds"), &format!("{id}.modes.chaos.seeds"));
             if seeds.is_empty() { vec![0, 1] } else { seeds }
@@ -352,7 +366,16 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
             let guest = guest_with_args(&guest, &guest_args);
             for seed in &seeds {
                 let seed = (mode == "chaos").then_some(*seed);
-                let command = hermit_command(mode, &backend, lane, timeout, seed, &extra, &guest);
+                let command = hermit_command(
+                    mode,
+                    &backend,
+                    lane,
+                    timeout,
+                    seed,
+                    &extra,
+                    verify_bitwise_parity,
+                    &guest,
+                );
                 let runs = match mode {
                     "chaos" => 2,
                     "custom" => custom_runs,
@@ -390,10 +413,9 @@ fn guest_args_tsv(tests: &[(String, Value)]) -> Vec<String> {
         for mode in mode_names {
             let spec = &modes[mode];
             let backends = match spec.get("backends_enabled") {
-                Some(value) => string_array(
-                    Some(value),
-                    &format!("{id}.modes.{mode}.backends_enabled"),
-                ),
+                Some(value) => {
+                    string_array(Some(value), &format!("{id}.modes.{mode}.backends_enabled"))
+                }
                 None => continue,
             };
             for backend in backends {
@@ -659,5 +681,51 @@ backends_enabled = ["ptrace"]
             !lines.iter().any(|line| line.starts_with("c-programs/bare")),
             "a cell declaring no guest_args must not appear in the dump"
         );
+    }
+
+    #[test]
+    fn generated_mode_commands_match_the_harness_contract() {
+        let replay = hermit_command(
+            "replay",
+            "ptrace",
+            "portable",
+            60,
+            None,
+            &[],
+            false,
+            "guest",
+        );
+        assert!(replay.contains("--data-dir \"$cell/recording\" --record-timeout 60"));
+        assert!(!replay.contains("--no-virtualize-cpuid"));
+
+        let chaos = hermit_command(
+            "chaos",
+            "ptrace",
+            "portable",
+            60,
+            Some(7),
+            &[],
+            false,
+            "guest",
+        );
+        assert!(chaos.contains("run --base-env=minimal"));
+        assert!(chaos.contains("--no-virtualize-cpuid --max-timeslice=disabled"));
+
+        let custom = hermit_command(
+            "custom",
+            "ptrace",
+            "portable",
+            60,
+            None,
+            &["--base-env=minimal".to_owned()],
+            false,
+            "guest",
+        );
+        assert!(custom.contains("run --backend ptrace --base-env=minimal -- guest"));
+        assert!(!custom.contains("--strict"));
+        assert!(!custom.contains("--no-virtualize-cpuid"));
+
+        let verify = hermit_command("verify", "ptrace", "portable", 60, None, &[], true, "guest");
+        assert!(verify.contains("--verify-strict --verify-json \"$cell/captures/verify.json\""));
     }
 }

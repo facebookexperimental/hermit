@@ -30,7 +30,7 @@ use toml::Value as TomlValue;
 
 const TRACKED_CELLS: &str = "ci/compat-envelope/cells.json";
 const PORTABLE_DAG: &str = "ci/dag/portable.json";
-const SCHEMA: u64 = 1;
+const SCHEMA: u64 = 2;
 /// The shipped portable DAG gives a whole manifest bucket 600 seconds. A red
 /// cell gets that complete existing allowance to itself; cells whose repeated
 /// mode could theoretically consume longer remain red when this pressure
@@ -80,11 +80,17 @@ struct TrackedCells {
     cells: Vec<TrackedCell>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct TrackedCell {
     #[serde(flatten)]
     id: CellId,
+    enabled: bool,
     status: String,
+}
+
+struct PressureCells {
+    red: Vec<TrackedCell>,
+    preparation_by_test: BTreeMap<String, CellId>,
 }
 
 #[derive(Clone, Debug)]
@@ -300,7 +306,7 @@ fn check_scorecard(root: &Path) -> Result<(), String> {
     }
 }
 
-fn red_cells(root: &Path) -> Result<Vec<CellId>, String> {
+fn pressure_cells(root: &Path) -> Result<PressureCells, String> {
     let path = root.join(TRACKED_CELLS);
     let text =
         fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
@@ -314,21 +320,38 @@ fn red_cells(root: &Path) -> Result<Vec<CellId>, String> {
     }
     let mut seen = BTreeSet::new();
     let mut red = Vec::new();
+    let mut preparation_by_test = BTreeMap::new();
     for cell in tracked.cells {
         if !seen.insert(cell.id.clone()) {
             return Err("tracked cells contain a duplicate identity".into());
         }
+        if cell.enabled {
+            preparation_by_test
+                .entry(cell.id.test.clone())
+                .or_insert_with(|| cell.id.clone());
+        }
         match cell.status.as_str() {
-            "red" => red.push(cell.id),
+            "red" => red.push(cell),
             "green" => {}
             other => return Err(format!("unknown cell status `{other}`")),
         }
     }
-    red.sort();
+    red.sort_by(|left, right| left.id.cmp(&right.id));
     if red.is_empty() {
         return Err("tracked scorecard has no red cells".into());
     }
-    Ok(red)
+    for cell in &red {
+        if !preparation_by_test.contains_key(&cell.id.test) {
+            return Err(format!(
+                "{} has no manifest-enabled mode available to build its fixture",
+                cell.id.test
+            ));
+        }
+    }
+    Ok(PressureCells {
+        red,
+        preparation_by_test,
+    })
 }
 
 fn load_budgets(root: &Path) -> Result<BTreeMap<(String, String), CellBudget>, String> {
@@ -421,7 +444,10 @@ fn pressure_node_timeout(budget: &CellBudget) -> i64 {
 
 fn write_plan(root: &Path, results: &Path, output: &Path) -> Result<RunMetadata, String> {
     check_scorecard(root)?;
-    let cells = red_cells(root)?;
+    let PressureCells {
+        red: cells,
+        preparation_by_test,
+    } = pressure_cells(root)?;
     let budgets = load_budgets(root)?;
     fs::create_dir_all(results).map_err(|e| format!("cannot create {}: {e}", results.display()))?;
     if let Some(parent) = output.parent() {
@@ -478,13 +504,7 @@ fn write_plan(root: &Path, results: &Path, output: &Path) -> Result<RunMetadata,
     let detcore_tree = git_output(root, &["rev-parse", "HEAD:detcore"])?;
     let build_root = results.join("build").join(&sha);
     let mut preparation_tags = BTreeMap::new();
-    let mut first_by_test = BTreeMap::<String, CellId>::new();
-    for cell in &cells {
-        first_by_test
-            .entry(cell.test.clone())
-            .or_insert_with(|| cell.clone());
-    }
-    for (test, cell) in first_by_test {
+    for (test, cell) in preparation_by_test {
         let budget = budgets
             .get(&(test.clone(), cell.mode.clone()))
             .ok_or_else(|| format!("no manifest budget for {test}/{}", cell.mode))?;
@@ -532,7 +552,8 @@ fn write_plan(root: &Path, results: &Path, output: &Path) -> Result<RunMetadata,
     }
 
     let mut cell_tags = Vec::new();
-    for cell in &cells {
+    for tracked in &cells {
+        let cell = &tracked.id;
         let budget = budgets
             .get(&(cell.test.clone(), cell.mode.clone()))
             .ok_or_else(|| format!("no manifest budget for {}/{}", cell.test, cell.mode))?;
@@ -545,10 +566,18 @@ fn write_plan(root: &Path, results: &Path, output: &Path) -> Result<RunMetadata,
         let result_file = cell_dir.join("results.jsonl");
         let junit = cell_dir.join("junit.xml");
         let status_file = cell_dir.join("harness-status");
-        let backend = if cell.backend == "native" {
-            String::new()
+        let (selector, backend) = if tracked.enabled {
+            let backend = if cell.backend == "native" {
+                String::new()
+            } else {
+                format!(" --backend {}", shell_quote(&cell.backend))
+            };
+            ("--include-manual", backend)
         } else {
-            format!(" --backend {}", shell_quote(&cell.backend))
+            (
+                "--probe-disabled",
+                format!(" --backend {}", shell_quote(&cell.backend)),
+            )
         };
         let pressure_seconds = pressure_timeout(budget);
         let cmd = format!(
@@ -556,7 +585,7 @@ fn write_plan(root: &Path, results: &Path, output: &Path) -> Result<RunMetadata,
              timeout --kill-after=10s {pressure_seconds}s env \
              E2E_RESULT_ROOT={results} E2E_BUILD_ROOT={build_root} E2E_RUN_ID={run_id} \
              ./ci/run-with-hermit-e2e-artifact.sh --require-install \
-             ./ci/test_harness.sh run --include-manual --include-occasional --prebuilt \
+             ./ci/test_harness.sh run {selector} --include-occasional --prebuilt \
              --test {test} --mode {mode}{backend} --results {result_file} --junit {junit} \
              || status=$?; printf '%s\\n' \"$status\" > {status_file}; exit 0",
             cell_dir = shell_quote(&cell_dir.to_string_lossy()),
@@ -565,6 +594,7 @@ fn write_plan(root: &Path, results: &Path, output: &Path) -> Result<RunMetadata,
             run_id = shell_quote(&slug),
             test = shell_quote(&cell.test),
             mode = shell_quote(&cell.mode),
+            selector = selector,
             backend = backend,
             result_file = shell_quote(&result_file.to_string_lossy()),
             junit = shell_quote(&junit.to_string_lossy()),
@@ -648,7 +678,7 @@ fn write_plan(root: &Path, results: &Path, output: &Path) -> Result<RunMetadata,
         detcore_tree,
         source_tree_dirty: worktree_dirty(root)?,
         run_timeout_seconds,
-        cells,
+        cells: cells.into_iter().map(|cell| cell.id).collect(),
     };
     let mut metadata_text = serde_json::to_string_pretty(&metadata)
         .map_err(|e| format!("cannot serialize run metadata: {e}"))?;
@@ -695,8 +725,10 @@ fn audit_dag(dag: &JsonValue, expected_cells: usize, run_timeout: i64) -> Result
         if group == "cell" {
             cells += 1;
             let cmd = step["cmd"].as_str().unwrap_or("");
+            let enabled_selector = cmd.contains("--include-manual");
+            let disabled_selector = cmd.contains("--probe-disabled");
             if !cmd.contains("timeout --kill-after=10s")
-                || !cmd.contains("--include-manual")
+                || enabled_selector == disabled_selector
                 || !cmd.contains("--prebuilt")
                 || !cmd.contains("--test")
                 || !cmd.contains("--mode")
@@ -959,6 +991,14 @@ fn self_test() -> Result<(), String> {
     });
     audit_dag(&fixture, 1, 100)
         .map_err(|e| format!("positive generated-DAG bracket failed: {e}"))?;
+    let mut disabled_fixture = fixture.clone();
+    disabled_fixture["steps"][0]["cmd"] = json!(
+        exact_cell_command
+            .replace("--include-manual", "--probe-disabled")
+            .replace("--test fixture", "--test fixture --backend kvm")
+    );
+    audit_dag(&disabled_fixture, 1, 100)
+        .map_err(|e| format!("positive disabled-cell bracket failed: {e}"))?;
     let mut missing_exact_selector = fixture;
     missing_exact_selector["steps"][0]["cmd"] =
         json!(exact_cell_command.replace("--mode verify", ""));

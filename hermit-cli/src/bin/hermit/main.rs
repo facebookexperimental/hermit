@@ -275,6 +275,12 @@ impl Subcommand {
                  and replay require the ptrace runtime's sequentialized scheduler"
             );
         }
+        if backend == Some(hermit::Backend::Dbt) && !matches!(self, Subcommand::Run(_)) {
+            anyhow::bail!(
+                "the DBT backend is available only through `hermit --backend dbt run`; record \
+                 and replay use the ptrace runtime"
+            );
+        }
         Ok(())
     }
 
@@ -726,6 +732,33 @@ mod tests {
             .validate_backend_scope(Some(Backend::Kvm))
             .unwrap_err();
         assert!(error.to_string().contains("require the ptrace runtime"));
+    }
+
+    #[test]
+    fn dbt_is_rejected_outside_run_instead_of_silently_recording_with_ptrace() {
+        use hermit::Backend;
+
+        let run =
+            Args::try_parse_from(["hermit", "--backend", "dbt", "run", "--", "/bin/true"]).unwrap();
+        run.command
+            .validate_backend_scope(Some(Backend::Dbt))
+            .expect("DBT run is the supported DBT execution path");
+
+        let record = Args::try_parse_from([
+            "hermit",
+            "--backend",
+            "dbt",
+            "record",
+            "start",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        let error = record
+            .command
+            .validate_backend_scope(Some(Backend::Dbt))
+            .expect_err("DBT record must not silently execute through ptrace");
+        assert!(error.to_string().contains("use the ptrace runtime"));
     }
 
     #[test]

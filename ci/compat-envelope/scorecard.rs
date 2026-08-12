@@ -28,7 +28,7 @@ use serde::Serialize;
 const SCORECARD: &str = "SCORECARD.md";
 const CELLS: &str = "ci/compat-envelope/cells.json";
 const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
-const SCHEMA: u64 = 1;
+const SCHEMA: u64 = 2;
 
 const USAGE: &str = r#"Usage: ci/compat-envelope/scorecard.rs COMMAND [OPTIONS]
 
@@ -58,6 +58,7 @@ struct ManifestRow {
     backend: String,
     bucket: String,
     ci: bool,
+    enabled: bool,
     lane: String,
     mode: String,
     test: String,
@@ -87,6 +88,8 @@ struct TrackedCells {
 struct TrackedCell {
     #[serde(flatten)]
     id: CellId,
+    #[serde(default)]
+    enabled: bool,
     status: CellStatus,
     /// Filled only by the periodic all-red pressure test. Ordinary validate
     /// never changes this array.
@@ -133,6 +136,7 @@ impl ResultRow {
 
 struct Derived {
     population: BTreeSet<CellId>,
+    enabled: BTreeSet<CellId>,
     selected: BTreeSet<CellId>,
     green: BTreeSet<CellId>,
 }
@@ -263,7 +267,7 @@ fn derive(root: &Path) -> Result<Derived, String> {
             "hermit-manifest-plan",
             "--",
             "--format",
-            "json",
+            "matrix-json",
         ])
         .current_dir(root)
         .output()
@@ -279,6 +283,7 @@ fn derive(root: &Path) -> Result<Derived, String> {
     let expected: ExpectedPlan = read_json(&root.join(EXPECTED_PLAN))?;
 
     let mut population = BTreeSet::new();
+    let mut enabled = BTreeSet::new();
     let mut ci_enabled = BTreeSet::new();
     for row in rows {
         let id = CellId {
@@ -294,8 +299,11 @@ fn derive(root: &Path) -> Result<Derived, String> {
                 display_id(&id)
             ));
         }
-        if row.ci {
-            ci_enabled.insert(id);
+        if row.enabled {
+            enabled.insert(id.clone());
+            if row.ci {
+                ci_enabled.insert(id);
+            }
         }
     }
     let selected: BTreeSet<CellId> = expected.cells.into_iter().collect();
@@ -311,7 +319,7 @@ fn derive(root: &Path) -> Result<Derived, String> {
         }
         if !ci_enabled.contains(id) {
             return Err(format!(
-                "expected plan names ci=false cell {}",
+                "expected plan names a cell not enabled for ordinary CI: {}",
                 display_id(id)
             ));
         }
@@ -323,6 +331,7 @@ fn derive(root: &Path) -> Result<Derived, String> {
         .collect();
     Ok(Derived {
         population,
+        enabled,
         selected,
         green,
     })
@@ -354,9 +363,9 @@ This table is derived from the manifest, not from a separately maintained parent
 `./ci/compat-envelope/scorecard.rs check` verifies it.\n\n\
 **Green** means the cell is in `ci/expected-e2e-plan.json`, is not a chaos-mode \
 race-exposure check, and is therefore required to pass by ordinary validation. **Red** is every \
-other `hermit-manifest-plan` cell: measured failure, unavailable, or not yet run all remain red \
-until the cell is promoted into the regression plan and passes. Combinations listed under \
-`backends_disabled` are outside this runnable denominator.\n\n\
+other test/mode/backend cell: measured failure, unavailable, or not yet run all remain red until \
+the cell is promoted into the regression plan and passes. Manifest-disabled combinations are red, \
+not omitted: a cell that cannot run is not green.\n\n\
 These are the current pre-basic-sanity contracts. In particular, bare `--verify` uses the \
 Stripped comparator and this table does not relabel it as strict INFO-log parity.\n\n\
 | Backend | Green | Red | Total |\n\
@@ -409,7 +418,7 @@ fn tracked_from(
 ) -> Result<TrackedCells, String> {
     let mut previous = BTreeMap::new();
     if let Some(existing) = existing {
-        if existing.schema != SCHEMA {
+        if existing.schema != 1 && existing.schema != SCHEMA {
             return Err(format!(
                 "unsupported tracked cell schema {}",
                 existing.schema
@@ -463,8 +472,10 @@ fn tracked_from(
             } else {
                 CellStatus::Red
             };
+            let enabled = derived.enabled.contains(&id);
             TrackedCell {
                 id,
+                enabled,
                 status,
                 observations,
             }
@@ -768,12 +779,14 @@ fn self_test() -> Result<(), String> {
         schema: SCHEMA,
         cells: vec![TrackedCell {
             id: id.clone(),
+            enabled: true,
             status: CellStatus::Green,
             observations: Vec::new(),
         }],
     };
     let regressed = Derived {
         population: BTreeSet::from([id.clone()]),
+        enabled: BTreeSet::from([id.clone()]),
         selected: BTreeSet::new(),
         green: BTreeSet::new(),
     };
@@ -784,6 +797,7 @@ fn self_test() -> Result<(), String> {
         schema: SCHEMA,
         cells: vec![TrackedCell {
             id,
+            enabled: true,
             status: CellStatus::Green,
             observations: Vec::new(),
         }],

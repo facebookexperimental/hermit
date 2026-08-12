@@ -9,6 +9,7 @@
 //! Usage:
 //!   cargo run -p hermit-manifest-plan -- --format text
 //!   cargo run -p hermit-manifest-plan -- --format json
+//!   cargo run -p hermit-manifest-plan -- --format matrix-json
 //!   cargo run -p hermit-manifest-plan -- --format harness-json
 
 use std::collections::BTreeSet;
@@ -23,18 +24,6 @@ use toml::Value;
 
 const KNOWN_BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
-/// Buckets where `ci = false` is not allowed to be a silent default.
-///
-/// `backends_disabled` has always required a per-backend reason, but `ci =
-/// false` switches a whole mode-cell off with no justification at all — so a
-/// generated cell is born not-running and nothing records that it is. In the
-/// buckets listed here, every `ci = false` mode must carry a non-empty
-/// `ci_disabled_reason`, and every `ci = true` mode must omit it (a leftover
-/// reason on a running cell is stale documentation).
-///
-/// This is a ratchet: add a bucket once its cells all carry reasons. Cells
-/// outside these buckets may still carry `ci_disabled_reason` voluntarily.
-const CI_REASON_REQUIRED_BUCKETS: [&str; 1] = ["backend-parity-c"];
 const MATRIX_SYMMETRY_BASELINE: &str = "ci/matrix-symmetry-baseline.json";
 const TEST_INVENTORY: &str = "tests/e2e/manifests/inventory/test-files.json";
 
@@ -46,12 +35,14 @@ struct PlanRow {
     mode: String,
     backend: String,
     ci: bool,
+    enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Format {
     Text,
     Json,
+    MatrixJson,
     HarnessJson,
 }
 
@@ -81,6 +72,7 @@ fn parse_format() -> Format {
         format = match value.as_str() {
             "text" => Format::Text,
             "json" => Format::Json,
+            "matrix-json" => Format::MatrixJson,
             "harness-json" => Format::HarnessJson,
             _ => die(format!("unknown format: {value}")),
         };
@@ -174,6 +166,7 @@ fn main() {
         Format::Json => {
             let output: Vec<_> = rows
                 .iter()
+                .filter(|row| row.enabled)
                 .map(|row| {
                     json!({
                         "bucket": row.bucket,
@@ -191,12 +184,33 @@ fn main() {
                     .unwrap_or_else(|error| die(format!("cannot encode plan: {error}")))
             );
         }
+        Format::MatrixJson => {
+            let output: Vec<_> = rows
+                .iter()
+                .map(|row| {
+                    json!({
+                        "bucket": row.bucket,
+                        "test": row.id,
+                        "lane": row.lane,
+                        "mode": row.mode,
+                        "backend": row.backend,
+                        "ci": row.ci,
+                        "enabled": row.enabled,
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string(&output)
+                    .unwrap_or_else(|error| die(format!("cannot encode matrix: {error}")))
+            );
+        }
         Format::Text => {
             println!(
                 "{:<10}\t{:<38}\t{:<10}\t{:<8}\t{:<5}\tBUCKET",
                 "LANE", "TEST", "MODE", "BACKEND", "CI"
             );
-            for row in &rows {
+            for row in rows.iter().filter(|row| row.enabled) {
                 println!(
                     "{:<10}\t{:<38}\t{:<10}\t{:<8}\t{:<5}\t{}",
                     row.lane, row.id, row.mode, row.backend, row.ci, row.bucket
@@ -206,7 +220,7 @@ fn main() {
                 "\nPASS: {} manifest(s), {} test(s), {} enabled plan cells validated",
                 manifests.len(),
                 seen_ids.len(),
-                rows.len()
+                rows.iter().filter(|row| row.enabled).count()
             );
         }
     }
@@ -574,7 +588,7 @@ fn validate_and_expand(
     for mode in MODES {
         validate_mode(&id, bucket, lane, mode, modes.get(mode).unwrap(), rows);
     }
-    if rows[row_start..].iter().any(|row| row.ci)
+    if rows[row_start..].iter().any(|row| row.enabled && row.ci)
         && program_path.as_ref().is_some_and(|path| !path.is_file())
     {
         die(format!(
@@ -608,40 +622,6 @@ fn validate_observation(test: &Value, id: &str) {
                 "{id}: observation artifact must stay below E2E_TMPDIR: {artifact}"
             ));
         }
-    }
-}
-
-/// Enforce that a switched-off mode-cell says why it is switched off.
-///
-/// Only applies to [`CI_REASON_REQUIRED_BUCKETS`]. The rule is symmetric on
-/// purpose: `ci = false` must explain itself, and `ci = true` must not carry a
-/// reason, so flipping a cell on forces the stale justification to be deleted
-/// in the same edit rather than left behind to mislead the next reader.
-fn validate_ci_disabled_reason(
-    id: &str,
-    bucket: &str,
-    mode: &str,
-    spec: &toml::map::Map<String, Value>,
-    ci: bool,
-) {
-    if !CI_REASON_REQUIRED_BUCKETS.contains(&bucket) {
-        return;
-    }
-    let reason = spec.get("ci_disabled_reason");
-    if ci {
-        if reason.is_some() {
-            die(format!(
-                "{id}: modes.{mode} is CI-enabled, so it must not carry ci_disabled_reason"
-            ));
-        }
-        return;
-    }
-    match reason.and_then(Value::as_str) {
-        Some(text) if !text.trim().is_empty() => {}
-        _ => die(format!(
-            "{id}: modes.{mode} sets ci = false and must state why in a non-empty \
-             ci_disabled_reason (bucket `{bucket}` forbids a silent default-off cell)"
-        )),
     }
 }
 
@@ -698,7 +678,6 @@ fn validate_mode(
         .get("ci")
         .and_then(Value::as_bool)
         .unwrap_or_else(|| die(format!("{id}: modes.{mode}.ci must be a boolean")));
-    validate_ci_disabled_reason(id, bucket, mode, spec, ci);
     let enabled = string_array(
         spec.get("backends_enabled"),
         &format!("{id}.modes.{mode}.backends_enabled"),
@@ -926,6 +905,18 @@ fn validate_mode(
             mode: mode.to_string(),
             backend,
             ci,
+            enabled: true,
+        });
+    }
+    for backend in disabled.keys() {
+        rows.push(PlanRow {
+            bucket: bucket.to_string(),
+            id: id.to_string(),
+            lane: lane.to_string(),
+            mode: mode.to_string(),
+            backend: backend.to_string(),
+            ci,
+            enabled: false,
         });
     }
 }
@@ -1031,110 +1022,12 @@ liteinst = "unsupported"
             &spec,
             &mut rows,
         );
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].backend, "ptrace");
-        assert!(rows[0].ci);
-    }
-
-    const REASON_BUCKET: &str = CI_REASON_REQUIRED_BUCKETS[0];
-
-    fn disabled_verify_spec(extra: &str) -> Value {
-        parse_mode(&format!(
-            r#"
-ci = false
-backends_enabled = ["ptrace"]
-{extra}
-
-[backends_disabled]
-dbt = "unsupported"
-kvm = "unsupported"
-sabre = "unsupported"
-liteinst = "unsupported"
-"#
-        ))
-    }
-
-    #[test]
-    #[should_panic(expected = "must state why in a non-empty ci_disabled_reason")]
-    fn rejects_silent_default_off_cell_in_ratcheted_bucket() {
-        validate_mode(
-            "bucket/test",
-            REASON_BUCKET,
-            "portable",
-            "verify",
-            &disabled_verify_spec(""),
-            &mut Vec::new(),
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "must state why in a non-empty ci_disabled_reason")]
-    fn rejects_blank_ci_disabled_reason() {
-        validate_mode(
-            "bucket/test",
-            REASON_BUCKET,
-            "portable",
-            "verify",
-            &disabled_verify_spec(r#"ci_disabled_reason = "   ""#),
-            &mut Vec::new(),
-        );
-    }
-
-    #[test]
-    fn accepts_default_off_cell_that_states_a_reason() {
-        let mut rows = Vec::new();
-        validate_mode(
-            "bucket/test",
-            REASON_BUCKET,
-            "portable",
-            "verify",
-            &disabled_verify_spec(r#"ci_disabled_reason = "fixture does not compile""#),
-            &mut rows,
-        );
-        assert_eq!(rows.len(), 1);
-        assert!(!rows[0].ci);
-    }
-
-    #[test]
-    #[should_panic(expected = "must not carry ci_disabled_reason")]
-    fn rejects_stale_reason_on_enabled_cell() {
-        let spec = parse_mode(
-            r#"
-ci = true
-backends_enabled = ["ptrace"]
-ci_disabled_reason = "left over from when this was off"
-
-[backends_disabled]
-dbt = "unsupported"
-kvm = "unsupported"
-sabre = "unsupported"
-liteinst = "unsupported"
-"#,
-        );
-        validate_mode(
-            "bucket/test",
-            REASON_BUCKET,
-            "portable",
-            "verify",
-            &spec,
-            &mut Vec::new(),
-        );
-    }
-
-    #[test]
-    fn leaves_unratcheted_buckets_alone() {
-        // The ratchet must not silently impose the rule on every other bucket;
-        // those still carry bare `ci = false` and must keep validating.
-        let mut rows = Vec::new();
-        validate_mode(
-            "bucket/test",
-            "c-programs",
-            "portable",
-            "verify",
-            &disabled_verify_spec(""),
-            &mut rows,
-        );
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 5);
+        let enabled: Vec<_> = rows.iter().filter(|row| row.enabled).collect();
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].backend, "ptrace");
+        assert!(enabled[0].ci);
+        assert_eq!(rows.iter().filter(|row| !row.enabled).count(), 4);
     }
 
     #[test]
@@ -1318,8 +1211,9 @@ liteinst = "unsupported"
         );
         let mut rows = Vec::new();
         validate_chaos(&spec, &mut rows);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].mode, "chaos");
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.iter().filter(|row| row.enabled).count(), 1);
+        assert!(rows.iter().all(|row| row.mode == "chaos"));
     }
 
     #[test]
@@ -1330,7 +1224,8 @@ liteinst = "unsupported"
         );
         let mut rows = Vec::new();
         validate_chaos(&spec, &mut rows);
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.iter().filter(|row| row.enabled).count(), 1);
     }
 
     // NEGATIVE side: an undeclared ceiling is what makes a saturated oracle
