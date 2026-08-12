@@ -20,6 +20,7 @@
   "build_debug_nodes": [
     "setup.manifest_plan",
     "e2e.metadata",
+    "e2e.audit_compile_backend_parity_c",
     "setup.nextest",
     "build.workspace",
     "build.manifest_guests"
