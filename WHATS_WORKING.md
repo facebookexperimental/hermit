@@ -269,9 +269,10 @@ cmp hello1 hello2 && echo IDENTICAL   # -> IDENTICAL
 ```
 
 Note: this is the build *artifact* being reproducible across independent runs. `gcc` still
-fails `--strict --verify` (that checks internal syscall-trace determinism across a multi-process
-`cc1`/`as`/`ld` pipeline, see §6) — both facts are true and not contradictory: the emitted
-binary is deterministic even though the internal syscall interleaving is not.
+fails `--strict --verify` (that checks Stripped internal syscall-trace equality across a
+multi-process `cc1`/`as`/`ld` pipeline, see §6) — both facts are true and not contradictory:
+the emitted binary is deterministic even though the compared internal syscall observations
+do not match.
 
 ### 3p. Overnight expansion batches 3-29 — 135 valid Stripped checks
 
@@ -536,9 +537,9 @@ pipeline-hangs boundary:
 Two reproducible R/R-record gaps were pinned:
 
 1. **Concurrent shell pipelines deadlock `hermit record`** (2 processes + a live pipe). The
-   *identical* pipeline is deterministic under plain `run --verify`, and the same apps record
-   cleanly when fed a **file argument** instead of a pipe — so the deadlock is record-engine
-   specific, not an app or determinism defect.
+   *identical* pipeline passes Stripped `run --verify`, and the same apps record cleanly when
+   fed a **file argument** instead of a pipe — so the deadlock is record-engine specific, not
+   an app execution defect.
 2. **A parent `write()` immediately followed by a cross-process `kill()` of a child blocked in
    `pause()` deadlocks the scheduler** (a `BlockingExternalIO` turn-race). A non-I/O syscall
    before the `kill` does not trigger it; single-process signal delivery and in-guest

@@ -88,10 +88,11 @@ The mode contracts are:
 | `naked` | Opt-in meta-CI only; run natively three to five times and require declared variation |
 | `custom` | Run declared edge-case Hermit arguments and require three to five identical observations |
 
-An enabled `verify` cell records backend-local L2 support under the manifest's
-declared status/stdout/stderr/artifact observation. It is not, by itself, a
-full cross-backend parity claim. Full parity additionally requires matching the
-complete INFO trace, `--detlog-stack`, and `--detlog-heap` between backends.
+An enabled `verify` cell records backend-local Stripped equality under the
+manifest's declared status/stdout/stderr/artifact observation. It is not L2 and
+is not, by itself, a full cross-backend parity claim. Full parity additionally
+requires matching the complete INFO trace, `--detlog-stack`, and
+`--detlog-heap` between backends.
 
 An enabled SaBRe cell has an additional execution-path contract. Every E2E
 Hermit execution writes structured evidence into the cell capture: the

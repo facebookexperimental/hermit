@@ -100,8 +100,8 @@ scheduled and how nondeterministic events are handled.
 
 [PR #1179](https://github.com/rrnewton/hermit/pull/1179) proved the basic path:
 rootless image materialization, a rootfs chroot, image `Env` and `WorkingDir`,
-and ptrace L2 execution. It also exposed the production requirements this RFC
-addresses:
+and ptrace Stripped verification. That bare `--verify` result did not establish
+L2. It also exposed the production requirements this RFC addresses:
 
 - remove the `buildah` subprocess dependency;
 - key storage by the resolved manifest digest, not the input reference string;

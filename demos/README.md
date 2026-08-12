@@ -45,7 +45,8 @@ KERNEL_IMAGE=/path/to/bzImage \
 The higher-level `05-qemu-busybox.sh` uses the same launcher while adding asset
 construction, timeouts, live serial output, log capture, and result checks.
 
-Run Hermit's two-execution comparison for L2 evidence:
+Run Hermit's two-execution Stripped comparison. This is a useful fast
+diagnostic, but it does not establish L2:
 
 ```bash
 VERIFY=1 DEMO_TIMEOUT_SECONDS=900 ./demos/05-qemu-busybox.sh
@@ -122,9 +123,9 @@ Pinning `q35` and `max` produced no QEMU stderr warnings.
 
 On the measured AMD EPYC 9D85 host, the repository PMU benchmark observed a
 33,138-RCB maximum skid over 1,000 samples and recommended a 66,276-RCB margin.
-Current Reverie's 1,000-RCB processor default panicked during L2 Run 1. The
+Current Reverie's 1,000-RCB processor default panicked during verification Run 1. The
 measured override passed the prior failure point, but Run 1 had not completed
-after nine minutes and was stopped; current-main L2 verification therefore
+after nine minutes and was stopped; current-main Stripped verification therefore
 remains blocked on practical PMU calibration.
 
 Further diagnostics did not produce an acceptable workaround. Margins of
@@ -135,8 +136,8 @@ after seven minutes while the inner Hermit process used about 3% CPU. QEMU
 therefore needs periodic preemption, but current Reverie's safe calibrated
 preemption path is not practical for this workload on the measured host.
 
-Before the Reverie PMU-default update, an L2 `VERIFY=1` run completed both q35
-boots with the same inputs. Each normalized log contained 759,956 messages,
+Before the Reverie PMU-default update, a Stripped `VERIFY=1` run completed both
+q35 boots with the same inputs. Each normalized log contained 759,956 messages,
 including 548,255 DETLOG and scheduler COMMIT messages. Hermit reported no
 substantive differences and printed `Success: deterministic. Determinism
-verified.`
+verified.` This historical result did not establish L2.
