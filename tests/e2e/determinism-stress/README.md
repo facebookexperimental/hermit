@@ -21,8 +21,10 @@ tests/e2e/lib/determinism-stress/run.sh
 ```
 
 `DETERMINISM_STRESS_REPETITIONS=20` repeats every internal two-run comparison
-twenty times for L4 stress evidence. The default is one Stripped comparison so
-the full targeted matrix remains practical. Other controls are:
+twenty times for repeated Stripped stress evidence. Repetition does not promote
+Stripped evidence to L4 because the underlying comparison is not L2. The
+default is one Stripped comparison so the full targeted matrix remains
+practical. Other controls are:
 
 ```text
 HERMIT_BIN                           release Hermit path

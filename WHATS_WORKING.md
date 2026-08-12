@@ -217,12 +217,12 @@ are exclusively **wall-clock reads from worker threads**, not scheduling.
 
 | Runtime | Command | Result |
 |---------|---------|--------|
-| perl | `perl -e 'print 42'` | **PASS L4 (20/20)** at `96f9953a`; host load averages remained 146–176 during the run. |
+| perl | `perl -e 'print 42'` | **PASS Stripped (20/20)** at `96f9953a`; host load averages remained 146–176 during the run. Repetition does not make this L4. |
 | lua | `lua -e 'print(6*7)'` | PASS |
 | node | `node -e 'console.log(6*7)'` | PASS |
 | java | `java -version` | PASS (OpenJDK 1.8.0_492 Temurin, 5/5 runs) — **requires PR #223** (`saturating_add` fix for `LogicalTime` overflow, #219) |
 | gawk | `gawk 'BEGIN{print 6*7}'` | PASS |
-| python3 (pure compute) | `python3 -c 'print(sum(range(100)))'` | **PASS L4 (20/20)** at `96f9953a`; host load averages remained 146–181 during the run. |
+| python3 (pure compute) | `python3 -c 'print(sum(range(100)))'` | **PASS Stripped (20/20)** at `96f9953a`; host load averages remained 146–181 during the run. Repetition does not make this L4. |
 | python3 threading | see §3j | **FAIL** — same clock divergence |
 | php | `php -r 'echo 6*7;'` | TIMEOUT (>120 s under load; heavy interpreter startup) |
 | ruby | `ruby -e 'puts 6*7'` | **native broken** — host RubyGems load error (fails outside Hermit too) |
@@ -453,18 +453,19 @@ Sources/binaries kept outside the Hermit-isolated `/tmp`.
 | C++ | batch 40: `g++ -std=c++17` vector/map/`std::thread`+atomic ×400000/regex/`chrono` | **PASS Stripped** (5/5) |
 | Rust | batch 41 + `rustc -O` integer-sum binary | **PASS Stripped** (3/3 this session) |
 | Go | `go build` integer-sum binary (`go sum: 4950`) | **PASS Stripped** (3/3 this session) — Go's multithreaded runtime passes for this compute workload |
-| Perl | `perl -e 'print 42'`; batch 38 (strftime/hash/map/line-count) | **PASS L4 (20/20)** at `96f9953a` under host load averages 146–176. |
+| Perl | `perl -e 'print 42'`; batch 38 (strftime/hash/map/line-count) | **PASS Stripped (20/20)** at `96f9953a` under host load averages 146–176; not L4. |
 | Lua | `lua -e 'print(6*7)'` | **PASS Stripped** |
 | Node.js | `node -e 'console.log(6*7)'` | **PASS Stripped** |
 | Java | `java -version` (OpenJDK 1.8.0_492 Temurin, 5/5) — **requires PR #223** (`saturating_add` `LogicalTime` overflow fix) | **PASS Stripped** |
 | gawk | `gawk 'BEGIN{print 6*7}'` | **PASS Stripped** |
-| Python 3 | `python3 -c 'print(sum(range(100)))'` | **PASS L4 (20/20)** at `96f9953a` under host load averages 146–181; threaded Python remains a separate gap (§3j). |
+| Python 3 | `python3 -c 'print(sum(range(100)))'` | **PASS Stripped (20/20)** at `96f9953a` under host load averages 146–181; not L4. Threaded Python remains a separate gap (§3j). |
 | Ruby | `ruby -e 'puts 6*7'` | **N/A** — host RubyGems broken (fails outside Hermit too), not a determinism result |
 | PHP | `php -r 'echo 6*7;'` | **N/A** — HHVM JIT, too slow to finish twice under load (timeout), not a determinism result |
 
 The nine broad runtime witnesses remain **C, C++, Rust, Go, Perl, Lua, Node.js, Java (with PR
-#223), and gawk**. Python's pure-compute witness now passes the L4 stress threshold, while
-threaded Python remains a separate gap. Ruby and PHP are excluded for host/runtime reasons.
+#223), and gawk**. Python's pure-compute witness passed 20 repeated Stripped comparisons;
+that repetition is not L4. Threaded Python remains a separate gap. Ruby and PHP are excluded
+for host/runtime reasons.
 
 ---
 
