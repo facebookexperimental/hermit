@@ -19,22 +19,35 @@ use std::process::exit;
 
 use serde_json::Value as JsonValue;
 use serde_json::json;
+use sha2::Digest;
+use sha2::Sha256;
 use toml::Value;
 
 const KNOWN_BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
-/// Buckets where `ci = false` is not allowed to be a silent default.
+/// Exact current population of enabled backend cells whose mode has `ci =
+/// false` and declares neither `ci_disabled_reason` nor a terminal
+/// `cell_verdicts` entry.
 ///
-/// `backends_disabled` has always required a per-backend reason, but `ci =
-/// false` switches a whole mode-cell off with no justification at all — so a
-/// generated cell is born not-running and nothing records that it is. In the
-/// buckets listed here, every `ci = false` mode must carry a non-empty
-/// `ci_disabled_reason`, and every `ci = true` mode must omit it (a leftover
-/// reason on a running cell is stale documentation).
-///
-/// This is a ratchet: add a bucket once its cells all carry reasons. Cells
-/// outside these buckets may still carry `ci_disabled_reason` voluntarily.
-const CI_REASON_REQUIRED_BUCKETS: [&str; 1] = ["backend-parity-c"];
+/// The digest binds sorted `lane\0bucket\0test\0mode\0backend\n` identities.
+/// Any new silent cell changes it, while adding either accepted explanation
+/// excludes that cell. The count makes the denominator visible rather than
+/// leaving the digest as the only description of the population.
+const CI_DISABLED_WITHOUT_EXPLANATION_COUNT: usize = 411;
+const CI_DISABLED_WITHOUT_EXPLANATION_SHA256: &str =
+    "e7ca3939697280d5fa90f3010f7be3f2dfe0cbed67b8e4dcd0a3b11b9469da81";
+/// Exact current population of `ci = false` enabled backend cells without an
+/// explicit tier. This is separate from the explanation baseline above: a
+/// reason is not a tier, and a tier is not a reason or terminal state.
+const CI_DISABLED_WITHOUT_TIER_COUNT: usize = 453;
+const CI_DISABLED_WITHOUT_TIER_SHA256: &str =
+    "6b98ea15f802d40110bf6967237d585803272f56034a9fc7a39d15c075bea7c5";
+const CELL_TIERS: [&str; 4] = [
+    "canonical-bitwise",
+    "exit-and-stream-equality",
+    "execution-only-self-consistent",
+    "declared-but-unverifiable",
+];
 const MATRIX_SYMMETRY_BASELINE: &str = "ci/matrix-symmetry-baseline.json";
 const TEST_INVENTORY: &str = "tests/e2e/manifests/inventory/test-files.json";
 
@@ -46,6 +59,8 @@ struct PlanRow {
     mode: String,
     backend: String,
     ci: bool,
+    ci_explained: bool,
+    tier_declared: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,6 +167,16 @@ fn main() {
         documents.push(document);
     }
 
+    validate_ci_disabled_explanation_baseline(
+        &rows,
+        CI_DISABLED_WITHOUT_EXPLANATION_COUNT,
+        CI_DISABLED_WITHOUT_EXPLANATION_SHA256,
+    );
+    validate_ci_disabled_tier_baseline(
+        &rows,
+        CI_DISABLED_WITHOUT_TIER_COUNT,
+        CI_DISABLED_WITHOUT_TIER_SHA256,
+    );
     validate_front_door(&repo_root, &documents);
 
     rows.sort_by(|left, right| {
@@ -316,6 +341,84 @@ fn enforce_exact_ratchet(label: &str, actual: &BTreeSet<String>, baseline: &BTre
     if !unexpected.is_empty() || !stale.is_empty() {
         die(format!(
             "matrix symmetry {label} changed; unexpected={unexpected:?}, stale_baseline={stale:?}. New compatibility coverage must enter a shared schema-v2 TOML manifest, establish ptrace first, and declare every backend/mode cell; remove migrated debt from {MATRIX_SYMMETRY_BASELINE}"
+        ));
+    }
+}
+
+fn cell_identity(row: &PlanRow) -> String {
+    [
+        row.lane.as_str(),
+        row.bucket.as_str(),
+        row.id.as_str(),
+        row.mode.as_str(),
+        row.backend.as_str(),
+    ]
+    .join("\0")
+}
+
+fn ci_disabled_without_explanation(rows: &[PlanRow]) -> BTreeSet<String> {
+    rows.iter()
+        .filter(|row| !row.ci && !row.ci_explained)
+        .map(cell_identity)
+        .collect()
+}
+
+fn ci_disabled_without_tier(rows: &[PlanRow]) -> BTreeSet<String> {
+    rows.iter()
+        .filter(|row| !row.ci && !row.tier_declared)
+        .map(cell_identity)
+        .collect()
+}
+
+fn ci_disabled_identity_digest(identities: &BTreeSet<String>) -> String {
+    let mut digest = Sha256::new();
+    for identity in identities {
+        digest.update(identity.as_bytes());
+        digest.update(b"\n");
+    }
+    format!("{:x}", digest.finalize())
+}
+
+/// Refuse any change to the exact unexplained population.
+///
+/// A new `ci = false` backend cell must carry either the mode-wide
+/// `ci_disabled_reason` or its own terminal `cell_verdicts` entry. An existing
+/// unexplained cell remains accepted only while its identity is part of the
+/// sealed population; when one is explained, this baseline must shrink in the
+/// same review.
+fn validate_ci_disabled_explanation_baseline(
+    rows: &[PlanRow],
+    expected_count: usize,
+    expected_sha256: &str,
+) {
+    let identities = ci_disabled_without_explanation(rows);
+    let actual_sha256 = ci_disabled_identity_digest(&identities);
+    if identities.len() != expected_count || actual_sha256 != expected_sha256 {
+        die(format!(
+            "ci=false cells without ci_disabled_reason or terminal cell_verdicts changed; \
+             expected count={expected_count} sha256={expected_sha256}, got count={} \
+             sha256={actual_sha256}. New cells must declare one; when an existing cell is \
+             explained, reduce the sealed population in the same review",
+            identities.len()
+        ));
+    }
+}
+
+/// Refuse a new `ci = false` backend cell that has an explanation but omits
+/// its independent tier (or vice versa).
+fn validate_ci_disabled_tier_baseline(
+    rows: &[PlanRow],
+    expected_count: usize,
+    expected_sha256: &str,
+) {
+    let identities = ci_disabled_without_tier(rows);
+    let actual_sha256 = ci_disabled_identity_digest(&identities);
+    if identities.len() != expected_count || actual_sha256 != expected_sha256 {
+        die(format!(
+            "ci=false cells without an explicit cell tier changed; expected count={expected_count} \
+             sha256={expected_sha256}, got count={} sha256={actual_sha256}. A tier classifies \
+             evidence; it never substitutes for ci_disabled_reason or a terminal cell_verdict",
+            identities.len()
         ));
     }
 }
@@ -611,38 +714,122 @@ fn validate_observation(test: &Value, id: &str) {
     }
 }
 
-/// Enforce that a switched-off mode-cell says why it is switched off.
+/// Validate the two accepted explanations for a non-selected backend cell.
 ///
-/// Only applies to [`CI_REASON_REQUIRED_BUCKETS`]. The rule is symmetric on
-/// purpose: `ci = false` must explain itself, and `ci = true` must not carry a
-/// reason, so flipping a cell on forces the stale justification to be deleted
-/// in the same edit rather than left behind to mislead the next reader.
-fn validate_ci_disabled_reason(
+/// `ci_disabled_reason` applies to every enabled backend in the mode. When the
+/// backends need different explanations, `cell_verdicts` is an exact map from
+/// enabled backend to one of the two non-comparison states in the durable
+/// result schema. The forms are mutually exclusive so one cell never carries
+/// two competing explanations.
+fn validate_ci_explanation(
     id: &str,
-    bucket: &str,
     mode: &str,
     spec: &toml::map::Map<String, Value>,
     ci: bool,
-) {
-    if !CI_REASON_REQUIRED_BUCKETS.contains(&bucket) {
-        return;
-    }
+    enabled: &[String],
+) -> (BTreeSet<String>, BTreeSet<String>) {
     let reason = spec.get("ci_disabled_reason");
-    if ci {
-        if reason.is_some() {
+    if let Some(reason) = reason {
+        if reason.as_str().is_none_or(|text| text.trim().is_empty()) {
+            die(format!(
+                "{id}: modes.{mode}.ci_disabled_reason must be a non-empty string"
+            ));
+        }
+        if ci {
             die(format!(
                 "{id}: modes.{mode} is CI-enabled, so it must not carry ci_disabled_reason"
             ));
         }
-        return;
     }
-    match reason.and_then(Value::as_str) {
-        Some(text) if !text.trim().is_empty() => {}
-        _ => die(format!(
-            "{id}: modes.{mode} sets ci = false and must state why in a non-empty \
-             ci_disabled_reason (bucket `{bucket}` forbids a silent default-off cell)"
-        )),
+
+    let expected: BTreeSet<_> = enabled.iter().map(String::as_str).collect();
+    let cell_tiers = spec.get("cell_tiers");
+    let tiered_backends = if let Some(cell_tiers) = cell_tiers {
+        let cell_tiers = cell_tiers
+            .as_table()
+            .unwrap_or_else(|| die(format!("{id}: modes.{mode}.cell_tiers must be a table")));
+        let actual: BTreeSet<_> = cell_tiers.keys().map(String::as_str).collect();
+        if actual != expected {
+            die(format!(
+                "{id}: modes.{mode}.cell_tiers must name every enabled backend exactly; \
+                 expected={expected:?}, got={actual:?}"
+            ));
+        }
+        for (backend, tier) in cell_tiers {
+            let tier = tier.as_str().unwrap_or_else(|| {
+                die(format!(
+                    "{id}: modes.{mode}.cell_tiers.{backend} must be a tier string"
+                ))
+            });
+            if !CELL_TIERS.contains(&tier) {
+                die(format!(
+                    "{id}: modes.{mode}.cell_tiers.{backend} has unknown tier `{tier}`; \
+                     expected one of {CELL_TIERS:?}"
+                ));
+            }
+        }
+        actual.into_iter().map(str::to_string).collect()
+    } else {
+        BTreeSet::new()
+    };
+
+    let verdicts = spec.get("cell_verdicts");
+    if reason.is_some() && verdicts.is_some() {
+        die(format!(
+            "{id}: modes.{mode} must declare either ci_disabled_reason or cell_verdicts, not both"
+        ));
     }
+    if cell_tiers.is_some() && verdicts.is_some() {
+        die(format!(
+            "{id}: modes.{mode} must declare a tier in either cell_tiers or cell_verdicts, not both"
+        ));
+    }
+    let Some(verdicts) = verdicts else {
+        let explained = if reason.is_some() {
+            enabled.iter().cloned().collect()
+        } else {
+            BTreeSet::new()
+        };
+        return (explained, tiered_backends);
+    };
+    let verdicts = verdicts
+        .as_table()
+        .unwrap_or_else(|| die(format!("{id}: modes.{mode}.cell_verdicts must be a table")));
+    let actual: BTreeSet<_> = verdicts.keys().map(String::as_str).collect();
+    if actual != expected {
+        die(format!(
+            "{id}: modes.{mode}.cell_verdicts must name every enabled backend exactly; \
+             expected={expected:?}, got={actual:?}"
+        ));
+    }
+    for (backend, verdict) in verdicts {
+        let location = format!("{id}.modes.{mode}.cell_verdicts.{backend}");
+        ensure_keys(verdict, &["state", "comparison_tier", "reason"], &location);
+        let state = required_string(verdict, "state", &location);
+        if !matches!(
+            state,
+            "performs-no-comparison-by-design" | "unavailable-with-reason"
+        ) {
+            die(format!(
+                "{location}.state must be performs-no-comparison-by-design or unavailable-with-reason"
+            ));
+        }
+        let tier = required_string(verdict, "comparison_tier", &location);
+        if !CELL_TIERS.contains(&tier) {
+            die(format!(
+                "{location}.comparison_tier has unknown tier `{tier}`; expected one of {CELL_TIERS:?}"
+            ));
+        }
+        if verdict
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_none_or(|reason| reason.trim().is_empty())
+        {
+            die(format!("{location}: missing non-empty string `reason`"));
+        }
+    }
+    let backends: BTreeSet<_> = actual.into_iter().map(str::to_string).collect();
+    (backends.clone(), backends)
 }
 
 fn validate_mode(
@@ -660,6 +847,8 @@ fn validate_mode(
     let mut allowed = vec![
         "ci",
         "ci_disabled_reason",
+        "cell_tiers",
+        "cell_verdicts",
         "backends_enabled",
         "backends_disabled",
         "guest_args",
@@ -698,7 +887,6 @@ fn validate_mode(
         .get("ci")
         .and_then(Value::as_bool)
         .unwrap_or_else(|| die(format!("{id}: modes.{mode}.ci must be a boolean")));
-    validate_ci_disabled_reason(id, bucket, mode, spec, ci);
     let enabled = string_array(
         spec.get("backends_enabled"),
         &format!("{id}.modes.{mode}.backends_enabled"),
@@ -739,6 +927,8 @@ fn validate_mode(
             expected
         ));
     }
+    let (explained_backends, tiered_backends) =
+        validate_ci_explanation(id, mode, spec, ci, &enabled);
     if let Some(guest_args) = spec.get("guest_args") {
         let guest_args = guest_args
             .as_table()
@@ -919,6 +1109,8 @@ fn validate_mode(
     }
 
     for backend in enabled {
+        let ci_explained = explained_backends.contains(&backend);
+        let tier_declared = tiered_backends.contains(&backend);
         rows.push(PlanRow {
             bucket: bucket.to_string(),
             id: id.to_string(),
@@ -926,6 +1118,8 @@ fn validate_mode(
             mode: mode.to_string(),
             backend,
             ci,
+            ci_explained,
+            tier_declared,
         });
     }
 }
@@ -1036,8 +1230,6 @@ liteinst = "unsupported"
         assert!(rows[0].ci);
     }
 
-    const REASON_BUCKET: &str = CI_REASON_REQUIRED_BUCKETS[0];
-
     fn disabled_verify_spec(extra: &str) -> Value {
         parse_mode(&format!(
             r#"
@@ -1054,25 +1246,38 @@ liteinst = "unsupported"
         ))
     }
 
-    #[test]
-    #[should_panic(expected = "must state why in a non-empty ci_disabled_reason")]
-    fn rejects_silent_default_off_cell_in_ratcheted_bucket() {
-        validate_mode(
-            "bucket/test",
-            REASON_BUCKET,
-            "portable",
-            "verify",
-            &disabled_verify_spec(""),
-            &mut Vec::new(),
-        );
+    fn empty_population_sha256() -> &'static str {
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+
+    fn validate_empty_populations(rows: &[PlanRow]) {
+        validate_ci_disabled_explanation_baseline(rows, 0, empty_population_sha256());
+        validate_ci_disabled_tier_baseline(rows, 0, empty_population_sha256());
     }
 
     #[test]
-    #[should_panic(expected = "must state why in a non-empty ci_disabled_reason")]
+    #[should_panic(
+        expected = "ci=false cells without ci_disabled_reason or terminal cell_verdicts changed"
+    )]
+    fn rejects_new_silent_default_off_cell() {
+        let mut rows = Vec::new();
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &disabled_verify_spec(""),
+            &mut rows,
+        );
+        validate_ci_disabled_explanation_baseline(&rows, 0, empty_population_sha256());
+    }
+
+    #[test]
+    #[should_panic(expected = "ci_disabled_reason must be a non-empty string")]
     fn rejects_blank_ci_disabled_reason() {
         validate_mode(
             "bucket/test",
-            REASON_BUCKET,
+            "bucket",
             "portable",
             "verify",
             &disabled_verify_spec(r#"ci_disabled_reason = "   ""#),
@@ -1081,18 +1286,178 @@ liteinst = "unsupported"
     }
 
     #[test]
-    fn accepts_default_off_cell_that_states_a_reason() {
+    fn accepts_default_off_cell_that_states_a_reason_and_tier() {
         let mut rows = Vec::new();
         validate_mode(
             "bucket/test",
-            REASON_BUCKET,
+            "bucket",
             "portable",
             "verify",
-            &disabled_verify_spec(r#"ci_disabled_reason = "fixture does not compile""#),
+            &disabled_verify_spec(
+                r#"ci_disabled_reason = "fixture does not compile"
+cell_tiers = { ptrace = "declared-but-unverifiable" }"#,
+            ),
             &mut rows,
         );
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].ci);
+        validate_empty_populations(&rows);
+    }
+
+    #[test]
+    fn accepts_each_terminal_cell_verdict() {
+        for (state, tier) in [
+            (
+                "performs-no-comparison-by-design",
+                "execution-only-self-consistent",
+            ),
+            ("unavailable-with-reason", "declared-but-unverifiable"),
+        ] {
+            let mut rows = Vec::new();
+            let declaration = format!(
+                r#"cell_verdicts = {{ ptrace = {{ state = "{state}", comparison_tier = "{tier}", reason = "measured limitation" }} }}"#
+            );
+            validate_mode(
+                "bucket/test",
+                "bucket",
+                "portable",
+                "verify",
+                &disabled_verify_spec(&declaration),
+                &mut rows,
+            );
+            validate_empty_populations(&rows);
+        }
+    }
+
+    #[test]
+    fn accepts_each_settled_tier_with_a_real_reason() {
+        for tier in CELL_TIERS {
+            let mut rows = Vec::new();
+            let declaration = format!(
+                r#"ci_disabled_reason = "measured limitation"
+cell_tiers = {{ ptrace = "{tier}" }}"#
+            );
+            validate_mode(
+                "bucket/test",
+                "bucket",
+                "portable",
+                "verify",
+                &disabled_verify_spec(&declaration),
+                &mut rows,
+            );
+            validate_empty_populations(&rows);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "ci=false cells without an explicit cell tier changed")]
+    fn rejects_new_reason_without_a_tier() {
+        let mut rows = Vec::new();
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &disabled_verify_spec(r#"ci_disabled_reason = "measured limitation""#),
+            &mut rows,
+        );
+        validate_ci_disabled_tier_baseline(&rows, 0, empty_population_sha256());
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "ci=false cells without ci_disabled_reason or terminal cell_verdicts changed"
+    )]
+    fn rejects_new_tier_without_an_explanation() {
+        let mut rows = Vec::new();
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &disabled_verify_spec(r#"cell_tiers = { ptrace = "declared-but-unverifiable" }"#),
+            &mut rows,
+        );
+        validate_ci_disabled_explanation_baseline(&rows, 0, empty_population_sha256());
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown tier `unqualified-no-comparison`")]
+    fn rejects_the_retired_tier_name() {
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &disabled_verify_spec(
+                r#"ci_disabled_reason = "measured limitation"
+cell_tiers = { ptrace = "unqualified-no-comparison" }"#,
+            ),
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown tier `unqualified-no-comparison`")]
+    fn rejects_the_retired_tier_name_in_a_terminal_verdict() {
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &disabled_verify_spec(
+                r#"cell_verdicts = { ptrace = { state = "unavailable-with-reason", comparison_tier = "unqualified-no-comparison", reason = "measured limitation" } }"#,
+            ),
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = ".state must be performs-no-comparison-by-design or unavailable-with-reason"
+    )]
+    fn rejects_a_green_claim_as_a_disabled_cell_explanation() {
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &disabled_verify_spec(
+                r#"cell_verdicts = { ptrace = { state = "compared-and-matched", comparison_tier = "canonical-bitwise", reason = "not an execution result" } }"#,
+            ),
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "missing non-empty string `reason`")]
+    fn rejects_a_terminal_cell_verdict_without_a_reason() {
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &disabled_verify_spec(
+                r#"cell_verdicts = { ptrace = { state = "unavailable-with-reason", comparison_tier = "declared-but-unverifiable", reason = "   " } }"#,
+            ),
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must declare either ci_disabled_reason or cell_verdicts, not both")]
+    fn rejects_ambiguous_disabled_cell_explanation() {
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &disabled_verify_spec(
+                r#"ci_disabled_reason = "mode reason"
+cell_verdicts = { ptrace = { state = "unavailable-with-reason", comparison_tier = "declared-but-unverifiable", reason = "cell reason" } }"#,
+            ),
+            &mut Vec::new(),
+        );
     }
 
     #[test]
@@ -1113,7 +1478,7 @@ liteinst = "unsupported"
         );
         validate_mode(
             "bucket/test",
-            REASON_BUCKET,
+            "bucket",
             "portable",
             "verify",
             &spec,
@@ -1122,9 +1487,9 @@ liteinst = "unsupported"
     }
 
     #[test]
-    fn leaves_unratcheted_buckets_alone() {
-        // The ratchet must not silently impose the rule on every other bucket;
-        // those still carry bare `ci = false` and must keep validating.
+    fn accepts_the_exact_existing_unexplained_population() {
+        // Existing cells stay buildable only while the complete identity set
+        // matches its sealed count and digest.
         let mut rows = Vec::new();
         validate_mode(
             "bucket/test",
@@ -1135,6 +1500,68 @@ liteinst = "unsupported"
             &mut rows,
         );
         assert_eq!(rows.len(), 1);
+        let identities = ci_disabled_without_explanation(&rows);
+        let digest = ci_disabled_identity_digest(&identities);
+        validate_ci_disabled_explanation_baseline(&rows, 1, &digest);
+        let tierless = ci_disabled_without_tier(&rows);
+        let tierless_digest = ci_disabled_identity_digest(&tierless);
+        validate_ci_disabled_tier_baseline(&rows, 1, &tierless_digest);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "ci=false cells without ci_disabled_reason or terminal cell_verdicts changed"
+    )]
+    fn rejects_same_size_substitution_in_unexplained_population() {
+        let mut expected = Vec::new();
+        validate_mode(
+            "bucket/original",
+            "bucket",
+            "portable",
+            "verify",
+            &disabled_verify_spec(""),
+            &mut expected,
+        );
+        let expected_identities = ci_disabled_without_explanation(&expected);
+        let expected_digest = ci_disabled_identity_digest(&expected_identities);
+
+        let mut replacement = Vec::new();
+        validate_mode(
+            "bucket/replacement",
+            "bucket",
+            "portable",
+            "verify",
+            &disabled_verify_spec(""),
+            &mut replacement,
+        );
+        validate_ci_disabled_explanation_baseline(&replacement, 1, &expected_digest);
+    }
+
+    #[test]
+    #[should_panic(expected = "ci=false cells without an explicit cell tier changed")]
+    fn rejects_same_size_substitution_in_tierless_population() {
+        let mut expected = Vec::new();
+        validate_mode(
+            "bucket/original",
+            "bucket",
+            "portable",
+            "verify",
+            &disabled_verify_spec(""),
+            &mut expected,
+        );
+        let expected_identities = ci_disabled_without_tier(&expected);
+        let expected_digest = ci_disabled_identity_digest(&expected_identities);
+
+        let mut replacement = Vec::new();
+        validate_mode(
+            "bucket/replacement",
+            "bucket",
+            "portable",
+            "verify",
+            &disabled_verify_spec(""),
+            &mut replacement,
+        );
+        validate_ci_disabled_tier_baseline(&replacement, 1, &expected_digest);
     }
 
     #[test]
