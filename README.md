@@ -137,8 +137,11 @@ invocation of each eligible syscall site and installs an instruction-punning
 hook. Later invocations enter the LiteInst trampoline and return to the same
 ptrace-owned Detcore lifecycle.
 
-`--verify` runs the normal Detcore comparison over captured status, output,
-and deterministic scheduler logs, so a successful result is an L2 claim.
+`--verify` compares captured status and output and applies the `Stripped`
+comparison to selected Detcore scheduler messages. A successful result is a
+useful diagnostic, but it is not L2. L2 additionally requires
+`--verify-strict --verify-json REPORT.json`, `bitwise_parity: true`, and nonzero
+compared-message counts.
 Current support is limited to single-threaded, single-process guests. Thread
 clone, `fork`, and `vfork` fail closed with `EOPNOTSUPP`; `exec` is also
 unsupported because runtime rebootstrap after image replacement is not yet
@@ -152,7 +155,7 @@ e9patch runtime artifacts. KVM requires read-write `/dev/kvm` access plus its
 guest-kernel Linux ABI.
 
 SaBRe is built only with the non-default `third-party-backends` feature. Its
-measured post-0.2 strict-verify envelope, build instructions, and explicit
+measured post-0.2 `Stripped` envelope, build instructions, and explicit
 unsupported cases are documented in
 [SaBRe backend compatibility](docs/SABRE_COMPATIBILITY.md).
 
@@ -203,7 +206,7 @@ virtual-machine configuration.
 | Goal | Command | Status |
 | --- | --- | --- |
 | Deterministic execution | `hermit run -- PROGRAM ARGS...` | Default and recommended mode |
-| Verify two executions | `hermit run --verify -- PROGRAM` | Compares output, status, and deterministic logs |
+| Verify two executions | `hermit run --verify -- PROGRAM` | Runs the `Stripped` diagnostic over output, status, and selected logs; not L2 |
 | Explore schedules | `hermit run --chaos --sched-seed=N -- PROGRAM` | Seeded, reproducible schedule variation |
 | Record an execution | `hermit record start -- PROGRAM ARGS...` | Experimental |
 | Replay the latest recording | `hermit replay --autopilot` | Experimental |

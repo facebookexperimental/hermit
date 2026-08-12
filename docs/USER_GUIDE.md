@@ -181,8 +181,11 @@ before activation; an arbitrary shared object or constructor-free runtime is
 rejected rather than silently falling back.
 
 LiteInst uses the normal Hermit run and verification paths. A successful
-`--strict --verify` run compares captured status/output and Detcore scheduler
-logs and is therefore an L2 result. Verification currently supplies
+`--strict --verify` run compares status/stdout/stderr exactly and applies the
+`Stripped` comparison to selected Detcore scheduler messages; it is useful
+diagnostic evidence, but it is not L2. L2 additionally requires
+`--verify-strict --verify-json REPORT.json`, `bitwise_parity: true`, and nonzero
+compared-message counts. Verification currently supplies
 `/dev/null` as guest stdin. The supported execution scope is dynamically
 linked, single-threaded, single-process Linux x86-64 guests. Thread clone,
 `fork`, and `vfork` fail closed with `EOPNOTSUPP`, and `exec` remains
@@ -202,7 +205,7 @@ guest-kernel ABI.
 SaBRe is available only in builds using the non-default
 `third-party-backends` feature. See
 [SaBRe backend compatibility](SABRE_COMPATIBILITY.md) for the measured
-strict-verify allowlist, build commands, and known gaps. An enabled probe is
+`Stripped` allowlist, build commands, and known gaps. An enabled probe is
 not a blanket support claim for every workload in its subsystem.
 
 `e9patch` is an experimental hybrid rather than a standalone Detcore runtime.
@@ -284,7 +287,12 @@ hermit run --verify -- /bin/echo reproducible
 
 Hermit runs the guest twice and compares observable output, including stdout,
 stderr, and its internal deterministic execution log. Verification fails if
-the executions differ or if the guest exit status is not allowed.
+the compared observations differ or if the guest exit status is not allowed.
+
+The default log comparison is `Stripped`: it can erase numbers, addresses,
+temporary paths, and time values from selected messages. It is a fast
+diagnostic, not L2. Use `--verify-strict --verify-json REPORT.json` when a
+canonical L2 result is required.
 
 The guest must be idempotent. A first run that modifies an input file,
 database, cache, or other host-visible state can legitimately change the

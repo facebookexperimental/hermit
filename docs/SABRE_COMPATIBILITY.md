@@ -10,8 +10,9 @@ drop-in replacement for the ptrace backend.
 
 This document describes the post-0.2 work-ahead envelope. The executable test
 manifests are the source of truth: a SaBRe entry in `backends_enabled` means the
-named cell passed both SaBRe strict verification and its stated semantic
-oracle. An exclusion remains a support gap, not an implied fallback to ptrace.
+named cell matched under SaBRe's `Stripped` comparison and passed its stated
+semantic oracle. An exclusion remains a support gap, not an implied fallback
+to ptrace.
 
 ## Build and run
 
@@ -49,7 +50,7 @@ This path is visible in INFO logs as
 than a generic `impl reverie::Backend`; the architectural difference does not
 create a second determinism engine.
 
-## Measured strict-verify envelope
+## Measured `Stripped` envelope
 
 Baseline sweep provenance:
 
@@ -61,10 +62,10 @@ Baseline sweep provenance:
 - Host: Linux `6.18.39-0_fbk0_hardened_0_ga43d5727b443`, AMD EPYC 9D85,
   `perf_event_paranoid=1`.
 - Toolchain: `rustc 1.99.0-nightly (26ae60a9e 2026-07-28)`.
-- Level: L2 (`run --backend sabre --strict --verify`). The portable corpus
-  uses `--no-virtualize-cpuid --max-timeslice=disabled`; the standalone
-  `/bin/echo`, `/bin/true`, and `/bin/cat /dev/null` probes pass L2 without
-  relaxations.
+- Comparator: `Stripped` (`run --backend sabre --strict --verify`). The portable
+  corpus uses `--no-virtualize-cpuid --max-timeslice=disabled`; the standalone
+  `/bin/echo`, `/bin/true`, and `/bin/cat /dev/null` probes matched under
+  `Stripped` without additional relaxations. These results are not L2.
 - Log level: INFO for verification. Every cell was bounded by its manifest
   timeout. `race.sh` was not run.
 
@@ -77,30 +78,33 @@ the Hermit binary is
 `48d79ea85d92933a7bb607f56a62eaadc71a1921ca6d2f832193d5f0e2955997`
 and `libdetcore_sabre.so` is
 `a9a3bcfd435ca350f3f2c8a0bb0ee9fadeec4737bcb373e4b47e883a71bbe9fc`.
-The cell passed SaBRe L2 with 9/9 DETLOG/scheduler-COMMIT messages matching;
-its ptrace and SaBRe guest output was byte-identical (SHA-256
+The cell produced a SaBRe `Stripped` match with 9/9 selected
+DETLOG/scheduler-COMMIT messages matching after `Stripped` normalization. Its
+ptrace and SaBRe guest output was independently byte-identical (SHA-256
 `8504ad2cf53c948ffdd59e277fe87ecf21f65ffa4fb543989366ec9cb40272fd`).
 
 This isolated cell does not change the separate 212-program compatibility
-corpus measurement. Its latest valid canonical run remains 207/212 (97.64%,
-B3) at Hermit `c4b7b1a6dc4c1bfe1f03b68ec5d2efa991d9256b`; `gcc`, `g++`, and `cpp`
-timed out, `java` had a substantive DETLOG mismatch, and `timeout` failed its
-first run. Those five gaps preclude B4 or a parity claim.
+corpus measurement. Its latest retained `Stripped` run remains 207/212
+(97.64%) at Hermit `c4b7b1a6dc4c1bfe1f03b68ec5d2efa991d9256b`; `gcc`, `g++`, and
+`cpp` timed out, `java` had a substantive DETLOG mismatch, and `timeout` failed
+its first run. The five gaps and the `Stripped` comparator preclude B3, B4, L2,
+or any canonical parity claim.
 
-The initial post-0.2 ptrace strict-verify plan had 194 cells. Before that
+The initial post-0.2 ptrace verification plan had 194 cells. Before that
 ratchet, SaBRe was enabled for 22 (11.3%). This ratchet evaluates 157
 previously disabled C candidates:
 
 | Result | Cells | Meaning |
 | --- | ---: | --- |
-| SaBRe L2 and ptrace exit/stdout parity | 110 | Enabled by this ratchet |
-| SaBRe L2, but ptrace output differs | 18 | Remains disabled |
-| SaBRe L2 failed or timed out | 29 | Remains disabled |
+| SaBRe `Stripped` match and ptrace exit/stdout parity | 110 | Enabled by this ratchet |
+| SaBRe `Stripped` match, but ptrace output differs | 18 | Remains disabled |
+| SaBRe `Stripped` comparison failed or timed out | 29 | Remains disabled |
 
 The resulting plan enables SaBRe for 132/194 cells (68.0%): seven blocking CI
-cells and 125 manual cells. This meets the B3 corpus-count threshold (at least
-50% of the ptrace strict-verify corpus). It does not establish B4, L3 memory
-determinism, L4 stress hardening, or support for every workload in a subsystem.
+cells and 125 manual cells. This meets the numerical threshold formerly used
+for the B3 corpus count, but the underlying comparisons were `Stripped`; it
+does not establish B3, L2, B4, L3 memory determinism, L4 stress hardening, or
+support for every workload in a subsystem.
 
 The 110 newly enabled cells are grouped as follows:
 
@@ -128,31 +132,34 @@ some fork and signal probes pass while other probes in those categories do not.
 The root-process identity increment starts the SaBRe tracee before creating its
 blocking ptrace-supervisor worker. Linux assigns the guest namespace PID 3,
 matching ptrace, instead of assigning 3 to the worker and 4 to the guest. This
-qualifies `backend-parity-c/pid-probe` and `debugger-c/debuggee` at SaBRe L2
-with byte-identical ptrace output under the portable profile. It does not claim
-parity for child/thread identities, whose backend task topologies still differ.
+gives `backend-parity-c/pid-probe` and `debugger-c/debuggee` SaBRe `Stripped`
+matches with byte-identical ptrace output under the portable profile. It does
+not establish L2 or claim parity for child/thread identities, whose backend
+task topologies still differ.
 The socket-cookie increment gives sockets their own per-task open sequence.
 Linux specifies a nonzero identity that is unique among live sockets and shared
 by descriptor aliases, but does not specify its numeric value. Keeping the
 socket sequence separate from regular-file opens preserves those properties and
 prevents ptrace-only dynamic-linker file operations from shifting SaBRe-visible
-cookies. This qualifies `c-programs/socket-cookie-tcp`,
-`c-programs/socket-cookie-udp`, and `c-programs/socket-cookie-unix` at SaBRe L2
-with byte-identical ptrace output under the portable profile.
+cookies. This gives `c-programs/socket-cookie-tcp`,
+`c-programs/socket-cookie-udp`, and `c-programs/socket-cookie-unix` SaBRe
+`Stripped` matches with byte-identical ptrace output under the portable profile;
+it does not establish L2.
 
 At this increment's source tree, the executable plan enables SaBRe for 133/200
-ptrace verify cells (66.5%, B3): seven blocking-CI cells and 126 manual cells.
-That is up by three cells from the live `origin/main` plan's 130/200 (65.0%);
-the denominator and enabled set have changed since the historical 133/199
-root-process-identity snapshot above.
+ptrace verify cells (66.5%) under `Stripped`: seven blocking-CI cells and 126
+manual cells. This count does not establish B3 or L2. It is up by three cells
+from the live `origin/main` plan's 130/200 (65.0%); the denominator and enabled
+set have changed since the historical 133/199 root-process-identity snapshot
+above.
 
 ## Known gaps
 
 The historical output-differ audit contained 18 cells. Five now have
 byte-identical ptrace/SaBRe output and are enabled. Ten remain under the owners
 of clock, multithreaded-random, SIGCHLD, or multithreaded-identity semantics.
-The three remaining non-gated cells pass SaBRe L2 but stay disabled because
-their guest output is still backend-specific:
+The three remaining non-gated cells match under SaBRe's `Stripped` comparison
+but stay disabled because their guest output is still backend-specific:
 
 | Cell | Disposition | Evidence |
 | --- | --- | --- |
@@ -177,18 +184,20 @@ their guest output is still backend-specific:
 
 The three non-gated probes were rerun at Hermit
 `cc026964cf8b992ecd95883418991571783799c0` with Reverie
-`aa6f1283aeee3efd174c57f6dd8198310bd307e1`. All three passed SaBRe INFO-level
-L2 under the portable profile, but direct strict ptrace/SaBRe stdout comparison
-failed for all three. This audit therefore makes no manifest promotion: the
-plan remains 133/200 before and after it.
+`aa6f1283aeee3efd174c57f6dd8198310bd307e1`. All three matched under SaBRe's
+`Stripped` comparison at INFO log level, but direct ptrace/SaBRe stdout
+comparison failed for all three. This audit therefore makes no manifest
+promotion: the plan remains 133/200 before and after it. These results are not
+L2.
 
-Separately, the same full scorecard found the already-enabled
-`c-programs/mmap-determinism` at L2 on both backends but with
+Separately, the same full scorecard found that the already-enabled
+`c-programs/mmap-determinism` matched under `Stripped` on both backends but had
 `stdout_parity=false`. That regression is outside the historical 18-cell set
 and requires independent requalification; it is not counted as progress here.
+The result is not L2.
 
-The following 27 candidates fail SaBRe strict verification or its timeout and
-remain disabled:
+The following 27 candidates fail SaBRe's `Stripped` comparison or its timeout
+and remain disabled:
 
 ```text
 backend-parity-c/cpuid-probe
@@ -224,8 +233,8 @@ Additional backend-wide limits:
 
 - GNU `patch` reaches `getrandom` through glibc at a libc site that the SaBRe
   syscall rewriter can miss. The plugin detours that libc function through
-  Detcore. The canonical `patch` workload passed five consecutive strict
-  verification probes on the measured Fedora host, but a GitHub Ubuntu package
+  Detcore. The named `patch` workload produced five consecutive `Stripped`
+  matches on the measured Fedora host, but a GitHub Ubuntu package
   still reached a different libc-internal random path and varied its temporary
   suffix. Portable CI therefore covers a compiled public-`getrandom` caller;
   it does not claim every host `patch` build is deterministic. This also does
