@@ -262,9 +262,18 @@ undecorate() {
 }
 
 readonly SHA40_RE='[0-9a-fA-F]{40}'
+# The structural-prefix class is on the REJECTIONS and deliberately NOT on
+# APPROVE_RE. `undecorate` removes markdown that WRAPS a line; a marker like
+# `##`, `>`, or `-` is a prefix with no closer and survives it. Each direction
+# here is the refusing one: a masked rejection is HONOURED so it revokes (being
+# generous about recognising a rejection only ever withdraws authority), while a
+# masked APPROVAL still cannot bind — extending the class to APPROVE_RE would
+# let `## APPROVED-AT: ...` start authorising. Matches the reference verifier
+# `ci-hub/health/approval_binding.py`; see its REJECT_PREFIX comment.
+readonly VERDICT_PREFIX='[[:space:]#>*+-]*'
 readonly APPROVE_RE="^APPROVED-AT:[[:space:]]*(claude|codex)[[:space:]]+(${SHA40_RE})$"
-readonly REJECT_RE="^CHANGES-REQUESTED-AT:[[:space:]]*(claude|codex)[[:space:]]+${SHA40_RE}$"
-readonly REJECT_LEGACY_RE="^REQUEST[[:space:]]+CHANGES[[:space:]]+AT[[:space:]]+${SHA40_RE}$"
+readonly REJECT_RE="^${VERDICT_PREFIX}CHANGES-REQUESTED-AT:[[:space:]]*(claude|codex)[[:space:]]+${SHA40_RE}$"
+readonly REJECT_LEGACY_RE="^${VERDICT_PREFIX}REQUEST[[:space:]]+CHANGES[[:space:]]+AT[[:space:]]+${SHA40_RE}$"
 # A line plainly trying to be a verdict binding but matching no known shape.
 #
 # DELIBERATELY STRICTER THAN THE REFERENCE, IN THE REFUSING DIRECTION ONLY.

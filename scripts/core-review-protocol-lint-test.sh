@@ -509,6 +509,25 @@ run_case "a heading-masked rejection at the head must not read as approved" 1 \
       {\"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"},
       {\"body\": \"## CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
 
+# Recovery must work, or the gate is unsatisfiable after any masked rejection.
+# Before the rejection grammar learned the prefix class, this case BLOCKED even
+# after a clean re-approval: the masked line was merely flagged as unparseable,
+# and the OTHER lane had not spoken past it, so the union kept reporting it.
+# Honouring the rejection instead of flagging it is what makes recovery clean —
+# and it is what the reference verifier does, so the two now agree here.
+run_case "a masked rejection followed by a fresh approval passes again" 0 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"## CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "a masked claude rejection does not revoke the codex lane" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"## CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
 run_case "a blockquote-masked rejection at the head must not read as approved" 1 \
     "$FULL_LABELS" "$FULL_BODY" false \
     "[{\"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
