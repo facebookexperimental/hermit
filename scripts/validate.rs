@@ -605,6 +605,22 @@ fn self_test() -> Result<(), String> {
     if scope_grace_s(600) != 60 || 600 + scope_grace_s(600) >= 720 {
         return Err("run-timeout scope backstop no longer satisfies 600 < 660 < 720".into());
     }
+    let cold_compat = build_release_hermit_node("gate.manifest", "/tmp/target/release/hermit");
+    if cold_compat.hint.preferred_inner_jobs != Some(8)
+        || cold_compat.hint.classification != safe_ci_dag_runner::model::StepClass::CpuBound
+    {
+        return Err("cold strict-compat release build lost its declared eight-job width".into());
+    }
+    let reused_compat = build_release_hermit_node(
+        "gate.manifest",
+        "/tmp/target/ci/hermit-strict",
+    );
+    if reused_compat.hint.preferred_inner_jobs.is_some()
+        || reused_compat.hint.classification != safe_ci_dag_runner::model::StepClass::Light
+        || !reused_compat.cmd.starts_with("test -x ")
+    {
+        return Err("prebuilt strict-compat path stopped being a lightweight existence check".into());
+    }
     // All three legitimate deadline sources share one pure precedence rule. The standalone boxed
     // re-exec must preserve D1 exactly; a scheduler epoch applies even when validate is top-level;
     // missing, future, and contradictory sources are refused.
@@ -2909,7 +2925,7 @@ fn build_release_hermit_node(gate: &str, bin: &str) -> safe_ci_dag_runner::model
         // for a reason that has nothing to do with compatibility.
         format!("test -x {}", validate_plan::shell_quote(bin))
     };
-    step_with_caps(
+    let mut step = step_with_caps(
         "compatprep",
         "hermit_release",
         "Release Hermit for compatibility",
@@ -2918,7 +2934,17 @@ fn build_release_hermit_node(gate: &str, bin: &str) -> safe_ci_dag_runner::model
         COMPAT_DIAGNOSTIC_WALL_S,
         COMPAT_DIAGNOSTIC_WALL_S * 2,
         16 * 1024 * 1024 * 1024,
-    )
+    );
+    if default {
+        // A fresh validation checkout has no target cache. Leaving this build
+        // undeclared makes the runner box Cargo to one core; that measured
+        // 420s and timed out before finishing at be4c0905. The full profile's
+        // established eight-job release build completed in 80s on the same
+        // host. Declare that width here instead of widening any timeout.
+        step.hint.classification = safe_ci_dag_runner::model::StepClass::CpuBound;
+        step.hint.preferred_inner_jobs = Some(8);
+    }
+    step
 }
 
 fn prepare_fixtures_node(_tag: &str, fixtures: &Path) -> safe_ci_dag_runner::model::Step {
