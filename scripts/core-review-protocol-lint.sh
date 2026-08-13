@@ -10,8 +10,9 @@
 #
 # A PR carrying that label may only land when ALL hold:
 #   (a) every review family in the shared contract has a numbered activity label;
-#   (b) every family has its approval label (these are invalidated on every new
-#       push, so their presence means the current revision is approved);
+#   (b) every family has its approval label;
+#   (b') every family's newest verdict comment binds the exact current head with
+#        `APPROVED-AT: <family> <40-hex>`;
 #   (c) the PR body contains the required sections: Summary, Determinism,
 #       Linux Semantics, Validation, Human Review Required, and — when the PR
 #       touches KVM — Relationship to gVisor.
@@ -19,11 +20,75 @@
 # A PR without the contract's post-facto label passes unconditionally; this
 # lint never second-guesses whether the label should have been applied.
 #
+# WHY (b') EXISTS. Until 2026-08-13 this lint checked only (b) — label presence
+# — and there was no SHA anywhere in it. A label is a cache: it survives new
+# commits and force-pushes, while an approval does not. The producer that was
+# supposed to strip a stale label (`merge-gate.yml`'s `invalidate-local-validation`)
+# is itself a `pull_request` job on a self-hosted runner, so it fails open
+# silently whenever no run fires or the runner is down — and this consumer
+# trusted it unconditionally, while its own failure text asserted "has not
+# approved the current revision", a claim it had no means to evaluate.
+# Composed, the merge gate was satisfiable by an approval of different code.
+# Observed live on PR #2176: both `passed-review-*` labels present, NEITHER lane
+# binding the current head, and the newest claude-lane verdict at that head a
+# REJECTION with nine open findings.
+#
+# The fix is the one in ai_docs/2026-08-10-stale-approval-label-scope-and-binding.md
+# (R1): derive validity at read time instead of depending on an event to remove
+# an artifact. There is no run to miss and no runner to be offline; if the head
+# moved, the comparison simply fails here. Nothing is deleted, so no review
+# history is lost — a superseded approval stops satisfying the gate and remains
+# visible forever as the record of what was reviewed and when.
+#
+# The labels are still required. Keeping (b) alongside (b') makes this gate
+# strictly stronger than before in every case, which is the only safe direction
+# for a change to an authorization check.
+#
+# GRAMMAR. Mirrors the reference verifier `ci-hub/health/approval_binding.py`
+# in the dev-hermit parent, which the landing path (`ci-hub/landing/land-pr.sh`)
+# and `ci-hub/health/pr_status.py` already call. Exactly one shape carries
+# authority:
+#
+#     APPROVED-AT: <claude|codex> <40-hex>
+#
+# matched case-insensitively against the whole line after whole-line markdown
+# emphasis is removed. Rejections mirror it and win within a comment:
+#
+#     CHANGES-REQUESTED-AT: <claude|codex> <40-hex>
+#     REQUEST CHANGES AT <40-hex>              (historical, lane-less)
+#
+# Verdicts are chronological: a rejection clears that lane's earlier approvals
+# and a later approval can re-establish authority. A lane binds only when the
+# NEWEST SHA it bound itself to equals the current head. A line carrying a
+# verdict-ish keyword and a 40-hex that matches no known shape is reported and
+# BLOCKS rather than being skipped — an unrecognised variant that is silently
+# ignored reads as no approval, and a heading-prefixed verdict line
+# (`## APPROVED-AT: ...`) is exactly how one real rejection went unseen.
+#
 # Inputs (environment variables):
-#   PR_LABELS  newline-separated label names on the PR (may be empty)
-#   PR_BODY    the PR description body text (may be empty)
-#   PR_IS_KVM  "true" when the PR changes KVM code (default: "false")
-#   PR_NUMBER  PR number, used only in diagnostics (default: "unknown")
+#   PR_LABELS         newline-separated label names on the PR (may be empty)
+#   PR_BODY           the PR description body text (may be empty)
+#   PR_IS_KVM         "true" when the PR changes KVM code (default: "false")
+#   PR_NUMBER         PR number, used only in diagnostics (default: "unknown")
+#   PR_HEAD_SHA       the exact 40-hex head the approvals must bind
+#   PR_COMMENTS_FILE  path to a file holding a JSON array of the PR's issue
+#                     comments, oldest first, each object carrying at least
+#                     `body`. PREFERRED, and what the workflow uses.
+#   PR_COMMENTS_JSON  the same JSON inline. Convenient for tests and small PRs;
+#                     PR_COMMENTS_FILE takes precedence when both are set.
+#
+# USE THE FILE FORM FOR ANYTHING REAL. A single environment variable is capped
+# at MAX_ARG_STRLEN (128 KiB on Linux), and PR #2176's comment array is
+# 154,666 bytes — passing it inline fails exec with E2BIG, which surfaces as
+# exit 126 and blocks a PR for a reason that has nothing to do with its reviews.
+# Comment volume grows with exactly the review activity this gate reads, so the
+# inline form breaks first on the PRs that need the gate most.
+#
+# PR_HEAD_SHA and PR_COMMENTS_JSON are REQUIRED whenever the
+# `post-facto-human-review` label is present, and a missing, malformed, or
+# unparseable value BLOCKS. They are deliberately not optional: a check that
+# goes quietly inert when its caller forgets an input is the same fail-open
+# shape this change exists to remove.
 #
 # Exit status:
 #   0  protocol satisfied, or the PR does not carry the post-facto label
@@ -76,6 +141,21 @@ fi
 
 pr="${PR_NUMBER:-unknown}"
 is_kvm="${PR_IS_KVM:-false}"
+head_sha="${PR_HEAD_SHA-}"
+comments_file="${PR_COMMENTS_FILE-}"
+comments_json="${PR_COMMENTS_JSON-}"
+comments_source_error=""
+if [ -n "$comments_file" ]; then
+    if [ -r "$comments_file" ]; then
+        comments_json=$(cat -- "$comments_file")
+    else
+        # Recorded rather than ignored: an unreadable path must not silently
+        # fall through to PR_COMMENTS_JSON (likely unset), which would report
+        # "no approval" for what is really a plumbing fault.
+        comments_json=""
+        comments_source_error="PR_COMMENTS_FILE '${comments_file}' is not readable."
+    fi
+fi
 
 # A grep predicate has three possible outcomes even though a shell condition is
 # only true or false: 0 is a match, 1 is a clean no-match, and every other status
@@ -153,6 +233,139 @@ has_section() {
         <<<"$body" \
         || status=$?
     match_status_or_refuse "PR-body section lookup" "$status"
+}
+
+# Remove only markdown that WRAPS a complete line, repeatedly, then trim.
+# `**APPROVED-AT: claude <sha>**` is a binding; a code span embedded in prose is
+# not, so a lone leading backtick must not be stripped. Faithful port of
+# `undecorate` in the reference verifier.
+undecorate() {
+    local line=$1 wrapper n changed=1
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    while [ "$changed" -eq 1 ]; do
+        changed=0
+        for wrapper in '`' '**' '__' '*' '_'; do
+            n=${#wrapper}
+            if [ "${#line}" -gt $((2 * n)) ] \
+               && [ "${line:0:n}" = "$wrapper" ] \
+               && [ "${line: -n}" = "$wrapper" ]; then
+                line="${line:n:${#line} - 2 * n}"
+                line="${line#"${line%%[![:space:]]*}"}"
+                line="${line%"${line##*[![:space:]]}"}"
+                changed=1
+                break
+            fi
+        done
+    done
+    printf '%s' "$line"
+}
+
+readonly SHA40_RE='[0-9a-fA-F]{40}'
+readonly APPROVE_RE="^APPROVED-AT:[[:space:]]*(claude|codex)[[:space:]]+(${SHA40_RE})$"
+readonly REJECT_RE="^CHANGES-REQUESTED-AT:[[:space:]]*(claude|codex)[[:space:]]+${SHA40_RE}$"
+readonly REJECT_LEGACY_RE="^REQUEST[[:space:]]+CHANGES[[:space:]]+AT[[:space:]]+${SHA40_RE}$"
+# A line plainly trying to be a verdict binding but matching no known shape.
+#
+# DELIBERATELY STRICTER THAN THE REFERENCE, IN THE REFUSING DIRECTION ONLY.
+# The leading `[#>*+-]` class is not in `approval_binding.py`. Without it a
+# verdict line carrying a markdown STRUCTURAL prefix — `## CHANGES-REQUESTED-AT:
+# claude <sha>` — matches neither the verdict grammar nor the suspect pattern,
+# so it is silently invisible. Measured against the reference on 2026-08-13: for
+# an approval followed by a `##`-prefixed rejection at the SAME head, the
+# reference returns the approval with an empty malformed list, i.e. the lane
+# reads as currently approved while its newest verdict is a rejection. That is a
+# false PASS, and it is what happened on PR #2176.
+#
+# `undecorate` above cannot absorb these because it only removes markdown that
+# WRAPS a line (matching opener and closer); a heading, blockquote, or list
+# marker is a prefix with no closer.
+#
+# This gate therefore refuses such a line instead of ignoring it. The divergence
+# can only ever turn a reference PASS into a refusal here, never the reverse —
+# a property the differential in the PR description measures rather than
+# asserts. The correct end state is for the reference to adopt the same class so
+# both consumers agree again; that belongs in a dev-hermit change, not here.
+readonly SUSPECT_RE="^[[:space:]#>*+-]*(APPROV|CHANGES-REQUESTED|REQUEST[[:space:]]+CHANGES|REJECT|LGTM|SIGN(ED)?[-[:space:]]?OFF|ACK).*${SHA40_RE}"
+
+# Scan every comment for LANE and emit one tagged row per line of stdout:
+#
+#   S <sha>    a SHA this lane bound itself to, oldest first
+#   M <line>   a verdict-ish line matching no known shape
+#
+# Everything travels out through stdout ON PURPOSE. The caller reads this with
+# `mapfile < <(...)`, which runs the function in a subshell, so a global
+# assigned in here would be silently discarded in the parent — an earlier draft
+# collected malformed lines that way and the malformed check was inert while its
+# tests still passed, because those cases also failed the binding check for an
+# unrelated reason. Tagged stdout is what makes both results actually observable.
+scan_lane() {
+    local lane=$1 encoded body line undecorated
+    local -a found=()
+    local idx=-1
+    # The reference grammar is case-insensitive throughout, so `APPROVED-AT:
+    # CODEX <SHA>` binds exactly as `approved-at: codex <sha>` does. Scoped to
+    # this function and restored on return.
+    local had_nocasematch=0
+    shopt -q nocasematch && had_nocasematch=1
+    shopt -s nocasematch
+    while IFS= read -r encoded; do
+        [ -n "$encoded" ] || continue
+        idx=$((idx + 1))
+        body=$(printf '%s' "$encoded" | base64 -d)
+        # A rejection contributes NOTHING from this comment, even if the same
+        # comment also carries an APPROVED-AT-shaped line: a comment quoting the
+        # approval it supersedes must not bind as a positive. Clearing rather
+        # than skipping is load-bearing, or APPROVED-then-CHANGES-REQUESTED
+        # would read as approved forever.
+        local rejected=0
+        while IFS= read -r line; do
+            undecorated=$(undecorate "$line")
+            if [[ $undecorated =~ $REJECT_LEGACY_RE ]]; then
+                rejected=1
+                break
+            fi
+            if [[ $undecorated =~ $REJECT_RE ]]; then
+                local rejected_lane=${BASH_REMATCH[1]}
+                if [ "${rejected_lane,,}" = "$lane" ]; then
+                    rejected=1
+                    break
+                fi
+            fi
+        done <<< "$body"
+        if [ "$rejected" -eq 1 ]; then
+            found=()
+            continue
+        fi
+        while IFS= read -r line; do
+            undecorated=$(undecorate "$line")
+            if [[ $undecorated =~ $APPROVE_RE ]]; then
+                local matched_lane=${BASH_REMATCH[1]} matched_sha=${BASH_REMATCH[2]}
+                if [ "${matched_lane,,}" = "$lane" ]; then
+                    # Recorded EXACTLY as written, deliberately not lowercased.
+                    # The reference verifier compares the captured text against
+                    # the API's lowercase head, so an upper-case SHA does not
+                    # bind there. Normalising here would make this gate accept
+                    # an approval the reference rejects, and two consumers
+                    # disagreeing about what approval means is the whole defect.
+                    found+=("$idx $matched_sha")
+                fi
+            elif [[ $undecorated =~ $SUSPECT_RE ]] \
+                 && ! [[ $undecorated =~ $REJECT_RE ]] \
+                 && ! [[ $undecorated =~ $REJECT_LEGACY_RE ]]; then
+                # A well-formed rejection for the OTHER lane reaches here (it is
+                # not this lane's rejection, and it is not an approval) and it
+                # opens with a verdict keyword, so it matches SUSPECT_RE. It is
+                # perfectly parseable and must not be reported as malformed.
+                printf 'M %s %s\n' "$idx" "${undecorated:0:120}"
+            fi
+        done <<< "$body"
+    done < <(printf '%s' "$comments_json" | jq -r '.[]? | .body // "" | @base64')
+    [ "$had_nocasematch" -eq 1 ] || shopt -u nocasematch
+    local row
+    for row in ${found[@]+"${found[@]}"}; do
+        printf 'S %s\n' "$row"
+    done
 }
 
 if ! has_label "$post_facto_label"; then
@@ -234,6 +447,90 @@ done
 for reviewer in "${review_families[@]}"; do
     has_label "${approval_labels[$reviewer]}" || missing_approval "$reviewer"
 done
+
+# (b') Each lane's newest verdict binds the EXACT current head.
+#
+# Fail closed on the inputs first. A missing or malformed head, or comments that
+# are not a JSON array, must BLOCK — never silently skip the binding check and
+# fall back to (b), which is the fail-open shape being removed here.
+binding_inputs_ok=1
+if ! [[ $head_sha =~ ^${SHA40_RE}$ ]]; then
+    binding_inputs_ok=0
+    fail "PR_HEAD_SHA is missing or is not a 40-hex commit id (got: '${head_sha}'); cannot bind approvals to the current head."
+fi
+if [ -n "$comments_source_error" ]; then
+    binding_inputs_ok=0
+    fail "$comments_source_error"
+elif ! command -v jq >/dev/null 2>&1; then
+    binding_inputs_ok=0
+    fail "jq is required to read the PR comments but is not on PATH."
+elif [ -z "${comments_json//[[:space:]]/}" ]; then
+    # Checked separately because `jq -e` exits 0 on EMPTY input: an unset
+    # PR_COMMENTS_JSON would otherwise pass this validation and be misreported
+    # downstream as "no approval" rather than "you did not pass the comments".
+    # An empty JSON array is a different thing and is legitimate here: it means
+    # the PR genuinely has no comments, which the binding check then refuses.
+    binding_inputs_ok=0
+    fail "PR_COMMENTS_JSON is missing or is not a JSON array; cannot verify exact-head approval."
+elif ! printf '%s' "$comments_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    binding_inputs_ok=0
+    fail "PR_COMMENTS_JSON is missing or is not a JSON array; cannot verify exact-head approval."
+fi
+
+if [ "$binding_inputs_ok" -eq 1 ]; then
+    head_lc=${head_sha,,}
+    malformed_seen=""
+    for lane in codex claude; do
+        lane_bound=()
+        lane_malformed=()
+        newest_idx=-1
+        while IFS= read -r row; do
+            case $row in
+                'S '*)
+                    row=${row#S }
+                    newest_idx=${row%% *}
+                    lane_bound+=("${row#* }")
+                    ;;
+                'M '*) lane_malformed+=("${row#M }") ;;
+            esac
+        done < <(scan_lane "$lane")
+
+        # An unparseable verdict line only matters if it could be a verdict this
+        # lane has not yet superseded. A malformed line in a comment OLDER than
+        # the lane's newest binding cannot express a newer opinion than that
+        # binding does, so it is history, not an open question.
+        #
+        # Without this the gate is UNSATISFIABLE for any PR that ever carried a
+        # prose verdict headline: #2176 and #2172 hold four such lines between
+        # them, and no amount of correct re-approval would clear them. A gate
+        # that cannot be satisfied by doing the right thing gets routed around,
+        # which is how it stops protecting anything. Lines at or after the
+        # newest binding still block, because those could be the rejection the
+        # parser failed to read.
+        for entry in ${lane_malformed[@]+"${lane_malformed[@]}"}; do
+            m_idx=${entry%% *}
+            m_line=${entry#* }
+            if [ "$newest_idx" -ge 0 ] && [ "$m_idx" -lt "$newest_idx" ]; then
+                continue
+            fi
+            case $'\n'"$malformed_seen" in
+                *$'\n'"$m_line"$'\n'*) ;;
+                *) malformed_seen+="${m_line}"$'\n' ;;
+            esac
+        done
+
+        if [ "${#lane_bound[@]}" -eq 0 ]; then
+            fail "no exact-head approval from ${lane}: found no \`APPROVED-AT: ${lane} <40-hex>\` line in any comment (the passed-review-${lane} label is a cache, not authority)."
+        elif [ "${lane_bound[-1]}" != "$head_lc" ]; then
+            fail "superseded approval from ${lane}: its newest binding is ${lane_bound[-1]}, but the current head is ${head_lc}; the approval must be re-earned at this head."
+        fi
+    done
+
+    while IFS= read -r bad; do
+        [ -n "$bad" ] || continue
+        fail "unparseable verdict line (matches no known APPROVED-AT / CHANGES-REQUESTED-AT shape, so it binds nothing): ${bad}"
+    done <<< "$malformed_seen"
+fi
 
 # (c) Required PR-body sections.
 for section in "Summary" "Determinism" "Linux Semantics" "Validation" "Human Review Required"; do
