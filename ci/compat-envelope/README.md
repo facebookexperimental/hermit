@@ -92,6 +92,16 @@ Run the complete red population from a clean committed checkout with:
 ./ci/compat-envelope/pressure-test.rs run
 ```
 
+The current improvement sequence starts with verify. Run only that red slice
+without changing its denominator or green definition with:
+
+```console
+./ci/compat-envelope/pressure-test.rs run --mode verify
+```
+
+The same option accepts `replay`, `chaos`, `custom`, or `naked`. Omitting it
+still attempts the complete red population.
+
 The command reuses the canonical Hermit/resource build nodes, serializes
 fixture preparation, and gives every red cell its own cgroup-boxed node.
 Enabled red cells use the ordinary exact-cell selector; disabled red cells use

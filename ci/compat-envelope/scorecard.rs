@@ -373,16 +373,16 @@ Stripped comparator and this table does not relabel it as strict INFO-log parity
     );
     let mut green_total = 0usize;
     let mut total = 0usize;
-    for backend in ordered {
+    for backend in &ordered {
         let backend_total = derived
             .population
             .iter()
-            .filter(|id| id.backend == backend)
+            .filter(|id| id.backend == *backend)
             .count();
         let backend_green = derived
             .green
             .iter()
-            .filter(|id| id.backend == backend)
+            .filter(|id| id.backend == *backend)
             .count();
         green_total += backend_green;
         total += backend_total;
@@ -393,6 +393,53 @@ Stripped comparator and this table does not relabel it as strict INFO-log parity
     }
     out.push_str(&format!(
         "| **Total** | **{green_total}** | **{}** | **{total}** |\n\n",
+        total - green_total
+    ));
+    out.push_str(
+        "The mode view makes the current order of work explicit: expand `verify` first, then \
+`replay`, then `chaos`. Each backend cell is `green / total`; an em dash means that mode does \
+not exist for that backend.\n\n| Mode",
+    );
+    for backend in &ordered {
+        out.push_str(&format!(" | `{backend}`"));
+    }
+    out.push_str(" | Green | Red | Total |\n| ---");
+    for _ in &ordered {
+        out.push_str(" | ---:");
+    }
+    out.push_str(" | ---: | ---: | ---: |\n");
+    for mode in ["verify", "replay", "chaos", "custom", "naked"] {
+        let mode_total = derived
+            .population
+            .iter()
+            .filter(|id| id.mode == mode)
+            .count();
+        let mode_green = derived.green.iter().filter(|id| id.mode == mode).count();
+        out.push_str(&format!("| `{mode}`"));
+        for backend in &ordered {
+            let cell_total = derived
+                .population
+                .iter()
+                .filter(|id| id.mode == mode && id.backend == *backend)
+                .count();
+            if cell_total == 0 {
+                out.push_str(" | —");
+            } else {
+                let cell_green = derived
+                    .green
+                    .iter()
+                    .filter(|id| id.mode == mode && id.backend == *backend)
+                    .count();
+                out.push_str(&format!(" | {cell_green} / {cell_total}"));
+            }
+        }
+        out.push_str(&format!(
+            " | {mode_green} | {} | {mode_total} |\n",
+            mode_total - mode_green
+        ));
+    }
+    out.push_str(&format!(
+        "| **Total** | | | | | | | **{green_total}** | **{}** | **{total}** |\n\n",
         total - green_total
     ));
     let chaos = derived

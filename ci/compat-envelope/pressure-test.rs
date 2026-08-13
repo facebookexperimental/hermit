@@ -44,10 +44,11 @@ const PRESSURE_RUN_TIMEOUT_SECONDS: i64 = 2 * 60 * 60;
 const USAGE: &str = r#"Usage: ci/compat-envelope/pressure-test.rs COMMAND [OPTIONS]
 
 Commands:
-  plan --results DIR [--output FILE]
+  plan --results DIR [--output FILE] [--mode MODE]
       Generate a safe-ci DAG that attempts every currently red cell. The
-      default output is DIR/dag.json.
-  run [--results DIR]
+      default output is DIR/dag.json. MODE selects verify, replay, chaos,
+      custom, or naked.
+  run [--results DIR] [--mode MODE]
       Require a clean committed checkout, generate the DAG, and execute it.
       The default result directory is ignored/compat-envelope/pressure-<SHA>-<time>.
   summarize --results DIR
@@ -110,6 +111,10 @@ struct ResultRow {
     mode: String,
     backend: Option<String>,
     outcome: String,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    error_kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -119,6 +124,8 @@ struct RunMetadata {
     detcore_tree: String,
     source_tree_dirty: bool,
     run_timeout_seconds: i64,
+    #[serde(default)]
+    mode: Option<String>,
     cells: Vec<CellId>,
 }
 
@@ -145,9 +152,9 @@ fn run() -> Result<(), String> {
     let root = repo_root()?;
     match command.as_str() {
         "plan" => {
-            let (results, output) = result_options(&root, &mut args, false)?;
+            let (results, output, mode) = result_options(&root, &mut args, false, true)?;
             let output = output.unwrap_or_else(|| results.join("dag.json"));
-            let metadata = write_plan(&root, &results, &output)?;
+            let metadata = write_plan(&root, &results, &output, mode.as_deref())?;
             println!("DAG: {}", output.display());
             println!("Results: {}", results.display());
             println!("Cells: {}", metadata.cells.len());
@@ -159,12 +166,12 @@ fn run() -> Result<(), String> {
             );
         }
         "run" => {
-            let (results, output) = result_options(&root, &mut args, true)?;
+            let (results, output, mode) = result_options(&root, &mut args, true, true)?;
             if worktree_dirty(&root)? {
                 return Err("run refuses a dirty checkout; commit first so every row binds to reproducible source".into());
             }
             let output = output.unwrap_or_else(|| results.join("dag.json"));
-            let metadata = write_plan(&root, &results, &output)?;
+            let metadata = write_plan(&root, &results, &output, mode.as_deref())?;
             let status = Command::new(root.join("ci/run-dag.sh"))
                 .args([
                     "portable",
@@ -187,7 +194,7 @@ fn run() -> Result<(), String> {
             summarize(&root, &results)?;
         }
         "summarize" => {
-            let (results, output) = result_options(&root, &mut args, false)?;
+            let (results, output, _) = result_options(&root, &mut args, false, false)?;
             if output.is_some() {
                 return Err("summarize does not accept --output".into());
             }
@@ -208,9 +215,11 @@ fn result_options(
     root: &Path,
     args: &mut impl Iterator<Item = String>,
     default_results: bool,
-) -> Result<(PathBuf, Option<PathBuf>), String> {
+    allow_mode: bool,
+) -> Result<(PathBuf, Option<PathBuf>, Option<String>), String> {
     let mut results = None;
     let mut output = None;
+    let mut mode = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--results" => {
@@ -223,6 +232,20 @@ fn result_options(
                     args.next().ok_or("--output requires a file")?,
                 ));
             }
+            "--mode" if allow_mode => {
+                let value = args.next().ok_or("--mode requires a value")?;
+                if !matches!(
+                    value.as_str(),
+                    "verify" | "replay" | "chaos" | "custom" | "naked"
+                ) {
+                    return Err(format!(
+                        "unknown mode `{value}`; expected verify, replay, chaos, custom, or naked"
+                    ));
+                }
+                if mode.replace(value).is_some() {
+                    return Err("--mode may be specified only once".into());
+                }
+            }
             _ => return Err(format!("unknown option `{arg}`\n\n{USAGE}")),
         }
     }
@@ -232,7 +255,7 @@ fn result_options(
         (None, false) => return Err("command requires --results DIR".into()),
     };
     let output = output.map(|path| absolute_from(root, path));
-    Ok((results, output))
+    Ok((results, output, mode))
 }
 
 fn absolute_from(root: &Path, path: PathBuf) -> PathBuf {
@@ -306,7 +329,7 @@ fn check_scorecard(root: &Path) -> Result<(), String> {
     }
 }
 
-fn pressure_cells(root: &Path) -> Result<PressureCells, String> {
+fn pressure_cells(root: &Path, mode: Option<&str>) -> Result<PressureCells, String> {
     let path = root.join(TRACKED_CELLS);
     let text =
         fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
@@ -320,33 +343,41 @@ fn pressure_cells(root: &Path) -> Result<PressureCells, String> {
     }
     let mut seen = BTreeSet::new();
     let mut red = Vec::new();
-    let mut preparation_by_test = BTreeMap::new();
+    let mut enabled_by_test = BTreeMap::new();
     for cell in tracked.cells {
         if !seen.insert(cell.id.clone()) {
             return Err("tracked cells contain a duplicate identity".into());
         }
         if cell.enabled {
-            preparation_by_test
+            enabled_by_test
                 .entry(cell.id.test.clone())
                 .or_insert_with(|| cell.id.clone());
         }
         match cell.status.as_str() {
-            "red" => red.push(cell),
+            "red" if mode.map_or(true, |selected| cell.id.mode == selected) => red.push(cell),
+            "red" => {}
             "green" => {}
             other => return Err(format!("unknown cell status `{other}`")),
         }
     }
     red.sort_by(|left, right| left.id.cmp(&right.id));
     if red.is_empty() {
-        return Err("tracked scorecard has no red cells".into());
+        return Err(match mode {
+            Some(mode) => format!("tracked scorecard has no red cells for mode `{mode}`"),
+            None => "tracked scorecard has no red cells".into(),
+        });
     }
+    let mut preparation_by_test = BTreeMap::new();
     for cell in &red {
-        if !preparation_by_test.contains_key(&cell.id.test) {
-            return Err(format!(
+        let prepared_with = enabled_by_test.get(&cell.id.test).ok_or_else(|| {
+            format!(
                 "{} has no manifest-enabled mode available to build its fixture",
                 cell.id.test
-            ));
-        }
+            )
+        })?;
+        preparation_by_test
+            .entry(cell.id.test.clone())
+            .or_insert_with(|| prepared_with.clone());
     }
     Ok(PressureCells {
         red,
@@ -442,12 +473,17 @@ fn pressure_node_timeout(budget: &CellBudget) -> i64 {
     pressure_timeout(budget) + 20
 }
 
-fn write_plan(root: &Path, results: &Path, output: &Path) -> Result<RunMetadata, String> {
+fn write_plan(
+    root: &Path,
+    results: &Path,
+    output: &Path,
+    mode: Option<&str>,
+) -> Result<RunMetadata, String> {
     check_scorecard(root)?;
     let PressureCells {
         red: cells,
         preparation_by_test,
-    } = pressure_cells(root)?;
+    } = pressure_cells(root, mode)?;
     let budgets = load_budgets(root)?;
     fs::create_dir_all(results).map_err(|e| format!("cannot create {}: {e}", results.display()))?;
     if let Some(parent) = output.parent() {
@@ -678,6 +714,7 @@ fn write_plan(root: &Path, results: &Path, output: &Path) -> Result<RunMetadata,
         detcore_tree,
         source_tree_dirty: worktree_dirty(root)?,
         run_timeout_seconds,
+        mode: mode.map(str::to_string),
         cells: cells.into_iter().map(|cell| cell.id).collect(),
     };
     let mut metadata_text = serde_json::to_string_pretty(&metadata)
@@ -799,7 +836,7 @@ fn summarize(root: &Path, results: &Path) -> Result<(), String> {
             )
         })?;
         let result_file = cell_dir.join("results.jsonl");
-        let (outcome, row_valid) = if result_file.is_file() {
+        let (outcome, row_valid, reason, error_kind) = if result_file.is_file() {
             let text = fs::read_to_string(&result_file)
                 .map_err(|e| format!("cannot read {}: {e}", result_file.display()))?;
             let lines: Vec<_> = text
@@ -807,7 +844,7 @@ fn summarize(root: &Path, results: &Path) -> Result<(), String> {
                 .filter(|line| !line.trim().is_empty())
                 .collect();
             if lines.len() != 1 {
-                ("NO_RESULT".to_string(), false)
+                ("NO_RESULT".to_string(), false, None, None)
             } else {
                 let row: ResultRow = serde_json::from_str(lines[0])
                     .map_err(|e| format!("invalid {}: {e}", result_file.display()))?;
@@ -832,13 +869,13 @@ fn summarize(root: &Path, results: &Path) -> Result<(), String> {
                     _ => false,
                 };
                 if id_matches && exit_matches {
-                    (row.outcome, true)
+                    (row.outcome, true, row.reason, row.error_kind)
                 } else {
-                    ("NO_RESULT".to_string(), false)
+                    ("NO_RESULT".to_string(), false, row.reason, row.error_kind)
                 }
             }
         } else {
-            ("NO_RESULT".to_string(), false)
+            ("NO_RESULT".to_string(), false, None, None)
         };
         *by_backend
             .entry(cell.backend.clone())
@@ -852,6 +889,8 @@ fn summarize(root: &Path, results: &Path) -> Result<(), String> {
             "cell": cell,
             "harness_exit": harness_status,
             "outcome": outcome,
+            "reason": reason,
+            "error_kind": error_kind,
             "result_row_valid": row_valid,
         }));
     }
@@ -899,6 +938,7 @@ fn summarize(root: &Path, results: &Path) -> Result<(), String> {
         "schema": SCHEMA,
         "hermit_sha": metadata.hermit_sha,
         "detcore_tree": metadata.detcore_tree,
+        "mode": metadata.mode,
         "attempted": metadata.cells.len(),
         "pass_candidates": passing,
         "rows": rows,

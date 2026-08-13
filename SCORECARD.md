@@ -16,4 +16,15 @@ These are the current pre-basic-sanity contracts. In particular, bare `--verify`
 | `native` | 0 | 336 | 336 |
 | **Total** | **170** | **6886** | **7056** |
 
+The mode view makes the current order of work explicit: expand `verify` first, then `replay`, then `chaos`. Each backend cell is `green / total`; an em dash means that mode does not exist for that backend.
+
+| Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `verify` | 147 / 336 | 9 / 336 | 0 / 336 | 9 / 336 | 2 / 336 | — | 167 | 1513 | 1680 |
+| `replay` | 1 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | — | 1 | 1679 | 1680 |
+| `chaos` | 0 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | — | 0 | 1680 | 1680 |
+| `custom` | 1 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | 1 / 336 | — | 2 | 1678 | 1680 |
+| `naked` | — | — | — | — | — | 0 / 336 | 0 | 336 | 336 |
+| **Total** | | | | | | | **170** | **6886** | **7056** |
+
 Ordinary full validation executes 172 selected regression cells: the 170 green compatibility cells above plus 2 chaos-mode race-exposure checks. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
