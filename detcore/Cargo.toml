@@ -29,8 +29,8 @@ async-trait = "0.1.91"
 bitflags = { version = "2.13.1", features = ["serde"], default-features = false }
 chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
-detcore-model = { version = "0.0.0", path = "../detcore-model" }
-digest = { version = "0.0.0", path = "../common/digest" }
+detcore-model = { path = "../detcore-model" }
+digest = { path = "../common/digest" }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
@@ -50,7 +50,7 @@ tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
-detcore-testutils = { version = "0.0.0", path = "tests/testutils" }
+detcore-testutils = { path = "tests/testutils" }
 reverie-ptrace = { version = "0.1.0", git = "https://github.com/facebookexperimental/reverie.git", branch = "main" }
-test-allocator = { version = "0.0.0", path = "../common/test-allocator" }
+test-allocator = { path = "../common/test-allocator" }
 test-case = "3.3.1"
