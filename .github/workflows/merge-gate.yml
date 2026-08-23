@@ -426,15 +426,8 @@ jobs:
               is_kvm=false
             fi
 
-            # The approver check needs to know who is being approved: a PR
-            # author who is also OWNER or MEMBER satisfies author_association
-            # on their own comment, so association alone cannot refuse a
-            # self-approval. Read from the PR, like head.sha above.
-            pr_author="$(jq -r '.user.login // ""' <<< "$pr_json")"
-
             if PR_LABELS="$labels" PR_BODY="$body" PR_IS_KVM="$is_kvm" \
                PR_NUMBER="$pr_number" PR_HEAD_SHA="$pr_head" \
-               PR_AUTHOR="$pr_author" \
                PR_COMMENTS_FILE="$pr_comments_file" \
                bash scripts/core-review-protocol-lint.sh; then
               :

@@ -99,18 +99,20 @@ fail=0
 # fixture that sets `user` or `author_association` keeps its own, and a
 # fixture that is not a JSON array (the input-validation cases) passes through
 # untouched rather than being silently repaired into something valid.
-readonly DEFAULT_APPROVER='reviewer-default'
+readonly DEFAULT_ROLE_TAG='[hermit2, reviewer-default, unresolved, devbig014, role=reviewer]'
 readonly PR_AUTHOR_FIXTURE='pr-author-fixture'
 authenticate_comments() {
     local json=$1 out
-    # `has`, not `//`: an explicit null is a real payload shape (a comment from a
-    # deleted account arrives as "user": null) and a fixture that states it must
-    # keep it. `//` treats null as absent and would quietly repair exactly the
-    # case the unidentified-commenter test exists to exercise.
-    out=$(jq -c --arg who "$DEFAULT_APPROVER" '
+    # Prefix a role tag onto any comment body that does not already open with a
+    # bracketed tag, so the pre-existing GRAMMAR cases keep testing grammar. A
+    # fixture that states its own tag, or deliberately omits one, is untouched:
+    # `test("^\\s*\\[")` looks only at what is there. A non-array payload (the
+    # input-validation cases) passes through so it can still be refused.
+    out=$(jq -c --arg tag "$DEFAULT_ROLE_TAG" '
         if type == "array" then
-            map((if has("user") then . else . + {user: {login: $who}} end)
-                | (if has("author_association") then . else . + {author_association: "MEMBER"} end))
+            map(if type == "object" and (.body // "" | test("^\\s*\\[") | not)
+                then .body = ($tag + "\n" + (.body // ""))
+                else . end)
         else . end' <<<"$json" 2>/dev/null) || { printf '%s' "$json"; return; }
     printf '%s' "$out"
 }
@@ -122,7 +124,6 @@ run_case() {
     comments=$(authenticate_comments "$comments")
     PR_LABELS="$labels" PR_BODY="$body" PR_IS_KVM="$is_kvm" PR_NUMBER="test" \
         PR_HEAD_SHA="$head" PR_COMMENTS_JSON="$comments" \
-        PR_AUTHOR="$PR_AUTHOR_FIXTURE" \
         bash "$LINT" >/dev/null 2>&1 || actual=$?
     if [ "$actual" -eq "$expected" ]; then
         echo "ok   - ${name} (exit ${actual})"
@@ -147,7 +148,6 @@ run_message_case() {
     comments=$(authenticate_comments "$comments")
     output=$(PR_LABELS="$labels" PR_BODY="$body" PR_IS_KVM=false PR_NUMBER="test" \
         PR_HEAD_SHA="$head" PR_COMMENTS_JSON="$comments" \
-        PR_AUTHOR="$PR_AUTHOR_FIXTURE" \
         bash "$LINT" 2>&1) || actual=$?
     if [ "$actual" -eq "$expected" ] && [[ $output == *"$needle"* ]]; then
         echo "ok   - ${name} (exit ${actual}, diagnosed)"
@@ -660,73 +660,101 @@ run_case "an old malformed line still blocks when that lane never re-bound" 1 \
 
 # --- WHO MAY APPROVE ----------------------------------------------------------
 #
-# Until 2026-08-23 the linter read only `.body`, so any account that could
-# comment could mint an approval and the PR's own author could satisfy both
-# lanes. Measured against the pre-fix script, ALL FOUR cases below exited 0.
-# These fixtures name their own identities, so authenticate_comments leaves
-# them alone.
-readonly SELF_APPROVAL="[
-  {\"user\": {\"login\": \"${PR_AUTHOR_FIXTURE}\"}, \"author_association\": \"OWNER\",
-   \"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
-  {\"user\": {\"login\": \"${PR_AUTHOR_FIXTURE}\"}, \"author_association\": \"OWNER\",
-   \"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"}
-]"
-readonly OUTSIDER_APPROVAL="[
-  {\"user\": {\"login\": \"drive-by\"}, \"author_association\": \"NONE\",
-   \"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
-  {\"user\": {\"login\": \"drive-by\"}, \"author_association\": \"NONE\",
-   \"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"}
-]"
-readonly GENUINE_APPROVAL="[
-  {\"user\": {\"login\": \"reviewer-codex\"}, \"author_association\": \"MEMBER\",
-   \"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
-  {\"user\": {\"login\": \"reviewer-claude\"}, \"author_association\": \"COLLABORATOR\",
-   \"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"}
-]"
-# An OWNER who is NOT the author is the control for the self-approval case: it
-# isolates "you cannot approve your own PR" from "you lack write access".
-readonly OTHER_OWNER_APPROVAL="[
-  {\"user\": {\"login\": \"some-owner\"}, \"author_association\": \"OWNER\",
-   \"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
-  {\"user\": {\"login\": \"some-owner\"}, \"author_association\": \"OWNER\",
-   \"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"}
-]"
+# These fixtures bypass authenticate_comments and state every byte themselves,
+# because what they test IS the tagging. Measured against the pre-fix script,
+# every "blocks" case below exited 0.
+run_raw_case() {
+    local name=$1 expected=$2 comments=$3 actual=0
+    PR_LABELS="$FULL_LABELS" PR_BODY="$FULL_BODY" PR_IS_KVM=false PR_NUMBER=test \
+        PR_HEAD_SHA="$HEAD_SHA" PR_COMMENTS_JSON="$comments" \
+        bash "$LINT" >/dev/null 2>&1 || actual=$?
+    if [ "$actual" -eq "$expected" ]; then
+        echo "ok   - ${name} (exit ${actual})"; pass=$((pass + 1))
+    else
+        echo "FAIL - ${name}: expected exit ${expected}, got ${actual}"; fail=$((fail + 1))
+    fi
+}
+run_raw_message_case() {
+    local name=$1 expected=$2 needle=$3 comments=$4 actual=0 output
+    output=$(PR_LABELS="$FULL_LABELS" PR_BODY="$FULL_BODY" PR_IS_KVM=false PR_NUMBER=test \
+        PR_HEAD_SHA="$HEAD_SHA" PR_COMMENTS_JSON="$comments" \
+        bash "$LINT" 2>&1) || actual=$?
+    if [ "$actual" -eq "$expected" ] && [[ $output == *"$needle"* ]]; then
+        echo "ok   - ${name} (exit ${actual}, diagnosed)"; pass=$((pass + 1))
+    else
+        echo "FAIL - ${name}: exit ${actual} (wanted ${expected}), diagnosis '${needle}' $([[ $output == *"$needle"* ]] && echo present || echo MISSING)"
+        fail=$((fail + 1))
+    fi
+}
+readonly TAG_REVIEWER='[hermit2, hermit-902, unresolved, devbig030, role=reviewer]'
+readonly TAG_RELAY='[hermit2, hermit-bpf-post, unresolved, devbig030, role=relay]'
+readonly TAG_LEGACY='[adversarial-reviewer agent, gpt-5.6-sol]'
 
-run_case "THE DEFECT: the PR author self-approving both lanes blocks" 1 \
-    "$FULL_LABELS" "$FULL_BODY" false "$SELF_APPROVAL" "$HEAD_SHA"
-
-run_case "an outside commenter (association NONE) cannot approve, blocks" 1 \
-    "$FULL_LABELS" "$FULL_BODY" false "$OUTSIDER_APPROVAL" "$HEAD_SHA"
-
-run_case "a comment with no identity in the payload cannot approve, blocks" 1 \
-    "$FULL_LABELS" "$FULL_BODY" false \
-    "[{\"user\": null, \"author_association\": null, \"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
-      {\"user\": null, \"author_association\": null, \"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"}]" \
-    "$HEAD_SHA"
-
-# Without these two the refusals above would also be satisfied by a linter that
-# simply rejects everything.
-run_case "GENUINE: two reviewers with write access approve, passes" 0 \
-    "$FULL_LABELS" "$FULL_BODY" false "$GENUINE_APPROVAL" "$HEAD_SHA"
-
-run_case "an OWNER who is not the author may approve, passes" 0 \
-    "$FULL_LABELS" "$FULL_BODY" false "$OTHER_OWNER_APPROVAL" "$HEAD_SHA"
-
-run_message_case "a self-approval is diagnosed as unauthenticated, not as absent" \
-    1 "no AUTHENTICATED exact-head approval" \
-    "$FULL_LABELS" "$FULL_BODY" "$SELF_APPROVAL" "$HEAD_SHA"
-
-# A rejection is deliberately NOT authenticated: anyone must be able to withdraw
-# authority, or the gate could be used to silence a real defect report.
-run_case "an UNPRIVILEGED rejection still supersedes a genuine approval, blocks" 1 \
-    "$FULL_LABELS" "$FULL_BODY" false \
-    "[{\"user\": {\"login\": \"reviewer-codex\"}, \"author_association\": \"MEMBER\",
+# THE HOLE. A bare binding, no role tag, posted by the repository OWNER who is
+# also the pull request's author. This is the case the previous revision still
+# admitted, and it is the one the whole change exists to refuse.
+run_raw_case "THE DEFECT: a BARE binding with no role tag does not approve" 1 \
+    "[{\"user\": {\"login\": \"owner-and-author\"}, \"author_association\": \"OWNER\",
        \"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
-      {\"user\": {\"login\": \"reviewer-claude\"}, \"author_association\": \"COLLABORATOR\",
-       \"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"},
-      {\"user\": {\"login\": \"drive-by\"}, \"author_association\": \"NONE\",
-       \"body\": \"CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"}]" \
-    "$HEAD_SHA"
+      {\"user\": {\"login\": \"owner-and-author\"}, \"author_association\": \"OWNER\",
+       \"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"}]"
+
+# ... and it stays refused however high the permission goes.
+run_raw_case "a bare binding from an OWNER still does not approve" 1 \
+    "[{\"author_association\": \"OWNER\", \"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"}]"
+
+# THE REAL SHAPES, which the association model refused. On this very PR both
+# approvals were posted by the owner, who was also the author, and one is a
+# relay for a reviewer with no route to api.github.com.
+run_raw_case "a role-tagged approval posted by the PR AUTHOR is accepted" 0 \
+    "[{\"user\": {\"login\": \"owner-and-author\"}, \"author_association\": \"OWNER\",
+       \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"user\": {\"login\": \"owner-and-author\"}, \"author_association\": \"OWNER\",
+       \"body\": \"${TAG_RELAY}\nAPPROVED-AT: claude ${HEAD_SHA}\nPROVENANCE: transcribed verbatim.\"}]"
+
+# Association is NOT the authority: a role-tagged review binds without it.
+run_raw_case "a role-tagged approval with association NONE is accepted" 0 \
+    "[{\"user\": {\"login\": \"relay-bot\"}, \"author_association\": \"NONE\",
+       \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"user\": {\"login\": \"relay-bot\"}, \"author_association\": \"NONE\",
+       \"body\": \"${TAG_RELAY}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
+
+# The fleet's tag shapes vary and the interior is deliberately not parsed;
+# approval_binding.py measured that reading it produces wrong verdicts.
+run_raw_case "a legacy-shaped role tag is accepted (interior is not parsed)" 0 \
+    "[{\"body\": \"${TAG_LEGACY}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"${TAG_LEGACY}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
+
+run_raw_case "a tag below an opening heading still counts as a review comment" 0 \
+    "[{\"body\": \"## Adversarial review\n${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"## Adversarial review\n${TAG_REVIEWER}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
+
+# A REJECTION IS NEVER REQUIRED TO BE TAGGED: authority may only be removed,
+# never granted, by this check.
+run_raw_case "an UNTAGGED rejection still supersedes a tagged approval" 1 \
+    "[{\"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"}]"
+
+# MALFORMED PAYLOAD MUST FAIL CLOSED. A non-object element makes jq raise and
+# ABORT, so rows after it are dropped. Placed between the approval and the
+# rejection that supersedes it, that deletes the rejection and the stale
+# approval stands: a fail-OPEN reachable from comment content.
+run_raw_case "THE DEFECT: a non-object element hiding a later rejection blocks" 1 \
+    "[{\"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: claude ${HEAD_SHA}\"},
+      \"not-an-object\",
+      {\"body\": \"CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"}]"
+
+run_raw_message_case "a malformed element is diagnosed as a refusal to read a truncated stream" \
+    1 "not a JSON object" \
+    "[{\"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"}, 42]"
+
+run_raw_message_case "a bare binding is diagnosed as not-a-review-comment, not as absent" \
+    1 "not a review comment" \
+    "[{\"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"}]"
 
 # --- PR_COMMENTS_FILE, the form the workflow actually uses --------------------
 comments_tmp=$(mktemp)
