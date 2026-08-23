@@ -88,12 +88,41 @@ fail=0
 #
 # Comments and head default to a valid dual-lane exact-head approval, so the
 # pre-existing label and body cases keep testing exactly what they always did.
+# Give every comment fixture an authorized author unless it names one itself.
+#
+# The cases below are about the verdict GRAMMAR — markdown wrappers, lane case,
+# supersession — not about who may approve. Since 2026-08-23 an approval must
+# also be authenticated, and spelling a login into each of those fixtures would
+# bury the thing each is actually testing. So the default is a reviewer with
+# write access who is not the PR author, and the authentication cases further
+# down state their identities explicitly. Deliberately non-destructive: a
+# fixture that sets `user` or `author_association` keeps its own, and a
+# fixture that is not a JSON array (the input-validation cases) passes through
+# untouched rather than being silently repaired into something valid.
+readonly DEFAULT_APPROVER='reviewer-default'
+readonly PR_AUTHOR_FIXTURE='pr-author-fixture'
+authenticate_comments() {
+    local json=$1 out
+    # `has`, not `//`: an explicit null is a real payload shape (a comment from a
+    # deleted account arrives as "user": null) and a fixture that states it must
+    # keep it. `//` treats null as absent and would quietly repair exactly the
+    # case the unidentified-commenter test exists to exercise.
+    out=$(jq -c --arg who "$DEFAULT_APPROVER" '
+        if type == "array" then
+            map((if has("user") then . else . + {user: {login: $who}} end)
+                | (if has("author_association") then . else . + {author_association: "MEMBER"} end))
+        else . end' <<<"$json" 2>/dev/null) || { printf '%s' "$json"; return; }
+    printf '%s' "$out"
+}
+
 run_case() {
     local name=$1 expected=$2 labels=$3 body=$4 is_kvm=${5:-false}
     local comments=${6-$FULL_APPROVALS} head=${7-$HEAD_SHA}
     local actual=0
+    comments=$(authenticate_comments "$comments")
     PR_LABELS="$labels" PR_BODY="$body" PR_IS_KVM="$is_kvm" PR_NUMBER="test" \
         PR_HEAD_SHA="$head" PR_COMMENTS_JSON="$comments" \
+        PR_AUTHOR="$PR_AUTHOR_FIXTURE" \
         bash "$LINT" >/dev/null 2>&1 || actual=$?
     if [ "$actual" -eq "$expected" ]; then
         echo "ok   - ${name} (exit ${actual})"
@@ -115,8 +144,10 @@ run_case() {
 run_message_case() {
     local name=$1 expected=$2 needle=$3 labels=$4 body=$5 comments=$6 head=$7
     local actual=0 output
+    comments=$(authenticate_comments "$comments")
     output=$(PR_LABELS="$labels" PR_BODY="$body" PR_IS_KVM=false PR_NUMBER="test" \
         PR_HEAD_SHA="$head" PR_COMMENTS_JSON="$comments" \
+        PR_AUTHOR="$PR_AUTHOR_FIXTURE" \
         bash "$LINT" 2>&1) || actual=$?
     if [ "$actual" -eq "$expected" ] && [[ $output == *"$needle"* ]]; then
         echo "ok   - ${name} (exit ${actual}, diagnosed)"
@@ -627,12 +658,83 @@ run_case "an old malformed line still blocks when that lane never re-bound" 1 \
     "[{\"body\": \"APPROVED AT EXACT HEAD ${OLD_SHA} -- prose headline\"},
       {\"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"}]" "$HEAD_SHA"
 
+# --- WHO MAY APPROVE ----------------------------------------------------------
+#
+# Until 2026-08-23 the linter read only `.body`, so any account that could
+# comment could mint an approval and the PR's own author could satisfy both
+# lanes. Measured against the pre-fix script, ALL FOUR cases below exited 0.
+# These fixtures name their own identities, so authenticate_comments leaves
+# them alone.
+readonly SELF_APPROVAL="[
+  {\"user\": {\"login\": \"${PR_AUTHOR_FIXTURE}\"}, \"author_association\": \"OWNER\",
+   \"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
+  {\"user\": {\"login\": \"${PR_AUTHOR_FIXTURE}\"}, \"author_association\": \"OWNER\",
+   \"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"}
+]"
+readonly OUTSIDER_APPROVAL="[
+  {\"user\": {\"login\": \"drive-by\"}, \"author_association\": \"NONE\",
+   \"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
+  {\"user\": {\"login\": \"drive-by\"}, \"author_association\": \"NONE\",
+   \"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"}
+]"
+readonly GENUINE_APPROVAL="[
+  {\"user\": {\"login\": \"reviewer-codex\"}, \"author_association\": \"MEMBER\",
+   \"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
+  {\"user\": {\"login\": \"reviewer-claude\"}, \"author_association\": \"COLLABORATOR\",
+   \"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"}
+]"
+# An OWNER who is NOT the author is the control for the self-approval case: it
+# isolates "you cannot approve your own PR" from "you lack write access".
+readonly OTHER_OWNER_APPROVAL="[
+  {\"user\": {\"login\": \"some-owner\"}, \"author_association\": \"OWNER\",
+   \"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
+  {\"user\": {\"login\": \"some-owner\"}, \"author_association\": \"OWNER\",
+   \"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"}
+]"
+
+run_case "THE DEFECT: the PR author self-approving both lanes blocks" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false "$SELF_APPROVAL" "$HEAD_SHA"
+
+run_case "an outside commenter (association NONE) cannot approve, blocks" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false "$OUTSIDER_APPROVAL" "$HEAD_SHA"
+
+run_case "a comment with no identity in the payload cannot approve, blocks" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"user\": null, \"author_association\": null, \"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"user\": null, \"author_association\": null, \"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"}]" \
+    "$HEAD_SHA"
+
+# Without these two the refusals above would also be satisfied by a linter that
+# simply rejects everything.
+run_case "GENUINE: two reviewers with write access approve, passes" 0 \
+    "$FULL_LABELS" "$FULL_BODY" false "$GENUINE_APPROVAL" "$HEAD_SHA"
+
+run_case "an OWNER who is not the author may approve, passes" 0 \
+    "$FULL_LABELS" "$FULL_BODY" false "$OTHER_OWNER_APPROVAL" "$HEAD_SHA"
+
+run_message_case "a self-approval is diagnosed as unauthenticated, not as absent" \
+    1 "no AUTHENTICATED exact-head approval" \
+    "$FULL_LABELS" "$FULL_BODY" "$SELF_APPROVAL" "$HEAD_SHA"
+
+# A rejection is deliberately NOT authenticated: anyone must be able to withdraw
+# authority, or the gate could be used to silence a real defect report.
+run_case "an UNPRIVILEGED rejection still supersedes a genuine approval, blocks" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"user\": {\"login\": \"reviewer-codex\"}, \"author_association\": \"MEMBER\",
+       \"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"user\": {\"login\": \"reviewer-claude\"}, \"author_association\": \"COLLABORATOR\",
+       \"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"},
+      {\"user\": {\"login\": \"drive-by\"}, \"author_association\": \"NONE\",
+       \"body\": \"CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"}]" \
+    "$HEAD_SHA"
+
 # --- PR_COMMENTS_FILE, the form the workflow actually uses --------------------
 comments_tmp=$(mktemp)
-printf '%s' "$FULL_APPROVALS" > "$comments_tmp"
+authenticate_comments "$FULL_APPROVALS" > "$comments_tmp"
 actual=0
 PR_LABELS="$FULL_LABELS" PR_BODY="$FULL_BODY" PR_IS_KVM=false PR_NUMBER=test \
     PR_HEAD_SHA="$HEAD_SHA" PR_COMMENTS_FILE="$comments_tmp" \
+    PR_AUTHOR="$PR_AUTHOR_FIXTURE" \
     bash "$LINT" >/dev/null 2>&1 || actual=$?
 if [ "$actual" -eq 0 ]; then
     echo "ok   - PR_COMMENTS_FILE is read and a valid binding passes (exit 0)"
@@ -646,11 +748,11 @@ rm -f "$comments_tmp"
 # PR_COMMENTS_FILE must WIN over PR_COMMENTS_JSON, or the workflow's real input
 # could be silently shadowed by a stale inline value.
 comments_tmp=$(mktemp)
-printf '[{"body": "APPROVED-AT: codex %s"}]' "$OLD_SHA" > "$comments_tmp"
+authenticate_comments "$(printf '[{"body": "APPROVED-AT: codex %s"}]' "$OLD_SHA")" > "$comments_tmp"
 actual=0
 PR_LABELS="$FULL_LABELS" PR_BODY="$FULL_BODY" PR_IS_KVM=false PR_NUMBER=test \
     PR_HEAD_SHA="$HEAD_SHA" PR_COMMENTS_FILE="$comments_tmp" \
-    PR_COMMENTS_JSON="$FULL_APPROVALS" \
+    PR_COMMENTS_JSON="$FULL_APPROVALS" PR_AUTHOR="$PR_AUTHOR_FIXTURE" \
     bash "$LINT" >/dev/null 2>&1 || actual=$?
 if [ "$actual" -eq 1 ]; then
     echo "ok   - PR_COMMENTS_FILE takes precedence over PR_COMMENTS_JSON (exit 1)"

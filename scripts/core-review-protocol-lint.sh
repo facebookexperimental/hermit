@@ -142,6 +142,7 @@ fi
 pr="${PR_NUMBER:-unknown}"
 is_kvm="${PR_IS_KVM:-false}"
 head_sha="${PR_HEAD_SHA-}"
+pr_author="${PR_AUTHOR-}"
 comments_file="${PR_COMMENTS_FILE-}"
 comments_json="${PR_COMMENTS_JSON-}"
 comments_source_error=""
@@ -195,6 +196,28 @@ if [ -z "${PR_LABELS+set}" ]; then
     exit 2
 fi
 labels="$PR_LABELS"
+
+# WHO MAY APPROVE. Until 2026-08-23 nothing here read the commenter at all: the
+# scan consumed `jq -r '.[]? | .body'` and matched the text, while the workflow
+# handed it the complete, unfiltered `issues/<pr>/comments` array. Every element
+# of that array carries `.user.login` and `.author_association`, and neither was
+# ever looked at, so ANY account that can comment could mint
+# `APPROVED-AT: claude <head>` — including the pull request's own author, who
+# could satisfy both lanes and self-clear the gate. The label cache was already
+# treated as "not authority"; the comment body was quietly trusted as if it were.
+#
+# GitHub computes `author_association` server-side per comment, so it cannot be
+# set by the commenter. These three are the values that imply write access to
+# this repository; CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR, MANNEQUIN, and NONE do
+# not, and an empty value means the payload did not identify the commenter.
+readonly APPROVER_ASSOCIATION_RE='^(OWNER|MEMBER|COLLABORATOR)$'
+
+# ONLY APPROVALS ARE AUTHENTICATED, NEVER REJECTIONS. Requiring authority to
+# REJECT would let an unprivileged reviewer's "this is broken" be discarded, so
+# a real defect report could be silenced by the gate itself. Authentication may
+# only ever remove a positive, never a negative; that keeps every divergence
+# from the reference in the refusing direction, the same property the SUSPECT_RE
+# divergence above is careful to preserve.
 
 # True when an exact label name is present (full-line match).
 has_label() {
@@ -309,7 +332,7 @@ readonly SUSPECT_RE="^[[:space:]#>*+-]*(APPROV|CHANGES-REQUESTED|REQUEST[[:space
 # tests still passed, because those cases also failed the binding check for an
 # unrelated reason. Tagged stdout is what makes both results actually observable.
 scan_lane() {
-    local lane=$1 encoded body line undecorated
+    local lane=$1 encoded body line undecorated login assoc
     local -a found=()
     local idx=-1
     # The reference grammar is case-insensitive throughout, so `APPROVED-AT:
@@ -318,10 +341,23 @@ scan_lane() {
     local had_nocasematch=0
     shopt -q nocasematch && had_nocasematch=1
     shopt -s nocasematch
-    while IFS= read -r encoded; do
+    while IFS=$'\t' read -r login assoc encoded; do
         [ -n "$encoded" ] || continue
         idx=$((idx + 1))
         body=$(printf '%s' "$encoded" | base64 -d)
+        # Decided per comment, before any line of it is read, so the same
+        # verdict applies to every APPROVED-AT line the comment carries.
+        local approver_refusal=""
+        if [ -z "$login" ] || [ -z "$assoc" ]; then
+            approver_refusal="the comment payload does not identify its author"
+        elif [ -n "$pr_author" ] && [ "${login,,}" = "${pr_author,,}" ]; then
+            # An author who is also OWNER/MEMBER passes the association test, so
+            # this check is not redundant with it: without it the one account
+            # guaranteed to want the gate open can still open it.
+            approver_refusal="the pull request's own author cannot approve it"
+        elif ! [[ $assoc =~ $APPROVER_ASSOCIATION_RE ]]; then
+            approver_refusal="author_association ${assoc} does not imply write access"
+        fi
         # A rejection contributes NOTHING from this comment, even if the same
         # comment also carries an APPROVED-AT-shaped line: a comment quoting the
         # approval it supersedes must not bind as a positive. Clearing rather
@@ -350,7 +386,13 @@ scan_lane() {
             undecorated=$(undecorate "$line")
             if [[ $undecorated =~ $APPROVE_RE ]]; then
                 local matched_lane=${BASH_REMATCH[1]} matched_sha=${BASH_REMATCH[2]}
-                if [ "${matched_lane,,}" = "$lane" ]; then
+                if [ "${matched_lane,,}" = "$lane" ] && [ -n "$approver_refusal" ]; then
+                    # Reported, not silently dropped. A refused approval that
+                    # vanished would surface only as the generic "no approval
+                    # from <lane>", which reads as "the reviewer never got to
+                    # it" rather than "someone tried to mint this".
+                    printf 'U %s %s (%s)\n' "$idx" "${login:-<unidentified>}" "$approver_refusal"
+                elif [ "${matched_lane,,}" = "$lane" ]; then
                     # Recorded EXACTLY as written, deliberately not lowercased.
                     # The reference verifier compares the captured text against
                     # the API's lowercase head, so an upper-case SHA does not
@@ -369,7 +411,12 @@ scan_lane() {
                 printf 'M %s %s\n' "$idx" "${undecorated:0:120}"
             fi
         done <<< "$body"
-    done < <(printf '%s' "$comments_json" | jq -r '.[]? | .body // "" | @base64')
+    # Carries the commenter out alongside the text. `.body` alone was the whole
+    # defect: it is the one field of a comment that its author fully controls.
+    # @tsv over a fixed 3-field row keeps the split unambiguous, and the body
+    # stays base64 so an embedded tab or newline cannot shift the columns.
+    done < <(printf '%s' "$comments_json" \
+        | jq -r '.[]? | [(.user.login // ""), (.author_association // ""), (.body // "" | @base64)] | @tsv')
     [ "$had_nocasematch" -eq 1 ] || shopt -u nocasematch
     local row
     for row in ${found[@]+"${found[@]}"}; do
@@ -492,6 +539,7 @@ if [ "$binding_inputs_ok" -eq 1 ]; then
     for lane in codex claude; do
         lane_bound=()
         lane_malformed=()
+        lane_unauthorized=()
         newest_idx=-1
         while IFS= read -r row; do
             case $row in
@@ -501,8 +549,15 @@ if [ "$binding_inputs_ok" -eq 1 ]; then
                     lane_bound+=("${row#* }")
                     ;;
                 'M '*) lane_malformed+=("${row#M }") ;;
+                'U '*) lane_unauthorized+=("${row#U }") ;;
             esac
         done < <(scan_lane "$lane")
+
+        # Said out loud even when the lane also has a genuine approval: an
+        # attempt to mint one is worth seeing in the log either way.
+        for entry in ${lane_unauthorized[@]+"${lane_unauthorized[@]}"}; do
+            echo "PR #${pr}: ignoring an unauthenticated ${lane} approval at comment ${entry% (*}: ${entry#* }"
+        done
 
         # An unparseable verdict line only matters if it could be a verdict this
         # lane has not yet superseded. A malformed line in a comment OLDER than
@@ -528,7 +583,9 @@ if [ "$binding_inputs_ok" -eq 1 ]; then
             esac
         done
 
-        if [ "${#lane_bound[@]}" -eq 0 ]; then
+        if [ "${#lane_bound[@]}" -eq 0 ] && [ "${#lane_unauthorized[@]}" -gt 0 ]; then
+            fail "no AUTHENTICATED exact-head approval from ${lane}: ${#lane_unauthorized[@]} \`APPROVED-AT: ${lane}\` line(s) were present but none came from an authorized approver (${lane_unauthorized[0]}). A comment body is not authority; the approver must have write access and must not be the pull request's author."
+        elif [ "${#lane_bound[@]}" -eq 0 ]; then
             fail "no exact-head approval from ${lane}: found no \`APPROVED-AT: ${lane} <40-hex>\` line in any comment (the passed-review-${lane} label is a cache, not authority)."
         elif [ "${lane_bound[-1]}" != "$head_lc" ]; then
             fail "superseded approval from ${lane}: its newest binding is ${lane_bound[-1]}, but the current head is ${head_lc}; the approval must be re-earned at this head."
