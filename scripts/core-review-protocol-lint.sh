@@ -479,7 +479,38 @@ scan_lane() {
     done
 }
 
+# AN INERT TRIGGER LABEL IS NOT A PASS.
+#
+# This gate keys on exactly one label. A PR carrying a DIFFERENT
+# `*-human-review` label gets the not-applicable fast path and exits 0 -- it
+# reads as "human review required" to anyone skimming, and is evaluated by
+# nothing. Measured on this repository: `pre-land-human-review` has ZERO
+# references across `.github/` and `scripts/`, so it triggers no gate anywhere,
+# while a `passed-review-claude` label sitting beside it reads as approved.
+#
+# Matched by SHAPE rather than by a list of known names, so a future variant is
+# caught the day it is invented instead of the day someone remembers to add it
+# here. That is deliberate: an enumerated set of bad labels would narrow
+# silently exactly as an enumerated rejection set does.
+#
+# Exit 2 (a plumbing refusal), not 1: the protocol has not failed, the caller
+# has asked an unanswerable question by labelling the PR with a trigger nothing
+# reads. Removing the label or replacing it with the real one both resolve it.
 if ! has_label "$post_facto_label"; then
+    inert_triggers=$(printf '%s\n' "$labels" \
+        | grep -E -- '-human-review$' \
+        | grep -Fxv -- "$post_facto_label" || true)
+    if [ -n "$inert_triggers" ]; then
+        echo "::error::PR #${pr}: carries a review-trigger label that NO gate reads:" >&2
+        printf '  %s\n' $inert_triggers >&2
+        echo "  This gate keys only on '${post_facto_label}'. As labelled, the PR takes" >&2
+        echo "  the not-applicable fast path and this lint checks NOTHING, while the label" >&2
+        echo "  reads as though human review were required. Either apply" >&2
+        echo "  '${post_facto_label}' so the protocol is actually evaluated, or remove" >&2
+        echo "  the inert label so the PR does not claim a review that no gate enforces." >&2
+        exit 2
+    fi
+
     # Report the genuinely-empty case distinctly from "has labels, but not this
     # one". Both are correct passes, and a reader who cannot tell them apart
     # cannot tell a real not-applicable from a lost label set.

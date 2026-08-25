@@ -162,6 +162,35 @@ run_message_case() {
 }
 
 # --- Not applicable: no post-facto-human-review label always passes. ----------
+# --- An INERT trigger label must refuse, not fast-path ------------------------
+#
+# The gate keys on exactly one label. A PR carrying a different `*-human-review`
+# label used to take the not-applicable path and exit 0, so it read as
+# "human review required" while being evaluated by nothing. That was live on
+# hermit#2216 itself -- the change that redefines what counts as an approval,
+# admitted without either version of that definition being applied to it.
+run_case "an inert *-human-review trigger refuses rather than fast-pathing" 2 \
+    "$(printf 'pre-land-human-review\nadversarial-review-claude1\npassed-review-claude')" \
+    "irrelevant body"
+
+# The refusal must NOT fire when the real trigger is also present: then the
+# protocol is applicable and must be evaluated on its merits (exit 0 or 1),
+# never short-circuited by the inert label sitting beside it.
+run_case "the real trigger beside an inert one is still evaluated, not refused" 1 \
+    "$(printf 'post-facto-human-review\npre-land-human-review')" \
+    "body missing the required sections"
+
+# Shape-matched, not name-matched: a label invented tomorrow is caught today.
+run_case "an unknown *-human-review variant is caught by shape" 2 \
+    "$(printf 'some-future-human-review\ncategory:infra')" \
+    "irrelevant body"
+
+# And the ordinary fast path is untouched: a label merely CONTAINING "review"
+# is not a trigger, so it must still pass.
+run_case "a non-trigger review label still takes the fast path" 0 \
+    "$(printf 'passed-review-claude\ncategory:infra')" \
+    "irrelevant body"
+
 run_case "unlabeled PR passes even with empty body" 0 \
     $'random-label\nlocally-validated' ""
 run_case "unlabeled PR passes even missing everything the protocol wants" 0 \
