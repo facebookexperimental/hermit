@@ -419,7 +419,7 @@ jobs:
 
             # A PR "touches KVM" when a changed file path or a label mentions kvm.
             files="$(gh api "repos/${REPO}/pulls/${pr_number}/files" \
-              --paginate --jq '.[].filename' || true)"
+              --paginate --jq '.[].filename')"
             if grep -qiE 'kvm' <<< "$files" || grep -Fixq kvm <<< "$labels"; then
               is_kvm=true
             else

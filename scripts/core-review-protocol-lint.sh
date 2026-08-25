@@ -84,9 +84,9 @@
 # Comment volume grows with exactly the review activity this gate reads, so the
 # inline form breaks first on the PRs that need the gate most.
 #
-# PR_HEAD_SHA and PR_COMMENTS_JSON are REQUIRED whenever the
-# `post-facto-human-review` label is present, and a missing, malformed, or
-# unparseable value BLOCKS. They are deliberately not optional: a check that
+# PR_HEAD_SHA and one of PR_COMMENTS_FILE / PR_COMMENTS_JSON are REQUIRED
+# whenever the `post-facto-human-review` label is present; a missing, malformed,
+# or unparseable value BLOCKS. They are deliberately not optional: a check that
 # goes quietly inert when its caller forgets an input is the same fail-open
 # shape this change exists to remove.
 #
@@ -196,53 +196,39 @@ if [ -z "${PR_LABELS+set}" ]; then
 fi
 labels="$PR_LABELS"
 
-# WHO MAY APPROVE. Until 2026-08-23 nothing here read anything but `.body`: the
+# WHICH COMMENTS MAY CARRY AN APPROVAL. Until 2026-08-23 nothing here read
+# anything but `.body`: the
 # scan consumed `jq -r '.[]? | .body'` and matched the text, while the workflow
 # handed it the complete, unfiltered `issues/<pr>/comments` array. So ANY account
 # that can comment could mint `APPROVED-AT: claude <head>`. The label cache was
 # already correctly treated as "not authority"; the comment body was quietly
 # trusted as if it were.
 #
-# THE AUTHORITY IS THE ROLE-TAGGED REVIEW COMMENT, NOT GITHUB WRITE ACCESS.
-# `ci-hub/health/approval_binding.py` states the rule this gate must agree with:
-# "an approval holds only if a role-tagged review comment names the EXACT
-# current head SHA for that lane", restating policy that "role-tagged review
-# comments carrying the full head SHA are authority; numbered review and
-# `passed-review-*` labels are caches."
+# AN APPROVAL NEEDS BOTH a role-tagged review comment and a trusted GitHub
+# posting association (OWNER, MEMBER, or COLLABORATOR). The association is not
+# proof that a review happened, so it cannot replace the role tag; the role tag
+# is self-asserted text, so it cannot replace the posting-account boundary.
+# Requiring both prevents an arbitrary public commenter from minting authority.
 #
-# An earlier revision of this file gated on `author_association` instead and was
-# rejected on review, for two measured reasons:
+# The posting account is deliberately allowed to equal the pull-request author.
+# This repository uses owner-posted relays when the independent reviewer cannot
+# reach api.github.com. Rejecting every author-posted comment would reject those
+# real attestations. The lane still comes only from the explicit
+# `APPROVED-AT: <lane> <40-hex>` line, not from the tag interior or association.
 #
-#   * It is not the authority. Association is a GitHub repository permission; it
-#     says nothing about whether a review happened.
-#   * It REJECTED THE REAL ATTESTATIONS. On this very pull request every genuine
-#     approval was posted by the repository owner, who was also the author, and
-#     one is an explicit relay: a reviewer with no route to api.github.com had
-#     its verdict transcribed by another process. A commenter-is-not-the-author
-#     rule refuses all of those, and "the reviewer could not reach GitHub" must
-#     not read as "nobody reviewed".
-#
-# So the posting account is recorded for the audit trail and is NOT gated on.
-# What is required is that the binding appear in a comment that presents itself
-# as a review — a bracketed role tag, the convention already used across this
-# fleet. The tag's INTERIOR is deliberately not parsed: approval_binding.py
-# measured that guessing from it produces confidently wrong verdicts, because
-# the tag does not encode the lane and its shape varies across the fleet
-# (`[impl agent, claude-opus-5]`, `[adversarial-reviewer agent, GPT-5 Codex]`,
-# `[hermit2, hermit-902, unresolved, devbig030, role=reviewer]`). The lane comes
-# only from the explicit `APPROVED-AT: <lane> <40-hex>` binding, exactly as
-# there. Presence of the tag is the signal; its contents are not interpreted.
+# The role tag's interior is deliberately not parsed: its shape varies across
+# the fleet and does not reliably encode the lane. Presence of a bracketed tag
+# marks a review/relay comment; OWNER/MEMBER/COLLABORATOR constrains who may post
+# it; the exact binding line names the lane and head.
 readonly ROLE_TAG_RE='^\[[^][]+\]$'
-
+#
 # WHAT THIS DOES AND DOES NOT ESTABLISH, stated because overclaiming here is
-# itself a defect. It closes the bare-line hole: a comment carrying nothing but
-# `APPROVED-AT: <lane> <head>` no longer binds, whoever posts it and whatever
-# their repository permission. It does NOT authenticate the tag's contents — a
-# determined author can write a role tag. This fleet already says so in band:
-# a disclosure line on this pull request reads "Disclosure, not authentication."
-# Cryptographic reviewer identity would have to come from the registered
-# boundary, not from a comment body, and that is not something this lint can
-# assert on its own.
+# itself a defect. It closes both the bare-line hole and the arbitrary-public-
+# commenter hole. It still does NOT cryptographically authenticate the human or
+# agent named inside a role tag: a repository collaborator, including the PR
+# author, can write one. Cryptographic reviewer identity must come from the
+# registered boundary rather than from mutable comment text; this lint can only
+# require the strongest provenance the GitHub comment payload itself exposes.
 #
 # ONLY APPROVALS ARE CHECKED, NEVER REJECTIONS. Requiring a role tag to REJECT
 # would let an untagged "this is broken" be discarded, so a real defect report
@@ -316,40 +302,46 @@ undecorate() {
 }
 
 readonly SHA40_RE='[0-9a-fA-F]{40}'
-# The structural-prefix class is on the REJECTIONS and deliberately NOT on
-# APPROVE_RE. `undecorate` removes markdown that WRAPS a line; a marker like
-# `##`, `>`, or `-` is a prefix with no closer and survives it. Each direction
-# here is the refusing one: a masked rejection is HONOURED so it revokes (being
-# generous about recognising a rejection only ever withdraws authority), while a
-# masked APPROVAL still cannot bind — extending the class to APPROVE_RE would
-# let `## APPROVED-AT: ...` start authorising. Matches the reference verifier
-# `ci-hub/health/approval_binding.py`; see its REJECT_PREFIX comment.
-readonly VERDICT_PREFIX='[[:space:]#>*+-]*'
+# Structural Markdown is accepted for rejections, never approvals. Normalise
+# headings, block quotes, unordered/ordered lists, and task-list markers one
+# layer at a time so nested forms cannot hide a negative verdict. Applying the
+# same normalisation to suspect detection makes malformed or truncated verdicts
+# visible too. An approval still binds only when APPROVE_RE matches the original
+# undecorated line exactly; `## APPROVED-AT: ...` therefore refuses rather than
+# authorising.
 readonly APPROVE_RE="^APPROVED-AT:[[:space:]]*(claude|codex)[[:space:]]+(${SHA40_RE})$"
-readonly REJECT_RE="^${VERDICT_PREFIX}CHANGES-REQUESTED-AT:[[:space:]]*(claude|codex)[[:space:]]+${SHA40_RE}$"
-readonly REJECT_LEGACY_RE="^${VERDICT_PREFIX}REQUEST[[:space:]]+CHANGES[[:space:]]+AT[[:space:]]+${SHA40_RE}$"
+readonly REJECT_RE="^CHANGES-REQUESTED-AT:[[:space:]]*(claude|codex)[[:space:]]+${SHA40_RE}$"
+readonly REJECT_LEGACY_RE="^REQUEST[[:space:]]+CHANGES[[:space:]]+AT[[:space:]]+${SHA40_RE}$"
+readonly EXPLICIT_VERDICT_RE='^(APPROVED-AT:|CHANGES-REQUESTED-AT:|REQUEST[[:space:]]+CHANGES[[:space:]]+AT)'
+readonly STRUCTURAL_PREFIX_RE='^(#{1,6}[[:space:]]*|>[[:space:]]*|[-+*][[:space:]]+(\[[[:space:]xX]\][[:space:]]+)?|[0-9]+[.)][[:space:]]+(\[[[:space:]xX]\][[:space:]]+)?)(.*)$'
+
+strip_structural_prefix() {
+    local line=$1
+    while [[ $line =~ $STRUCTURAL_PREFIX_RE ]]; do
+        line=${BASH_REMATCH[4]}
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+    done
+    printf '%s' "$line"
+}
+
 # A line plainly trying to be a verdict binding but matching no known shape.
 #
 # DELIBERATELY STRICTER THAN THE REFERENCE, IN THE REFUSING DIRECTION ONLY.
-# The leading `[#>*+-]` class is not in `approval_binding.py`. Without it a
-# verdict line carrying a markdown STRUCTURAL prefix — `## CHANGES-REQUESTED-AT:
-# claude <sha>` — matches neither the verdict grammar nor the suspect pattern,
-# so it is silently invisible. Measured against the reference on 2026-08-13: for
-# an approval followed by a `##`-prefixed rejection at the SAME head, the
-# reference returns the approval with an empty malformed list, i.e. the lane
-# reads as currently approved while its newest verdict is a rejection. That is a
-# false PASS, and it is what happened on PR #2176.
-#
-# `undecorate` above cannot absorb these because it only removes markdown that
-# WRAPS a line (matching opener and closer); a heading, blockquote, or list
-# marker is a prefix with no closer.
+# Explicit APPROVED-AT / CHANGES-REQUESTED-AT / REQUEST CHANGES AT prefixes are
+# suspect even without a full SHA. Otherwise a truncated rejection such as
+# `CHANGES-REQUESTED-AT: claude 0123456789ab` silently disappears. The broader
+# pattern retains the historical verdict-ish spellings when they do carry a
+# full SHA, without treating ordinary prose beginning with "approval" as a
+# verdict.
 #
 # This gate therefore refuses such a line instead of ignoring it. The divergence
 # can only ever turn a reference PASS into a refusal here, never the reverse —
 # a property the differential in the PR description measures rather than
 # asserts. The correct end state is for the reference to adopt the same class so
 # both consumers agree again; that belongs in a dev-hermit change, not here.
-readonly SUSPECT_RE="^[[:space:]#>*+-]*(APPROV|CHANGES-REQUESTED|REQUEST[[:space:]]+CHANGES|REJECT|LGTM|SIGN(ED)?[-[:space:]]?OFF|ACK).*${SHA40_RE}"
+readonly SUSPECT_RE="^(APPROV|CHANGES-REQUESTED|REQUEST[[:space:]]+CHANGES|REJECT|LGTM|SIGN(ED)?[-[:space:]]?OFF|ACK).*${SHA40_RE}"
+
 
 # Scan every comment for LANE and emit one tagged row per line of stdout:
 #
@@ -363,7 +355,7 @@ readonly SUSPECT_RE="^[[:space:]#>*+-]*(APPROV|CHANGES-REQUESTED|REQUEST[[:space
 # tests still passed, because those cases also failed the binding check for an
 # unrelated reason. Tagged stdout is what makes both results actually observable.
 scan_lane() {
-    local lane=$1 encoded body line undecorated login assoc
+    local lane=$1 encoded body line undecorated verdict_line login assoc created updated
     local -a found=()
     local idx=-1
     # The reference grammar is case-insensitive throughout, so `APPROVED-AT:
@@ -372,10 +364,33 @@ scan_lane() {
     local had_nocasematch=0
     shopt -q nocasematch && had_nocasematch=1
     shopt -s nocasematch
-    while IFS=$'\x1f' read -r login assoc encoded; do
+    while IFS=$'\x1f' read -r login assoc created updated encoded; do
         [ -n "$encoded" ] || continue
         idx=$((idx + 1))
         body=$(printf '%s' "$encoded" | base64 -d)
+        # GitHub returns issue comments in creation order, but comments are
+        # mutable. If a verdict-bearing comment was edited, the current payload
+        # cannot prove where the edited verdict belongs in the chronology or
+        # what verdict it replaced. Refuse it instead of treating creation order
+        # as an answer about edit order.
+        if [ -n "$created" ] && [ -n "$updated" ] && [ "$created" != "$updated" ]; then
+            local edited_verdict=0
+            while IFS= read -r line; do
+                undecorated=$(undecorate "$line")
+                verdict_line=$(strip_structural_prefix "$undecorated")
+                if [[ $undecorated =~ $APPROVE_RE ]] \
+                   || [[ $verdict_line =~ $REJECT_RE ]] \
+                   || [[ $verdict_line =~ $REJECT_LEGACY_RE ]] \
+                   || [[ $verdict_line =~ $EXPLICIT_VERDICT_RE ]] \
+                   || [[ $verdict_line =~ $SUSPECT_RE ]]; then
+                    printf 'E %s edited verdict comment cannot establish chronology: %s\n' \
+                        "$idx" "${verdict_line:0:80}"
+                    edited_verdict=1
+                    break
+                fi
+            done <<< "$body"
+            [ "$edited_verdict" -eq 0 ] || continue
+        fi
         # Decided per comment, before any line of it is read, so the same
         # verdict applies to every APPROVED-AT line the comment carries.
         # Scanned over the WHOLE comment, not just its first line: the relayed
@@ -394,6 +409,12 @@ scan_lane() {
                 break
             fi
         done <<< "$body"
+        if [ -z "$approver_refusal" ]; then
+            case ${assoc^^} in
+                OWNER|MEMBER|COLLABORATOR) ;;
+                *) approver_refusal="author_association '${assoc:-<missing>}' is not OWNER, MEMBER, or COLLABORATOR" ;;
+            esac
+        fi
         # A rejection contributes NOTHING from this comment, even if the same
         # comment also carries an APPROVED-AT-shaped line: a comment quoting the
         # approval it supersedes must not bind as a positive. Clearing rather
@@ -402,11 +423,12 @@ scan_lane() {
         local rejected=0
         while IFS= read -r line; do
             undecorated=$(undecorate "$line")
-            if [[ $undecorated =~ $REJECT_LEGACY_RE ]]; then
+            verdict_line=$(strip_structural_prefix "$undecorated")
+            if [[ $verdict_line =~ $REJECT_LEGACY_RE ]]; then
                 rejected=1
                 break
             fi
-            if [[ $undecorated =~ $REJECT_RE ]]; then
+            if [[ $verdict_line =~ $REJECT_RE ]]; then
                 local rejected_lane=${BASH_REMATCH[1]}
                 if [ "${rejected_lane,,}" = "$lane" ]; then
                     rejected=1
@@ -420,6 +442,7 @@ scan_lane() {
         fi
         while IFS= read -r line; do
             undecorated=$(undecorate "$line")
+            verdict_line=$(strip_structural_prefix "$undecorated")
             if [[ $undecorated =~ $APPROVE_RE ]]; then
                 local matched_lane=${BASH_REMATCH[1]} matched_sha=${BASH_REMATCH[2]}
                 if [ "${matched_lane,,}" = "$lane" ] && [ -n "$approver_refusal" ]; then
@@ -427,7 +450,9 @@ scan_lane() {
                     # vanished would surface only as the generic "no approval
                     # from <lane>", which reads as "the reviewer never got to
                     # it" rather than "someone tried to mint this".
-                    printf 'U %s %s (%s)\n' "$idx" "${login:-<unidentified>}" "$approver_refusal"
+                    printf 'U %s %s association=%s (%s)\n' \
+                        "$idx" "${login:-<unidentified>}" \
+                        "${assoc:-<unknown>}" "$approver_refusal"
                 elif [ "${matched_lane,,}" = "$lane" ]; then
                     # Recorded EXACTLY as written, deliberately not lowercased.
                     # The reference verifier compares the captured text against
@@ -437,21 +462,20 @@ scan_lane() {
                     # disagreeing about what approval means is the whole defect.
                     found+=("$idx $matched_sha")
                 fi
-            elif [[ $undecorated =~ $SUSPECT_RE ]] \
-                 && ! [[ $undecorated =~ $REJECT_RE ]] \
-                 && ! [[ $undecorated =~ $REJECT_LEGACY_RE ]]; then
+            elif { [[ $verdict_line =~ $EXPLICIT_VERDICT_RE ]] \
+                   || [[ $verdict_line =~ $SUSPECT_RE ]]; } \
+                 && ! [[ $verdict_line =~ $REJECT_RE ]] \
+                 && ! [[ $verdict_line =~ $REJECT_LEGACY_RE ]]; then
                 # A well-formed rejection for the OTHER lane reaches here (it is
                 # not this lane's rejection, and it is not an approval) and it
                 # opens with a verdict keyword, so it matches SUSPECT_RE. It is
                 # perfectly parseable and must not be reported as malformed.
-                printf 'M %s %s\n' "$idx" "${undecorated:0:120}"
+                printf 'M %s %s\n' "$idx" "${verdict_line:0:120}"
             fi
         done <<< "$body"
-    # Carries the commenter out alongside the text, for the audit trail. `.body`
-    # alone was the whole defect: it is the one field of a comment that its
-    # author fully controls. @tsv over a fixed 3-field row keeps the split
-    # unambiguous, and the body stays base64 so an embedded tab or newline
-    # cannot shift the columns.
+    # Carries commenter identity and creation/edit timestamps alongside the
+    # text. @tsv over a fixed 5-field row keeps the split unambiguous, and the
+    # body stays base64 so an embedded tab or newline cannot shift the columns.
     #
     # TOTAL BY CONSTRUCTION. Every accessor is guarded, so no element can make
     # jq raise and truncate the stream mid-way. The input validation above
@@ -462,8 +486,10 @@ scan_lane() {
         | jq -r '.[]? | if type == "object" then
                             [((.user // {}) | if type == "object" then (.login // "") else "" end),
                              (.author_association // ""),
+                             (.created_at // ""),
+                             (.updated_at // ""),
                              (.body // "" | tostring | @base64)]
-                        else ["", "", ""] end | join("\u001f")')
+                        else ["", "", "", "", ""] end | join("\u001f")')
     # Truncation is still checked rather than assumed: if the loop saw fewer
     # comments than the payload holds, something dropped rows and the lane's
     # verdict was computed from a partial history.
@@ -639,6 +665,7 @@ if [ "$binding_inputs_ok" -eq 1 ]; then
         lane_bound=()
         lane_malformed=()
         lane_unauthorized=()
+        lane_edited=()
         lane_truncated=()
         newest_idx=-1
         while IFS= read -r row; do
@@ -650,6 +677,7 @@ if [ "$binding_inputs_ok" -eq 1 ]; then
                     ;;
                 'M '*) lane_malformed+=("${row#M }") ;;
                 'U '*) lane_unauthorized+=("${row#U }") ;;
+                'E '*) lane_edited+=("${row#E }") ;;
                 'X '*) lane_truncated+=("${row#X }") ;;
             esac
         done < <(scan_lane "$lane")
@@ -658,6 +686,10 @@ if [ "$binding_inputs_ok" -eq 1 ]; then
         # direction, because the rows that went missing could be the rejection.
         for entry in ${lane_truncated[@]+"${lane_truncated[@]}"}; do
             fail "cannot verify ${lane}: ${entry}. A verdict computed from part of the comment history is not a verdict."
+        done
+
+        for entry in ${lane_edited[@]+"${lane_edited[@]}"}; do
+            fail "cannot verify ${lane}: ${entry}. Edited verdict comments have no trustworthy chronology."
         done
 
         # Said out loud even when the lane also has a genuine approval: an
@@ -691,7 +723,7 @@ if [ "$binding_inputs_ok" -eq 1 ]; then
         done
 
         if [ "${#lane_bound[@]}" -eq 0 ] && [ "${#lane_unauthorized[@]}" -gt 0 ]; then
-            fail "no AUTHENTICATED exact-head approval from ${lane}: ${#lane_unauthorized[@]} \`APPROVED-AT: ${lane}\` line(s) were present but none came from an authorized approver (${lane_unauthorized[0]}). A comment body is not authority; the approver must have write access and must not be the pull request's author."
+            fail "no trusted role-tagged exact-head approval from ${lane}: ${#lane_unauthorized[@]} \`APPROVED-AT: ${lane}\` line(s) were present but none came from an eligible review comment (${lane_unauthorized[0]}). A bare or public-commenter body is not authority; the comment must contain a bracketed reviewer or relay role tag and have OWNER, MEMBER, or COLLABORATOR association."
         elif [ "${#lane_bound[@]}" -eq 0 ]; then
             fail "no exact-head approval from ${lane}: found no \`APPROVED-AT: ${lane} <40-hex>\` line in any comment (the passed-review-${lane} label is a cache, not authority)."
         elif [ "${lane_bound[-1]}" != "$head_lc" ]; then

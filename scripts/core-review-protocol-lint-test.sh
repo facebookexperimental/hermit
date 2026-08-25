@@ -88,14 +88,14 @@ fail=0
 #
 # Comments and head default to a valid dual-lane exact-head approval, so the
 # pre-existing label and body cases keep testing exactly what they always did.
-# Give every comment fixture an authorized author unless it names one itself.
+# Give every comment fixture a reviewer role tag unless it names one itself.
 #
 # The cases below are about the verdict GRAMMAR — markdown wrappers, lane case,
 # supersession — not about who may approve. Since 2026-08-23 an approval must
-# also be authenticated, and spelling a login into each of those fixtures would
+# also carry a role tag, and spelling one into each of those fixtures would
 # bury the thing each is actually testing. So the default is a reviewer with
-# write access who is not the PR author, and the authentication cases further
-# down state their identities explicitly. Deliberately non-destructive: a
+# recognizable role tag, and the role-tag cases further down state their comment
+# shapes explicitly. Deliberately non-destructive: a
 # fixture that sets `user` or `author_association` keeps its own, and a
 # fixture that is not a JSON array (the input-validation cases) passes through
 # untouched rather than being silently repaired into something valid.
@@ -103,15 +103,19 @@ readonly DEFAULT_ROLE_TAG='[hermit2, reviewer-default, unresolved, devbig014, ro
 readonly PR_AUTHOR_FIXTURE='pr-author-fixture'
 authenticate_comments() {
     local json=$1 out
-    # Prefix a role tag onto any comment body that does not already open with a
-    # bracketed tag, so the pre-existing GRAMMAR cases keep testing grammar. A
-    # fixture that states its own tag, or deliberately omits one, is untouched:
+    # Add the trusted OWNER association used by this repository's real relay
+    # comments, and prefix a role tag onto any body that does not already open
+    # with one, so the pre-existing GRAMMAR cases keep testing grammar. A
+    # fixture that states its own association/tag is untouched:
     # `test("^\\s*\\[")` looks only at what is there. A non-array payload (the
     # input-validation cases) passes through so it can still be refused.
     out=$(jq -c --arg tag "$DEFAULT_ROLE_TAG" '
         if type == "array" then
-            map(if type == "object" and (.body // "" | test("^\\s*\\[") | not)
-                then .body = ($tag + "\n" + (.body // ""))
+            map(if type == "object" then
+                    .author_association = (.author_association // "OWNER")
+                    | if (.body // "" | test("^\\s*\\[") | not)
+                      then .body = ($tag + "\n" + (.body // ""))
+                      else . end
                 else . end)
         else . end' <<<"$json" 2>/dev/null) || { printf '%s' "$json"; return; }
     printf '%s' "$out"
@@ -742,8 +746,9 @@ run_raw_case "a role-tagged approval posted by the PR AUTHOR is accepted" 0 \
       {\"user\": {\"login\": \"owner-and-author\"}, \"author_association\": \"OWNER\",
        \"body\": \"${TAG_RELAY}\nAPPROVED-AT: claude ${HEAD_SHA}\nPROVENANCE: transcribed verbatim.\"}]"
 
-# Association is NOT the authority: a role-tagged review binds without it.
-run_raw_case "a role-tagged approval with association NONE is accepted" 0 \
+# Association is not reviewer identity, but it is a minimum posting-account
+# trust boundary: an arbitrary public commenter cannot mint an approval.
+run_raw_case "a role-tagged approval with association NONE is refused" 1 \
     "[{\"user\": {\"login\": \"relay-bot\"}, \"author_association\": \"NONE\",
        \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
       {\"user\": {\"login\": \"relay-bot\"}, \"author_association\": \"NONE\",
@@ -752,19 +757,53 @@ run_raw_case "a role-tagged approval with association NONE is accepted" 0 \
 # The fleet's tag shapes vary and the interior is deliberately not parsed;
 # approval_binding.py measured that reading it produces wrong verdicts.
 run_raw_case "a legacy-shaped role tag is accepted (interior is not parsed)" 0 \
-    "[{\"body\": \"${TAG_LEGACY}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
-      {\"body\": \"${TAG_LEGACY}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
+    "[{\"author_association\": \"OWNER\", \"body\": \"${TAG_LEGACY}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"${TAG_LEGACY}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
 
 run_raw_case "a tag below an opening heading still counts as a review comment" 0 \
-    "[{\"body\": \"## Adversarial review\n${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
-      {\"body\": \"## Adversarial review\n${TAG_REVIEWER}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
+    "[{\"author_association\": \"OWNER\", \"body\": \"## Adversarial review\n${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"## Adversarial review\n${TAG_REVIEWER}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
 
 # A REJECTION IS NEVER REQUIRED TO BE TAGGED: authority may only be removed,
 # never granted, by this check.
 run_raw_case "an UNTAGGED rejection still supersedes a tagged approval" 1 \
-    "[{\"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
-      {\"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: claude ${HEAD_SHA}\"},
+    "[{\"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: claude ${HEAD_SHA}\"},
       {\"body\": \"CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"}]"
+
+run_case "an ordered-list rejection still revokes" 1 "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"1. CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "a task-list rejection still revokes" 1 "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"- [ ] CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "a truncated explicit rejection is unparseable and blocks" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"CHANGES-REQUESTED-AT: claude 0123456789ab\"}]" "$HEAD_SHA"
+run_case "a no-space truncated rejection is unparseable and blocks" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"CHANGES-REQUESTED-AT:claude 0123456789ab\"}]" "$HEAD_SHA"
+
+run_case "a no-space truncated approval is unparseable and blocks" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"APPROVED-AT:claude 0123456789ab\"}]" "$HEAD_SHA"
+
+
+run_case "an edited older verdict comment blocks instead of using creation order" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"created_at\": \"2026-08-25T01:00:00Z\", \"updated_at\": \"2026-08-25T04:00:00Z\", \"body\": \"CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"created_at\": \"2026-08-25T02:00:00Z\", \"updated_at\": \"2026-08-25T02:00:00Z\", \"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"created_at\": \"2026-08-25T03:00:00Z\", \"updated_at\": \"2026-08-25T03:00:00Z\", \"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
 
 # MALFORMED PAYLOAD MUST FAIL CLOSED. A non-object element makes jq raise and
 # ABORT, so rows after it are dropped. Placed between the approval and the
@@ -785,7 +824,14 @@ run_raw_message_case "a bare binding is diagnosed as not-a-review-comment, not a
     "[{\"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
       {\"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"}]"
 
+# --- Diagnostic specificity --------------------------------------------------
+run_raw_message_case "a bare binding diagnosis names the role-tag requirement" \
+    1 "bracketed reviewer or relay role tag" \
+    "[{\"author_association\": \"OWNER\", \"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"}]"
+
 # --- PR_COMMENTS_FILE, the form the workflow actually uses --------------------
+
 comments_tmp=$(mktemp)
 authenticate_comments "$FULL_APPROVALS" > "$comments_tmp"
 actual=0
