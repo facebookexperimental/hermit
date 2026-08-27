@@ -313,6 +313,36 @@ readonly APPROVE_RE="^APPROVED-AT:[[:space:]]*(claude|codex)[[:space:]]+(${SHA40
 readonly REJECT_RE="^CHANGES-REQUESTED-AT:[[:space:]]*(claude|codex)[[:space:]]+${SHA40_RE}$"
 readonly REJECT_LEGACY_RE="^REQUEST[[:space:]]+CHANGES[[:space:]]+AT[[:space:]]+${SHA40_RE}$"
 readonly EXPLICIT_VERDICT_RE='^(APPROVED-AT:|CHANGES-REQUESTED-AT:|REQUEST[[:space:]]+CHANGES[[:space:]]+AT)'
+# The same keywords ANYWHERE on the line, not only at column 0.
+#
+# ⚠️ A LEADING WORD IS NOT STRUCTURE, AND THAT IS HOW A REJECTION WENT MISSING.
+# `strip_structural_prefix` removes headings, quotes and list markers, so
+# `## CHANGES-REQUESTED-AT: ...` is caught. It does not remove an arbitrary word,
+# and every detector above is `^`-anchored, so a line beginning with one matched
+# NOTHING -- not a binding, and not the malformed check either. It was silently
+# ignored, which for a rejection means ADMITTED. Measured at f57f6549904b with a
+# valid admit-control:
+#
+#     CHANGES-REQUESTED-AT: claude <head>                    BLOCKS
+#     ## CHANGES-REQUESTED-AT: claude <head>                 BLOCKS
+#     ## CODEX-LANE CHANGES-REQUESTED-AT: claude <head>      ADMITTED
+#     CODEX-LANE CHANGES-REQUESTED-AT: claude <head>         ADMITTED
+#     Note: CHANGES-REQUESTED-AT: claude <head>              ADMITTED
+#     **Codex lane** CHANGES-REQUESTED-AT: claude <head>     ADMITTED
+#
+# ⚠️ AND THE ADMITTED FORM IS THE ONE FROM THE INCIDENT THIS GATE CITES.
+# `## CODEX-LANE CHANGES-REQUESTED-AT: codex <sha>` is what was live on
+# https://github.com/rrnewton/hermit/pull/2176, named in this file's own header as
+# the motivating case. The gate closed the heading variant and left the variant
+# that actually happened.
+#
+# THIS IS USED ONLY TO DECIDE "SUSPECT", NEVER TO BIND. Binding stays anchored, so
+# a prefixed line still binds nothing -- it now REFUSES as unparseable instead of
+# being dropped. That direction is deliberate: the cost is that an unindented
+# prose quotation of a marker also refuses, and a refusal that says "this line
+# looks like a verdict and binds nothing" is recoverable, while a silently
+# swallowed rejection is not.
+readonly EXPLICIT_VERDICT_ANYWHERE_RE='(APPROVED-AT:|CHANGES-REQUESTED-AT:|REQUEST[[:space:]]+CHANGES[[:space:]]+AT)'
 readonly STRUCTURAL_PREFIX_RE='^(#{1,6}[[:space:]]*|>[[:space:]]*|[-+*][[:space:]]+(\[[[:space:]xX]\][[:space:]]+)?|[0-9]+[.)][[:space:]]+(\[[[:space:]xX]\][[:space:]]+)?)(.*)$'
 
 strip_structural_prefix() {
@@ -463,6 +493,7 @@ scan_lane() {
                     found+=("$idx $matched_sha")
                 fi
             elif { [[ $verdict_line =~ $EXPLICIT_VERDICT_RE ]] \
+                   || [[ $verdict_line =~ $EXPLICIT_VERDICT_ANYWHERE_RE ]] \
                    || [[ $verdict_line =~ $SUSPECT_RE ]]; } \
                  && ! [[ $verdict_line =~ $REJECT_RE ]] \
                  && ! [[ $verdict_line =~ $REJECT_LEGACY_RE ]]; then

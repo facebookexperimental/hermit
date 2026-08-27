@@ -771,6 +771,38 @@ run_raw_case "an UNTAGGED rejection still supersedes a tagged approval" 1 \
       {\"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: claude ${HEAD_SHA}\"},
       {\"body\": \"CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"}]"
 
+# ⚠️ A LEADING WORD IS NOT STRUCTURE, AND EVERY ONE OF THESE ONCE ADMITTED.
+# `strip_structural_prefix` removes headings, quotes and list markers; it does not
+# remove an arbitrary word, and the detectors were all `^`-anchored, so a rejection
+# opening with one matched NOTHING -- not a binding, and not the malformed check --
+# and was silently dropped. For a rejection, dropped means ADMITTED.
+#
+# ⚠️ THE THIRD AND FOURTH CASES ARE THE FORM FROM THE INCIDENT THIS GATE CITES:
+# `## CODEX-LANE CHANGES-REQUESTED-AT: codex <sha>` was live on
+# https://github.com/rrnewton/hermit/pull/2176, named in the linter's own header as
+# the motivating case. The gate closed the heading variant and left this one open.
+# Measured before the fix: cases 1 and 2 blocked, cases 3 to 6 admitted, against a
+# valid admit-control.
+for prefixed_rejection in \
+    "## CODEX-LANE CHANGES-REQUESTED-AT: claude ${HEAD_SHA}" \
+    "CODEX-LANE CHANGES-REQUESTED-AT: claude ${HEAD_SHA}" \
+    "Note: CHANGES-REQUESTED-AT: claude ${HEAD_SHA}" \
+    "**Codex lane** CHANGES-REQUESTED-AT: claude ${HEAD_SHA}"; do
+    run_case "a word-prefixed rejection is not silently dropped: ${prefixed_rejection:0:44}" 1 \
+        "$FULL_LABELS" "$FULL_BODY" false \
+        "[{\"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"},
+          {\"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
+          {\"body\": \"${prefixed_rejection}\"}]" "$HEAD_SHA"
+done
+
+# THE CONTROL FOR THE FOUR ABOVE. Every one of them asserts exit 1, and a linter
+# that refused everything would satisfy all four. The same inputs WITHOUT the
+# prefixed line must still admit, or they prove nothing.
+run_case "the prefixed-rejection control still admits without one" 0 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
 run_case "an ordered-list rejection still revokes" 1 "$FULL_LABELS" "$FULL_BODY" false \
     "[{\"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
       {\"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"},
