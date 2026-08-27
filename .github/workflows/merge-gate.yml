@@ -421,7 +421,25 @@ jobs:
             # A PR "touches KVM" when a changed file path or a label mentions kvm.
             files="$(gh api "repos/${REPO}/pulls/${pr_number}/files" \
               --paginate --jq '.[].filename')"
-            if grep -qiE 'kvm' <<< "$files" || grep -Fixq kvm <<< "$labels"; then
+            files_kvm_status=0
+            grep -qiE 'kvm' <<< "$files" || files_kvm_status=$?
+            labels_kvm_status=0
+            grep -Fixq kvm <<< "$labels" || labels_kvm_status=$?
+            case "$files_kvm_status" in
+              0 | 1) ;;
+              *)
+                echo "::error::KVM changed-file lookup could not decide (grep exit ${files_kvm_status})."
+                exit 2
+                ;;
+            esac
+            case "$labels_kvm_status" in
+              0 | 1) ;;
+              *)
+                echo "::error::KVM label lookup could not decide (grep exit ${labels_kvm_status})."
+                exit 2
+                ;;
+            esac
+            if [ "$files_kvm_status" -eq 0 ] || [ "$labels_kvm_status" -eq 0 ]; then
               is_kvm=true
             else
               is_kvm=false

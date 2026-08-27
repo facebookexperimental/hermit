@@ -890,9 +890,15 @@ scan_lane() {
 # has asked an unanswerable question by labelling the PR with a trigger nothing
 # reads. Removing the label or replacing it with the real one both resolve it.
 if ! has_label "$post_facto_label"; then
-    inert_triggers=$(printf '%s\n' "$labels" \
-        | grep -E -- '-human-review$' \
-        | grep -Fxv -- "$post_facto_label" || true)
+    inert_status=0
+    inert_candidates=$(grep -E -- '-human-review$' <<<"$labels") || inert_status=$?
+    inert_triggers=''
+    if match_status_or_refuse "review-trigger label lookup" "$inert_status"; then
+        while IFS= read -r trigger; do
+            [ "$trigger" = "$post_facto_label" ] && continue
+            inert_triggers+="${inert_triggers:+$'\n'}${trigger}"
+        done <<<"$inert_candidates"
+    fi
     if [ -n "$inert_triggers" ]; then
         echo "::error::PR #${pr}: carries a review-trigger label that NO gate reads:" >&2
         printf '  %s\n' $inert_triggers >&2

@@ -52,6 +52,30 @@ core_job_has 'PR_HEAD_SHA="$pr_head"' ||
     fail "core-review linter must receive the exact pull-request head"
 core_job_has 'PR_COMMENTS_FILE="$pr_comments_file"' ||
     fail "core-review linter must receive the fetched comment history"
+core_job_has 'grep -qiE '\''kvm'\'' <<< "$files" || files_kvm_status=$?' ||
+    fail "KVM changed-file grep status must be captured"
+core_job_has 'grep -Fixq kvm <<< "$labels" || labels_kvm_status=$?' ||
+    fail "KVM label grep status must be captured"
+core_job_has 'case "$files_kvm_status" in' ||
+    fail "KVM changed-file grep errors must be handled"
+core_job_has 'case "$labels_kvm_status" in' ||
+    fail "KVM label grep errors must be handled"
+core_job_has 'if [ "$files_kvm_status" -eq 0 ] || [ "$labels_kvm_status" -eq 0 ]; then' ||
+    fail "KVM classification must use only checked match statuses"
+files_kvm_case=$(awk '
+    /case "\$files_kvm_status" in/ { in_case = 1 }
+    in_case { print }
+    in_case && /esac/ { exit }
+' <<<"$core_review_job")
+labels_kvm_case=$(awk '
+    /case "\$labels_kvm_status" in/ { in_case = 1 }
+    in_case { print }
+    in_case && /esac/ { exit }
+' <<<"$core_review_job")
+[[ $files_kvm_case == *'0 | 1)'* && $files_kvm_case == *'exit 2'* ]] ||
+    fail "KVM changed-file grep must accept only status 0/1 and refuse every error"
+[[ $labels_kvm_case == *'0 | 1)'* && $labels_kvm_case == *'exit 2'* ]] ||
+    fail "KVM label grep must accept only status 0/1 and refuse every error"
 grep -Fq 'actions: write' "$WORKFLOW" || fail "NO_RESULT must be able to re-dispatch and cancel"
 grep -Fq 'ref=4b78d727f35bc8612ac460a6e270dda5f5df304c' "$WORKFLOW" ||
     fail "gate must pin the parent authority commit"

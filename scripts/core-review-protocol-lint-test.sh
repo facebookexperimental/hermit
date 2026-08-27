@@ -375,8 +375,9 @@ run_case "empty labels + empty body still passes (not applicable)" 0 "" ""
 # Every other observable shell status must become the linter's internal-error 2.
 # The fake python3 supplies the already-validated contract records so these
 # checks isolate the predicate status rather than depending on network access.
-run_predicate_status_case() { # NAME MODE RAW_STATUS OPERATION
+run_predicate_status_case() { # NAME MODE RAW_STATUS OPERATION [LABELS]
     local name=$1 mode=$2 raw_status=$3 operation=$4
+    local labels=${5:-post-facto-human-review}
     local actual=0 output
 
     # These functions are exported and invoked by the child Bash, which the
@@ -390,23 +391,39 @@ run_predicate_status_case() { # NAME MODE RAW_STATUS OPERATION
     }
     # shellcheck disable=SC2317
     grep() {
-        while IFS= read -r _; do :; done
         case "$PREDICATE_FAILURE_MODE" in
-            status) return "$PREDICATE_FAILURE_STATUS" ;;
+            status)
+                while IFS= read -r _; do :; done
+                return "$PREDICATE_FAILURE_STATUS"
+                ;;
             section-status)
+                while IFS= read -r _; do :; done
                 if [ "$1" = -Eiq ]; then
                     return "$PREDICATE_FAILURE_STATUS"
                 fi
                 return 0
                 ;;
-            not-executable) command / "$@" ;;
-            not-found) command /tmp/core-review-protocol-lint-no-such-command "$@" ;;
+            inert-status)
+                if [ "${1-}" = -E ] && [ "${3-}" = '-human-review$' ]; then
+                    while IFS= read -r _; do :; done
+                    return "$PREDICATE_FAILURE_STATUS"
+                fi
+                command grep "$@"
+                ;;
+            not-executable)
+                while IFS= read -r _; do :; done
+                command / "$@"
+                ;;
+            not-found)
+                while IFS= read -r _; do :; done
+                command /tmp/core-review-protocol-lint-no-such-command "$@"
+                ;;
         esac
     }
     export -f python3 grep
 
     output=$(PREDICATE_FAILURE_MODE="$mode" PREDICATE_FAILURE_STATUS="$raw_status" \
-        PR_LABELS=post-facto-human-review PR_BODY='' PR_IS_KVM=false PR_NUMBER=test \
+        PR_LABELS="$labels" PR_BODY='' PR_IS_KVM=false PR_NUMBER=test \
         bash "$LINT" 2>&1) || actual=$?
     unset -f python3 grep
 
@@ -425,6 +442,9 @@ run_predicate_status_case \
     "command found but not executable refuses" not-executable 126 "label lookup"
 run_predicate_status_case \
     "command not found refuses" not-found 127 "label lookup"
+run_predicate_status_case \
+    "inert-trigger grep error refuses instead of returning not applicable" \
+    inert-status 2 "review-trigger label lookup" category:infra
 
 predicate_status_failures=0
 for predicate_mode in status section-status; do

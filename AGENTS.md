@@ -512,7 +512,19 @@ if ! files=$(with-proxy gh api --paginate "repos/$repo/pulls/$pr/files" \
   echo "changed-file fetch FAILED -- cannot decide whether this is KVM" >&2
   exit 2
 fi
-if grep -qiE 'kvm' <<<"$files" || grep -Fixq kvm <<<"$labels"; then
+files_kvm_status=0
+grep -qiE 'kvm' <<<"$files" || files_kvm_status=$?
+labels_kvm_status=0
+grep -Fixq kvm <<<"$labels" || labels_kvm_status=$?
+case "$files_kvm_status" in
+  0 | 1) ;;
+  *) echo "KVM changed-file lookup FAILED (grep exit $files_kvm_status)" >&2; exit 2 ;;
+esac
+case "$labels_kvm_status" in
+  0 | 1) ;;
+  *) echo "KVM label lookup FAILED (grep exit $labels_kvm_status)" >&2; exit 2 ;;
+esac
+if [ "$files_kvm_status" -eq 0 ] || [ "$labels_kvm_status" -eq 0 ]; then
   is_kvm=true
 else
   is_kvm=false
