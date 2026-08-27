@@ -353,6 +353,60 @@ readonly EXPLICIT_VERDICT_RE='^(APPROVED-AT:|CHANGES-REQUESTED-AT:|CHANGES-REQUE
 readonly EXPLICIT_VERDICT_ANYWHERE_RE='(APPROVED-AT:|CHANGES-REQUESTED-AT:|CHANGES-REQUESTED-WITHDRAWN-AT:|REQUEST[[:space:]]+CHANGES[[:space:]]+AT)'
 readonly STRUCTURAL_PREFIX_RE='^(#{1,6}[[:space:]]*|>[[:space:]]*|[-+*][[:space:]]+(\[[[:space:]xX]\][[:space:]]+)?|[0-9]+[.)][[:space:]]+(\[[[:space:]xX]\][[:space:]]+)?)(.*)$'
 readonly AUTHORITY_PREFIX_RE='^(#{1,6}[[:space:]]*|[-+*][[:space:]]+(\[[[:space:]xX]\][[:space:]]+)?|[0-9]+[.)][[:space:]]+(\[[[:space:]xX]\][[:space:]]+)?)(.*)$'
+readonly FENCE_RE='^ {0,3}(`{3,}|~{3,})[[:space:]]*(.*)$'
+
+# Emit only prose lines. Review comments routinely quote this protocol inside
+# fenced examples and CommonMark indented code; those examples must not grant an
+# approval, create or withdraw a refusal, name an issuer, or authenticate a
+# comment. An indented block starts only after a blank line, matching CommonMark
+# closely enough not to discard a deliberately indented marker under a list.
+marker_lines() {
+    local body=$1 raw candidate info first
+    local fence='' indented=0 prev_blank=1 blank=0
+    while IFS= read -r raw; do
+        blank=0
+        [ -z "${raw//[[:space:]]/}" ] && blank=1
+        if [ -n "$fence" ]; then
+            if [[ $raw =~ $FENCE_RE ]]; then
+                candidate=${BASH_REMATCH[1]}
+                info=${BASH_REMATCH[2]}
+                info="${info#"${info%%[![:space:]]*}"}"
+                info="${info%"${info##*[![:space:]]}"}"
+                first=${candidate:0:1}
+                if [ "$first" = "${fence:0:1}" ] \
+                   && [ "${#candidate}" -ge "${#fence}" ] \
+                   && [ -z "$info" ]; then
+                    fence=''
+                fi
+            fi
+            prev_blank=$blank
+            continue
+        fi
+        if [[ $raw =~ $FENCE_RE ]]; then
+            fence=${BASH_REMATCH[1]}
+            indented=0
+            prev_blank=0
+            continue
+        fi
+        if [ "$indented" -eq 1 ]; then
+            if [ "$blank" -eq 1 ]; then
+                prev_blank=1
+                continue
+            fi
+            if [[ $raw == '    '* ]] || [[ $raw == $'\t'* ]]; then
+                continue
+            fi
+            indented=0
+        elif [ "$prev_blank" -eq 1 ] && [ "$blank" -eq 0 ] \
+             && { [[ $raw == '    '* ]] || [[ $raw == $'\t'* ]]; }; then
+            indented=1
+            prev_blank=0
+            continue
+        fi
+        printf '%s\n' "$raw"
+        prev_blank=$blank
+    done <<< "$body"
+}
 
 strip_structural_prefix() {
     local line=$1
@@ -393,14 +447,15 @@ strip_authority_prefix() {
 # both consumers agree again; that belongs in a dev-hermit change, not here.
 readonly SUSPECT_RE="^(APPROV|CHANGES-REQUESTED|REQUEST[[:space:]]+CHANGES|REJECT|LGTM|SIGN(ED)?[-[:space:]]?OFF|ACK).*${SHA40_RE}"
 readonly RETIRES_RE='(^|[^[:alnum:]_])RETIRES[[:space:]]+#?([0-9]{6,})([^[:alnum:]_]|$)'
+readonly CITATION_MARKER_RE="^(APPROVED-AT|CHANGES-REQUESTED-AT|CHANGES-REQUESTED-WITHDRAWN-AT):[[:space:]]+(claude|codex)[[:space:]]+([0-9a-fA-F]{7,40})${MARKER_ISSUER_SUFFIX_RE}$"
 
 # The GitHub account is shared for relayed review comments, so `.user.login`
 # cannot identify the reviewer. Agent comments carry their writer in the
 # existing `[team, agent, ...]` disclosure tag. Read the first such tag from an
 # unquoted, unindented line; bracketed role tags may precede it on the same line.
 comment_author() {
-    local body=$1 line rest tag
-    while IFS= read -r line; do
+    local line rest tag
+    for line in "$@"; do
         rest=$line
         while [[ $rest =~ ^\[([^][]*)\][[:space:]]*(.*)$ ]]; do
             tag=${BASH_REMATCH[1]}
@@ -410,14 +465,15 @@ comment_author() {
                 return
             fi
         done
-    done <<< "$body"
+    done
 }
 
 # The refusal gate attributes withdrawal and RETIRES authority to the comment:
 # the first marker-level BY in the body wins, then the disclosure author.
 comment_issuer() {
-    local body=$1 line undecorated verdict_line named
-    while IFS= read -r line; do
+    local author=$1 line undecorated verdict_line named
+    shift
+    for line in "$@"; do
         undecorated=$(undecorate "$line")
         verdict_line=$(strip_authority_prefix "$undecorated")
         if [[ $verdict_line =~ $APPROVE_RE ]] \
@@ -429,8 +485,8 @@ comment_issuer() {
                 return
             fi
         fi
-    done <<< "$body"
-    comment_author "$body"
+    done
+    printf '%s' "$author"
 }
 
 # Two readable issuers are the same reviewer. Unattributed markers match nobody.
@@ -456,18 +512,31 @@ discharge_refusals() {
     done
 }
 
-# Emit every numeric comment id named by `RETIRES` in BODY, in text order.
+# Emit every numeric comment id named by `RETIRES` in the supplied prose lines,
+# in text order.
 retire_targets() {
-    local rest=$1 match
-    while [[ $rest =~ $RETIRES_RE ]]; do
-        printf '%s\n' "${BASH_REMATCH[2]}"
-        match=${BASH_REMATCH[0]}
-        rest=${rest#*"$match"}
+    local line rest match
+    for line in "$@"; do
+        rest=$line
+        while [[ $rest =~ $RETIRES_RE ]]; do
+            printf '%s\n' "${BASH_REMATCH[2]}"
+            match=${BASH_REMATCH[0]}
+            rest=${rest#*"$match"}
+        done
     done
 }
 
-# A verdict is issued once. A later identical marker from the same comment
-# author is a citation, not a fresh decision after an intervening refusal.
+# A citation may abbreviate the original SHA, but it cannot name a different
+# head. This mirrors the shared authority's prefix-compatible comparison.
+shas_name_same_head() {
+    local left=$1 right=$2
+    [ -n "$left" ] && [ -n "$right" ] \
+        && { [ "${left#"$right"}" != "$left" ] \
+             || [ "${right#"$left"}" != "$right" ]; }
+}
+
+# A verdict is issued once. A later exact or SHA-abbreviated copy from the same
+# comment author is a citation, not a fresh decision after an intervening refusal.
 verdict_is_citation() {
     local author=$1 kind=$2 lane=$3 sha=$4 issued
     local seen_author seen_kind seen_lane seen_sha
@@ -478,7 +547,7 @@ verdict_is_citation() {
         if [ "$seen_author" = "$author" ] \
            && [ "$seen_kind" = "$kind" ] \
            && { [ "$seen_lane" = "$lane" ] || [ "$seen_lane" = '*' ] || [ "$lane" = '*' ]; } \
-           && [ "$seen_sha" = "$sha" ]; then
+           && shas_name_same_head "$seen_sha" "$sha"; then
             return 0
         fi
     done
@@ -500,6 +569,7 @@ verdict_is_citation() {
 # unrelated reason. Tagged stdout is what makes both results actually observable.
 scan_lane() {
     local lane=$1 cid encoded body line undecorated verdict_line authority_line login assoc created updated author comment_issuer_value withdrawer
+    local -a comment_lines=()
     local -a found=()
     local -a outstanding=()
     local -a withdrawals=()
@@ -516,8 +586,9 @@ scan_lane() {
         idx=$((idx + 1))
         cid=${cid:-index-$idx}
         body=$(printf '%s' "$encoded" | base64 -d)
-        author=$(comment_author "$body")
-        comment_issuer_value=$(comment_issuer "$body")
+        mapfile -t comment_lines < <(marker_lines "$body")
+        author=$(comment_author "${comment_lines[@]}")
+        comment_issuer_value=$(comment_issuer "$author" "${comment_lines[@]}")
         # GitHub returns issue comments in creation order, but comments are
         # mutable. If a verdict-bearing comment was edited, the current payload
         # cannot prove where the edited verdict belongs in the chronology or
@@ -541,12 +612,12 @@ scan_lane() {
                     edited_verdict=1
                     break
                 fi
-            done <<< "$body"
+            done < <(printf '%s\n' "${comment_lines[@]}")
             [ "$edited_verdict" -eq 0 ] || continue
         fi
         # Decided per comment, before any line of it is read, so the same
         # verdict applies to every APPROVED-AT line the comment carries.
-        # Scanned over the WHOLE comment, not just its first line: the relayed
+        # Scanned over every prose line, not just the first: the relayed
         # attestations on this pull request put the tag first, but a review that
         # opens with a heading and tags itself lower down is still a review.
         local approver_refusal="carries no role tag, so it is not a review comment"
@@ -561,7 +632,7 @@ scan_lane() {
                 approver_refusal=""
                 break
             fi
-        done <<< "$body"
+        done < <(printf '%s\n' "${comment_lines[@]}")
         if [ -z "$approver_refusal" ]; then
             case ${assoc^^} in
                 OWNER|MEMBER|COLLABORATOR) ;;
@@ -589,7 +660,7 @@ scan_lane() {
                     issued_verdicts+=("$author"$'\x1f'"withdrawn"$'\x1f'"$withdrawn_lane"$'\x1f'"$withdrawn_sha")
                     local -a targets=()
                     local targets_csv='-'
-                    mapfile -t targets < <(retire_targets "$body")
+                    mapfile -t targets < <(retire_targets "${comment_lines[@]}")
                     if [ "${#targets[@]}" -gt 0 ]; then
                         local old_ifs=$IFS
                         IFS=,
@@ -603,7 +674,7 @@ scan_lane() {
                     withdrawals+=("$idx $cid $withdrawn_lane $withdrawn_sha ${withdrawer:-<unattributed>} $targets_csv")
                 fi
             fi
-        done <<< "$body"
+        done < <(printf '%s\n' "${comment_lines[@]}")
 
         # A rejection contributes NOTHING from this comment, even if the same
         # comment also carries an APPROVED-AT-shaped line: a comment quoting the
@@ -642,7 +713,7 @@ scan_lane() {
                     outstanding+=("$cid $idx $rejected_sha ${refusing_issuer:-<unattributed>}")
                 fi
             fi
-        done <<< "$body"
+        done < <(printf '%s\n' "${comment_lines[@]}")
         if [ "$rejected" -eq 1 ]; then
             found=()
             continue
@@ -653,15 +724,30 @@ scan_lane() {
             if [[ $undecorated =~ $APPROVE_RE ]]; then
                 local matched_lane=${BASH_REMATCH[1]} matched_sha=${BASH_REMATCH[2]}
                 local approver=${BASH_REMATCH[4]-}
-                if [ "${matched_lane,,}" = "$lane" ] && [ -n "$approver_refusal" ]; then
-                    # Reported, not silently dropped. A refused approval that
-                    # vanished would surface only as the generic "no approval
-                    # from <lane>", which reads as "the reviewer never got to
-                    # it" rather than "someone tried to mint this".
-                    printf 'U %s %s association=%s (%s)\n' \
-                        "$idx" "${login:-<unidentified>}" \
-                        "${assoc:-<unknown>}" "$approver_refusal"
-                elif [ "${matched_lane,,}" = "$lane" ]; then
+                matched_lane=${matched_lane,,}
+                if [ -n "$approver_refusal" ]; then
+                    if [ "$matched_lane" = "$lane" ]; then
+                        # Reported, not silently dropped. A refused approval that
+                        # vanished would surface only as the generic "no approval
+                        # from <lane>", which reads as "the reviewer never got to
+                        # it" rather than "someone tried to mint this".
+                        printf 'U %s %s association=%s (%s)\n' \
+                            "$idx" "${login:-<unidentified>}" \
+                            "${assoc:-<unknown>}" "$approver_refusal"
+                    fi
+                    # An untrusted copy cannot consume a later trusted issuance
+                    # by making it look like a citation.
+                    continue
+                fi
+                # Citation history spans both lanes. Otherwise a shortened
+                # claude copy is suppressed while scanning claude but is still
+                # reported malformed while scanning codex.
+                if verdict_is_citation "$author" approved "$matched_lane" "$matched_sha" \
+                    "${issued_verdicts[@]}"; then
+                    continue
+                fi
+                issued_verdicts+=("$author"$'\x1f'"approved"$'\x1f'"$matched_lane"$'\x1f'"$matched_sha")
+                if [ "$matched_lane" = "$lane" ]; then
                     # Recorded EXACTLY as written, deliberately not lowercased.
                     # The reference verifier compares the captured text against
                     # the API's lowercase head, so an upper-case SHA does not
@@ -673,12 +759,6 @@ scan_lane() {
                     # an intervening refusal. This uses the disclosure author,
                     # matching the parent authority's citation rule; marker BY
                     # remains the more specific issuer for refusal ownership.
-                    if verdict_is_citation "$author" approved "$lane" "$matched_sha" \
-                        "${issued_verdicts[@]}"; then
-                        continue
-                    fi
-                    issued_verdicts+=("$author"$'\x1f'"approved"$'\x1f'"$lane"$'\x1f'"$matched_sha")
-
                     approver=${approver:-$author}
                     approver=${approver,,}
                     mapfile -t outstanding < <(discharge_refusals "$approver" \
@@ -691,13 +771,27 @@ scan_lane() {
                  && ! [[ $verdict_line =~ $REJECT_RE ]] \
                  && ! [[ $verdict_line =~ $WITHDRAW_RE ]] \
                  && ! [[ $verdict_line =~ $REJECT_LEGACY_RE ]]; then
+                if [[ $undecorated =~ $CITATION_MARKER_RE ]]; then
+                    local citation_marker=${BASH_REMATCH[1]^^}
+                    local citation_lane=${BASH_REMATCH[2],,}
+                    local citation_sha=${BASH_REMATCH[3]}
+                    local citation_kind=approved
+                    case $citation_marker in
+                        CHANGES-REQUESTED-AT) citation_kind=refused ;;
+                        CHANGES-REQUESTED-WITHDRAWN-AT) citation_kind=withdrawn ;;
+                    esac
+                    if verdict_is_citation "$author" "$citation_kind" "$citation_lane" \
+                        "$citation_sha" "${issued_verdicts[@]}"; then
+                        continue
+                    fi
+                fi
                 # A well-formed rejection for the OTHER lane reaches here (it is
                 # not this lane's rejection, and it is not an approval) and it
                 # opens with a verdict keyword, so it matches SUSPECT_RE. It is
                 # perfectly parseable and must not be reported as malformed.
                 printf 'M %s %s\n' "$idx" "${verdict_line:0:120}"
             fi
-        done <<< "$body"
+        done < <(printf '%s\n' "${comment_lines[@]}")
     # Carries comment id, commenter identity, and creation/edit timestamps
     # alongside the text. A fixed 6-field row keeps the split unambiguous, and
     # the body stays base64 so an embedded tab or newline cannot shift columns.

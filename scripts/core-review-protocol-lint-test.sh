@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Self-test for core-review-protocol-lint.sh.
 #
-# Feeds the linter a set of fixture PRs (labels + body + KVM flag) and asserts
-# the exit status. Run locally or in CI:
+# Feeds the linter fixture PR labels, body, KVM flag, exact head, and issue
+# comments (inline or through a file), then asserts the exit status. Run locally
+# or in CI:
 #
 #     scripts/core-review-protocol-lint-test.sh
 #
@@ -548,6 +549,18 @@ run_case "an identical repeated approval is a citation and does not discharge" 1
       {\"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
       {\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
 
+run_case "a same-author shortened approval copy is a citation" 0 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: claude ${HEAD_SHA:0:12}\"}]" "$HEAD_SHA"
+
+run_case "a different-author shortened approval copy remains malformed" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA:0:12}\"}]" "$HEAD_SHA"
+
 run_case "a marker's BY issuer takes precedence over the comment disclosure" 0 \
     "$FULL_LABELS" "$FULL_BODY" false \
     "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
@@ -603,6 +616,63 @@ run_message_absent_case "an edited blockquoted withdrawal remains inert" \
     "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
       {\"id\": ${REFUSAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
       {\"id\": ${WITHDRAWAL_ID}, \"created_at\": \"2026-08-27T01:00:00Z\", \"updated_at\": \"2026-08-27T02:00:00Z\", \"body\": \"${REVIEWER_901}\\n> CHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+# Review protocol examples are documentation, not verdicts. Both fenced and
+# CommonMark indented code are removed once before any consumer reads a role
+# tag, issuer, approval, refusal, withdrawal, RETIRES claim, edit, or malformed
+# line. Genuine markers outside the examples remain authoritative.
+run_case "outside markers bind while fenced documentation is ignored" 0 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\\n~~~text\\nCHANGES-REQUESTED-AT: codex ${HEAD_SHA}\\nAPPROVED-AT: claude bad\\n~~~\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "outside markers bind while indented documentation is ignored" 0 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\\n\\n    CHANGES-REQUESTED-AT: codex ${HEAD_SHA}\\n    APPROVED-AT: claude bad\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "a fenced approval example does not bind" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_902}\\n~~~\\nAPPROVED-AT: claude ${HEAD_SHA}\\n~~~\"}]" "$HEAD_SHA"
+
+run_case "an indented approval example does not bind" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_902}\\n\\n    APPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "a fenced withdrawal example does not discharge" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_903}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_901}\\n~~~\\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\\n~~~\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "an indented withdrawal example does not discharge" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_903}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_901}\\n\\n    CHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "a fenced marker BY cannot transfer precise retirement authority" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_903}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_902}\\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\\nRETIRES ${REFUSAL_ID}\\n~~~\\nAPPROVED-AT: codex ${HEAD_SHA} BY hermit-901\\n~~~\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_message_absent_case "edited fenced marker documentation is inert" \
+    0 "edited verdict comment" "$FULL_LABELS" "$FULL_BODY" \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"created_at\": \"2026-08-27T01:00:00Z\", \"updated_at\": \"2026-08-27T02:00:00Z\", \"body\": \"${REVIEWER_901}\\n~~~\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\\n~~~\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_message_absent_case "edited indented marker documentation is inert" \
+    0 "edited verdict comment" "$FULL_LABELS" "$FULL_BODY" \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"created_at\": \"2026-08-27T01:00:00Z\", \"updated_at\": \"2026-08-27T02:00:00Z\", \"body\": \"${REVIEWER_901}\\n\\n    CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
       {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
 
 run_case "the issuer's RETIRES clears the named refusal" 0 \
@@ -931,6 +1001,11 @@ run_raw_case "a role-tagged approval with association NONE is refused" 1 \
       {\"user\": {\"login\": \"relay-bot\"}, \"author_association\": \"NONE\",
        \"body\": \"${TAG_RELAY}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
 
+run_raw_case "an untrusted approval copy cannot consume a later trusted issuance" 0 \
+    "[{\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_903}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"author_association\": \"NONE\", \"body\": \"${REVIEWER_901}\nAPPROVED-AT: claude ${HEAD_SHA}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_901}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
+
 # The fleet's tag shapes vary and the interior is deliberately not parsed;
 # approval_binding.py measured that reading it produces wrong verdicts.
 run_raw_case "a legacy-shaped role tag is accepted (interior is not parsed)" 0 \
@@ -940,6 +1015,36 @@ run_raw_case "a legacy-shaped role tag is accepted (interior is not parsed)" 0 \
 run_raw_case "a tag below an opening heading still counts as a review comment" 0 \
     "[{\"author_association\": \"OWNER\", \"body\": \"## Adversarial review\n${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
       {\"author_association\": \"OWNER\", \"body\": \"## Adversarial review\n${TAG_REVIEWER}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
+
+run_raw_case "a fenced role tag cannot authenticate an outside approval" 1 \
+    "[{\"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"~~~\n${TAG_REVIEWER}\n~~~\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
+
+run_raw_case "an indented role tag cannot authenticate an outside approval" 1 \
+    "[{\"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"Documentation:\n\n    ${TAG_REVIEWER}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
+
+run_raw_case "a fenced disclosure cannot own an outside refusal" 1 \
+    "[{\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_903}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"~~~\n${REVIEWER_901}\n~~~\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_901}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
+
+run_raw_case "an indented disclosure cannot own an outside refusal" 1 \
+    "[{\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_903}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"Documentation:\n\n    ${REVIEWER_901}\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_901}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
+
+run_raw_case "a fenced RETIRES example does not clear an unsigned refusal" 1 \
+    "[{\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_903}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_901}\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\n~~~\nRETIRES ${REFUSAL_ID}\n~~~\"},
+      {\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_902}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
+
+run_raw_case "an indented RETIRES example does not clear an unsigned refusal" 1 \
+    "[{\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_903}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_901}\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\n\n    RETIRES ${REFUSAL_ID}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_902}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
 
 # A REJECTION IS NEVER REQUIRED TO BE TAGGED: authority may only be removed,
 # never granted, by this check.

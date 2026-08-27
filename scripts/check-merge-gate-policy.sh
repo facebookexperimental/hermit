@@ -22,6 +22,36 @@ fail() {
 }
 
 [[ -f $WORKFLOW ]] || fail "missing $WORKFLOW"
+
+# Scope core-review assertions to that job and remove YAML comments before
+# matching. A literal pasted into an unrelated job or a `#` comment is not
+# executable wiring and must not keep this policy check green.
+core_review_job=$(awk '
+    /^  core-review-protocol:[[:space:]]*$/ { in_job = 1 }
+    in_job && /^  [[:alnum:]_-]+:[[:space:]]*$/ \
+        && $0 !~ /^  core-review-protocol:[[:space:]]*$/ { exit }
+    in_job {
+        line = $0
+        if (line ~ /^[[:space:]]*#/) next
+        sub(/[[:space:]]+#.*$/, "", line)
+        print line
+    }
+' "$WORKFLOW")
+[[ -n $core_review_job ]] || fail "missing core-review-protocol job"
+core_job_has() {
+    grep -Fq -- "$1" <<<"$core_review_job"
+}
+
+core_job_has 'pr_head="$(jq -r '\''.head.sha'\'' <<< "$pr_json")"' ||
+    fail "core-review protocol must read the exact pull-request head"
+core_job_has 'issues/${pr_number}/comments?per_page=100' ||
+    fail "core-review protocol must fetch the complete issue-comment history"
+core_job_has '--paginate --slurp | jq -c '\''add // []'\'' > "$pr_comments_file"' ||
+    fail "core-review comment fetch must preserve all pages in one JSON array"
+core_job_has 'PR_HEAD_SHA="$pr_head"' ||
+    fail "core-review linter must receive the exact pull-request head"
+core_job_has 'PR_COMMENTS_FILE="$pr_comments_file"' ||
+    fail "core-review linter must receive the fetched comment history"
 grep -Fq 'actions: write' "$WORKFLOW" || fail "NO_RESULT must be able to re-dispatch and cancel"
 grep -Fq 'ref=4b78d727f35bc8612ac460a6e270dda5f5df304c' "$WORKFLOW" ||
     fail "gate must pin the parent authority commit"

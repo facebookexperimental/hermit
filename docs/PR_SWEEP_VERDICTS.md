@@ -2220,12 +2220,13 @@ approval nor reaches the malformed counter. A refusal gate may deliberately acce
 more spellings in order to fail closed, but that result does not establish what the
 approval parser accepts.
 
-⚠️ **`scripts/core-review-protocol-lint.sh` IS NOT A SECOND IMPLEMENTATION OF THIS
-GRAMMAR.** At this document's head it reads supplied labels and required PR-body
-sections; it does not read review comments or parse `APPROVED-AT` at all. The exact-head
-binding check lives in dev-hermit's `approval_binding.py` and the landing wrapper.
-Calling the shell lint a disagreeing parser attributed behavior to code that has no
-such path.
+⚠️ **`scripts/core-review-protocol-lint.sh` IS NOW A SECOND CONSUMER OF THIS
+GRAMMAR.** The historical version measured in this section read only supplied
+labels and required PR-body sections. The current script also reads the exact
+pull-request head and complete issue-comment history, parses `APPROVED-AT`,
+refusals and withdrawals, and rejects a standing reviewer-owned refusal. Its
+self-test must therefore cover both directions, and changes must still be
+compared with dev-hermit's pinned `approval_binding.py` authority.
 
 ⚠️ **PIN THE PATH AND COMMIT BEFORE QUOTING THIS BEHAVIOR.** The parser changed
 several times while this section was reviewed. The current table above names both:
@@ -2607,7 +2608,7 @@ moved" — also false; the record shows agents, prompted by the row. Corrected
 because the true story is the stronger one: the printed reason did its job, and
 printing the reason still was not enough.
 
-## 22. Run the review-protocol label/body lint by hand; no pull-request event runs it
+## 22. Run the review-protocol lint by hand; no pull-request event runs it
 
 `scripts/core-review-protocol-lint.sh` is called by the `core-review-protocol` job
 in `.github/workflows/merge-gate.yml`. That workflow's only trigger is
@@ -2616,15 +2617,16 @@ lint against a real pull request**. The Makefile schedules
 `scripts/core-review-protocol-lint-test.sh`, which tests fixtures rather than a
 live pull request.
 
-The distinction matters because the script is a **partial label/body lint**, not
-exact-head approval authority. It receives the labels, body, pull-request number,
-and a Boolean saying whether changed paths or labels identify a KVM change. It
-does not receive the head SHA or state, read review comments, or establish the
-reviewers' identities. An exit 0 therefore says only that the supplied snapshot
-passes these checks, or that the `post-facto-human-review` label is absent. It does
-not prove that two named reviewers approved the current open head.
+The distinction still matters, but the script now checks the complete input it
+needs: labels, body, pull-request number, current head, issue comments, and a
+Boolean saying whether changed paths or labels identify a KVM change. For a
+`post-facto-human-review` pull request it requires each review lane's trusted
+approval to bind the supplied exact head and refuses outstanding reviewer-owned
+change requests. An exit 0 means that supplied snapshot passed those checks, or
+that the post-facto label is absent; it is not evidence that the snapshot fetch
+itself succeeded unless every guarded command below succeeded.
 
-**The partial lint is still useful.** Measured from
+**The earlier label/body-only lint was still useful.** Measured from
 `2026-08-27T07:40:16Z` through `2026-08-27T07:42:08Z`, using the checker and
 workflow at fetched `main` SHA
 `63b778646101bb7228a1fc1674c937274b75aab4`. The exact GitHub search window was
@@ -2649,12 +2651,12 @@ The raw results were:
 Fetching each of those twelve pull requests' live labels, body, and complete
 paginated changed-file list, then supplying `PR_IS_KVM`, produced:
 
-| partial label/body lint outcome | count | pull requests |
+| historical label/body lint outcome | count | pull requests |
 | --- | --- | --- |
 | blocked | **9 of 12** | #2568 #2517 #2486 #2434 #2407 #2312 #2236 #2172 #2150 |
 | passed | 3 | #2534 #2373 #2370 |
 
-Run the same partial lint before landing a labelled pull request. Every fetch is
+Run the current lint before landing a labelled pull request. Every fetch is
 checked, including the file list used to derive `PR_IS_KVM`; a failed fetch is an
 error, never a non-KVM answer:
 
@@ -2675,6 +2677,17 @@ if ! body=$(jq -r '.body // ""' <<<"$pr_json"); then
   echo "body decode FAILED -- this is not a pass" >&2
   exit 2
 fi
+if ! head_sha=$(jq -r '.head.sha' <<<"$pr_json"); then
+  echo "head decode FAILED -- this is not a pass" >&2
+  exit 2
+fi
+pr_comments_file=$(mktemp)
+trap 'rm -f "$pr_comments_file"' EXIT
+if ! with-proxy gh api "repos/$repo/issues/$pr/comments?per_page=100" \
+    --paginate --slurp | jq -ce 'add // []' >"$pr_comments_file"; then
+  echo "comment fetch FAILED -- this is not a pass" >&2
+  exit 2
+fi
 if ! files=$(with-proxy gh api --paginate "repos/$repo/pulls/$pr/files" \
     --jq '.[].filename'); then
   echo "changed-file fetch FAILED -- cannot decide whether this is KVM" >&2
@@ -2689,6 +2702,7 @@ fi
 
 lint_status=0
 PR_NUMBER="$pr" PR_LABELS="$labels" PR_BODY="$body" PR_IS_KVM="$is_kvm" \
+PR_HEAD_SHA="$head_sha" PR_COMMENTS_FILE="$pr_comments_file" \
   bash scripts/core-review-protocol-lint.sh || lint_status=$?
 
 case "$lint_status" in
@@ -2710,17 +2724,14 @@ case "$lint_status" in
 esac
 ```
 
-The lint itself emits only three statuses: 0 means the partial lint passed or did
-not apply; 1 means it found a label/body violation; 2 means it could not decide
+The lint itself emits only three statuses: 0 means the supplied snapshot passed
+the label, body, exact-head approval, and standing-refusal checks or the lint did
+not apply; 1 means it found a protocol violation; 2 means it could not decide
 because of a usage or internal error. Those three are not the shell's complete
 status range. Status 126 means the command was found but could not be executed;
 127 means it was not found. Statuses 3..125 and 128..255 are also outside the
 lint's contract (128 plus a signal number commonly reports signal termination).
 Every status other than 0 is a failure; an undocumented status is never a pass.
-
-Record the exact-head adversarial-review evidence separately before binding a
-lane or landing. In particular, do not present this command's exit 0 as proof of
-an approval at the current head.
 
 ⚠️ **CAPTURE EACH FETCH AND CHECK IT.** A failing command substitution can still
 leave a variable set and empty. The linter deliberately treats an explicitly

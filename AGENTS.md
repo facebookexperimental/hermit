@@ -491,26 +491,51 @@ landing is gated has no reason to run anything by hand, so the claim removed the
 very behaviour it described. Every agent is told to read this file; almost none
 read the workflow YAML that would have contradicted it.
 
-**The script itself is sound — it is the wiring that is absent.** Measured the
-same day: its self-test passes 24/24, and it returns rc=1 on heads that are
-genuinely short and rc=0 on heads that are not. Run it before you land a labeled
-PR:
+**The script itself is sound — it is the wiring that is absent.** Its self-test
+must pass, and the live invocation below checks labels, body sections, exact-head
+review comments, and outstanding refusals. Run it before you land a labeled PR:
 
 ```bash
+set -euo pipefail
+repo=rrnewton/hermit
 pr=<N>
-PR_LABELS="$(gh pr view "$pr" -R rrnewton/hermit --json labels \
-              -q '.labels|map(.name)|join("\n")')" \
-PR_BODY="$(gh pr view "$pr" -R rrnewton/hermit --json body -q .body)" \
-  bash scripts/core-review-protocol-lint.sh "$pr"
+
+if ! pr_json=$(with-proxy gh api "repos/$repo/pulls/$pr"); then
+  echo "pull-request fetch FAILED -- this is not a pass" >&2
+  exit 2
+fi
+labels=$(jq -r '.labels[].name' <<<"$pr_json")
+body=$(jq -r '.body // ""' <<<"$pr_json")
+head_sha=$(jq -r '.head.sha' <<<"$pr_json")
+if ! files=$(with-proxy gh api --paginate "repos/$repo/pulls/$pr/files" \
+    --jq '.[].filename'); then
+  echo "changed-file fetch FAILED -- cannot decide whether this is KVM" >&2
+  exit 2
+fi
+if grep -qiE 'kvm' <<<"$files" || grep -Fixq kvm <<<"$labels"; then
+  is_kvm=true
+else
+  is_kvm=false
+fi
+pr_comments_file=$(mktemp)
+trap 'rm -f "$pr_comments_file"' EXIT
+if ! with-proxy gh api "repos/$repo/issues/$pr/comments?per_page=100" \
+    --paginate --slurp | jq -ce 'add // []' >"$pr_comments_file"; then
+  echo "comment fetch FAILED -- this is not a pass" >&2
+  exit 2
+fi
+
+PR_NUMBER="$pr" PR_LABELS="$labels" PR_BODY="$body" PR_IS_KVM="$is_kvm" \
+PR_HEAD_SHA="$head_sha" PR_COMMENTS_FILE="$pr_comments_file" \
+  bash scripts/core-review-protocol-lint.sh
 ```
 
-⚠️ **BOTH variables are required, and the script REFUSES rather than guessing** —
-an unset `PR_LABELS` or `PR_BODY` exits 2 with `This gate cannot decide anything`,
-not 0. That is deliberate: a missing body would otherwise produce five phantom
-"missing section" errors, and a missing label list would silently pass every PR.
-Pass an explicit empty string to mean "genuinely none". Supplying only
-`PR_LABELS` — the obvious half — is itself an exit 2, so read the status rather
-than the absence of complaints.
+⚠️ **THE INPUTS ARE REQUIRED, AND THE SCRIPT REFUSES RATHER THAN GUESSING.** An
+unset `PR_LABELS` or `PR_BODY` exits 2. For a labeled pull request, a missing
+`PR_HEAD_SHA` or missing/unreadable `PR_COMMENTS_FILE`/`PR_COMMENTS_JSON` exits
+1. Pass an explicit empty string only to mean "genuinely none". The file form is
+used above because a complete comment history can exceed the per-environment-
+variable size limit.
 
 ⚠️ **DO NOT "FIX" THIS BY ARMING THE GATE.** Adding a `pull_request` trigger
 contradicts the standing directive that Actions never run automatically for
