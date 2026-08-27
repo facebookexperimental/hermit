@@ -165,6 +165,25 @@ run_message_case() {
     fi
 }
 
+run_message_absent_case() {
+    local name=$1 expected=$2 forbidden=$3 labels=$4 body=$5 comments=$6 head=$7
+    local actual=0 output
+    comments=$(authenticate_comments "$comments")
+    output=$(PR_LABELS="$labels" PR_BODY="$body" PR_IS_KVM=false PR_NUMBER="test" \
+        PR_HEAD_SHA="$head" PR_COMMENTS_JSON="$comments" \
+        bash "$LINT" 2>&1) || actual=$?
+    if [ "$actual" -eq "$expected" ] && [[ $output != *"$forbidden"* ]]; then
+        echo "ok   - ${name} (exit ${actual}, absent)"
+        pass=$((pass + 1))
+    elif [ "$actual" -ne "$expected" ]; then
+        echo "FAIL - ${name}: expected exit ${expected}, got ${actual}"
+        fail=$((fail + 1))
+    else
+        echo "FAIL - ${name}: exit ${expected} but forbidden diagnosis '${forbidden}' was present"
+        fail=$((fail + 1))
+    fi
+}
+
 # --- Not applicable: no post-facto-human-review label always passes. ----------
 # --- An INERT trigger label must refuse, not fast-path ------------------------
 #
@@ -495,6 +514,164 @@ run_case "a rejection followed by a later approval at the head passes" 0 \
       {\"body\": \"CHANGES-REQUESTED-AT: claude ${OLD_SHA}\"},
       {\"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
 
+# A lane contains multiple reviewers. A refusal belongs to its issuer: that
+# reviewer may discharge it, while a different reviewer's approval may bind the
+# lane but must leave the refusal standing.
+readonly REVIEWER_901='[hermit2, hermit-901, unresolved, devbig014, role=reviewer]'
+readonly REVIEWER_902='[hermit2, hermit-902, unresolved, devbig014, role=reviewer]'
+readonly REVIEWER_903='[hermit2, hermit-903, unresolved, devbig014, role=reviewer]'
+readonly REFUSAL_ID=900001
+readonly SECOND_REFUSAL_ID=900002
+readonly WITHDRAWAL_ID=900003
+run_case "issuer control: no refusal admits approvals from different reviewers" 0 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "issuer control: same-reviewer approval discharges its refusal" 0 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "issuer control: different-reviewer approval leaves the refusal standing" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "an identical repeated approval is a citation and does not discharge" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "a marker's BY issuer takes precedence over the comment disclosure" 0 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_902}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA} BY hermit-901\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA} BY hermit-901\"}]" "$HEAD_SHA"
+
+run_case "a marker BY another issuer does not inherit the comment disclosure" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA} BY hermit-901\"},
+      {\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: claude ${HEAD_SHA} BY hermit-902\"}]" "$HEAD_SHA"
+
+run_case "another line's BY does not transfer refusal ownership" 0 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"id\": ${REFUSAL_ID}, \"body\": \"${REVIEWER_902}\\nAPPROVED-AT: codex ${HEAD_SHA} BY hermit-901\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "another line's BY does not transfer unquoted-withdrawal ownership" 0 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"id\": ${REFUSAL_ID}, \"body\": \"${REVIEWER_902}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"body\": \"${REVIEWER_902}\\nAPPROVED-AT: codex ${HEAD_SHA} BY hermit-901\\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_903}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "precise RETIRES uses the comment claimant" 0 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"id\": ${REFUSAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"body\": \"${REVIEWER_902}\\nAPPROVED-AT: codex ${HEAD_SHA} BY hermit-901\\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\\nRETIRES ${REFUSAL_ID}\"},
+      {\"body\": \"${REVIEWER_903}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "same-reviewer unquoted withdrawal retires one refusal" 0 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "different-reviewer unquoted withdrawal leaves the refusal standing" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"body\": \"${REVIEWER_902}\\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_message_absent_case "an unedited blockquoted withdrawal is inert" \
+    1 "edited verdict comment" "$FULL_LABELS" "$FULL_BODY" \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"created_at\": \"2026-08-27T01:00:00Z\", \"updated_at\": \"2026-08-27T01:00:00Z\", \"body\": \"${REVIEWER_901}\\n> CHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_message_absent_case "an edited blockquoted withdrawal remains inert" \
+    1 "edited verdict comment" "$FULL_LABELS" "$FULL_BODY" \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"created_at\": \"2026-08-27T01:00:00Z\", \"updated_at\": \"2026-08-27T02:00:00Z\", \"body\": \"${REVIEWER_901}\\n> CHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "the issuer's RETIRES clears the named refusal" 0 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\\nRETIRES ${REFUSAL_ID}\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "a different reviewer's RETIRES cannot clear a signed refusal" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"body\": \"${REVIEWER_902}\\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\\nRETIRES ${REFUSAL_ID}\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "RETIRES naming a different comment retires nothing" 1 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\\nRETIRES 999999\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "RETIRES is order- and lane-independent because it names the refusing comment" 0 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-WITHDRAWN-AT: codex ${HEAD_SHA}\\nRETIRES ${REFUSAL_ID}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_message_case "RETIRES clears only the named refusal comment" \
+    1 "1 standing refusal(s) remain for claude" "$FULL_LABELS" "$FULL_BODY" \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${SECOND_REFUSAL_ID}, \"body\": \"${REVIEWER_902}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\\nRETIRES ${REFUSAL_ID}\"},
+      {\"body\": \"${REVIEWER_903}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_message_case "one unquoted withdrawal leaves another issuer's refusal standing" \
+    1 "1 standing refusal(s) remain for claude" "$FULL_LABELS" "$FULL_BODY" \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${SECOND_REFUSAL_ID}, \"body\": \"${REVIEWER_902}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_903}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "precise and unquoted withdrawals in separate comments both apply" 0 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${SECOND_REFUSAL_ID}, \"body\": \"${REVIEWER_902}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"body\": \"${REVIEWER_902}\\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\"},
+      {\"id\": 900004, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\\nRETIRES ${REFUSAL_ID}\"},
+      {\"body\": \"${REVIEWER_903}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_case "one unquoted withdrawal clears all earlier refusals by its issuer" 0 \
+    "$FULL_LABELS" "$FULL_BODY" false \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${OLD_SHA}\"},
+      {\"id\": ${SECOND_REFUSAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
+run_message_case "a stale refusal remains standing after another reviewer approves" \
+    1 "$OLD_SHA" "$FULL_LABELS" "$FULL_BODY" \
+    "[{\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${OLD_SHA}\"},
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+
 # NEGATIVE: the exact defect — labels present, nothing binding the head.
 run_case "THE DEFECT: both labels present but NO binding at all blocks" 1 \
     "$FULL_LABELS" "$FULL_BODY" false "[]" "$HEAD_SHA"
@@ -579,12 +756,12 @@ run_case "a heading-masked rejection at the head must not read as approved" 1 \
 # and the OTHER lane had not spoken past it, so the union kept reporting it.
 # Honouring the rejection instead of flagging it is what makes recovery clean —
 # and it is what the reference verifier does, so the two now agree here.
-run_case "a masked rejection followed by a fresh approval passes again" 0 \
+run_case "a masked rejection followed by its issuer's fresh approval passes again" 0 \
     "$FULL_LABELS" "$FULL_BODY" false \
     "[{\"body\": \"APPROVED-AT: codex ${HEAD_SHA}\"},
-      {\"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"},
-      {\"body\": \"## CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
-      {\"body\": \"APPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
+      {\"body\": \"${REVIEWER_902}\\nAPPROVED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_901}\\n## CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"body\": \"${REVIEWER_901}\\nAPPROVED-AT: claude ${HEAD_SHA}\"}]" "$HEAD_SHA"
 
 run_case "a masked claude rejection does not revoke the codex lane" 1 \
     "$FULL_LABELS" "$FULL_BODY" false \
@@ -770,6 +947,61 @@ run_raw_case "an UNTAGGED rejection still supersedes a tagged approval" 1 \
     "[{\"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
       {\"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: claude ${HEAD_SHA}\"},
       {\"body\": \"CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"}]"
+
+run_raw_case "an unattributed refusal is not discharged by a later approval" 1 \
+    "[{\"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
+
+run_raw_case "RETIRES keeps an unsigned refusal's precise exit" 0 \
+    "[{\"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\nRETIRES ${REFUSAL_ID}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
+
+run_raw_message_case "RETIRES of one unsigned refusal leaves the other comment standing" \
+    1 "1 standing refusal(s) remain for claude" \
+    "[{\"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${SECOND_REFUSAL_ID}, \"body\": \"CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\nRETIRES ${REFUSAL_ID}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
+
+run_raw_case "an unsigned RETIRES cannot clear a signed refusal" 1 \
+    "[{\"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"${TAG_REVIEWER}\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"body\": \"CHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\nRETIRES ${REFUSAL_ID}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: claude ${HEAD_SHA} BY hermit-903\"}]"
+
+run_raw_case "an unquoted withdrawal cannot clear an unsigned refusal" 1 \
+    "[{\"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"body\": \"CHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"${TAG_REVIEWER}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
+
+run_raw_case "a forged-disclosure non-member unquoted withdrawal cannot discharge" 1 \
+    "[{\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_903}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"author_association\": \"OWNER\", \"body\": \"${REVIEWER_901}\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"author_association\": \"NONE\", \"body\": \"${REVIEWER_901}\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_902}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
+
+run_raw_case "trusted unquoted withdrawal with the same text still discharges" 0 \
+    "[{\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_903}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"author_association\": \"OWNER\", \"body\": \"${REVIEWER_901}\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"author_association\": \"OWNER\", \"body\": \"${REVIEWER_901}\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_902}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
+
+run_raw_case "a forged-disclosure non-member precise RETIRES cannot discharge" 1 \
+    "[{\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_903}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"author_association\": \"OWNER\", \"body\": \"${REVIEWER_901}\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"author_association\": \"NONE\", \"body\": \"${REVIEWER_901}\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\nRETIRES ${REFUSAL_ID}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_902}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
+
+run_raw_case "trusted precise RETIRES with the same text still discharges" 0 \
+    "[{\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_903}\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"id\": ${REFUSAL_ID}, \"author_association\": \"OWNER\", \"body\": \"${REVIEWER_901}\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA}\"},
+      {\"id\": ${WITHDRAWAL_ID}, \"author_association\": \"OWNER\", \"body\": \"${REVIEWER_901}\nCHANGES-REQUESTED-WITHDRAWN-AT: claude ${HEAD_SHA}\nRETIRES ${REFUSAL_ID}\"},
+      {\"author_association\": \"OWNER\", \"body\": \"${REVIEWER_902}\nAPPROVED-AT: claude ${HEAD_SHA}\"}]"
 
 # ⚠️ A LEADING WORD IS NOT STRUCTURE, AND EVERY ONE OF THESE ONCE ADMITTED.
 # `strip_structural_prefix` removes headings, quotes and list markers; it does not

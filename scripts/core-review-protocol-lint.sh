@@ -49,20 +49,24 @@
 # and `ci-hub/health/pr_status.py` already call. Exactly one shape carries
 # authority:
 #
-#     APPROVED-AT: <claude|codex> <40-hex>
+#     APPROVED-AT: <claude|codex> <40-hex> [BY <agent>]
 #
 # matched case-insensitively against the whole line after whole-line markdown
 # emphasis is removed. Rejections mirror it and win within a comment:
 #
-#     CHANGES-REQUESTED-AT: <claude|codex> <40-hex>
+#     CHANGES-REQUESTED-AT: <claude|codex> <40-hex> [BY <agent>]
+#     CHANGES-REQUESTED-WITHDRAWN-AT: <claude|codex> <40-hex> [BY <agent>]
 #     REQUEST CHANGES AT <40-hex>              (historical, lane-less)
 #
-# Verdicts are chronological: a rejection clears that lane's earlier approvals
-# and a later approval can re-establish authority. A lane binds only when the
-# NEWEST SHA it bound itself to equals the current head. A line carrying a
-# verdict-ish keyword and a 40-hex that matches no known shape is reported and
-# BLOCKS rather than being skipped — an unrecognised variant that is silently
-# ignored reads as no approval, and a heading-prefixed verdict line
+# Verdicts are chronological: a rejection clears that lane's earlier approvals.
+# It remains a standing refusal until its own issuer later approves that lane,
+# withdraws its outstanding refusals with an unquoted canonical withdrawal, or precisely
+# names the refusing comment with `RETIRES <comment-id>`. A different reviewer
+# cannot discharge an attributed refusal. A lane binds only when the NEWEST SHA
+# it bound itself to equals the current head and no refusal remains. A line
+# carrying a verdict-ish keyword and a 40-hex that matches no known shape is
+# reported and BLOCKS rather than being skipped — an unrecognised variant that
+# is silently ignored reads as no approval, and a heading-prefixed verdict line
 # (`## APPROVED-AT: ...`) is exactly how one real rejection went unseen.
 #
 # Inputs (environment variables):
@@ -73,7 +77,8 @@
 #   PR_HEAD_SHA       the exact 40-hex head the approvals must bind
 #   PR_COMMENTS_FILE  path to a file holding a JSON array of the PR's issue
 #                     comments, oldest first, each object carrying at least
-#                     `body`. PREFERRED, and what the workflow uses.
+#                     `body`; `id` is required for `RETIRES`. PREFERRED, and what
+#                     the workflow uses.
 #   PR_COMMENTS_JSON  the same JSON inline. Convenient for tests and small PRs;
 #                     PR_COMMENTS_FILE takes precedence when both are set.
 #
@@ -302,6 +307,8 @@ undecorate() {
 }
 
 readonly SHA40_RE='[0-9a-fA-F]{40}'
+readonly AGENT_ID_RE='[a-z0-9][a-z0-9-]*'
+readonly MARKER_ISSUER_SUFFIX_RE="([[:space:]]+BY[[:space:]]+(${AGENT_ID_RE}))?"
 # Structural Markdown is accepted for rejections, never approvals. Normalise
 # headings, block quotes, unordered/ordered lists, and task-list markers one
 # layer at a time so nested forms cannot hide a negative verdict. Applying the
@@ -309,10 +316,11 @@ readonly SHA40_RE='[0-9a-fA-F]{40}'
 # visible too. An approval still binds only when APPROVE_RE matches the original
 # undecorated line exactly; `## APPROVED-AT: ...` therefore refuses rather than
 # authorising.
-readonly APPROVE_RE="^APPROVED-AT:[[:space:]]*(claude|codex)[[:space:]]+(${SHA40_RE})$"
-readonly REJECT_RE="^CHANGES-REQUESTED-AT:[[:space:]]*(claude|codex)[[:space:]]+${SHA40_RE}$"
-readonly REJECT_LEGACY_RE="^REQUEST[[:space:]]+CHANGES[[:space:]]+AT[[:space:]]+${SHA40_RE}$"
-readonly EXPLICIT_VERDICT_RE='^(APPROVED-AT:|CHANGES-REQUESTED-AT:|REQUEST[[:space:]]+CHANGES[[:space:]]+AT)'
+readonly APPROVE_RE="^APPROVED-AT:[[:space:]]*(claude|codex)[[:space:]]+(${SHA40_RE})${MARKER_ISSUER_SUFFIX_RE}$"
+readonly REJECT_RE="^CHANGES-REQUESTED-AT:[[:space:]]*(claude|codex)[[:space:]]+(${SHA40_RE})${MARKER_ISSUER_SUFFIX_RE}$"
+readonly WITHDRAW_RE="^CHANGES-REQUESTED-WITHDRAWN-AT:[[:space:]]*(claude|codex)[[:space:]]+(${SHA40_RE})${MARKER_ISSUER_SUFFIX_RE}$"
+readonly REJECT_LEGACY_RE="^REQUEST[[:space:]]+CHANGES[[:space:]]+AT[[:space:]]+(${SHA40_RE})$"
+readonly EXPLICIT_VERDICT_RE='^(APPROVED-AT:|CHANGES-REQUESTED-AT:|CHANGES-REQUESTED-WITHDRAWN-AT:|REQUEST[[:space:]]+CHANGES[[:space:]]+AT)'
 # The same keywords ANYWHERE on the line, not only at column 0.
 #
 # ⚠️ A LEADING WORD IS NOT STRUCTURE, AND THAT IS HOW A REJECTION WENT MISSING.
@@ -342,12 +350,25 @@ readonly EXPLICIT_VERDICT_RE='^(APPROVED-AT:|CHANGES-REQUESTED-AT:|REQUEST[[:spa
 # prose quotation of a marker also refuses, and a refusal that says "this line
 # looks like a verdict and binds nothing" is recoverable, while a silently
 # swallowed rejection is not.
-readonly EXPLICIT_VERDICT_ANYWHERE_RE='(APPROVED-AT:|CHANGES-REQUESTED-AT:|REQUEST[[:space:]]+CHANGES[[:space:]]+AT)'
+readonly EXPLICIT_VERDICT_ANYWHERE_RE='(APPROVED-AT:|CHANGES-REQUESTED-AT:|CHANGES-REQUESTED-WITHDRAWN-AT:|REQUEST[[:space:]]+CHANGES[[:space:]]+AT)'
 readonly STRUCTURAL_PREFIX_RE='^(#{1,6}[[:space:]]*|>[[:space:]]*|[-+*][[:space:]]+(\[[[:space:]xX]\][[:space:]]+)?|[0-9]+[.)][[:space:]]+(\[[[:space:]xX]\][[:space:]]+)?)(.*)$'
+readonly AUTHORITY_PREFIX_RE='^(#{1,6}[[:space:]]*|[-+*][[:space:]]+(\[[[:space:]xX]\][[:space:]]+)?|[0-9]+[.)][[:space:]]+(\[[[:space:]xX]\][[:space:]]+)?)(.*)$'
 
 strip_structural_prefix() {
     local line=$1
     while [[ $line =~ $STRUCTURAL_PREFIX_RE ]]; do
+        line=${BASH_REMATCH[4]}
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+    done
+    printf '%s' "$line"
+}
+
+# The shared authority accepts headings and list markers but not blockquotes:
+# quoted text may describe a verdict, but cannot issue or withdraw one.
+strip_authority_prefix() {
+    local line=$1
+    while [[ $line =~ $AUTHORITY_PREFIX_RE ]]; do
         line=${BASH_REMATCH[4]}
         line="${line#"${line%%[![:space:]]*}"}"
         line="${line%"${line##*[![:space:]]}"}"
@@ -371,11 +392,104 @@ strip_structural_prefix() {
 # asserts. The correct end state is for the reference to adopt the same class so
 # both consumers agree again; that belongs in a dev-hermit change, not here.
 readonly SUSPECT_RE="^(APPROV|CHANGES-REQUESTED|REQUEST[[:space:]]+CHANGES|REJECT|LGTM|SIGN(ED)?[-[:space:]]?OFF|ACK).*${SHA40_RE}"
+readonly RETIRES_RE='(^|[^[:alnum:]_])RETIRES[[:space:]]+#?([0-9]{6,})([^[:alnum:]_]|$)'
+
+# The GitHub account is shared for relayed review comments, so `.user.login`
+# cannot identify the reviewer. Agent comments carry their writer in the
+# existing `[team, agent, ...]` disclosure tag. Read the first such tag from an
+# unquoted, unindented line; bracketed role tags may precede it on the same line.
+comment_author() {
+    local body=$1 line rest tag
+    while IFS= read -r line; do
+        rest=$line
+        while [[ $rest =~ ^\[([^][]*)\][[:space:]]*(.*)$ ]]; do
+            tag=${BASH_REMATCH[1]}
+            rest=${BASH_REMATCH[2]}
+            if [[ $tag =~ ^[[:space:]]*[a-z0-9]+[[:space:]]*,[[:space:]]*(${AGENT_ID_RE})[[:space:]]*, ]]; then
+                printf '%s' "${BASH_REMATCH[1],,}"
+                return
+            fi
+        done
+    done <<< "$body"
+}
+
+# The refusal gate attributes withdrawal and RETIRES authority to the comment:
+# the first marker-level BY in the body wins, then the disclosure author.
+comment_issuer() {
+    local body=$1 line undecorated verdict_line named
+    while IFS= read -r line; do
+        undecorated=$(undecorate "$line")
+        verdict_line=$(strip_authority_prefix "$undecorated")
+        if [[ $verdict_line =~ $APPROVE_RE ]] \
+           || [[ $verdict_line =~ $REJECT_RE ]] \
+           || [[ $verdict_line =~ $WITHDRAW_RE ]]; then
+            named=${BASH_REMATCH[4]-}
+            if [ -n "$named" ]; then
+                printf '%s' "${named,,}"
+                return
+            fi
+        fi
+    done <<< "$body"
+    comment_author "$body"
+}
+
+# Two readable issuers are the same reviewer. Unattributed markers match nobody.
+# Keep this as the single ownership comparison so the mutation check can prove
+# every issuer-scoped discharge depends on it.
+same_issuer() {
+    local left=$1 right=$2
+    [ -n "$left" ] && [ "$left" != '<unattributed>' ] \
+        && [ "$left" = "$right" ]
+}
+
+# Remove all refusals owned by ISSUER after that issuer posts a fresh approval.
+# Rows are `<comment-id> <comment-index> <sha> <issuer>`.
+discharge_refusals() {
+    local issuer=$1 held held_issuer
+    shift
+    for held in "$@"; do
+        held_issuer=${held##* }
+        if same_issuer "$held_issuer" "$issuer"; then
+            continue
+        fi
+        printf '%s\n' "$held"
+    done
+}
+
+# Emit every numeric comment id named by `RETIRES` in BODY, in text order.
+retire_targets() {
+    local rest=$1 match
+    while [[ $rest =~ $RETIRES_RE ]]; do
+        printf '%s\n' "${BASH_REMATCH[2]}"
+        match=${BASH_REMATCH[0]}
+        rest=${rest#*"$match"}
+    done
+}
+
+# A verdict is issued once. A later identical marker from the same comment
+# author is a citation, not a fresh decision after an intervening refusal.
+verdict_is_citation() {
+    local author=$1 kind=$2 lane=$3 sha=$4 issued
+    local seen_author seen_kind seen_lane seen_sha
+    shift 4
+    [ -n "$author" ] || return 1
+    for issued in "$@"; do
+        IFS=$'\x1f' read -r seen_author seen_kind seen_lane seen_sha <<< "$issued"
+        if [ "$seen_author" = "$author" ] \
+           && [ "$seen_kind" = "$kind" ] \
+           && { [ "$seen_lane" = "$lane" ] || [ "$seen_lane" = '*' ] || [ "$lane" = '*' ]; } \
+           && [ "$seen_sha" = "$sha" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
 
 
 # Scan every comment for LANE and emit one tagged row per line of stdout:
 #
-#   S <sha>    a SHA this lane bound itself to, oldest first
+#   S <index> <sha>  a SHA this lane bound itself to, oldest first
+#   R <comment-id> <index> <sha> <issuer>  a refusal not discharged
 #   M <line>   a verdict-ish line matching no known shape
 #
 # Everything travels out through stdout ON PURPOSE. The caller reads this with
@@ -385,8 +499,11 @@ readonly SUSPECT_RE="^(APPROV|CHANGES-REQUESTED|REQUEST[[:space:]]+CHANGES|REJEC
 # tests still passed, because those cases also failed the binding check for an
 # unrelated reason. Tagged stdout is what makes both results actually observable.
 scan_lane() {
-    local lane=$1 encoded body line undecorated verdict_line login assoc created updated
+    local lane=$1 cid encoded body line undecorated verdict_line authority_line login assoc created updated author comment_issuer_value withdrawer
     local -a found=()
+    local -a outstanding=()
+    local -a withdrawals=()
+    local -a issued_verdicts=()
     local idx=-1
     # The reference grammar is case-insensitive throughout, so `APPROVED-AT:
     # CODEX <SHA>` binds exactly as `approved-at: codex <sha>` does. Scoped to
@@ -394,10 +511,13 @@ scan_lane() {
     local had_nocasematch=0
     shopt -q nocasematch && had_nocasematch=1
     shopt -s nocasematch
-    while IFS=$'\x1f' read -r login assoc created updated encoded; do
+    while IFS=$'\x1f' read -r cid login assoc created updated encoded; do
         [ -n "$encoded" ] || continue
         idx=$((idx + 1))
+        cid=${cid:-index-$idx}
         body=$(printf '%s' "$encoded" | base64 -d)
+        author=$(comment_author "$body")
+        comment_issuer_value=$(comment_issuer "$body")
         # GitHub returns issue comments in creation order, but comments are
         # mutable. If a verdict-bearing comment was edited, the current payload
         # cannot prove where the edited verdict belongs in the chronology or
@@ -408,11 +528,14 @@ scan_lane() {
             while IFS= read -r line; do
                 undecorated=$(undecorate "$line")
                 verdict_line=$(strip_structural_prefix "$undecorated")
+                authority_line=$(strip_authority_prefix "$undecorated")
                 if [[ $undecorated =~ $APPROVE_RE ]] \
                    || [[ $verdict_line =~ $REJECT_RE ]] \
+                   || [[ $authority_line =~ $WITHDRAW_RE ]] \
                    || [[ $verdict_line =~ $REJECT_LEGACY_RE ]] \
-                   || [[ $verdict_line =~ $EXPLICIT_VERDICT_RE ]] \
-                   || [[ $verdict_line =~ $SUSPECT_RE ]]; then
+                   || { ! [[ $verdict_line =~ $WITHDRAW_RE ]] \
+                        && { [[ $verdict_line =~ $EXPLICIT_VERDICT_RE ]] \
+                             || [[ $verdict_line =~ $SUSPECT_RE ]]; }; }; then
                     printf 'E %s edited verdict comment cannot establish chronology: %s\n' \
                         "$idx" "${verdict_line:0:80}"
                     edited_verdict=1
@@ -445,24 +568,78 @@ scan_lane() {
                 *) approver_refusal="author_association '${assoc:-<missing>}' is not OWNER, MEMBER, or COLLABORATOR" ;;
             esac
         fi
+        # Record canonical withdrawals for application after the whole history
+        # is known. A RETIRES claim is precise to its named comment; an unquoted
+        # withdrawal remains an independent issuer-scoped operation.
+        while IFS= read -r line; do
+            undecorated=$(undecorate "$line")
+            verdict_line=$(strip_authority_prefix "$undecorated")
+            if [[ $verdict_line =~ $WITHDRAW_RE ]]; then
+                local withdrawn_lane=${BASH_REMATCH[1]}
+                local withdrawn_sha=${BASH_REMATCH[2]}
+                local withdrawal_marker_issuer=${BASH_REMATCH[4]-}
+                local withdrawal_refusal=$approver_refusal
+                withdrawn_lane=${withdrawn_lane,,}
+                if [ -n "$withdrawal_refusal" ]; then
+                    printf 'W %s %s association=%s (%s)\n' \
+                        "$idx" "${login:-<unidentified>}" \
+                        "${assoc:-<unknown>}" "$withdrawal_refusal"
+                elif ! verdict_is_citation "$author" withdrawn "$withdrawn_lane" \
+                    "$withdrawn_sha" "${issued_verdicts[@]}"; then
+                    issued_verdicts+=("$author"$'\x1f'"withdrawn"$'\x1f'"$withdrawn_lane"$'\x1f'"$withdrawn_sha")
+                    local -a targets=()
+                    local targets_csv='-'
+                    mapfile -t targets < <(retire_targets "$body")
+                    if [ "${#targets[@]}" -gt 0 ]; then
+                        local old_ifs=$IFS
+                        IFS=,
+                        targets_csv=${targets[*]}
+                        IFS=$old_ifs
+                        withdrawer=$comment_issuer_value
+                    else
+                        withdrawer=${withdrawal_marker_issuer:-$author}
+                    fi
+                    withdrawer=${withdrawer,,}
+                    withdrawals+=("$idx $cid $withdrawn_lane $withdrawn_sha ${withdrawer:-<unattributed>} $targets_csv")
+                fi
+            fi
+        done <<< "$body"
+
         # A rejection contributes NOTHING from this comment, even if the same
         # comment also carries an APPROVED-AT-shaped line: a comment quoting the
         # approval it supersedes must not bind as a positive. Clearing rather
         # than skipping is load-bearing, or APPROVED-then-CHANGES-REQUESTED
         # would read as approved forever.
-        local rejected=0
+        local rejected=0 rejected_sha refusing_issuer
         while IFS= read -r line; do
             undecorated=$(undecorate "$line")
             verdict_line=$(strip_structural_prefix "$undecorated")
             if [[ $verdict_line =~ $REJECT_LEGACY_RE ]]; then
+                rejected_sha=${BASH_REMATCH[1]}
+                if verdict_is_citation "$author" refused '*' "$rejected_sha" \
+                    "${issued_verdicts[@]}"; then
+                    continue
+                fi
+                issued_verdicts+=("$author"$'\x1f'"refused"$'\x1f'"*"$'\x1f'"$rejected_sha")
                 rejected=1
-                break
+                refusing_issuer=$author
+                outstanding+=("$cid $idx $rejected_sha ${refusing_issuer:-<unattributed>}")
+                continue
             fi
             if [[ $verdict_line =~ $REJECT_RE ]]; then
                 local rejected_lane=${BASH_REMATCH[1]}
                 if [ "${rejected_lane,,}" = "$lane" ]; then
+                    rejected_sha=${BASH_REMATCH[2]}
+                    local refusal_marker_issuer=${BASH_REMATCH[4]-}
+                    if verdict_is_citation "$author" refused "$lane" "$rejected_sha" \
+                        "${issued_verdicts[@]}"; then
+                        continue
+                    fi
+                    issued_verdicts+=("$author"$'\x1f'"refused"$'\x1f'"$lane"$'\x1f'"$rejected_sha")
                     rejected=1
-                    break
+                    refusing_issuer=${refusal_marker_issuer:-$author}
+                    refusing_issuer=${refusing_issuer,,}
+                    outstanding+=("$cid $idx $rejected_sha ${refusing_issuer:-<unattributed>}")
                 fi
             fi
         done <<< "$body"
@@ -475,6 +652,7 @@ scan_lane() {
             verdict_line=$(strip_structural_prefix "$undecorated")
             if [[ $undecorated =~ $APPROVE_RE ]]; then
                 local matched_lane=${BASH_REMATCH[1]} matched_sha=${BASH_REMATCH[2]}
+                local approver=${BASH_REMATCH[4]-}
                 if [ "${matched_lane,,}" = "$lane" ] && [ -n "$approver_refusal" ]; then
                     # Reported, not silently dropped. A refused approval that
                     # vanished would surface only as the generic "no approval
@@ -490,12 +668,28 @@ scan_lane() {
                     # bind there. Normalising here would make this gate accept
                     # an approval the reference rejects, and two consumers
                     # disagreeing about what approval means is the whole defect.
+                    # The same author repeating the same lane/head approval is a
+                    # citation of its earlier verdict, not a fresh verdict after
+                    # an intervening refusal. This uses the disclosure author,
+                    # matching the parent authority's citation rule; marker BY
+                    # remains the more specific issuer for refusal ownership.
+                    if verdict_is_citation "$author" approved "$lane" "$matched_sha" \
+                        "${issued_verdicts[@]}"; then
+                        continue
+                    fi
+                    issued_verdicts+=("$author"$'\x1f'"approved"$'\x1f'"$lane"$'\x1f'"$matched_sha")
+
+                    approver=${approver:-$author}
+                    approver=${approver,,}
+                    mapfile -t outstanding < <(discharge_refusals "$approver" \
+                        "${outstanding[@]}")
                     found+=("$idx $matched_sha")
                 fi
             elif { [[ $verdict_line =~ $EXPLICIT_VERDICT_RE ]] \
                    || [[ $verdict_line =~ $EXPLICIT_VERDICT_ANYWHERE_RE ]] \
                    || [[ $verdict_line =~ $SUSPECT_RE ]]; } \
                  && ! [[ $verdict_line =~ $REJECT_RE ]] \
+                 && ! [[ $verdict_line =~ $WITHDRAW_RE ]] \
                  && ! [[ $verdict_line =~ $REJECT_LEGACY_RE ]]; then
                 # A well-formed rejection for the OTHER lane reaches here (it is
                 # not this lane's rejection, and it is not an approval) and it
@@ -504,9 +698,9 @@ scan_lane() {
                 printf 'M %s %s\n' "$idx" "${verdict_line:0:120}"
             fi
         done <<< "$body"
-    # Carries commenter identity and creation/edit timestamps alongside the
-    # text. @tsv over a fixed 5-field row keeps the split unambiguous, and the
-    # body stays base64 so an embedded tab or newline cannot shift the columns.
+    # Carries comment id, commenter identity, and creation/edit timestamps
+    # alongside the text. A fixed 6-field row keeps the split unambiguous, and
+    # the body stays base64 so an embedded tab or newline cannot shift columns.
     #
     # TOTAL BY CONSTRUCTION. Every accessor is guarded, so no element can make
     # jq raise and truncate the stream mid-way. The input validation above
@@ -515,12 +709,13 @@ scan_lane() {
     # rather than as an error.
     done < <(printf '%s' "$comments_json" \
         | jq -r '.[]? | if type == "object" then
-                            [((.user // {}) | if type == "object" then (.login // "") else "" end),
+                            [(.id // "" | tostring),
+                             ((.user // {}) | if type == "object" then (.login // "") else "" end),
                              (.author_association // ""),
                              (.created_at // ""),
                              (.updated_at // ""),
                              (.body // "" | tostring | @base64)]
-                        else ["", "", "", "", ""] end | join("\u001f")')
+                        else ["", "", "", "", "", ""] end | join("\u001f")')
     # Truncation is still checked rather than assumed: if the loop saw fewer
     # comments than the payload holds, something dropped rows and the lane's
     # verdict was computed from a partial history.
@@ -529,10 +724,57 @@ scan_lane() {
     if [ "$declared" -ge 0 ] && [ "$seen" -ne "$declared" ]; then
         printf 'X read %s of %s comments; the stream was truncated\n' "$seen" "$declared"
     fi
+    # Apply withdrawals after the complete lane history is known. RETIRES is
+    # order-independent because the comment id identifies its target exactly.
+    # An unquoted withdrawal is chronological and removes all earlier refusals
+    # from its own readable issuer; it does not become inert merely because a
+    # different withdrawal comment uses RETIRES.
+    local withdrawal w_idx w_cid w_lane w_sha w_issuer w_targets
+    for withdrawal in ${withdrawals[@]+"${withdrawals[@]}"}; do
+        read -r w_idx w_cid w_lane w_sha w_issuer w_targets <<< "$withdrawal"
+        : "$w_cid" "$w_sha"
+        if [ "$w_targets" != '-' ]; then
+            local -a target_ids=() retained=()
+            local target held r_cid r_idx r_sha r_issuer
+            IFS=, read -r -a target_ids <<< "$w_targets"
+            for held in ${outstanding[@]+"${outstanding[@]}"}; do
+                read -r r_cid r_idx r_sha r_issuer <<< "$held"
+                : "$r_idx" "$r_sha"
+                local retire=0
+                for target in "${target_ids[@]}"; do
+                    if [ "$r_cid" = "$target" ]; then
+                        if [ "$r_issuer" = '<unattributed>' ] \
+                           || same_issuer "$r_issuer" "$w_issuer"; then
+                            retire=1
+                        fi
+                    fi
+                done
+                [ "$retire" -eq 1 ] || retained+=("$held")
+            done
+            outstanding=("${retained[@]}")
+        elif [ "$w_lane" = "$lane" ]; then
+            local -a retained=()
+            local held r_cid r_idx r_sha r_issuer
+            for held in ${outstanding[@]+"${outstanding[@]}"}; do
+                read -r r_cid r_idx r_sha r_issuer <<< "$held"
+                : "$r_cid" "$r_sha"
+                if [ "$r_idx" -lt "$w_idx" ] \
+                   && same_issuer "$r_issuer" "$w_issuer"; then
+                    continue
+                fi
+                retained+=("$held")
+            done
+            outstanding=("${retained[@]}")
+        fi
+    done
+
     [ "$had_nocasematch" -eq 1 ] || shopt -u nocasematch
     local row
     for row in ${found[@]+"${found[@]}"}; do
         printf 'S %s\n' "$row"
+    done
+    for row in ${outstanding[@]+"${outstanding[@]}"}; do
+        printf 'R %s\n' "$row"
     done
 }
 
@@ -698,6 +940,8 @@ if [ "$binding_inputs_ok" -eq 1 ]; then
         lane_unauthorized=()
         lane_edited=()
         lane_truncated=()
+        lane_refused=()
+        lane_unauthorized_withdrawal=()
         newest_idx=-1
         while IFS= read -r row; do
             case $row in
@@ -710,6 +954,8 @@ if [ "$binding_inputs_ok" -eq 1 ]; then
                 'U '*) lane_unauthorized+=("${row#U }") ;;
                 'E '*) lane_edited+=("${row#E }") ;;
                 'X '*) lane_truncated+=("${row#X }") ;;
+                'R '*) lane_refused+=("${row#R }") ;;
+                'W '*) lane_unauthorized_withdrawal+=("${row#W }") ;;
             esac
         done < <(scan_lane "$lane")
 
@@ -727,6 +973,9 @@ if [ "$binding_inputs_ok" -eq 1 ]; then
         # attempt to mint one is worth seeing in the log either way.
         for entry in ${lane_unauthorized[@]+"${lane_unauthorized[@]}"}; do
             echo "PR #${pr}: ignoring an unauthenticated ${lane} approval at comment ${entry% (*}: ${entry#* }"
+        done
+        for entry in ${lane_unauthorized_withdrawal[@]+"${lane_unauthorized_withdrawal[@]}"}; do
+            echo "PR #${pr}: ignoring an unauthenticated withdrawal at comment ${entry% (*}: ${entry#* }"
         done
 
         # An unparseable verdict line only matters if it could be a verdict this
@@ -753,7 +1002,16 @@ if [ "$binding_inputs_ok" -eq 1 ]; then
             esac
         done
 
-        if [ "${#lane_bound[@]}" -eq 0 ] && [ "${#lane_unauthorized[@]}" -gt 0 ]; then
+        if [ "${#lane_refused[@]}" -gt 0 ]; then
+            latest_refusal=${lane_refused[-1]}
+            refusal_cid=${latest_refusal%% *}
+            refusal_detail=${latest_refusal#* }
+            refusal_idx=${refusal_detail%% *}
+            refusal_detail=${refusal_detail#* }
+            refusal_sha=${refusal_detail%% *}
+            refusal_issuer=${refusal_detail#* }
+            fail "${#lane_refused[@]} standing refusal(s) remain for ${lane}; latest is at ${refusal_sha} from ${refusal_issuer} (comment ${refusal_cid}, index ${refusal_idx}). Only that issuer's later approval or withdrawal, or an entitled RETIRES naming that comment, can discharge it."
+        elif [ "${#lane_bound[@]}" -eq 0 ] && [ "${#lane_unauthorized[@]}" -gt 0 ]; then
             fail "no trusted role-tagged exact-head approval from ${lane}: ${#lane_unauthorized[@]} \`APPROVED-AT: ${lane}\` line(s) were present but none came from an eligible review comment (${lane_unauthorized[0]}). A bare or public-commenter body is not authority; the comment must contain a bracketed reviewer or relay role tag and have OWNER, MEMBER, or COLLABORATOR association."
         elif [ "${#lane_bound[@]}" -eq 0 ]; then
             fail "no exact-head approval from ${lane}: found no \`APPROVED-AT: ${lane} <40-hex>\` line in any comment (the passed-review-${lane} label is a cache, not authority)."
