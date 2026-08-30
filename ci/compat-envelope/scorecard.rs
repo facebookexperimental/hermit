@@ -504,6 +504,7 @@ struct Observation {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     depth: BTreeMap<String, SourceDepth>,
     hermit_shas: BTreeSet<String>,
+    #[serde(deserialize_with = "deserialize_product_observation_results")]
     results: BTreeSet<ObservedResult>,
     /// The compact receipt for canonical validate evidence. Raw result files
     /// remain in retained history; this keeps the comparison identity and INFO
@@ -5199,6 +5200,32 @@ where
     Ok(unique)
 }
 
+fn require_product_observation_results(results: &BTreeSet<ObservedResult>) -> Result<(), String> {
+    if let Some(result) = results.iter().find(|result| {
+        matches!(
+            result,
+            ObservedResult::SandboxDenied | ObservedResult::InfrastructureError
+        )
+    }) {
+        return Err(format!(
+            "tracked scorecard observation cannot contain non-product result `{}`",
+            result.as_str()
+        ));
+    }
+    Ok(())
+}
+
+fn deserialize_product_observation_results<'de, D>(
+    deserializer: D,
+) -> Result<BTreeSet<ObservedResult>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let results = BTreeSet::<ObservedResult>::deserialize(deserializer)?;
+    require_product_observation_results(&results).map_err(serde::de::Error::custom)?;
+    Ok(results)
+}
+
 fn validate_observation_identity_namespace(cells: &TrackedCells) -> Result<(), String> {
     let permits_projected_identity = cells.schema >= 7
         && cells.projection.as_ref().is_some_and(|projection| {
@@ -5208,6 +5235,7 @@ fn validate_observation_identity_namespace(cells: &TrackedCells) -> Result<(), S
     for cell in &cells.cells {
         let id = display_id(&cell.id);
         for observation in &cell.observations {
+            require_product_observation_results(&observation.results)?;
             let projected = !observation.event_ids.is_empty();
             if (projected || observation.detcore_tree.is_none()) && !permits_projected_identity {
                 return Err(format!(
@@ -12689,6 +12717,33 @@ red/`measured-and-passed` count is **0**.",
     event_ids.push(duplicate_event_id);
     if serde_json::from_value::<TrackedCells>(duplicate_event_ids).is_ok() {
         return Err("duplicate projected observation event_id was accepted".into());
+    }
+    for (rendered, typed) in [
+        ("sandbox-denied", ObservedResult::SandboxDenied),
+        ("infrastructure-error", ObservedResult::InfrastructureError),
+    ] {
+        let mut direct_json: JsonValue = serde_json::from_str(&object_store_outputs[0])
+            .map_err(|e| format!("cannot decode projected fixture for result refusal: {e}"))?;
+        direct_json["cells"][0]["observations"][0]["results"] =
+            serde_json::json!([rendered]);
+        let direct_error = serde_json::from_value::<TrackedCells>(direct_json)
+            .expect_err("direct tracked serde accepted a non-product observation result")
+            .to_string();
+        if !direct_error.contains(rendered) {
+            return Err(format!(
+                "direct tracked serde refusal did not name {rendered}: {direct_error}"
+            ));
+        }
+
+        let mut typed_cells = projected_fixture.clone();
+        typed_cells.cells[0].observations[0].results = BTreeSet::from([typed]);
+        let encode_error = encoded_cells(&typed_cells)
+            .expect_err("scorecard writer accepted a non-product observation result");
+        if !encode_error.contains(rendered) {
+            return Err(format!(
+                "scorecard writer refusal did not name {rendered}: {encode_error}"
+            ));
+        }
     }
 
     // The real erasure mode: the observation SURVIVES and its coordinates are
