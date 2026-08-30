@@ -57,7 +57,7 @@ const SCORECARD: &str = "SCORECARD.md";
 const CELLS: &str = "ci/compat-envelope/cells.json";
 const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
 const SCHEMA: u64 = 7;
-const PRESSURE_SUMMARY_SCHEMA: u64 = 4;
+const PRESSURE_SUMMARY_SCHEMA: u64 = 5;
 const CELL_RESULT_SCHEMA: u64 = 4;
 
 const USAGE: &str = r#"Usage: ci/compat-envelope/scorecard.rs COMMAND [OPTIONS]
@@ -3747,7 +3747,7 @@ fn apply_pressure_summary(
     detcore_tree: &str,
     depth: &BTreeMap<String, SourceDepth>,
 ) -> Result<FoldOutcome, String> {
-    if summary.schema != PRESSURE_SUMMARY_SCHEMA {
+    if !matches!(summary.schema, 4 | PRESSURE_SUMMARY_SCHEMA) {
         return Err(format!(
             "unsupported pressure summary schema {}",
             summary.schema
@@ -11190,6 +11190,22 @@ red/`measured-and-passed` count is **0**.",
     .is_ok()
     {
         return Err("infrastructure failure was stored as product behavior".into());
+    }
+    let sandbox_denied = pressure_summary(
+        "sha-1",
+        "tree-1",
+        vec![pressure_row("sandbox-denied", None, None)],
+    );
+    if apply_pressure_summary(
+        &mut refusal_target,
+        &sandbox_denied,
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+    )
+    .is_ok()
+    {
+        return Err("sandbox-denied pressure output was stored as product behavior".into());
     }
     // ⚠️ THE HEADLINE PROPERTY, OWNER RULING: A BATCH OF N CELLS HAS EXACTLY THE
     // SAME EFFECT AS N SEPARATE SINGLE-CELL RUNS. Cells have nothing to do with
