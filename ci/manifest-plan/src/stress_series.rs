@@ -1019,7 +1019,8 @@ impl SeriesRow {
                 )
                 | (
                     SeriesOutcome::Errored,
-                    None,
+                    Some(ObservedResult::SandboxDenied | ObservedResult::InfrastructureError)
+                        | None,
                     Some(FailureClass::UnderstoodInfrastructureFailure)
                 )
                 | (

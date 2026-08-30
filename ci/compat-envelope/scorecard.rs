@@ -431,7 +431,11 @@ fn derive_measurement(cell: &TrackedCell) -> MeasurementState {
                 ObservedResult::DeterminismFailure
                 | ObservedResult::ParityFailure
                 | ObservedResult::ReplayFailure => diverged = true,
-                ObservedResult::CrashError | ObservedResult::Timeout | ObservedResult::Oom => {}
+                ObservedResult::CrashError
+                | ObservedResult::Timeout
+                | ObservedResult::Oom
+                | ObservedResult::SandboxDenied
+                | ObservedResult::InfrastructureError => {}
             }
         }
         located |= !observation.first_divergent_record.is_empty()
@@ -5326,7 +5330,13 @@ fn series_evidence(row: &SeriesRow, id: &CellId) -> Option<SeriesEvidence> {
                 result: Some(result),
                 no_verdict: false,
             }),
-            Some(ObservedResult::CrashError | ObservedResult::Timeout | ObservedResult::Oom)
+            Some(
+                ObservedResult::CrashError
+                | ObservedResult::Timeout
+                | ObservedResult::Oom
+                | ObservedResult::SandboxDenied
+                | ObservedResult::InfrastructureError,
+            )
             | None => None,
         };
     }

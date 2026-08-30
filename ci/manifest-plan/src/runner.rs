@@ -34,6 +34,8 @@ pub use crate::canonical_verdict::VerificationRuntime;
 use crate::ci_selection::CiDisabledReasonSpec;
 use crate::ci_selection::CiSelection;
 use crate::ci_selection::CiSelectionSpec;
+use crate::environmental_block::EnvBlockClass;
+use crate::environmental_block::environmental_block_observation;
 use crate::host_capability::probe_host_capabilities;
 use crate::stress_series::HostCapabilities;
 use crate::stress_series::HostCapability;
@@ -995,6 +997,8 @@ pub enum ObservedResult {
     CrashError,
     Timeout,
     Oom,
+    SandboxDenied,
+    InfrastructureError,
 }
 
 impl ObservedResult {
@@ -1007,6 +1011,10 @@ impl ObservedResult {
             "crash-error" => Ok(Self::CrashError),
             "timeout" => Ok(Self::Timeout),
             "oom" => Ok(Self::Oom),
+            "sandbox-denied" => Err(
+                "pressure summary contains a sandbox-denied operation; refusing to store it as product behavior"
+                    .into(),
+            ),
             "infrastructure-error" => Err(
                 "pressure summary contains an infrastructure error; refusing to store it as product behavior"
                     .into(),
@@ -1024,6 +1032,8 @@ impl ObservedResult {
             Self::CrashError => "crash-error",
             Self::Timeout => "timeout",
             Self::Oom => "oom",
+            Self::SandboxDenied => "sandbox-denied",
+            Self::InfrastructureError => "infrastructure-error",
         }
     }
 
@@ -1042,6 +1052,9 @@ impl ObservedResult {
             | Self::ReplayFailure
             | Self::CrashError => Some(FailureClass::ProductFailure),
             Self::Timeout | Self::Oom => Some(FailureClass::NoResult),
+            Self::SandboxDenied | Self::InfrastructureError => {
+                Some(FailureClass::UnderstoodInfrastructureFailure)
+            }
         }
     }
 }
@@ -1373,6 +1386,10 @@ impl CellResult {
                 }
             }
             "ERROR" => match (self.result, self.failure_class) {
+                (
+                    Some(ObservedResult::SandboxDenied | ObservedResult::InfrastructureError),
+                    Some(FailureClass::UnderstoodInfrastructureFailure),
+                ) => Ok(()),
                 (
                     None,
                     Some(
@@ -2920,6 +2937,16 @@ fn observed_result(
     if outcome == "PASS" {
         return Some(ObservedResult::Pass);
     }
+    if let Some(class) = attempts.iter().find_map(|attempt| {
+        let output = format!("{}\n{}", attempt.stdout, attempt.stderr);
+        environmental_block_observation(&output).block_class()
+    }) {
+        return Some(if class == EnvBlockClass::BpfjailerBanner {
+            ObservedResult::SandboxDenied
+        } else {
+            ObservedResult::InfrastructureError
+        });
+    }
     // A later framework or evidence failure decides whether this cell produced
     // a usable product result. An earlier attempt can still retain a located
     // divergence in `attempts`, but it must not make a terminal infrastructure
@@ -2969,6 +2996,12 @@ fn failure_class(
 ) -> Option<FailureClass> {
     if outcome == "PASS" {
         return None;
+    }
+    if matches!(
+        result,
+        Some(ObservedResult::SandboxDenied | ObservedResult::InfrastructureError)
+    ) {
+        return Some(FailureClass::UnderstoodInfrastructureFailure);
     }
     if let Some(failure_class) = non_product_failure_class(error_kind) {
         return Some(failure_class);
@@ -6691,6 +6724,14 @@ backends_disabled:
         timeout.result = Some(ObservedResult::Timeout);
         timeout.failure_class = Some(FailureClass::NoResult);
         timeout.require_current_classification().unwrap();
+
+        let mut sandbox_denied = cell_result_that_located_nothing();
+        sandbox_denied.outcome = "ERROR".into();
+        sandbox_denied.result = Some(ObservedResult::SandboxDenied);
+        sandbox_denied.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+        sandbox_denied
+            .require_current_classification()
+            .expect("typed sandbox denial is a current non-product result");
     }
 
     #[test]
@@ -6771,6 +6812,73 @@ backends_disabled:
                 invalid_evidence.error_kind.as_deref()
             ),
             Some(FailureClass::NoResult)
+        );
+    }
+
+    #[test]
+    fn framework_serializes_environmental_results_from_captured_output() {
+        let mut sandbox_denied = attempt_with_sabre_evidence("");
+        sandbox_denied.outcome = "ERROR".into();
+        sandbox_denied.error_kind = Some("incomplete-verification-evidence".into());
+        sandbox_denied.stderr =
+            "An action was blocked on this server based on a security policy!\n\
+             Enforcer: FS, Reason: FILE_OPEN\n"
+                .into();
+        let sandbox_result = observed_result(
+            "verify",
+            &sandbox_denied.outcome,
+            std::slice::from_ref(&sandbox_denied),
+            sandbox_denied.error_kind.as_deref(),
+        );
+        assert_eq!(sandbox_result, Some(ObservedResult::SandboxDenied));
+        assert_eq!(
+            failure_class(
+                &sandbox_denied.outcome,
+                sandbox_result,
+                sandbox_denied.error_kind.as_deref()
+            ),
+            Some(FailureClass::UnderstoodInfrastructureFailure)
+        );
+
+        let mut proxy_denied = sandbox_denied.clone();
+        proxy_denied.stderr = "fatal: unable to access repository: Could not resolve proxy".into();
+        let infrastructure_result = observed_result(
+            "verify",
+            &proxy_denied.outcome,
+            std::slice::from_ref(&proxy_denied),
+            proxy_denied.error_kind.as_deref(),
+        );
+        assert_eq!(
+            infrastructure_result,
+            Some(ObservedResult::InfrastructureError)
+        );
+        assert_eq!(
+            failure_class(
+                &proxy_denied.outcome,
+                infrastructure_result,
+                proxy_denied.error_kind.as_deref()
+            ),
+            Some(FailureClass::UnderstoodInfrastructureFailure)
+        );
+
+        let mut ordinary = sandbox_denied;
+        ordinary.outcome = "FAIL".into();
+        ordinary.error_kind = None;
+        ordinary.stderr = "ordinary guest assertion failed".into();
+        let ordinary_result = observed_result(
+            "verify",
+            &ordinary.outcome,
+            std::slice::from_ref(&ordinary),
+            ordinary.error_kind.as_deref(),
+        );
+        assert_eq!(ordinary_result, Some(ObservedResult::CrashError));
+        assert_eq!(
+            failure_class(
+                &ordinary.outcome,
+                ordinary_result,
+                ordinary.error_kind.as_deref()
+            ),
+            Some(FailureClass::ProductFailure)
         );
     }
 
