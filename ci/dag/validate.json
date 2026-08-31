@@ -3062,6 +3062,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/ipc-determinism",
+          "mode": "chaos",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ipc-determinism",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -15571,6 +15578,13 @@
           "test": "c-programs/ioctl-siocethtool",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ipc-determinism",
+          "mode": "chaos",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",

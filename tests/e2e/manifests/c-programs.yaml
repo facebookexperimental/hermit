@@ -2559,14 +2559,14 @@ test:
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
       chaos:
-        ci: false
-        ci_disabled_reason: >-
-          Measured 2026-08-25 by agent(hermit-007). 32 seeds under --chaos --strict gave 32 of 32 passes and 0 failures, but only 6 distinct observation classes against this cell's own assert.min_distinct of 16. The other two cells in this ratchet met their oracles - thread-sync-determinism 14 distinct, thread-contention 32. Reconcile the 16 before enabling - either diversity regressed from the 32 classes the description records, or the threshold does not describe what the harness hashes, which is status plus stdout.
+        ci: true
         # Three producers each write twelve records in fixed per-producer order to one
         # pipe, so stdout can expose 36! / (12!^3) = 3384731762521200 classes. The
         # mechanically selected prefix 0..31 produced 32 classes under strict INFO
-        # verification. Keeping the same work but printing a fixed valid record order
-        # collapsed the population to one class.
+        # verification, re-measured on 2026-09-15 at 0b26fb78 after an earlier run
+        # reported only 6; a control raising min_distinct to 33 fails, so the floor
+        # is enforced rather than decorative. Keeping the same work but printing a
+        # fixed valid record order collapsed the population to one class.
         seeds:
           - 0
           - 1
