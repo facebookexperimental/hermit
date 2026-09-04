@@ -39,10 +39,6 @@ The mode view makes the current order of work explicit: expand `verify` first, t
 | `naked` | — | — | — | — | — | 0 / 360 | 0 | 33 | 327 | 360 |
 | **Total** | | | | | | | **753** | **154** | **4853** | **5760** |
 
-## Cross-backend parity
-
-The manifest-backed scorecard does not yet contain cross-backend parity cells. In particular, a DBT, KVM, SaBRe, or LiteInst `verify` cell compares that backend with itself, not with ptrace. Standalone backend gates exercise selected comparisons, but their results are not counted here. Until a cell actually compares a fresh ptrace log with the corresponding backend log, this table reports no cross-backend parity number.
-
 ## Ptrace by manifest category
 
 This view uses the same Basic Sanity Milestone 1 contracts as the tables above, but makes the ptrace workload mix visible. Each entry is `green / total`; `custom` commands are not part of this denominator.
@@ -74,6 +70,23 @@ These rows are part of the selected regression denominator even though they are 
 | `portable` | `backend-parity-c` | `backend-parity-c/environment-and-workdir` | `custom` | `ptrace` |
 | `portable` | `system-utils` | `system-utils/clock-determinism` | `custom` | `liteinst` |
 | `portable` | `system-utils` | `system-utils/clock-determinism` | `custom` | `ptrace` |
+
+## Cross-backend parity
+
+This is measured ptrace-reference parity, not CI plan membership and not same-backend repeatability. A cell is eligible when the corresponding ptrace `verify` coordinate is Green; this intentionally includes manifest-disabled candidate cells selected through `--probe-disabled`. `Never measured` means no strict typed ptrace-vs-candidate report exists. At the latest recorded Hermit source depth, any divergence outranks a match.
+
+| Candidate backend | Eligible ptrace-green cells | Disabled probe candidates | Measured match | Parity failure | Never measured |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `dbt` | 340 | 280 | 0 | 0 | 340 |
+| `kvm` | 340 | 321 | 0 | 0 | 340 |
+| `sabre` | 340 | 197 | 0 | 0 | 340 |
+| `liteinst` | 340 | 289 | 0 | 0 | 340 |
+
+Measured pairs are listed individually so a failing backend/test coordinate is visible without interpreting the plan-colour tables. Counts are records/messages actually compared.
+
+| Test | Candidate backend | Result | Compared records | Ptrace INFO | Candidate INFO |
+| --- | --- | --- | ---: | ---: | ---: |
+| _none_ | — | — | — | — | — |
 
 ## Status and measurement
 

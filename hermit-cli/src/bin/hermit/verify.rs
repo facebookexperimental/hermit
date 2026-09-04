@@ -27,6 +27,8 @@ use hermit::Error;
 use hermit::HERMIT_VERIFICATION_DIVERGENCE_EXIT;
 use hermit::canonical_verdict::ComparedLogMessages;
 use hermit::canonical_verdict::ComparedLogScope;
+use hermit::canonical_verdict::ComparedOutput;
+use hermit::canonical_verdict::ComparedOutputs;
 use hermit::canonical_verdict::ComparisonReport;
 pub(crate) use hermit::canonical_verdict::DbtCountedBranchComparison;
 use hermit::canonical_verdict::InfrastructureError;
@@ -507,6 +509,8 @@ pub struct VerificationOutcome {
     /// the log comparison was not run at all (output-only fallback). `None` and
     /// `Some(0/0)` are both "no log evidence" and neither can support parity.
     pub compared_log_messages: Option<ComparedLogCounts>,
+    /// Exact guest output and disposition for both runs.
+    pub compared_outputs: ComparedOutputs,
     /// Typed whole-process DBT branch clocks, when that backend completed both
     /// runs and produced readable statistics. `None` for non-DBT runs and when
     /// verification did not reach a verdict.
@@ -594,6 +598,9 @@ fn comparison_report(comparison: &ComparisonSpec) -> ComparisonReport {
             RecordEnvelopePolicy::DbtEvidenceTransportV1 => {
                 RecordEnvelopeReport::DbtEvidenceTransportV1
             }
+            RecordEnvelopePolicy::CrossBackendDetcoreV1 => {
+                RecordEnvelopeReport::CrossBackendDetcoreV1
+            }
             RecordEnvelopePolicy::CallerDefined => RecordEnvelopeReport::CallerDefined,
         },
         virtualize_time: Some(comparison.virtualize_time),
@@ -654,6 +661,8 @@ pub(crate) fn verification_report(outcome: &VerificationOutcome) -> Verification
                     right: u64::try_from(counts.right).expect("compared log count fits u64"),
                 })
         },
+        compared_outputs: (outcome.verdict != Verdict::NoResult)
+            .then(|| outcome.compared_outputs.clone()),
         dbt_counted_branches: if outcome.verdict == Verdict::NoResult {
             None
         } else {
@@ -1150,6 +1159,18 @@ fn compare_two_runs_with_unsupported_scan(
         log: log2,
         label: label2,
     } = second;
+    let output_evidence = |output: &Output| ComparedOutput {
+        exit_code: output.status.code(),
+        signal: output.status.signal(),
+        stdout_sha256: detcore::Digest::new(&output.stdout).to_string(),
+        stdout_bytes: u64::try_from(output.stdout.len()).expect("guest stdout length fits u64"),
+        stderr_sha256: detcore::Digest::new(&output.stderr).to_string(),
+        stderr_bytes: u64::try_from(output.stderr.len()).expect("guest stderr length fits u64"),
+    };
+    let compared_outputs = ComparedOutputs {
+        left: output_evidence(out1),
+        right: output_evidence(out2),
+    };
     let compared_labels = ComparisonSideLabels::new(label1, label2);
     let mut failed = false;
     // A difference that was actually OBSERVED, as opposed to a comparison that
@@ -1390,6 +1411,7 @@ fn compare_two_runs_with_unsupported_scan(
             guest_status: out2.status,
             comparison: spec,
             compared_log_messages,
+            compared_outputs,
             dbt_counted_branches: None,
             runtime: None,
             first_divergent_scheduler_turn,
@@ -1406,6 +1428,7 @@ fn compare_two_runs_with_unsupported_scan(
             guest_status: out2.status,
             comparison: spec,
             compared_log_messages,
+            compared_outputs,
             dbt_counted_branches: None,
             runtime: None,
             first_divergent_scheduler_turn,
@@ -3162,6 +3185,24 @@ mod tests {
             guest_status: ExitStatus::Exited(0),
             comparison: full,
             compared_log_messages: Some(ComparedLogCounts { left: 9, right: 9 }),
+            compared_outputs: ComparedOutputs {
+                left: ComparedOutput {
+                    exit_code: Some(0),
+                    signal: None,
+                    stdout_sha256: detcore::Digest::new(b"same stdout").to_string(),
+                    stdout_bytes: 11,
+                    stderr_sha256: detcore::Digest::new(b"").to_string(),
+                    stderr_bytes: 0,
+                },
+                right: ComparedOutput {
+                    exit_code: Some(0),
+                    signal: None,
+                    stdout_sha256: detcore::Digest::new(b"different stdout").to_string(),
+                    stdout_bytes: 16,
+                    stderr_sha256: detcore::Digest::new(b"").to_string(),
+                    stderr_bytes: 0,
+                },
+            },
             dbt_counted_branches: None,
             runtime: None,
             first_divergent_scheduler_turn: None,

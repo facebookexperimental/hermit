@@ -15,8 +15,13 @@ use std::time::Instant;
 use clap::Parser;
 use detcore::logdiff;
 use hermit::HERMIT_VERIFICATION_DIVERGENCE_EXIT;
+use hermit::logdiff_report::LOG_DIFF_REPORT_SCHEMA;
+use hermit::logdiff_report::LogDiffComparison;
+use hermit::logdiff_report::LogDiffMessageCounts;
+use hermit::logdiff_report::LogDiffRecords;
+use hermit::logdiff_report::LogDiffReport;
+use hermit::logdiff_report::LogDiffVerdict;
 use reverie::process::ExitStatus;
-use serde::Serialize;
 use tempfile::NamedTempFile;
 
 use super::global_opts::GlobalOpts;
@@ -238,6 +243,9 @@ impl LogDiffCLIOpts {
             options.comparison = logdiff::LogComparisonMode::Info;
             options.canonicalize_addresses = true;
         }
+        if record_envelope.policy() == RecordEnvelopePolicy::CrossBackendDetcoreV1 {
+            options.require_structured_events = true;
+        }
 
         if let Some(path) = &self.json
             && let Err(error) = write_json(
@@ -280,7 +288,7 @@ impl LogDiffCLIOpts {
                 // refusal is deterministic and re-running changes nothing.
                 if let Some(path) = &self.json {
                     let mut report = pending_json_report(&options, record_envelope.policy());
-                    report.verdict = JsonVerdict::Refused;
+                    report.verdict = LogDiffVerdict::Refused;
                     report.refusal = Some(error.to_string());
                     if let Err(write_error) = write_json(path, &report) {
                         eprintln!(
@@ -292,7 +300,7 @@ impl LogDiffCLIOpts {
                 return ExitStatus::Exited(2);
             }
         };
-        let records = JsonRecords {
+        let records = LogDiffRecords {
             compared: records_left.min(records_right),
             available_left: records_left,
             available_right: records_right,
@@ -397,7 +405,7 @@ impl LogDiffCLIOpts {
                     return ExitStatus::Exited(2);
                 }
             };
-            let records = JsonRecords {
+            let records = LogDiffRecords {
                 compared: comparison.records_compared,
                 available_left: comparison.records_available_left,
                 available_right: comparison.records_available_right,
@@ -445,7 +453,7 @@ impl LogDiffCLIOpts {
                     options,
                     &comparison.summary,
                     records,
-                    JsonVerdict::Diverged,
+                    LogDiffVerdict::Diverged,
                     "diverged",
                     ExitStatus::Exited(HERMIT_VERIFICATION_DIVERGENCE_EXIT),
                 );
@@ -472,7 +480,7 @@ impl LogDiffCLIOpts {
                         options,
                         &comparison.summary,
                         records,
-                        JsonVerdict::IdenticalSoFar,
+                        LogDiffVerdict::IdenticalSoFar,
                         "quiescent",
                         ExitStatus::Exited(0),
                     );
@@ -488,7 +496,7 @@ impl LogDiffCLIOpts {
                     options,
                     &comparison.summary,
                     records,
-                    JsonVerdict::NoComparableMessages,
+                    LogDiffVerdict::NoComparableMessages,
                     "quiescent",
                     ExitStatus::Exited(2),
                 );
@@ -507,7 +515,7 @@ impl LogDiffCLIOpts {
                     options,
                     &comparison.summary,
                     records,
-                    JsonVerdict::IdenticalSoFar,
+                    LogDiffVerdict::IdenticalSoFar,
                     "timeout",
                     ExitStatus::Exited(3),
                 );
@@ -521,8 +529,8 @@ impl LogDiffCLIOpts {
         &self,
         options: &logdiff::LogDiffOpts,
         summary: &logdiff::LogDiffSummary,
-        records: JsonRecords,
-        verdict: JsonVerdict,
+        records: LogDiffRecords,
+        verdict: LogDiffVerdict,
         stopped_because: &'static str,
         status: ExitStatus,
     ) -> ExitStatus {
@@ -536,7 +544,7 @@ impl LogDiffCLIOpts {
             self.record_envelope.envelope().policy(),
         );
         report.verdict = verdict;
-        report.follow_stopped_because = Some(stopped_because);
+        report.follow_stopped_because = Some(stopped_because.to_owned());
         if let Err(error) = write_json(path, &report) {
             eprintln!(
                 "hermit log-diff: could not write JSON report to {}: {error}",
@@ -568,103 +576,20 @@ fn canonical_comparison_is_unrelaxed(options: &logdiff::LogDiffOpts) -> Result<(
     Ok(())
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "snake_case")]
-enum JsonVerdict {
-    NoResult,
-    /// The comparison REFUSED to run -- it did not reach a verdict and it did
-    /// not merely fail to find one.
-    ///
-    /// Distinct from [`Self::NoResult`] on purpose. The JSON is written up front
-    /// as a pending `no_result` so a crash cannot leave a stale report behind,
-    /// which is right; but it meant a caller reading the file could not tell a
-    /// refusal from a legitimate "no verdict reached". They call for different
-    /// actions: `no_result` invites re-running, `refused` says the inputs
-    /// cannot be compared as given and re-running will do the same thing.
-    Refused,
-    Matched,
-    /// No difference over the records compared so far, with more of at least
-    /// one run still unread. This is deliberately *not* `Matched`: a caller who
-    /// treats agreement over a prefix as agreement overall will stop early and
-    /// conclude the wrong thing. Read `records.compared` before believing it.
-    IdenticalSoFar,
-    Diverged,
-    NoComparableMessages,
-}
-
-#[derive(Serialize)]
-struct JsonMessageCounts {
-    left: usize,
-    right: usize,
-}
-
-/// How much of each run was actually read. Always present: a verdict without a
-/// denominator cannot be acted on.
-#[derive(Serialize)]
-struct JsonRecords {
-    /// Records compared in both streams -- the shorter side bounds this.
-    compared: usize,
-    available_left: usize,
-    available_right: usize,
-    /// True when a still-being-written tail was deliberately held back so a
-    /// partial write could not read as a difference.
-    withheld_incomplete_tail: bool,
-}
-
-#[derive(Serialize)]
-struct JsonComparison<'a> {
-    stream: &'static str,
-    record_envelope: RecordEnvelopePolicy,
-    unsafe_strip_lines: bool,
-    canonicalize_host_addresses: bool,
-    ignored_line_substrings: &'a [String],
-    skip_commit: bool,
-    skip_detlog: bool,
-    included_detlog_kinds: Vec<&'static str>,
-    git_diff: bool,
-}
-
-#[derive(Serialize)]
-struct JsonReport<'a> {
-    verdict: JsonVerdict,
-    /// Why the comparison refused, when `verdict` is `refused`. Absent
-    /// otherwise, so its presence alone distinguishes a refusal from every
-    /// other outcome without parsing the verdict string.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    refusal: Option<String>,
-    selected_messages: JsonMessageCounts,
-    records: JsonRecords,
-    comparison: JsonComparison<'a>,
-    /// Why following stopped: `refused`, `diverged`, `quiescent`, or `timeout`. Absent for
-    /// a one-shot comparison of two finished logs.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    follow_stopped_because: Option<&'static str>,
-    /// 1-based index of the first differing record, located by bisection rather
-    /// than merely bounded by `records.compared`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    first_divergent_record: Option<usize>,
-    /// How many syscalls the guest had completed when the divergence appeared.
-    first_divergent_syscall: Option<u64>,
-    first_divergent_scheduler_turn: Option<u64>,
-    first_divergent_virtual_nanoseconds: Option<u64>,
-    first_divergent_left_message: Option<String>,
-    first_divergent_right_message: Option<String>,
-}
-
-fn json_report<'a>(
+fn json_report(
     summary: &logdiff::LogDiffSummary,
-    options: &'a logdiff::LogDiffOpts,
-    records: JsonRecords,
+    options: &logdiff::LogDiffOpts,
+    records: LogDiffRecords,
     record_envelope: RecordEnvelopePolicy,
-) -> JsonReport<'a> {
+) -> LogDiffReport {
     let verdict = if summary.refusal_reason.is_some() {
-        JsonVerdict::Refused
+        LogDiffVerdict::Refused
     } else if summary.diff_found {
-        JsonVerdict::Diverged
+        LogDiffVerdict::Diverged
     } else if summary.compared_left == 0 && summary.compared_right == 0 {
-        JsonVerdict::NoComparableMessages
+        LogDiffVerdict::NoComparableMessages
     } else {
-        JsonVerdict::Matched
+        LogDiffVerdict::Matched
     };
     let stream = match options.comparison {
         logdiff::LogComparisonMode::Deterministic => "deterministic",
@@ -675,15 +600,16 @@ fn json_report<'a>(
         .include_detlogs
         .iter()
         .map(|kind| match kind {
-            logdiff::DetLogFilter::Syscall => "syscall",
-            logdiff::DetLogFilter::SyscallResult => "syscall_result",
-            logdiff::DetLogFilter::Other => "other",
+            logdiff::DetLogFilter::Syscall => "syscall".to_owned(),
+            logdiff::DetLogFilter::SyscallResult => "syscall_result".to_owned(),
+            logdiff::DetLogFilter::Other => "other".to_owned(),
         })
         .collect();
-    JsonReport {
+    LogDiffReport {
+        schema: LOG_DIFF_REPORT_SCHEMA,
         verdict,
         refusal: summary.refusal_reason.clone(),
-        selected_messages: JsonMessageCounts {
+        selected_messages: LogDiffMessageCounts {
             left: summary.compared_left,
             right: summary.compared_right,
         },
@@ -691,12 +617,13 @@ fn json_report<'a>(
         follow_stopped_because: None,
         first_divergent_record: summary.first_divergent_record,
         first_divergent_syscall: summary.first_divergent_syscall,
-        comparison: JsonComparison {
-            stream,
+        comparison: LogDiffComparison {
+            stream: stream.to_owned(),
             record_envelope,
             unsafe_strip_lines: options.strip_lines,
             canonicalize_host_addresses: options.canonicalize_addresses,
-            ignored_line_substrings: &options.ignore_lines,
+            require_structured_events: options.require_structured_events,
+            ignored_line_substrings: options.ignore_lines.clone(),
             skip_commit: options.skip_commit,
             skip_detlog: options.skip_detlog,
             included_detlog_kinds,
@@ -712,7 +639,7 @@ fn json_report<'a>(
 fn pending_json_report(
     options: &logdiff::LogDiffOpts,
     record_envelope: RecordEnvelopePolicy,
-) -> JsonReport<'_> {
+) -> LogDiffReport {
     let summary = logdiff::LogDiffSummary {
         diff_found: false,
         compared_left: 0,
@@ -726,12 +653,12 @@ fn pending_json_report(
         refusal_reason: None,
     };
     let mut report = json_report(&summary, options, no_records(), record_envelope);
-    report.verdict = JsonVerdict::NoResult;
+    report.verdict = LogDiffVerdict::NoResult;
     report
 }
 
-fn no_records() -> JsonRecords {
-    JsonRecords {
+fn no_records() -> LogDiffRecords {
+    LogDiffRecords {
         compared: 0,
         available_left: 0,
         available_right: 0,
@@ -749,7 +676,7 @@ fn read_growing_log(path: &Path) -> std::io::Result<Vec<u8>> {
     }
 }
 
-fn write_json(path: &Path, report: &JsonReport<'_>) -> std::io::Result<()> {
+fn write_json(path: &Path, report: &LogDiffReport) -> std::io::Result<()> {
     let directory = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -767,6 +694,8 @@ fn write_json(path: &Path, report: &JsonReport<'_>) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use detcore::detlog::DetLogEvent;
+    use detcore::detlog::record_suffix;
 
     use super::*;
 
@@ -922,7 +851,7 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
         let report = serde_json::to_value(json_report(
             &empty,
             &follow_options(),
-            JsonRecords {
+            LogDiffRecords {
                 compared: records_left.min(records_right),
                 available_left: records_left,
                 available_right: records_right,
@@ -1082,6 +1011,77 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
     }
 
     #[test]
+    fn cross_backend_envelope_matches_and_detects_a_detcore_divergence() {
+        let directory = tempfile::tempdir().unwrap();
+        let reference = directory.path().join("ptrace.log");
+        let candidate = directory.path().join("kvm.log");
+        let record = |time| {
+            format!(
+                "2026-09-03T10:00:00.000000Z INFO detcore::scheduler: COMMIT turn 7 at time {time}{}\n",
+                record_suffix(DetLogEvent::SchedulerCommit {
+                    scheduler_turn: 7,
+                    virtual_nanoseconds: time,
+                    internal_io_poll: false,
+                    runtime_maps_read: false,
+                })
+            )
+        };
+        let ptrace_transport = "2026-09-03T10:00:00.000001Z INFO reverie_ptrace: backend ready\n";
+        let kvm_transport = "2026-09-03T10:00:00.000001Z INFO reverie_kvm: backend ready\n";
+        let envelope = RecordEnvelope::cross_backend_detcore_v1();
+        let options = logdiff::LogDiffOpts {
+            comparison: logdiff::LogComparisonMode::Info,
+            canonicalize_addresses: true,
+            require_structured_events: true,
+            ..Default::default()
+        };
+
+        std::fs::write(&reference, format!("{}{ptrace_transport}", record(17))).unwrap();
+        std::fs::write(&candidate, format!("{}{kvm_transport}", record(17))).unwrap();
+        let (matched, left_records, right_records) =
+            try_log_diff_with_records(&reference, &candidate, &options, envelope).unwrap();
+        let matched_report = json_report(
+            &matched,
+            &options,
+            LogDiffRecords {
+                compared: left_records.min(right_records),
+                available_left: left_records,
+                available_right: right_records,
+                withheld_incomplete_tail: false,
+            },
+            envelope.policy(),
+        );
+        matched_report.require_cross_backend_evidence().unwrap();
+        assert_eq!(matched_report.verdict, LogDiffVerdict::Matched);
+        assert_eq!(matched_report.selected_messages.left, 1);
+
+        // Change only a shared Detcore value in the candidate. Backend-specific
+        // lifecycle text still differs in both controls and is intentionally
+        // outside the named comparison envelope.
+        std::fs::write(&candidate, format!("{}{kvm_transport}", record(18))).unwrap();
+        let (diverged, left_records, right_records) =
+            try_log_diff_with_records(&reference, &candidate, &options, envelope).unwrap();
+        let diverged_report = json_report(
+            &diverged,
+            &options,
+            LogDiffRecords {
+                compared: left_records.min(right_records),
+                available_left: left_records,
+                available_right: right_records,
+                withheld_incomplete_tail: false,
+            },
+            envelope.policy(),
+        );
+        diverged_report.require_cross_backend_evidence().unwrap();
+        assert_eq!(diverged_report.verdict, LogDiffVerdict::Diverged);
+        assert_eq!(diverged_report.first_divergent_scheduler_turn, Some(7));
+        assert_eq!(
+            diverged_report.first_divergent_virtual_nanoseconds,
+            Some(17)
+        );
+    }
+
+    #[test]
     fn follow_reports_divergence_before_either_run_finishes() {
         let directory = tempfile::tempdir().unwrap();
         let left = directory.path().join("left.log");
@@ -1205,7 +1205,7 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
             first_divergent_right_message: None,
             refusal_reason: None,
         };
-        let records = JsonRecords {
+        let records = LogDiffRecords {
             compared: 40,
             available_left: 41,
             available_right: 40,

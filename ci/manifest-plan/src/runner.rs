@@ -27,6 +27,10 @@ use serde_json::Value as JsonValue;
 use sha2::Digest;
 use sha2::Sha256;
 
+use crate::backend_parity::BACKEND_PARITY_REPORT_SCHEMA;
+use crate::backend_parity::BackendParityOperand;
+use crate::backend_parity::BackendParityReport;
+use crate::backend_parity::BackendParityVerdict;
 use crate::canonical_verdict::InfrastructureError;
 use crate::canonical_verdict::Verdict;
 pub use crate::canonical_verdict::VerificationReport;
@@ -37,6 +41,8 @@ use crate::ci_selection::CiSelectionSpec;
 use crate::environmental_block::EnvBlockClass;
 use crate::environmental_block::environmental_block_observation;
 use crate::host_capability::probe_host_capabilities;
+use crate::logdiff_report::LogDiffReport;
+use crate::logdiff_report::LogDiffVerdict;
 use crate::stress_series::HostCapabilities;
 use crate::stress_series::HostCapability;
 #[cfg(test)]
@@ -1277,6 +1283,11 @@ pub struct CellResult {
     pub execution_path: Option<JsonValue>,
     pub diversity: Option<JsonValue>,
     pub attempts: Vec<AttemptResult>,
+    /// Strict ptrace-reference comparison produced in this cell, when
+    /// explicitly requested by the runner. Same-backend verification evidence
+    /// remains in `attempts`; this field is the separate cross-backend fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_parity: Option<BackendParityReport>,
     /// Cell-level divergence position: the FIRST attempt that located one.
     ///
     /// This mirrors `reason` exactly, which is also
@@ -2973,11 +2984,197 @@ fn verification_verdict(attempt: &AttemptResult) -> Option<Verdict> {
         .map(|report| report.verdict)
 }
 
+fn retained_run1_log(spec: &CellRunSpec) -> Result<PathBuf, String> {
+    let directory = spec
+        .verification_log_dir
+        .as_ref()
+        .ok_or_else(|| format!("{} retained no verification log directory", spec.attempt))?;
+    let mut logs = fs::read_dir(directory)
+        .map_err(|error| format!("cannot read {}: {error}", directory.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with("run1_log_"))
+                && path.metadata().is_ok_and(|metadata| metadata.len() > 0)
+        })
+        .collect::<Vec<_>>();
+    logs.sort();
+    match logs.as_slice() {
+        [log] => Ok(log.clone()),
+        _ => Err(format!(
+            "{} retained {} nonempty run1 logs in {}; expected exactly one",
+            spec.attempt,
+            logs.len(),
+            directory.display()
+        )),
+    }
+}
+
+fn current_verification_report(
+    label: &str,
+    attempt: &AttemptResult,
+) -> Result<VerificationReport, String> {
+    let raw = attempt
+        .verification_report
+        .as_deref()
+        .ok_or_else(|| format!("{label} attempt omitted its verification report"))?;
+    let value = serde_json::from_str(raw)
+        .map_err(|error| format!("{label} verification report is not JSON: {error}"))?;
+    let report = VerificationReport::from_current_json_value(value)
+        .map_err(|error| format!("{label} verification report is incomplete: {error}"))?;
+    report.require_canonical_match().map_err(|error| {
+        format!("{label} did not pass strict same-backend verification: {error}")
+    })?;
+    Ok(report)
+}
+
+fn parity_operand(
+    label: &str,
+    backend: &str,
+    spec: &CellRunSpec,
+    attempt: &AttemptResult,
+    log: &Path,
+) -> Result<BackendParityOperand, String> {
+    let verification = current_verification_report(label, attempt)?;
+    let output = verification
+        .compared_outputs
+        .as_ref()
+        .ok_or_else(|| format!("{label} verification omitted exact stdout/stderr evidence"))?
+        .left
+        .clone();
+    let log_bytes = fs::read(log)
+        .map_err(|error| format!("cannot read retained log {}: {error}", log.display()))?;
+    let retained_log = log
+        .strip_prefix(&spec.cell_dir)
+        .unwrap_or(log)
+        .to_string_lossy()
+        .into_owned();
+    Ok(BackendParityOperand {
+        backend: backend.to_owned(),
+        output,
+        verification,
+        retained_log,
+        retained_log_sha256: hex_digest(&log_bytes),
+    })
+}
+
+struct ParityComparatorBudget {
+    deadline: Instant,
+    remaining_cpu_usec: u64,
+    cpu_timeout_seconds: u64,
+    wall_timeout_seconds: u64,
+}
+
+fn produce_backend_parity_report(
+    context: &RunContext,
+    candidate_spec: &CellRunSpec,
+    candidate_attempt: &AttemptResult,
+    reference_spec: &CellRunSpec,
+    reference_attempt: &AttemptResult,
+    budget: ParityComparatorBudget,
+) -> Result<(BackendParityReport, u64), String> {
+    let candidate_backend = candidate_spec
+        .id
+        .backend
+        .as_deref()
+        .ok_or_else(|| "parity candidate has no backend".to_string())?;
+    let reference_backend = reference_spec
+        .id
+        .backend
+        .as_deref()
+        .ok_or_else(|| "parity reference has no backend".to_string())?;
+    let candidate_log = retained_run1_log(candidate_spec)?;
+    let reference_log = retained_run1_log(reference_spec)?;
+    let comparison_path = candidate_spec.cell_dir.join("backend-parity-logdiff.json");
+    let _ = fs::remove_file(&comparison_path);
+    let comparator_args = vec![
+        "log-diff".into(),
+        reference_log.to_string_lossy().into_owned(),
+        candidate_log.to_string_lossy().into_owned(),
+        "--json".into(),
+        comparison_path.to_string_lossy().into_owned(),
+        "--record-envelope".into(),
+        "cross-backend-detcore-v1".into(),
+    ];
+    let comparator_program = context.hermit_bin.to_string_lossy().into_owned();
+    let captures = candidate_spec.cell_dir.join("captures");
+    let output = execute_process(
+        &context.root,
+        &comparator_program,
+        &comparator_args,
+        &BTreeMap::new(),
+        &captures.join("backend-parity-logdiff.stdout"),
+        &captures.join("backend-parity-logdiff.stderr"),
+        (budget.deadline, Some(budget.remaining_cpu_usec)),
+    )
+    .map_err(|error| format!("cannot execute strict backend log comparison: {error}"))?;
+    if let Some(timeout) = output.timeout {
+        return Err(format!(
+            "strict backend log comparison {}",
+            timeout.reason(budget.cpu_timeout_seconds, budget.wall_timeout_seconds)
+        ));
+    }
+    let comparison_bytes = fs::read(&comparison_path).map_err(|error| {
+        format!(
+            "strict backend log comparison wrote no report at {}: {error}",
+            comparison_path.display()
+        )
+    })?;
+    let comparison: LogDiffReport = serde_json::from_slice(&comparison_bytes)
+        .map_err(|error| format!("backend log comparison report is unreadable: {error}"))?;
+    comparison.require_cross_backend_evidence()?;
+    match (output.status.code(), comparison.verdict) {
+        (Some(0), LogDiffVerdict::Matched) | (Some(1), LogDiffVerdict::Diverged) => {}
+        (status, verdict) => {
+            return Err(format!(
+                "backend log comparator status {status:?} contradicts verdict {verdict:?}"
+            ));
+        }
+    }
+    let reference = parity_operand(
+        "ptrace reference",
+        reference_backend,
+        reference_spec,
+        reference_attempt,
+        &reference_log,
+    )?;
+    let candidate = parity_operand(
+        "candidate",
+        candidate_backend,
+        candidate_spec,
+        candidate_attempt,
+        &candidate_log,
+    )?;
+    let verdict =
+        if reference.output == candidate.output && comparison.verdict == LogDiffVerdict::Matched {
+            BackendParityVerdict::Matched
+        } else {
+            BackendParityVerdict::Diverged
+        };
+    let report = BackendParityReport {
+        schema: BACKEND_PARITY_REPORT_SCHEMA,
+        verdict,
+        reference,
+        candidate,
+        comparison,
+    };
+    report.validate(candidate_backend)?;
+    let mut bytes = serde_json::to_vec(&report)
+        .map_err(|error| format!("cannot serialize backend parity report: {error}"))?;
+    bytes.push(b'\n');
+    fs::write(candidate_spec.cell_dir.join("backend-parity.json"), bytes)
+        .map_err(|error| format!("cannot retain backend parity report: {error}"))?;
+    Ok((report, output.cpu_usage_usec))
+}
+
 fn observed_result(
     mode: &str,
     outcome: &str,
     attempts: &[AttemptResult],
     error_kind: Option<&str>,
+    backend_parity: Option<&BackendParityReport>,
 ) -> Option<ObservedResult> {
     // Preserve the existing terminal evidence and timeout guards before using
     // a typed product verdict. Incidental diagnostic text cannot erase a valid
@@ -3026,6 +3223,9 @@ fn observed_result_from_typed_evidence(
     if attempts.iter().any(|attempt| attempt.timed_out) {
         return Some(ObservedResult::Timeout);
     }
+    if backend_parity.is_some_and(|report| report.verdict == BackendParityVerdict::Diverged) {
+        return Some(ObservedResult::ParityFailure);
+    }
     if mode == "verify"
         && attempts
             .iter()
@@ -3051,9 +3251,11 @@ fn non_product_failure_class(error_kind: Option<&str>) -> Option<FailureClass> {
         Some("infrastructure" | "result-publication") => {
             Some(FailureClass::UnderstoodInfrastructureFailure)
         }
-        Some("incomplete-verification-evidence" | "invalid-backend-evidence") => {
-            Some(FailureClass::NoResult)
-        }
+        Some(
+            "incomplete-verification-evidence"
+            | "incomplete-parity-evidence"
+            | "invalid-backend-evidence",
+        ) => Some(FailureClass::NoResult),
         _ => None,
     }
 }
@@ -3103,6 +3305,80 @@ fn apply_failed_chaos_assertion(
 }
 
 pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult, String> {
+    run_cell_inner(context, cell, None)
+}
+
+/// Run the ordinary cell plus a ptrace reference and compare one retained run
+/// from each. Both operands still execute their normal two-run strict
+/// verification; parity is an additional fact, not a replacement for either
+/// backend's repeatability result.
+pub fn run_cell_with_parity(
+    context: &RunContext,
+    cell: &SelectedCell,
+    reference_backend: &str,
+) -> Result<CellResult, String> {
+    if reference_backend != "ptrace" {
+        return Err(format!(
+            "backend parity currently requires the ptrace reference, got {reference_backend:?}"
+        ));
+    }
+    if cell.id.mode != "verify" {
+        return Err(format!(
+            "backend parity requires verify mode, got {:?}",
+            cell.id.mode
+        ));
+    }
+    let candidate_backend = cell
+        .id
+        .backend
+        .as_deref()
+        .ok_or_else(|| "backend parity requires a candidate backend".to_string())?;
+    if candidate_backend == reference_backend {
+        return Err("backend parity candidate and reference must differ".into());
+    }
+    let mode = &cell.test.modes[&cell.id.mode];
+    if !mode
+        .backends_enabled
+        .iter()
+        .any(|backend| backend == reference_backend)
+    {
+        return Err(format!(
+            "{} verify has no enabled ptrace reference",
+            cell.id.test
+        ));
+    }
+    if mode.compare_io_buffers == Some(false) || mode.rcb_time == Some(false) {
+        return Err(format!(
+            "{} verify relaxes I/O-buffer or RCB-time comparison and cannot produce strict backend parity",
+            cell.id.test
+        ));
+    }
+    let candidate_args = mode
+        .guest_args
+        .get(candidate_backend)
+        .cloned()
+        .unwrap_or_default();
+    let reference_args = mode
+        .guest_args
+        .get(reference_backend)
+        .cloned()
+        .unwrap_or_default();
+    if candidate_args != reference_args {
+        return Err(format!(
+            "{} verify changes guest arguments between {candidate_backend} and ptrace; refusing to compare different workloads",
+            cell.id.test
+        ));
+    }
+    let mut retained_context = context.clone();
+    retained_context.keep_logs = true;
+    run_cell_inner(&retained_context, cell, Some(reference_backend))
+}
+
+fn run_cell_inner(
+    context: &RunContext,
+    cell: &SelectedCell,
+    parity_reference: Option<&str>,
+) -> Result<CellResult, String> {
     let dir = cell_artifact_dir(context, cell);
     let started = Instant::now();
     let timeouts = cell_timeouts(context, cell)?;
@@ -3129,6 +3405,9 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
     let mut execution_cpu_usage_usec = 0u64;
     let mode = cell.test.modes.get(&cell.id.mode).unwrap();
     let mut attempts = Vec::new();
+    let mut backend_parity = None;
+    let mut parity_error = None;
+    let mut parity_comparison_cpu_usage_usec = 0;
     match cell.id.mode.as_str() {
         "naked" => {
             for index in 1..=mode.runs.unwrap_or(3) {
@@ -3238,7 +3517,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
             }
         }
         _ => {
-            let spec = build_spec(
+            let candidate_spec = build_spec(
                 context,
                 cell,
                 dir.clone(),
@@ -3248,7 +3527,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                 remaining_cell_seconds(deadline),
             )?;
             attempts.push(execute_observed_until(
-                &spec,
+                &candidate_spec,
                 &cell.test.observation,
                 &dir,
                 deadline,
@@ -3256,6 +3535,71 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                 timeouts.wall_seconds,
                 Some(execution_cpu_budget_usec),
             )?);
+            execution_cpu_usage_usec = attempts
+                .last()
+                .and_then(|attempt| attempt.cpu_usage_usec)
+                .unwrap_or(0);
+            if let Some(reference_backend) = parity_reference {
+                if attempts
+                    .last()
+                    .is_some_and(|attempt| attempt.outcome == "PASS")
+                {
+                    let mut reference_cell = cell.clone();
+                    reference_cell.id.backend = Some(reference_backend.to_owned());
+                    reference_cell.enabled = true;
+                    let reference_spec = build_spec(
+                        context,
+                        &reference_cell,
+                        dir.clone(),
+                        guest.clone(),
+                        "parity-reference",
+                        None,
+                        remaining_cell_seconds(deadline),
+                    )?;
+                    attempts.push(execute_observed_until(
+                        &reference_spec,
+                        &cell.test.observation,
+                        &dir,
+                        deadline,
+                        timeouts.cpu_seconds,
+                        timeouts.wall_seconds,
+                        Some(execution_cpu_budget_usec.saturating_sub(execution_cpu_usage_usec)),
+                    )?);
+                    if attempts
+                        .last()
+                        .is_some_and(|attempt| attempt.outcome == "PASS")
+                    {
+                        let used_cpu_usec = attempts.iter().try_fold(0u64, |total, attempt| {
+                            let usage = attempt.cpu_usage_usec.ok_or_else(|| {
+                                "completed parity operand has no CPU measurement".to_string()
+                            })?;
+                            total.checked_add(usage).ok_or_else(|| {
+                                "parity operand CPU usage overflowed u64".to_string()
+                            })
+                        })?;
+                        match produce_backend_parity_report(
+                            context,
+                            &candidate_spec,
+                            &attempts[0],
+                            &reference_spec,
+                            &attempts[1],
+                            ParityComparatorBudget {
+                                deadline,
+                                remaining_cpu_usec: execution_cpu_budget_usec
+                                    .saturating_sub(used_cpu_usec),
+                                cpu_timeout_seconds: timeouts.cpu_seconds,
+                                wall_timeout_seconds: timeouts.wall_seconds,
+                            },
+                        ) {
+                            Ok((report, cpu_usage_usec)) => {
+                                backend_parity = Some(report);
+                                parity_comparison_cpu_usage_usec = cpu_usage_usec;
+                            }
+                            Err(error) => parity_error = Some(error),
+                        }
+                    }
+                }
+            }
         }
     }
     let hashes = attempts
@@ -3273,15 +3617,39 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
     .to_string();
     let mut reason = attempts.iter().find_map(|attempt| attempt.reason.clone());
     let position = cell_divergence_position(&attempts);
-    let first_divergent_scheduler_turn = position.scheduler_turn;
-    let first_divergent_virtual_nanoseconds = position.virtual_nanoseconds;
-    let first_divergent_record = position.record;
-    let first_divergent_syscall = position.syscall;
-    let first_divergent_left_message = position.left_message;
-    let first_divergent_right_message = position.right_message;
+    let mut first_divergent_scheduler_turn = position.scheduler_turn;
+    let mut first_divergent_virtual_nanoseconds = position.virtual_nanoseconds;
+    let mut first_divergent_record = position.record;
+    let mut first_divergent_syscall = position.syscall;
+    let mut first_divergent_left_message = position.left_message;
+    let mut first_divergent_right_message = position.right_message;
     let mut error_kind = attempts
         .iter()
         .find_map(|attempt| attempt.error_kind.clone());
+    if let Some(error) = parity_error {
+        outcome = "ERROR".into();
+        error_kind = Some("incomplete-parity-evidence".into());
+        reason = Some(error);
+    } else if let Some(report) = backend_parity.as_ref() {
+        if report.verdict == BackendParityVerdict::Diverged {
+            outcome = "FAIL".into();
+            error_kind = None;
+            reason = Some(format!(
+                "{} diverged from ptrace under strict shared-Detcore parity",
+                report.candidate.backend
+            ));
+            first_divergent_scheduler_turn = report.comparison.first_divergent_scheduler_turn;
+            first_divergent_virtual_nanoseconds =
+                report.comparison.first_divergent_virtual_nanoseconds;
+            first_divergent_record = report
+                .comparison
+                .first_divergent_record
+                .map(|record| record as u64);
+            first_divergent_syscall = report.comparison.first_divergent_syscall;
+            first_divergent_left_message = report.comparison.first_divergent_left_message.clone();
+            first_divergent_right_message = report.comparison.first_divergent_right_message.clone();
+        }
+    }
     if cell.id.mode == "naked" {
         let minimum = mode
             .assert
@@ -3397,13 +3765,20 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         error_kind = Some("infrastructure".into());
         reason = Some("Hermit binary changed while the cell was executing".into());
     }
-    let result = observed_result(&cell.id.mode, &outcome, &attempts, error_kind.as_deref());
+    let result = observed_result(
+        &cell.id.mode,
+        &outcome,
+        &attempts,
+        error_kind.as_deref(),
+        backend_parity.as_ref(),
+    );
     let failure_class = failure_class(&outcome, result, error_kind.as_deref());
     let cpu_usage_usec = attempts
         .iter()
         .try_fold(preparation_cpu_usage_usec, |total, attempt| {
             checked_add_cpu_usage(Some(total), attempt.cpu_usage_usec)
-        });
+        })
+        .and_then(|total| total.checked_add(parity_comparison_cpu_usage_usec));
     Ok(CellResult {
         artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
@@ -3461,6 +3836,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
             )
         }),
         attempts,
+        backend_parity,
         first_divergent_scheduler_turn,
         first_divergent_virtual_nanoseconds,
         first_divergent_record,
@@ -3529,6 +3905,7 @@ pub fn infrastructure_error_result(
         execution_path: None,
         diversity: None,
         attempts: Vec::new(),
+        backend_parity: None,
         // No attempt ran, so there is no divergence position to report. `None`
         // here means "never measured", which is the same value a clean run
         // produces -- see the note in the observation fold about those two
@@ -3601,6 +3978,7 @@ pub fn host_inapplicable_result(
         execution_path: None,
         diversity: None,
         attempts: Vec::new(),
+        backend_parity: None,
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
         first_divergent_record: None,
@@ -3695,6 +4073,16 @@ fn summarize_sabre_path_evidence(attempts: &[AttemptResult]) -> Result<Option<Js
     }
     let expected = attempts
         .iter()
+        // A parity cell carries a ptrace reference attempt beside the SaBRe
+        // candidate. Only executions which actually selected SaBRe can emit
+        // SaBRe path evidence; counting the ptrace operand would turn every
+        // otherwise-valid SaBRe parity measurement into an incomplete path.
+        .filter(|attempt| {
+            attempt
+                .argv
+                .windows(2)
+                .any(|window| window[0] == "--backend" && window[1] == "sabre")
+        })
         .map(|attempt| {
             if attempt.argv.iter().any(|arg| arg == "--verify") {
                 2
@@ -5145,6 +5533,7 @@ mod tests {
                     &attempt.outcome,
                     std::slice::from_ref(&attempt),
                     attempt.error_kind.as_deref(),
+                    None,
                 ),
                 attempt.error_kind.as_deref(),
             ),
@@ -6761,6 +7150,7 @@ backends_disabled:
             execution_path: None,
             diversity: None,
             attempts: vec![attempt_with_sabre_evidence("evidence")],
+            backend_parity: None,
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
@@ -7009,6 +7399,7 @@ backends_disabled:
             &divergence.outcome,
             std::slice::from_ref(&divergence),
             divergence.error_kind.as_deref(),
+            None,
         );
         assert_eq!(divergence_result, Some(ObservedResult::DeterminismFailure));
         assert_eq!(
@@ -7028,6 +7419,7 @@ backends_disabled:
             &crash.outcome,
             std::slice::from_ref(&crash),
             crash.error_kind.as_deref(),
+            None,
         );
         assert_eq!(crash_result, Some(ObservedResult::CrashError));
         assert_eq!(
@@ -7043,6 +7435,7 @@ backends_disabled:
             &invalidated.outcome,
             std::slice::from_ref(&invalidated),
             invalidated.error_kind.as_deref(),
+            None,
         );
         assert_eq!(
             invalidated_result, None,
@@ -7065,6 +7458,7 @@ backends_disabled:
             &invalid_evidence.outcome,
             std::slice::from_ref(&invalid_evidence),
             invalid_evidence.error_kind.as_deref(),
+            None,
         );
         assert_eq!(invalid_evidence_result, None);
         assert_eq!(
@@ -7248,8 +7642,23 @@ backends_disabled:
         let clean = r#"{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}"#;
         let complete = attempt_with_sabre_evidence(&format!("{clean}\n{clean}\n"));
         assert_eq!(
-            summarize_sabre_path_evidence(&[complete]).unwrap().unwrap()["eligible"],
+            summarize_sabre_path_evidence(std::slice::from_ref(&complete))
+                .unwrap()
+                .unwrap()["eligible"],
             true
+        );
+
+        let mut ptrace_reference = complete.clone();
+        ptrace_reference.index = "parity-reference".into();
+        ptrace_reference.argv[2] = "ptrace".into();
+        ptrace_reference.sabre_path_evidence = None;
+        ptrace_reference.sabre_path_evidence_sha256 = None;
+        assert_eq!(
+            summarize_sabre_path_evidence(&[complete, ptrace_reference])
+                .unwrap()
+                .unwrap()["eligible"],
+            true,
+            "a ptrace parity operand is not a missing SaBRe execution"
         );
 
         let short = attempt_with_sabre_evidence(&format!("{clean}\n"));
@@ -7341,6 +7750,7 @@ backends_disabled:
                 left: 1,
                 right: 1,
             }),
+            compared_outputs: None,
             dbt_counted_branches: None,
             runtime: None,
             guest_exit_code: Some(7),
@@ -7530,6 +7940,7 @@ backends_disabled:
                     &unavailable.outcome,
                     std::slice::from_ref(&unavailable),
                     unavailable.error_kind.as_deref(),
+                    None,
                 ),
                 unavailable.error_kind.as_deref()
             ),
@@ -7543,6 +7954,7 @@ backends_disabled:
                     &silent.outcome,
                     std::slice::from_ref(&silent),
                     silent.error_kind.as_deref(),
+                    None,
                 ),
                 silent.error_kind.as_deref()
             ),
@@ -7606,6 +8018,7 @@ backends_disabled:
                     &result.outcome,
                     std::slice::from_ref(&result),
                     result.error_kind.as_deref(),
+                    None,
                 ),
                 None,
                 "mismatched producer evidence must not manufacture a product result: {result:?}"
@@ -7643,6 +8056,7 @@ backends_disabled:
             &ordinary_failure.outcome,
             std::slice::from_ref(&ordinary_failure),
             ordinary_failure.error_kind.as_deref(),
+            None,
         );
         assert_eq!(observed, Some(ObservedResult::CrashError));
         assert_eq!(
@@ -7713,6 +8127,7 @@ backends_disabled:
                     &prose_only.outcome,
                     std::slice::from_ref(&prose_only),
                     prose_only.error_kind.as_deref(),
+                    None,
                 ),
                 prose_only.error_kind.as_deref(),
             ),
@@ -7857,6 +8272,7 @@ backends_disabled:
                 &failed.outcome,
                 std::slice::from_ref(&failed),
                 failed.error_kind.as_deref(),
+                None,
             ),
             Some(ObservedResult::CrashError)
         );

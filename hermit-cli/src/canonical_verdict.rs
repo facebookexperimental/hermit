@@ -125,6 +125,7 @@ pub enum ComparedLogScope {
 pub enum RecordEnvelopeReport {
     AllRecordsV1,
     DbtEvidenceTransportV1,
+    CrossBackendDetcoreV1,
     CallerDefined,
 }
 
@@ -137,6 +138,7 @@ impl RecordEnvelopeReport {
         match self {
             Self::AllRecordsV1 => "all_records_v1",
             Self::DbtEvidenceTransportV1 => "dbt_evidence_transport_v1",
+            Self::CrossBackendDetcoreV1 => "cross_backend_detcore_v1",
             Self::CallerDefined => "caller_defined",
         }
     }
@@ -186,6 +188,39 @@ pub struct ComparedLogMessages {
     pub right: u64,
 }
 
+/// Content identity and disposition of one guest execution.
+///
+/// The bytes themselves remain in the invoking process or retained artifacts;
+/// these fields make the exact stdout/stderr/status comparison independently
+/// checkable without attempting to recover guest stderr from controller logs.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComparedOutput {
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub stdout_sha256: String,
+    pub stdout_bytes: u64,
+    pub stderr_sha256: String,
+    pub stderr_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComparedOutputs {
+    pub left: ComparedOutput,
+    pub right: ComparedOutput,
+}
+
+impl ComparedOutputs {
+    pub fn require_exact_match(&self) -> Result<(), String> {
+        if self.left == self.right {
+            Ok(())
+        } else {
+            Err("verification operands differ in status, stdout, or stderr".into())
+        }
+    }
+}
+
 /// The complete machine-readable report written by `--verify-json`.
 ///
 /// This type is shared by the Hermit producer, the manifest runner, the
@@ -209,6 +244,10 @@ pub struct VerificationReport {
     #[serde(deserialize_with = "present_but_nullable_comparison")]
     pub comparison: Option<ComparisonReport>,
     pub compared_log_messages: Option<ComparedLogMessages>,
+    /// Exact output/status evidence for both executions. Optional only so
+    /// retained reports written before this field remain readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compared_outputs: Option<ComparedOutputs>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dbt_counted_branches: Option<DbtCountedBranchComparison>,
     /// Runtime totals for the two compared executions when the producer could
@@ -303,6 +342,7 @@ impl VerificationReport {
             infrastructure_error: None,
             comparison: None,
             compared_log_messages: None,
+            compared_outputs: None,
             dbt_counted_branches: None,
             runtime: None,
             guest_exit_code: None,
@@ -658,6 +698,7 @@ mod tests {
                 skip_detlog: None,
             }),
             compared_log_messages: Some(ComparedLogMessages { left, right }),
+            compared_outputs: None,
             dbt_counted_branches: None,
             runtime: None,
             guest_exit_code: None,

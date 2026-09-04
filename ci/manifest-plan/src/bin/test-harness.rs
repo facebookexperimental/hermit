@@ -33,6 +33,7 @@ use hermit_manifest_plan::runner::infrastructure_error_result;
 use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::run_cell;
+use hermit_manifest_plan::runner::run_cell_with_parity;
 use hermit_manifest_plan::runner::write_junit;
 use hermit_manifest_plan::stress_series::HostCapabilities;
 #[cfg(test)]
@@ -76,6 +77,7 @@ Selection options:
   --include-occasional             Include occasional cells
   --include-manual                 Include manual cells; requires exact test and mode
   --probe-disabled                 Run one exact disabled cell
+  --parity-reference <ptrace>      Measure selected verify cells against ptrace
 
 Execution and output options:
   --prebuilt                       Reuse prepared test programs (run only)
@@ -192,6 +194,7 @@ fn print_command_help(command: &str) -> bool {
              --include-occasional             Include occasional cells\n  \
              --include-manual                 Include manual cells; requires exact test and mode\n  \
              --probe-disabled                 Run one disabled cell; requires exact test/mode/backend\n  \
+             --parity-reference <ptrace>      Measure selected verify cells against ptrace\n  \
              --prebuilt                       Reuse prepared test programs\n  \
              --allow-empty                    Permit an empty CI selection; requires --ci-only and category\n  \
              --results <PATH>                 Write JSONL cell results to PATH\n  \
@@ -249,6 +252,7 @@ struct Args {
     allow_empty: bool,
     ci_only: bool,
     probe_disabled: bool,
+    parity_reference: Option<String>,
     results: Option<PathBuf>,
     junit: Option<PathBuf>,
     format: String,
@@ -310,6 +314,11 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
                 args.probe_disabled = true;
                 args.selection.population = Some(Population::Disabled);
             }
+            "--parity-reference" => set_once(
+                &mut args.parity_reference,
+                &mut values,
+                "--parity-reference",
+            ),
             "--prebuilt" => args.prebuilt = true,
             "--allow-empty" => args.allow_empty = true,
             "--results" => {
@@ -485,6 +494,23 @@ fn validate_args(command: &str, args: &Args) {
         }
         if args.selection.include_manual || args.ci_only {
             fail("--probe-disabled is mutually exclusive with --include-manual and --ci-only");
+        }
+    }
+    if let Some(reference) = args.parity_reference.as_deref() {
+        if command != "run" {
+            fail("--parity-reference is accepted by run only");
+        }
+        if reference != "ptrace" {
+            fail("--parity-reference currently requires ptrace");
+        }
+        if args.selection.mode.as_deref() != Some("verify") {
+            fail("--parity-reference requires --mode verify");
+        }
+        let Some(candidate) = args.selection.backend.as_deref() else {
+            fail("--parity-reference requires an explicit candidate --backend");
+        };
+        if candidate == reference {
+            fail("--parity-reference must differ from the candidate --backend");
         }
     }
     if args.allow_empty {
@@ -2017,7 +2043,11 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 context.attempt,
                 |attempt| {
                     let attempt_context = context.with_attempt(attempt);
-                    match run_cell(&attempt_context, cell) {
+                    let result = match args.parity_reference.as_deref() {
+                        Some(reference) => run_cell_with_parity(&attempt_context, cell, reference),
+                        None => run_cell(&attempt_context, cell),
+                    };
+                    match result {
                         Ok(result) => result,
                         Err(error) => infrastructure_error_result(&attempt_context, cell, error),
                     }
@@ -2219,6 +2249,7 @@ mod tests {
 
     use super::DEFAULT_BUILD_JOBS;
     use super::EXPECTED_PLAN_SCHEMA;
+    use super::HELP;
     use super::HostCapability;
     use super::HostCapabilityVerdict;
     use super::PINNED_COMMAND_PREFIX;
@@ -2242,6 +2273,31 @@ mod tests {
     use super::shell_quote_one;
     use super::structured_test_results_from_rows;
     use super::unique_plan_rows;
+    use super::validate_args;
+
+    #[test]
+    fn ptrace_parity_policy_is_explicit_and_independent_of_selection() {
+        let args = parse(
+            [
+                "--mode",
+                "verify",
+                "--backend",
+                "kvm",
+                "--probe-disabled",
+                "--test",
+                "fixture/kvm-candidate",
+                "--parity-reference",
+                "ptrace",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        validate_args("run", &args);
+        assert_eq!(args.parity_reference.as_deref(), Some("ptrace"));
+        assert_eq!(args.selection.backend.as_deref(), Some("kvm"));
+        assert!(args.probe_disabled);
+        assert!(HELP.contains("--parity-reference <ptrace>"));
+    }
 
     #[test]
     fn generated_expected_plan_is_versioned_and_matches_the_tracked_file() {
