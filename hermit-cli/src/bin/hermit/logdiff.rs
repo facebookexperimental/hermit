@@ -393,7 +393,7 @@ impl LogDiffCLIOpts {
                     eprintln!("hermit log-diff: comparison failed while following: {reason}");
                     if fixed_bitwise_info_v1 && let Some(path) = &self.json {
                         let mut report = pending_json_report(options, record_envelope.policy());
-                        report.verdict = JsonVerdict::Refused;
+                        report.verdict = LogDiffVerdict::Refused;
                         report.refusal = Some(reason);
                         if let Err(write_error) = write_json(path, &report) {
                             eprintln!(

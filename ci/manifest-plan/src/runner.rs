@@ -3650,15 +3650,17 @@ fn run_cell_inner(
                 .and_then(|attempt| attempt.cpu_usage_usec)
                 .unwrap_or(0);
             if let Some(reference_backend) = parity_reference {
-                if attempts
-                    .last()
-                    .is_some_and(|attempt| attempt.outcome == "PASS")
-                {
-                    parity_error = parity_candidate_path_error(&attempts);
-                }
-                if attempts
-                    .last()
-                    .is_some_and(|attempt| attempt.outcome == "PASS")
+                // Backend-path eligibility is a precondition for interpreting
+                // any candidate outcome. Check it even when the candidate
+                // failed or diverged: an ineligible SaBRe path cannot support
+                // a candidate product result. It must also prevent the ptrace
+                // reference from running, because that work cannot turn the
+                // ineligible candidate into parity evidence.
+                parity_error = parity_candidate_path_error(&attempts);
+                if parity_error.is_none()
+                    && attempts
+                        .last()
+                        .is_some_and(|attempt| attempt.outcome == "PASS")
                 {
                     let mut reference_cell = cell.clone();
                     reference_cell.id.backend = Some(reference_backend.to_owned());
@@ -8098,6 +8100,304 @@ backends_disabled:
             first_divergent_syscall: None,
             first_divergent_left_message: None,
             first_divergent_right_message: None,
+        }
+    }
+
+    fn parity_fixture_output() -> crate::canonical_verdict::ComparedOutput {
+        crate::canonical_verdict::ComparedOutput {
+            exit_code: Some(0),
+            signal: None,
+            stdout_sha256: "a".repeat(64),
+            stdout_bytes: 0,
+            stderr_sha256: "b".repeat(64),
+            stderr_bytes: 0,
+        }
+    }
+
+    fn parity_fixture_verification(verdict: Verdict) -> VerificationReport {
+        let mut report = canonical_verification_report();
+        let output = parity_fixture_output();
+        report.guest_exit_code = Some(0);
+        report.compared_outputs = Some(crate::canonical_verdict::ComparedOutputs {
+            left: output.clone(),
+            right: output,
+        });
+        if verdict == Verdict::Diverged {
+            report.verified = false;
+            report.bitwise_parity = false;
+            report.verdict = Verdict::Diverged;
+            report.first_divergent_scheduler_turn = Some(7);
+            report.first_divergent_virtual_nanoseconds = Some(18);
+            report.first_divergent_record = Some(2);
+            report.first_divergent_syscall = Some(1);
+            report.first_divergent_left_message = Some("candidate-left".into());
+            report.first_divergent_right_message = Some("candidate-right".into());
+        }
+        report
+    }
+
+    fn parity_fixture_logdiff(verdict: LogDiffVerdict) -> LogDiffReport {
+        let divergent = verdict == LogDiffVerdict::Diverged;
+        LogDiffReport {
+            schema: crate::logdiff_report::LOG_DIFF_REPORT_SCHEMA,
+            verdict,
+            refusal: None,
+            selected_messages: crate::logdiff_report::LogDiffMessageCounts { left: 2, right: 2 },
+            records: crate::logdiff_report::LogDiffRecords {
+                compared: 2,
+                available_left: 2,
+                available_right: 2,
+                withheld_incomplete_tail: false,
+            },
+            comparison: crate::logdiff_report::LogDiffComparison {
+                stream: "info".into(),
+                record_envelope: crate::logdiff_report::RecordEnvelopePolicy::CrossBackendDetcoreV1,
+                unsafe_strip_lines: false,
+                canonicalize_host_addresses: true,
+                require_structured_events: true,
+                ignored_line_substrings: Vec::new(),
+                skip_commit: false,
+                skip_detlog: false,
+                included_detlog_kinds: vec![
+                    "syscall".into(),
+                    "syscall_result".into(),
+                    "other".into(),
+                ],
+                git_diff: false,
+            },
+            follow_stopped_because: None,
+            first_divergent_record: divergent.then_some(2),
+            first_divergent_syscall: divergent.then_some(1),
+            first_divergent_scheduler_turn: divergent.then_some(7),
+            first_divergent_virtual_nanoseconds: divergent.then_some(18),
+            first_divergent_left_message: divergent.then(|| "ptrace-value".into()),
+            first_divergent_right_message: divergent.then(|| "candidate-value".into()),
+        }
+    }
+
+    fn run_production_parity_fixture(
+        scenario: &str,
+        candidate_backend: &str,
+    ) -> (CellResult, String) {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-production-parity-{}-{:?}-{scenario}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("parity-scenario"), format!("{scenario}\n")).unwrap();
+        fs::write(
+            root.join("verification-match.json"),
+            serde_json::to_vec(&parity_fixture_verification(Verdict::Matched)).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("verification-diverge.json"),
+            serde_json::to_vec(&parity_fixture_verification(Verdict::Diverged)).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("logdiff-match.json"),
+            serde_json::to_vec(&parity_fixture_logdiff(LogDiffVerdict::Matched)).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("logdiff-diverge.json"),
+            serde_json::to_vec(&parity_fixture_logdiff(LogDiffVerdict::Diverged)).unwrap(),
+        )
+        .unwrap();
+
+        let hermit = root.join("hermit");
+        fs::write(
+            &hermit,
+            r#"#!/bin/sh
+set -eu
+scenario=$(cat "$PWD/parity-scenario")
+if [ "${1-}" = "log-diff" ]; then
+  if [ "$#" -eq 2 ]; then
+    printf 'normalize\n' >> "$PWD/invocations"
+    cat "$2"
+    exit 0
+  fi
+  printf 'compare\n' >> "$PWD/invocations"
+  if cmp -s "$2" "$3"; then
+    cp "$PWD/logdiff-match.json" "$5"
+    exit 0
+  fi
+  cp "$PWD/logdiff-diverge.json" "$5"
+  exit 1
+fi
+
+backend=
+verdict=
+logdir=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --backend) backend=$2; shift 2 ;;
+    --verify-json) verdict=$2; shift 2 ;;
+    --verify-log-dir) logdir=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf 'run:%s\n' "$backend" >> "$PWD/invocations"
+
+if [ "$scenario" = "reference-timeout" ] && [ "$backend" = "ptrace" ]; then
+  sleep 10
+  exit 0
+fi
+if [ "$scenario" = "reference-crash" ] && [ "$backend" = "ptrace" ]; then
+  exit 7
+fi
+
+mkdir -p "$logdir"
+log_value=shared
+if [ "$scenario" = "parity-diverge" ] && [ "$backend" != "ptrace" ]; then
+  log_value=candidate-diverged
+fi
+printf 'INFO detcore: %s\n' "$log_value" > "$logdir/run1_log_fixture.log"
+
+if [ -n "${HERMIT_SABRE_PATH_EVIDENCE-}" ]; then
+  evidence='{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}'
+  printf '%s\n' "$evidence" > "$HERMIT_SABRE_PATH_EVIDENCE"
+  case "$scenario" in
+    sabre-ineligible-*) ;;
+    *) printf '%s\n' "$evidence" >> "$HERMIT_SABRE_PATH_EVIDENCE" ;;
+  esac
+fi
+
+case "$scenario:$backend" in
+  reference-diverge:ptrace|sabre-ineligible-diverge:sabre|sabre-eligible-diverge:sabre)
+    cp "$PWD/verification-diverge.json" "$verdict"
+    exit 1
+    ;;
+  *)
+    cp "$PWD/verification-match.json" "$verdict"
+    exit 0
+    ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut cell = ptrace_cell("verify");
+        cell.test.id = "fixture/backend-parity-production".into();
+        cell.id.test = cell.test.id.clone();
+        cell.id.backend = Some(candidate_backend.into());
+        cell.enabled = false;
+        cell.cpu_timeout_seconds = if scenario == "reference-timeout" {
+            1
+        } else {
+            5
+        };
+        cell.timeout_seconds = if scenario == "reference-timeout" {
+            2
+        } else {
+            10
+        };
+        let mut context = run_context(&root);
+        context.hermit_bin = hermit;
+        context.run_verify_strict = true;
+
+        let result = run_cell_with_parity(&context, &cell, "ptrace").unwrap();
+        let invocations = fs::read_to_string(root.join("invocations")).unwrap_or_default();
+        fs::remove_dir_all(root).unwrap();
+        (result, invocations)
+    }
+
+    #[test]
+    fn production_backend_parity_reports_matches_and_divergences() {
+        let (matched, matched_invocations) = run_production_parity_fixture("parity-match", "kvm");
+        assert_eq!(matched.outcome, "PASS", "{matched:#?}");
+        assert_eq!(matched.result, Some(ObservedResult::Pass));
+        assert_eq!(matched.attempts.len(), 2);
+        assert_eq!(
+            matched.backend_parity.as_ref().map(|report| report.verdict),
+            Some(BackendParityVerdict::Matched)
+        );
+        assert!(matched_invocations.contains("run:kvm\nrun:ptrace\n"));
+        assert!(matched_invocations.ends_with("normalize\ncompare\n"));
+
+        let (diverged, divergent_invocations) =
+            run_production_parity_fixture("parity-diverge", "kvm");
+        assert_eq!(diverged.outcome, "FAIL", "{diverged:#?}");
+        assert_eq!(diverged.result, Some(ObservedResult::ParityFailure));
+        assert_eq!(
+            diverged
+                .backend_parity
+                .as_ref()
+                .map(|report| report.verdict),
+            Some(BackendParityVerdict::Diverged)
+        );
+        assert_eq!(diverged.first_divergent_record, Some(2));
+        assert!(divergent_invocations.ends_with("normalize\ncompare\n"));
+    }
+
+    #[test]
+    fn production_sabre_parity_eligibility_gates_match_and_divergence() {
+        let (eligible_match, match_invocations) =
+            run_production_parity_fixture("sabre-eligible-match", "sabre");
+        assert_eq!(eligible_match.outcome, "PASS", "{eligible_match:#?}");
+        assert_eq!(eligible_match.result, Some(ObservedResult::Pass));
+        assert!(eligible_match.backend_parity.is_some());
+        assert!(match_invocations.contains("run:sabre\nrun:ptrace\n"));
+        assert!(match_invocations.ends_with("normalize\ncompare\n"));
+
+        let (eligible_divergence, divergence_invocations) =
+            run_production_parity_fixture("sabre-eligible-diverge", "sabre");
+        assert_eq!(
+            eligible_divergence.result,
+            Some(ObservedResult::DeterminismFailure),
+            "{eligible_divergence:#?}"
+        );
+        assert_eq!(
+            eligible_divergence.failure_class,
+            Some(FailureClass::ProductFailure)
+        );
+        assert!(eligible_divergence.backend_parity.is_none());
+        assert_eq!(divergence_invocations, "run:sabre\n");
+
+        for scenario in ["sabre-ineligible-match", "sabre-ineligible-diverge"] {
+            let (result, invocations) = run_production_parity_fixture(scenario, "sabre");
+            assert_eq!(result.outcome, "ERROR", "{scenario}: {result:#?}");
+            assert_eq!(result.result, None, "{scenario}: {result:#?}");
+            assert_eq!(result.failure_class, Some(FailureClass::NoResult));
+            assert_eq!(
+                result.error_kind.as_deref(),
+                Some("incomplete-parity-evidence")
+            );
+            assert!(result.backend_parity.is_none());
+            assert_eq!(result.attempts.len(), 1);
+            assert_eq!(invocations, "run:sabre\n");
+        }
+    }
+
+    #[test]
+    fn production_ptrace_reference_failures_preserve_the_candidate_as_no_result() {
+        for scenario in ["reference-diverge", "reference-crash", "reference-timeout"] {
+            let (result, invocations) = run_production_parity_fixture(scenario, "kvm");
+            assert_eq!(result.outcome, "ERROR", "{scenario}: {result:#?}");
+            assert_eq!(result.result, None, "{scenario}: {result:#?}");
+            assert_eq!(result.failure_class, Some(FailureClass::NoResult));
+            assert_eq!(
+                result.error_kind.as_deref(),
+                Some("incomplete-parity-evidence")
+            );
+            assert!(result.backend_parity.is_none());
+            assert_eq!(result.attempts.len(), 2);
+            assert_eq!(result.attempts[0].outcome, "PASS");
+            assert_eq!(
+                verification_verdict(&result.attempts[0]),
+                Some(Verdict::Matched)
+            );
+            assert!(result.first_divergent_record.is_none());
+            assert!(result.first_divergent_scheduler_turn.is_none());
+            assert!(invocations.contains("run:kvm\nrun:ptrace\n"));
+            assert!(!invocations.contains("compare\n"));
+            if scenario == "reference-timeout" {
+                assert!(result.attempts[1].timed_out);
+            }
         }
     }
 
