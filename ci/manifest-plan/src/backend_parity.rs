@@ -283,8 +283,31 @@ mod tests {
     #[test]
     fn output_mismatch_cannot_be_reported_as_a_match() {
         let mut report = report(BackendParityVerdict::Matched);
-        report.candidate.output.stdout_sha256 = "e".repeat(64);
+        let different = output('e');
+        report.candidate.output = different.clone();
+        report.candidate.verification.compared_outputs = Some(ComparedOutputs {
+            left: different.clone(),
+            right: different,
+        });
         assert!(report.validate("kvm").is_err());
+        report.verdict = BackendParityVerdict::Diverged;
+        report.validate("kvm").unwrap();
+    }
+
+    #[test]
+    fn disposition_mismatch_is_a_real_cross_backend_divergence() {
+        let mut report = report(BackendParityVerdict::Matched);
+        let mut different = output('a');
+        different.exit_code = Some(7);
+        report.candidate.output = different.clone();
+        report.candidate.verification.compared_outputs = Some(ComparedOutputs {
+            left: different.clone(),
+            right: different,
+        });
+        report.candidate.verification.guest_exit_code = Some(7);
+        assert!(report.validate("kvm").is_err());
+        report.verdict = BackendParityVerdict::Diverged;
+        report.validate("kvm").unwrap();
     }
 
     #[test]

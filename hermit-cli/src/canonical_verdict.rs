@@ -457,6 +457,17 @@ impl VerificationReport {
                 ));
             }
         }
+        let verdict = object.get("verdict").and_then(serde_json::Value::as_str);
+        if matches!(verdict, Some("matched" | "diverged"))
+            && object
+                .get("compared_outputs")
+                .is_none_or(serde_json::Value::is_null)
+        {
+            return Err(
+                "incomplete verification report: missing current producer field `compared_outputs`"
+                    .into(),
+            );
+        }
         if let Some(comparison) = object
             .get("comparison")
             .and_then(serde_json::Value::as_object)
@@ -934,6 +945,24 @@ mod tests {
                 "skip_detlog": false
             },
             "compared_log_messages": {"left": 1, "right": 1},
+            "compared_outputs": {
+                "left": {
+                    "exit_code": 0,
+                    "signal": null,
+                    "stdout_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "stdout_bytes": 4,
+                    "stderr_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "stderr_bytes": 0
+                },
+                "right": {
+                    "exit_code": 0,
+                    "signal": null,
+                    "stdout_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "stdout_bytes": 4,
+                    "stderr_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "stderr_bytes": 0
+                }
+            },
             "guest_exit_code": 0,
             "guest_signal": null,
             "first_divergent_scheduler_turn": null,
@@ -949,6 +978,19 @@ mod tests {
         assert_eq!(comparison.compare_io_buffers, Some(true));
         assert_eq!(comparison.log_scope, Some(ComparedLogScope::Info));
         assert_eq!(parsed.guest_exit_code, Some(0));
+        let mut missing_outputs = current.clone();
+        missing_outputs
+            .as_object_mut()
+            .unwrap()
+            .remove("compared_outputs");
+        let error = VerificationReport::from_current_json_value(missing_outputs)
+            .expect_err("a completed current report must carry exact output evidence");
+        assert!(error.contains("compared_outputs"), "{error}");
+        let mut null_outputs = current.clone();
+        null_outputs["compared_outputs"] = serde_json::Value::Null;
+        let error = VerificationReport::from_current_json_value(null_outputs)
+            .expect_err("null is not output evidence for a completed current report");
+        assert!(error.contains("compared_outputs"), "{error}");
         current["comparison"]
             .as_object_mut()
             .unwrap()

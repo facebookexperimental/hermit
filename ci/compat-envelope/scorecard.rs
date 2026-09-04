@@ -1081,6 +1081,30 @@ fn default_attempt() -> u64 {
 }
 
 impl ResultRow {
+    /// Normal validation publishes `required` rows. A deliberately selected
+    /// disabled cell is admissible only when the row proves that it came from
+    /// the parity path, either with its report or the parity-specific no-result
+    /// disposition. This keeps `--probe-disabled` measurable without turning
+    /// arbitrary disabled runs into scorecard evidence.
+    fn is_ingestible_classification(&self) -> bool {
+        self.classification == "required"
+            || (self.classification == "disabled"
+                && (self.backend_parity.is_some()
+                    || self.error_kind.as_deref() == Some("incomplete-parity-evidence")))
+    }
+
+    fn require_ingestible_classification(&self) -> Result<(), String> {
+        match self.classification.as_str() {
+            "required" => Ok(()),
+            "disabled" if self.is_ingestible_classification() => Ok(()),
+            "disabled" => Err("disabled result has neither a typed backend-parity report nor an incomplete-parity disposition; only explicit parity probes are admissible".into()),
+            _ => Err(format!(
+                "result classification {:?} is not admissible",
+                self.classification
+            )),
+        }
+    }
+
     fn validate_timeout_policy(&self) -> Result<(), String> {
         match (
             self.execution_cpu_timeout_seconds,
@@ -1505,6 +1529,7 @@ impl ResultRow {
             "shell_command": self.shell_command,
             "relaxations": self.relaxations,
             "attempts": self.attempts,
+            "backend_parity": self.backend_parity,
         });
         let encoded = serde_json::to_vec(&evidence)
             .map_err(|error| format!("cannot encode result evidence: {error}"))?;
@@ -2128,6 +2153,16 @@ impl ResultRow {
             };
         }
 
+        if self.outcome == "ERROR"
+            && self.error_kind.as_deref() == Some("incomplete-parity-evidence")
+        {
+            return Ok(ValidateRowEvidence::Unavailable {
+                reason: "NO_RESULT: the ptrace reference or cross-backend comparator did not establish parity"
+                    .into(),
+                result: None,
+            });
+        }
+
         if !divergence_positions.is_empty() {
             let aggregate = DivergenceCoordinates {
                 scheduler_turn: divergence_positions
@@ -2207,7 +2242,20 @@ struct Derived {
 }
 
 fn retained_import_cells(derived: &Derived) -> BTreeSet<CellId> {
-    derived.enabled.clone()
+    let mut eligible = derived.enabled.clone();
+    eligible.extend(derived.population.iter().filter(|candidate| {
+        if candidate.mode != "verify"
+            || matches!(candidate.backend.as_str(), "ptrace" | "native")
+        {
+            return false;
+        }
+        let reference = CellId {
+            backend: "ptrace".into(),
+            ..(*candidate).clone()
+        };
+        derived.green.contains(&reference)
+    }).cloned());
+    eligible
 }
 
 #[derive(Clone)]
@@ -4595,6 +4643,10 @@ fn apply_validate_results(
             .map(|candidate| {
                 candidate
                     .row
+                    .require_ingestible_classification()
+                    .map_err(|error| format!("{} {error}", display_id(id)))?;
+                candidate
+                    .row
                     .comparison_evidence()
                     .map(|evidence| (candidate, evidence))
                     .map_err(|error| format!("{} {error}", display_id(id)))
@@ -5218,7 +5270,7 @@ fn import_results(
         .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
 
     println!(
-        "compatibility scorecard: found {} enabled cell(s) with {} terminal BitwiseInfoV1 comparison(s) in {} retained results.jsonl file(s) containing {} row(s); imported {} retained row(s) and {} current pressure row(s); no guest was executed",
+        "compatibility scorecard: found {} eligible cell(s) with {} terminal BitwiseInfoV1 comparison(s) in {} retained results.jsonl file(s) containing {} row(s); imported {} retained row(s) and {} current pressure row(s); no guest was executed",
         retained_cell_count,
         terminal_comparisons,
         files_scanned,
@@ -5227,14 +5279,14 @@ fn import_results(
         current_rows_imported,
     );
     println!(
-        "  excluded as stale: {stale_coordinate_rows} older diverging comparison row(s), carrying {stale_coordinates} coordinate value(s), across {} enabled cell(s) whose newest retained canonical result is a pass",
+        "  excluded as stale: {stale_coordinate_rows} older diverging comparison row(s), carrying {stale_coordinates} coordinate value(s), across {} eligible cell(s) whose newest retained canonical result is a pass",
         stale_coordinate_cells.len()
     );
     for cell in &stale_coordinate_cells {
         println!("    stale coordinate: {cell}");
     }
     println!(
-        "  retained comparisons without a divergence coordinate: {historical_without_coordinates}; enabled cells with no retained canonical comparison: {}",
+        "  retained comparisons without a divergence coordinate: {historical_without_coordinates}; eligible cells with no retained canonical comparison: {}",
         no_result_cells.len()
     );
     println!(
@@ -8034,7 +8086,7 @@ fn read_result_candidates(
                     row.source_tree_dirty
                 ));
             }
-            if row.classification != "required" {
+            if !row.is_ingestible_classification() {
                 continue;
             }
             if row.attempt == 0 {
@@ -8073,9 +8125,10 @@ struct RetainedImport {
 
 /// Read retained validate rows without pretending they belong to the current
 /// checkout. Each row keeps its own Hermit SHA, and only clean canonical
-/// comparisons on HEAD's history are eligible. For each enabled cell, import
-/// every terminal comparison at the newest eligible SHA so disagreement at one
-/// revision remains visible instead of being resolved by file ordering.
+/// comparisons on HEAD's history are eligible. For each enabled cell or
+/// disabled ptrace-referenced parity candidate, import every terminal
+/// comparison at the newest eligible SHA so disagreement at one revision
+/// remains visible instead of being resolved by file ordering.
 fn read_retained_results(
     root: &Path,
     result_root: &Path,
@@ -8140,7 +8193,7 @@ fn read_retained_results(
             if let Some(prefix) = retained_workspace.as_deref() {
                 normalise_recorded_prefix(&mut row, prefix);
             }
-            if row.classification != "required" || row.source_tree_dirty || row.attempt == 0 {
+            if !row.is_ingestible_classification() || row.source_tree_dirty || row.attempt == 0 {
                 continue;
             }
             let Some(id) = row.id() else { continue };
@@ -10231,6 +10284,21 @@ red/`measured-and-passed` count is **0**.",
             empty_tracked_cell(parity_id.clone(), CellStatus::NotApplicable),
         ],
     };
+    let retained_fixture = Derived {
+        population: BTreeSet::from([ptrace_id.clone(), parity_id.clone()]),
+        enabled: BTreeSet::from([ptrace_id.clone()]),
+        ci_disabled_reasons: BTreeMap::new(),
+        not_applicable_reasons: BTreeMap::from([(
+            parity_id.clone(),
+            "fixture candidate disabled".into(),
+        )]),
+        selected: BTreeSet::from([ptrace_id.clone()]),
+        green: BTreeSet::from([ptrace_id.clone()]),
+        selected_custom: BTreeSet::new(),
+    };
+    if !retained_import_cells(&retained_fixture).contains(&parity_id) {
+        return Err("retained imports excluded a disabled ptrace-referenced parity cell".into());
+    }
     let parity_attempt = |backend: &str, index: &str| {
         let mut attempt = candidate("PASS")
             .row
@@ -10381,6 +10449,28 @@ red/`measured-and-passed` count is **0**.",
 
     let mut matching_parity = parity_tracked();
     let matching_row = parity_row(BackendParityVerdict::Matched)?;
+    let mut disabled_without_parity = candidate("PASS").row;
+    disabled_without_parity.classification = "disabled".into();
+    let ingest_fixture = tempfile::tempdir()
+        .map_err(|error| format!("cannot create parity-ingestion fixture: {error}"))?;
+    fs::write(
+        ingest_fixture.path().join("results.jsonl"),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&matching_row)
+                .map_err(|error| format!("cannot encode parity-ingestion fixture: {error}"))?,
+            serde_json::to_string(&disabled_without_parity)
+                .map_err(|error| format!("cannot encode disabled-row fixture: {error}"))?,
+        ),
+    )
+    .map_err(|error| format!("cannot write parity-ingestion fixture: {error}"))?;
+    let ingested = read_result_candidates(ingest_fixture.path(), &matching_row.hermit_sha)?;
+    if ingested.get(&parity_id).is_none_or(Vec::is_empty) {
+        return Err("observe-results reader discarded a disabled backend-parity probe".into());
+    }
+    if ingested.contains_key(&id) {
+        return Err("observe-results reader admitted a disabled row without parity evidence".into());
+    }
     apply_validate_results(
         &mut matching_parity,
         &BTreeMap::from([(
@@ -10411,6 +10501,105 @@ red/`measured-and-passed` count is **0**.",
     {
         return Err(
             "matching ptrace/KVM pair did not become a measured parity pass in the scorecard"
+                .into(),
+        );
+    }
+
+    let first_identity_row = parity_row(BackendParityVerdict::Matched)?;
+    let mut conflicting_identity_row = first_identity_row.clone();
+    conflicting_identity_row
+        .backend_parity
+        .as_mut()
+        .expect("fixture carries parity evidence")
+        .candidate
+        .retained_log_sha256 = "e".repeat(64);
+    if first_identity_row.evidence_identity()? == conflicting_identity_row.evidence_identity()? {
+        return Err("backend parity bytes were omitted from the result evidence identity".into());
+    }
+    let conflict = apply_validate_results(
+        &mut parity_tracked(),
+        &BTreeMap::from([(
+            parity_id.clone(),
+            vec![
+                parity_candidate(first_identity_row)?,
+                parity_candidate(conflicting_identity_row)?,
+            ],
+        )]),
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+        false,
+        true,
+    )
+    .expect_err("same-run parity receipts with different evidence must conflict");
+    if !conflict.contains("conflicting evidence") {
+        return Err(format!(
+            "parity evidence conflict returned the wrong diagnostic: {conflict}"
+        ));
+    }
+
+    let mut reference_failure_row = parity_row(BackendParityVerdict::Matched)?;
+    reference_failure_row.run_id = "parity-reference-failed".into();
+    reference_failure_row.outcome = "ERROR".into();
+    reference_failure_row.result = None;
+    reference_failure_row.failure_class = Some(FailureClass::NoResult);
+    reference_failure_row.error_kind = Some("incomplete-parity-evidence".into());
+    reference_failure_row.backend_parity = None;
+    reference_failure_row.first_divergent_scheduler_turn = None;
+    reference_failure_row.first_divergent_virtual_nanoseconds = None;
+    reference_failure_row.first_divergent_record = None;
+    reference_failure_row.first_divergent_syscall = None;
+    let reference_attempt = &mut reference_failure_row.attempts[1];
+    let mut reference_report = canonical_verdict::VerificationReport::from_json_slice(
+        reference_attempt["verification_report"]
+            .as_str()
+            .expect("fixture reference report is a string")
+            .as_bytes(),
+    )?;
+    reference_report.verified = false;
+    reference_report.bitwise_parity = false;
+    reference_report.verdict = canonical_verdict::Verdict::Diverged;
+    reference_report.first_divergent_record = Some(2);
+    reference_report.first_divergent_scheduler_turn = Some(7);
+    reference_report.first_divergent_virtual_nanoseconds = Some(18);
+    let reference_report = serde_json::to_string(&reference_report)
+        .map_err(|error| format!("cannot encode failed reference fixture: {error}"))?;
+    reference_attempt["outcome"] = JsonValue::String("FAIL".into());
+    reference_attempt["status"] = serde_json::json!(1);
+    reference_attempt["verification_report"] = JsonValue::String(reference_report.clone());
+    reference_attempt["verification_report_sha256"] = JsonValue::String(format!(
+        "{:x}",
+        Sha256::digest(reference_report.as_bytes())
+    ));
+    let mut reference_failure_tracked = parity_tracked();
+    let reference_failure_fold = apply_validate_results(
+        &mut reference_failure_tracked,
+        &BTreeMap::from([(
+            parity_id.clone(),
+            vec![parity_candidate(reference_failure_row)?],
+        )]),
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+        false,
+        true,
+    )?;
+    let reference_failure_cell = reference_failure_tracked
+        .cells
+        .iter()
+        .find(|cell| cell.id == parity_id)
+        .expect("reference-failure parity cell remains tracked");
+    if reference_failure_fold.errored.len() != 1
+        || reference_failure_cell.observations[0].results.len() != 0
+        || !reference_failure_cell.observations[0]
+            .backend_parity_comparisons
+            .is_empty()
+        || !reference_failure_cell.observations[0]
+            .first_divergent_record
+            .is_empty()
+    {
+        return Err(
+            "a divergent ptrace reference was attributed to the candidate instead of retained as no-result"
                 .into(),
         );
     }

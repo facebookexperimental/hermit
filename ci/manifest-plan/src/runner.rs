@@ -1118,7 +1118,8 @@ pub struct AttemptResult {
     pub timed_out: bool,
     #[serde(default)]
     pub duration_ms: u128,
-    /// CPU consumed by the launched process group.
+    /// CPU consumed by the launched process group and any required retained-log
+    /// normalization process.
     ///
     /// Completed commands use `wait4`; a CPU timeout retains the last live
     /// process-group observation when that is larger. It is not inferred from
@@ -1262,7 +1263,8 @@ pub struct CellResult {
     /// cell never ran; a measured zero remains a valid sub-millisecond result.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u128>,
-    /// CPU consumed by this cell's preparation and launched attempts.
+    /// CPU consumed by this cell's preparation, launched attempts, and parity
+    /// comparison.
     ///
     /// Null when the cell never reached execution or the runner could not
     /// obtain a complete measurement. A measured zero remains a real value.
@@ -2341,9 +2343,25 @@ fn execute_spec_until(
         &stderr_path,
         (deadline, remaining_cpu_usec),
     )?;
-    if spec.id.mode == "verify" && spec.id.backend.as_deref() == Some("ptrace") {
+    let mut accounted_cpu_usage_usec = Some(output.cpu_usage_usec);
+    let mut normalization_error = None;
+    if output.timeout.is_none()
+        && spec.id.mode == "verify"
+        && spec.id.backend.as_deref() == Some("ptrace")
+    {
         if let Some(directory) = &spec.verification_log_dir {
-            normalize_ptrace_golden(&spec.argv[0], directory)?;
+            let normalized = normalize_ptrace_golden(
+                &spec.argv[0],
+                directory,
+                &spec.cwd,
+                deadline,
+                remaining_cpu_usec.map(|budget| budget.saturating_sub(output.cpu_usage_usec)),
+                cpu_timeout_seconds,
+                wall_timeout_seconds,
+            );
+            accounted_cpu_usage_usec =
+                checked_add_cpu_usage(accounted_cpu_usage_usec, normalized.cpu_usage_usec);
+            normalization_error = normalized.result.err();
         }
     }
     let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
@@ -2601,6 +2619,11 @@ fn execute_spec_until(
         error_kind = Some(timeout.error_kind().into());
         reason = Some(timeout.reason(cpu_timeout_seconds, wall_timeout_seconds));
     }
+    if let Some(error) = normalization_error {
+        outcome = "ERROR".into();
+        error_kind = Some("incomplete-verification-evidence".into());
+        reason = Some(error);
+    }
     Ok(AttemptResult {
         index: index.into(),
         outcome,
@@ -2609,7 +2632,7 @@ fn execute_spec_until(
         signal: std::os::unix::process::ExitStatusExt::signal(&output.status),
         timed_out: output.timeout.is_some(),
         duration_ms: started.elapsed().as_millis(),
-        cpu_usage_usec: Some(output.cpu_usage_usec),
+        cpu_usage_usec: accounted_cpu_usage_usec,
         observation_sha256: None,
         argv: spec.argv.clone(),
         guest_argv: spec.guest_argv.clone(),
@@ -2633,9 +2656,32 @@ fn execute_spec_until(
     })
 }
 
-fn normalize_ptrace_golden(hermit: &str, directory: &Path) -> Result<(), String> {
-    let mut run1 = fs::read_dir(directory)
-        .map_err(|e| format!("cannot read {}: {e}", directory.display()))?
+/// Preserve process accounting even when post-processing cannot produce its
+/// semantic result. An `Err` must not erase CPU already consumed by a child.
+struct AccountedStep<T> {
+    result: Result<T, String>,
+    cpu_usage_usec: Option<u64>,
+}
+
+fn normalize_ptrace_golden(
+    hermit: &str,
+    directory: &Path,
+    cwd: &Path,
+    deadline: Instant,
+    remaining_cpu_usec: Option<u64>,
+    cpu_timeout_seconds: u64,
+    wall_timeout_seconds: u64,
+) -> AccountedStep<()> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return AccountedStep {
+                result: Err(format!("cannot read {}: {error}", directory.display())),
+                cpu_usage_usec: Some(0),
+            };
+        }
+    };
+    let mut run1 = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
@@ -2647,23 +2693,53 @@ fn normalize_ptrace_golden(hermit: &str, directory: &Path) -> Result<(), String>
     run1.sort();
     let normalized = directory.join("normalized-ptrace-golden.log");
     let status_path = directory.join("normalized-ptrace-golden.status");
-    let status = if run1.len() == 1 && run1[0].metadata().is_ok_and(|metadata| metadata.len() > 0) {
-        let output = Command::new(hermit)
-            .arg("log-diff")
-            .arg(&run1[0])
-            .output()
-            .map_err(|e| format!("cannot normalize {}: {e}", run1[0].display()))?;
-        if output.status.success() {
-            fs::write(&normalized, output.stdout).map_err(|e| e.to_string())?;
-        } else {
-            fs::write(&normalized, b"").map_err(|e| e.to_string())?;
+    if run1.len() != 1 || !run1[0].metadata().is_ok_and(|metadata| metadata.len() > 0) {
+        let result = fs::write(&normalized, b"")
+            .and_then(|()| fs::write(status_path, b"2\n"))
+            .map_err(|error| error.to_string());
+        return AccountedStep {
+            result,
+            cpu_usage_usec: Some(0),
+        };
+    }
+    let stderr = directory.join("normalized-ptrace-golden.stderr");
+    let args = vec!["log-diff".into(), run1[0].to_string_lossy().into_owned()];
+    let output = match execute_process(
+        cwd,
+        hermit,
+        &args,
+        &BTreeMap::new(),
+        &normalized,
+        &stderr,
+        (deadline, remaining_cpu_usec),
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            return AccountedStep {
+                result: Err(format!("cannot normalize {}: {error}", run1[0].display())),
+                cpu_usage_usec: None,
+            };
         }
-        output.status.code().unwrap_or(1)
-    } else {
-        fs::write(&normalized, b"").map_err(|e| e.to_string())?;
-        2
     };
-    fs::write(status_path, format!("{status}\n")).map_err(|e| e.to_string())
+    let cpu_usage_usec = Some(output.cpu_usage_usec);
+    let status = output.status.code().unwrap_or(1);
+    let result = (|| {
+        if !output.status.success() {
+            fs::write(&normalized, b"").map_err(|error| error.to_string())?;
+        }
+        fs::write(&status_path, format!("{status}\n")).map_err(|error| error.to_string())?;
+        if let Some(timeout) = output.timeout {
+            return Err(format!(
+                "ptrace golden normalization {}",
+                timeout.reason(cpu_timeout_seconds, wall_timeout_seconds)
+            ));
+        }
+        Ok(())
+    })();
+    AccountedStep {
+        result,
+        cpu_usage_usec,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3074,19 +3150,36 @@ fn produce_backend_parity_report(
     reference_spec: &CellRunSpec,
     reference_attempt: &AttemptResult,
     budget: ParityComparatorBudget,
-) -> Result<(BackendParityReport, u64), String> {
-    let candidate_backend = candidate_spec
-        .id
-        .backend
-        .as_deref()
-        .ok_or_else(|| "parity candidate has no backend".to_string())?;
-    let reference_backend = reference_spec
-        .id
-        .backend
-        .as_deref()
-        .ok_or_else(|| "parity reference has no backend".to_string())?;
-    let candidate_log = retained_run1_log(candidate_spec)?;
-    let reference_log = retained_run1_log(reference_spec)?;
+) -> AccountedStep<BackendParityReport> {
+    let inputs = (|| {
+        let candidate_backend = candidate_spec
+            .id
+            .backend
+            .as_deref()
+            .ok_or_else(|| "parity candidate has no backend".to_string())?;
+        let reference_backend = reference_spec
+            .id
+            .backend
+            .as_deref()
+            .ok_or_else(|| "parity reference has no backend".to_string())?;
+        let candidate_log = retained_run1_log(candidate_spec)?;
+        let reference_log = retained_run1_log(reference_spec)?;
+        Ok((
+            candidate_backend,
+            reference_backend,
+            candidate_log,
+            reference_log,
+        ))
+    })();
+    let (candidate_backend, reference_backend, candidate_log, reference_log) = match inputs {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            return AccountedStep {
+                result: Err(error),
+                cpu_usage_usec: Some(0),
+            };
+        }
+    };
     let comparison_path = candidate_spec.cell_dir.join("backend-parity-logdiff.json");
     let _ = fs::remove_file(&comparison_path);
     let comparator_args = vec![
@@ -3100,7 +3193,7 @@ fn produce_backend_parity_report(
     ];
     let comparator_program = context.hermit_bin.to_string_lossy().into_owned();
     let captures = candidate_spec.cell_dir.join("captures");
-    let output = execute_process(
+    let output = match execute_process(
         &context.root,
         &comparator_program,
         &comparator_args,
@@ -3108,65 +3201,82 @@ fn produce_backend_parity_report(
         &captures.join("backend-parity-logdiff.stdout"),
         &captures.join("backend-parity-logdiff.stderr"),
         (budget.deadline, Some(budget.remaining_cpu_usec)),
-    )
-    .map_err(|error| format!("cannot execute strict backend log comparison: {error}"))?;
-    if let Some(timeout) = output.timeout {
-        return Err(format!(
-            "strict backend log comparison {}",
-            timeout.reason(budget.cpu_timeout_seconds, budget.wall_timeout_seconds)
-        ));
-    }
-    let comparison_bytes = fs::read(&comparison_path).map_err(|error| {
-        format!(
-            "strict backend log comparison wrote no report at {}: {error}",
-            comparison_path.display()
-        )
-    })?;
-    let comparison: LogDiffReport = serde_json::from_slice(&comparison_bytes)
-        .map_err(|error| format!("backend log comparison report is unreadable: {error}"))?;
-    comparison.require_cross_backend_evidence()?;
-    match (output.status.code(), comparison.verdict) {
-        (Some(0), LogDiffVerdict::Matched) | (Some(1), LogDiffVerdict::Diverged) => {}
-        (status, verdict) => {
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            return AccountedStep {
+                result: Err(format!(
+                    "cannot execute strict backend log comparison: {error}"
+                )),
+                cpu_usage_usec: None,
+            };
+        }
+    };
+    let cpu_usage_usec = Some(output.cpu_usage_usec);
+    let result = (|| {
+        if let Some(timeout) = output.timeout {
             return Err(format!(
-                "backend log comparator status {status:?} contradicts verdict {verdict:?}"
+                "strict backend log comparison {}",
+                timeout.reason(budget.cpu_timeout_seconds, budget.wall_timeout_seconds)
             ));
         }
-    }
-    let reference = parity_operand(
-        "ptrace reference",
-        reference_backend,
-        reference_spec,
-        reference_attempt,
-        &reference_log,
-    )?;
-    let candidate = parity_operand(
-        "candidate",
-        candidate_backend,
-        candidate_spec,
-        candidate_attempt,
-        &candidate_log,
-    )?;
-    let verdict =
-        if reference.output == candidate.output && comparison.verdict == LogDiffVerdict::Matched {
+        let comparison_bytes = fs::read(&comparison_path).map_err(|error| {
+            format!(
+                "strict backend log comparison wrote no report at {}: {error}",
+                comparison_path.display()
+            )
+        })?;
+        let comparison: LogDiffReport = serde_json::from_slice(&comparison_bytes)
+            .map_err(|error| format!("backend log comparison report is unreadable: {error}"))?;
+        comparison.require_cross_backend_evidence()?;
+        match (output.status.code(), comparison.verdict) {
+            (Some(0), LogDiffVerdict::Matched) | (Some(1), LogDiffVerdict::Diverged) => {}
+            (status, verdict) => {
+                return Err(format!(
+                    "backend log comparator status {status:?} contradicts verdict {verdict:?}"
+                ));
+            }
+        }
+        let reference = parity_operand(
+            "ptrace reference",
+            reference_backend,
+            reference_spec,
+            reference_attempt,
+            &reference_log,
+        )?;
+        let candidate = parity_operand(
+            "candidate",
+            candidate_backend,
+            candidate_spec,
+            candidate_attempt,
+            &candidate_log,
+        )?;
+        let verdict = if reference.output == candidate.output
+            && comparison.verdict == LogDiffVerdict::Matched
+        {
             BackendParityVerdict::Matched
         } else {
             BackendParityVerdict::Diverged
         };
-    let report = BackendParityReport {
-        schema: BACKEND_PARITY_REPORT_SCHEMA,
-        verdict,
-        reference,
-        candidate,
-        comparison,
-    };
-    report.validate(candidate_backend)?;
-    let mut bytes = serde_json::to_vec(&report)
-        .map_err(|error| format!("cannot serialize backend parity report: {error}"))?;
-    bytes.push(b'\n');
-    fs::write(candidate_spec.cell_dir.join("backend-parity.json"), bytes)
-        .map_err(|error| format!("cannot retain backend parity report: {error}"))?;
-    Ok((report, output.cpu_usage_usec))
+        let report = BackendParityReport {
+            schema: BACKEND_PARITY_REPORT_SCHEMA,
+            verdict,
+            reference,
+            candidate,
+            comparison,
+        };
+        report.validate(candidate_backend)?;
+        let mut bytes = serde_json::to_vec(&report)
+            .map_err(|error| format!("cannot serialize backend parity report: {error}"))?;
+        bytes.push(b'\n');
+        fs::write(candidate_spec.cell_dir.join("backend-parity.json"), bytes)
+            .map_err(|error| format!("cannot retain backend parity report: {error}"))?;
+        Ok(report)
+    })();
+    AccountedStep {
+        result,
+        cpu_usage_usec,
+    }
 }
 
 fn observed_result(
@@ -3406,8 +3516,8 @@ fn run_cell_inner(
     let mode = cell.test.modes.get(&cell.id.mode).unwrap();
     let mut attempts = Vec::new();
     let mut backend_parity = None;
-    let mut parity_error = None;
-    let mut parity_comparison_cpu_usage_usec = 0;
+    let mut parity_error: Option<(&'static str, String)> = None;
+    let mut parity_comparison_cpu_usage_usec = Some(0);
     match cell.id.mode.as_str() {
         "naked" => {
             for index in 1..=mode.runs.unwrap_or(3) {
@@ -3544,6 +3654,12 @@ fn run_cell_inner(
                     .last()
                     .is_some_and(|attempt| attempt.outcome == "PASS")
                 {
+                    parity_error = parity_candidate_path_error(&attempts);
+                }
+                if attempts
+                    .last()
+                    .is_some_and(|attempt| attempt.outcome == "PASS")
+                {
                     let mut reference_cell = cell.clone();
                     reference_cell.id.backend = Some(reference_backend.to_owned());
                     reference_cell.enabled = true;
@@ -3556,7 +3672,7 @@ fn run_cell_inner(
                         None,
                         remaining_cell_seconds(deadline),
                     )?;
-                    attempts.push(execute_observed_until(
+                    let reference_attempt = execute_observed_until(
                         &reference_spec,
                         &cell.test.observation,
                         &dir,
@@ -3564,38 +3680,57 @@ fn run_cell_inner(
                         timeouts.cpu_seconds,
                         timeouts.wall_seconds,
                         Some(execution_cpu_budget_usec.saturating_sub(execution_cpu_usage_usec)),
-                    )?);
-                    if attempts
-                        .last()
-                        .is_some_and(|attempt| attempt.outcome == "PASS")
-                    {
-                        let used_cpu_usec = attempts.iter().try_fold(0u64, |total, attempt| {
-                            let usage = attempt.cpu_usage_usec.ok_or_else(|| {
-                                "completed parity operand has no CPU measurement".to_string()
-                            })?;
-                            total.checked_add(usage).ok_or_else(|| {
-                                "parity operand CPU usage overflowed u64".to_string()
-                            })
-                        })?;
-                        match produce_backend_parity_report(
-                            context,
-                            &candidate_spec,
-                            &attempts[0],
-                            &reference_spec,
-                            &attempts[1],
-                            ParityComparatorBudget {
-                                deadline,
-                                remaining_cpu_usec: execution_cpu_budget_usec
-                                    .saturating_sub(used_cpu_usec),
-                                cpu_timeout_seconds: timeouts.cpu_seconds,
-                                wall_timeout_seconds: timeouts.wall_seconds,
-                            },
-                        ) {
-                            Ok((report, cpu_usage_usec)) => {
-                                backend_parity = Some(report);
-                                parity_comparison_cpu_usage_usec = cpu_usage_usec;
+                    );
+                    match reference_attempt {
+                        Err(error) => {
+                            parity_error.get_or_insert_with(|| {
+                                (
+                                    "incomplete-parity-evidence",
+                                    format!("ptrace reference could not execute: {error}"),
+                                )
+                            });
+                        }
+                        Ok(reference_attempt) => {
+                            attempts.push(reference_attempt);
+                            let reference =
+                                attempts.last().expect("reference attempt was appended");
+                            if let Some(error) = parity_reference_error(reference) {
+                                parity_error.get_or_insert(error);
+                            } else if parity_error.is_none() {
+                                let used_cpu_usec =
+                                    attempts.iter().try_fold(0u64, |total, attempt| {
+                                        let usage = attempt.cpu_usage_usec.ok_or_else(|| {
+                                            "completed parity operand has no CPU measurement"
+                                                .to_string()
+                                        })?;
+                                        total.checked_add(usage).ok_or_else(|| {
+                                            "parity operand CPU usage overflowed u64".to_string()
+                                        })
+                                    })?;
+                                let comparison = produce_backend_parity_report(
+                                    context,
+                                    &candidate_spec,
+                                    &attempts[0],
+                                    &reference_spec,
+                                    &attempts[1],
+                                    ParityComparatorBudget {
+                                        deadline,
+                                        remaining_cpu_usec: execution_cpu_budget_usec
+                                            .saturating_sub(used_cpu_usec),
+                                        cpu_timeout_seconds: timeouts.cpu_seconds,
+                                        wall_timeout_seconds: timeouts.wall_seconds,
+                                    },
+                                );
+                                parity_comparison_cpu_usage_usec = comparison.cpu_usage_usec;
+                                match comparison.result {
+                                    Ok(report) => {
+                                        backend_parity = Some(report);
+                                    }
+                                    Err(error) => {
+                                        parity_error = Some(("incomplete-parity-evidence", error));
+                                    }
+                                }
                             }
-                            Err(error) => parity_error = Some(error),
                         }
                     }
                 }
@@ -3626,10 +3761,16 @@ fn run_cell_inner(
     let mut error_kind = attempts
         .iter()
         .find_map(|attempt| attempt.error_kind.clone());
-    if let Some(error) = parity_error {
+    if let Some((kind, error)) = parity_error {
         outcome = "ERROR".into();
-        error_kind = Some("incomplete-parity-evidence".into());
+        error_kind = Some(kind.into());
         reason = Some(error);
+        first_divergent_scheduler_turn = None;
+        first_divergent_virtual_nanoseconds = None;
+        first_divergent_record = None;
+        first_divergent_syscall = None;
+        first_divergent_left_message = None;
+        first_divergent_right_message = None;
     } else if let Some(report) = backend_parity.as_ref() {
         if report.verdict == BackendParityVerdict::Diverged {
             outcome = "FAIL".into();
@@ -3723,7 +3864,14 @@ fn run_cell_inner(
         Ok(value) => value,
         Err(error) => {
             outcome = "ERROR".into();
-            error_kind = Some("invalid-backend-evidence".into());
+            error_kind = Some(
+                if parity_reference.is_some() {
+                    "incomplete-parity-evidence"
+                } else {
+                    "invalid-backend-evidence"
+                }
+                .into(),
+            );
             reason = Some(error);
             None
         }
@@ -3778,7 +3926,7 @@ fn run_cell_inner(
         .try_fold(preparation_cpu_usage_usec, |total, attempt| {
             checked_add_cpu_usage(Some(total), attempt.cpu_usage_usec)
         })
-        .and_then(|total| total.checked_add(parity_comparison_cpu_usage_usec));
+        .and_then(|total| checked_add_cpu_usage(Some(total), parity_comparison_cpu_usage_usec));
     Ok(CellResult {
         artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
@@ -4133,6 +4281,36 @@ fn summarize_sabre_path_evidence(attempts: &[AttemptResult]) -> Result<Option<Js
         "eligible": eligible,
         "executions": executions
     })))
+}
+
+fn parity_candidate_path_error(attempts: &[AttemptResult]) -> Option<(&'static str, String)> {
+    match summarize_sabre_path_evidence(attempts) {
+        Err(error) => Some(("incomplete-parity-evidence", error)),
+        Ok(Some(evidence)) if evidence["eligible"] != true => Some((
+            "incomplete-parity-evidence",
+            "SaBRe execution path is incomplete or used fallback/native sites".into(),
+        )),
+        Ok(_) => None,
+    }
+}
+
+fn parity_reference_error(attempt: &AttemptResult) -> Option<(&'static str, String)> {
+    (attempt.outcome != "PASS").then(|| {
+        (
+            "incomplete-parity-evidence",
+            format!(
+                "ptrace reference did not pass strict same-backend verification: outcome={} status={:?} signal={:?}{}",
+                attempt.outcome,
+                attempt.status,
+                attempt.signal,
+                attempt
+                    .reason
+                    .as_deref()
+                    .map(|reason| format!(" reason={reason}"))
+                    .unwrap_or_default(),
+            ),
+        )
+    })
 }
 
 fn diversity_evidence(
@@ -5860,6 +6038,112 @@ mod tests {
         assert_eq!(checked_add_cpu_usage(Some(2), None), None);
         assert_eq!(checked_add_cpu_usage(None, Some(3)), None);
         assert_eq!(checked_add_cpu_usage(Some(u64::MAX), Some(1)), None);
+    }
+
+    #[test]
+    fn ptrace_golden_normalization_is_bounded_and_accounts_a_timeout() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-normalization-budget-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("run1_log_fixture.log"), b"retained log\n").unwrap();
+        let program = root.join("hermit");
+        fs::write(&program, "#!/bin/sh\nwhile :; do :; done\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let normalized = normalize_ptrace_golden(
+            program.to_str().unwrap(),
+            &root,
+            &root,
+            Instant::now() + Duration::from_secs(5),
+            Some(200_000),
+            1,
+            5,
+        );
+        let error = normalized
+            .result
+            .expect_err("normalization must obey the shared CPU budget");
+        assert!(error.contains("CPU"), "{error}");
+        assert!(
+            normalized
+                .cpu_usage_usec
+                .is_some_and(|usage| usage >= 100_000),
+            "timed-out normalization must retain its measured CPU: {:?}",
+            normalized.cpu_usage_usec
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_backend_comparator_retains_its_cpu_measurement() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-parity-comparator-budget-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let candidate_logs = root.join("candidate-logs");
+        let reference_logs = root.join("reference-logs");
+        fs::create_dir_all(root.join("cell/captures")).unwrap();
+        fs::create_dir_all(&candidate_logs).unwrap();
+        fs::create_dir_all(&reference_logs).unwrap();
+        fs::write(candidate_logs.join("run1_log_fixture.log"), b"candidate\n").unwrap();
+        fs::write(reference_logs.join("run1_log_fixture.log"), b"reference\n").unwrap();
+        let program = root.join("hermit");
+        fs::write(&program, "#!/bin/sh\nwhile :; do :; done\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let spec = |backend: &str, logs: PathBuf, attempt: &str| CellRunSpec {
+            id: CellId {
+                test: "fixture/parity-budget".into(),
+                mode: "verify".into(),
+                backend: Some(backend.into()),
+            },
+            lane: "portable".into(),
+            category: "fixture".into(),
+            cwd: root.clone(),
+            env: BTreeMap::new(),
+            argv: vec![program.to_string_lossy().into_owned()],
+            guest_argv: vec!["fixture".into()],
+            timeout_seconds: 5,
+            verdict_path: None,
+            verification_log_dir: Some(logs),
+            sabre_path_evidence: None,
+            cell_dir: root.join("cell"),
+            attempt: attempt.into(),
+            fixed_workdir_source: root.join(format!("workdir/{attempt}")),
+        };
+        let candidate_spec = spec("kvm", candidate_logs, "1");
+        let reference_spec = spec("ptrace", reference_logs, "parity-reference");
+        let attempt = attempt_with_sabre_evidence("");
+        let mut context = run_context(&root);
+        context.hermit_bin = program;
+        let compared = produce_backend_parity_report(
+            &context,
+            &candidate_spec,
+            &attempt,
+            &reference_spec,
+            &attempt,
+            ParityComparatorBudget {
+                deadline: Instant::now() + Duration::from_secs(5),
+                remaining_cpu_usec: 200_000,
+                cpu_timeout_seconds: 1,
+                wall_timeout_seconds: 5,
+            },
+        );
+        let error = compared
+            .result
+            .expect_err("the comparator must obey its CPU budget");
+        assert!(error.contains("CPU"), "{error}");
+        assert!(
+            compared
+                .cpu_usage_usec
+                .is_some_and(|usage| usage >= 100_000),
+            "a failed comparator must retain measured CPU: {:?}",
+            compared.cpu_usage_usec
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -7638,6 +7922,49 @@ backends_disabled:
     }
 
     #[test]
+    fn failed_ptrace_reference_cannot_become_a_candidate_product_failure() {
+        let candidate = attempt_with_sabre_evidence("");
+        let mut divergent_reference = candidate.clone();
+        divergent_reference.index = "parity-reference".into();
+        divergent_reference.outcome = "FAIL".into();
+        divergent_reference.verification_report = Some(
+            r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1"},"compared_log_messages":{"left":1,"right":1},"first_divergent_scheduler_turn":4,"first_divergent_virtual_nanoseconds":7,"first_divergent_record":9,"first_divergent_syscall":2,"first_divergent_left_message":"left","first_divergent_right_message":"right"}"#
+                .into(),
+        );
+        let attempts = [candidate.clone(), divergent_reference];
+        let (kind, reason) = parity_reference_error(&attempts[1])
+            .expect("a divergent ptrace reference must invalidate parity");
+        assert_eq!(kind, "incomplete-parity-evidence");
+        assert!(reason.contains("ptrace reference"));
+        assert_eq!(
+            observed_result("verify", "ERROR", &attempts, Some(kind), None),
+            None,
+            "the reference's divergence must not be attributed to the candidate"
+        );
+        assert_eq!(
+            failure_class("ERROR", None, Some(kind)),
+            Some(FailureClass::NoResult)
+        );
+
+        let mut crashed_reference = candidate;
+        crashed_reference.index = "parity-reference".into();
+        crashed_reference.outcome = "FAIL".into();
+        crashed_reference.status = Some(7);
+        let (kind, _) = parity_reference_error(&crashed_reference)
+            .expect("a crashing ptrace reference must invalidate parity");
+        assert_eq!(
+            observed_result(
+                "verify",
+                "ERROR",
+                std::slice::from_ref(&crashed_reference),
+                Some(kind),
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn sabre_path_evidence_requires_every_execution_and_no_fallback() {
         let clean = r#"{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}"#;
         let complete = attempt_with_sabre_evidence(&format!("{clean}\n{clean}\n"));
@@ -7646,6 +7973,10 @@ backends_disabled:
                 .unwrap()
                 .unwrap()["eligible"],
             true
+        );
+        assert_eq!(
+            parity_candidate_path_error(std::slice::from_ref(&complete)),
+            None
         );
 
         let mut ptrace_reference = complete.clone();
@@ -7662,9 +7993,15 @@ backends_disabled:
         );
 
         let short = attempt_with_sabre_evidence(&format!("{clean}\n"));
-        let summary = summarize_sabre_path_evidence(&[short]).unwrap().unwrap();
+        let summary = summarize_sabre_path_evidence(std::slice::from_ref(&short))
+            .unwrap()
+            .unwrap();
         assert_eq!(summary["complete"], false);
         assert_eq!(summary["eligible"], false);
+        let (kind, reason) = parity_candidate_path_error(std::slice::from_ref(&short))
+            .expect("an incomplete SaBRe path must prevent parity comparison");
+        assert_eq!(kind, "incomplete-parity-evidence");
+        assert!(reason.contains("fallback/native"));
 
         let malformed = attempt_with_sabre_evidence(
             r#"{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":"0","trusted_shared_object_sites":"0","trusted_shared_objects":"none"}
