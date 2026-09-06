@@ -183,6 +183,8 @@ pub enum SeriesNoVerdictKind {
 pub struct SeriesAttemptDisposition {
     pub index: String,
     pub kind: SeriesNoVerdictKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     pub attempt_outcome: String,
     pub disposition: SeriesOutcome,
     #[serde(default)]
@@ -773,6 +775,18 @@ impl SeriesRow {
                 );
             }
             if disposition
+                .detail
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                return Err("no_verdict_evidence detail must be nonempty when present".into());
+            }
+            if disposition.detail.is_some()
+                && disposition.kind != SeriesNoVerdictKind::ComparisonRefused
+            {
+                return Err("only comparison_refused evidence may carry detail".into());
+            }
+            if disposition
                 .error_kind
                 .as_ref()
                 .is_some_and(|value| value.trim().is_empty())
@@ -823,6 +837,10 @@ impl SeriesRow {
                 SeriesNoVerdictKind::ComparisonRefused => {
                     if disposition.attempt_outcome != "ERROR"
                         || disposition.disposition != SeriesOutcome::NoResult
+                        || disposition
+                            .detail
+                            .as_ref()
+                            .is_none_or(|value| value.trim().is_empty())
                         || disposition.timed_out
                         || disposition.error_kind.as_deref()
                             != Some("incomplete-verification-evidence")
@@ -830,7 +848,7 @@ impl SeriesRow {
                         || disposition.verification_report_sha256.is_none()
                     {
                         return Err(
-                            "comparison_refused evidence must carry attempt outcome ERROR, error_kind incomplete-verification-evidence, a verification report, exactly one nonzero status or signal, timed_out=false, and no_result disposition"
+                            "comparison_refused evidence must carry nonempty detail, attempt outcome ERROR, error_kind incomplete-verification-evidence, a verification report, exactly one nonzero status or signal, timed_out=false, and no_result disposition"
                                 .into(),
                         );
                     }
@@ -1171,6 +1189,7 @@ mod tests {
             attempts: vec![SeriesAttemptDisposition {
                 index: "1".into(),
                 kind: SeriesNoVerdictKind::NotRun,
+                detail: None,
                 attempt_outcome: "ERROR".into(),
                 disposition: SeriesOutcome::NoResult,
                 error_kind: Some("incomplete-verification-evidence".into()),
@@ -1604,6 +1623,7 @@ mod tests {
             attempts: vec![SeriesAttemptDisposition {
                 index: "1".into(),
                 kind: SeriesNoVerdictKind::FirstRunRejected,
+                detail: None,
                 attempt_outcome: "FAIL".into(),
                 disposition: SeriesOutcome::NoResult,
                 error_kind: None,
@@ -1626,14 +1646,36 @@ mod tests {
         unspecified.validate_for_write().unwrap();
 
         let mut refused = no_verdict_row();
-        refused
+        let refusal_detail = "the second log was truncated at the configured size bound";
+        let refused_disposition = &mut refused
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0];
+        refused_disposition.kind = SeriesNoVerdictKind::ComparisonRefused;
+        refused_disposition.detail = Some(refusal_detail.into());
+        refused.validate_for_write().unwrap();
+        let serialized = serde_json::to_value(&refused).unwrap();
+        assert_eq!(
+            serialized["series"]["no_verdict_evidence"]["attempts"][0]["detail"],
+            refusal_detail
+        );
+
+        let mut refused_without_detail = refused.clone();
+        refused_without_detail
             .series
             .no_verdict_evidence
             .as_mut()
             .unwrap()
             .attempts[0]
-            .kind = SeriesNoVerdictKind::ComparisonRefused;
-        refused.validate_for_write().unwrap();
+            .detail = None;
+        assert!(
+            refused_without_detail
+                .validate_for_write()
+                .unwrap_err()
+                .contains("must carry nonempty detail")
+        );
 
         let mut refused_without_typed_error = refused;
         refused_without_typed_error
