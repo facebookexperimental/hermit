@@ -319,7 +319,10 @@ impl LogDiffCLIOpts {
             );
             return ExitStatus::Exited(2);
         }
-        if summary.diff_found {
+        if let Some(reason) = summary.refusal_reason.as_deref() {
+            eprintln!("hermit log-diff: REFUSED: {reason}");
+            ExitStatus::Exited(2)
+        } else if summary.diff_found {
             ExitStatus::Exited(HERMIT_VERIFICATION_DIVERGENCE_EXIT)
         } else if summary.matched_with_evidence() {
             ExitStatus::Exited(0)
@@ -414,7 +417,18 @@ impl LogDiffCLIOpts {
                 last_reported_records = records.compared;
             }
 
-            if comparison.summary.diff_found {
+            if let Some(reason) = comparison.summary.refusal_reason.as_deref() {
+                std::io::stderr().write_all(&transcript).ok();
+                eprintln!("hermit log-diff: REFUSED: {reason}");
+                return self.finish_follow(
+                    options,
+                    &comparison.summary,
+                    records,
+                    JsonVerdict::Refused,
+                    "refused",
+                    ExitStatus::Exited(2),
+                );
+            } else if comparison.summary.diff_found {
                 std::io::stderr().write_all(&transcript).ok();
                 let first = comparison.summary.first_divergent_record;
                 match first {
@@ -621,7 +635,7 @@ struct JsonReport<'a> {
     selected_messages: JsonMessageCounts,
     records: JsonRecords,
     comparison: JsonComparison<'a>,
-    /// Why following stopped: `diverged`, `quiescent`, or `timeout`. Absent for
+    /// Why following stopped: `refused`, `diverged`, `quiescent`, or `timeout`. Absent for
     /// a one-shot comparison of two finished logs.
     #[serde(skip_serializing_if = "Option::is_none")]
     follow_stopped_because: Option<&'static str>,
@@ -643,7 +657,9 @@ fn json_report<'a>(
     records: JsonRecords,
     record_envelope: RecordEnvelopePolicy,
 ) -> JsonReport<'a> {
-    let verdict = if summary.diff_found {
+    let verdict = if summary.refusal_reason.is_some() {
+        JsonVerdict::Refused
+    } else if summary.diff_found {
         JsonVerdict::Diverged
     } else if summary.compared_left == 0 && summary.compared_right == 0 {
         JsonVerdict::NoComparableMessages
@@ -666,7 +682,7 @@ fn json_report<'a>(
         .collect();
     JsonReport {
         verdict,
-        refusal: None,
+        refusal: summary.refusal_reason.clone(),
         selected_messages: JsonMessageCounts {
             left: summary.compared_left,
             right: summary.compared_right,
@@ -1034,6 +1050,38 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
     }
 
     #[test]
+    fn bounded_log_refusal_is_json_refused_and_exits_two() {
+        let directory = tempfile::tempdir().unwrap();
+        let left = directory.path().join("left.log");
+        let right = directory.path().join("right.log");
+        let json = directory.path().join("comparison.json");
+        let truncated = format!("{}\n", logdiff::TRUNCATION_MARKER);
+        std::fs::write(&left, &truncated).unwrap();
+        std::fs::write(&right, &truncated).unwrap();
+
+        let mut options = LogDiffCLIOpts::new(&left, &right);
+        options.json = Some(json.clone());
+        let global = GlobalOpts::try_parse_from(["hermit"]).unwrap();
+        let status = options.main(&global);
+        assert!(
+            matches!(status, ExitStatus::Exited(2)),
+            "a bounded-log refusal must exit 2, got {status:?}"
+        );
+
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+        assert_eq!(report["verdict"], "refused");
+        let refusal = report["refusal"].as_str().unwrap();
+        assert!(refusal.contains("both logs were truncated"), "{refusal}");
+        assert!(
+            refusal.contains("HERMIT_LOG_MAX_BYTES"),
+            "the refusal must retain its actionable remedy: {refusal}"
+        );
+        assert_eq!(report["selected_messages"]["left"], 0);
+        assert_eq!(report["selected_messages"]["right"], 0);
+    }
+
+    #[test]
     fn follow_reports_divergence_before_either_run_finishes() {
         let directory = tempfile::tempdir().unwrap();
         let left = directory.path().join("left.log");
@@ -1279,6 +1327,21 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
             .unwrap()["verdict"],
             "no_comparable_messages"
         );
+
+        let refused = logdiff::LogDiffSummary {
+            diff_found: true,
+            refusal_reason: Some("the first log was truncated".into()),
+            ..empty
+        };
+        let refused = serde_json::to_value(json_report(
+            &refused,
+            &options,
+            no_records(),
+            RecordEnvelopePolicy::AllRecordsV1,
+        ))
+        .unwrap();
+        assert_eq!(refused["verdict"], "refused");
+        assert_eq!(refused["refusal"], "the first log was truncated");
     }
 
     #[test]
