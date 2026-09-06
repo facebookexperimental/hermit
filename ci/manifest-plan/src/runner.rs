@@ -1306,6 +1306,19 @@ pub struct CellResult {
 }
 
 impl CellResult {
+    /// Human-facing explanation without manufacturing a cause the producer did
+    /// not record.
+    pub fn reason_for_display(&self) -> &str {
+        self.reason
+            .as_deref()
+            .unwrap_or(match self.outcome.as_str() {
+                "FAIL" => "no specific failure reason was recorded",
+                "ERROR" => "no specific error reason was recorded",
+                "HOST-INAPPLICABLE" => "no prerequisite reason was recorded",
+                _ => "no reason was recorded",
+            })
+    }
+
     /// Validate the additive timeout fields while keeping earlier schema-4 rows
     /// readable. `timeout_seconds` retains its original wall-bound meaning;
     /// only rows carrying both new fields claim the execution CPU/backstop
@@ -2230,6 +2243,11 @@ pub fn build_spec(
     })
 }
 
+fn current_verification_report(bytes: &[u8]) -> Result<VerificationReport, String> {
+    let value = serde_json::from_slice::<JsonValue>(bytes)
+        .map_err(|error| format!("incomplete verification report: {error}"))?;
+    VerificationReport::from_current_json_value(value)
+}
 pub fn execute_spec(spec: &CellRunSpec) -> Result<AttemptResult, String> {
     execute_spec_until(
         spec,
@@ -2400,7 +2418,11 @@ fn execute_spec_until(
     if unclassified_internal_failure {
         outcome = "ERROR".into();
         error_kind = Some("incomplete-verification-evidence".into());
-        reason = Some("Hermit reported cli-error without a more specific result".into());
+        reason = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("Error: "))
+            .filter(|detail| !detail.trim().is_empty())
+            .map(str::to_owned);
     }
     let producer_failure_classified = launch_refusal
         || backend_unavailable
@@ -2431,7 +2453,7 @@ fn execute_spec_until(
             Ok(bytes) => {
                 report_sha = Some(hex_digest(&bytes));
                 report_json = Some(String::from_utf8_lossy(&bytes).into_owned());
-                match VerificationReport::from_json_slice(&bytes) {
+                match current_verification_report(&bytes) {
                     Ok(report) => {
                         runtime = report.runtime.clone();
                         // Recorded BEFORE the classification chain below,
@@ -2480,6 +2502,23 @@ fn execute_spec_until(
                                     ),
                                 });
                             }
+                        } else if report.verdict == Verdict::NoResult
+                            && matches!(
+                                report.no_result_reason,
+                                Some(
+                                    crate::canonical_verdict::NoResultReason::ComparisonRefused { .. }
+                                )
+                            )
+                        {
+                            let Some(crate::canonical_verdict::NoResultReason::ComparisonRefused {
+                                detail,
+                            }) = report.no_result_reason.as_ref()
+                            else {
+                                unreachable!()
+                            };
+                            outcome = "ERROR".into();
+                            error_kind = Some("incomplete-verification-evidence".into());
+                            reason = Some(detail.clone());
                         } else if report.verdict == Verdict::NoResult
                             && matches!(
                                 report.no_result_reason,
@@ -2923,7 +2962,7 @@ fn cell_artifact_dir(context: &RunContext, cell: &SelectedCell) -> PathBuf {
 
 fn verification_verdict(attempt: &AttemptResult) -> Option<Verdict> {
     let report = attempt.verification_report.as_deref()?;
-    VerificationReport::from_json_slice(report.as_bytes())
+    current_verification_report(report.as_bytes())
         .ok()
         .map(|report| report.verdict)
 }
@@ -3799,19 +3838,19 @@ pub fn write_junit(path: &Path, results: &[CellResult]) -> Result<(), String> {
         if result.outcome == "FAIL" {
             out.push_str(&format!(
                 "<failure>{}</failure>",
-                xml(result.reason.as_deref().unwrap_or("failed"))
+                xml(result.reason_for_display())
             ));
         }
         if result.outcome == "ERROR" {
             out.push_str(&format!(
                 "<error>{}</error>",
-                xml(result.reason.as_deref().unwrap_or("error"))
+                xml(result.reason_for_display())
             ));
         }
         if result.outcome == "HOST-INAPPLICABLE" {
             out.push_str(&format!(
                 "<skipped message=\"{}\"/>",
-                xml(result.reason.as_deref().unwrap_or("host-inapplicable"))
+                xml(result.reason_for_display())
             ));
         }
         out.push_str("</testcase>\n");
@@ -5447,6 +5486,34 @@ mod tests {
     }
 
     #[test]
+    fn junit_names_absent_failure_reasons_instead_of_guessing() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-junit-absent-reason-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut failed = cell_result_that_located_nothing();
+        failed.outcome = "FAIL".into();
+        failed.reason = None;
+        let mut errored = cell_result_that_located_nothing();
+        errored.outcome = "ERROR".into();
+        errored.reason = None;
+        let junit = root.join("junit.xml");
+        write_junit(&junit, &[failed, errored]).unwrap();
+        let xml = fs::read_to_string(&junit).unwrap();
+        assert!(
+            xml.contains("<failure>no specific failure reason was recorded</failure>"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("<error>no specific error reason was recorded</error>"),
+            "{xml}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn retry_preserves_a_divergence_when_the_later_row_passes() {
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-durable-row-bracket-{}",
@@ -6762,10 +6829,17 @@ backends_disabled:
     fn framework_classifies_divergence_and_crash_before_pressure_reads_them() {
         let mut divergence = attempt_with_sabre_evidence("");
         divergence.outcome = "FAIL".into();
-        divergence.verification_report = Some(
-            r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1"},"compared_log_messages":{"left":1,"right":1},"first_divergent_scheduler_turn":4,"first_divergent_virtual_nanoseconds":7,"first_divergent_record":9,"first_divergent_syscall":2,"first_divergent_left_message":"left","first_divergent_right_message":"right"}"#
-                .into(),
-        );
+        let mut report = canonical_verification_report();
+        report.verified = false;
+        report.bitwise_parity = false;
+        report.verdict = Verdict::Diverged;
+        report.first_divergent_scheduler_turn = Some(4);
+        report.first_divergent_virtual_nanoseconds = Some(7);
+        report.first_divergent_record = Some(9);
+        report.first_divergent_syscall = Some(2);
+        report.first_divergent_left_message = Some("left".into());
+        report.first_divergent_right_message = Some("right".into());
+        divergence.verification_report = Some(serde_json::to_string(&report).unwrap());
         let divergence_result = observed_result(
             "verify",
             &divergence.outcome,
@@ -7260,18 +7334,18 @@ backends_disabled:
     /// bracket exercises both directions through real subprocesses.
     #[test]
     fn an_unavailable_backend_is_not_reported_as_a_silent_one() {
-        let no_result = r#"{"verified":false,"bitwise_parity":false,"verdict":"no_result","comparison":null,"compared_log_messages":null}"#;
+        let no_result = serde_json::to_string(&VerificationReport::no_result()).unwrap();
         let unavailable = attempt_from_script(
             "sabre",
             "printf %s \"$1\" > \"$2\"; \
              printf '%s\\n' 'HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=sabre' \
              'Error: backend \x60sabre\x60 is unavailable: HERMIT_SABRE_BINARY=/nonexistent/sabre is not an executable file' >&2; exit 1",
-            Some(no_result),
+            Some(&no_result),
         );
         let silent = attempt_from_script(
             "sabre",
             "printf %s \"$1\" > \"$2\"; exit 0",
-            Some(no_result),
+            Some(&no_result),
         );
 
         assert_eq!(unavailable.outcome, "ERROR");
@@ -7336,20 +7410,20 @@ backends_disabled:
 
     #[test]
     fn backend_unavailable_requires_the_requested_backend_and_empty_stdout() {
-        let no_result = r#"{"verified":false,"bitwise_parity":false,"verdict":"no_result","comparison":null,"compared_log_messages":null}"#;
+        let no_result = serde_json::to_string(&VerificationReport::no_result()).unwrap();
         let wrong_backend = attempt_from_script(
             "sabre",
             "printf %s \"$1\" > \"$2\"; \
              printf '%s\\n' 'HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=dbt' \
              'Error: backend \x60dbt\x60 is unavailable: no SDK' >&2; exit 7",
-            Some(no_result),
+            Some(&no_result),
         );
         let guest_output = attempt_from_script(
             "sabre",
             "printf %s \"$1\" > \"$2\"; printf 'guest-started\\n'; \
              printf '%s\\n' 'HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=sabre' \
              'Error: backend \x60sabre\x60 is unavailable: spoofed' >&2; exit 8",
-            Some(no_result),
+            Some(&no_result),
         );
 
         for result in [wrong_backend, guest_output] {
@@ -7383,10 +7457,13 @@ backends_disabled:
             );
         }
 
+        let mut unspecified = VerificationReport::no_result();
+        unspecified.no_result_reason = None;
+        let unspecified = serde_json::to_string(&unspecified).unwrap();
         let ordinary_failure = attempt_from_script(
             "sabre",
             "printf %s \"$1\" > \"$2\"; printf 'guest-started\\n'; exit 8",
-            Some(no_result),
+            Some(&unspecified),
         );
         assert_eq!(ordinary_failure.outcome, "FAIL");
         let observed = observed_result(
@@ -7433,20 +7510,20 @@ backends_disabled:
 
     #[test]
     fn launch_refusal_requires_the_producer_class_line() {
-        let no_result = r#"{"verified":false,"bitwise_parity":false,"verdict":"no_result","comparison":null,"compared_log_messages":null}"#;
+        let no_result = serde_json::to_string(&VerificationReport::no_result()).unwrap();
         let typed = attempt_from_script(
             "ptrace",
             "printf %s \"$1\" > \"$2\"; printf '%s\\n' \
              'HERMIT_INTERNAL_FAILURE class=guest-program-not-found' \
              'Error: Program /missing does not exist' >&2; exit 127",
-            Some(no_result),
+            Some(&no_result),
         );
         let prose_only = attempt_from_script(
             "ptrace",
             "printf %s \"$1\" > \"$2\"; printf '%s\\n' \
              'HERMIT_INTERNAL_FAILURE class=cli-error' \
              'Error: Program /missing does not exist' >&2; exit 127",
-            Some(no_result),
+            Some(&no_result),
         );
 
         assert_eq!(typed.error_kind.as_deref(), Some("guest-launch-refused"));
@@ -7470,6 +7547,33 @@ backends_disabled:
             Some(FailureClass::NoResult),
             "English launch prose without the producer class must remain no-result"
         );
+    }
+    #[test]
+    fn cli_error_preserves_the_producer_cause_without_inventing_one() {
+        let vector_13 = attempt_from_script(
+            "kvm",
+            "printf '%s\\n' \
+             'HERMIT_INTERNAL_FAILURE class=cli-error' \
+             'Error: KVM guest execution failed: guest exception vector 13' >&2; exit 1",
+            None,
+        );
+        assert_eq!(vector_13.outcome, "ERROR");
+        assert_eq!(
+            vector_13.error_kind.as_deref(),
+            Some("incomplete-verification-evidence")
+        );
+        assert_eq!(
+            vector_13.reason.as_deref(),
+            Some("KVM guest execution failed: guest exception vector 13")
+        );
+
+        let no_detail = attempt_from_script(
+            "kvm",
+            "printf '%s\\n' 'HERMIT_INTERNAL_FAILURE class=cli-error' >&2; exit 1",
+            None,
+        );
+        assert_eq!(no_detail.outcome, "ERROR");
+        assert_eq!(no_detail.reason, None, "absence must remain honest absence");
     }
 
     #[test]

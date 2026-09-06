@@ -18450,6 +18450,17 @@ fn write_validation_service_result(path: &Path, summary: &RunSummary) -> Result<
         profile: summary.profile.clone(),
         selection_mode: summary.selection_mode.clone(),
         final_validate_status: status,
+        detail: if status == FinalValidateStatus::CouldNotRun {
+            let detail = summary
+                .detail
+                .iter()
+                .filter(|line| !line.trim().is_empty())
+                .cloned()
+                .collect::<Vec<_>>();
+            (!detail.is_empty()).then_some(detail)
+        } else {
+            None
+        },
         exit_code: i32::from(summary.exit_code),
         executed_nodes: u64::try_from(summary.nodes_executed)
             .map_err(|_| "validation-service-result-executed_nodes exceeds u64".to_string())?,

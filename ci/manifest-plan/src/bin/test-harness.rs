@@ -2011,17 +2011,14 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                     result.test,
                     result.mode,
                     result.backend.as_deref().unwrap_or("native"),
-                    result.reason.as_deref().unwrap_or("infrastructure error")
+                    result.reason_for_display()
                 );
             }
             // A FAILURE MUST SAY ENOUGH TO BE CLASSIFIED, NOT JUST COUNTED.
             let located = if result.outcome == "PASS" {
                 String::new()
             } else if result.outcome == "HOST-INAPPLICABLE" {
-                format!(
-                    " {}",
-                    result.reason.as_deref().unwrap_or("host-inapplicable")
-                )
+                format!(" {}", result.reason_for_display())
             } else {
                 let coords = [
                     ("turn", result.first_divergent_scheduler_turn),
@@ -2036,8 +2033,8 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 if !coords.is_empty() {
                     suffix.push_str(&format!(" [{}]", coords.join(" ")));
                 }
-                if let Some(reason) = result.reason.as_deref() {
-                    suffix.push_str(&format!(" {reason}"));
+                if result.outcome != "PASS" {
+                    suffix.push_str(&format!(" {}", result.reason_for_display()));
                 }
                 suffix.push_str(&format!("\n    evidence: {}", result.artifact_dir));
                 suffix
@@ -2624,6 +2621,26 @@ mod tests {
         rows.sort_unstable();
         assert_eq!(rows, (0..8).map(|index| (index, index)).collect::<Vec<_>>());
         assert!(maximum.load(Ordering::SeqCst) > 1);
+    }
+    #[test]
+    fn retry_policy_retries_only_classified_product_failures() {
+        assert!(cell_result_is_retryable(
+            "FAIL",
+            Some(FailureClass::ProductFailure)
+        ));
+        for (outcome, class) in [
+            ("PASS", None),
+            ("HOST-INAPPLICABLE", None),
+            ("FAIL", None),
+            ("FAIL", Some(FailureClass::UnderstoodInfrastructureFailure)),
+            ("ERROR", Some(FailureClass::NoResult)),
+            ("ERROR", Some(FailureClass::UnderstoodPrerequisiteFailure)),
+        ] {
+            assert!(
+                !cell_result_is_retryable(outcome, class),
+                "{outcome} {class:?}"
+            );
+        }
     }
 
     #[test]

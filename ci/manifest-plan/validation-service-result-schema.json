@@ -1,11 +1,12 @@
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "fields": [
     "schema_version",
     "commit",
     "profile",
     "selection_mode",
     "final_validate_status",
+    "detail",
     "exit_code",
     "executed_nodes",
     "executed_tests",

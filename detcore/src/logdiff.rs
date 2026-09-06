@@ -1505,8 +1505,10 @@ pub struct LogDiffSummary {
     /// The corresponding first differing compared message from the right
     /// execution, with the same narrowly scoped removals.
     pub first_divergent_right_message: Option<String>,
-    /// True when the comparison was REFUSED rather than performed, so there is
-    /// no verdict about whether the runs agree.
+    /// The reason the comparison was REFUSED rather than performed, so there
+    /// is no verdict about whether the runs agree. None means the comparison
+    /// ran. Keeping the cause here, rather than only printing it, lets every
+    /// caller carry the producer's diagnosis into its typed result.
     ///
     /// [`Self::diff_found`] is also set, because a refusal must never read as a
     /// match on any existing predicate. But the two are not the same fact: a
@@ -1518,14 +1520,17 @@ pub struct LogDiffSummary {
     ///
     /// Set today by exactly one condition: an input log that ends at the
     /// bounded writer's truncation marker.
-    pub refused: bool,
+    pub refusal_reason: Option<String>,
 }
 
 impl LogDiffSummary {
     /// True only when the comparison both ran on a nonempty selection *and*
     /// found no difference. An empty-vs-empty comparison is never a match.
     pub fn matched_with_evidence(&self) -> bool {
-        !self.diff_found && self.compared_left > 0 && self.compared_right > 0
+        self.refusal_reason.is_none()
+            && !self.diff_found
+            && self.compared_left > 0
+            && self.compared_right > 0
     }
 }
 
@@ -2003,13 +2008,12 @@ pub fn log_diff_summary_from_strs_with_filter(
             (false, true) => "the second log was",
             (false, false) => unreachable!("guarded by the condition above"),
         };
+        let refusal_reason = format!(
+            "{which_side} truncated at the configured size bound (the log ends with the bounded writer's truncation marker). The discarded tail was never written, so no comparison of these files can establish that the runs agree past that point. Re-run with a larger HERMIT_LOG_MAX_BYTES, or 0 to disable the bound."
+        );
         writeln!(
             w,
-            "REFUSING to compare: {which_side} truncated at the configured size bound \
-             (the log ends with the bounded writer's truncation marker). The discarded tail was \
-             never written, so no comparison of these files can establish that the runs agree \
-             past that point. This is a NO-RESULT, not a difference and not a match. Re-run with \
-             a larger HERMIT_LOG_MAX_BYTES, or 0 to disable the bound."
+            "REFUSING to compare: {refusal_reason} This is a NO-RESULT, not a difference and not a match."
         )?;
         return Ok(LogDiffSummary {
             diff_found: true,
@@ -2021,7 +2025,7 @@ pub fn log_diff_summary_from_strs_with_filter(
             first_divergent_syscall: None,
             first_divergent_left_message: None,
             first_divergent_right_message: None,
-            refused: true,
+            refusal_reason: Some(refusal_reason),
         });
     }
 
@@ -2180,7 +2184,7 @@ pub fn log_diff_summary_from_strs_with_filter(
             .then_some(first_divergent_right_message)
             .flatten(),
         // This path compared the logs; only the refusal above declines to.
-        refused: false,
+        refusal_reason: None,
     };
 
     if diff_found {
@@ -2992,6 +2996,7 @@ mod test {
             clean.matched_with_evidence(),
             "the untruncated match must carry nonzero compared counts, got {clean:?}"
         );
+        assert!(clean.refusal_reason.is_none());
 
         // Direction 2: the marker on the left, the right, or both -> refused,
         // even though the retained content is byte-identical to direction 1.
@@ -3010,6 +3015,13 @@ mod test {
                 (summary.compared_left, summary.compared_right),
                 (0, 0),
                 "{label}: nothing was compared, so the counts must not claim otherwise"
+            );
+            assert!(
+                summary
+                    .refusal_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("truncated at the configured size bound")),
+                "{label}: the typed result must retain the printed refusal cause"
             );
             assert!(
                 !summary.matched_with_evidence(),

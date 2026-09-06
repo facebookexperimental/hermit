@@ -1355,11 +1355,15 @@ impl ResultRow {
                         index + 1
                     ));
                 }
-                None => {
+                Some(canonical_verdict::NoResultReason::ComparisonRefused { detail }) => {
                     return Err(format!(
-                        "attempt {} no_result omitted no_result_reason",
+                        "attempt {} comparison was refused: {detail}",
                         index + 1
                     ));
+                }
+                None => {
+                    reasons.push("explicitly unspecified no-result cause".into());
+                    continue;
                 }
             };
             reasons.push(
@@ -1899,11 +1903,18 @@ impl ResultRow {
                             .ok_or("FirstRunRejected did not classify as no_result")?;
                         unavailable.get_or_insert(format!("NO_RESULT: {reason}"));
                     }
-                    None => {
-                        return Err(format!(
-                            "attempt {} no_result omitted no_result_reason",
+                    Some(canonical_verdict::NoResultReason::ComparisonRefused { detail }) => {
+                        saw_no_result = true;
+                        unavailable.get_or_insert(format!(
+                            "NO_RESULT: attempt {} comparison was refused: {detail}",
                             index + 1
                         ));
+                    }
+                    None => {
+                        saw_no_result = true;
+                        unavailable.get_or_insert_with(|| {
+                            format!("NO_RESULT: attempt {} recorded no specific cause", index + 1)
+                        });
                     }
                 },
                 canonical_verdict::Verdict::InfrastructureError => {
@@ -10045,6 +10056,26 @@ red/`measured-and-passed` count is **0**.",
     no_result_row.first_divergent_syscall = None;
     no_result_row.attempts = vec![no_result_attempt];
     let no_result_identity = no_result_row.evidence_identity().unwrap();
+
+    let mut unspecified_no_result = no_result_row.clone();
+    let mut report: JsonValue = serde_json::from_str(
+        unspecified_no_result.attempts[0]["verification_report"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    report["no_result_reason"] = JsonValue::Null;
+    let report = serde_json::to_string(&report).unwrap();
+    unspecified_no_result.attempts[0]["verification_report_sha256"] =
+        JsonValue::String(format!("{:x}", Sha256::digest(report.as_bytes())));
+    unspecified_no_result.attempts[0]["verification_report"] = JsonValue::String(report);
+    if unspecified_no_result.typed_no_result_reason()?.as_deref()
+        != Some("explicitly unspecified no-result cause")
+    {
+        return Err(
+            "an explicitly null no_result_reason was not retained as explicit absence".into(),
+        );
+    }
 
     let mut recovered_pass_row = validate_row.clone();
     recovered_pass_row.run_id = no_result_row.run_id.clone();

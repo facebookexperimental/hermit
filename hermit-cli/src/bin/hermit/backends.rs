@@ -174,6 +174,7 @@ impl DbtSummaryComparison {
     fn apply(self, outcome: &mut VerificationOutcome) -> Option<String> {
         if self.failure.is_some() {
             outcome.verdict = Verdict::Diverged;
+            outcome.no_result_reason = None;
         }
         self.failure
     }
@@ -196,6 +197,7 @@ fn record_dbt_branch_clock_comparison(
         Some(message) => {
             outcome.dbt_counted_branches = Some(comparison);
             outcome.verdict = Verdict::Diverged;
+            outcome.no_result_reason = None;
             Some(message)
         }
         None if outcome.verdict == Verdict::NoResult => {
@@ -1767,6 +1769,11 @@ mod tests {
 
         VerificationOutcome {
             verdict,
+            no_result_reason: (verdict == Verdict::NoResult).then(|| {
+                super::super::verify::NoResultReason::ComparisonRefused {
+                    detail: "fixture comparator refusal".into(),
+                }
+            }),
             guest_status: ExitStatus::Exited(guest_exit),
             comparison: ComparisonSpec::new(
                 LogCompareStrictness::Canonical,

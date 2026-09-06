@@ -494,6 +494,9 @@ pub(crate) fn verification_runtime_from_summaries(
 #[derive(Debug, Clone)]
 pub struct VerificationOutcome {
     pub verdict: Verdict,
+    /// Why verification did not reach a verdict. None for a completed match or
+    /// divergence; current no-result producers must provide a typed reason.
+    pub no_result_reason: Option<NoResultReason>,
     /// Exit status of the second (replay / repeat) run, propagated verbatim.
     pub guest_status: ExitStatus,
     /// The exact common output/log comparison used for [`Self::verdict`],
@@ -560,13 +563,18 @@ impl VerificationOutcome {
         match self.verdict {
             Verdict::Matched => Ok(self.guest_status),
             Verdict::Diverged => Ok(ExitStatus::Exited(HERMIT_VERIFICATION_DIVERGENCE_EXIT)),
-            // Reached when the comparator refused (a truncated log) and nothing
-            // else was observed to differ. Still an error, so the historical
-            // nonzero process exit is unchanged -- but it must not be reported
-            // as a mismatch, because no comparison established one.
-            Verdict::NoResult => Err(Error::msg(
-                "Verification did not reach a verdict (no comparison was performed).",
-            )),
+            // Still an error, so the historical nonzero process exit is
+            // unchanged -- but carry the reason instead of replacing it with a
+            // generic message.
+            Verdict::NoResult => match self.no_result_reason {
+                Some(NoResultReason::ComparisonRefused { detail }) => Err(Error::msg(format!(
+                    "Verification did not reach a verdict: {detail}"
+                ))),
+                Some(reason) => Err(Error::msg(format!(
+                    "Verification did not reach a verdict: {reason:?}"
+                ))),
+                None => Err(Error::msg("Verification did not reach a verdict.")),
+            },
             Verdict::InfrastructureError => {
                 Err(Error::msg("Verification recorded an infrastructure error."))
             }
@@ -632,18 +640,20 @@ pub(crate) fn verification_report(outcome: &VerificationOutcome) -> Verification
                 .compared_log_messages
                 .is_some_and(|counts| counts.is_nonzero()),
         verdict: outcome.verdict,
-        // A verdict reached through the outcome path has no refusal to
-        // explain. The rejected-first-run path never builds an outcome, so
-        // it writes its own reason at the site where the status is in hand.
-        no_result_reason: None,
+        no_result_reason: outcome.no_result_reason.clone(),
         infrastructure_error: None,
-        comparison: Some(comparison_report(&outcome.comparison)),
-        compared_log_messages: outcome
-            .compared_log_messages
-            .map(|counts| ComparedLogMessages {
-                left: u64::try_from(counts.left).expect("compared log count fits u64"),
-                right: u64::try_from(counts.right).expect("compared log count fits u64"),
-            }),
+        comparison: (outcome.verdict != Verdict::NoResult)
+            .then(|| comparison_report(&outcome.comparison)),
+        compared_log_messages: if outcome.verdict == Verdict::NoResult {
+            None
+        } else {
+            outcome
+                .compared_log_messages
+                .map(|counts| ComparedLogMessages {
+                    left: u64::try_from(counts.left).expect("compared log count fits u64"),
+                    right: u64::try_from(counts.right).expect("compared log count fits u64"),
+                })
+        },
         dbt_counted_branches: if outcome.verdict == Verdict::NoResult {
             None
         } else {
@@ -688,6 +698,7 @@ pub fn write_skid_overshoot_verification_json(
     report.verified = false;
     report.bitwise_parity = false;
     report.verdict = Verdict::InfrastructureError;
+    report.no_result_reason = None;
     report.infrastructure_error = Some(InfrastructureError::SkidOvershoot { count });
     report.dbt_counted_branches = None;
     write_report_json(path, &report)
@@ -1145,8 +1156,8 @@ fn compare_two_runs_with_unsupported_scan(
     // was refused. Only an observed difference can justify a `Diverged`
     // verdict; see the verdict selection at the end of this function.
     let mut observed_divergence = false;
-    // The log comparator declined to produce a verdict (a truncated input).
-    let mut comparison_refused = false;
+    // The log comparator's exact reason for declining to produce a verdict.
+    let mut comparison_refusal_reason = None;
     // None until the log comparison actually runs; stays None on the
     // output-only fallback so the report can distinguish
     // "compared nothing" from "compared and matched".
@@ -1270,8 +1281,8 @@ fn compare_two_runs_with_unsupported_scan(
             });
             if summary.diff_found {
                 failed = true;
-                if summary.refused {
-                    comparison_refused = true;
+                if let Some(refusal_reason) = summary.refusal_reason.clone() {
+                    comparison_refusal_reason = Some(refusal_reason);
                 } else {
                     observed_divergence = true;
                 }
@@ -1297,7 +1308,7 @@ fn compare_two_runs_with_unsupported_scan(
                 first_divergent_syscall = summary.first_divergent_syscall;
                 first_divergent_left_message = summary.first_divergent_left_message.clone();
                 first_divergent_right_message = summary.first_divergent_right_message.clone();
-                if !summary.refused {
+                if summary.refusal_reason.is_none() {
                     eprintln!(
                         ":: {}",
                         format!("Log differences found between {label1} and {label2}.")
@@ -1358,17 +1369,24 @@ fn compare_two_runs_with_unsupported_scan(
     if failed {
         // A refused comparison is a NO-RESULT, not a divergence. A real
         // stdout/stderr/exit-status mismatch still outranks the refusal.
-        let verdict = if comparison_refused && !observed_divergence {
+        let verdict = if comparison_refusal_reason.is_some() && !observed_divergence {
             Verdict::NoResult
         } else {
             Verdict::Diverged
         };
+        let no_result_reason =
+            (verdict == Verdict::NoResult).then(|| NoResultReason::ComparisonRefused {
+                detail: comparison_refusal_reason
+                    .expect("a refused comparison retains its producer reason"),
+            });
+
         // Divergence is a verification *verdict*, not an I/O error: return it as
         // a value carrying the guest exit status. Callers that want the
         // historical "divergence -> nonzero process exit" behavior use
         // `VerificationOutcome::into_exit_status`.
         Ok(VerificationOutcome {
             verdict,
+            no_result_reason,
             guest_status: out2.status,
             comparison: spec,
             compared_log_messages,
@@ -1384,6 +1402,7 @@ fn compare_two_runs_with_unsupported_scan(
     } else {
         Ok(VerificationOutcome {
             verdict: Verdict::Matched,
+            no_result_reason: None,
             guest_status: out2.status,
             comparison: spec,
             compared_log_messages,
@@ -1769,6 +1788,16 @@ mod tests {
         let report = verification_report(&outcome);
         assert!(!report.verified);
         assert!(!report.bitwise_parity);
+        assert!(
+            matches!(
+                report.no_result_reason.as_ref(),
+                Some(NoResultReason::ComparisonRefused { detail })
+                    if detail.contains("truncated at the configured size bound")
+            ),
+            "the typed report must retain the exact comparator refusal: {report:?}"
+        );
+        assert_eq!(report.comparison, None);
+        assert_eq!(report.compared_log_messages, None);
         assert!(
             outcome.into_exit_status().is_err(),
             "a no-result must still exit nonzero; it is not a pass"
@@ -3114,6 +3143,7 @@ mod tests {
         // report's boolean is the conjunction of the verdict and the contract.
         let diverged = VerificationOutcome {
             verdict: Verdict::Diverged,
+            no_result_reason: None,
             guest_status: ExitStatus::Exited(0),
             comparison: full,
             compared_log_messages: Some(ComparedLogCounts { left: 9, right: 9 }),

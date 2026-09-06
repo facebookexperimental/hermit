@@ -168,6 +168,8 @@ pub struct SeriesRuntime {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SeriesNoVerdictKind {
+    Unspecified,
+    ComparisonRefused,
     NotRun,
     FirstRunRejected,
     InfrastructureError,
@@ -801,6 +803,38 @@ impl SeriesRow {
                 (None, Some(signal)) if signal > 0
             );
             match disposition.kind {
+                SeriesNoVerdictKind::Unspecified => {
+                    if disposition.attempt_outcome != "ERROR"
+                        || disposition.disposition != SeriesOutcome::NoResult
+                        || disposition.timed_out
+                        || disposition
+                            .error_kind
+                            .as_ref()
+                            .is_none_or(|value| value.trim().is_empty())
+                        || !has_nonzero_process_disposition
+                        || disposition.verification_report_sha256.is_none()
+                    {
+                        return Err(
+                            "unspecified evidence must carry attempt outcome ERROR, an error_kind, a verification report, exactly one nonzero status or signal, timed_out=false, and no_result disposition"
+                                .into(),
+                        );
+                    }
+                }
+                SeriesNoVerdictKind::ComparisonRefused => {
+                    if disposition.attempt_outcome != "ERROR"
+                        || disposition.disposition != SeriesOutcome::NoResult
+                        || disposition.timed_out
+                        || disposition.error_kind.as_deref()
+                            != Some("incomplete-verification-evidence")
+                        || !has_nonzero_process_disposition
+                        || disposition.verification_report_sha256.is_none()
+                    {
+                        return Err(
+                            "comparison_refused evidence must carry attempt outcome ERROR, error_kind incomplete-verification-evidence, a verification report, exactly one nonzero status or signal, timed_out=false, and no_result disposition"
+                                .into(),
+                        );
+                    }
+                }
                 SeriesNoVerdictKind::NotRun => {
                     let expected = if disposition.timed_out {
                         SeriesOutcome::Timeout
@@ -1580,6 +1614,41 @@ mod tests {
             }],
         });
         historical_errored.validate_for_write().unwrap();
+
+        let mut unspecified = no_verdict_row();
+        unspecified
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0]
+            .kind = SeriesNoVerdictKind::Unspecified;
+        unspecified.validate_for_write().unwrap();
+
+        let mut refused = no_verdict_row();
+        refused
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0]
+            .kind = SeriesNoVerdictKind::ComparisonRefused;
+        refused.validate_for_write().unwrap();
+
+        let mut refused_without_typed_error = refused;
+        refused_without_typed_error
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0]
+            .error_kind = Some("cli-error".into());
+        assert!(
+            refused_without_typed_error
+                .validate_for_write()
+                .unwrap_err()
+                .contains("comparison_refused evidence")
+        );
 
         let mut noncanonical = no_verdict_row();
         let disposition = &mut noncanonical

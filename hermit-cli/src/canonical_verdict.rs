@@ -54,6 +54,8 @@ pub enum NoResultReason {
         stdout_bytes: u64,
         stderr_bytes: u64,
     },
+    /// The log comparator refused to claim either agreement or divergence.
+    ComparisonRefused { detail: String },
 }
 
 /// The understood infrastructure failure recorded by verification.
@@ -194,7 +196,7 @@ pub struct VerificationReport {
     pub verified: bool,
     pub bitwise_parity: bool,
     pub verdict: Verdict,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub no_result_reason: Option<NoResultReason>,
     #[serde(default)]
     pub infrastructure_error: Option<InfrastructureError>,
@@ -386,6 +388,7 @@ impl VerificationReport {
             "verdict",
             "infrastructure_error",
             "comparison",
+            "no_result_reason",
             "compared_log_messages",
             "guest_exit_code",
             "guest_signal",
@@ -431,7 +434,21 @@ impl VerificationReport {
                 }
             }
         }
-        Self::from_json_value(value)
+        let report = Self::from_json_value(value)?;
+        match (&report.verdict, &report.no_result_reason) {
+            (Verdict::NoResult, Some(NoResultReason::ComparisonRefused { detail }))
+                if detail.trim().is_empty() =>
+            {
+                Err("incomplete verification report: comparison_refused omitted its detail".into())
+            }
+            (Verdict::NoResult, Some(_)) => Ok(report),
+            (Verdict::NoResult, None) => Ok(report),
+            (_, Some(_)) => Err(format!(
+                "inconsistent verification report: verdict={} carries no_result_reason",
+                report.verdict
+            )),
+            (_, None) => Ok(report),
+        }
     }
 
     /// Prove that the invocation actually compared the canonical INFO evidence.
@@ -801,17 +818,31 @@ mod tests {
             .expect("the typed not-run reason must round-trip");
         assert_eq!(parsed.no_result_reason, Some(NoResultReason::NotRun));
 
-        // A comparator refusal is also a current no-result outcome, but it is
-        // written without this pre-run/first-run reason. Preserve that distinct
-        // producer state rather than inventing a reason on its behalf.
-        let mut comparator_refusal = current.clone();
-        comparator_refusal
-            .as_object_mut()
-            .unwrap()
-            .remove("no_result_reason");
-        let parsed = VerificationReport::from_current_json_value(comparator_refusal)
-            .expect("a current comparator refusal may have no run reason");
+        let mut missing = current.clone();
+        missing.as_object_mut().unwrap().remove("no_result_reason");
+        let error = VerificationReport::from_current_json_value(missing)
+            .expect_err("a current no-result must state the nullable reason field");
+        assert!(error.contains("no_result_reason"), "{error}");
+
+        let mut absent = current.clone();
+        absent["no_result_reason"] = serde_json::Value::Null;
+        let parsed = VerificationReport::from_current_json_value(absent)
+            .expect("explicit null records that the producer has no exact cause");
         assert_eq!(parsed.no_result_reason, None);
+
+        let mut comparator_refusal = current.clone();
+        comparator_refusal["no_result_reason"] = serde_json::json!({
+            "kind": "comparison_refused",
+            "detail": "the first log was truncated"
+        });
+        let parsed = VerificationReport::from_current_json_value(comparator_refusal)
+            .expect("a comparator refusal carries the producer's exact cause");
+        assert_eq!(
+            parsed.no_result_reason,
+            Some(NoResultReason::ComparisonRefused {
+                detail: "the first log was truncated".into()
+            })
+        );
 
         let mut unknown = current;
         unknown["no_result_reason"] = serde_json::json!({"kind": "never_ran"});
@@ -829,6 +860,7 @@ mod tests {
             "verified": true,
             "bitwise_parity": true,
             "verdict": "matched",
+            "no_result_reason": null,
             "infrastructure_error": null,
             "comparison": {
                 "strictness": "canonical",

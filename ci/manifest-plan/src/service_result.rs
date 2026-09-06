@@ -9,7 +9,8 @@ use serde_json::Value;
 pub const HISTORICAL_SCHEMA_VERSION: u64 = 1;
 pub const WRITEBACK_SCHEMA_VERSION: u64 = 2;
 pub const SELECTION_SCHEMA_VERSION: u64 = 3;
-pub const SCHEMA_VERSION: u64 = 4;
+pub const TEST_COUNTS_SCHEMA_VERSION: u64 = 4;
+pub const SCHEMA_VERSION: u64 = 5;
 pub const HISTORICAL_FIELD_NAMES: [&str; 7] = [
     "schema_version",
     "commit",
@@ -40,12 +41,25 @@ pub const SELECTION_FIELD_NAMES: [&str; 9] = [
     "executed_tests",
     "scorecard_writeback",
 ];
-pub const FIELD_NAMES: [&str; 10] = [
+pub const TEST_COUNTS_FIELD_NAMES: [&str; 10] = [
     "schema_version",
     "commit",
     "profile",
     "selection_mode",
     "final_validate_status",
+    "exit_code",
+    "executed_nodes",
+    "executed_tests",
+    "passed_tests",
+    "scorecard_writeback",
+];
+pub const FIELD_NAMES: [&str; 11] = [
+    "schema_version",
+    "commit",
+    "profile",
+    "selection_mode",
+    "final_validate_status",
+    "detail",
     "exit_code",
     "executed_nodes",
     "executed_tests",
@@ -126,6 +140,11 @@ pub struct ValidationServiceResult {
     #[serde(default)]
     pub selection_mode: Option<String>,
     pub final_validate_status: FinalValidateStatus,
+    /// Ordered terminal detail rendered by validation. A current producer
+    /// writes the field even when no cause exists, so null is honest absence
+    /// rather than a missing field.
+    #[serde(default)]
+    pub detail: Option<Vec<String>>,
     /// The command exit, not the validation verdict's exit. A PASSED validation
     /// may therefore carry 75 when its required scorecard write-back failed.
     pub exit_code: i32,
@@ -165,9 +184,10 @@ impl ValidationServiceResult {
             WRITEBACK_SCHEMA_VERSION => WRITEBACK_FIELD_NAMES.into_iter().collect(),
             SELECTION_SCHEMA_VERSION => SELECTION_FIELD_NAMES.into_iter().collect(),
             SCHEMA_VERSION => FIELD_NAMES.into_iter().collect(),
+            TEST_COUNTS_SCHEMA_VERSION => TEST_COUNTS_FIELD_NAMES.into_iter().collect(),
             other => {
                 return Err(format!(
-                    "validation-service-result-schema_version: expected {HISTORICAL_SCHEMA_VERSION}, {WRITEBACK_SCHEMA_VERSION}, {SELECTION_SCHEMA_VERSION}, or {SCHEMA_VERSION}, got {other}"
+                    "validation-service-result-schema_version: expected {HISTORICAL_SCHEMA_VERSION}, {WRITEBACK_SCHEMA_VERSION}, {SELECTION_SCHEMA_VERSION}, {TEST_COUNTS_SCHEMA_VERSION}, or {SCHEMA_VERSION}, got {other}"
                 ));
             }
         };
@@ -188,12 +208,13 @@ impl ValidationServiceResult {
             HISTORICAL_SCHEMA_VERSION,
             WRITEBACK_SCHEMA_VERSION,
             SELECTION_SCHEMA_VERSION,
+            TEST_COUNTS_SCHEMA_VERSION,
             SCHEMA_VERSION,
         ]
         .contains(&self.schema_version)
         {
             return Err(format!(
-                "validation-service-result-schema_version: expected {HISTORICAL_SCHEMA_VERSION}, {WRITEBACK_SCHEMA_VERSION}, {SELECTION_SCHEMA_VERSION}, or {SCHEMA_VERSION}, got {}",
+                "validation-service-result-schema_version: expected {HISTORICAL_SCHEMA_VERSION}, {WRITEBACK_SCHEMA_VERSION}, {SELECTION_SCHEMA_VERSION}, {TEST_COUNTS_SCHEMA_VERSION}, or {SCHEMA_VERSION}, got {}",
                 self.schema_version
             ));
         }
@@ -218,6 +239,26 @@ impl ValidationServiceResult {
             return Err(
                 "validation-service-result-selection_mode: must be nonempty or null".to_string(),
             );
+        }
+        if let Some(detail) = &self.detail {
+            if detail.is_empty() || detail.iter().any(|line| line.trim().is_empty()) {
+                return Err(
+                    "validation-service-result-detail: must be a nonempty list of nonempty strings or null"
+                        .to_string(),
+                );
+            }
+        }
+        if self.schema_version != SCHEMA_VERSION && self.detail.is_some() {
+            return Err(format!(
+                "validation-service-result-historical-fields: schema {} cannot carry detail",
+                self.schema_version
+            ));
+        }
+        if self.final_validate_status != FinalValidateStatus::CouldNotRun && self.detail.is_some() {
+            return Err(format!(
+                "validation-service-result-detail: {} must carry null",
+                self.final_validate_status.as_str()
+            ));
         }
         let validation_exit = self.final_validate_status.exit_code();
         if self.schema_version == HISTORICAL_SCHEMA_VERSION {
@@ -270,13 +311,13 @@ impl ValidationServiceResult {
                 "validation-service-result-executed_tests: must be nonnegative or null".to_string(),
             );
         }
-        if self.schema_version != SCHEMA_VERSION && self.passed_tests.is_some() {
+        if self.schema_version < TEST_COUNTS_SCHEMA_VERSION && self.passed_tests.is_some() {
             return Err(format!(
                 "validation-service-result-historical-fields: schema {} cannot carry passed_tests",
                 self.schema_version
             ));
         }
-        if self.schema_version == SCHEMA_VERSION
+        if self.schema_version >= TEST_COUNTS_SCHEMA_VERSION
             && self.executed_tests.is_some()
             && self.passed_tests.is_none()
         {
@@ -301,7 +342,7 @@ impl ValidationServiceResult {
                 ));
             }
         }
-        if self.schema_version == SCHEMA_VERSION
+        if self.schema_version >= TEST_COUNTS_SCHEMA_VERSION
             && self.final_validate_status == FinalValidateStatus::Passed
         {
             let passed = self.passed_tests.ok_or_else(|| {
@@ -333,6 +374,7 @@ mod tests {
             profile: "full".into(),
             selection_mode: Some("full".into()),
             final_validate_status: FinalValidateStatus::Passed,
+            detail: None,
             exit_code: 0,
             executed_nodes: 76,
             executed_tests: Some(2129),
@@ -394,6 +436,10 @@ mod tests {
             profile: "full".into(),
             selection_mode: Some("full".into()),
             final_validate_status: FinalValidateStatus::CouldNotRun,
+            detail: Some(vec![
+                "refused by: pre.reverie_pin".into(),
+                "recorded pin is not an ancestor".into(),
+            ]),
             exit_code: 75,
             executed_nodes: 0,
             executed_tests: None,
@@ -407,6 +453,13 @@ mod tests {
             FinalValidateStatus::CouldNotRun
         );
         assert_eq!(result.scorecard_writeback, None);
+        assert_eq!(
+            result.detail,
+            Some(vec![
+                "refused by: pre.reverie_pin".into(),
+                "recorded pin is not an ancestor".into()
+            ])
+        );
     }
 
     #[test]
@@ -414,6 +467,7 @@ mod tests {
         let mut value = serde_json::to_value(valid()).unwrap();
         value["schema_version"] = Value::from(HISTORICAL_SCHEMA_VERSION);
         value.as_object_mut().unwrap().remove("selection_mode");
+        value.as_object_mut().unwrap().remove("detail");
         value.as_object_mut().unwrap().remove("passed_tests");
         value.as_object_mut().unwrap().remove("scorecard_writeback");
         let decoded =
@@ -433,6 +487,7 @@ mod tests {
         let mut value = serde_json::to_value(valid()).unwrap();
         value["schema_version"] = Value::from(WRITEBACK_SCHEMA_VERSION);
         value.as_object_mut().unwrap().remove("selection_mode");
+        value.as_object_mut().unwrap().remove("detail");
         value.as_object_mut().unwrap().remove("passed_tests");
         let decoded =
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap()).unwrap();
@@ -442,11 +497,21 @@ mod tests {
 
         let mut value = serde_json::to_value(valid()).unwrap();
         value["schema_version"] = Value::from(SELECTION_SCHEMA_VERSION);
+        value.as_object_mut().unwrap().remove("detail");
         value.as_object_mut().unwrap().remove("passed_tests");
         let decoded =
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert_eq!(decoded.schema_version, SELECTION_SCHEMA_VERSION);
         assert_eq!(decoded.passed_tests, None);
+
+        let mut value = serde_json::to_value(valid()).unwrap();
+        value["schema_version"] = Value::from(TEST_COUNTS_SCHEMA_VERSION);
+        value.as_object_mut().unwrap().remove("detail");
+        let decoded =
+            ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(decoded.schema_version, TEST_COUNTS_SCHEMA_VERSION);
+        assert_eq!(decoded.passed_tests, Some(2129));
+        assert_eq!(decoded.detail, None);
     }
 
     #[test]
@@ -456,7 +521,7 @@ mod tests {
         assert!(
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap())
                 .unwrap_err()
-                .contains("schema 4 expected")
+                .contains("schema 5 expected")
         );
     }
 
@@ -467,7 +532,7 @@ mod tests {
         assert!(
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap())
                 .unwrap_err()
-                .contains("schema 4 expected")
+                .contains("schema 5 expected")
         );
     }
 
@@ -478,8 +543,38 @@ mod tests {
         assert!(
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap())
                 .unwrap_err()
-                .contains("schema 4 expected")
+                .contains("schema 5 expected")
         );
+    }
+    #[test]
+    fn current_detail_is_required_nullable_and_only_names_no_result() {
+        let mut missing = serde_json::to_value(valid()).unwrap();
+        missing.as_object_mut().unwrap().remove("detail");
+        let error =
+            ValidationServiceResult::from_json_slice(&serde_json::to_vec(&missing).unwrap())
+                .unwrap_err();
+        assert!(error.contains("schema 5 expected"), "{error}");
+
+        let mut pass_with_detail = valid();
+        pass_with_detail.detail = Some(vec!["not pass detail".into()]);
+        assert!(
+            pass_with_detail
+                .validate()
+                .unwrap_err()
+                .contains("PASSED must carry null")
+        );
+
+        let mut no_result = valid();
+        no_result.final_validate_status = FinalValidateStatus::CouldNotRun;
+        no_result.exit_code = 75;
+        no_result.executed_tests = None;
+        no_result.passed_tests = None;
+        no_result.detail = None;
+        no_result.validate().expect("genuine absence stays null");
+        no_result.detail = Some(vec![]);
+        assert!(no_result.validate().unwrap_err().contains("nonempty list"));
+        no_result.detail = Some(vec![" ".into()]);
+        assert!(no_result.validate().unwrap_err().contains("nonempty list"));
     }
 
     #[test]
