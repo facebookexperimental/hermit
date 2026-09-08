@@ -514,7 +514,7 @@ fn resource_syscalls_are_deterministic_across_five_runs() {
             "rusage children before reap modeled-cpu",
             "rusage children after reap modeled-cpu",
             "sysinfo",
-            "sysinfo freeram tracks virtual size",
+            "sysinfo memory matches configured memory",
             "times logical process and child CPU ticks",
         ] {
             assert!(

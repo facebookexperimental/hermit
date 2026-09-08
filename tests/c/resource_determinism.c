@@ -430,14 +430,36 @@ static void check_sysinfo(void) {
       info.mem_unit);
 }
 
-// Regression for sysinfo(2) free-memory determinism. Detcore must derive
-// `freeram` from guest-controlled virtual mappings, not from the resident set
-// size, which the host kernel manages (demand paging, reclaim) and which drifts
-// between otherwise-identical runs. Touching the pages of an existing mapping
-// raises RSS without changing the virtual size, so `freeram` must not move: an
-// RSS-based implementation would report less free memory after the memset and
-// would be nondeterministic across runs (it made `getconf -a` flake ~10% at L2).
-static void check_sysinfo_free_ram_tracks_virtual_size(void) {
+// Regression for sysinfo(2) free-memory determinism. Linux reports system-wide
+// memory here, not one process's virtual mappings. Detcore does not model
+// allocation pressure within its configured memory limit, so total and free
+// memory must remain equal before and after a mapping is populated.
+static void check_sysinfo_memory_matches_configured_memory(void) {
+  const unsigned long configured_memory = 1000000000UL;
+  struct sysinfo before = {0};
+  if (sysinfo(&before) != 0) {
+    fail("sysinfo before allocation");
+  }
+  if (before.mem_unit != 1 || before.totalram != configured_memory ||
+      before.freeram != configured_memory || before.bufferram != 0 ||
+      before.sharedram != 0 || before.totalswap != 0 || before.freeswap != 0 ||
+      before.totalhigh != 0 || before.freehigh != 0) {
+    fprintf(
+        stderr,
+        "sysinfo memory mismatch before allocation: total=%lu free=%lu "
+        "buffer=%lu shared=%lu swap=%lu/%lu high=%lu/%lu unit=%u\n",
+        before.totalram,
+        before.freeram,
+        before.bufferram,
+        before.sharedram,
+        before.totalswap,
+        before.freeswap,
+        before.totalhigh,
+        before.freehigh,
+        before.mem_unit);
+    exit(1);
+  }
+
   const size_t region = (size_t)16 * 1024 * 1024;
   void* mapping = mmap(
       NULL, region, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -445,12 +467,8 @@ static void check_sysinfo_free_ram_tracks_virtual_size(void) {
     fail("mmap for free-ram regression");
   }
 
-  struct sysinfo before = {0};
-  if (sysinfo(&before) != 0) {
-    fail("sysinfo before touch");
-  }
-
-  // Fault in every page: RSS rises by `region`, virtual size is unchanged.
+  // Neither a new private mapping nor faulting in its pages changes Detcore's
+  // configured system-wide memory value.
   memset(mapping, 0x5a, region);
 
   struct sysinfo after = {0};
@@ -458,19 +476,30 @@ static void check_sysinfo_free_ram_tracks_virtual_size(void) {
     fail("sysinfo after touch");
   }
 
-  if (before.freeram != after.freeram) {
+  if (after.mem_unit != 1 || after.totalram != configured_memory ||
+      after.freeram != configured_memory || after.bufferram != 0 ||
+      after.sharedram != 0 || after.totalswap != 0 || after.freeswap != 0 ||
+      after.totalhigh != 0 || after.freehigh != 0) {
     fprintf(
         stderr,
-        "sysinfo freeram changed when only RSS grew: before=%lu after=%lu\n",
-        before.freeram,
-        after.freeram);
+        "sysinfo memory mismatch after allocation: total=%lu free=%lu "
+        "buffer=%lu shared=%lu swap=%lu/%lu high=%lu/%lu unit=%u\n",
+        after.totalram,
+        after.freeram,
+        after.bufferram,
+        after.sharedram,
+        after.totalswap,
+        after.freeswap,
+        after.totalhigh,
+        after.freehigh,
+        after.mem_unit);
     exit(1);
   }
 
   if (munmap(mapping, region) != 0) {
     fail("munmap for free-ram regression");
   }
-  puts("sysinfo freeram tracks virtual size");
+  puts("sysinfo memory matches configured memory");
 }
 
 static void check_times(void) {
@@ -584,7 +613,7 @@ int main(void) {
   check_self_and_thread_rusage_advances();
   check_rusage_errors();
   check_sysinfo();
-  check_sysinfo_free_ram_tracks_virtual_size();
+  check_sysinfo_memory_matches_configured_memory();
   check_times();
   return 0;
 }

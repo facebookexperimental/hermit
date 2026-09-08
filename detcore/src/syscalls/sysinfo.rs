@@ -18,7 +18,6 @@ use crate::RecordOrReplay;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::ResourceLimit;
 
-const MB: u64 = 1024 * 1024;
 // Linux exposes USER_HZ, not the kernel's configurable scheduler HZ, through times(2).
 const CLOCK_TICKS_PER_SECOND: u64 = 100;
 const NANOS_PER_CLOCK_TICK: u64 = 1_000_000_000 / CLOCK_TICKS_PER_SECOND;
@@ -227,9 +226,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// `ru_maxrss` is populated for the process/thread cases with the guest's peak resident set
     /// size so that programs which require a positive maximum RSS (e.g. rr's `rusage` test)
-    /// behave like they do on Linux. The value comes from the same procfs memory accounting that
-    /// `sysinfo`'s free-memory reporting already relies on, which is deterministic across runs
-    /// under Detcore's fixed schedule.
+    /// behave like they do on Linux. This remains a best-effort host-procfs observation on
+    /// backends where [`Guest::pid`] names a host process; it is separate from the configured
+    /// system-wide memory reported by `sysinfo(2)` and virtual `/proc/meminfo`.
     ///
     /// Page-fault and context-switch counts remain zero: Detcore does not model them, and
     /// synthesizing a plausible-looking number would be worse than reporting none.
@@ -307,7 +306,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// The guest's peak resident set size ("high water mark") in kibibytes, matching the units of
-    /// Linux `getrusage`'s `ru_maxrss`. Reads procfs like [`Self::free_ram`]; always returns a
+    /// Linux `getrusage`'s `ru_maxrss`. This reads host procfs through [`Guest::pid`], which only
+    /// identifies the guest process on backends where it names a host process; always returns a
     /// positive value so guests can rely on a nonzero maximum RSS even if the read fails.
     fn guest_peak_rss_kb<G: Guest<Self>>(&self, guest: &G) -> u64 {
         Process::new(guest.pid().as_raw())
@@ -324,12 +324,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Sysinfo,
     ) -> Result<i64, Error> {
+        let info_addr = call.info().ok_or(Errno::EFAULT)?;
         let sys_info = self.collect_sysinfo(guest).await?;
         let mut memory = guest.memory();
 
-        if let Some(info_addr) = call.info() {
-            memory.write_value(info_addr, &sys_info.into())?;
-        }
+        memory.write_value(info_addr, &sys_info.into())?;
         Ok(0)
     }
 
@@ -346,47 +345,58 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
     ) -> Result<syscalls::SysInfo, Error> {
+        let memory = configured_memory(self.cfg.memory);
         Ok(syscalls::SysInfo {
             uptime: self.calculate_uptime(guest).await?,
             loads_1: 1,
             loads_5: 1,
             loads_15: 1,
-            total_ram: self.cfg.memory,
-            free_ram: self.free_ram(guest, self.cfg.memory)?,
-            buffer_ram: MB,
-            shared_ram: MB,
-            total_swap: 0,
-            free_swap: 0,
+            total_ram: memory.total_ram,
+            free_ram: memory.free_ram,
+            buffer_ram: memory.buffer_ram,
+            shared_ram: memory.shared_ram,
+            total_swap: memory.total_swap,
+            free_swap: memory.free_swap,
             procs: 1,
-            total_high: 0,
-            free_high: 0,
-            mem_unit: 1,
+            total_high: memory.total_high,
+            free_high: memory.free_high,
+            mem_unit: memory.mem_unit,
         })
     }
+}
 
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-1054): Deterministic free-memory accounting for sysinfo(2).
-    /// Report guest-visible free memory as `total_ram` minus the guest's virtual
-    /// address-space size.
-    ///
-    /// The used-memory figure must be a function of guest computation alone, or
-    /// `sysinfo`'s `free_ram` (and therefore glibc `sysconf(_SC_AVPHYS_PAGES)`)
-    /// becomes nondeterministic across `--verify` and record/replay. The virtual
-    /// size (`statm.size`, i.e. `/proc/<pid>/statm` field 1) is the sum of the
-    /// guest's own mappings, which is fixed by the guest's brk/mmap sequence under
-    /// Detcore's deterministic schedule. The resident set size (`statm.resident`),
-    /// used previously, is physical page residency managed by the host kernel
-    /// (demand paging, reclaim, host memory pressure); it drifts by a page or two
-    /// between otherwise-identical runs and made `getconf -a` flake ~10% at L2.
-    fn free_ram<G: Guest<Self>>(&self, guest: &mut G, total_ram: u64) -> anyhow::Result<u64> {
-        let process = Process::new(guest.pid().as_raw())?;
-        let page_size = procfs::page_size();
-        let statm = process.statm()?;
-        let used_memory = statm.size * page_size;
-        if used_memory > total_ram {
-            return Ok(0);
-        }
-        Ok(total_ram - used_memory)
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-1054): Deterministic free-memory accounting for sysinfo(2).
+#[derive(Debug, PartialEq, Eq)]
+struct ConfiguredMemory {
+    total_ram: u64,
+    free_ram: u64,
+    buffer_ram: u64,
+    shared_ram: u64,
+    total_swap: u64,
+    free_swap: u64,
+    total_high: u64,
+    free_high: u64,
+    mem_unit: u32,
+}
+
+/// Report the configured guest memory consistently with virtual `/proc/meminfo`.
+///
+/// Linux `sysinfo(2)` describes system-wide memory, not one process's virtual
+/// mappings. Detcore does not model allocation pressure within its configured
+/// memory limit, so all configured memory remains available and the other
+/// modeled memory categories remain empty.
+fn configured_memory(memory: u64) -> ConfiguredMemory {
+    ConfiguredMemory {
+        total_ram: memory,
+        free_ram: memory,
+        buffer_ram: 0,
+        shared_ram: 0,
+        total_swap: 0,
+        free_swap: 0,
+        total_high: 0,
+        free_high: 0,
+        mem_unit: 1,
     }
 }
 
@@ -401,6 +411,24 @@ mod tests {
         let now = boot + LogicalTime::from_millis(25);
 
         assert_eq!(logical_clock_ticks(now, boot, 120), 12_002);
+    }
+
+    #[test]
+    fn sysinfo_memory_matches_configured_memory() {
+        assert_eq!(
+            configured_memory(1_000_000_000),
+            ConfiguredMemory {
+                total_ram: 1_000_000_000,
+                free_ram: 1_000_000_000,
+                buffer_ram: 0,
+                shared_ram: 0,
+                total_swap: 0,
+                free_swap: 0,
+                total_high: 0,
+                free_high: 0,
+                mem_unit: 1,
+            },
+        );
     }
 
     #[test]

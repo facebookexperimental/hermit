@@ -6,9 +6,13 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#define _GNU_SOURCE
+
+#include <errno.h>
 #include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/syscall.h>
 #include <sys/sysinfo.h>
 #include <unistd.h>
 
@@ -34,21 +38,47 @@ int main() {
     return EXIT_FAILURE;
   }
 
-  enum { EXPECTED_CHECKS = 2 };
-  /* Hermit's documented virtual container identity: 1,000,000,000 bytes.
-     freeram is deliberately NOT asserted; it tracks RSS and is the subject
-     of separate determinism work. */
+  /* Hermit's configured virtual memory is 1,000,000,000 bytes by default.
+     Detcore does not model allocation pressure within that limit, so the
+     reported available memory equals the configured total. */
   const unsigned long VIRT_TOTALRAM = 1000000000UL;
-  int ok = 0;
 
   if (sysinfo(&info) != 0) {
     perror("sysinfo");
     free(allocation);
     return EXIT_FAILURE;
   }
-  ok++;
-  if (info.totalram == VIRT_TOTALRAM) {
-    ok++;
+  if (info.totalram != VIRT_TOTALRAM || info.freeram != VIRT_TOTALRAM ||
+      info.mem_unit != 1 || info.bufferram != 0 || info.sharedram != 0 ||
+      info.totalswap != 0 || info.freeswap != 0 || info.totalhigh != 0 ||
+      info.freehigh != 0) {
+    fprintf(
+        stderr,
+        "sysinfo memory mismatch: total=%lu free=%lu buffer=%lu shared=%lu "
+        "swap=%lu/%lu high=%lu/%lu unit=%u\n",
+        info.totalram,
+        info.freeram,
+        info.bufferram,
+        info.sharedram,
+        info.totalswap,
+        info.freeswap,
+        info.totalhigh,
+        info.freehigh,
+        info.mem_unit);
+    free(allocation);
+    return EXIT_FAILURE;
+  }
+
+  errno = 0;
+  long null_result = syscall(SYS_sysinfo, NULL);
+  if (null_result != -1 || errno != EFAULT) {
+    fprintf(
+        stderr,
+        "sysinfo(NULL) returned %ld errno=%d, expected -1/EFAULT\n",
+        null_result,
+        errno);
+    free(allocation);
+    return EXIT_FAILURE;
   }
 
   setlocale(LC_NUMERIC, ""); // Print large numbers with commas.
@@ -68,5 +98,5 @@ int main() {
   printf("mem_unit: %u\n", info.mem_unit);
   printf("Total - free = used: %'lu\n", info.totalram - info.freeram);
   free(allocation);
-  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
+  return EXIT_SUCCESS;
 }
