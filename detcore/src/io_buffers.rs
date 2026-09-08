@@ -121,17 +121,13 @@ fn whole(addr: Option<u64>, len: u64) -> Vec<BufferExtent> {
 /// accounted for. Under `MSG_TRUNC` the returned count can exceed the buffers'
 /// capacity, which is why the running remainder rather than `moved` alone
 /// bounds each segment.
-fn iovec_extents<G, T>(
-    guest: &mut G,
+fn iovec_extents<M: MemoryAccess>(
+    memory: &M,
     iov_addr: usize,
     iov_count: usize,
     moved: i64,
-) -> Result<Vec<BufferExtent>, Error>
-where
-    G: Guest<T>,
-    T: Tool,
-{
-    let mut remaining = u64::try_from(moved).unwrap_or(0);
+) -> Result<Vec<BufferExtent>, Error> {
+    let remaining = u64::try_from(moved).unwrap_or(0);
     if iov_addr == 0 || iov_count == 0 || remaining == 0 {
         return Ok(Vec::new());
     }
@@ -142,12 +138,19 @@ where
     let mut iovecs: Vec<libc::iovec> = (0..iov_count)
         .map(|_| unsafe { std::mem::zeroed() })
         .collect();
-    guest
-        .memory()
-        .read_values(iov_address.into(), &mut iovecs)?;
+    memory.read_values(iov_address.into(), &mut iovecs)?;
+    Ok(iovec_extents_from_slice(&iovecs, moved))
+}
+
+/// Apply the return-value bound after the guest `iovec` array has been read.
+///
+/// This is separate from the memory access so the short-transfer rule can be
+/// tested directly for every syscall family that shares it.
+fn iovec_extents_from_slice(iovecs: &[libc::iovec], moved: i64) -> Vec<BufferExtent> {
+    let mut remaining = u64::try_from(moved).unwrap_or(0);
 
     let mut out = Vec::new();
-    for iov in &iovecs {
+    for iov in iovecs {
         if remaining == 0 {
             break;
         }
@@ -161,47 +164,69 @@ where
         });
         remaining -= take;
     }
-    Ok(out)
+    out
+}
+
+/// Return the guest `iovec` array described by a vectored I/O syscall.
+///
+/// Keep the family in one match so adding a syscall variant cannot update the
+/// log direction without also making its complete, return-value-bounded iovec
+/// prefix available to [`extents`].
+fn iovec_extent_arguments(call: &Syscall) -> Option<(usize, usize)> {
+    match call {
+        Syscall::Readv(call) => Some((call.iov().map_or(0, |p| p.as_raw()), call.len())),
+        Syscall::Preadv(call) => Some((call.iov().map_or(0, |p| p.as_raw()), call.iov_len())),
+        Syscall::Preadv2(call) => Some((
+            call.iov().map_or(0, |p| p.as_raw()),
+            usize::try_from(call.iov_len()).unwrap_or(usize::MAX),
+        )),
+        Syscall::Writev(call) => Some((call.iov().map_or(0, |p| p.as_raw()), call.len())),
+        Syscall::Pwritev(call) => Some((call.iov().map_or(0, |p| p.as_raw()), call.iov_len())),
+        Syscall::Pwritev2(call) => Some((
+            call.iov().map_or(0, |p| p.as_raw()),
+            usize::try_from(call.iov_len()).unwrap_or(usize::MAX),
+        )),
+        _ => None,
+    }
 }
 
 /// Read a `msghdr` out of the guest and walk the iovecs it points at.
-fn msghdr_extents<G, T>(
-    guest: &mut G,
+fn msghdr_extents<M: MemoryAccess>(
+    memory: &M,
     msg_addr: usize,
     moved: i64,
-) -> Result<Vec<BufferExtent>, Error>
-where
-    G: Guest<T>,
-    T: Tool,
-{
+) -> Result<Vec<BufferExtent>, Error> {
     if msg_addr == 0 {
         return Ok(Vec::new());
     }
     let address: AddrMut<'_, libc::msghdr> = AddrMut::from_raw(msg_addr).ok_or(Errno::EFAULT)?;
-    let message: libc::msghdr = guest.memory().read_value(address)?;
-    iovec_extents(guest, message.msg_iov as usize, message.msg_iovlen, moved)
+    let message: libc::msghdr = memory.read_value(address)?;
+    iovec_extents(memory, message.msg_iov as usize, message.msg_iovlen, moved)
 }
 
-/// Walk the `mmsghdr` array a batch receive filled.
+/// Number of completed messages whose per-message lengths are meaningful.
+fn completed_mmsghdr_count(vlen: u32, completed: i64) -> usize {
+    usize::try_from(completed)
+        .unwrap_or(0)
+        .min(vlen as usize)
+        .min(libc::UIO_MAXIOV as usize)
+}
+
+/// Walk the `mmsghdr` array a batch send or receive completed.
 ///
 /// `moved` here is a COUNT OF MESSAGES, not a byte count -- which is why
-/// `recvmmsg` cannot share the `clamp`/`msghdr_extents` path that every other
-/// receive uses. Each delivered message carries its own byte count in
+/// these calls cannot share the `clamp`/`msghdr_extents` path that every other
+/// send or receive uses. Each completed message carries its own byte count in
 /// `msg_len`, so each is walked separately and bounded by that; treating the
 /// batch as one buffer would let one message's length run into the next
 /// message's memory.
-fn mmsghdr_extents<G, T>(
-    guest: &mut G,
+fn mmsghdr_extents<M: MemoryAccess>(
+    memory: &M,
     mmsg_addr: usize,
     vlen: u32,
     delivered: i64,
-) -> Result<Vec<BufferExtent>, Error>
-where
-    G: Guest<T>,
-    T: Tool,
-{
-    let delivered = usize::try_from(delivered).unwrap_or(0);
-    let count = delivered.min(vlen as usize).min(libc::UIO_MAXIOV as usize);
+) -> Result<Vec<BufferExtent>, Error> {
+    let count = completed_mmsghdr_count(vlen, delivered);
     if mmsg_addr == 0 || count == 0 {
         return Ok(Vec::new());
     }
@@ -210,12 +235,12 @@ where
     // staging value that `read_values` immediately overwrites.
     let mut headers: Vec<libc::mmsghdr> =
         (0..count).map(|_| unsafe { std::mem::zeroed() }).collect();
-    guest.memory().read_values(address.into(), &mut headers)?;
+    memory.read_values(address.into(), &mut headers)?;
 
     let mut out = Vec::new();
     for header in &headers {
         out.extend(iovec_extents(
-            guest,
+            memory,
             header.msg_hdr.msg_iov as usize,
             header.msg_hdr.msg_iovlen,
             i64::from(header.msg_len),
@@ -263,13 +288,16 @@ pub(crate) const HASHED_SYSCALLS: &[reverie::syscalls::Sysno] = &[
     reverie::syscalls::Sysno::recvmmsg,
     reverie::syscalls::Sysno::readv,
     reverie::syscalls::Sysno::preadv,
+    reverie::syscalls::Sysno::preadv2,
     // Bytes the guest produced.
     reverie::syscalls::Sysno::write,
     reverie::syscalls::Sysno::pwrite64,
     reverie::syscalls::Sysno::sendto,
     reverie::syscalls::Sysno::sendmsg,
+    reverie::syscalls::Sysno::sendmmsg,
     reverie::syscalls::Sysno::writev,
     reverie::syscalls::Sysno::pwritev,
+    reverie::syscalls::Sysno::pwritev2,
     // Rewritten in place across the whole array.
     reverie::syscalls::Sysno::poll,
     reverie::syscalls::Sysno::ppoll,
@@ -285,17 +313,20 @@ fn ret_gates_output(call: &Syscall) -> bool {
 /// Only syscalls whose buffer CONTENT the INFO record does not already show are
 /// listed. `clock_gettime` and `newfstatat`, for instance, are absent because
 /// Reverie's typed display already dereferences and prints their output.
-fn extents<G, T>(guest: &mut G, call: &Syscall, ret: i64) -> Result<Vec<BufferExtent>, Error>
-where
-    G: Guest<T>,
-    T: Tool,
-{
+fn extents<M: MemoryAccess>(
+    memory: &M,
+    call: &Syscall,
+    ret: i64,
+) -> Result<Vec<BufferExtent>, Error> {
     // Nothing was written on a failed or empty call -- for every syscall whose
     // return value is a byte count. `ret_gates_output` is what keeps the poll
     // family out of this, and it is a predicate rather than an arm placed above
     // so the exclusion cannot be undone by moving code.
     if ret <= 0 && ret_gates_output(call) {
         return Ok(Vec::new());
+    }
+    if let Some((iov_addr, iov_count)) = iovec_extent_arguments(call) {
+        return iovec_extents(memory, iov_addr, iov_count, ret);
     }
     let raw = |a: Option<AddrMut<'_, u8>>| a.map(|p| p.as_raw() as u64);
     Ok(match call {
@@ -312,20 +343,15 @@ where
         ),
         Syscall::Readlink(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.bufsize(), ret),
         Syscall::Readlinkat(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.buf_len(), ret),
-        Syscall::Recvmsg(c) => msghdr_extents(guest, c.msg().map_or(0, |p| p.as_raw()), ret)?,
+        Syscall::Recvmsg(c) => msghdr_extents(memory, c.msg().map_or(0, |p| p.as_raw()), ret)?,
         // `ret` is a MESSAGE count here, not a byte count; see
         // `mmsghdr_extents`. recvmmsg is one of the four receive syscalls
         // that could reach a NETLINK_SOCK_DIAG dump without passing the
         // sock_diag sanitizer, so leaving it unhashed left this check blind
         // to exactly the bypass it would otherwise have reported.
         Syscall::Recvmmsg(c) => {
-            mmsghdr_extents(guest, c.mmsg().map_or(0, |p| p.as_raw()), c.vlen(), ret)?
+            mmsghdr_extents(memory, c.mmsg().map_or(0, |p| p.as_raw()), c.vlen(), ret)?
         }
-        Syscall::Readv(c) => iovec_extents(guest, c.iov().map_or(0, |p| p.as_raw()), c.len(), ret)?,
-        Syscall::Preadv(c) => {
-            iovec_extents(guest, c.iov().map_or(0, |p| p.as_raw()), c.iov_len(), ret)?
-        }
-
         // Bytes the guest produced. These never reach stdout/stderr for a QEMU
         // boot -- measured, all 234,872 writes went to fds 7/12/14/11/13/4/8/19/23
         // and none to fd 1 or 2 -- so `--verify`'s stdout/stderr comparison does
@@ -333,14 +359,12 @@ where
         Syscall::Write(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.len(), ret),
         Syscall::Pwrite64(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.len(), ret),
         Syscall::Sendto(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.size(), ret),
-        Syscall::Sendmsg(c) => msghdr_extents(guest, c.msg().map_or(0, |p| p.as_raw()), ret)?,
-        Syscall::Writev(c) => {
-            iovec_extents(guest, c.iov().map_or(0, |p| p.as_raw()), c.len(), ret)?
+        Syscall::Sendmsg(c) => msghdr_extents(memory, c.msg().map_or(0, |p| p.as_raw()), ret)?,
+        // Like recvmmsg, `ret` counts completed messages and each completed
+        // header's `msg_len` bounds the bytes consumed from that message.
+        Syscall::Sendmmsg(c) => {
+            mmsghdr_extents(memory, c.msgvec().map_or(0, |p| p.as_raw()), c.vlen(), ret)?
         }
-        Syscall::Pwritev(c) => {
-            iovec_extents(guest, c.iov().map_or(0, |p| p.as_raw()), c.iov_len(), ret)?
-        }
-
         // Rewritten in place across the WHOLE array: `poll` sets `revents` on
         // every entry, not just on the `ret` that were ready, so the extent is
         // the array and not a prefix of it -- and it is reached even when
@@ -365,8 +389,10 @@ fn direction(call: &Syscall) -> Direction {
         | Syscall::Pwrite64(_)
         | Syscall::Sendto(_)
         | Syscall::Sendmsg(_)
+        | Syscall::Sendmmsg(_)
         | Syscall::Writev(_)
-        | Syscall::Pwritev(_) => Direction::Out,
+        | Syscall::Pwritev(_)
+        | Syscall::Pwritev2(_) => Direction::Out,
         _ => Direction::In,
     }
 }
@@ -488,7 +514,11 @@ where
         Some(fd) => fd.to_string(),
         None => "-".to_string(),
     };
-    for extent in extents(guest, call, ret)? {
+    let moved_extents = {
+        let memory = guest.memory();
+        extents(&memory, call, ret)?
+    };
+    for extent in moved_extents {
         let (whole, chunk, chunks) = extent_digests(guest, extent.addr, extent.len)?;
         let located = if chunks.is_empty() {
             String::new()
@@ -513,6 +543,7 @@ where
 #[cfg(test)]
 mod tests {
     use reverie::syscalls;
+    use reverie::syscalls::LocalMemory;
 
     /// A divergence must be LOCATED, not merely detected -- that is the whole
     /// reason the chunk list exists, so it is asserted rather than assumed.
@@ -656,6 +687,7 @@ mod tests {
             Syscall::Read(syscalls::Read::new()),
             Syscall::Recvmsg(syscalls::Recvmsg::new()),
             Syscall::Recvmmsg(syscalls::Recvmmsg::new()),
+            Syscall::Sendmmsg(syscalls::Sendmmsg::new()),
         ] {
             assert!(
                 ret_gates_output(&call),
@@ -670,5 +702,192 @@ mod tests {
     fn direction_separates_kernel_produced_from_guest_produced() {
         assert_eq!(Direction::In.as_str(), "in");
         assert_eq!(Direction::Out.as_str(), "out");
+
+        assert_eq!(
+            direction(&Syscall::Preadv2(syscalls::Preadv2::new())),
+            Direction::In
+        );
+        assert_eq!(
+            direction(&Syscall::Pwritev2(syscalls::Pwritev2::new())),
+            Direction::Out
+        );
+        assert_eq!(
+            direction(&Syscall::Sendmmsg(syscalls::Sendmmsg::new())),
+            Direction::Out
+        );
+    }
+
+    #[test]
+    fn vectored_v2_calls_are_hashed_over_their_complete_iovec_prefix() {
+        for sysno in [syscalls::Sysno::preadv2, syscalls::Sysno::pwritev2] {
+            assert!(
+                HASHED_SYSCALLS.contains(&sysno),
+                "{sysno:?} must remain in strict io-buffer observation"
+            );
+        }
+
+        let first = [0_u8; 4];
+        let second = [0_u8; 8];
+        let third = [0_u8; 16];
+        let iovecs = [
+            libc::iovec {
+                iov_base: first.as_ptr() as *mut libc::c_void,
+                iov_len: first.len(),
+            },
+            libc::iovec {
+                iov_base: second.as_ptr() as *mut libc::c_void,
+                iov_len: second.len(),
+            },
+            libc::iovec {
+                iov_base: third.as_ptr() as *mut libc::c_void,
+                iov_len: third.len(),
+            },
+        ];
+        let iov = Addr::from_ptr(iovecs.as_ptr());
+        let calls = [
+            Syscall::Preadv2(syscalls::Preadv2::new().with_iov(iov).with_iov_len(3)),
+            Syscall::Pwritev2(syscalls::Pwritev2::new().with_iov(iov).with_iov_len(3)),
+        ];
+        let expected = vec![
+            BufferExtent {
+                addr: first.as_ptr() as u64,
+                len: 4,
+            },
+            BufferExtent {
+                addr: second.as_ptr() as u64,
+                len: 2,
+            },
+        ];
+        let memory = LocalMemory::new();
+
+        for call in calls {
+            assert_eq!(
+                iovec_extent_arguments(&call),
+                Some((iovecs.as_ptr() as usize, 3))
+            );
+            assert_eq!(extents(&memory, &call, 6).unwrap(), expected);
+            assert!(extents(&memory, &call, 0).unwrap().is_empty());
+            assert!(extents(&memory, &call, -1).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn vectored_io_extents_stop_at_the_completed_byte_count() {
+        let iovecs = [
+            libc::iovec {
+                iov_base: 0x1000usize as *mut libc::c_void,
+                iov_len: 4,
+            },
+            libc::iovec {
+                iov_base: 0x2000usize as *mut libc::c_void,
+                iov_len: 8,
+            },
+            libc::iovec {
+                iov_base: 0x3000usize as *mut libc::c_void,
+                iov_len: 16,
+            },
+        ];
+
+        assert_eq!(
+            iovec_extents_from_slice(&iovecs, 6),
+            vec![
+                BufferExtent {
+                    addr: 0x1000,
+                    len: 4,
+                },
+                BufferExtent {
+                    addr: 0x2000,
+                    len: 2,
+                },
+            ]
+        );
+        assert!(iovec_extents_from_slice(&iovecs, 0).is_empty());
+        assert!(iovec_extents_from_slice(&iovecs, -1).is_empty());
+    }
+
+    #[test]
+    fn sendmmsg_hashes_only_completed_messages_and_each_reported_byte_prefix() {
+        assert!(HASHED_SYSCALLS.contains(&syscalls::Sysno::sendmmsg));
+
+        let first = [0_u8; 4];
+        let second = [0_u8; 8];
+        let third = [0_u8; 16];
+        let first_iovecs = [
+            libc::iovec {
+                iov_base: first.as_ptr() as *mut libc::c_void,
+                iov_len: first.len(),
+            },
+            libc::iovec {
+                iov_base: second.as_ptr() as *mut libc::c_void,
+                iov_len: second.len(),
+            },
+            libc::iovec {
+                iov_base: third.as_ptr() as *mut libc::c_void,
+                iov_len: third.len(),
+            },
+        ];
+        let fourth = [0_u8; 5];
+        let fifth = [0_u8; 7];
+        let second_iovecs = [
+            libc::iovec {
+                iov_base: fourth.as_ptr() as *mut libc::c_void,
+                iov_len: fourth.len(),
+            },
+            libc::iovec {
+                iov_base: fifth.as_ptr() as *mut libc::c_void,
+                iov_len: fifth.len(),
+            },
+        ];
+
+        // SAFETY: `mmsghdr` is a plain C record and every field consumed by
+        // `extents` is initialized below before LocalMemory reads it.
+        let mut headers: [libc::mmsghdr; 2] = unsafe { std::mem::zeroed() };
+        headers[0].msg_hdr.msg_iov = first_iovecs.as_ptr() as *mut libc::iovec;
+        headers[0].msg_hdr.msg_iovlen = first_iovecs.len();
+        headers[0].msg_len = 6;
+        headers[1].msg_hdr.msg_iov = second_iovecs.as_ptr() as *mut libc::iovec;
+        headers[1].msg_hdr.msg_iovlen = second_iovecs.len();
+        headers[1].msg_len = 9;
+
+        let call = Syscall::Sendmmsg(
+            syscalls::Sendmmsg::new()
+                .with_msgvec(Addr::from_ptr(headers.as_ptr().cast::<libc::msghdr>()))
+                .with_vlen(2),
+        );
+        let memory = LocalMemory::new();
+        let first_message = vec![
+            BufferExtent {
+                addr: first.as_ptr() as u64,
+                len: 4,
+            },
+            BufferExtent {
+                addr: second.as_ptr() as u64,
+                len: 2,
+            },
+        ];
+        assert_eq!(extents(&memory, &call, 1).unwrap(), first_message);
+
+        let both_messages = vec![
+            BufferExtent {
+                addr: first.as_ptr() as u64,
+                len: 4,
+            },
+            BufferExtent {
+                addr: second.as_ptr() as u64,
+                len: 2,
+            },
+            BufferExtent {
+                addr: fourth.as_ptr() as u64,
+                len: 5,
+            },
+            BufferExtent {
+                addr: fifth.as_ptr() as u64,
+                len: 4,
+            },
+        ];
+        assert_eq!(extents(&memory, &call, 2).unwrap(), both_messages);
+        assert!(extents(&memory, &call, 0).unwrap().is_empty());
+        assert!(extents(&memory, &call, -1).unwrap().is_empty());
+        assert_eq!(completed_mmsghdr_count(1, 2), 1);
     }
 }

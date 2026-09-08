@@ -85,6 +85,113 @@ __attribute__((noreturn)) void _start(void) {
 }
 "#;
 
+const SENDMMSG_BUFFER_MUTATOR_SOURCE: &str = r#"
+typedef unsigned int u32;
+typedef unsigned long usize;
+
+struct iovec {
+  void *iov_base;
+  usize iov_len;
+};
+
+struct msghdr {
+  void *msg_name;
+  u32 msg_namelen;
+  struct iovec *msg_iov;
+  usize msg_iovlen;
+  void *msg_control;
+  usize msg_controllen;
+  u32 msg_flags;
+};
+
+struct mmsghdr {
+  struct msghdr msg_hdr;
+  u32 msg_len;
+};
+
+static inline long syscall1(long number, long arg1) {
+  register long rax __asm__("rax") = number;
+  register long rdi __asm__("rdi") = arg1;
+  __asm__ volatile("syscall"
+                   : "+a"(rax)
+                   : "D"(rdi)
+                   : "rcx", "r11", "memory");
+  return rax;
+}
+
+static inline long syscall4(long number, long arg1, long arg2, long arg3,
+                            long arg4) {
+  register long rax __asm__("rax") = number;
+  register long rdi __asm__("rdi") = arg1;
+  register long rsi __asm__("rsi") = arg2;
+  register long rdx __asm__("rdx") = arg3;
+  register long r10 __asm__("r10") = arg4;
+  __asm__ volatile("syscall"
+                   : "+a"(rax)
+                   : "D"(rdi), "S"(rsi), "d"(rdx), "r"(r10)
+                   : "rcx", "r11", "memory");
+  return rax;
+}
+
+static inline long syscall6(long number, long arg1, long arg2, long arg3,
+                            long arg4, long arg5, long arg6) {
+  register long rax __asm__("rax") = number;
+  register long rdi __asm__("rdi") = arg1;
+  register long rsi __asm__("rsi") = arg2;
+  register long rdx __asm__("rdx") = arg3;
+  register long r10 __asm__("r10") = arg4;
+  register long r8 __asm__("r8") = arg5;
+  register long r9 __asm__("r9") = arg6;
+  __asm__ volatile("syscall"
+                   : "+a"(rax)
+                   : "D"(rdi), "S"(rsi), "d"(rdx), "r"(r10), "r"(r8), "r"(r9)
+                   : "rcx", "r11", "memory");
+  return rax;
+}
+
+__attribute__((noreturn)) void _start(void) {
+  static const char path[] = "@STATE_PATH@";
+  static const char replacement[16] = {
+      66, 66, 66, 66, 66, 66, 66, 66,
+      66, 66, 66, 66, 66, 66, 66, 66,
+  };
+  static int sockets[2];
+  static struct iovec iovecs[2];
+  static struct mmsghdr message;
+  long result = 0;
+  long fd = syscall4(257, -100, (long)path, 2 | 02000000, 0);
+  long mapping = fd < 0 ? -1 : syscall6(9, 0, 16, 1, 2, fd, 0);
+  if (fd < 0 || mapping < 0) {
+    result = 65;
+  } else if (syscall4(53, 1, 2 | 02000000, 0, (long)sockets) != 0) {
+    result = 66;
+  } else {
+    iovecs[0].iov_base = (void *)mapping;
+    iovecs[0].iov_len = 4;
+    iovecs[1].iov_base = (void *)(mapping + 4);
+    iovecs[1].iov_len = 12;
+    message.msg_hdr.msg_iov = iovecs;
+    message.msg_hdr.msg_iovlen = 2;
+    long sent = syscall4(307, sockets[0], (long)&message, 1, 0);
+    if (sent != 1) {
+      result = sent < 0 ? 100 - sent : 80 + sent;
+    } else if (message.msg_len != 16) {
+      result = 70;
+    } else if (syscall4(18, fd, (long)replacement, sizeof(replacement), 0) !=
+               (long)sizeof(replacement)) {
+      result = 68;
+    } else if (syscall1(74, fd) != 0) {
+      result = 69;
+    }
+    syscall1(3, sockets[0]);
+    syscall1(3, sockets[1]);
+  }
+  if (fd >= 0) syscall1(3, fd);
+  syscall1(231, result);
+  __builtin_unreachable();
+}
+"#;
+
 fn compile_source_guest(name: &str, source_text: &str, extra_args: &[&str]) -> PathBuf {
     let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kvm-info-log-determinism");
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
@@ -202,7 +309,8 @@ fn strip_ansi_sgr(input: &str) -> String {
     output
 }
 
-fn run_kvm_verify(
+fn run_verify(
+    backend: &str,
     binary: &Path,
     state_path: &Path,
     initial: &[u8; 16],
@@ -220,7 +328,7 @@ fn run_kvm_verify(
     let output = Command::new("timeout")
         .args(["--kill-after", "10s", "90s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log", "info", "--backend", "kvm"])
+        .args(["--log", "info", "--backend", backend])
         .args([
             "run",
             "--strict",
@@ -237,16 +345,28 @@ fn run_kvm_verify(
         .arg("--")
         .arg(binary)
         .output()
-        .unwrap_or_else(|error| panic!("failed to verify io-buffer guest under KVM: {error}"));
+        .unwrap_or_else(|error| {
+            panic!("failed to verify io-buffer guest under {backend}: {error}")
+        });
     let report = serde_json::from_slice(&fs::read(&report_path).unwrap_or_else(|error| {
         panic!(
-            "KVM verification did not write {}: {error}; stderr:\n{}",
+            "{backend} verification did not write {}: {error}; stderr:\n{}",
             report_path.display(),
             String::from_utf8_lossy(&output.stderr),
         )
     }))
     .expect("KVM verification report was not valid JSON");
     (output, report)
+}
+
+fn run_kvm_verify(
+    binary: &Path,
+    state_path: &Path,
+    initial: &[u8; 16],
+    label: &str,
+    extra_run_flags: &[&str],
+) -> (Output, serde_json::Value) {
+    run_verify("kvm", binary, state_path, initial, label, extra_run_flags)
 }
 
 #[test]
@@ -342,6 +462,82 @@ fn kvm_verify_compares_retained_io_buffer_hashes() {
             .as_u64()
             .is_some_and(|count| count > 0)
     );
+
+    let _ = fs::remove_file(state_path);
+}
+
+// This reaches the shared Detcore logging path through ptrace. KVM currently
+// returns ENOSYS for sendmmsg, so a KVM version would test syscall support
+// rather than the buffer comparison implemented here. The unit tests above
+// cover extraction of the completed message prefix independently of backend
+// execution.
+#[test]
+fn ptrace_verify_compares_sendmmsg_iovec_prefixes() {
+    let _guard = KVM_RUN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let state_path = Path::new("/tmp").join(format!(
+        "hermit-ptrace-sendmmsg-verification-{}",
+        std::process::id()
+    ));
+    let source = SENDMMSG_BUFFER_MUTATOR_SOURCE.replace(
+        "@STATE_PATH@",
+        state_path.to_str().expect("state path was not UTF-8"),
+    );
+    let binary = compile_source_guest(
+        "sendmmsg-buffer-mutator",
+        &source,
+        &[
+            "-nostdlib",
+            "-static",
+            "-Wl,-e,_start",
+            "-fno-pie",
+            "-no-pie",
+        ],
+    );
+
+    let (mutation, mutation_report) = run_verify(
+        "ptrace",
+        &binary,
+        &state_path,
+        b"AAAAAAAAAAAAAAAA",
+        "sendmmsg-mutation",
+        &[],
+    );
+    let mutation_stderr = strip_ansi_sgr(&String::from_utf8_lossy(&mutation.stderr));
+    assert!(
+        !mutation.status.success(),
+        "A-to-B sendmmsg mutation was accepted by ptrace verification:\n{mutation_stderr}"
+    );
+    assert_eq!(mutation_report["verified"], false);
+    assert_eq!(
+        mutation_report["verdict"], "diverged",
+        "ptrace sendmmsg mutation produced no comparison result:\n{mutation_stderr}"
+    );
+    assert_eq!(mutation_report["comparison"]["compare_io_buffers"], true);
+    for marker in ["[iobuf]", "sendmmsg out", "+4->", "+12->"] {
+        assert!(
+            mutation_stderr.contains(marker),
+            "ptrace sendmmsg mutation failure did not name {marker:?}:\n{mutation_stderr}"
+        );
+    }
+
+    let (stable, stable_report) = run_verify(
+        "ptrace",
+        &binary,
+        &state_path,
+        b"BBBBBBBBBBBBBBBB",
+        "sendmmsg-stable",
+        &[],
+    );
+    assert!(
+        stable.status.success(),
+        "identical B-to-B sendmmsg input failed ptrace verification:\n{}",
+        String::from_utf8_lossy(&stable.stderr)
+    );
+    assert_eq!(stable_report["verified"], true);
+    assert_eq!(stable_report["verdict"], "matched");
 
     let _ = fs::remove_file(state_path);
 }
