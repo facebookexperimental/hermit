@@ -366,7 +366,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-1054): Deterministic free-memory accounting for sysinfo(2).
+// TODO-HUMAN-REVIEW(PR-2979): Deterministic free-memory accounting for sysinfo(2).
 #[derive(Debug, PartialEq, Eq)]
 struct ConfiguredMemory {
     total_ram: u64,
