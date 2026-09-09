@@ -449,6 +449,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(guest.inject(call).await?);
         }
 
+        // Linux copies pselect6's outer { sigmask, sigsetsize } wrapper before
+        // validating the timeout. Copy only the wrapper here; validation of the
+        // pointed-to signal mask remains below, after timeout validation.
+        let sigmask_argument = match call.sigmask() {
+            Some(argument) => {
+                let argument: Pselect6SigmaskArg = guest.memory().read_value(argument.cast())?;
+                Some(argument)
+            }
+            None => None,
+        };
         let raw_timeout = match call.timeout() {
             Some(timeout) => {
                 let timeout: Timespec = guest.memory().read_value(timeout)?;
@@ -456,7 +466,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             None => None,
         };
-        if matches!(raw_timeout, Some(timeout) if timeout.tv_sec == 0 && timeout.tv_nsec == 0) {
+        let timeout = raw_timeout.map(ppoll_timeout_duration).transpose()?;
+        if timeout == Some(Duration::ZERO) {
             return Ok(guest.inject(call).await?);
         }
 
@@ -479,8 +490,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // `sigchld_deferred`/`sigchld_ready`), honor the mask on each deterministic poll
         // probe instead: a pending unblocked signal is observed at a scheduler-decided
         // probe point rather than at host signal-arrival time.
-        let sigmask = if let Some(argument) = call.sigmask() {
-            let argument: Pselect6SigmaskArg = guest.memory().read_value(argument.cast())?;
+        let sigmask = if let Some(argument) = sigmask_argument {
             if argument.sigmask != 0 {
                 if argument.sigsetsize != KERNEL_SIGSET_SIZE {
                     return Err(Errno::EINVAL.into());
@@ -498,7 +508,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         // The inner mask was snapshotted above. Do not let later guest mutations of the
         // outer wrapper change the meaning of a retry probe.
         let call = call.with_sigmask(None);
-        let timeout = raw_timeout.map(ppoll_timeout_duration).transpose()?;
 
         self.handle_internal_pselect6(guest, call, timeout, sigmask)
             .await
@@ -872,16 +881,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             } else {
                 Ok(guest.inject_with_retry(probe).await?)
             };
-            if let Some(timeout_address) = timeout_address {
-                // Linux preserves the ppoll result when remaining-time copyout faults,
-                // so a failed writeback is logged and dropped rather than propagated.
-                let _ = guest
-                    .memory()
-                    .write_value(timeout_address, &timespec_from_duration(Duration::ZERO))
-                    .inspect_err(|error| {
-                        trace!(?error, "ignoring ppoll zero-timeout writeback failure");
-                    });
-            }
+            // Linux does not write back an initially zero timeout. Besides matching the
+            // kernel, omitting this write matters when the timeout aliases the pollfd array:
+            // the injected probe may have just stored revents in those same bytes.
             result
         } else if ppoll_uses_kernel_wait(
             self.cfg.sequentialize_threads,

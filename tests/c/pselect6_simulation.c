@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/select.h>
 #include <sys/syscall.h>
@@ -58,7 +59,58 @@ static void* delayed_signal(void* argument) {
   return NULL;
 }
 
-int main(void) {
+struct pselect6_sigmask_arg {
+  const void* sigmask;
+  size_t sigsetsize;
+};
+
+static int run_argument_validation_order(void) {
+  struct timespec malformed = {.tv_sec = 0, .tv_nsec = 1000000000};
+  errno = 0;
+  long result = syscall(SYS_pselect6, 0, NULL, NULL, NULL, &malformed,
+                        (void*)1);
+  if (result != -1 || errno != EFAULT) {
+    fprintf(stderr,
+            "unreadable pselect6 signal-mask wrapper did not precede timeout "
+            "validation: result=%ld errno=%d\n",
+            result, errno);
+    return 1;
+  }
+
+  sigset_t mask;
+  sigemptyset(&mask);
+  struct pselect6_sigmask_arg bad_size = {
+      .sigmask = &mask,
+      .sigsetsize = 0,
+  };
+  errno = 0;
+  result = syscall(SYS_pselect6, 0, NULL, NULL, NULL, (void*)1, &bad_size);
+  if (result != -1 || errno != EFAULT) {
+    fprintf(stderr,
+            "pselect6 timeout access did not precede signal-mask size "
+            "validation: result=%ld errno=%d\n",
+            result, errno);
+    return 1;
+  }
+
+  struct pselect6_sigmask_arg unreadable_mask = {
+      .sigmask = (void*)1,
+      .sigsetsize = sizeof(uint64_t),
+  };
+  errno = 0;
+  result = syscall(SYS_pselect6, 0, NULL, NULL, NULL, &malformed,
+                   &unreadable_mask);
+  if (result != -1 || errno != EINVAL) {
+    fprintf(stderr,
+            "pselect6 timeout validation did not precede signal-mask access: "
+            "result=%ld errno=%d\n",
+            result, errno);
+    return 1;
+  }
+  return 0;
+}
+
+static int run_default_workload(void) {
   int pipefd[2];
   if (pipe(pipefd) != 0 || write(pipefd[1], "r", 1) != 1) {
     perror("ready pipe");
@@ -259,6 +311,30 @@ int main(void) {
     return 1;
   }
 
+  if (run_argument_validation_order() != 0) {
+    return 1;
+  }
+
   puts("pselect6-simulation-ok");
   return 0;
+}
+
+int main(int argc, char** argv) {
+  if (argc == 1) {
+    return run_default_workload();
+  }
+  if (argc != 2) {
+    fprintf(stderr, "usage: %s [argument-validation-order]\n", argv[0]);
+    return 2;
+  }
+  if (strcmp(argv[1], "argument-validation-order") == 0) {
+    int result = run_argument_validation_order();
+    if (result == 0) {
+      puts("pselect6-simulation-ok");
+    }
+    return result;
+  }
+
+  fprintf(stderr, "usage: %s [argument-validation-order]\n", argv[0]);
+  return 2;
 }

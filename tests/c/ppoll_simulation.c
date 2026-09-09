@@ -136,6 +136,47 @@ static int run_invalid_nfds(void) {
   return 0;
 }
 
+static int run_zero_timeout_alias(void) {
+  int saved_stdin = dup(STDIN_FILENO);
+  int pipefd[2];
+  if (saved_stdin < 0 || pipe(pipefd) != 0) {
+    perror("zero timeout alias setup");
+    return 1;
+  }
+  if (dup2(pipefd[0], STDIN_FILENO) < 0) {
+    perror("zero timeout alias dup2");
+    return 1;
+  }
+  if (close(pipefd[0]) != 0 || close(pipefd[1]) != 0) {
+    perror("zero timeout alias close pipe");
+    return 1;
+  }
+
+  union {
+    struct timespec timeout;
+    struct pollfd pfd;
+  } aliased;
+  memset(&aliased, 0, sizeof(aliased));
+  errno = 0;
+  long result = syscall(SYS_ppoll, &aliased.pfd, 1, &aliased.timeout, NULL,
+                        sizeof(uint64_t));
+  int observed_errno = errno;
+  short observed_revents = aliased.pfd.revents;
+
+  if (dup2(saved_stdin, STDIN_FILENO) < 0 || close(saved_stdin) != 0) {
+    perror("zero timeout alias restore stdin");
+    return 1;
+  }
+  if (result != 1 || observed_errno != 0 || !(observed_revents & POLLHUP)) {
+    fprintf(stderr,
+            "zero timeout alias ppoll diverged: result=%ld errno=%d "
+            "revents=%d\n",
+            result, observed_errno, observed_revents);
+    return 1;
+  }
+  return 0;
+}
+
 static int run_masked_readonly_timeout(void) {
   int pipefd[2];
   if (pipe(pipefd) != 0 || write(pipefd[1], "r", 1) != 1) {
@@ -427,6 +468,10 @@ static int run_default_workload(void) {
     return 1;
   }
 
+  if (run_zero_timeout_alias() != 0) {
+    return 1;
+  }
+
   puts("ppoll-simulation-ok");
   return 0;
 }
@@ -439,7 +484,7 @@ int main(int argc, char** argv) {
     fprintf(stderr,
             "usage: %s [raw-timeout-copyout|masked-readonly-timeout|"
             "masked-readonly-zero-timeout|masked-fail-closed|"
-            "inaccessible-mask-kernel-wait|record-replay]\n",
+            "inaccessible-mask-kernel-wait|record-replay|zero-timeout-alias]\n",
             argv[0]);
     return 2;
   }
@@ -485,11 +530,18 @@ int main(int argc, char** argv) {
     }
     return result;
   }
+  if (strcmp(argv[1], "zero-timeout-alias") == 0) {
+    int result = run_zero_timeout_alias();
+    if (result == 0) {
+      puts("ppoll-simulation-ok");
+    }
+    return result;
+  }
 
   fprintf(stderr,
           "usage: %s [raw-timeout-copyout|masked-readonly-timeout|"
           "masked-readonly-zero-timeout|masked-fail-closed|"
-          "inaccessible-mask-kernel-wait|record-replay]\n",
+          "inaccessible-mask-kernel-wait|record-replay|zero-timeout-alias]\n",
           argv[0]);
   return 2;
 }
