@@ -25,7 +25,7 @@ test:
       verify:
         ci:
           ptrace: true
-          kvm: false
+          kvm: true
         backends_enabled:
           - ptrace
           - kvm
@@ -33,11 +33,6 @@ test:
           dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
-        ci_disabled_reason:
-          kvm:
-            result: determinism-failure
-            evidence: RUN1726 at Hermit 160217da2e5782ff03cc8ebb3bccf34bdf5d1d96
-            reason: The first canonical full-validation attempt diverged at turn 52, record 902, syscall 389 in scheduler COMMIT virtual time and passed only on retry, so it does not meet the zero-retry qualification bar.
       replay:
         ci: false
         backends_enabled: []
@@ -90,7 +85,7 @@ test:
       verify:
         ci:
           ptrace: true
-          kvm: false
+          kvm: true
           sabre: false
         backends_enabled:
           - ptrace
@@ -100,7 +95,6 @@ test:
           dbt: Concurrent shell stdout differed between strict verification runs
           liteinst: The preload runtime cannot survive the shell script's post-start exec
         ci_disabled_reason:
-          kvm: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
       replay:
         ci: false

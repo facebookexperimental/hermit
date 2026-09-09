@@ -4989,6 +4989,153 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/record-replay-file-state-regular-sink"
+    },
+    {
+      "backend": "kvm",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/fork-exec-pipeline"
+    },
+    {
+      "backend": "kvm",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/pipe-ipc"
+    },
+    {
+      "backend": "kvm",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/short-io-split-identity"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/dbt-copied-tiocgpgrp"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/get-robust-list-child"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/ptrace-seize-eperm"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/wait-on-child"
+    },
+    {
+      "backend": "kvm",
+      "category": "data-handling",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "data-handling/jq-json-transform"
+    },
+    {
+      "backend": "kvm",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/example-race"
+    },
+    {
+      "backend": "kvm",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/thread-output"
+    },
+    {
+      "backend": "kvm",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress-c/pipe-chain"
+    },
+    {
+      "backend": "kvm",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress-c/pipe-prefill"
+    },
+    {
+      "backend": "kvm",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/m4-macro-mkstemp"
+    },
+    {
+      "backend": "kvm",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/perl-io-subprocess-time"
+    },
+    {
+      "backend": "kvm",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/python-dict-hash-iteration"
+    },
+    {
+      "backend": "kvm",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/python-io-subprocess-time"
+    },
+    {
+      "backend": "kvm",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/tcl-rand-clock"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/date-nanoseconds"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/openssl-enc"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/shm-coherency-identity"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/ssh-keygen-ed25519"
     }
   ],
   "schema": 1

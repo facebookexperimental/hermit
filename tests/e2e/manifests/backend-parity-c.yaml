@@ -4162,7 +4162,7 @@ test:
       verify:
         ci:
           ptrace: true
-          kvm: false
+          kvm: true
         backends_enabled:
           - ptrace
           - kvm
@@ -4170,11 +4170,6 @@ test:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
-        ci_disabled_reason:
-          kvm:
-            result: determinism-failure
-            evidence: RUN1729 at Hermit a9905b8b4c9afaf880d37ff814e6d92feb045f94
-            reason: The canonical first attempt diverged at scheduler turn 4, record 81, syscall 29 in previously committed virtual time and passed only on retry, so it does not meet the zero-retry qualification bar.
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -6076,7 +6071,7 @@ test:
       verify:
         ci:
           ptrace: true
-          kvm: false
+          kvm: true
         backends_enabled:
           - ptrace
           - kvm
@@ -6086,11 +6081,6 @@ test:
           dbt: 'Measured: the guest produces NO stdout and hermit exits 1 under --backend dbi, so the fixture does not complete there. Recorded as an observed gap, not diagnosed by this change'
           sabre: Not yet qualified for the partial-transfer split contract
           liteinst: Not yet qualified for the partial-transfer split contract
-        ci_disabled_reason:
-          kvm:
-            result: determinism-failure
-            evidence: RUN1726 at Hermit 160217da2e5782ff03cc8ebb3bccf34bdf5d1d96
-            reason: Both canonical full-validation attempts diverged in scheduler COMMIT virtual time; the first attempt differed at turn 4, record 95, syscall 35, and the retry differed at turn 83, record 254, syscall 43.
       custom:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED: No custom edge-case arguments have been calibrated for this C guest'
@@ -6218,7 +6208,7 @@ test:
       verify:
         ci:
           ptrace: true
-          kvm: false
+          kvm: true
         backends_enabled:
           - ptrace
           - kvm
@@ -6226,11 +6216,6 @@ test:
           dbt: New top-of-funnel coverage is established on the ptrace reference first; DBI ratchets against it separately
           sabre: New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately
           liteinst: New top-of-funnel coverage is established on the ptrace reference first; LiteInst ratchets against it separately
-        ci_disabled_reason:
-          kvm:
-            result: determinism-failure
-            evidence: RUN1709 at Hermit 8c2bb5620f13e5d351e7bdb5d20c8dcec1f3eaba
-            reason: Both canonical full-validation attempts diverged at turn 4, record 81, syscall 29, so KVM remains enabled but is not selected by CI pending separate qualification.
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED: This row asserts strict-verify determinism; it does not assert native nondeterminism'

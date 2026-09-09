@@ -673,7 +673,7 @@ test:
         ci:
           ptrace: true
           sabre: false
-          kvm: false
+          kvm: true
         backends_enabled:
           - ptrace
           - sabre
@@ -686,10 +686,6 @@ test:
             result: infrastructure-error
             evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
             reason: Both canonical full-validation attempts timed out at the 15-second cell limit during Run1 and produced verdict=no_result with no comparison, so this backend remains red without a divergence claim.
-          kvm:
-            result: determinism-failure
-            evidence: RUN1709 at Hermit 8c2bb5620f13e5d351e7bdb5d20c8dcec1f3eaba
-            reason: The first canonical full-validation attempt diverged and only the retry passed, so KVM remains enabled but is not selected by CI pending three first-attempt passes.
       naked:
         ci: false
         backends_enabled: []
@@ -1672,7 +1668,7 @@ test:
         ci:
           ptrace: true
           sabre: false
-          kvm: false
+          kvm: true
         backends_enabled:
           - ptrace
           - sabre
@@ -1685,10 +1681,6 @@ test:
             result: infrastructure-error
             evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
             reason: Both canonical full-validation attempts timed out at the 15-second cell limit during Run1 and produced verdict=no_result with no comparison, so this backend remains red without a divergence claim.
-          kvm:
-            result: determinism-failure
-            evidence: RUN1709 at Hermit 8c2bb5620f13e5d351e7bdb5d20c8dcec1f3eaba
-            reason: The first canonical full-validation attempt diverged and only the retry passed, so KVM remains enabled but is not selected by CI pending three first-attempt passes.
       naked:
         ci: false
         backends_enabled: []
@@ -6437,13 +6429,14 @@ test:
       verify:
         ci:
           ptrace: true
+          kvm: true
           sabre: false
         backends_enabled:
           - ptrace
+          - kvm
           - sabre
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre:
@@ -10700,7 +10693,7 @@ test:
       verify:
         ci:
           ptrace: true
-          kvm: false
+          kvm: true
         backends_enabled:
           - ptrace
           - kvm
@@ -10708,11 +10701,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason:
-          kvm:
-            result: determinism-failure
-            evidence: RUN1735 at Hermit a6f23c68669196aa7a9a801bff686bf671d96a3a
-            reason: Both canonical full-validation attempts diverged at scheduler turn 4, record 77, syscall 28 in previously committed virtual time, so this cell does not meet the zero-retry qualification bar.
       naked:
         ci: false
         backends_enabled: []

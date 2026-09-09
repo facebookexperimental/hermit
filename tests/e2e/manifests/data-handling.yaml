@@ -142,12 +142,14 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
-          kvm: KVM requires the privileged runner
           sabre: SaBRe jq qualification is tracked by backend compatibility
           liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:

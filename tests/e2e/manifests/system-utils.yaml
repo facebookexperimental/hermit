@@ -103,7 +103,7 @@ test:
       verify:
         ci:
           ptrace: true
-          kvm: false
+          kvm: true
         backends_enabled:
           - ptrace
           - kvm
@@ -111,11 +111,6 @@ test:
           dbt: DBT coverage is owned by its backend parity partition
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           sabre: The exec socket is fixed, but required date/clock virtual-time support remains owner-gated for SaBRe
-        ci_disabled_reason:
-          kvm:
-            result: determinism-failure
-            evidence: RUN1726 at Hermit 160217da2e5782ff03cc8ebb3bccf34bdf5d1d96
-            reason: The first canonical full-validation attempt diverged at turn 34, record 570, syscall 243 in scheduler COMMIT virtual time and passed only on retry, so it does not meet the zero-retry qualification bar.
       replay:
         ci: false
         backends_enabled: []
@@ -415,12 +410,14 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
-          kvm: KVM requires the privileged runner
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
@@ -1095,12 +1092,14 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
-          kvm: KVM requires the privileged runner
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
@@ -1670,12 +1669,14 @@ test:
         - -D_GNU_SOURCE
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away
-          kvm: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away
           liteinst: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away
           sabre: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away
       naked:

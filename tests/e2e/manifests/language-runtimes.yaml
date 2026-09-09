@@ -339,12 +339,14 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT m4 qualification is tracked by backend compatibility
-          kvm: KVM interpreter coverage requires separate privileged qualification
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst m4 qualification is tracked by backend compatibility
       replay:
@@ -399,7 +401,7 @@ test:
       verify:
         ci:
           ptrace: true
-          kvm: false
+          kvm: true
         backends_enabled:
           - ptrace
           - kvm
@@ -407,11 +409,6 @@ test:
           dbt: DBT Perl qualification is tracked by backend compatibility
           sabre: SaBRe path ineligible - the measured verify pair recorded 132 trusted shared-object sites (33 libc/ld-linux syscall instructions x Perl and tr x two runs; clock_gettime, getrandom, file I/O, memory mapping, and signal operations); forcing the first through the SaBRe marker caused SIGILL, so qualification requires zero trusted or fallback sites
           liteinst: LiteInst Perl qualification is tracked by backend compatibility
-        ci_disabled_reason:
-          kvm:
-            result: determinism-failure
-            evidence: RUN1735 at Hermit a6f23c68669196aa7a9a801bff686bf671d96a3a
-            reason: The first canonical full-validation attempt diverged at scheduler turn 84, record 1989, syscall 875 in previously committed virtual time and passed only on retry, so it does not meet the zero-retry qualification bar.
       replay:
         ci: false
         backends_enabled: []
@@ -586,12 +583,14 @@ test:
         backends_disabled:
           native: This regression establishes Hermit verification, not native nondeterminism
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT Python qualification is tracked by backend compatibility
-          kvm: KVM interpreter coverage requires separate privileged qualification
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst Python qualification is tracked by backend compatibility
       replay:
@@ -1031,12 +1030,14 @@ test:
         backends_disabled:
           native: Native hash-seed variation is host/PYTHONHASHSEED sensitive; this regression establishes Hermit verification, not native nondeterminism
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT Python qualification is tracked by backend compatibility
-          kvm: KVM interpreter coverage requires separate privileged qualification
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst Python qualification is tracked by backend compatibility
       replay:
@@ -1095,7 +1096,7 @@ test:
       verify:
         ci:
           ptrace: true
-          kvm: false
+          kvm: true
         backends_enabled:
           - ptrace
           - kvm
@@ -1103,11 +1104,6 @@ test:
           dbt: DBT Tcl qualification is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst Tcl qualification is tracked by backend compatibility
-        ci_disabled_reason:
-          kvm:
-            result: determinism-failure
-            evidence: KVM next-40 qualification at Hermit 4d8f866102882b6eeabdf99cc7e81433cc3c95c5; all-results.jsonl sha256 a14c6a90d249389336b894087fe16f56970298ca04620a1aadf7e94186e016ce
-            reason: Canonical repetition 1 diverged on both attempts at record 1105 and syscall 90; repetitions 2 and 3 passed on their first attempts, so the cell did not satisfy three clean first-attempt passes.
       replay:
         ci: false
         backends_enabled: []
