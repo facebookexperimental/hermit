@@ -78,7 +78,7 @@ This is measured ptrace-reference parity, not CI plan membership and not same-ba
 | Candidate backend | Eligible ptrace-green cells | Disabled probe candidates | Measured match | Parity failure | Never measured |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `dbt` | 340 | 280 | 0 | 0 | 340 |
-| `kvm` | 340 | 321 | 0 | 0 | 340 |
+| `kvm` | 340 | 102 | 0 | 0 | 340 |
 | `sabre` | 340 | 197 | 0 | 0 | 340 |
 | `liteinst` | 340 | 289 | 0 | 0 | 340 |
 
