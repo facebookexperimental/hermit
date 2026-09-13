@@ -183,8 +183,8 @@ impl ValidationServiceResult {
             HISTORICAL_SCHEMA_VERSION => HISTORICAL_FIELD_NAMES.into_iter().collect(),
             WRITEBACK_SCHEMA_VERSION => WRITEBACK_FIELD_NAMES.into_iter().collect(),
             SELECTION_SCHEMA_VERSION => SELECTION_FIELD_NAMES.into_iter().collect(),
-            SCHEMA_VERSION => FIELD_NAMES.into_iter().collect(),
             TEST_COUNTS_SCHEMA_VERSION => TEST_COUNTS_FIELD_NAMES.into_iter().collect(),
+            SCHEMA_VERSION => FIELD_NAMES.into_iter().collect(),
             other => {
                 return Err(format!(
                     "validation-service-result-schema_version: expected {HISTORICAL_SCHEMA_VERSION}, {WRITEBACK_SCHEMA_VERSION}, {SELECTION_SCHEMA_VERSION}, {TEST_COUNTS_SCHEMA_VERSION}, or {SCHEMA_VERSION}, got {other}"
@@ -430,36 +430,38 @@ mod tests {
 
     #[test]
     fn genuine_could_not_run_remains_distinct_from_writeback_failure() {
-        let result = ValidationServiceResult {
-            schema_version: SCHEMA_VERSION,
-            commit: "a".repeat(40),
-            profile: "full".into(),
-            selection_mode: Some("full".into()),
-            final_validate_status: FinalValidateStatus::CouldNotRun,
-            detail: Some(vec![
+        for detail in [
+            vec![
                 "refused by: pre.reverie_pin".into(),
                 "recorded pin is not an ancestor".into(),
-            ]),
-            exit_code: 75,
-            executed_nodes: 0,
-            executed_tests: None,
-            passed_tests: None,
-            scorecard_writeback: None,
+            ],
+            vec![
+                "REFUSED ON COMPLETENESS: ZERO tests executed".into(),
+                "0 test(s) executed, 0 passed, 4 filtered".into(),
+            ],
+        ] {
+            let result = ValidationServiceResult {
+                schema_version: SCHEMA_VERSION,
+                commit: "a".repeat(40),
+                profile: "full".into(),
+                selection_mode: Some("full".into()),
+                final_validate_status: FinalValidateStatus::CouldNotRun,
+                detail: Some(detail.clone()),
+                exit_code: 75,
+                executed_nodes: 0,
+                executed_tests: None,
+                passed_tests: None,
+                scorecard_writeback: None,
+            }
+            .validated()
+            .unwrap();
+            assert_eq!(
+                result.final_validate_status,
+                FinalValidateStatus::CouldNotRun
+            );
+            assert_eq!(result.detail, Some(detail));
+            assert_eq!(result.scorecard_writeback, None);
         }
-        .validated()
-        .unwrap();
-        assert_eq!(
-            result.final_validate_status,
-            FinalValidateStatus::CouldNotRun
-        );
-        assert_eq!(result.scorecard_writeback, None);
-        assert_eq!(
-            result.detail,
-            Some(vec![
-                "refused by: pre.reverie_pin".into(),
-                "recorded pin is not an ancestor".into()
-            ])
-        );
     }
 
     #[test]
@@ -546,6 +548,7 @@ mod tests {
                 .contains("schema 5 expected")
         );
     }
+
     #[test]
     fn current_detail_is_required_nullable_and_only_names_no_result() {
         let mut missing = serde_json::to_value(valid()).unwrap();
@@ -555,14 +558,17 @@ mod tests {
                 .unwrap_err();
         assert!(error.contains("schema 5 expected"), "{error}");
 
-        let mut pass_with_detail = valid();
-        pass_with_detail.detail = Some(vec!["not pass detail".into()]);
-        assert!(
-            pass_with_detail
-                .validate()
-                .unwrap_err()
-                .contains("PASSED must carry null")
-        );
+        for status in [FinalValidateStatus::Passed, FinalValidateStatus::Failed] {
+            let mut result = valid();
+            result.final_validate_status = status;
+            result.exit_code = status.exit_code();
+            result.detail = Some(vec!["must not survive".into()]);
+            let error = result.validate().unwrap_err();
+            assert!(
+                error.contains(&format!("{} must carry null", status.as_str())),
+                "{error}"
+            );
+        }
 
         let mut no_result = valid();
         no_result.final_validate_status = FinalValidateStatus::CouldNotRun;
@@ -575,6 +581,13 @@ mod tests {
         assert!(no_result.validate().unwrap_err().contains("nonempty list"));
         no_result.detail = Some(vec![" ".into()]);
         assert!(no_result.validate().unwrap_err().contains("nonempty list"));
+
+        let mut malformed = serde_json::to_value(&no_result).unwrap();
+        malformed["detail"] = Value::String("not an ordered list".into());
+        let error =
+            ValidationServiceResult::from_json_slice(&serde_json::to_vec(&malformed).unwrap())
+                .unwrap_err();
+        assert!(error.contains("validation-service-result-shape"), "{error}");
     }
 
     #[test]

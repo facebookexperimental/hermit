@@ -671,8 +671,9 @@ fn usage() -> &'static str {
      \x20 FINAL_VALIDATE_STATUS: COULD_NOT_RUN   exit 75\n\
      The line is validate's last output and reports the validation verdict. A\n\
      post-verdict scorecard write-back failure preserves that line and exits 75;\n\
-     current readers distinguish the two through ValidationServiceResult. No line\n\
-     means validate died before reporting.\n\
+     current readers distinguish the two through ValidationServiceResult. A\n\
+     COULD_NOT_RUN service result carries the ordered refusal detail when validate\n\
+     has one. No line means validate died before reporting.\n\
      Help, --show-plan, --write-constructed-dag, --write-generated-plan, and\n\
      --probe-host-capability do\n\
      not attempt validation and therefore do not emit a final validate status.\n\
@@ -2040,6 +2041,7 @@ fn self_test() -> Result<(), String> {
             .map_err(|error| format!("summary: cannot read write-back result: {error}"))?,
     )?;
     if writeback_result.final_validate_status != FinalValidateStatus::Passed
+        || writeback_result.detail.is_some()
         || writeback_result.exit_code != i32::from(COULD_NOT_RUN_EXIT_CODE)
         || writeback_result.scorecard_writeback
             != Some(ScorecardWriteback::Failed {
@@ -2050,9 +2052,20 @@ fn self_test() -> Result<(), String> {
             "summary: scorecard write-back refusal did not preserve the validation verdict and carry its own typed failure: {writeback_result:?}"
         ));
     }
-    let mut genuine_could_not_run =
-        RunSummary::new(Verdict::NoResult, COULD_NOT_RUN_EXIT_CODE, "self-test", Vec::new());
+    let refusal_detail = verdict_refusals(None, 0, Some(0))
+        .into_iter()
+        .map(|why| format!("REFUSED ON COMPLETENESS: {why}"))
+        .collect::<Vec<_>>();
+    let refusal_exit = exit_code_with_verdict_refusals(0, &refusal_detail);
+    let mut genuine_could_not_run = RunSummary::new(
+        completed_verdict(refusal_exit),
+        refusal_exit,
+        "self-test",
+        refusal_detail.clone(),
+    );
     genuine_could_not_run.nodes_executed = 1;
+    genuine_could_not_run.executed_tests = Some(0);
+    genuine_could_not_run.passed_tests = Some(0);
     let could_not_run_path = writeback_result_dir.path().join("could-not-run.json");
     write_validation_service_result(&could_not_run_path, &genuine_could_not_run)?;
     let could_not_run = ValidationServiceResult::from_json_slice(
@@ -2061,6 +2074,7 @@ fn self_test() -> Result<(), String> {
     )?;
     if could_not_run.final_validate_status != FinalValidateStatus::CouldNotRun
         || could_not_run.exit_code != i32::from(COULD_NOT_RUN_EXIT_CODE)
+        || could_not_run.detail.as_ref() != Some(&refusal_detail)
         || could_not_run.scorecard_writeback.is_some()
         || run_summary_lines(&genuine_could_not_run, std::time::Instant::now())
             .last()
@@ -2084,6 +2098,7 @@ fn self_test() -> Result<(), String> {
             .map_err(|error| format!("summary: cannot read service result: {error}"))?,
     )?;
     if service_result.final_validate_status != FinalValidateStatus::Passed
+        || service_result.detail.is_some()
         || service_result.exit_code != 0
         || service_result.executed_nodes != 76
         || service_result.executed_tests != Some(2129)
@@ -2093,6 +2108,42 @@ fn self_test() -> Result<(), String> {
         return Err(format!(
             "summary: framework service result lost typed status or counts: {service_result:?}"
         ));
+    }
+
+    let mut failed_summary = RunSummary::new(
+        Verdict::Fail,
+        1,
+        "full",
+        vec!["product test failed".into()],
+    );
+    failed_summary.nodes_executed = 1;
+    failed_summary.executed_tests = Some(2);
+    failed_summary.passed_tests = Some(1);
+    let failed_result_path = service_result_dir.path().join("failed.json");
+    write_validation_service_result(&failed_result_path, &failed_summary)?;
+    let failed_result = ValidationServiceResult::from_json_slice(
+        &std::fs::read(&failed_result_path)
+            .map_err(|error| format!("summary: cannot read failed result: {error}"))?,
+    )?;
+    if failed_result.final_validate_status != FinalValidateStatus::Failed
+        || failed_result.exit_code != 1
+        || failed_result.detail.is_some()
+    {
+        return Err(format!(
+            "summary: a genuine product failure did not remain FAILED/exit 1 without refusal detail: {failed_result:?}"
+        ));
+    }
+
+    let permissionless_path = Path::new("/proc/self/validation-service-result.json");
+    let permission_error = write_validation_service_result(permissionless_path, &service_summary)
+        .expect_err("service-result publication unexpectedly wrote beneath /proc/self");
+    if !permission_error.contains("cannot create validation service result beside") {
+        return Err(format!(
+            "summary: permissionless service-result publication failure was unclear: {permission_error}"
+        ));
+    }
+    if !usage().contains("COULD_NOT_RUN service result carries the ordered refusal detail") {
+        return Err("summary: CLI help omitted the schema-5 refusal-detail contract".into());
     }
 
     let cache_tree = "b".repeat(40);
@@ -9989,6 +10040,25 @@ fn verdict_refusals(
     out
 }
 
+/// A completeness refusal is a completed attempt that cannot certify the tree,
+/// not a product failure. Preserve an earlier failure (or no-result) exactly;
+/// only replace the otherwise-successful exit that the refusal invalidates.
+fn exit_code_with_verdict_refusals(exit_code: u8, refusals: &[String]) -> u8 {
+    if exit_code == 0 && !refusals.is_empty() {
+        NO_RESULT_EXIT_CODE as u8
+    } else {
+        exit_code
+    }
+}
+
+fn completed_verdict(exit_code: u8) -> Verdict {
+    match exit_code {
+        0 => Verdict::Pass,
+        code if code == NO_RESULT_EXIT_CODE as u8 => Verdict::NoResult,
+        _ => Verdict::Fail,
+    }
+}
+
 /// Execution completeness applies after profile-specific failure policy. A
 /// profile may allow a fully measured failing row, but no profile may turn a
 /// partial run into exit zero.
@@ -10585,9 +10655,34 @@ fn verdict_refusal_bracket() -> Result<(), String> {
     if !verdict_refusals(None, 0, None).is_empty() {
         return Err("verdict: unknown counts must not be read as a measured zero".into());
     }
+    let zero_executed = verdict_refusals(None, 0, Some(0));
+    let refusal_exit = exit_code_with_verdict_refusals(0, &zero_executed);
+    if refusal_exit != NO_RESULT_EXIT_CODE as u8
+        || completed_verdict(refusal_exit) != Verdict::NoResult
+    {
+        return Err(format!(
+            "verdict: a zero-exit completeness refusal must become exit {NO_RESULT_EXIT_CODE}/COULD_NOT_RUN, got exit {refusal_exit}/{:?}",
+            completed_verdict(refusal_exit)
+        ));
+    }
+    let failed_exit = exit_code_with_verdict_refusals(1, &zero_executed);
+    if failed_exit != 1 || completed_verdict(failed_exit) != Verdict::Fail {
+        return Err(format!(
+            "verdict: a genuine product failure must remain exit 1/FAILED, got exit {failed_exit}/{:?}",
+            completed_verdict(failed_exit)
+        ));
+    }
+    let clean_exit = exit_code_with_verdict_refusals(0, &[]);
+    if clean_exit != 0 || completed_verdict(clean_exit) != Verdict::Pass {
+        return Err(format!(
+            "verdict: a complete clean run must remain exit 0/PASSED, got exit {clean_exit}/{:?}",
+            completed_verdict(clean_exit)
+        ));
+    }
     println!(
         "  verdict refusals: 3 positive(s) fire (0-measured+spine, 0-executed, spine-with-full-matrix), \
-         2 negative(s) inert (complete run, unknown counts)"
+         2 negative(s) inert (complete run, unknown counts); refusal -> exit 75/COULD_NOT_RUN, \
+         product failure -> exit 1/FAILED, clean -> exit 0/PASSED"
     );
     Ok(())
 }
@@ -20586,8 +20681,8 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             "validate: refusing to report PASS: the run did not measure enough to certify \
              anything."
         );
-        exit_code = 1;
     }
+    exit_code = exit_code_with_verdict_refusals(exit_code, &refusals);
 
     // Receipt production is itself an enforcement path (validate.sh:1846).
     //
@@ -20939,11 +21034,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     }
 
     let mut s = RunSummary::new(
-        match exit_code {
-            0 => Verdict::Pass,
-            code if code == NO_RESULT_EXIT_CODE as u8 => Verdict::NoResult,
-            _ => Verdict::Fail,
-        },
+        completed_verdict(exit_code),
         exit_code,
         &plan.profile,
         detail,
@@ -21759,6 +21850,120 @@ os.execv(sys.executable,[sys.executable,str(Path(__file__).with_name('cargo-fixt
 
 }
 
+
+#[cfg(test)]
+mod final_validate_status_tests {
+    use super::*;
+
+    #[test]
+    fn completeness_refusal_is_not_a_product_failure() {
+        let refusals = verdict_refusals(None, 0, Some(0));
+        assert!(!refusals.is_empty());
+
+        let refused_exit = exit_code_with_verdict_refusals(0, &refusals);
+        assert_eq!(refused_exit, COULD_NOT_RUN_EXIT_CODE);
+        assert_eq!(completed_verdict(refused_exit), Verdict::NoResult);
+        assert_eq!(
+            final_validate_status(completed_verdict(refused_exit)),
+            Some(FinalValidateStatus::CouldNotRun)
+        );
+
+        let failed_exit = exit_code_with_verdict_refusals(1, &refusals);
+        assert_eq!(failed_exit, 1);
+        assert_eq!(completed_verdict(failed_exit), Verdict::Fail);
+        assert_eq!(
+            final_validate_status(completed_verdict(failed_exit)),
+            Some(FinalValidateStatus::Failed)
+        );
+
+        let clean_exit = exit_code_with_verdict_refusals(0, &[]);
+        assert_eq!(clean_exit, 0);
+        assert_eq!(completed_verdict(clean_exit), Verdict::Pass);
+        assert_eq!(
+            final_validate_status(completed_verdict(clean_exit)),
+            Some(FinalValidateStatus::Passed)
+        );
+    }
+
+    #[test]
+    fn schema_five_publishes_detail_only_for_could_not_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let refusals = verdict_refusals(None, 0, Some(0));
+        let expected_detail = refusals
+            .iter()
+            .map(|why| format!("REFUSED ON COMPLETENESS: {why}"))
+            .collect::<Vec<_>>();
+
+        let mut refused = RunSummary::new(
+            Verdict::NoResult,
+            COULD_NOT_RUN_EXIT_CODE,
+            "fixture",
+            expected_detail.clone(),
+        );
+        refused.commit = "0123456789abcdef0123456789abcdef01234567".into();
+        refused.nodes_executed = 1;
+        refused.executed_tests = Some(0);
+        refused.passed_tests = Some(0);
+        let refused_path = temp.path().join("refused.json");
+        write_validation_service_result(&refused_path, &refused).unwrap();
+        let refused_result = ValidationServiceResult::from_json_slice(
+            &std::fs::read(&refused_path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(refused_result.schema_version, 5);
+        assert_eq!(
+            refused_result.final_validate_status,
+            FinalValidateStatus::CouldNotRun
+        );
+        assert_eq!(refused_result.exit_code, i32::from(COULD_NOT_RUN_EXIT_CODE));
+        assert_eq!(refused_result.detail, Some(expected_detail));
+
+        let mut failed = RunSummary::new(
+            Verdict::Fail,
+            1,
+            "fixture",
+            vec!["a product test failed".into()],
+        );
+        failed.commit = "0123456789abcdef0123456789abcdef01234567".into();
+        failed.nodes_executed = 1;
+        failed.executed_tests = Some(2);
+        failed.passed_tests = Some(1);
+        let failed_path = temp.path().join("failed.json");
+        write_validation_service_result(&failed_path, &failed).unwrap();
+        let failed_result = ValidationServiceResult::from_json_slice(
+            &std::fs::read(&failed_path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(failed_result.final_validate_status, FinalValidateStatus::Failed);
+        assert_eq!(failed_result.exit_code, 1);
+        assert_eq!(failed_result.detail, None);
+
+        let mut passed = RunSummary::new(Verdict::Pass, 0, "fixture", Vec::new());
+        passed.commit = "0123456789abcdef0123456789abcdef01234567".into();
+        passed.nodes_executed = 1;
+        passed.executed_tests = Some(2);
+        passed.passed_tests = Some(2);
+        let passed_path = temp.path().join("passed.json");
+        write_validation_service_result(&passed_path, &passed).unwrap();
+        let passed_result = ValidationServiceResult::from_json_slice(
+            &std::fs::read(&passed_path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(passed_result.final_validate_status, FinalValidateStatus::Passed);
+        assert_eq!(passed_result.exit_code, 0);
+        assert_eq!(passed_result.detail, None);
+
+        let collision = write_validation_service_result(&passed_path, &passed).unwrap_err();
+        assert!(collision.contains("without replacing an existing result"));
+
+        let permissionless = write_validation_service_result(
+            Path::new("/proc/self/validation-service-result.json"),
+            &passed,
+        )
+        .unwrap_err();
+        assert!(permissionless.contains("cannot create validation service result beside"));
+    }
+}
 
 #[cfg(test)]
 mod e2e_attempt_tests {
