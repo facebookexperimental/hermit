@@ -12793,7 +12793,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .max()
         .ok_or("retry bounds: no declared nextest cap")?;
 
-    let lane_configs = ["portable", "privileged"]
+    let lane_configs = ["portable", "privileged", "super"]
         .into_iter()
         .map(|lane| validate_plan::lane_config(root, lane).map(|cfg| (lane, cfg)))
         .collect::<Result<Vec<_>, _>>()?;
