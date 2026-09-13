@@ -2,8 +2,10 @@
 
 `ci/run-nextest-counted.sh` installs one Nextest run wrapper in its temporary
 configuration. Default and CI profiles retain their existing wall limits,
-grace period, retries and test selection. The wrapper adds measurements; it
-does not set a CPU limit or calibrate the test budgets.
+grace period, retries and test selection. The generated configuration remains
+measurement-only until a clean-host Nextest CPU distribution supplies a
+production budget. Focused controls exercise enforcement by invoking the
+wrapper with an explicit `--cpu-timeout-usec` budget and termination grace.
 
 Each test attempt gets an atomic record keyed by package, typed binary ID,
 test name and retry number. The report reconciles every record against the
@@ -13,19 +15,35 @@ records remains a failure with zero executed tests and an empty CPU report.
 
 Set `HERMIT_NEXTEST_CPU_REPORT_PATH` to retain the report. Otherwise a counted
 run writes `<DAGRUN_TEST_COUNTS_PATH>.cpu.json`; without a count path it retains
-no CPU report. Schema 1 includes the Nextest run ID, typed identities,
+no CPU report. Schema 2 includes the Nextest run ID, typed identities,
 `cpu_usage_usec`, `wall_time_ms`, the CPU source and completion status. A run
 with no attempt records has a null run ID. Retained stress-index events remain
 readable by the count-only adapter; CPU reconciliation explicitly refuses them
 because the declared Nextest version provides no corresponding wrapper identity.
 
-CPU is sampled from the wrapper's process group and descendants using the
-shared procfs counter. It includes wrapper overhead and has procfs clock-tick
-resolution. `supervisor_signal` is a snapshot at interruption: it excludes
-later work during Nextest's cleanup grace period. It must not be treated as a
-complete CPU total for that interrupted attempt. Nextest owns group signaling;
-the wrapper reproduces its own exit or signal status without broadcasting an
-additional signal to the test.
+The production measurement-only path retains Nextest's process group and uses
+the child's final `wait4` accounting; it does not add a polling loop. An
+explicit budget moves the test into a child-owned process group and samples the
+whole live descendant tree using procfs, including descendants that change
+process groups. CPU totals have procfs clock-tick resolution and exclude wrapper
+overhead. The budgeted wrapper samples twice per second so each test adds at
+most two full procfs scans per wall second. At the first sample at or above the
+CPU budget, it records
+the boundary value, sends `SIGTERM`, waits the configured grace period, sends
+`SIGKILL` if needed, reaps the group, and publishes a typed `cpu_timeout`
+completion before returning a failing status to Nextest. External signals and
+ordinary exits remain distinct first causes. On the budgeted path the wrapper
+forwards one external signal to the child group and does not let a later signal
+replace an already observed CPU timeout. Missing live CPU accounting is an
+infrastructure failure, not an unbounded run.
+
+On the measurement-only path, `supervisor_signal` retains the snapshot taken at
+interruption. Nextest still owns the existing 2-second grace, so CPU consumed
+after that snapshot is not in the record and must not be read as a final total.
+
+Production activation also needs the outer Nextest termination grace to exceed
+the wrapper's child grace by a measured publication margin. The current 2-second
+Nextest grace remains unchanged, so this change does not activate a CPU budget.
 
 The committed graph prepares the normal wrapper binary along with its Nextest
 executables. Prepared-record schema 2 binds the Cargo artifact's package,

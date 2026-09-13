@@ -1070,7 +1070,14 @@ mod tests {
         );
         write_record(
             &scratch.0,
-            &attempt("recovers", 1, AttemptCompletion::Exit { code: 23 }),
+            &attempt(
+                "recovers",
+                1,
+                AttemptCompletion::CpuTimeout {
+                    cpu_budget_usec: 10_000,
+                    observed_cpu_usec: 12_345,
+                },
+            ),
         );
         write_record(
             &scratch.0,
@@ -1148,7 +1155,14 @@ mod tests {
         let false_pass = Scratch::new();
         write_record(
             &false_pass.0,
-            &attempt("passes", 1, AttemptCompletion::Exit { code: 23 }),
+            &attempt(
+                "passes",
+                1,
+                AttemptCompletion::CpuTimeout {
+                    cpu_budget_usec: 10_000,
+                    observed_cpu_usec: 12_345,
+                },
+            ),
         );
         write_record(
             &false_pass.0,
@@ -1186,6 +1200,56 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("disagree on whether"), "{error}");
+    }
+
+    #[test]
+    fn cpu_timeout_records_require_an_exact_valid_boundary() {
+        let mut zero_budget = attempt(
+            "timeout",
+            1,
+            AttemptCompletion::CpuTimeout {
+                cpu_budget_usec: 0,
+                observed_cpu_usec: 12_345,
+            },
+        );
+        let error = zero_budget.validate().unwrap_err();
+        assert!(error.contains("budget must be greater than zero"), "{error}");
+
+        zero_budget.completion = AttemptCompletion::CpuTimeout {
+            cpu_budget_usec: 12_000,
+            observed_cpu_usec: 11_999,
+        };
+        let error = zero_budget.validate().unwrap_err();
+        assert!(error.contains("below its budget 12000us"), "{error}");
+
+        zero_budget.completion = AttemptCompletion::CpuTimeout {
+            cpu_budget_usec: 10_000,
+            observed_cpu_usec: 12_346,
+        };
+        let error = zero_budget.validate().unwrap_err();
+        assert!(error.contains("CPU total 12345us is below"), "{error}");
+
+        let valid = attempt(
+            "timeout",
+            1,
+            AttemptCompletion::CpuTimeout {
+                cpu_budget_usec: 10_000,
+                observed_cpu_usec: 12_345,
+            },
+        );
+        valid.validate().unwrap();
+        let mut wrong_source = valid.clone();
+        wrong_source.cpu_source = nextest_cpu::CPU_SOURCE.into();
+        let error = wrong_source.validate().unwrap_err();
+        assert!(error.contains("requires cpu_source"), "{error}");
+        assert_eq!(
+            serde_json::to_value(valid.completion).unwrap(),
+            serde_json::json!({
+                "kind": "cpu_timeout",
+                "cpu_budget_usec": 10_000,
+                "observed_cpu_usec": 12_345,
+            })
+        );
     }
 
     #[test]

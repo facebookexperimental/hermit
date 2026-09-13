@@ -343,11 +343,11 @@ PYEOF
     [[ $(<"$scratch/wrapper-counts.json") == \
         '{"executed_tests":1,"filtered_tests":0,"results":[{"attempts":1,"id":"suite$failure","result":"fail"}],"schema":2}' ]] || return 1
     jq -e '
-        .schema == 1 and .run_id == "self-test-nextest" and
+        .schema == 2 and .run_id == "self-test-nextest" and
         (.attempts | length) == 1 and
         .attempts[0].identity == {package:"suite", binary:"suite", test:"failure", attempt:1} and
         .attempts[0].completion == {kind:"exit", code:23} and
-        .attempts[0].cpu_source == "procfs-subtree"
+        .attempts[0].cpu_source == "wait4-subtree"
     ' "$scratch/wrapper-cpu.json" >/dev/null || return 1
     grep -q 'period = "86s"' "$scratch/scaled-nextest.toml" || return 1
     [[ $(grep -c '^run-wrapper = "hermit-per-test-cpu"$' \
@@ -377,7 +377,7 @@ PYEOF
     [[ $got != *'test result: ok.'* ]] || return 1
     [[ $(<"$scratch/launch-counts.json") == \
         '{"executed_tests":0,"filtered_tests":0,"results":[],"schema":2}' ]] || return 1
-    jq -e '. == {schema:1, run_id:null, attempts:[]}' "$scratch/launch-cpu.json" >/dev/null || return 1
+    jq -e '. == {schema:2, run_id:null, attempts:[]}' "$scratch/launch-cpu.json" >/dev/null || return 1
     cmp -s "$scratch/expected-list-arguments" "$scratch/list-arguments" || return 1
     if compgen -G "$scratch/hermit-nextest-config.*.toml" >/dev/null; then return 1; fi
 

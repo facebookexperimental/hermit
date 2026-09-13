@@ -11,13 +11,14 @@ use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
 
-pub const ATTEMPT_RECORD_SCHEMA: u64 = 1;
+pub const ATTEMPT_RECORD_SCHEMA: u64 = 2;
 pub const BINARY_MAP_SCHEMA: u64 = 1;
-pub const CPU_REPORT_SCHEMA: u64 = 1;
+pub const CPU_REPORT_SCHEMA: u64 = 2;
 pub const CPU_BINARY_MAP_ENV: &str = "HERMIT_NEXTEST_CPU_BINARY_MAP";
 pub const CPU_RECORD_DIR_ENV: &str = "HERMIT_NEXTEST_CPU_RECORD_DIR";
 pub const CPU_REPORT_PATH_ENV: &str = "HERMIT_NEXTEST_CPU_REPORT_PATH";
-pub const CPU_SOURCE: &str = dagrun::proccpu::CPU_SOURCE_PROCFS;
+pub const CPU_SOURCE: &str = "wait4-subtree";
+pub const CPU_SOURCE_ENFORCED: &str = "procfs-descendants+wait4";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -206,9 +207,19 @@ impl AttemptIdentity {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AttemptCompletion {
-    Exit { code: i32 },
-    Signal { signal: i32 },
-    SupervisorSignal { signal: i32 },
+    Exit {
+        code: i32,
+    },
+    Signal {
+        signal: i32,
+    },
+    SupervisorSignal {
+        signal: i32,
+    },
+    CpuTimeout {
+        cpu_budget_usec: u64,
+        observed_cpu_usec: u64,
+    },
 }
 
 impl AttemptCompletion {
@@ -220,6 +231,19 @@ impl AttemptCompletion {
             Self::Signal { signal } | Self::SupervisorSignal { signal } => {
                 Err(format!("signal {signal} is not positive"))
             }
+            Self::CpuTimeout {
+                cpu_budget_usec,
+                observed_cpu_usec,
+            } if *cpu_budget_usec == 0 => {
+                Err("CPU timeout budget must be greater than zero".into())
+            }
+            Self::CpuTimeout {
+                cpu_budget_usec,
+                observed_cpu_usec,
+            } if observed_cpu_usec < cpu_budget_usec => Err(format!(
+                "CPU timeout observation {observed_cpu_usec}us is below its budget {cpu_budget_usec}us"
+            )),
+            Self::CpuTimeout { .. } => Ok(()),
         }
     }
 
@@ -249,13 +273,36 @@ impl AttemptRecord {
         wall_time_ms: u64,
         completion: AttemptCompletion,
     ) -> Self {
+        let cpu_source = if matches!(completion, AttemptCompletion::CpuTimeout { .. }) {
+            CPU_SOURCE_ENFORCED
+        } else {
+            CPU_SOURCE
+        };
+        Self::new_with_source(
+            run_id,
+            identity,
+            cpu_usage_usec,
+            wall_time_ms,
+            completion,
+            cpu_source,
+        )
+    }
+
+    pub fn new_with_source(
+        run_id: String,
+        identity: AttemptIdentity,
+        cpu_usage_usec: u64,
+        wall_time_ms: u64,
+        completion: AttemptCompletion,
+        cpu_source: &str,
+    ) -> Self {
         let key = identity.key();
         Self {
             schema: ATTEMPT_RECORD_SCHEMA,
             key,
             run_id,
             identity,
-            cpu_source: CPU_SOURCE.into(),
+            cpu_source: cpu_source.into(),
             cpu_usage_usec,
             wall_time_ms,
             completion,
@@ -278,13 +325,32 @@ impl AttemptRecord {
                 "attempt record key does not match its binary/test/attempt identity".into(),
             );
         }
-        if self.cpu_source != CPU_SOURCE {
+        if self.cpu_source != CPU_SOURCE && self.cpu_source != CPU_SOURCE_ENFORCED {
             return Err(format!(
-                "attempt record cpu_source {:?} is not {CPU_SOURCE:?}",
+                "attempt record cpu_source {:?} is neither {CPU_SOURCE:?} nor {CPU_SOURCE_ENFORCED:?}",
                 self.cpu_source
             ));
         }
-        self.completion.validate()
+        self.completion.validate()?;
+        if matches!(self.completion, AttemptCompletion::CpuTimeout { .. })
+            && self.cpu_source != CPU_SOURCE_ENFORCED
+        {
+            return Err(format!(
+                "CPU-timeout attempt record requires cpu_source {CPU_SOURCE_ENFORCED:?}"
+            ));
+        }
+        if let AttemptCompletion::CpuTimeout {
+            observed_cpu_usec, ..
+        } = self.completion
+        {
+            if self.cpu_usage_usec < observed_cpu_usec {
+                return Err(format!(
+                    "attempt CPU total {}us is below its timeout-boundary observation {observed_cpu_usec}us",
+                    self.cpu_usage_usec
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn file_name(&self) -> String {
