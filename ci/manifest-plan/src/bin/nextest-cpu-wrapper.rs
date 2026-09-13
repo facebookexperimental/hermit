@@ -293,6 +293,7 @@ fn control_child(mode: &str, args: &[OsString]) -> Result<ExitCode, String> {
             }
             if env::var_os(CPU_RECORD_DIR_ENV).is_some()
                 || env::var_os(CPU_BINARY_MAP_ENV).is_some()
+                || env::var_os(CPU_REPORT_PATH_ENV).is_some()
                 || env::var_os(CPU_WRAPPER_ENV).is_some()
             {
                 return Err(
@@ -407,6 +408,7 @@ fn control_command(
         .current_dir(scratch)
         .env(CPU_BINARY_MAP_ENV, scratch.join("binary-map.json"))
         .env(CPU_RECORD_DIR_ENV, scratch.join("attempts"))
+        .env(CPU_REPORT_PATH_ENV, scratch.join("unused-report.json"))
         .env(RUN_ID_ENV, "self-test-run")
         .env(PACKAGE_ENV, "fixture")
         .env(ATTEMPT_ENV, attempt.to_string())
