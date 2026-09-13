@@ -45,6 +45,14 @@ class BackendParityTemporaryPathTest(unittest.TestCase):
                         },
                         "comparison": None,
                         "compared_log_messages": None,
+                        "guest_exit_code": None,
+                        "guest_signal": None,
+                        "first_divergent_scheduler_turn": None,
+                        "first_divergent_virtual_nanoseconds": None,
+                        "first_divergent_record": None,
+                        "first_divergent_syscall": None,
+                        "first_divergent_left_message": None,
+                        "first_divergent_right_message": None,
                     }
                 )
             )

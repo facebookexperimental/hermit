@@ -151,6 +151,60 @@ got = tier_of(record(verified=False, verdict="diverged"))
 check("typed divergent verdict is refused rather than assigned a positive tier",
       got is None, repr(got))
 
+print("case INFRASTRUCTURE ERROR — retain the cause without claiming verification")
+infrastructure = record(verified=False, bitwise=False, verdict="infrastructure_error")
+infrastructure["infrastructure_error"] = {"kind": "skid_overshoot", "count": 2}
+infrastructure["comparison"] = None
+infrastructure["compared_log_messages"] = None
+got = tier_of(infrastructure)
+check("a typed infrastructure error retains the gap tier",
+      got and got["tier"] == "gap", repr(got))
+check("the infrastructure cause and count survive the typed reader",
+      got and got["infrastructure_error"] ==
+      "verification recorded 2 HERMIT_SKID_OVERSHOOT report(s)", repr(got))
+check("an infrastructure error never claims bitwise parity",
+      got and got["bitwise_parity"] == "0", repr(got))
+
+for field in ("verified", "bitwise_parity"):
+    contradictory = {**infrastructure, field: True}
+    check(f"an infrastructure error claiming {field} is refused",
+          tier_of(contradictory) is None)
+for cause in (None, {"kind": "unknown", "count": 2},
+              {"kind": "skid_overshoot", "count": 0},
+              {"kind": "skid_overshoot", "count": -1},
+              {"kind": "skid_overshoot", "count": True},
+              {"kind": "skid_overshoot", "count": "2"}):
+    malformed = {**infrastructure, "infrastructure_error": cause}
+    check(f"an invalid infrastructure cause is refused: {cause!r}",
+          tier_of(malformed) is None)
+
+# Replace only guest execution with a report-producing transport fixture. The
+# actual matrix and compiled Rust reader decide the reported result. No guest
+# qualification is claimed by this test.
+from unittest.mock import patch  # noqa: E402
+from run_matrix import run_case_verify  # noqa: E402
+
+for process_status in (0, 1, 126, 127):
+    def infrastructure_transport(command):
+        report_path = next(arg.split("=", 1)[1] for arg in command
+                           if arg.startswith("--verify-json="))
+        Path(report_path).write_text(json.dumps(infrastructure), encoding="utf-8")
+        return subprocess.CompletedProcess(command, process_status, b"", b"")
+
+    with tempfile.TemporaryDirectory(prefix="infrastructure-tier-") as tmp:
+        evidence = {}
+        with patch("run_matrix.run_with_timeout", side_effect=infrastructure_transport):
+            result, detail, _ = run_case_verify(
+                Path("/fixture-hermit"), "ptrace", "hello_stdout", ["/bin/true"],
+                0, "gap", Path(tmp), {}, evidence,
+            )
+    check(f"infrastructure receipt reports ERROR even with process status {process_status}",
+          result == "ERROR", repr((result, detail)))
+    check(f"matrix result retains the cause with process status {process_status}",
+          detail == "verification recorded 2 HERMIT_SKID_OVERSHOOT report(s)", detail)
+    check(f"matrix evidence remains gap with process status {process_status}",
+          evidence.get("tier") == "gap", repr(evidence))
+
 # --------------------------------------------------------------------------
 # Ported from the closed hermit#2303, re-expected against THIS ladder.
 #

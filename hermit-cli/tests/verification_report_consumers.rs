@@ -39,7 +39,7 @@ const CONSUMERS: &[Consumer] = &[
     Consumer {
         path: "tests/backend-parity/run_matrix.py",
         requirement: "matched",
-        invocation: "[str(VERIFICATION_REPORT_BIN), \"matched\", str(path)]",
+        invocation: "[str(VERIFICATION_REPORT_BIN), \"--json\", \"matched\", str(path)]",
         minimum_invocations: 1,
     },
     Consumer {
@@ -505,5 +505,92 @@ fn current_shape_and_canonical_evidence_fail_by_name() {
         "weakened comparison must fail by name: {}",
         String::from_utf8_lossy(&refused.stderr)
     );
+    fs::remove_dir_all(temporary).expect("remove temporary directory");
+}
+
+#[test]
+fn json_output_retains_failure_evidence_without_satisfying_a_match_requirement() {
+    let temporary = temporary_directory();
+    let report_path = temporary.join("verify.json");
+    for name in ["matched", "diverged", "no_result", "infrastructure_error"] {
+        let mut report = measured_match();
+        report["verdict"] = serde_json::json!(name);
+        if name != "matched" {
+            report["verified"] = serde_json::json!(false);
+            report["bitwise_parity"] = serde_json::json!(false);
+        }
+        if matches!(name, "no_result" | "infrastructure_error") {
+            report["comparison"] = Value::Null;
+            report["compared_log_messages"] = Value::Null;
+        }
+        if name == "infrastructure_error" {
+            report["infrastructure_error"] =
+                serde_json::json!({"kind": "skid_overshoot", "count": 2});
+        }
+        write_report(&report_path, &report);
+        for requirement in ["matched", "canonical-match"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_verification-report"))
+                .args(["--json", requirement])
+                .arg(&report_path)
+                .output()
+                .expect("read report with JSON output");
+            assert_eq!(
+                output.status.code(),
+                Some(if name == "matched" { 0 } else { 1 }),
+                "{name} must retain its {requirement} exit status: {output:?}"
+            );
+            let parsed: Value = serde_json::from_slice(&output.stdout).expect("typed JSON");
+            for field in [
+                "verified",
+                "bitwise_parity",
+                "verdict",
+                "infrastructure_error",
+                "comparison",
+                "compared_log_messages",
+                "guest_exit_code",
+                "guest_signal",
+            ] {
+                assert_eq!(parsed[field], report[field], "{name}: {field}");
+            }
+            if name == "matched" {
+                assert!(output.stderr.is_empty(), "{output:?}");
+            } else {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains(name),
+                    "failure must still be named: {output:?}"
+                );
+            }
+        }
+    }
+
+    for malformed in ["missing field", "unknown verdict", "invalid cause"] {
+        let mut report = measured_match();
+        match malformed {
+            "missing field" => {
+                report.as_object_mut().unwrap().remove("guest_signal");
+            }
+            "unknown verdict" => report["verdict"] = serde_json::json!("future_verdict"),
+            "invalid cause" => {
+                report["verified"] = serde_json::json!(false);
+                report["bitwise_parity"] = serde_json::json!(false);
+                report["verdict"] = serde_json::json!("infrastructure_error");
+                report["infrastructure_error"] =
+                    serde_json::json!({"kind": "skid_overshoot", "count": 0});
+            }
+            _ => unreachable!(),
+        }
+        write_report(&report_path, &report);
+        let output = Command::new(env!("CARGO_BIN_EXE_verification-report"))
+            .args(["--json", "matched"])
+            .arg(&report_path)
+            .output()
+            .expect("refuse malformed report");
+        assert_eq!(output.status.code(), Some(2), "{malformed}: {output:?}");
+        assert!(output.stdout.is_empty(), "{malformed}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("REFUSED"),
+            "{malformed}: {output:?}"
+        );
+    }
     fs::remove_dir_all(temporary).expect("remove temporary directory");
 }

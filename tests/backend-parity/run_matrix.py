@@ -1068,16 +1068,18 @@ def verify_tier_from_json(path: Path) -> dict[str, str] | None:
     which are the rungs it already belonged on.
 
     The producer-owned Rust type is the vocabulary authority. Python reads the
-    evidence fields only after `verification-report matched` has parsed the
-    complete current shape and accepted the closed `Verdict` enum. Therefore a
-    new Rust variant, an incomplete report, or a self-contradictory verdict is a
-    loud refusal rather than a plausible `guest` or `stripped` tier.
+    evidence fields from `verification-report --json matched`, which parses the
+    complete current shape and checks the closed `Verdict` enum. Its JSON is the
+    same report that was checked, without a second read of a mutable file. A
+    non-match never earns a positive tier; a typed infrastructure error retains
+    its cause beside `gap` so the caller can report `ERROR`.
 
-    Returns ``None`` when no usable current matched report exists.
+    Returns ``None`` for absent, malformed, contradictory or other non-match
+    reports. A well-formed infrastructure error returns `gap`, never a match.
     """
     try:
         typed = subprocess.run(
-            [str(VERIFICATION_REPORT_BIN), "matched", str(path)],
+            [str(VERIFICATION_REPORT_BIN), "--json", "matched", str(path)],
             capture_output=True,
             text=True,
             check=False,
@@ -1088,7 +1090,7 @@ def verify_tier_from_json(path: Path) -> dict[str, str] | None:
             file=sys.stderr,
         )
         return None
-    if typed.returncode != 0:
+    if typed.returncode not in (0, 1):
         detail = typed.stderr.strip() or f"reader exited {typed.returncode}"
         print(
             f"run_matrix: REFUSED typed verification report {path}: {detail}",
@@ -1096,13 +1098,26 @@ def verify_tier_from_json(path: Path) -> dict[str, str] | None:
         )
         return None
     try:
-        record = json.loads(path.read_text(encoding="utf-8").strip() or "{}")
-    except (OSError, ValueError):
+        record = json.loads(typed.stdout)
+    except ValueError:
         return None
     if not isinstance(record, dict):
         return None
+    if typed.returncode != 0 and record.get("verdict") != "infrastructure_error":
+        print(
+            f"run_matrix: REFUSED typed verification report {path}: {typed.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return None
     infrastructure_error = ""
     if record.get("verdict") == "infrastructure_error":
+        if record.get("verified") is not False or record.get("bitwise_parity") is not False:
+            print(
+                f"run_matrix: REFUSED infrastructure_error receipt {path}: "
+                "verified and bitwise_parity must both be false",
+                file=sys.stderr,
+            )
+            return None
         cause = record.get("infrastructure_error")
         if not isinstance(cause, dict):
             print(
@@ -1180,7 +1195,9 @@ def verify_tier_from_json(path: Path) -> dict[str, str] | None:
             file=sys.stderr,
         )
 
-    if bitwise:
+    if infrastructure_error:
+        tier = "gap"
+    elif bitwise:
         tier = "bitwise"
     elif comparison.get("compare_logs"):
         tier = "stripped"

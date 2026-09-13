@@ -22,6 +22,11 @@ fn conventional_help_is_successful_and_consistent() {
         assert!(stdout.starts_with("Usage: verification-report"), "{stdout}");
         assert!(stdout.contains("matched"), "{stdout}");
         assert!(stdout.contains("canonical-match"), "{stdout}");
+        assert!(stdout.contains("--json"), "{stdout}");
+        assert!(
+            stdout.contains("does not mean verification passed"),
+            "{stdout}"
+        );
         assert!(output.stderr.is_empty(), "help wrote stderr: {output:?}");
     }
     assert_eq!(short.stdout, long.stdout, "-h and --help must agree");
