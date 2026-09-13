@@ -179,7 +179,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_unit", 657),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
-    ("test.hermit_integration", 138),
+    ("test.hermit_integration", 139),
     ("test.arbitrary_binaries", 3),
     ("test.cli", 76),
     ("test.liteinst_strict", 23),
