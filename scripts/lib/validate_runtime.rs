@@ -316,11 +316,10 @@ pub fn understood_infrastructure_class(output: &str) -> Option<&'static str> {
     {
         return Some("bpfjailer-banner");
     }
-    match environmental_block_class(output) {
-        Some(class @ ("proxy-egress" | "toolchain-eperm" | "vcs-fs-denial")) => {
-            return Some(class);
-        }
-        _ => {}
+    if let Some(class @ ("proxy-egress" | "toolchain-eperm" | "vcs-fs-denial")) =
+        environmental_block_class(output)
+    {
+        return Some(class);
     }
     if lower.contains("prehook: pmu rcb overshoot!")
         && lower.contains("clock_value:")

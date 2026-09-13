@@ -9315,9 +9315,7 @@ fn ledger_run_results(
     };
     let result = if failures > 0 {
         "fail"
-    } else if interrupted
-        || (exit_code == NO_RESULT_EXIT_CODE as u8 && no_results > 0)
-    {
+    } else if interrupted || exit_code == NO_RESULT_EXIT_CODE as u8 {
         "no_result"
     } else {
         raw
@@ -13046,8 +13044,9 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ));
     }
 
-    // The one attempt remains the terminal failure. The environmental signature
-    // is diagnostic evidence only and stays unconfirmed without a rerun.
+    // The one attempt remains a raw failure. Its environmental hypothesis
+    // stays unconfirmed without a rerun; the separately classified aggregate
+    // records the understood infrastructure cause without claiming a pass.
     let environmental_attempts: Vec<&NodeAttempt> = retried
         .attempts
         .iter()
@@ -13088,10 +13087,20 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         .ok_or("scheduler accounting: recovered environmental outcome disappeared")?;
     let environmental_gate =
         ledger_gate_with_attempts(environmental_outcome, &retried.attempts);
-    if environmental_gate["result"] != "fail"
+    if environmental_gate["result"] != "no_result"
+        || environmental_gate["failure_class"] != "understood_infrastructure_failure"
+        || environmental_gate["raw_result"] != "fail"
+        || environmental_gate["raw_failure_class"] != "understood_infrastructure_failure"
+        || environmental_gate["exit_code"] != 1
+        || !environmental_gate["failure_origin"].is_null()
+        || environmental_gate.get("failed_substeps").is_some()
         || environmental_gate["retries"] != 0
         || environmental_gate["attempts"].as_array().map(Vec::len) != Some(1)
         || environmental_gate["attempts"][0]["result"] != "fail"
+        || environmental_gate["attempts"][0]["exit_code"] != 1
+        || environmental_gate["attempts"][0]["reported"] != true
+        || environmental_gate["attempts"][0]["execution"] != "completed"
+        || environmental_gate["attempts"][0]["environmental_verdict"] != "unconfirmed"
         || !environmental_gate["attempts"][0]["retry_class"].is_null()
     {
         return Err(format!(
@@ -16768,6 +16777,8 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         || completed_exit_code(0, 1, false, false) != NO_RESULT_EXIT_CODE as u8
         || ledger_run_results(NO_RESULT_EXIT_CODE as u8, 0, 1, false)
             != ("fail", "no_result")
+        || ledger_run_results(NO_RESULT_EXIT_CODE as u8, 0, 0, false)
+            != ("fail", "no_result")
     {
         return Err("no-result propagation: exit 75 did not remain a distinct NO_RESULT".into());
     }
@@ -16821,6 +16832,7 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         || ledger_run_results(1, 1, 1, false) != ("fail", "fail")
         || ledger_run_results(1, 0, 1, false) != ("fail", "fail")
         || ledger_run_results(NO_RESULT_EXIT_CODE as u8, 1, 1, false) != ("fail", "fail")
+        || ledger_run_results(NO_RESULT_EXIT_CODE as u8, 1, 0, false) != ("fail", "fail")
     {
         return Err("no-result propagation: a sibling exit 75 hid a genuine failure".into());
     }
@@ -20212,7 +20224,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // non-ok state remains a failure.
     let unexplained_runner_failure =
         plan.nonblocking.is_empty() && plan.compat.is_none() && !ok && no_results == 0
-            && failures == 0 && !run_timed_out && !outcomes.iter().any(|o| outcome_is_failure(o));
+            && failures == 0 && !run_timed_out && !outcomes.iter().any(outcome_is_failure);
     let mut exit_code = completed_exit_code(
         effective_failures,
         no_results,

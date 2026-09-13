@@ -777,6 +777,15 @@ mod ledger_tests {
                 0,
             ),
             (
+                "incomplete_after_collected_pass",
+                vec![pass.clone()],
+                vec![reported_attempt(&pass, 1)],
+                false,
+                super::super::NO_RESULT_EXIT_CODE as u8,
+                "no_result",
+                0,
+            ),
+            (
                 "node_budget",
                 vec![budget.clone()],
                 vec![reported_attempt(&budget, 1)],
@@ -903,6 +912,17 @@ mod ledger_tests {
                 assert_eq!(row["no_result_nodes"], serde_json::json!(["test.fixture"]));
                 assert_eq!(row["product_result_nodes"], serde_json::json!([]));
                 assert_eq!(row["gates"], serde_json::json!([]));
+            }
+            if name == "incomplete_after_collected_pass" {
+                assert_eq!(row["raw_result"], "fail");
+                assert_eq!(row["exit_code"], super::super::NO_RESULT_EXIT_CODE);
+                assert_eq!(row["no_result_nodes"], serde_json::json!([]));
+                assert_eq!(
+                    row["product_result_nodes"],
+                    serde_json::json!(["test.fixture"])
+                );
+                assert_eq!(row["gates"][0]["result"], "pass");
+                assert_eq!(row["validation_complete"], false);
             }
             // These are deliberately nonqualifying fixture rows: no fabricated
             // clean-source, preflight, concurrency, or test-coverage authority.
