@@ -5547,7 +5547,7 @@ struct DirectRepresentation {
 
 fn direct_evidence_keys(
     tracked: &TrackedCells,
-) -> Result<(BTreeSet<DirectEvidenceKey>, bool), String> {
+) -> Result<(BTreeMap<DirectEvidenceKey, usize>, bool), String> {
     let mut counts = BTreeMap::<DirectEvidenceKey, usize>::new();
     let mut opaque = false;
     for cell in &tracked.cells {
@@ -5618,12 +5618,11 @@ fn direct_evidence_keys(
             }
         }
     }
-    if let Some((key, count)) = counts.iter().find(|(_, count)| **count != 1) {
-        return Err(format!(
-            "direct scorecard evidence has {count} records for one exact run identity: {key:?}"
-        ));
-    }
-    Ok((counts.into_keys().collect(), opaque))
+    // Retained history may contain the same compact key in more than one
+    // observation. Keep that multiplicity so the caller can refuse only when
+    // a snapshot event actually claims the ambiguous base; unrelated history
+    // remains opaque evidence rather than disabling every combined write.
+    Ok((counts, opaque))
 }
 
 fn source_direct_evidence_key(
@@ -5695,11 +5694,17 @@ fn direct_representation(
 
     let mut represented_event_ids = BTreeSet::new();
     let mut represented_direct = BTreeSet::new();
-    for direct_key in &direct {
+    for (direct_key, direct_count) in &direct {
         let candidates = source
             .get(&direct_key.base)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
+        if !candidates.is_empty() && *direct_count != 1 {
+            return Err(format!(
+                "series evidence claims direct run {} at {}, but the retained scorecard has {direct_count} records for that exact identity",
+                direct_key.base.run_id, direct_key.base.hermit_sha
+            ));
+        }
         let exact = candidates
             .iter()
             .filter(|(candidate, _)| candidate.as_ref() == Some(direct_key))
@@ -11238,6 +11243,137 @@ red/`measured-and-passed` count is **0**.",
 
     restore_combined_baseline()?;
     let original_combined_pair = read_generated_files(&result_command_root)?;
+
+    // A valid outer digest must not turn malformed snapshot metadata or rows
+    // into admissible input. Row mutations also receive a freshly computed
+    // canonical-row digest and matching counts, so each refusal exercises the
+    // strict field/event contract rather than stopping at an earlier checksum.
+    let recompute_snapshot_rows = |snapshot: &mut JsonValue| -> Result<(), String> {
+        let (rows_read, rows_sha256) = {
+            let rows = snapshot
+                .get("rows")
+                .and_then(JsonValue::as_array)
+                .ok_or("mutated scorecard snapshot lost its rows array")?;
+            (
+                rows.len(),
+                format!("{:x}", Sha256::digest(canonical_snapshot_rows_bytes(rows)?)),
+            )
+        };
+        snapshot["rows_read"] = serde_json::json!(rows_read);
+        snapshot["source"]["published_rows"] = serde_json::json!(rows_read);
+        snapshot["rows_sha256"] = JsonValue::String(rows_sha256);
+        Ok(())
+    };
+    let assert_snapshot_refused_unchanged =
+        |label: &str, snapshot: &JsonValue, expected_cause: &str| -> Result<(), String> {
+            let path = snapshot_root.join(format!("refuse-{label}.json"));
+            let sha256 = write_scorecard_snapshot_fixture(&path, snapshot)?;
+            let error = project_and_observe_results(
+                &result_command_root,
+                &path,
+                &sha256,
+                &result_root,
+                &fixture_head,
+                "fixture-refresh",
+            )
+            .err()
+            .ok_or_else(|| format!("combined snapshot accepted {label}"))?;
+            if !error.contains(expected_cause) {
+                return Err(format!(
+                    "combined snapshot {label} refusal lost its cause: {error}"
+                ));
+            }
+            if read_generated_files(&result_command_root)? != original_combined_pair {
+                return Err(format!(
+                    "combined snapshot {label} refusal changed the generated pair"
+                ));
+            }
+            Ok(())
+        };
+
+    for (label, field, value) in [
+        ("wrong-source-path", "path", serde_json::json!("not-series")),
+        (
+            "wrong-source-commit",
+            "commit",
+            serde_json::json!("not-an-object-id"),
+        ),
+        (
+            "wrong-source-tree",
+            "tree",
+            serde_json::json!("not-an-object-id"),
+        ),
+    ] {
+        let mut mutated = row_snapshot_value.clone();
+        mutated["source"][field] = value;
+        assert_snapshot_refused_unchanged(label, &mutated, "invalid source identity")?;
+    }
+
+    let mut unknown_source_field = row_snapshot_value.clone();
+    unknown_source_field["source"]["unexpected"] = serde_json::json!(true);
+    assert_snapshot_refused_unchanged(
+        "unknown-source-field",
+        &unknown_source_field,
+        "unknown field",
+    )?;
+
+    let mut invalid_snapshot_schema = row_snapshot_value.clone();
+    invalid_snapshot_schema["schema"] = serde_json::json!("scorecard-series-snapshot/v2");
+    assert_snapshot_refused_unchanged(
+        "invalid-snapshot-schema",
+        &invalid_snapshot_schema,
+        "expected scorecard-series-snapshot/v1",
+    )?;
+
+    let mut unknown_snapshot_field = row_snapshot_value.clone();
+    unknown_snapshot_field["unexpected"] = serde_json::json!(true);
+    assert_snapshot_refused_unchanged(
+        "unknown-snapshot-field",
+        &unknown_snapshot_field,
+        "unknown field",
+    )?;
+
+    let mut invalid_row_schema = row_snapshot_value.clone();
+    invalid_row_schema["rows"][0]["schema"] = serde_json::json!("stress-series/v4");
+    recompute_snapshot_rows(&mut invalid_row_schema)?;
+    assert_snapshot_refused_unchanged(
+        "invalid-row-schema",
+        &invalid_row_schema,
+        "unknown variant",
+    )?;
+
+    let mut unknown_row_field = row_snapshot_value.clone();
+    unknown_row_field["rows"][0]["unexpected"] = serde_json::json!(true);
+    recompute_snapshot_rows(&mut unknown_row_field)?;
+    assert_snapshot_refused_unchanged(
+        "unknown-row-field",
+        &unknown_row_field,
+        "invalid field set",
+    )?;
+
+    let mut unknown_series_field = row_snapshot_value.clone();
+    unknown_series_field["rows"][0]["series"]["unexpected"] = serde_json::json!(true);
+    recompute_snapshot_rows(&mut unknown_series_field)?;
+    assert_snapshot_refused_unchanged(
+        "unknown-series-field",
+        &unknown_series_field,
+        "series has an unknown field",
+    )?;
+
+    let mut duplicate_event_id = row_snapshot_value.clone();
+    let mut duplicate_row = duplicate_event_id["rows"][0].clone();
+    duplicate_row["emitted_at"] = serde_json::json!("2026-09-13T18:30:01Z");
+    duplicate_event_id["rows"]
+        .as_array_mut()
+        .expect("snapshot fixture rows are an array")
+        .push(duplicate_row);
+    recompute_snapshot_rows(&mut duplicate_event_id)?;
+    assert_snapshot_refused_unchanged(
+        "duplicate-event-id",
+        &duplicate_event_id,
+        "repeats event_id",
+    )?;
+
     let moved_head_error = project_and_observe_results_with(
         &result_command_root,
         &empty_snapshot_path,
@@ -14038,7 +14174,10 @@ red/`measured-and-passed` count is **0**.",
     let mut preserve_import = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(vec![imported_observation], CellStatus::Green)],
+        cells: vec![boundary_cell(
+            vec![imported_observation.clone()],
+            CellStatus::Green,
+        )],
     };
     let mut current_validate_row = series_row(
         "fixture/boundary/verify/ptrace",
@@ -14050,6 +14189,45 @@ red/`measured-and-passed` count is **0**.",
     );
     current_validate_row.run_id = canonical.run_id.clone();
     current_validate_row.event_id = "fixture-stable-mapped-event".into();
+
+    // Faithful retained-history shape: distinct observation records can carry
+    // the same compact run/result key. That ambiguity is opaque history when
+    // the snapshot claims a different run, and must not make the whole
+    // combined writer inert. It becomes a refusal only when a source event
+    // actually claims the duplicated base.
+    let mut duplicate_history = preserve_import.clone();
+    let mut duplicate_observation = imported_observation.clone();
+    duplicate_observation.depth.insert(
+        "hermit".into(),
+        SourceDepth {
+            commits: 11,
+            first_parent: 10,
+        },
+    );
+    duplicate_history.cells[0]
+        .observations
+        .push(duplicate_observation);
+    let mut unrelated_source_row = current_validate_row.clone();
+    unrelated_source_row.run_id = "fixture-unrelated-source-run".into();
+    unrelated_source_row.event_id = "fixture-unrelated-source-event".into();
+    let unrelated_representation =
+        direct_representation(&duplicate_history, &[unrelated_source_row])?;
+    if !unrelated_representation.represented_event_ids.is_empty()
+        || !unrelated_representation.has_unrepresented_direct_evidence
+    {
+        return Err(
+            "unclaimed duplicate retained evidence was not preserved as opaque history".into(),
+        );
+    }
+    let claimed_duplicate_error =
+        direct_representation(&duplicate_history, &[current_validate_row.clone()])
+            .expect_err("a source event claimed duplicate retained direct evidence");
+    if !claimed_duplicate_error.contains("2 records for that exact identity") {
+        return Err(format!(
+            "claimed duplicate retained-evidence refusal lost its cause: {claimed_duplicate_error}"
+        ));
+    }
+
     let preserved = apply_series_rows(&root, &mut preserve_import, &[current_validate_row], None)?;
     if preserved.represented_rows != 1 || preserved.replaced_observations != 0 {
         return Err(format!(
