@@ -77,10 +77,10 @@ This is measured ptrace-reference parity, not CI plan membership and not same-ba
 
 | Candidate backend | Eligible ptrace-green cells | Disabled probe candidates | Measured match | Parity failure | Never measured |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `dbt` | 340 | 280 | 0 | 0 | 340 |
-| `kvm` | 340 | 102 | 0 | 0 | 340 |
-| `sabre` | 340 | 197 | 0 | 0 | 340 |
-| `liteinst` | 340 | 289 | 0 | 0 | 340 |
+| `dbt` | 341 | 281 | 0 | 0 | 341 |
+| `kvm` | 341 | 93 | 0 | 0 | 341 |
+| `sabre` | 341 | 197 | 0 | 0 | 341 |
+| `liteinst` | 341 | 290 | 0 | 0 | 341 |
 
 Measured pairs are listed individually so a failing backend/test coordinate is visible without interpreting the plan-colour tables. Counts are records/messages actually compared.
 
