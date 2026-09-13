@@ -2371,8 +2371,13 @@ mod tests {
             "explicit-ptrace",
             "broad-disabled",
         ] {
-            let fixture = tempfile::tempdir().unwrap();
-            let path = fixture.path();
+            let fixture = std::env::temp_dir().join(format!(
+                "hermit-harness-mixed-parity-{}-{:?}-{scenario}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            fs::create_dir(&fixture).unwrap();
+            let path = fixture.as_path();
             fs::write(path.join("scenario"), scenario).unwrap();
             let manifests = path.join("tests/e2e/manifests");
             fs::create_dir_all(&manifests).unwrap();
