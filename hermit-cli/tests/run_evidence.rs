@@ -14,7 +14,6 @@ use std::process::Command;
 use std::process::Output;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
-use std::sync::OnceLock;
 
 use detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
 use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
@@ -28,8 +27,6 @@ use hermit::run_evidence::RunEvidenceOutcome;
 use hermit::run_evidence::inspect_run_evidence;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
-static SESSION_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
-static STDIO_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
 fn hermit_run_guard() -> MutexGuard<'static, ()> {
     HERMIT_RUN_LOCK
@@ -37,12 +34,11 @@ fn hermit_run_guard() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn compile_c_fixture(source: &str, directory: &str, output: &str) -> PathBuf {
+fn compile_c_fixture(source: &str, build_root: &Path, output: &str) -> PathBuf {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(directory);
-    fs::create_dir_all(&build_root).expect("failed to create fixture directory");
+    fs::create_dir_all(build_root).expect("failed to create fixture directory");
     let guest = build_root.join(output);
     let compiled = Command::new("cc")
         .args(["-O2", "-Wall", "-Wextra", "-Werror"])
@@ -60,24 +56,20 @@ fn compile_c_fixture(source: &str, directory: &str, output: &str) -> PathBuf {
     guest
 }
 
-fn session_identity_guest() -> &'static Path {
-    SESSION_IDENTITY_GUEST.get_or_init(|| {
-        compile_c_fixture(
-            "tests/c/session_identity.c",
-            "run-evidence-session-identity",
-            "session_identity",
-        )
-    })
+fn session_identity_guest(parent: &Path) -> PathBuf {
+    compile_c_fixture(
+        "tests/c/session_identity.c",
+        &parent.join("run-evidence-session-identity"),
+        "session_identity",
+    )
 }
 
-fn stdio_identity_guest() -> &'static Path {
-    STDIO_IDENTITY_GUEST.get_or_init(|| {
-        compile_c_fixture(
-            "tests/c/stdio_lseek_identity.c",
-            "run-evidence-stdio-identity",
-            "stdio_lseek_identity",
-        )
-    })
+fn stdio_identity_guest(parent: &Path) -> PathBuf {
+    compile_c_fixture(
+        "tests/c/stdio_lseek_identity.c",
+        &parent.join("run-evidence-stdio-identity"),
+        "stdio_lseek_identity",
+    )
 }
 
 fn run(args: &[&str]) -> Output {
@@ -228,7 +220,8 @@ fn sidecar_preserves_session_and_process_group_identity() {
     let parent = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let destination = parent.path().join("evidence");
     let destination_arg = destination.display().to_string();
-    let guest = session_identity_guest().to_str().unwrap();
+    let guest_path = session_identity_guest(parent.path());
+    let guest = guest_path.to_str().unwrap();
 
     // The test binary can itself live below /tmp when this suite is built in a
     // disposable mirror. Expose that host path identically in both controls.
@@ -266,7 +259,8 @@ fn private_evidence_does_not_reuse_the_public_log_file_or_add_a_worker() {
     let baseline_log = parent.path().join("baseline.log");
     let public_log = parent.path().join("public.log");
     let evidence = parent.path().join("evidence");
-    let guest = session_identity_guest().to_str().unwrap();
+    let guest_path = session_identity_guest(parent.path());
+    let guest = guest_path.to_str().unwrap();
 
     let baseline = Command::new(env!("CARGO_BIN_EXE_hermit"))
         .args(["--log-file"])
@@ -320,7 +314,8 @@ fn sidecar_does_not_replace_or_reopen_guest_standard_descriptors() {
     let evidence_report = parent.path().join("evidence-report");
     let evidence_guest_output = parent.path().join("evidence-guest-output");
     let evidence = parent.path().join("evidence");
-    let guest = stdio_identity_guest().to_str().unwrap();
+    let guest_path = stdio_identity_guest(parent.path());
+    let guest = guest_path.to_str().unwrap();
 
     let baseline = run(&[
         "run",
