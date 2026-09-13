@@ -1312,10 +1312,9 @@ fn run_dbt_verifies_simple_env_shebang() {
 #[test]
 #[ignore = "requires the pinned-root isolation validation node and its /test marker"]
 fn run_dbt_verifies_fresh_physical_workdirs() {
-    assert!(
-        cfg!(feature = "dbt"),
-        "the isolation control requires the DBT feature"
-    );
+    if !cfg!(feature = "dbt") {
+        panic!("the isolation control requires the DBT feature");
+    }
     assert_eq!(std::env::var_os(ISOLATED_WORKDIR_ENV), Some("/test".into()));
     let parent_cwd = std::env::current_dir().unwrap();
     let parent_namespace = fs::read_link("/proc/self/ns/mnt").unwrap();
