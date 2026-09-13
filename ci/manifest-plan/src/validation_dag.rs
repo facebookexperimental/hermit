@@ -1811,6 +1811,224 @@ pub fn require_fresh(committed: &str, generated: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    // The fake Podman below executes no container. It records the real wrapper's
+    // argv, reconstructs only its declared environment, and maps exactly the two
+    // fixed image assertion paths to inert files before executing the guard.
+    fn renderer_wrapper_capture(step: &Step, width: i64, wrapped: bool) -> serde_json::Value {
+        use std::os::unix::fs::PermissionsExt;
+
+        use dagrun::model::command_with_inner_jobs;
+        use dagrun::model::env_with_inner_jobs;
+
+        let scratch = Scratch::create().unwrap();
+        let root = &scratch.0;
+        let write_executable = |path: &Path, text: &[u8]| {
+            fs::write(path, text).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        fs::create_dir_all(root.join("ci/hermetic")).unwrap();
+        fs::create_dir_all(root.join("tools")).unwrap();
+        fs::create_dir_all(root.join("ignored/hermetic/split/cargo/registry")).unwrap();
+        let actual_wrapper =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../hermetic/run-in-pinned-root.sh");
+        write_executable(
+            &root.join("ci/hermetic/run-in-pinned-root.sh"),
+            &fs::read(actual_wrapper).unwrap(),
+        );
+        fs::write(
+            root.join("ci/hermetic/image.digest"),
+            "fixture@sha256:unused\n",
+        )
+        .unwrap();
+        for name in ["assert-no-network.sh", "assert-build-dependencies.sh"] {
+            write_executable(&root.join("ci/hermetic").join(name), b"#!/bin/sh\nexit 0\n");
+        }
+        fs::write(
+            root.join("guards.json"),
+            serde_json::to_vec(&[PINNED_ROOT_COMMAND_GUARD, LEGACY_PINNED_ROOT_COMMAND_GUARD])
+                .unwrap(),
+        )
+        .unwrap();
+        write_executable(
+            &root.join("tools/podman"),
+            br##"#!/usr/bin/env python3
+import json, os, pathlib, shlex, subprocess, sys
+root = pathlib.Path(os.environ['WRAPPER_TEST_ROOT'])
+args = sys.argv[1:]
+with (root / 'podman.jsonl').open('a') as out:
+    out.write(json.dumps(args) + '\n')
+if args == ['image', 'exists', 'fixture@sha256:unused']:
+    sys.exit(0)
+assert args[0] == 'run', args
+boundary = args.index('fixture@sha256:unused')
+command = args[boundary + 1:]
+assert command[:2] == ['bash', '-c'] and command[3] == 'bash', command
+assert command[2] in json.loads((root / 'guards.json').read_text()), command
+# No ambient NEXTEST_TEST_THREADS leakage: emulate only explicitly forwarded
+# Podman environment flags, plus the executable lookup needed by the fixture.
+env = {'PATH': os.environ['PATH'], 'LC_ALL': 'C'}
+for index, arg in enumerate(args[:boundary]):
+    if arg in ['--env', '-e']:
+        item = args[index + 1]
+        if '=' in item:
+            name, value = item.split('=', 1)
+            env[name] = value
+        elif item in os.environ:
+            env[item] = os.environ[item]
+for name in ['assert-no-network.sh', 'assert-build-dependencies.sh']:
+    original = '/src/ci/hermetic/' + name
+    assert command[2].count(original) == 1
+    command[2] = command[2].replace(original, shlex.quote(str(root / 'ci/hermetic' / name)))
+completed = subprocess.run(command, cwd=root, env=env, timeout=5)
+sys.exit(completed.returncode)
+"##,
+        );
+        fs::write(
+            root.join("capture.py"),
+            br#"import json, os, pathlib, sys
+pathlib.Path('capture.json').write_text(json.dumps({
+    'args': sys.argv[1:], 'width': os.environ.get('NEXTEST_TEST_THREADS')
+}))
+print('literal-payload-status-37')
+sys.exit(37)
+"#,
+        )
+        .unwrap();
+        let mut command_step = step.clone();
+        command_step.cmd = format!(
+            "python3 {} {}",
+            shell_quote(root.join("capture.py").to_str().unwrap()),
+            step.cmd,
+        );
+        let unwrapped = command_step.cmd.clone();
+        if wrapped {
+            command_step.cmd = pinned_root_command(&command_step);
+        }
+        let rendered = command_with_inner_jobs(&command_step, "-j", Some(width));
+        let mut command = Command::new("timeout");
+        command
+            .args(["-k", "1", "10", "bash", "-c"])
+            .arg(&rendered)
+            .current_dir(root)
+            .env_clear()
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    root.join("tools").display(),
+                    std::env::var("PATH").unwrap(),
+                ),
+            )
+            .env("LC_ALL", "C")
+            .env("WRAPPER_TEST_ROOT", root)
+            .env("NEXTEST_TEST_THREADS", "99");
+        if let Some((name, value)) = env_with_inner_jobs(&command_step, "", Some(width)) {
+            command.env(name, value);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(37),
+            "payload failure status must survive: {rendered}\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(output.stdout, b"literal-payload-status-37\n");
+        assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+        if wrapped {
+            let calls = fs::read_to_string(root.join("podman.jsonl")).unwrap();
+            let calls = calls
+                .lines()
+                .map(|line| serde_json::from_str::<Vec<String>>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0], ["image", "exists", "fixture@sha256:unused"]);
+            let boundary = calls[1]
+                .iter()
+                .position(|arg| arg == "fixture@sha256:unused")
+                .unwrap();
+            assert_eq!(calls[1][boundary + 5], unwrapped);
+            if step.jobs_env.as_deref() == Some("NEXTEST_TEST_THREADS") {
+                assert_eq!(
+                    calls[1][..boundary]
+                        .windows(2)
+                        .filter(|pair| pair[0] == "--env" && pair[1] == "NEXTEST_TEST_THREADS")
+                        .count(),
+                    1,
+                    "the wrapper must explicitly forward the admitted width",
+                );
+                assert_eq!(calls[1].len(), boundary + 6, "no trailing jobs argv");
+            }
+        }
+        serde_json::from_slice(&fs::read(root.join("capture.json")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn pinned_wrapper_preserves_actual_renderer_literal_arguments_and_status() {
+        let mut step = owner(Vec::new());
+        let original = ["already present", ""];
+        let literal = [
+            "space value",
+            "",
+            "$(printf expanded)",
+            "`printf expanded`",
+            "semi;value",
+            "quote'\"",
+            "line\nbreak",
+            "*",
+        ];
+        step.cmd = original.map(shell_quote).join(" ");
+        step.jobs_flag = Some(format!("--jobs %d {}", literal.map(shell_quote).join(" ")));
+        step.jobs_env = Some(String::new());
+        for width in [1, 3] {
+            let plain = renderer_wrapper_capture(&step, width, false);
+            let wrapped = renderer_wrapper_capture(&step, width, true);
+            let expected = original
+                .iter()
+                .copied()
+                .chain(["--jobs", &width.to_string()])
+                .chain(literal)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            assert_eq!(plain["args"], serde_json::json!(expected));
+            assert_eq!(
+                wrapped, plain,
+                "literal renderer argv changed at width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_wrapper_forwards_admitted_nextest_width_without_changing_filter_tail() {
+        for tag in ["test.isolated_dbt_workdir", "test.isolated_detcore_workdir"] {
+            let mut step = crate::validation_dag_static::config()
+                .steps
+                .into_iter()
+                .find(|step| step.tag() == tag)
+                .unwrap();
+            assert_eq!(step.jobs_flag.as_deref(), Some(""));
+            assert_eq!(step.jobs_env.as_deref(), Some("NEXTEST_TEST_THREADS"));
+            let tail = [
+                "existing argument",
+                "--",
+                "--include-ignored",
+                "--exact",
+                "literal test",
+            ];
+            step.cmd = tail.map(shell_quote).join(" ");
+            for width in [1, 3] {
+                let plain = renderer_wrapper_capture(&step, width, false);
+                let wrapped = renderer_wrapper_capture(&step, width, true);
+                assert_eq!(plain["args"], serde_json::json!(tail));
+                assert_eq!(plain["width"], width.to_string());
+                assert_eq!(
+                    wrapped, plain,
+                    "renderer-owned width/filter changed for {tag}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn pinned_root_wrapper_preserves_cache_and_run_state_boundaries() {
         let script = Path::new(env!("CARGO_MANIFEST_DIR"))
