@@ -464,7 +464,8 @@ fn prepare_dbt_guest_command(
     }
 }
 
-// run_dbt supplies only program/args, a cleared exact environment, and cwd.
+// run_dbt supplies program/args, an exact environment represented by values
+// and explicit removals, and cwd.
 // Reconstruct those fields inside the physical run, before DbtRunner performs
 // its own command reconstruction. Stdin and evidence descriptors remain owned
 // by the existing runner adapters.
@@ -487,7 +488,8 @@ fn prepare_dbt_physical_command(guest: &StdCommand) -> Result<StdCommand, Error>
     );
     let mut command = StdCommand::new(prepared.program);
     command.args(prepared.args);
-    command.env_clear();
+    // Do not call env_clear here: std::Command then erases removal entries,
+    // so DbtRunner cannot see them when it reconstructs from get_envs().
     // DbtRunner copies explicit removals as well as values. Preserve the raw
     // command's removal entries instead of re-enumerating ambient variables.
     for (name, value) in guest.get_envs() {
@@ -2215,6 +2217,41 @@ mod tests {
             "the counted-branch clock has its own typed comparison and must not be folded into \
              the opaque summary mismatch"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_physical_command_preserves_explicit_environment_removals() {
+        let inherited = env::vars_os()
+            .map(|(key, _)| key)
+            .find(|key| key != "DBT_PHYSICAL_KEPT")
+            .expect("native fixture requires an inherited environment entry");
+        let environment = BTreeMap::from([(
+            OsString::from("DBT_PHYSICAL_KEPT"),
+            OsString::from("literal guest value"),
+        )]);
+        let mut command = StdCommand::new("/usr/bin/env");
+        apply_exact_environment(&mut command, &environment);
+        command.env_remove("DBT_PHYSICAL_EXPLICIT_REMOVAL");
+        let original = command
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(OsStr::to_owned)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(original.get(&inherited), Some(&None));
+        assert_eq!(
+            original.get(OsStr::new("DBT_PHYSICAL_EXPLICIT_REMOVAL")),
+            Some(&None)
+        );
+        let prepared = prepare_dbt_physical_command(&command).unwrap();
+        let transported = prepared
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(OsStr::to_owned)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            transported, original,
+            "physical command preparation must preserve each removal for DbtRunner"
+        );
+        assert_eq!(prepared.get_program(), command.get_program());
     }
 
     #[test]
