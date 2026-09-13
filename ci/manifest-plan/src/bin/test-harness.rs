@@ -2399,8 +2399,12 @@ mod tests {
                     "modes": {
                         "verify": {"ci": true, "backends_enabled": ["ptrace", "kvm"],
                             "backends_disabled": {"dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected"}},
-                        "naked": {"ci": true, "backends_enabled": ["native"], "runs": 1, "assert": {"min_distinct": 1}},
-                        "chaos": disabled, "replay": disabled, "custom": disabled
+                        "naked": {"ci": false, "backends_enabled": [],
+                            "backends_disabled": {"native": "Not selected by this CI control"}},
+                        "chaos": disabled, "replay": disabled,
+                        "custom": {"ci": true, "backends_enabled": ["kvm"],
+                            "backends_disabled": {"ptrace": "Not selected", "dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected"},
+                            "assert": {"runs": 1}}
                     }
                 }]
             })).unwrap()).unwrap();
@@ -2472,6 +2476,9 @@ if a[0]=='log-diff':
                 first_divergent_virtual_nanoseconds=18,first_divergent_left_message='reference',first_divergent_right_message='candidate')
  pathlib.Path(a[4]).write_text(json.dumps(report));sys.exit(0 if same else 1)
 backend=a[a.index('--backend')+1]
+if '--verify-json' not in a:
+ assert '--verify' not in a and '--verify-strict' not in a,a
+ record({'kind':'custom','backend':backend,'argv':a});sys.exit(0)
 report=pathlib.Path(a[a.index('--verify-json')+1])
 logdir=pathlib.Path(a[a.index('--verify-log-dir')+1])
 reference='parity-reference' in str(logdir)
@@ -2554,7 +2561,7 @@ report.write_bytes((root/'verification.json').read_bytes())
                     assert_eq!(row.attempts.len(), 1);
                 }
             }
-            assert_eq!(rows.iter().filter(|row| row.mode == "naked").count(), 1);
+            assert_eq!(rows.iter().filter(|row| row.mode == "custom").count(), 1);
             assert_eq!(
                 rows.iter()
                     .filter(|row| row.mode == "verify" && row.backend.as_deref() == Some("ptrace"))
@@ -2616,6 +2623,13 @@ report.write_bytes((root/'verification.json').read_bytes())
                     );
                 }
             }
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call["kind"] == "custom" && call["backend"] == "kvm")
+                    .count(),
+                1
+            );
             assert_eq!(
                 calls
                     .iter()
