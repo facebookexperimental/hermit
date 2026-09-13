@@ -432,7 +432,7 @@ impl LogDiffCLIOpts {
                     options,
                     &comparison.summary,
                     records,
-                    JsonVerdict::Refused,
+                    LogDiffVerdict::Refused,
                     "refused",
                     ExitStatus::Exited(2),
                 );
