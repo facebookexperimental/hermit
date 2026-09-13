@@ -17,8 +17,13 @@ use hermit::Backend;
 use tracing::metadata::LevelFilter;
 
 use super::tracing::BoundedWriter;
+use super::tracing::LatchedWriter;
+use super::tracing::TracingGuard;
+use super::tracing::WriteErrorLatch;
 use super::tracing::init_file_tracing;
+use super::tracing::init_file_tracing_with_evidence;
 use super::tracing::init_stderr_tracing;
+use super::tracing::init_stderr_tracing_with_evidence;
 use super::tracing::log_max_bytes;
 
 /// Hermit provides a sandbox for deterministic and reproducible execution.
@@ -72,6 +77,15 @@ pub struct GlobalOpts {
     #[clap(skip)]
     pub log_file_handle: Option<Arc<File>>,
 
+    /// Fresh anonymous host file receiving the opt-in ordinary-run evidence log.
+    /// It is opened before entering the container and never replaces `--log-file`.
+    #[clap(skip)]
+    pub(crate) run_evidence_log_handle: Option<Arc<File>>,
+
+    /// Process-shared error state for the private run-evidence writer.
+    #[clap(skip)]
+    pub(crate) run_evidence_write_error: Option<WriteErrorLatch>,
+
     /// Select the process instrumentation backend. This is the preferred, global
     /// position (e.g. `hermit --backend ptrace run ...`); for backwards
     /// compatibility `run` also accepts `--backend` after the subcommand.
@@ -98,6 +112,30 @@ impl GlobalOpts {
         Ok(())
     }
 
+    pub(crate) fn set_run_evidence_log_handle(
+        &mut self,
+        handle: Arc<File>,
+        write_error: WriteErrorLatch,
+    ) {
+        self.run_evidence_log_handle = Some(handle);
+        self.run_evidence_write_error = Some(write_error);
+    }
+
+    fn run_evidence_writer(&self, limit: u64) -> Option<LatchedWriter<BoundedWriter<File>>> {
+        self.run_evidence_log_handle.as_ref().map(|evidence| {
+            let evidence = evidence
+                .try_clone()
+                .expect("cannot duplicate the private run-evidence descriptor");
+            let evidence = BoundedWriter::new(evidence, limit);
+            let write_error = self
+                .run_evidence_write_error
+                .as_ref()
+                .expect("private run-evidence writer is missing its error latch")
+                .clone();
+            LatchedWriter::new(evidence, write_error)
+        })
+    }
+
     /// Initalizes tracing. If using a container, this must be done *inside* of
     /// the container because the tracer may create a new thread.
     ///
@@ -105,7 +143,7 @@ impl GlobalOpts {
     /// `log_file_handle` for why opening at this point resolves the path in the
     /// guest namespace and silently loses it.
     #[must_use = "This function returns a guard that should not be immediately dropped"]
-    pub fn init_tracing(&self) -> Option<impl Drop + use<>> {
+    pub fn init_tracing(&self) -> Option<TracingGuard> {
         if let Some(handle) = &self.log_file_handle {
             // Each subscriber needs an owned File; `try_clone` dups the descriptor,
             // so every run writes through the same host-side open file.
@@ -114,7 +152,15 @@ impl GlobalOpts {
                 .expect("cannot duplicate the host log file descriptor");
             let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
             let file_writer = BoundedWriter::new(file_writer, limit);
-            Some(init_file_tracing(self.log, file_writer))
+            if let Some(evidence) = self.run_evidence_writer(limit) {
+                Some(init_file_tracing_with_evidence(
+                    self.log,
+                    file_writer,
+                    evidence,
+                ))
+            } else {
+                Some(init_file_tracing(self.log, file_writer))
+            }
         } else if let Some(path) = &self.log_file {
             // An internal caller set the path directly rather than going through
             // `open_log_file` -- today that is verify's double-run setup, which
@@ -130,7 +176,21 @@ impl GlobalOpts {
             // re-enable it.
             let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
             let file_writer = BoundedWriter::new(file_writer, limit);
-            Some(init_file_tracing(self.log, file_writer))
+            if let Some(evidence) = self.run_evidence_writer(limit) {
+                Some(init_file_tracing_with_evidence(
+                    self.log,
+                    file_writer,
+                    evidence,
+                ))
+            } else {
+                Some(init_file_tracing(self.log, file_writer))
+            }
+        } else if self.run_evidence_log_handle.is_some() {
+            let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
+            let evidence = self
+                .run_evidence_writer(limit)
+                .expect("run-evidence handle was present");
+            Some(init_stderr_tracing_with_evidence(self.log, evidence))
         } else {
             init_stderr_tracing(self.log);
             None

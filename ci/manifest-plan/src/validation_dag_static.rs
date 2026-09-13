@@ -175,11 +175,11 @@ pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
 /// corresponding shipped command and accounting for changed test identities.
 pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.regular_crates", 447),
-    ("test.hermit_unit", 496),
+    ("test.hermit_unit", 523),
     ("test.detcore_unit", 667),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
-    ("test.hermit_integration", 139),
+    ("test.hermit_integration", 148),
     ("test.arbitrary_binaries", 3),
     ("test.cli", 76),
     ("test.liteinst_strict", 23),
@@ -2174,7 +2174,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test chown_virtual_root_identity --test clock_determinism --test clock_discipline_determinism --test container_init_deadline --test cpufreq_avg_determinism --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test robust_futex_owner_death --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test verification_report_cli --test verification_report_consumers --test writev_determinism --test zero_copy_pipe_fallback -j 1"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test chown_virtual_root_identity --test clock_determinism --test clock_discipline_determinism --test container_init_deadline --test cpufreq_avg_determinism --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test robust_futex_owner_death --test run_evidence --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test verification_report_cli --test verification_report_consumers --test writev_determinism --test zero_copy_pipe_fallback -j 1"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[
@@ -2209,6 +2209,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"pty_nr_determinism"########,
             r########"python_stdlib"########,
             r########"robust_futex_owner_death"########,
+            r########"run_evidence"########,
             r########"self_sched_determinism"########,
             r########"self_schedstat_determinism"########,
             r########"signal_determinism"########,

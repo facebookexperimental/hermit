@@ -186,6 +186,8 @@ impl RunData {
             // separate global-position backend to apply here.
             backend: None,
             log_file_handle: None,
+            run_evidence_log_handle: None,
+            run_evidence_write_error: None,
         };
         // Open it HERE, on the host, for the same reason `main` does: `launch` runs
         // before the container exists, and opening later would resolve this path in

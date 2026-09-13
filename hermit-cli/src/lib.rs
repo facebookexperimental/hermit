@@ -27,6 +27,7 @@ mod id;
 pub mod instruction_map;
 mod interp;
 mod metadata;
+pub mod run_evidence;
 
 pub use canonical_verdict::Verdict;
 

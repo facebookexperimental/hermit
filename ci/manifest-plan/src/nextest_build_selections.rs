@@ -112,6 +112,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "robust_futex_owner_death",
             "--test",
+            "run_evidence",
+            "--test",
             "self_sched_determinism",
             "--test",
             "self_schedstat_determinism",

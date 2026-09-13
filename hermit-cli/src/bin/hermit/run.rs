@@ -534,6 +534,24 @@ pub struct RunOpts {
     )]
     backend_engagement_json: Option<PathBuf>,
 
+    /// Retain typed evidence for this one ordinary run in a newly created
+    /// directory. NEW_PATH must not exist. Hermit writes a private synchronous
+    /// INFO log without changing the guest's standard descriptors, validates it
+    /// under BitwiseInfoV1, publishes the log with a SHA-256 digest, and publishes
+    /// manifest.json last. A missing, malformed, truncated, or empty log is a
+    /// no-result, never successful evidence. This is currently supported by
+    /// ptrace, LiteInst, and KVM. DBT is refused because its authenticated evidence
+    /// transport currently implies isolated process-group policy that can change
+    /// guest setsid/setpgid results. SaBRe is refused because plugin DETLOG is
+    /// emitted only on shared stderr. KVM's manifest records its exit-code-only
+    /// disposition limitation.
+    #[clap(
+        long,
+        conflicts_with_all = ["verify", "namespace_only"],
+        value_name = "NEW_PATH"
+    )]
+    run_evidence_dir: Option<PathBuf>,
+
     /// Diagnose non-zero network binds. Implies an isolated network namespace and conflicts with
     /// `--network=host`.
     #[clap(long)]
@@ -828,6 +846,10 @@ impl fmt::Display for RunOpts {
         if let Some(p) = &self.backend_engagement_json {
             let s = p.to_str().expect("valid unicode path");
             write!(f, " --backend-engagement-json={}", shell_words::quote(s))?;
+        }
+        if let Some(p) = &self.run_evidence_dir {
+            let s = p.to_str().expect("valid unicode path");
+            write!(f, " --run-evidence-dir={}", shell_words::quote(s))?;
         }
         if self.analyze_networking {
             write!(f, " --analyze-networking")?;
@@ -2636,6 +2658,16 @@ impl RunOpts {
         self.image.as_deref()
     }
 
+    pub(crate) fn run_evidence_request(
+        &self,
+        global_backend: Option<Backend>,
+    ) -> Option<(&Path, Backend)> {
+        self.run_evidence_dir.as_deref().map(|directory| {
+            let backend = self.backend.or(global_backend).unwrap_or_default();
+            (directory, backend)
+        })
+    }
+
     fn selected_backend(&self) -> Backend {
         self.backend.unwrap_or_default()
     }
@@ -2949,6 +2981,29 @@ impl RunOpts {
 
     fn validate_args_with_perf_support(&mut self, perf_supported: bool) -> Result<(), Error> {
         let backend = self.selected_backend();
+        if self.run_evidence_dir.is_some() {
+            let limitation = match backend {
+                Backend::Ptrace | Backend::Liteinst | Backend::Kvm => None,
+                Backend::Dbt => Some(
+                    "authenticated DBT evidence currently implies an isolated process group, \
+                     which can change guest setsid/setpgid results",
+                ),
+                Backend::Sabre => Some(
+                    "the SaBRe plugin currently emits DETLOG only on shared stderr, which is not \
+                     an authoritative private evidence channel",
+                ),
+                Backend::E9patch => Some(
+                    "e9patch preprocessing has not been qualified for this evidence contract; \
+                     request the ptrace backend directly",
+                ),
+            };
+            if let Some(limitation) = limitation {
+                return Err(Error::new(PolicyRefusal).context(format!(
+                    "--run-evidence-dir is unavailable for backend `{}`: {limitation}",
+                    backend.as_str()
+                )));
+            }
+        }
         if self.skid_margin.is_some()
             && (self.namespace_only
                 || !matches!(
@@ -4909,6 +4964,53 @@ mod tests {
             options.retained_verify_log_dir().unwrap(),
             Some(fs::canonicalize(requested).unwrap())
         );
+    }
+
+    #[test]
+    fn run_evidence_backend_scope_matches_authoritative_private_sinks() {
+        for backend in [Backend::Ptrace, Backend::Liteinst, Backend::Kvm] {
+            let mut options = RunOpts::parse_from([
+                "run",
+                &format!("--backend={}", backend.as_str()),
+                "--run-evidence-dir=/unused/new-path",
+                "/bin/true",
+            ]);
+            options
+                .validate_args_with_perf_support(true)
+                .unwrap_or_else(|error| panic!("{backend:?} should be supported: {error:#}"));
+        }
+
+        for (backend, limitation) in [
+            (Backend::Dbt, "isolated process group"),
+            (Backend::Sabre, "shared stderr"),
+            (Backend::E9patch, "not been qualified"),
+        ] {
+            let mut options = RunOpts::parse_from([
+                "run",
+                &format!("--backend={}", backend.as_str()),
+                "--run-evidence-dir=/unused/new-path",
+                "/bin/true",
+            ]);
+            let error = options.validate_args_with_perf_support(true).unwrap_err();
+            assert!(error.downcast_ref::<PolicyRefusal>().is_some());
+            assert!(error.to_string().contains(limitation), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn run_evidence_is_only_an_ordinary_instrumented_run_option() {
+        for incompatible in ["--verify", "--namespace-only"] {
+            assert!(
+                RunOpts::try_parse_from([
+                    "run",
+                    "--run-evidence-dir=/unused/new-path",
+                    incompatible,
+                    "/bin/true",
+                ])
+                .is_err(),
+                "{incompatible} must remain incompatible with one-run evidence"
+            );
+        }
     }
 
     #[test]
