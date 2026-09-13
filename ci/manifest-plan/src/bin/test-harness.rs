@@ -39,6 +39,7 @@ use hermit_manifest_plan::stress_series::HostCapabilities;
 use hermit_manifest_plan::stress_series::HostCapability;
 #[cfg(test)]
 use hermit_manifest_plan::stress_series::HostCapabilityVerdict;
+use hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD;
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 
@@ -1041,7 +1042,14 @@ fn command_runs_exactly(command: &str, inner: &str) -> bool {
     let Some(rest) = command.strip_prefix(PINNED_COMMAND_PREFIX) else {
         return false;
     };
-    let Some((forwarded, quoted_inner)) = rest.split_once(PINNED_COMMAND_SEPARATOR) else {
+    let current_separator = format!(
+        " -- bash -c {} bash ",
+        shell_quote_one(PINNED_ROOT_COMMAND_GUARD)
+    );
+    let Some((forwarded, quoted_inner)) = rest
+        .split_once(&current_separator)
+        .or_else(|| rest.split_once(PINNED_COMMAND_SEPARATOR))
+    else {
         return false;
     };
     let words = forwarded.split_whitespace().collect::<Vec<_>>();
@@ -2994,6 +3002,50 @@ mod tests {
             ),
             inner
         ));
+
+        let committed = dagrun::dag_from_json(include_str!("../../../dag/validate.json"))
+            .expect("the committed validation DAG must parse");
+        for lane in ["portable", "privileged"] {
+            let dag = dagrun::select_steps_by_labels(&committed, &[lane.to_string()]).unwrap();
+            let inner =
+                format!("target/debug/test-harness build --lane {lane} --ci-only --allow-empty");
+            let matches = dag
+                .steps
+                .iter()
+                .filter(|step| command_runs_exactly(&step.cmd, &inner))
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 2, "{lane}: host and pinned build commands");
+            let pinned = matches
+                .iter()
+                .find(|step| step.cmd.starts_with(PINNED_COMMAND_PREFIX))
+                .expect("the generated pinned command must match");
+            for malformed in [
+                pinned
+                    .cmd
+                    .replace("/src/ci/hermetic/assert-no-network.sh && ", ""),
+                pinned
+                    .cmd
+                    .replace("/src/ci/hermetic/assert-build-dependencies.sh && ", ""),
+                pinned
+                    .cmd
+                    .replace("hermit_payload=$1", "hermit_payload=true"),
+                format!("{} --unexpected", pinned.cmd),
+                pinned.cmd.replace(
+                    "--env E2E_RESULT_ROOT ",
+                    "--env E2E_RESULT_ROOT --env E2E_RESULT_ROOT ",
+                ),
+                pinned
+                    .cmd
+                    .replace("--env E2E_RESULT_ROOT ", "--env lowercase "),
+                pinned.cmd.replace(&inner, &format!("{inner} --jobs 2")),
+            ] {
+                assert_ne!(malformed, pinned.cmd, "control must alter the command");
+                assert!(
+                    !command_runs_exactly(&malformed, &inner),
+                    "accepted malformed or nonmatching command: {malformed}"
+                );
+            }
+        }
     }
 
     #[test]
