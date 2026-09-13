@@ -338,6 +338,9 @@ pub fn init_sync_file_tracing<W: Write + Send + 'static>(
     level: Option<LevelFilter>,
     f: W,
 ) -> TracingGuard {
+    // Match the PID/TID slot consumed by file tracing's worker and by the
+    // stderr logger, while keeping verification evidence synchronous.
+    equalize_tracing_thread_number();
     let level = level.unwrap_or(DEFAULT_TRACE_LEVEL);
     let subscriber = sync_file_subscriber(level, f);
     subscriber
