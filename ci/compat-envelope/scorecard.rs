@@ -7,8 +7,9 @@
 //! [dependencies]
 //! fs2 = "0.4"
 //! hermit-manifest-plan = { path = "../manifest-plan" }
+//! libc = "0.2"
 //! serde = { version = "1", features = ["derive"] }
-//! serde_json = "1"
+//! serde_json = { version = "1", features = ["raw_value"] }
 //! sha2 = "0.10"
 //! tempfile = "3"
 //! ```
@@ -23,10 +24,14 @@ use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::os::unix::fs::FileExt as UnixFileExt;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
+use std::process::Stdio;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -49,6 +54,7 @@ use hermit_manifest_plan::stress_series::SourceDepth;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
+use serde_json::value::RawValue;
 use sha2::Digest;
 use sha2::Sha256;
 use tempfile::NamedTempFile;
@@ -59,6 +65,8 @@ const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
 const SCHEMA: u64 = 7;
 const PRESSURE_SUMMARY_SCHEMA: u64 = 5;
 const CELL_RESULT_SCHEMA: u64 = 4;
+const SCORECARD_SERIES_SNAPSHOT_SCHEMA: &str = "scorecard-series-snapshot/v1";
+const SCORECARD_SERIES_SNAPSHOT_SOURCE: &str = "series";
 
 const USAGE: &str = r#"Usage: ci/compat-envelope/scorecard.rs COMMAND [OPTIONS]
 
@@ -94,6 +102,12 @@ Commands:
       supplied no rows: reading nothing is what an unpopulated series looks
       like, not a finding that a cell has no evidence. An unreachable root is
       refused outright rather than read as empty.
+  project-and-observe-results --snapshot FILE --snapshot-sha256 HEX \
+      --results DIR --expected-head SHA --refreshed-at STAMP
+      In one locked transaction, project one immutable canonical series
+      snapshot and then merge one completed validate result directory. The
+      two generated files are replaced as one guarded pair. This command is
+      dormant until its parent snapshot provider and callers land together.
   verify-results --results DIR [--lanes portable,privileged]
       Check the tracked files, then require a fresh PASS row at HEAD for every
       selected regression cell in the named lanes. The default is both lanes.
@@ -108,6 +122,24 @@ Green means that the cell is selected by full in ci/expected-e2e-plan.json.
 Red means that the cell is in the manifest but is not selected by full; red
 does not mean failed. Manifest-disabled combinations are Not applicable.
 "#;
+
+const PROJECT_AND_OBSERVE_USAGE: &str = r#"Usage: ci/compat-envelope/scorecard.rs project-and-observe-results \
+    --snapshot FILE --snapshot-sha256 HEX --results DIR \
+    --expected-head SHA --refreshed-at STAMP
+
+Project one immutable scorecard-series-snapshot/v1 input, then merge one exact
+completed validation result directory, under one scorecard write-back lock and
+one guarded two-file replacement.
+"#;
+
+#[derive(Debug)]
+struct ProjectAndObserveArgs {
+    snapshot: PathBuf,
+    snapshot_sha256: String,
+    results: PathBuf,
+    expected_head: String,
+    refreshed_at: String,
+}
 
 #[derive(Clone, Debug, Deserialize)]
 struct ManifestRow {
@@ -1238,8 +1270,10 @@ impl ResultRow {
             if raw.get("verdict").and_then(JsonValue::as_str) != Some("no_result") {
                 return Ok(None);
             }
-            let report = canonical_verdict::VerificationReport::from_current_json_slice(report_text.as_bytes())
-                .map_err(|error| format!("attempt {} {error}", index + 1))?;
+            let report = canonical_verdict::VerificationReport::from_current_json_slice(
+                report_text.as_bytes(),
+            )
+            .map_err(|error| format!("attempt {} {error}", index + 1))?;
             reports.push((index, attempt, report));
         }
 
@@ -1554,9 +1588,10 @@ impl ResultRow {
                     index + 1
                 ));
             }
-            let report =
-                canonical_verdict::VerificationReport::from_current_json_slice(report_text.as_bytes())
-                    .map_err(|error| format!("attempt {} {error}", index + 1))?;
+            let report = canonical_verdict::VerificationReport::from_current_json_slice(
+                report_text.as_bytes(),
+            )
+            .map_err(|error| format!("attempt {} {error}", index + 1))?;
             report.require_canonical_comparison().map_err(|error| {
                 format!(
                     "attempt {} cannot support a scorecard result: {error}",
@@ -1681,9 +1716,10 @@ impl ResultRow {
                     index + 1
                 )
             })?;
-            let report =
-                canonical_verdict::VerificationReport::from_current_json_slice(report_text.as_bytes())
-                    .map_err(|error| format!("attempt {} {error}", index + 1))?;
+            let report = canonical_verdict::VerificationReport::from_current_json_slice(
+                report_text.as_bytes(),
+            )
+            .map_err(|error| format!("attempt {} {error}", index + 1))?;
 
             if matches!(
                 report.verdict,
@@ -1913,7 +1949,10 @@ impl ResultRow {
                     None => {
                         saw_no_result = true;
                         unavailable.get_or_insert_with(|| {
-                            format!("NO_RESULT: attempt {} recorded no specific cause", index + 1)
+                            format!(
+                                "NO_RESULT: attempt {} recorded no specific cause",
+                                index + 1
+                            )
                         });
                     }
                 },
@@ -2138,6 +2177,67 @@ where
     Ok((summaries, retained))
 }
 
+fn set_project_and_observe_arg(
+    slot: &mut Option<String>,
+    option: &str,
+    value: Option<String>,
+) -> Result<(), String> {
+    if slot.is_some() {
+        return Err(format!(
+            "project-and-observe-results accepts {option} only once\n\n{PROJECT_AND_OBSERVE_USAGE}"
+        ));
+    }
+    *slot = Some(value.ok_or_else(|| {
+        format!(
+            "project-and-observe-results {option} requires a value\n\n{PROJECT_AND_OBSERVE_USAGE}"
+        )
+    })?);
+    Ok(())
+}
+
+fn parse_project_and_observe_args<I>(mut args: I) -> Result<ProjectAndObserveArgs, String>
+where
+    I: Iterator<Item = String>,
+{
+    let mut snapshot = None;
+    let mut snapshot_sha256 = None;
+    let mut results = None;
+    let mut expected_head = None;
+    let mut refreshed_at = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--snapshot" => set_project_and_observe_arg(&mut snapshot, "--snapshot", args.next())?,
+            "--snapshot-sha256" => {
+                set_project_and_observe_arg(&mut snapshot_sha256, "--snapshot-sha256", args.next())?
+            }
+            "--results" => set_project_and_observe_arg(&mut results, "--results", args.next())?,
+            "--expected-head" => {
+                set_project_and_observe_arg(&mut expected_head, "--expected-head", args.next())?
+            }
+            "--refreshed-at" => {
+                set_project_and_observe_arg(&mut refreshed_at, "--refreshed-at", args.next())?
+            }
+            _ => {
+                return Err(format!(
+                    "unknown project-and-observe-results option `{arg}`\n\n{PROJECT_AND_OBSERVE_USAGE}"
+                ));
+            }
+        }
+    }
+    let required = |value: Option<String>, option: &str| {
+        value.ok_or_else(|| {
+            format!("project-and-observe-results requires {option}\n\n{PROJECT_AND_OBSERVE_USAGE}")
+        })
+    };
+    Ok(ProjectAndObserveArgs {
+        snapshot: PathBuf::from(required(snapshot, "--snapshot FILE")?),
+        snapshot_sha256: required(snapshot_sha256, "--snapshot-sha256 HEX")?,
+        results: PathBuf::from(required(results, "--results DIR")?),
+        expected_head: required(expected_head, "--expected-head SHA")?,
+        refreshed_at: required(refreshed_at, "--refreshed-at STAMP")?,
+    })
+}
+
 fn main() -> ExitCode {
     rust_script_prelude::init();
     match run() {
@@ -2239,6 +2339,22 @@ fn run() -> Result<(), String> {
                 // produce the same file. A refresh timestamp the tool invents is
                 // a diff on every run that says nothing changed.
                 &refreshed_at.ok_or("project-observations requires --refreshed-at STAMP")?,
+            )?;
+        }
+        "project-and-observe-results" => {
+            let remaining = args.collect::<Vec<_>>();
+            if remaining.len() == 1 && matches!(remaining[0].as_str(), "-h" | "--help") {
+                print!("{PROJECT_AND_OBSERVE_USAGE}");
+                return Ok(());
+            }
+            let options = parse_project_and_observe_args(remaining.into_iter())?;
+            project_and_observe_results(
+                &root,
+                &options.snapshot,
+                &options.snapshot_sha256,
+                &options.results,
+                &options.expected_head,
+                &options.refreshed_at,
             )?;
         }
         "verify-results" => {
@@ -3364,7 +3480,7 @@ fn check_observation_worktree(root: &Path) -> Result<(), String> {
     observation_dirt_error(staged_clean, unrelated_clean).map_or(Ok(()), |e| Err(e.into()))
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 struct GeneratedFiles {
     scorecard: Vec<u8>,
     cells: Vec<u8>,
@@ -3581,13 +3697,14 @@ fn observation_tree_counts(tracked: &TrackedCells, head_tree: &str) -> (usize, u
         .cells
         .iter()
         .flat_map(|cell| cell.observations.iter())
-        .fold((0, 0), |(different, unknown), observation| {
-            match observation.detcore_tree.as_deref() {
+        .fold(
+            (0, 0),
+            |(different, unknown), observation| match observation.detcore_tree.as_deref() {
                 Some(tree) if tree != head_tree => (different + 1, unknown),
                 None => (different, unknown + 1),
                 _ => (different, unknown),
-            }
-        })
+            },
+        )
 }
 
 fn render_evidence_coverage(root: &Path) -> Result<String, String> {
@@ -4204,8 +4321,7 @@ fn apply_validate_results(
                 .then(left.evidence_identity.cmp(&right.evidence_identity))
         });
         let mut distinct = Vec::with_capacity(classified.len());
-        let mut identities_by_attempt =
-            BTreeMap::<(String, u64), (String, Option<String>)>::new();
+        let mut identities_by_attempt = BTreeMap::<(String, u64), (String, Option<String>)>::new();
         for (candidate, evidence) in classified {
             let key = (candidate.row.run_id.clone(), candidate.row.attempt);
             let classification_identity = (candidate.row.result.is_some()
@@ -5028,6 +5144,219 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
     Ok(())
 }
 
+fn verify_combined_write_state(
+    root: &Path,
+    expected_head: &str,
+    expected_scorecard: &[u8],
+    expected_cells: &[u8],
+    snapshot: &HeldScorecardSeriesSnapshot,
+) -> Result<(), String> {
+    check_observation_worktree(root)?;
+    let current_head = git_head(root)?;
+    if current_head != expected_head {
+        return Err(format!(
+            "HEAD moved from {expected_head} to {current_head} during combined scorecard write-back"
+        ));
+    }
+    let current = read_generated_files(root)?;
+    if current.scorecard != expected_scorecard {
+        return Err(format!(
+            "{SCORECARD} changed during combined scorecard write-back"
+        ));
+    }
+    if current.cells != expected_cells {
+        return Err(format!(
+            "{CELLS} changed during combined scorecard write-back"
+        ));
+    }
+    snapshot.verify()
+}
+
+fn project_and_observe_results(
+    root: &Path,
+    snapshot_path: &Path,
+    snapshot_sha256: &str,
+    results: &Path,
+    expected_head: &str,
+    refreshed_at: &str,
+) -> Result<(), String> {
+    project_and_observe_results_with(
+        root,
+        snapshot_path,
+        snapshot_sha256,
+        results,
+        expected_head,
+        refreshed_at,
+        || Ok(()),
+        |_| Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_and_observe_results_with<BeforeGuard, BeforeReplace>(
+    root: &Path,
+    snapshot_path: &Path,
+    snapshot_sha256: &str,
+    results: &Path,
+    expected_head: &str,
+    refreshed_at: &str,
+    mut before_guard: BeforeGuard,
+    mut before_replace: BeforeReplace,
+) -> Result<(), String>
+where
+    BeforeGuard: FnMut() -> Result<(), String>,
+    BeforeReplace: FnMut(usize) -> Result<(), String>,
+{
+    if !is_object_id(expected_head) {
+        return Err("--expected-head requires exactly 40 lowercase hexadecimal characters".into());
+    }
+    if refreshed_at.trim().is_empty() {
+        return Err("--refreshed-at requires a nonempty deterministic stamp".into());
+    }
+    if !results.is_dir() {
+        return Err(format!(
+            "result directory does not exist: {}",
+            results.display()
+        ));
+    }
+
+    let _lock = acquire_scorecard_write_lock(root)?;
+    let head = git_head(root)?;
+    if head != expected_head {
+        return Err(format!(
+            "combined scorecard write-back expected HEAD {expected_head}, found {head}"
+        ));
+    }
+    check_observation_worktree(root)?;
+    let original = read_generated_files(root)?;
+    let derived = check_tracked(root)?;
+    let snapshot = HeldScorecardSeriesSnapshot::open(snapshot_path, snapshot_sha256)?;
+    let detcore_tree = git_rev_parse(root, "HEAD:detcore")?;
+    let depth = source_depths(root, &head)?;
+    let result_rows = read_result_candidates(results, &head)?;
+
+    let mut tracked: TrackedCells = serde_json::from_slice(&original.cells)
+        .map_err(|error| format!("cannot parse tracked {CELLS}: {error}"))?;
+    let before = tracked.clone();
+    let _initial_projection = apply_series_rows(
+        root,
+        &mut tracked,
+        &snapshot.rows,
+        Some(&snapshot.snapshot.source.path),
+    )?;
+    let rows_read = snapshot.snapshot.rows_read;
+    tracked.schema = SCHEMA;
+    tracked.projection = Some(ObservationProjection {
+        source: snapshot.snapshot.source.path.clone(),
+        source_commit: Some(snapshot.snapshot.source.commit.clone()),
+        source_tree: Some(snapshot.snapshot.source.tree.clone()),
+        refreshed_at: refreshed_at.to_string(),
+        rows_read,
+        pre_series_corpus: true,
+    });
+    enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
+    let fold = apply_validate_results(
+        &mut tracked,
+        &result_rows,
+        &head,
+        &detcore_tree,
+        &depth,
+        true,
+        true,
+    )?;
+    // A normal validate publishes its series row before this local write-back.
+    // Match the final direct evidence to the complete snapshot before choosing
+    // its stored representation. Exactly represented events are suppressed in
+    // favour of the richer direct invocation; zero matches remain explicit
+    // pre-series evidence, while conflicting or multiple matches refuse.
+    let representation = direct_representation(&tracked, &snapshot.rows)?;
+    remove_replaceable_projected_observations(
+        &mut tracked,
+        &snapshot.rows,
+        Some(&snapshot.snapshot.source.path),
+    )?;
+    let projected_rows = snapshot
+        .rows
+        .iter()
+        .filter(|row| !representation.represented_event_ids.contains(&row.event_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let projection = apply_series_rows(
+        root,
+        &mut tracked,
+        &projected_rows,
+        Some(&snapshot.snapshot.source.path),
+    )?;
+    tracked.projection = Some(ObservationProjection {
+        source: snapshot.snapshot.source.path.clone(),
+        source_commit: Some(snapshot.snapshot.source.commit.clone()),
+        source_tree: Some(snapshot.snapshot.source.tree.clone()),
+        refreshed_at: refreshed_at.to_string(),
+        rows_read,
+        // This describes the FINAL post-current state. An exact direct run
+        // represented by one snapshot event is not pre-series merely because
+        // its richer stored form deliberately has no event_ids.
+        pre_series_corpus: rows_read == 0 || representation.has_unrepresented_direct_evidence,
+    });
+    enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
+    refresh_measurement(&mut tracked);
+    enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
+    let updated = generated_files(&derived, &tracked)?;
+    let partial_scorecard = updated.scorecard.clone();
+
+    let changed = replace_generated_files_with(
+        root,
+        &original,
+        &updated,
+        || {
+            before_guard()?;
+            verify_combined_write_state(
+                root,
+                &head,
+                &original.scorecard,
+                &original.cells,
+                &snapshot,
+            )
+        },
+        |replacement| {
+            before_replace(replacement)?;
+            let expected_scorecard = if replacement == 1 {
+                &original.scorecard
+            } else {
+                &partial_scorecard
+            };
+            verify_combined_write_state(root, &head, expected_scorecard, &original.cells, &snapshot)
+        },
+    )?;
+    println!(
+        "compatibility scorecard: projected {} cell(s) from {} canonical series row(s), then merged {} pass, {} located divergence, and {} unlocated divergence validate observation(s) at {head}",
+        projection.cells, rows_read, fold.passed, fold.located, fold.unlocated,
+    );
+    println!(
+        "compatibility scorecard: generated files {}",
+        if changed { "changed" } else { "unchanged" }
+    );
+    if !fold.errored.is_empty() {
+        println!(
+            "  {} current result row(s) determined no canonical product result; their exact invocation evidence was retained",
+            fold.errored.len()
+        );
+        for row in &fold.errored {
+            println!("    determined nothing: {row}");
+        }
+    }
+    for skipped in &projection.skipped {
+        println!("  skipped {skipped}");
+    }
+    if !representation.represented_event_ids.is_empty() {
+        println!(
+            "  {} series event(s) were represented once by richer direct validation evidence",
+            representation.represented_event_ids.len()
+        );
+    }
+    Ok(())
+}
+
 /// Keep the generated status-and-measurement section in step with an explicit
 /// observation write. Since that section is derived from `cells.json`, writing
 /// only the latter would make `check` fail immediately after a successful fold.
@@ -5185,6 +5514,228 @@ impl SeriesObservationIdentity {
     }
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DirectEvidenceBase {
+    cell: String,
+    identity: SeriesObservationIdentity,
+    provenance: ObservationProvenance,
+    hermit_sha: String,
+    run_id: String,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum DirectEvidenceKind {
+    Result(ObservedResult),
+    ExactInvocation {
+        attempt: u64,
+        evidence_sha256: String,
+        result: Option<ObservedResult>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DirectEvidenceKey {
+    base: DirectEvidenceBase,
+    kind: DirectEvidenceKind,
+}
+
+#[derive(Debug)]
+struct DirectRepresentation {
+    represented_event_ids: BTreeSet<String>,
+    has_unrepresented_direct_evidence: bool,
+}
+
+fn direct_evidence_keys(
+    tracked: &TrackedCells,
+) -> Result<(BTreeSet<DirectEvidenceKey>, bool), String> {
+    let mut counts = BTreeMap::<DirectEvidenceKey, usize>::new();
+    let mut opaque = false;
+    for cell in &tracked.cells {
+        let cell_name = series_cell_key(&cell.id);
+        for observation in &cell.observations {
+            if !observation.event_ids.is_empty() {
+                continue;
+            }
+            let identity = SeriesObservationIdentity::from_observation(observation)?;
+            let mut represented_results = BTreeSet::new();
+            let mut units = 0usize;
+            for comparison in &observation.canonical_comparisons {
+                let key = DirectEvidenceKey {
+                    base: DirectEvidenceBase {
+                        cell: cell_name.clone(),
+                        identity: identity.clone(),
+                        provenance: observation.provenance,
+                        hermit_sha: comparison.hermit_sha.clone(),
+                        run_id: comparison.run_id.clone(),
+                    },
+                    kind: DirectEvidenceKind::Result(comparison.result),
+                };
+                *counts.entry(key).or_default() += 1;
+                represented_results.insert(comparison.result);
+                units += 1;
+            }
+            for invocation in &observation.invocations {
+                if let Some(result) = invocation.result {
+                    represented_results.insert(result);
+                }
+                let base = DirectEvidenceBase {
+                    cell: cell_name.clone(),
+                    identity: identity.clone(),
+                    provenance: observation.provenance,
+                    hermit_sha: invocation.hermit_sha.clone(),
+                    run_id: invocation.run_id.clone(),
+                };
+                let kind = match (invocation.attempt, invocation.evidence_sha256.as_ref()) {
+                    (Some(attempt), Some(evidence_sha256)) => DirectEvidenceKind::ExactInvocation {
+                        attempt,
+                        evidence_sha256: evidence_sha256.clone(),
+                        result: invocation.result,
+                    },
+                    (None, None) => {
+                        let Some(result) = invocation.result else {
+                            opaque = true;
+                            continue;
+                        };
+                        if observation.canonical_comparisons.iter().any(|comparison| {
+                            comparison.hermit_sha == invocation.hermit_sha
+                                && comparison.run_id == invocation.run_id
+                                && comparison.result == result
+                        }) {
+                            continue;
+                        }
+                        DirectEvidenceKind::Result(result)
+                    }
+                    _ => {
+                        opaque = true;
+                        continue;
+                    }
+                };
+                *counts.entry(DirectEvidenceKey { base, kind }).or_default() += 1;
+                units += 1;
+            }
+            if units == 0 || !observation.results.is_subset(&represented_results) {
+                opaque = true;
+            }
+        }
+    }
+    if let Some((key, count)) = counts.iter().find(|(_, count)| **count != 1) {
+        return Err(format!(
+            "direct scorecard evidence has {count} records for one exact run identity: {key:?}"
+        ));
+    }
+    Ok((counts.into_keys().collect(), opaque))
+}
+
+fn source_direct_evidence_key(
+    row: &SeriesRow,
+    tracked: &TrackedCells,
+) -> Result<Option<(DirectEvidenceBase, Option<DirectEvidenceKey>)>, String> {
+    if row.validate_for_projection().is_err() {
+        return Ok(None);
+    }
+    let matches = tracked
+        .cells
+        .iter()
+        .filter(|cell| series_cell_key(&cell.id) == row.cell())
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Ok(None);
+    }
+    let cell = matches[0];
+    let Some(evidence) = series_evidence(row, &cell.id) else {
+        return Ok(None);
+    };
+    let base = DirectEvidenceBase {
+        cell: row.cell().to_string(),
+        identity: series_observation_identity(row)?,
+        provenance: series_provenance(row.producer),
+        hermit_sha: row.series.tree.clone(),
+        run_id: row.run_id.clone(),
+    };
+    let kind = if evidence.no_verdict {
+        let exact = row
+            .series
+            .no_verdict_evidence
+            .as_ref()
+            .ok_or("series no-verdict row lost its exact evidence identity")?;
+        row.series
+            .attempt
+            .map(|attempt| DirectEvidenceKind::ExactInvocation {
+                attempt,
+                evidence_sha256: exact.evidence_sha256.clone(),
+                result: evidence.result,
+            })
+    } else if row.series.num_runs == 1 && row.series.attempt.unwrap_or(1) == 1 {
+        evidence.result.map(DirectEvidenceKind::Result)
+    } else {
+        None
+    };
+    Ok(Some((
+        base.clone(),
+        kind.map(|kind| DirectEvidenceKey { base, kind }),
+    )))
+}
+
+fn direct_representation(
+    tracked: &TrackedCells,
+    rows: &[SeriesRow],
+) -> Result<DirectRepresentation, String> {
+    let (direct, opaque) = direct_evidence_keys(tracked)?;
+    let mut source =
+        BTreeMap::<DirectEvidenceBase, Vec<(Option<DirectEvidenceKey>, String)>>::new();
+    for row in rows {
+        let Some((base, key)) = source_direct_evidence_key(row, tracked)? else {
+            continue;
+        };
+        source
+            .entry(base)
+            .or_default()
+            .push((key, row.event_id.clone()));
+    }
+
+    let mut represented_event_ids = BTreeSet::new();
+    let mut represented_direct = BTreeSet::new();
+    for direct_key in &direct {
+        let candidates = source
+            .get(&direct_key.base)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let exact = candidates
+            .iter()
+            .filter(|(candidate, _)| candidate.as_ref() == Some(direct_key))
+            .collect::<Vec<_>>();
+        match exact.as_slice() {
+            [] if candidates.is_empty() => {}
+            [] => {
+                return Err(format!(
+                    "series evidence for run {} at {} disagrees with its exact direct result",
+                    direct_key.base.run_id, direct_key.base.hermit_sha
+                ));
+            }
+            [(_, event_id)] => {
+                if !represented_event_ids.insert(event_id.clone()) {
+                    return Err(format!(
+                        "series event {event_id} maps to more than one exact direct result"
+                    ));
+                }
+                represented_direct.insert(direct_key.clone());
+            }
+            _ => {
+                return Err(format!(
+                    "series evidence cannot map one-to-one to direct run {} at {}: {} source rows match",
+                    direct_key.base.run_id,
+                    direct_key.base.hermit_sha,
+                    exact.len()
+                ));
+            }
+        }
+    }
+    Ok(DirectRepresentation {
+        represented_event_ids,
+        has_unrepresented_direct_evidence: opaque || represented_direct.len() != direct.len(),
+    })
+}
+
 fn is_object_id(value: &str) -> bool {
     value.len() == 40
         && value
@@ -5263,7 +5814,9 @@ fn validate_observation_identity_namespace(cells: &TrackedCells) -> Result<(), S
             }
             for event_id in &observation.event_ids {
                 if event_id.trim().is_empty() || !seen_event_ids.insert(event_id) {
-                    return Err(format!("invalid or repeated projected event_id {event_id:?}"));
+                    return Err(format!(
+                        "invalid or repeated projected event_id {event_id:?}"
+                    ));
                 }
             }
             if observation.detcore_tree.is_none()
@@ -5534,12 +6087,7 @@ fn apply_series_rows(
     projection_source: Option<&str>,
 ) -> Result<ProjectObservationsOutcome, String> {
     let mut updated = tracked.clone();
-    let outcome = apply_series_rows_inner(
-        ambient_git_root,
-        &mut updated,
-        rows,
-        projection_source,
-    )?;
+    let outcome = apply_series_rows_inner(ambient_git_root, &mut updated, rows, projection_source)?;
     *tracked = updated;
     Ok(outcome)
 }
@@ -5857,6 +6405,520 @@ struct SeriesSourceSnapshot {
 struct SeriesSourceShard {
     display_path: PathBuf,
     bytes: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScorecardSeriesSnapshot {
+    schema: String,
+    source: ScorecardSeriesSnapshotSource,
+    rows_read: u64,
+    rows_sha256: String,
+    rows: Vec<Box<RawValue>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScorecardSeriesSnapshotSource {
+    path: String,
+    commit: String,
+    tree: String,
+    published_rows: u64,
+    local_sources: Vec<ScorecardSeriesSnapshotLocalSource>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScorecardSeriesSnapshotLocalSource {
+    kind: String,
+    path: String,
+    device: u64,
+    inode: u64,
+    rows: u64,
+    size: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SnapshotPathIdentity {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    links: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl SnapshotPathIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            links: metadata.nlink(),
+            size: metadata.size(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
+struct HeldScorecardSeriesSnapshot {
+    path: PathBuf,
+    parent: PathBuf,
+    _parent_file: File,
+    file: File,
+    parent_identity: SnapshotPathIdentity,
+    file_identity: SnapshotPathIdentity,
+    sha256: String,
+    snapshot: ScorecardSeriesSnapshot,
+    rows: Vec<SeriesRow>,
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn snapshot_path_identity(path: &Path, kind: &str) -> Result<SnapshotPathIdentity, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "cannot inspect scorecard snapshot {kind} {}: {error}",
+            path.display()
+        )
+    })?;
+    let valid = match kind {
+        "directory" => metadata.is_dir(),
+        "file" => metadata.is_file(),
+        _ => false,
+    };
+    if !valid {
+        return Err(format!(
+            "scorecard snapshot {kind} is not a regular {kind}: {}",
+            path.display()
+        ));
+    }
+    Ok(SnapshotPathIdentity::from_metadata(&metadata))
+}
+
+fn read_held_snapshot_file(file: &File, identity: SnapshotPathIdentity) -> Result<Vec<u8>, String> {
+    let size = usize::try_from(identity.size)
+        .map_err(|_| "scorecard snapshot is too large to address".to_string())?;
+    let mut bytes = vec![0; size];
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let read = UnixFileExt::read_at(file, &mut bytes[offset..], offset as u64)
+            .map_err(|error| format!("cannot read held scorecard snapshot: {error}"))?;
+        if read == 0 {
+            return Err("scorecard snapshot changed size while being read".into());
+        }
+        offset += read;
+    }
+    let mut extra = [0u8; 1];
+    if UnixFileExt::read_at(file, &mut extra, identity.size)
+        .map_err(|error| format!("cannot finish reading held scorecard snapshot: {error}"))?
+        != 0
+    {
+        return Err("scorecard snapshot changed size while being read".into());
+    }
+    Ok(bytes)
+}
+
+fn canonical_snapshot_rows_bytes(rows: &[JsonValue]) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    for row in rows {
+        serde_json::to_writer(&mut bytes, row)
+            .map_err(|error| format!("cannot encode canonical scorecard snapshot row: {error}"))?;
+        bytes.push(b'\n');
+    }
+    Ok(bytes)
+}
+
+fn canonical_snapshot_raw_rows_bytes(rows: &[Box<RawValue>]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for row in rows {
+        bytes.extend_from_slice(row.get().as_bytes());
+        bytes.push(b'\n');
+    }
+    bytes
+}
+
+fn require_exact_object_keys(
+    value: &JsonValue,
+    expected: &[&str],
+    label: &str,
+) -> Result<(), String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{label} must be an object"))?;
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(format!("{label} has an invalid field set"));
+    }
+    Ok(())
+}
+
+fn validate_scorecard_snapshot(
+    snapshot: &ScorecardSeriesSnapshot,
+    display: &Path,
+) -> Result<Vec<SeriesRow>, String> {
+    if snapshot.schema != SCORECARD_SERIES_SNAPSHOT_SCHEMA {
+        return Err(format!(
+            "scorecard snapshot {} has schema {:?}, expected {SCORECARD_SERIES_SNAPSHOT_SCHEMA}",
+            display.display(),
+            snapshot.schema
+        ));
+    }
+    if snapshot.source.path != SCORECARD_SERIES_SNAPSHOT_SOURCE
+        || !is_object_id(&snapshot.source.commit)
+        || !is_object_id(&snapshot.source.tree)
+    {
+        return Err(format!(
+            "scorecard snapshot {} has an invalid source identity",
+            display.display()
+        ));
+    }
+    if snapshot.source.published_rows > snapshot.rows_read {
+        return Err(format!(
+            "scorecard snapshot {} reports more published rows than canonical rows",
+            display.display()
+        ));
+    }
+
+    let mut previous_source: Option<(u8, &str)> = None;
+    let mut source_paths = BTreeSet::new();
+    let mut declared_source_facts = (0u64, 0u64, 0u64);
+    for source in &snapshot.source.local_sources {
+        let kind_order = match source.kind.as_str() {
+            "live" => 0,
+            "published-retained" => 1,
+            _ => {
+                return Err(format!(
+                    "scorecard snapshot {} has an invalid local source kind {:?}",
+                    display.display(),
+                    source.kind
+                ));
+            }
+        };
+        let relative = Path::new(&source.path);
+        let components = relative.components().count();
+        let valid_path = !source.path.is_empty()
+            && !relative.is_absolute()
+            && !relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+            && match source.kind.as_str() {
+                "live" => components == 1,
+                "published-retained" => {
+                    components == 2
+                        && relative.components().next().is_some_and(|component| {
+                            component.as_os_str() == std::ffi::OsStr::new("published")
+                        })
+                }
+                _ => false,
+            };
+        if !valid_path
+            || source.inode == 0
+            || !is_sha256(&source.sha256)
+            || !source_paths.insert(source.path.as_str())
+        {
+            return Err(format!(
+                "scorecard snapshot {} has an invalid local source",
+                display.display()
+            ));
+        }
+        let current = (kind_order, source.path.as_str());
+        if previous_source.is_some_and(|previous| previous >= current) {
+            return Err(format!(
+                "scorecard snapshot {} local sources are not in canonical order",
+                display.display()
+            ));
+        }
+        declared_source_facts.0 = declared_source_facts
+            .0
+            .checked_add(source.device)
+            .ok_or("scorecard snapshot local-source device total overflowed")?;
+        declared_source_facts.1 = declared_source_facts
+            .1
+            .checked_add(source.rows)
+            .ok_or("scorecard snapshot local-source row total overflowed")?;
+        declared_source_facts.2 = declared_source_facts
+            .2
+            .checked_add(source.size)
+            .ok_or("scorecard snapshot local-source byte total overflowed")?;
+        previous_source = Some(current);
+    }
+
+    if snapshot.rows_read != snapshot.rows.len() as u64 {
+        return Err(format!(
+            "scorecard snapshot {} rows_read does not match its rows",
+            display.display()
+        ));
+    }
+    if !is_sha256(&snapshot.rows_sha256) {
+        return Err(format!(
+            "scorecard snapshot {} has an invalid rows_sha256",
+            display.display()
+        ));
+    }
+    // The producer defines rows_sha256 over its exact canonical UTF-8 JSON
+    // bytes, one row plus one newline. Preserve those bytes through RawValue:
+    // reserializing through Rust would silently change valid Python spellings
+    // such as exponent-form floats and would verify a different contract.
+    let rows_bytes = canonical_snapshot_raw_rows_bytes(&snapshot.rows);
+    let rows_sha256 = format!("{:x}", Sha256::digest(&rows_bytes));
+    if rows_sha256 != snapshot.rows_sha256 {
+        return Err(format!(
+            "scorecard snapshot {} row digest does not match its rows",
+            display.display()
+        ));
+    }
+
+    const ROW_FIELDS: &[&str] = &[
+        "schema",
+        "event_id",
+        "event_type",
+        "emitted_at",
+        "team",
+        "host",
+        "producer",
+        "run_id",
+        "series",
+    ];
+    const SERIES_FIELDS: &[&str] = &[
+        "cell",
+        "tree",
+        "detcore_tree",
+        "outcome",
+        "result",
+        "failure_class",
+        "no_verdict_evidence",
+        "pressure_evidence",
+        "run_index",
+        "attempt",
+        "num_runs",
+        "last_run_index",
+        "main_ancestry",
+        "runtime",
+        "source_tree_dirty",
+        "depth",
+        "coordinates",
+        "first_divergent_messages",
+        "machine_shortname",
+        "kernel_version",
+        "host_capabilities",
+    ];
+    let allowed_series_fields = SERIES_FIELDS.iter().copied().collect::<BTreeSet<_>>();
+    let mut rows = Vec::with_capacity(snapshot.rows.len());
+    let mut event_ids = BTreeSet::new();
+    let mut previous_order: Option<(String, String)> = None;
+    for (index, raw) in snapshot.rows.iter().enumerate() {
+        let label = format!("scorecard snapshot {} row {}", display.display(), index + 1);
+        let value: JsonValue = serde_json::from_str(raw.get())
+            .map_err(|error| format!("{label} is malformed: {error}"))?;
+        require_exact_object_keys(&value, ROW_FIELDS, &label)?;
+        let series = value
+            .get("series")
+            .and_then(JsonValue::as_object)
+            .ok_or_else(|| format!("{label} series must be an object"))?;
+        if series
+            .keys()
+            .map(String::as_str)
+            .any(|field| !allowed_series_fields.contains(field))
+        {
+            return Err(format!("{label} series has an unknown field"));
+        }
+        let mut row: SeriesRow = serde_json::from_value(value)
+            .map_err(|error| format!("{label} is malformed: {error}"))?;
+        row.validate_for_read()
+            .map_err(|error| format!("{label} is invalid: {error}"))?;
+        if !event_ids.insert(row.event_id.clone()) {
+            return Err(format!(
+                "scorecard snapshot {} repeats event_id {:?}",
+                display.display(),
+                row.event_id
+            ));
+        }
+        let order = (row.emitted_at.clone(), row.event_id.clone());
+        if previous_order
+            .as_ref()
+            .is_some_and(|previous| previous >= &order)
+        {
+            return Err(format!(
+                "scorecard snapshot {} rows are not in canonical emitted_at/event_id order",
+                display.display()
+            ));
+        }
+        previous_order = Some(order);
+        row.source = format!("{}:rows[{}]", display.display(), index);
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+impl HeldScorecardSeriesSnapshot {
+    fn open(path: &Path, expected_sha256: &str) -> Result<Self, String> {
+        if !is_sha256(expected_sha256) {
+            return Err(
+                "--snapshot-sha256 requires exactly 64 lowercase hexadecimal characters".into(),
+            );
+        }
+        let parent = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let parent_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&parent)
+            .map_err(|error| {
+                format!(
+                    "cannot open scorecard snapshot parent without following links {}: {error}",
+                    parent.display()
+                )
+            })?;
+        let parent_identity =
+            SnapshotPathIdentity::from_metadata(&parent_file.metadata().map_err(|error| {
+                format!("cannot inspect held scorecard snapshot parent: {error}")
+            })?);
+        if snapshot_path_identity(&parent, "directory")? != parent_identity {
+            return Err(format!(
+                "scorecard snapshot parent changed while being opened: {}",
+                parent.display()
+            ));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|error| {
+                format!(
+                    "cannot open regular scorecard snapshot without following links {}: {error}",
+                    path.display()
+                )
+            })?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("cannot inspect held scorecard snapshot: {error}"))?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "scorecard snapshot is not a regular file: {}",
+                path.display()
+            ));
+        }
+        let file_identity = SnapshotPathIdentity::from_metadata(&metadata);
+        if snapshot_path_identity(path, "file")? != file_identity {
+            return Err(format!(
+                "scorecard snapshot pathname changed while being opened: {}",
+                path.display()
+            ));
+        }
+        let payload = read_held_snapshot_file(&file, file_identity)?;
+        let actual_sha256 = format!("{:x}", Sha256::digest(&payload));
+        if actual_sha256 != expected_sha256 {
+            return Err(format!(
+                "scorecard snapshot digest mismatch: expected {expected_sha256}, got {actual_sha256}"
+            ));
+        }
+        let snapshot: ScorecardSeriesSnapshot = serde_json::from_slice(&payload)
+            .map_err(|error| format!("scorecard snapshot is not valid strict JSON: {error}"))?;
+        let rows = validate_scorecard_snapshot(&snapshot, path)?;
+        let held = Self {
+            path: path.to_path_buf(),
+            parent,
+            _parent_file: parent_file,
+            file,
+            parent_identity,
+            file_identity,
+            sha256: actual_sha256,
+            snapshot,
+            rows,
+        };
+        held.verify()?;
+        Ok(held)
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        if SnapshotPathIdentity::from_metadata(
+            &self._parent_file.metadata().map_err(|error| {
+                format!("cannot inspect held scorecard snapshot parent: {error}")
+            })?,
+        ) != self.parent_identity
+            || snapshot_path_identity(&self.parent, "directory")? != self.parent_identity
+        {
+            return Err(format!(
+                "scorecard snapshot parent changed while held: {}",
+                self.parent.display()
+            ));
+        }
+        let metadata = self
+            .file
+            .metadata()
+            .map_err(|error| format!("cannot inspect held scorecard snapshot: {error}"))?;
+        if !metadata.is_file()
+            || SnapshotPathIdentity::from_metadata(&metadata) != self.file_identity
+            || snapshot_path_identity(&self.path, "file")? != self.file_identity
+        {
+            return Err(format!(
+                "scorecard snapshot pathname or identity changed while held: {}",
+                self.path.display()
+            ));
+        }
+        let payload = read_held_snapshot_file(&self.file, self.file_identity)?;
+        let actual_sha256 = format!("{:x}", Sha256::digest(&payload));
+        if actual_sha256 != self.sha256 {
+            return Err(format!(
+                "scorecard snapshot content changed while held: {}",
+                self.path.display()
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn scorecard_snapshot_fixture_value(
+    source_commit: &str,
+    source_tree: &str,
+    rows: &[SeriesRow],
+) -> Result<JsonValue, String> {
+    let row_values = rows
+        .iter()
+        .map(|row| serde_json::to_value(row).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let rows_sha256 = format!(
+        "{:x}",
+        Sha256::digest(canonical_snapshot_rows_bytes(&row_values)?)
+    );
+    Ok(serde_json::json!({
+        "schema": SCORECARD_SERIES_SNAPSHOT_SCHEMA,
+        "source": {
+            "path": SCORECARD_SERIES_SNAPSHOT_SOURCE,
+            "commit": source_commit,
+            "tree": source_tree,
+            "published_rows": row_values.len(),
+            "local_sources": [],
+        },
+        "rows_read": row_values.len(),
+        "rows_sha256": rows_sha256,
+        "rows": row_values,
+    }))
+}
+
+fn write_scorecard_snapshot_fixture(path: &Path, value: &JsonValue) -> Result<String, String> {
+    let mut payload = serde_json::to_vec(value)
+        .map_err(|error| format!("cannot encode scorecard snapshot fixture: {error}"))?;
+    payload.push(b'\n');
+    fs::write(path, &payload)
+        .map_err(|error| format!("cannot write scorecard snapshot fixture: {error}"))?;
+    Ok(format!("{:x}", Sha256::digest(&payload)))
 }
 
 /// Capture the committed series source once and verify that the worktree is an
@@ -7343,16 +8405,22 @@ fn pressure_invocation_matches(
     existing: &ObservedInvocation,
     incoming: &ObservedInvocation,
 ) -> bool {
-    let reconstructs = |command: &str, cwd: &str, env: &BTreeMap<String, String>, argv: &[String]| {
-        command.is_empty() || command == literal_shell_command(cwd, env, argv)
-    };
+    let reconstructs =
+        |command: &str, cwd: &str, env: &BTreeMap<String, String>, argv: &[String]| {
+            command.is_empty() || command == literal_shell_command(cwd, env, argv)
+        };
     if !reconstructs(
         &existing.shell_command,
         &existing.cwd,
         &existing.env,
         &existing.argv,
     ) || existing.attempts.iter().any(|attempt| {
-        !reconstructs(&attempt.shell_command, &attempt.cwd, &attempt.env, &attempt.argv)
+        !reconstructs(
+            &attempt.shell_command,
+            &attempt.cwd,
+            &attempt.env,
+            &attempt.argv,
+        )
     }) {
         return false;
     }
@@ -7484,19 +8552,36 @@ fn self_test() -> Result<(), String> {
     let mut additional_depth = current_last_tested.depth.clone();
     additional_depth.insert(
         "reverie".into(),
-        SourceDepth { commits: 30, first_parent: 25 },
+        SourceDepth {
+            commits: 30,
+            first_parent: 25,
+        },
     );
     for depth in [&additional_depth, &BTreeMap::new()] {
         if should_replace_retained_last_tested(
-            Some(&current_last_tested), "current-sha", "current-tree", Some(true), depth,
+            Some(&current_last_tested),
+            "current-sha",
+            "current-tree",
+            Some(true),
+            depth,
         ) {
-            return Err("retained reimport replaced the same code identity's recorded depths".into());
+            return Err(
+                "retained reimport replaced the same code identity's recorded depths".into(),
+            );
         }
     }
     if !should_replace_retained_last_tested(
-        None, "current-sha", "current-tree", Some(true), &additional_depth,
+        None,
+        "current-sha",
+        "current-tree",
+        Some(true),
+        &additional_depth,
     ) || !should_replace_retained_last_tested(
-        Some(&current_last_tested), "current-sha", "different-tree", Some(true), &additional_depth,
+        Some(&current_last_tested),
+        "current-sha",
+        "different-tree",
+        Some(true),
+        &additional_depth,
     ) {
         return Err("retained stamp preservation hid absent or conflicting code identity".into());
     }
@@ -7656,8 +8741,7 @@ fn self_test() -> Result<(), String> {
     let current_report: JsonValue = serde_json::from_str(current_report_text).unwrap();
     if current_report.get("no_result_reason") != Some(&JsonValue::Null) {
         return Err(
-            "a current verification report did not serialize explicit null no_result_reason"
-                .into(),
+            "a current verification report did not serialize explicit null no_result_reason".into(),
         );
     }
     current_identity
@@ -7680,8 +8764,7 @@ fn self_test() -> Result<(), String> {
     let missing_report = serde_json::to_string(&missing_report).unwrap();
     missing_current_reason.attempts[0]["verification_report_sha256"] =
         JsonValue::String(format!("{:x}", Sha256::digest(missing_report.as_bytes())));
-    missing_current_reason.attempts[0]["verification_report"] =
-        JsonValue::String(missing_report);
+    missing_current_reason.attempts[0]["verification_report"] = JsonValue::String(missing_report);
     for error in [
         missing_current_reason
             .bitwise_info_comparison()
@@ -8501,13 +9584,17 @@ red/`measured-and-passed` count is **0**.",
                     .map(|mut invocation| {
                         if legacy_fields & 1 != 0 {
                             invocation.shell_command = literal_shell_command(
-                                &invocation.cwd, &invocation.env, &invocation.argv,
+                                &invocation.cwd,
+                                &invocation.env,
+                                &invocation.argv,
                             );
                         }
                         if legacy_fields & 2 != 0 {
                             for attempt in &mut invocation.attempts {
                                 attempt.shell_command = literal_shell_command(
-                                    &attempt.cwd, &attempt.env, &attempt.argv,
+                                    &attempt.cwd,
+                                    &attempt.env,
+                                    &attempt.argv,
                                 );
                             }
                         }
@@ -8541,7 +9628,13 @@ red/`measured-and-passed` count is **0**.",
     if !pressure_invocation_matches(&legacy, &compact) {
         return Err("valid legacy pressure invocation differs from its compact form".into());
     }
-    for change in ["command", "attempt-command", "attempt-status", "attempt-index", "run-id"] {
+    for change in [
+        "command",
+        "attempt-command",
+        "attempt-status",
+        "attempt-index",
+        "run-id",
+    ] {
         let mut distinct = legacy.clone();
         match change {
             "command" => distinct.shell_command.push_str(" ; false"),
@@ -8552,7 +9645,9 @@ red/`measured-and-passed` count is **0**.",
             _ => unreachable!(),
         }
         if pressure_invocation_matches(&distinct, &compact) {
-            return Err(format!("pressure invocation identity discarded distinct {change} evidence"));
+            return Err(format!(
+                "pressure invocation identity discarded distinct {change} evidence"
+            ));
         }
     }
     let same_engine = pressure_summary("sha-doc", "tree-1", vec![pressure_row("pass", None, None)]);
@@ -9606,6 +10701,709 @@ red/`measured-and-passed` count is **0**.",
     }
     restore_generated()?;
 
+    // --- combined immutable-snapshot + current-result transaction ---------
+    // This is deliberately dormant: the production callers continue to use
+    // their existing commands until the parent snapshot provider lands. The
+    // self-test exercises the new command's actual transaction boundary.
+    let mut combined_baseline_cells: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+    for cell in &mut combined_baseline_cells.cells {
+        cell.observations.clear();
+        cell.last_tested = None;
+    }
+    combined_baseline_cells.projection = None;
+    refresh_measurement(&mut combined_baseline_cells);
+    let combined_derived = derive(&result_command_root)?;
+    let combined_baseline = generated_files(&combined_derived, &combined_baseline_cells)?;
+    fs::write(
+        result_command_root.join(SCORECARD),
+        &combined_baseline.scorecard,
+    )
+    .and_then(|()| fs::write(result_command_root.join(CELLS), &combined_baseline.cells))
+    .map_err(|error| format!("cannot write combined transaction baseline: {error}"))?;
+    let restore_combined_baseline = || -> Result<(), String> {
+        fs::write(
+            result_command_root.join(SCORECARD),
+            &combined_baseline.scorecard,
+        )
+        .and_then(|()| fs::write(result_command_root.join(CELLS), &combined_baseline.cells))
+        .map_err(|error| error.to_string())
+    };
+    let snapshot_root = result_command_fixture.path().join("scorecard-snapshots");
+    fs::create_dir(&snapshot_root)
+        .map_err(|error| format!("cannot create combined snapshot fixture: {error}"))?;
+    let source_commit = "a".repeat(40);
+    let source_tree = "b".repeat(40);
+    let empty_snapshot_value = scorecard_snapshot_fixture_value(&source_commit, &source_tree, &[])?;
+    let empty_snapshot_path = snapshot_root.join("empty.json");
+    let empty_snapshot_sha =
+        write_scorecard_snapshot_fixture(&empty_snapshot_path, &empty_snapshot_value)?;
+    HeldScorecardSeriesSnapshot::open(&empty_snapshot_path, &empty_snapshot_sha)
+        .map_err(|error| format!("valid empty combined snapshot was refused: {error}"))?;
+
+    // Frozen output from Python json.dumps(sort_keys=True, separators=(",", ":"),
+    // ensure_ascii=False). RawValue is load-bearing here: Rust reserialization
+    // is not the contract for exponent-form floats or non-ASCII strings.
+    let python_canonical_row = r#"{"emitted_at":"2026-09-13T18:31:00Z","event_id":"fixture-python-canonical","event_type":"series.observation","host":"höst","producer":"validate","run_id":"fixture-python","schema":"stress-series/v3","series":{"attempt":1,"cell":"system-utils/record-getpid/replay/ptrace","depth":{"hermit":{"commits":1,"first_parent":1}},"detcore_tree":"dddddddddddddddddddddddddddddddddddddddd","failure_class":null,"host_capabilities":{"cpuid-faulting":{"evidence":"測定","present":true},"kvm":{"evidence":"none","present":false}},"kernel_version":"κernel","machine_shortname":"höst","main_ancestry":true,"num_runs":1,"outcome":"passed","result":"pass","run_index":1,"runtime":{"run1":null,"run2":null,"wall_time_max_ms":1e+20,"wall_time_min_ms":1e-07},"source_tree_dirty":false,"tree":"cccccccccccccccccccccccccccccccccccccccc"},"team":"hermit"}"#;
+    let python_rows_sha = "5c1fbe913a2bebe8a98ebe07e7a1ac3c4d17a6c5da239b237a083a7f77cdcd94";
+    let mut python_rows_bytes = python_canonical_row.as_bytes().to_vec();
+    python_rows_bytes.push(b'\n');
+    if format!("{:x}", Sha256::digest(&python_rows_bytes)) != python_rows_sha {
+        return Err("frozen Python canonical-row fixture digest changed".into());
+    }
+    let python_snapshot_payload = format!(
+        "{{\"schema\":\"{SCORECARD_SERIES_SNAPSHOT_SCHEMA}\",\"source\":{{\"path\":\"series\",\"commit\":\"{source_commit}\",\"tree\":\"{source_tree}\",\"published_rows\":1,\"local_sources\":[]}},\"rows_read\":1,\"rows_sha256\":\"{python_rows_sha}\",\"rows\":[{python_canonical_row}]}}\n"
+    );
+    let python_snapshot_path = snapshot_root.join("python-canonical.json");
+    fs::write(&python_snapshot_path, python_snapshot_payload.as_bytes())
+        .map_err(|error| format!("cannot write Python canonical snapshot fixture: {error}"))?;
+    let python_snapshot_sha = format!("{:x}", Sha256::digest(python_snapshot_payload.as_bytes()));
+    HeldScorecardSeriesSnapshot::open(&python_snapshot_path, &python_snapshot_sha).map_err(
+        |error| {
+            format!(
+                "Python canonical snapshot with exponent floats and Unicode was refused: {error}"
+            )
+        },
+    )?;
+    let wrong_digest = "0".repeat(64);
+    let digest_error = HeldScorecardSeriesSnapshot::open(&empty_snapshot_path, &wrong_digest)
+        .err()
+        .ok_or("combined snapshot accepted a wrong outer digest")?;
+    if !digest_error.contains("digest mismatch") {
+        return Err(format!(
+            "combined snapshot digest refusal lost its cause: {digest_error}"
+        ));
+    }
+    let snapshot_link = snapshot_root.join("snapshot-link.json");
+    std::os::unix::fs::symlink(&empty_snapshot_path, &snapshot_link)
+        .map_err(|error| format!("cannot create combined snapshot symlink fixture: {error}"))?;
+    if HeldScorecardSeriesSnapshot::open(&snapshot_link, &empty_snapshot_sha).is_ok() {
+        return Err("combined snapshot reader followed a symlink".into());
+    }
+
+    let series_row = SeriesRow {
+        source: String::new(),
+        schema: SeriesSchema::V3,
+        event_id: "fixture-combined-current-result".into(),
+        event_type: "series.observation".into(),
+        emitted_at: "2026-09-13T18:30:00Z".into(),
+        team: "hermit".into(),
+        host: "fixture-host".into(),
+        producer: SeriesProducer::Validate,
+        run_id: replay_row.run_id.clone(),
+        series: SeriesPayload {
+            cell: series_cell_key(&replay_id),
+            tree: fixture_head.clone(),
+            detcore_tree: Some(fixture_detcore_tree.clone()),
+            outcome: SeriesOutcome::Passed,
+            result: Some(ObservedResult::Pass),
+            failure_class: None,
+            no_verdict_evidence: None,
+            pressure_evidence: None,
+            run_index: 1,
+            attempt: Some(1),
+            num_runs: 1,
+            last_run_index: None,
+            main_ancestry: Some(true),
+            runtime: None,
+            source_tree_dirty: false,
+            depth: source_depths(&result_command_root, &fixture_head)?,
+            coordinates: None,
+            first_divergent_messages: None,
+            machine_shortname: Some("fixture-host".into()),
+            kernel_version: Some("fixture-kernel".into()),
+            host_capabilities: Some(BTreeMap::from([
+                (
+                    HostCapability::CpuidFaulting,
+                    HostCapabilityVerdict {
+                        present: true,
+                        evidence: "fixture cpuid probe".into(),
+                    },
+                ),
+                (
+                    HostCapability::Kvm,
+                    HostCapabilityVerdict {
+                        present: false,
+                        evidence: "fixture kvm probe".into(),
+                    },
+                ),
+            ])),
+        },
+    };
+    series_row.validate_for_read()?;
+    let row_snapshot_value =
+        scorecard_snapshot_fixture_value(&source_commit, &source_tree, &[series_row.clone()])?;
+    let row_snapshot_path = snapshot_root.join("with-current-row.json");
+    let row_snapshot_sha =
+        write_scorecard_snapshot_fixture(&row_snapshot_path, &row_snapshot_value)?;
+    HeldScorecardSeriesSnapshot::open(&row_snapshot_path, &row_snapshot_sha)
+        .map_err(|error| format!("valid row-bearing combined snapshot was refused: {error}"))?;
+
+    let mut wrong_count = row_snapshot_value.clone();
+    wrong_count["rows_read"] = serde_json::json!(2);
+    let wrong_count_path = snapshot_root.join("wrong-count.json");
+    let wrong_count_sha = write_scorecard_snapshot_fixture(&wrong_count_path, &wrong_count)?;
+    let wrong_count_error = HeldScorecardSeriesSnapshot::open(&wrong_count_path, &wrong_count_sha)
+        .err()
+        .ok_or("combined snapshot accepted a false row count")?;
+    if !wrong_count_error.contains("rows_read") {
+        return Err(format!(
+            "combined snapshot row-count refusal lost its cause: {wrong_count_error}"
+        ));
+    }
+    let mut wrong_row_digest = row_snapshot_value.clone();
+    wrong_row_digest["rows_sha256"] = serde_json::json!("0".repeat(64));
+    let wrong_row_digest_path = snapshot_root.join("wrong-row-digest.json");
+    let wrong_row_digest_sha =
+        write_scorecard_snapshot_fixture(&wrong_row_digest_path, &wrong_row_digest)?;
+    let wrong_row_digest_error =
+        HeldScorecardSeriesSnapshot::open(&wrong_row_digest_path, &wrong_row_digest_sha)
+            .err()
+            .ok_or("combined snapshot accepted a false canonical-row digest")?;
+    if !wrong_row_digest_error.contains("row digest") {
+        return Err(format!(
+            "combined snapshot row-digest refusal lost its cause: {wrong_row_digest_error}"
+        ));
+    }
+    let mut earlier_row = series_row.clone();
+    earlier_row.event_id = "fixture-combined-earlier".into();
+    earlier_row.emitted_at = "2026-09-13T18:29:59Z".into();
+    let noncanonical_value = scorecard_snapshot_fixture_value(
+        &source_commit,
+        &source_tree,
+        &[series_row.clone(), earlier_row],
+    )?;
+    let noncanonical_path = snapshot_root.join("noncanonical-order.json");
+    let noncanonical_sha =
+        write_scorecard_snapshot_fixture(&noncanonical_path, &noncanonical_value)?;
+    let noncanonical_error =
+        HeldScorecardSeriesSnapshot::open(&noncanonical_path, &noncanonical_sha)
+            .err()
+            .ok_or("combined snapshot accepted noncanonical row order")?;
+    if !noncanonical_error.contains("canonical emitted_at/event_id order") {
+        return Err(format!(
+            "combined snapshot ordering refusal lost its cause: {noncanonical_error}"
+        ));
+    }
+
+    project_and_observe_results(
+        &result_command_root,
+        &empty_snapshot_path,
+        &empty_snapshot_sha,
+        &result_root,
+        &fixture_head,
+        "fixture-refresh",
+    )?;
+    let before_publication: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+    let count_run_representations =
+        |cells: &TrackedCells, id: &CellId, run_id: &str, event_id: &str| {
+            cells
+                .cells
+                .iter()
+                .filter(|cell| &cell.id == id)
+                .flat_map(|cell| &cell.observations)
+                .map(|observation| {
+                    usize::from(
+                        observation
+                            .canonical_comparisons
+                            .iter()
+                            .any(|comparison| comparison.run_id == run_id)
+                            || observation
+                                .invocations
+                                .iter()
+                                .any(|invocation| invocation.run_id == run_id),
+                    ) + usize::from(observation.event_ids.contains(event_id))
+                })
+                .sum::<usize>()
+        };
+    let count_current_result = |cells: &TrackedCells| {
+        count_run_representations(
+            cells,
+            &replay_id,
+            &replay_row.run_id,
+            "fixture-combined-current-result",
+        )
+    };
+    if count_current_result(&before_publication) != 1
+        || before_publication
+            .projection
+            .as_ref()
+            .is_none_or(|projection| projection.rows_read != 0 || !projection.pre_series_corpus)
+    {
+        return Err(
+            "combined transaction did not retain the exact current result once before series publication"
+                .into(),
+        );
+    }
+
+    project_and_observe_results(
+        &result_command_root,
+        &row_snapshot_path,
+        &row_snapshot_sha,
+        &result_root,
+        &fixture_head,
+        "fixture-refresh",
+    )?;
+    let after_publication: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+    if count_current_result(&after_publication) != 1
+        || after_publication
+            .projection
+            .as_ref()
+            .is_none_or(|projection| {
+                projection.rows_read != 1
+                    || projection.source_commit.as_deref() != Some(source_commit.as_str())
+                    || projection.source_tree.as_deref() != Some(source_tree.as_str())
+            })
+    {
+        return Err(
+            "combined transaction duplicated or lost the current result after series publication"
+                .into(),
+        );
+    }
+    let stable_publication = read_generated_files(&result_command_root)?;
+    project_and_observe_results(
+        &result_command_root,
+        &row_snapshot_path,
+        &row_snapshot_sha,
+        &result_root,
+        &fixture_head,
+        "fixture-refresh",
+    )?;
+    if read_generated_files(&result_command_root)? != stable_publication {
+        return Err("repeating the same combined transaction changed its generated pair".into());
+    }
+
+    // The event may already be in the parent snapshot on the first local
+    // write. It must still collapse to the richer direct invocation exactly
+    // once, rather than leaving one projected and one direct observation.
+    restore_combined_baseline()?;
+    project_and_observe_results(
+        &result_command_root,
+        &row_snapshot_path,
+        &row_snapshot_sha,
+        &result_root,
+        &fixture_head,
+        "fixture-refresh",
+    )?;
+    let first_write_with_published_row: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+    if count_current_result(&first_write_with_published_row) != 1
+        || first_write_with_published_row
+            .projection
+            .as_ref()
+            .is_none_or(|projection| projection.pre_series_corpus)
+    {
+        return Err(
+            "combined first write duplicated a current result already present in the snapshot"
+                .into(),
+        );
+    }
+    let stable_publication = read_generated_files(&result_command_root)?;
+
+    // Exercise the same exact reconciliation for every current result class.
+    // A canonical divergence is keyed by its product result. ERROR and
+    // no_result are keyed by the exact outer-attempt evidence digest, because
+    // neither establishes a canonical product comparison.
+    let bind_attempt_to_row = |attempt: &mut JsonValue, row: &ResultRow| {
+        attempt["argv"] = serde_json::to_value(&row.argv).unwrap();
+        attempt["guest_argv"] = serde_json::to_value(&row.guest_argv).unwrap();
+        attempt["env"] = serde_json::to_value(&row.env).unwrap();
+        attempt["cwd"] = JsonValue::String(row.cwd.clone());
+        attempt["shell_command"] = JsonValue::String(row.shell_command.clone());
+    };
+    let replace_attempt_report = |attempt: &mut JsonValue, report: JsonValue| {
+        let report = serde_json::to_string(&report).unwrap();
+        attempt["verification_report_sha256"] =
+            JsonValue::String(format!("{:x}", Sha256::digest(report.as_bytes())));
+        attempt["verification_report"] = JsonValue::String(report);
+    };
+
+    let mut fail_row = replay_row.clone();
+    fail_row.run_id = "result-command-combined-fail".into();
+    fail_row.outcome = "FAIL".into();
+    fail_row.result = Some(ObservedResult::ReplayFailure);
+    fail_row.failure_class = Some(FailureClass::ProductFailure);
+    fail_row.error_kind = None;
+    fail_row.first_divergent_scheduler_turn = Some(7);
+    fail_row.first_divergent_virtual_nanoseconds = Some(70);
+    fail_row.first_divergent_record = Some(12);
+    fail_row.first_divergent_syscall = Some(9);
+    fail_row.attempts = vec![validate_attempt("FAIL")];
+    let mut fail_report: JsonValue = serde_json::from_str(
+        fail_row.attempts[0]["verification_report"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    fail_report["comparison"]["virtualize_time"] = JsonValue::Bool(false);
+    replace_attempt_report(&mut fail_row.attempts[0], fail_report);
+    let fail_binding = fail_row.clone();
+    bind_attempt_to_row(&mut fail_row.attempts[0], &fail_binding);
+    let mut fail_series = series_row.clone();
+    fail_series.event_id = "fixture-combined-current-fail".into();
+    fail_series.run_id = fail_row.run_id.clone();
+    fail_series.series.outcome = SeriesOutcome::Diverged;
+    fail_series.series.result = Some(ObservedResult::ReplayFailure);
+    fail_series.series.failure_class = Some(FailureClass::ProductFailure);
+    fail_series.series.coordinates = Some(SeriesCoordinates {
+        first_divergent_scheduler_turn: Some(7),
+        first_divergent_virtual_nanoseconds: Some(70),
+        first_divergent_record: Some(12),
+        first_divergent_syscall: Some(9),
+    });
+    fail_series.validate_for_read()?;
+
+    let mut error_row = replay_row.clone();
+    error_row.run_id = "result-command-combined-error".into();
+    error_row.outcome = "ERROR".into();
+    error_row.result = None;
+    error_row.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+    error_row.error_kind = Some("infrastructure".into());
+    error_row.first_divergent_scheduler_turn = None;
+    error_row.first_divergent_virtual_nanoseconds = None;
+    error_row.first_divergent_record = None;
+    error_row.first_divergent_syscall = None;
+    error_row.attempts = vec![validate_attempt("ERROR")];
+    error_row.attempts[0]["timed_out"] = JsonValue::Bool(false);
+    error_row.attempts[0]["status"] = serde_json::json!(1);
+    error_row.attempts[0]["signal"] = JsonValue::Null;
+    error_row.attempts[0]["error_kind"] = JsonValue::String("infrastructure".into());
+    let mut infrastructure_report = canonical_verdict::VerificationReport::no_result();
+    infrastructure_report.verdict = canonical_verdict::Verdict::InfrastructureError;
+    infrastructure_report.no_result_reason = None;
+    infrastructure_report.infrastructure_error =
+        Some(canonical_verdict::InfrastructureError::SkidOvershoot { count: 1 });
+    replace_attempt_report(
+        &mut error_row.attempts[0],
+        serde_json::to_value(&infrastructure_report).unwrap(),
+    );
+    let error_binding = error_row.clone();
+    bind_attempt_to_row(&mut error_row.attempts[0], &error_binding);
+    let error_evidence_identity = error_row.evidence_identity()?;
+    let error_report_identity = error_row.attempts[0]["verification_report_sha256"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut error_series = series_row.clone();
+    error_series.event_id = "fixture-combined-current-error".into();
+    error_series.run_id = error_row.run_id.clone();
+    error_series.series.outcome = SeriesOutcome::Errored;
+    error_series.series.result = None;
+    error_series.series.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+    error_series.series.coordinates = None;
+    error_series.series.no_verdict_evidence = Some(SeriesNoVerdictEvidence {
+        evidence_sha256: error_evidence_identity,
+        attempts: vec![SeriesAttemptDisposition {
+            index: "1".into(),
+            kind: SeriesNoVerdictKind::InfrastructureError,
+            detail: None,
+            attempt_outcome: "ERROR".into(),
+            disposition: SeriesOutcome::Errored,
+            error_kind: Some("infrastructure".into()),
+            status: Some(1),
+            signal: None,
+            timed_out: false,
+            verification_report_sha256: Some(error_report_identity),
+        }],
+    });
+    error_series.validate_for_read()?;
+
+    let mut no_result_row = replay_row.clone();
+    no_result_row.run_id = "result-command-combined-no-result".into();
+    no_result_row.outcome = "ERROR".into();
+    no_result_row.result = None;
+    no_result_row.failure_class = Some(FailureClass::NoResult);
+    no_result_row.error_kind = Some("incomplete-verification-evidence".into());
+    no_result_row.first_divergent_scheduler_turn = None;
+    no_result_row.first_divergent_virtual_nanoseconds = None;
+    no_result_row.first_divergent_record = None;
+    no_result_row.first_divergent_syscall = None;
+    no_result_row.attempts = vec![validate_attempt("ERROR")];
+    no_result_row.attempts[0]["timed_out"] = JsonValue::Bool(false);
+    no_result_row.attempts[0]["status"] = serde_json::json!(125);
+    no_result_row.attempts[0]["signal"] = JsonValue::Null;
+    let no_result_binding = no_result_row.clone();
+    bind_attempt_to_row(&mut no_result_row.attempts[0], &no_result_binding);
+    let no_result_evidence_identity = no_result_row.evidence_identity()?;
+    let no_result_report_identity = no_result_row.attempts[0]["verification_report_sha256"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut no_result_series = series_row.clone();
+    no_result_series.event_id = "fixture-combined-current-no-result".into();
+    no_result_series.run_id = no_result_row.run_id.clone();
+    no_result_series.series.outcome = SeriesOutcome::NoResult;
+    no_result_series.series.result = None;
+    no_result_series.series.failure_class = Some(FailureClass::NoResult);
+    no_result_series.series.coordinates = None;
+    no_result_series.series.no_verdict_evidence = Some(SeriesNoVerdictEvidence {
+        evidence_sha256: no_result_evidence_identity,
+        attempts: vec![SeriesAttemptDisposition {
+            index: "1".into(),
+            kind: SeriesNoVerdictKind::NotRun,
+            detail: None,
+            attempt_outcome: "ERROR".into(),
+            disposition: SeriesOutcome::NoResult,
+            error_kind: Some("incomplete-verification-evidence".into()),
+            status: Some(125),
+            signal: None,
+            timed_out: false,
+            verification_report_sha256: Some(no_result_report_identity),
+        }],
+    });
+    no_result_series.validate_for_read()?;
+
+    for (label, result_row, source_row) in [
+        ("FAIL", &fail_row, &fail_series),
+        ("ERROR", &error_row, &error_series),
+        ("no_result", &no_result_row, &no_result_series),
+    ] {
+        restore_combined_baseline()?;
+        write_result_row(result_row)?;
+        let value = scorecard_snapshot_fixture_value(
+            &source_commit,
+            &source_tree,
+            std::slice::from_ref(source_row),
+        )?;
+        let path = snapshot_root.join(format!("current-{}.json", label.to_ascii_lowercase()));
+        let sha = write_scorecard_snapshot_fixture(&path, &value)?;
+        project_and_observe_results(
+            &result_command_root,
+            &path,
+            &sha,
+            &result_root,
+            &fixture_head,
+            "fixture-refresh",
+        )?;
+        let written: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+        if count_run_representations(
+            &written,
+            &replay_id,
+            &result_row.run_id,
+            &source_row.event_id,
+        ) != 1
+            || written
+                .projection
+                .as_ref()
+                .is_none_or(|projection| projection.pre_series_corpus)
+        {
+            return Err(format!(
+                "combined transaction did not reconcile {label} direct and series evidence exactly once"
+            ));
+        }
+    }
+    restore_combined_baseline()?;
+    write_result_row(&replay_row)?;
+
+    // A second real command must wait on the same repository-local lock. It
+    // may proceed only after the first writer releases that lock.
+    let held_writer = acquire_scorecard_write_lock(&result_command_root)?;
+    let mut waiting_writer = Command::new(&executable)
+        .arg("project-and-observe-results")
+        .arg("--snapshot")
+        .arg(&row_snapshot_path)
+        .arg("--snapshot-sha256")
+        .arg(&row_snapshot_sha)
+        .arg("--results")
+        .arg(&result_root)
+        .arg("--expected-head")
+        .arg(&fixture_head)
+        .arg("--refreshed-at")
+        .arg("fixture-refresh")
+        .current_dir(&result_command_root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot start second combined writer: {error}"))?;
+    std::thread::sleep(Duration::from_millis(150));
+    if let Some(status) = waiting_writer
+        .try_wait()
+        .map_err(|error| format!("cannot inspect waiting combined writer: {error}"))?
+    {
+        return Err(format!(
+            "second combined writer did not serialize on the held lock: {status}"
+        ));
+    }
+    drop(held_writer);
+    let waiting_output = waiting_writer
+        .wait_with_output()
+        .map_err(|error| format!("cannot finish second combined writer: {error}"))?;
+    if !waiting_output.status.success()
+        || read_generated_files(&result_command_root)? != stable_publication
+    {
+        return Err(format!(
+            "serialized second combined writer failed or changed an idempotent pair: status={} stderr={:?}",
+            waiting_output.status,
+            String::from_utf8_lossy(&waiting_output.stderr)
+        ));
+    }
+
+    restore_combined_baseline()?;
+    let original_combined_pair = read_generated_files(&result_command_root)?;
+    let moved_head_error = project_and_observe_results_with(
+        &result_command_root,
+        &empty_snapshot_path,
+        &empty_snapshot_sha,
+        &result_root,
+        &fixture_head,
+        "fixture-refresh",
+        || {
+            git_ok(
+                &result_command_root,
+                &[
+                    "-c",
+                    "user.email=scorecard@example.invalid",
+                    "-c",
+                    "user.name=Scorecard Self-Test",
+                    "commit",
+                    "--quiet",
+                    "--allow-empty",
+                    "-m",
+                    "move head during combined write",
+                ],
+            )
+        },
+        |_| Ok(()),
+    )
+    .expect_err("combined transaction accepted a moved HEAD");
+    if !moved_head_error.contains("HEAD moved")
+        || read_generated_files(&result_command_root)? != original_combined_pair
+    {
+        return Err(format!(
+            "moved-HEAD refusal changed the generated pair or lost its cause: {moved_head_error}"
+        ));
+    }
+    git_ok(&result_command_root, &["update-ref", "HEAD", &fixture_head])?;
+
+    for (path, label) in [
+        (result_command_root.join(SCORECARD), SCORECARD),
+        (result_command_root.join(CELLS), CELLS),
+    ] {
+        let preimage_error = project_and_observe_results_with(
+            &result_command_root,
+            &empty_snapshot_path,
+            &empty_snapshot_sha,
+            &result_root,
+            &fixture_head,
+            "fixture-refresh",
+            || fs::write(&path, b"foreign generated bytes\n").map_err(|error| error.to_string()),
+            |_| Ok(()),
+        )
+        .expect_err("combined transaction accepted a changed generated-file preimage");
+        if !preimage_error.contains(label) {
+            return Err(format!(
+                "changed-{label} refusal lost the changed pathname: {preimage_error}"
+            ));
+        }
+        restore_combined_baseline()?;
+    }
+
+    let tampered_snapshot = row_snapshot_value.clone();
+    let tamper_error = project_and_observe_results_with(
+        &result_command_root,
+        &row_snapshot_path,
+        &row_snapshot_sha,
+        &result_root,
+        &fixture_head,
+        "fixture-refresh",
+        || {
+            let mut payload = serde_json::to_vec(&tampered_snapshot).map_err(|e| e.to_string())?;
+            payload.extend_from_slice(b" \n");
+            fs::write(&row_snapshot_path, payload).map_err(|error| error.to_string())
+        },
+        |_| Ok(()),
+    )
+    .expect_err("combined transaction accepted snapshot bytes changed while held");
+    if !tamper_error.contains("snapshot") {
+        return Err(format!(
+            "held-snapshot tamper refusal lost its cause: {tamper_error}"
+        ));
+    }
+    let row_snapshot_sha =
+        write_scorecard_snapshot_fixture(&row_snapshot_path, &row_snapshot_value)?;
+
+    let rollback_error = project_and_observe_results_with(
+        &result_command_root,
+        &row_snapshot_path,
+        &row_snapshot_sha,
+        &result_root,
+        &fixture_head,
+        "fixture-refresh-after-rollback",
+        || Ok(()),
+        |replacement| {
+            if replacement == 2 {
+                Err("planted combined second-file replacement failure".into())
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .expect_err("combined transaction ignored a second-file replacement failure");
+    if !rollback_error.contains("restored the original generated files")
+        || read_generated_files(&result_command_root)? != original_combined_pair
+    {
+        return Err(format!(
+            "combined transaction did not roll back its first replacement: {rollback_error}"
+        ));
+    }
+    restore_combined_baseline()?;
+
+    // Two series events that both claim the exact direct run, or one whose
+    // result conflicts with it, must refuse rather than silently picking an
+    // observation representation.
+    let mut duplicate_mapping = series_row.clone();
+    duplicate_mapping.event_id = "fixture-combined-duplicate-mapping".into();
+    duplicate_mapping.emitted_at = "2026-09-13T18:30:01Z".into();
+    let multiple_value = scorecard_snapshot_fixture_value(
+        &source_commit,
+        &source_tree,
+        &[series_row.clone(), duplicate_mapping],
+    )?;
+    let multiple_path = snapshot_root.join("multiple-mapping.json");
+    let multiple_sha = write_scorecard_snapshot_fixture(&multiple_path, &multiple_value)?;
+    let multiple_error = project_and_observe_results(
+        &result_command_root,
+        &multiple_path,
+        &multiple_sha,
+        &result_root,
+        &fixture_head,
+        "fixture-refresh",
+    )
+    .expect_err("multiple source rows were allowed to claim one exact direct run");
+    if !multiple_error.contains("cannot map one-to-one") {
+        return Err(format!(
+            "multiple-mapping refusal lost its cause: {multiple_error}"
+        ));
+    }
+    if read_generated_files(&result_command_root)? != original_combined_pair {
+        return Err("multiple-mapping refusal changed the generated pair".into());
+    }
+    let mut conflicting_mapping = series_row.clone();
+    conflicting_mapping.event_id = "fixture-combined-conflicting-mapping".into();
+    conflicting_mapping.series.outcome = SeriesOutcome::Diverged;
+    conflicting_mapping.series.result = Some(ObservedResult::ReplayFailure);
+    conflicting_mapping.series.failure_class = Some(FailureClass::ProductFailure);
+    let conflicting_value =
+        scorecard_snapshot_fixture_value(&source_commit, &source_tree, &[conflicting_mapping])?;
+    let conflicting_path = snapshot_root.join("conflicting-mapping.json");
+    let conflicting_sha = write_scorecard_snapshot_fixture(&conflicting_path, &conflicting_value)?;
+    let conflicting_error = project_and_observe_results(
+        &result_command_root,
+        &conflicting_path,
+        &conflicting_sha,
+        &result_root,
+        &fixture_head,
+        "fixture-refresh",
+    )
+    .expect_err("a conflicting series/direct result mapping was accepted");
+    if !conflicting_error.contains("disagree") {
+        return Err(format!(
+            "conflicting-mapping refusal lost its cause: {conflicting_error}"
+        ));
+    }
+    if read_generated_files(&result_command_root)? != original_combined_pair {
+        return Err("conflicting-mapping refusal changed the generated pair".into());
+    }
+    restore_generated()?;
+
     let mut current_row = pressure_row("pass", None, None);
     current_row.cell = verify_id.clone();
     current_row.verification = None;
@@ -9667,8 +11465,7 @@ red/`measured-and-passed` count is **0**.",
         "{:x}",
         Sha256::digest(prior_verify_report.as_bytes())
     ));
-    prior_verify_row.attempts[0]["verification_report"] =
-        JsonValue::String(prior_verify_report);
+    prior_verify_row.attempts[0]["verification_report"] = JsonValue::String(prior_verify_report);
     write_result_row(&prior_verify_row)?;
     let seeded = run_result_command("observe-results", None)?;
     if !seeded.status.success() {
@@ -10562,8 +12359,7 @@ red/`measured-and-passed` count is **0**.",
             || fold.reads_all_green()
             || tracked.cells[0].measurement != MeasurementState::MeasuredNoVerdict
             || tracked.cells[0].observations.len() != 1
-            || tracked.cells[0].observations[0].results
-                != BTreeSet::from([ObservedResult::Timeout])
+            || tracked.cells[0].observations[0].results != BTreeSet::from([ObservedResult::Timeout])
             || tracked.cells[0].last_tested.is_none()
         {
             return Err(format!(
@@ -11962,10 +13758,7 @@ red/`measured-and-passed` count is **0**.",
     let mut native_projection = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![
-            boundary_cell(Vec::new(), CellStatus::Green),
-            native_cell,
-        ],
+        cells: vec![boundary_cell(Vec::new(), CellStatus::Green), native_cell],
     };
     let native_pass = series_row(
         "fixture/boundary/naked/native",
@@ -12389,19 +14182,17 @@ red/`measured-and-passed` count is **0**.",
     series_unavailable.series.run_index = 2;
     series_unavailable.series.attempt = Some(2);
     series_unavailable.series.no_verdict_evidence = Some(no_verdict_evidence(false));
-    let project_series_fixture = |rows: &[SeriesRow]| -> Result<
-        (TrackedCells, ProjectObservationsOutcome),
-        String,
-    > {
-        let mut tracked = TrackedCells {
-            schema: SCHEMA,
-            projection: None,
-            cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
+    let project_series_fixture =
+        |rows: &[SeriesRow]| -> Result<(TrackedCells, ProjectObservationsOutcome), String> {
+            let mut tracked = TrackedCells {
+                schema: SCHEMA,
+                projection: None,
+                cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
+            };
+            let outcome = apply_series_rows(&root, &mut tracked, rows, None)?;
+            refresh_measurement(&mut tracked);
+            Ok((tracked, outcome))
         };
-        let outcome = apply_series_rows(&root, &mut tracked, rows, None)?;
-        refresh_measurement(&mut tracked);
-        Ok((tracked, outcome))
-    };
     let (projected_timeout, _) = project_series_fixture(&[series_timeout.clone()])?;
     let (direct_timeout, _) = fold_fixture_row(not_run_row.clone())?;
     if projected_timeout.cells[0].measurement != direct_timeout.cells[0].measurement
@@ -12440,10 +14231,7 @@ red/`measured-and-passed` count is **0**.",
     disposition.status = Some(0);
     let (projected_noncanonical, _) = project_series_fixture(&[series_noncanonical])?;
     let mut direct_noncanonical_rows = coordinate_less_row(&unlocated_id, "PASS");
-    let direct_noncanonical = &mut direct_noncanonical_rows
-        .get_mut(&unlocated_id)
-        .unwrap()[0]
-        .row;
+    let direct_noncanonical = &mut direct_noncanonical_rows.get_mut(&unlocated_id).unwrap()[0].row;
     let mut report: JsonValue = serde_json::from_str(
         direct_noncanonical.attempts[0]["verification_report"]
             .as_str()
@@ -12472,9 +14260,7 @@ red/`measured-and-passed` count is **0**.",
         || projected_noncanonical.cells[0].observations[0].results
             != direct_noncanonical_tracked.cells[0].observations[0].results
     {
-        return Err(
-            "noncanonical comparison changed between direct and series paths".into(),
-        );
+        return Err("noncanonical comparison changed between direct and series paths".into());
     }
 
     let (projected_no_verdict, projected_no_verdict_outcome) =
@@ -12679,34 +14465,30 @@ red/`measured-and-passed` count is **0**.",
 
     let procfs_cell = "c-programs/procfs-positioned-probe/verify/ptrace";
     let legacy_row = |key: usize, outcome: SeriesOutcome, detcore_tree: Option<String>| {
-            let commit = ambient_commits.get(key).unwrap_or(&ambient_commits[0]);
-            let mut row = series_row(
-                procfs_cell,
-                outcome,
-                SeriesProducer::Validate,
-                1,
-                detcore_tree,
-                None,
-            );
-            row.schema = SeriesSchema::V2;
-            row.event_id = format!("ambient-event-{key}");
-            row.run_id = format!("ambient-run-{key}");
-            row.emitted_at = format!("2026-08-27T05:00:{key:02}Z");
-            row.series.tree = (*commit).into();
-            row.series.result = None;
-            row.series.failure_class = None;
-            row
-        };
+        let commit = ambient_commits.get(key).unwrap_or(&ambient_commits[0]);
+        let mut row = series_row(
+            procfs_cell,
+            outcome,
+            SeriesProducer::Validate,
+            1,
+            detcore_tree,
+            None,
+        );
+        row.schema = SeriesSchema::V2;
+        row.event_id = format!("ambient-event-{key}");
+        row.run_id = format!("ambient-run-{key}");
+        row.emitted_at = format!("2026-08-27T05:00:{key:02}Z");
+        row.series.tree = (*commit).into();
+        row.series.result = None;
+        row.series.failure_class = None;
+        row
+    };
     let mut ambient_rows = (0..ambient_commits.len())
         .map(|index| legacy_row(index, SeriesOutcome::Passed, None))
         .collect::<Vec<_>>();
     ambient_rows.extend([
         legacy_row(6, SeriesOutcome::Diverged, None),
-        legacy_row(
-            7,
-            SeriesOutcome::Passed,
-            Some(ambient_commits[0].into()),
-        ),
+        legacy_row(7, SeriesOutcome::Passed, Some(ambient_commits[0].into())),
     ]);
 
     let source_commit = "a".repeat(40);
@@ -12834,8 +14616,7 @@ red/`measured-and-passed` count is **0**.",
     ] {
         let mut direct_json: JsonValue = serde_json::from_str(&object_store_outputs[0])
             .map_err(|e| format!("cannot decode projected fixture for result refusal: {e}"))?;
-        direct_json["cells"][0]["observations"][0]["results"] =
-            serde_json::json!([rendered]);
+        direct_json["cells"][0]["observations"][0]["results"] = serde_json::json!([rendered]);
         let direct_error = serde_json::from_value::<TrackedCells>(direct_json)
             .expect_err("direct tracked serde accepted a non-product observation result")
             .to_string();
@@ -13395,15 +15176,14 @@ red/`measured-and-passed` count is **0**.",
     let embedded_root = format!("--hermit={foreign_root}/target/debug/hermit");
     let path_root = format!("/usr/bin:{foreign_root}/bin");
     let interior_root = format!("prefix{foreign_root}/target/debug/hermit");
-    let foreign_env: BTreeMap<String, String> =
-        [
-            ("HOME".to_string(), format!("{foreign_root}/home")),
-            ("PATH".to_string(), path_root),
-            ("SIBLING".to_string(), sibling_root.clone()),
-            ("INTERIOR".to_string(), interior_root.clone()),
-        ]
-            .into_iter()
-            .collect();
+    let foreign_env: BTreeMap<String, String> = [
+        ("HOME".to_string(), format!("{foreign_root}/home")),
+        ("PATH".to_string(), path_root),
+        ("SIBLING".to_string(), sibling_root.clone()),
+        ("INTERIOR".to_string(), interior_root.clone()),
+    ]
+    .into_iter()
+    .collect();
     let mut fixture = ObservedInvocation {
         hermit_sha: "fixture-sha".into(),
         run_id: "fixture-run".into(),
