@@ -20868,6 +20868,194 @@ mod committed_selection_preservation_tests {
     use super::*;
 
     #[test]
+    fn hosted_shard_consumers_resolve_public_names_without_losing_coverage() {
+        let root = Path::new(file!()).parent().and_then(Path::parent).unwrap();
+        let (committed, _, _) = load_committed_validation_dag(root).unwrap();
+        let hosted = dagrun::select_steps_by_labels(&committed, &["hosted-portable".into()]).unwrap();
+        let plan = serde_json::json!({
+            "profile": "hosted-portable", "selection_mode": "label",
+            "dags": [{"steps": hosted.steps.iter().map(|step| serde_json::json!({
+                "tag": step.tag(), "deps": step.deps,
+            })).collect::<Vec<_>>()}],
+        });
+        let shards: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("ci/portable-shards.json")).unwrap())
+                .unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let fixture = scratch.path();
+        for path in [
+            "ci/hermetic/run-split-validate.sh",
+            "ci/check-shard-coverage.sh",
+            "ci/expected-e2e-plan.json",
+            ".github/workflows/ci-portable.yml",
+        ] {
+            let dest = fixture.join(path);
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::copy(root.join(path), dest).unwrap();
+        }
+        std::fs::create_dir(fixture.join("scripts")).unwrap();
+        let driver = fixture.join("scripts/validate.rs");
+        // Only the plan transport is replaced: both real shell consumers and
+        // their complete shard/workflow inputs execute unchanged. The plan is
+        // the actual committed hosted selection loaded above.
+        std::fs::write(&driver, "#!/usr/bin/env bash\nset -euo pipefail\n[[ $# == 3 && $1 == --hosted-portable-only && $2 == --show-plan-json && $3 == --skip-inner-dirty-working-tree-and-rebase-freshness-checks ]] || exit 90\ncat ./plan.json\n").unwrap();
+        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run = |script: &str, selected: &serde_json::Value, exported: &serde_json::Value| {
+            std::fs::write(
+                fixture.join("ci/portable-shards.json"),
+                serde_json::to_vec(selected).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                fixture.join("plan.json"),
+                serde_json::to_vec(exported).unwrap(),
+            )
+            .unwrap();
+            let mut command = Command::new("bash");
+            command
+                .arg(fixture.join(script))
+                .current_dir(fixture)
+                .env("LC_ALL", "C.UTF-8");
+            if script.contains("run-split") {
+                command.arg("--dry-run");
+            }
+            command.output().unwrap()
+        };
+        for script in [
+            "ci/hermetic/run-split-validate.sh",
+            "ci/check-shard-coverage.sh",
+        ] {
+            let output = run(script, &shards, &plan);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{script}: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if script.contains("run-split") {
+                // Feed the exact emitted public argv through the real driver's
+                // selector logic. Together the two partitions must cover each
+                // committed hosted node once, with no dependency expansion.
+                let mut actual = BTreeSet::new();
+                let mut partitions = 0;
+                for line in stdout.lines() {
+                    let Some(selected) = line.trim().strip_prefix("ci/run-node.sh portable ") else {
+                        continue;
+                    };
+                    partitions += 1;
+                    let args = parse_argv(&[
+                        "--hosted-portable-only".into(),
+                        "--selected".into(),
+                        selected.into(),
+                        "--ignore-selected-deps".into(),
+                        ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
+                    ])
+                    .unwrap();
+                    let part = build_plan(root, &args, fixture).unwrap();
+                    for step in part.cfg.steps {
+                        assert!(
+                            actual.insert(step.tag()),
+                            "duplicate physical node across partitions"
+                        );
+                    }
+                }
+                assert_eq!(partitions, 2);
+                assert_eq!(actual, hosted.steps.iter().map(Step::tag).collect());
+                assert!(
+                    stdout.contains("test.hermit_unit,test.detcore_unit"),
+                    "public selectors changed: {stdout}"
+                );
+                assert!(
+                    stdout.contains("190 strict compatibility"),
+                    "the fixture must accompany all 189 cases: {stdout}"
+                );
+            } else {
+                assert!(
+                    stdout.contains(
+                        "251 committed hosted-portable steps each assigned to exactly one hosted job"
+                    ),
+                    "{stdout}"
+                );
+            }
+            for (case, marker) in [
+                ("missing", "test.hermit_unit_on_host"),
+                ("duplicate-public", "test.hermit_unit_on_host"),
+                ("duplicate-resolved", "test.hermit_unit_on_host"),
+                ("duplicate-fixture", "compatprep.fixtures_on_host"),
+                ("unknown", "test.no_such_shard_node"),
+                ("missing-strict", "expected exactly one"),
+            ] {
+                let mut broken = shards.clone();
+                let nodes = broken["debug_shards"][0]["nodes"].as_array_mut().unwrap();
+                match case {
+                    "missing" => {
+                        assert_eq!(nodes.remove(0), "test.hermit_unit");
+                    }
+                    "duplicate-public" => nodes.push("test.hermit_unit".into()),
+                    "duplicate-resolved" => nodes.push("test.hermit_unit_on_host".into()),
+                    "duplicate-fixture" => nodes.push("compatprep.fixtures_on_host".into()),
+                    "unknown" => nodes.push("test.no_such_shard_node".into()),
+                    "missing-strict" => broken["strict_compat_nodes"] = serde_json::json!([]),
+                    _ => unreachable!(),
+                }
+                let output = run(script, &broken, &plan);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let (expected_status, marker) =
+                    if case == "missing-strict" && script.contains("run-split") {
+                        (5, "no strict compatibility steps")
+                    } else {
+                        (1, marker)
+                    };
+                eprintln!(
+                    "SHARD_CONSUMER_CONTROL {script} {case}: status={:?} stderr={stderr:?}",
+                    output.status.code()
+                );
+                assert_eq!(
+                    output.status.code(),
+                    Some(expected_status),
+                    "{script} {case}: {stderr}"
+                );
+                assert!(stderr.contains(marker), "{script} {case}: {stderr}");
+            }
+        }
+        let mut duplicate_plan = plan.clone();
+        let rows = duplicate_plan["dags"][0]["steps"].as_array_mut().unwrap();
+        rows.push(rows[0].clone());
+        let output = run(
+            "ci/hermetic/run-split-validate.sh",
+            &shards,
+            &duplicate_plan,
+        );
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("duplicate constructed step"));
+
+        // Set coverage is still complete, but this dependency is owned by a
+        // different, later shard. Resolving public selectors must not hide it.
+        let mut bad_dependency = plan.clone();
+        let row = bad_dependency["dags"][0]["steps"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|row| row["tag"] == "test.hermit_unit_on_host")
+            .unwrap();
+        row["deps"]
+            .as_array_mut()
+            .unwrap()
+            .push("test.hermit_integration_on_host".into());
+        let output = run("ci/check-shard-coverage.sh", &shards, &bad_dependency);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("debug shard unit drops constructed predecessor"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("test.hermit_integration_on_host"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
     fn hosted_portable_public_selection_retains_exact_nodes_and_compat_fixture() {
         let root = Path::new(file!()).parent().and_then(Path::parent).unwrap();
         let (committed, _, _) = load_committed_validation_dag(root).unwrap();

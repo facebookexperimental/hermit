@@ -212,7 +212,7 @@ if [[ -z "$shards" ]]; then
     }
     compat_expansion=$(jq -r '
         .dags[].steps[].tag
-        | select(. == "compatprep.fixtures" or startswith("compat."))
+        | select(. == "compatprep.fixtures" or . == "compatprep.fixtures_on_host" or startswith("compat."))
     ' <<<"$plan_json")
     [[ -n "$compat_expansion" ]] || {
         echo "run-split-validate: constructed plan has no direct strict compatibility nodes." >&2
@@ -223,20 +223,27 @@ if [[ -z "$shards" ]]; then
     # here too before comparing the partition with the constructed graph.
     selected_list=$(
         {
-            tr ',' '\n' <<<"$build_nodes,$test_nodes" | grep -Fvx 'test.strict_compat'
+            # Match validate's exact-name-first hosted selector resolution.
+            # Preserve unknown names and duplicates for the checks below.
+            tr ',' '\n' <<<"$build_nodes,$test_nodes" | grep -Fvx 'test.strict_compat' |
+                jq -Rr --argjson available "$(jq '[.dags[].steps[].tag]' <<<"$plan_json")" '
+                    . as $tag | ($tag + "_on_host") as $hosted
+                    | if ($available | index($tag)) == null and ($available | index($hosted)) != null
+                      then $hosted else $tag end
+                '
             printf '%s\n' "$compat_expansion"
         } | LC_ALL=C sort
     )
-    duplicate_nodes=$(uniq -d <<<"$selected_list" || true)
+    duplicate_nodes=$(LC_ALL=C uniq -d <<<"$selected_list" || true)
     strict_compat_node_count=$(wc -l <<<"$compat_expansion")
     test_node_count=$((test_node_count - 1 + strict_compat_node_count))
     total_node_count=$((build_node_count + test_node_count))
     expected_list=$(jq -r '.dags[].steps[].tag' <<<"$plan_json" | LC_ALL=C sort)
-    duplicate_dag_nodes=$(uniq -d <<<"$expected_list" || true)
-    selected_unique=$(uniq <<<"$selected_list")
-    expected_unique=$(uniq <<<"$expected_list")
-    missing_nodes=$(comm -23 <(printf '%s\n' "$expected_unique") <(printf '%s\n' "$selected_unique") || true)
-    extra_nodes=$(comm -13 <(printf '%s\n' "$expected_unique") <(printf '%s\n' "$selected_unique") || true)
+    duplicate_dag_nodes=$(LC_ALL=C uniq -d <<<"$expected_list" || true)
+    selected_unique=$(LC_ALL=C uniq <<<"$selected_list")
+    expected_unique=$(LC_ALL=C uniq <<<"$expected_list")
+    missing_nodes=$(LC_ALL=C comm -23 <(printf '%s\n' "$expected_unique") <(printf '%s\n' "$selected_unique") || true)
+    extra_nodes=$(LC_ALL=C comm -13 <(printf '%s\n' "$expected_unique") <(printf '%s\n' "$selected_unique") || true)
     if [[ -n "$duplicate_nodes" || -n "$duplicate_dag_nodes" || -n "$missing_nodes" || -n "$extra_nodes" ]]; then
         echo "run-split-validate: full portable step selection does not exactly match validate's constructed plan." >&2
         [[ -z "$duplicate_nodes" ]] || printf '  duplicate selection: %s\n' $duplicate_nodes >&2

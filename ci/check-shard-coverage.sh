@@ -48,13 +48,27 @@ mapfile -t expected < <(jq -r '.dags[].steps[].tag' <<<"$plan_json" | sort -u)
 mapfile -t strict_compat_expansion < <(
     jq -r '
         .dags[].steps[].tag
-        | select(. == "compatprep.fixtures" or startswith("compat."))
+        | select(. == "compatprep.fixtures" or . == "compatprep.fixtures_on_host" or startswith("compat."))
     ' <<<"$plan_json" | sort -u
 )
 if ((${#strict_compat_expansion[@]} == 0)); then
     echo "check-shard-coverage.sh: constructed plan has no direct strict compatibility nodes" >&2
     exit 2
 fi
+
+# Match validate's exact-name-first hosted selector resolution before checking
+# either coverage or predecessor supply. The source shard map keeps its public
+# selectors; unknown names and duplicate resolutions remain failures below.
+shards_json=$(jq --argjson available "$(jq '[.dags[].steps[].tag]' <<<"$plan_json")" '
+    def resolve:
+        . as $tag | ($tag + "_on_host") as $hosted
+        | if ($available | index($tag)) == null and ($available | index($hosted)) != null
+          then $hosted else $tag end;
+    (.preflight_nodes[], .check_nodes[], .build_debug_nodes[],
+     .build_dbt_nodes[], .build_aux_nodes[], .strict_compat_nodes[],
+     .e2e_nodes[], .final_nodes[], .debug_shards[].nodes[],
+     .release_shards[].nodes[]) |= resolve
+' "$shards")
 
 # Every selection alias assigned by the shard map, across all job buckets.
 mapfile -t assigned_aliases < <(
@@ -70,7 +84,7 @@ mapfile -t assigned_aliases < <(
       + ([ (.debug_shards // [])[]   | .nodes[] ])
       + ([ (.release_shards // [])[] | .nodes[] ])
         | .[]
-    ' "$shards" | sort
+    ' <<<"$shards_json" | sort
 )
 strict_alias_count=$(printf '%s\n' "${assigned_aliases[@]}" |
     grep -Fxc 'test.strict_compat' || true)
@@ -430,11 +444,11 @@ check_dependencies() {
     fi
 }
 
-preflight_json=$(jq -c '.preflight_nodes // []' "$shards")
-check_json=$(jq -c '.check_nodes // []' "$shards")
-build_debug_json=$(jq -c '.build_debug_nodes // []' "$shards")
-build_dbt_json=$(jq -c '.build_dbt_nodes // []' "$shards")
-build_aux_json=$(jq -c '.build_aux_nodes // []' "$shards")
+preflight_json=$(jq -c '.preflight_nodes // []' <<<"$shards_json")
+check_json=$(jq -c '.check_nodes // []' <<<"$shards_json")
+build_debug_json=$(jq -c '.build_debug_nodes // []' <<<"$shards_json")
+build_dbt_json=$(jq -c '.build_dbt_nodes // []' <<<"$shards_json")
+build_aux_json=$(jq -c '.build_aux_nodes // []' <<<"$shards_json")
 strict_compat_json=$(printf '%s\n' "${strict_compat_expansion[@]}" |
     jq -Rsc 'split("\n") | map(select(length > 0))')
 through_preflight=$(jq -cn --argjson preflight "$preflight_json" '$preflight')
@@ -454,7 +468,7 @@ check_dependencies "debug build job" "$build_debug_json" "$through_debug"
 check_dependencies "release build job" "$build_dbt_json" "$through_release"
 check_dependencies "completed build job" "$build_aux_json" "$through_builds"
 
-debug_test_json=$(jq -c '[.debug_shards[].nodes[]]' "$shards")
+debug_test_json=$(jq -c '[.debug_shards[].nodes[]]' <<<"$shards_json")
 strict_compat_supplied=$(jq -cn \
     --argjson prior "$through_builds" \
     --argjson tests "$debug_test_json" \
@@ -467,22 +481,22 @@ while IFS= read -r shard; do
     nodes=$(jq -c '.nodes' <<<"$shard")
     supplied=$(jq -cn --argjson prior "$through_builds" --argjson selected "$nodes" '$prior + $selected')
     check_dependencies "debug shard $slug" "$nodes" "$supplied"
-done < <(jq -c '.debug_shards[]' "$shards")
+done < <(jq -c '.debug_shards[]' <<<"$shards_json")
 
 while IFS= read -r shard; do
     slug=$(jq -r '.slug' <<<"$shard")
     nodes=$(jq -c '.nodes' <<<"$shard")
     supplied=$(jq -cn --argjson prior "$through_builds" --argjson selected "$nodes" '$prior + $selected')
     check_dependencies "release shard $slug" "$nodes" "$supplied"
-done < <(jq -c '.release_shards[]' "$shards")
+done < <(jq -c '.release_shards[]' <<<"$shards_json")
 
 while IFS= read -r node; do
     selected=$(jq -cn --arg node "$node" '[$node]')
     supplied=$(jq -cn --argjson prior "$through_builds" --argjson selected "$selected" '$prior + $selected')
     check_dependencies "E2E job $node" "$selected" "$supplied"
-done < <(jq -r '.e2e_nodes[]' "$shards")
+done < <(jq -r '.e2e_nodes[]' <<<"$shards_json")
 
-final_json=$(jq -c '.final_nodes // []' "$shards")
+final_json=$(jq -c '.final_nodes // []' <<<"$shards_json")
 all_supplied_json=$(printf '%s\n' "${assigned[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
 check_dependencies "final job" "$final_json" "$all_supplied_json"
 
@@ -490,7 +504,7 @@ if ! jq -e '
     (.build_aux_nodes // []) as $completed_build
     | ($completed_build | index("build.e2e_artifact") != null)
       and ($completed_build | index("build.liteinst_runtime_release") != null)
-' "$shards" >/dev/null; then
+' <<<"$shards_json" >/dev/null; then
     echo "check-shard-coverage.sh: FAIL — completed build job must preserve build.e2e_artifact -> build.liteinst_runtime_release" >&2
     status=1
 fi
