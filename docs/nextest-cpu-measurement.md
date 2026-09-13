@@ -37,9 +37,12 @@ forwards one external signal to the child group and does not let a later signal
 replace an already observed CPU timeout. Missing live CPU accounting is an
 infrastructure failure, not an unbounded run.
 
-On the measurement-only path, `supervisor_signal` retains the snapshot taken at
-interruption. Nextest still owns the existing 2-second grace, so CPU consumed
-after that snapshot is not in the record and must not be read as a final total.
+On the measurement-only path, an ordinary exit uses the final reaped `wait4`
+total. `supervisor_signal` combines already-reaped `wait4` CPU with the live
+procfs descendant snapshot taken at interruption, and records that distinct
+`procfs-descendants+wait4` source. Nextest still owns the existing 2-second
+grace, so CPU consumed after that snapshot is not in the record and must not be
+read as a final total.
 
 Production activation also needs the outer Nextest termination grace to exceed
 the wrapper's child grace by a measured publication margin. The current 2-second

@@ -17,8 +17,8 @@ pub const CPU_REPORT_SCHEMA: u64 = 2;
 pub const CPU_BINARY_MAP_ENV: &str = "HERMIT_NEXTEST_CPU_BINARY_MAP";
 pub const CPU_RECORD_DIR_ENV: &str = "HERMIT_NEXTEST_CPU_RECORD_DIR";
 pub const CPU_REPORT_PATH_ENV: &str = "HERMIT_NEXTEST_CPU_REPORT_PATH";
-pub const CPU_SOURCE: &str = "wait4-subtree";
-pub const CPU_SOURCE_ENFORCED: &str = "procfs-descendants+wait4";
+pub const CPU_SOURCE_REAPED: &str = "wait4-subtree";
+pub const CPU_SOURCE_PROCFS_AND_REAPED: &str = "procfs-descendants+wait4";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -274,9 +274,9 @@ impl AttemptRecord {
         completion: AttemptCompletion,
     ) -> Self {
         let cpu_source = if matches!(completion, AttemptCompletion::CpuTimeout { .. }) {
-            CPU_SOURCE_ENFORCED
+            CPU_SOURCE_PROCFS_AND_REAPED
         } else {
-            CPU_SOURCE
+            CPU_SOURCE_REAPED
         };
         Self::new_with_source(
             run_id,
@@ -325,18 +325,18 @@ impl AttemptRecord {
                 "attempt record key does not match its binary/test/attempt identity".into(),
             );
         }
-        if self.cpu_source != CPU_SOURCE && self.cpu_source != CPU_SOURCE_ENFORCED {
+        if self.cpu_source != CPU_SOURCE_REAPED && self.cpu_source != CPU_SOURCE_PROCFS_AND_REAPED {
             return Err(format!(
-                "attempt record cpu_source {:?} is neither {CPU_SOURCE:?} nor {CPU_SOURCE_ENFORCED:?}",
+                "attempt record cpu_source {:?} is neither {CPU_SOURCE_REAPED:?} nor {CPU_SOURCE_PROCFS_AND_REAPED:?}",
                 self.cpu_source
             ));
         }
         self.completion.validate()?;
         if matches!(self.completion, AttemptCompletion::CpuTimeout { .. })
-            && self.cpu_source != CPU_SOURCE_ENFORCED
+            && self.cpu_source != CPU_SOURCE_PROCFS_AND_REAPED
         {
             return Err(format!(
-                "CPU-timeout attempt record requires cpu_source {CPU_SOURCE_ENFORCED:?}"
+                "CPU-timeout attempt record requires cpu_source {CPU_SOURCE_PROCFS_AND_REAPED:?}"
             ));
         }
         if let AttemptCompletion::CpuTimeout {

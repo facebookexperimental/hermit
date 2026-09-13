@@ -30,8 +30,8 @@ use hermit_manifest_plan::nextest_cpu::BinaryMapEntry;
 use hermit_manifest_plan::nextest_cpu::CPU_BINARY_MAP_ENV;
 use hermit_manifest_plan::nextest_cpu::CPU_RECORD_DIR_ENV;
 use hermit_manifest_plan::nextest_cpu::CPU_REPORT_PATH_ENV;
-use hermit_manifest_plan::nextest_cpu::CPU_SOURCE;
-use hermit_manifest_plan::nextest_cpu::CPU_SOURCE_ENFORCED;
+use hermit_manifest_plan::nextest_cpu::CPU_SOURCE_PROCFS_AND_REAPED;
+use hermit_manifest_plan::nextest_cpu::CPU_SOURCE_REAPED;
 use hermit_manifest_plan::nextest_cpu::read_attempt_records;
 use hermit_manifest_plan::nextest_cpu::read_binary_map;
 use hermit_manifest_plan::nextest_cpu::write_attempt_atomic;
@@ -790,30 +790,13 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
                     break reserve_or_external(FirstCause::AccountingUnavailable { error });
                 }
             };
-            if let Some(status) = direct_status {
-                if let Err(signal) = reserve_non_signal_cause() {
-                    break FirstCause::ExternalSignal { signal };
-                }
-                let observed = match observed_cpu_usec(reaped_cpu_usec) {
-                    Ok(observed) => observed,
-                    Err(error) => break FirstCause::AccountingUnavailable { error },
-                };
-                max_cpu_usec = max_cpu_usec.max(observed);
-                if observed >= cpu_budget_usec {
-                    break FirstCause::CpuTimeout {
-                        observed_cpu_usec: observed,
-                    };
-                }
-                break FirstCause::Exit(status);
-            }
-            if population == ChildPopulation::Empty {
-                break reserve_or_external(FirstCause::AccountingUnavailable {
-                    error: "nextest test subtree disappeared before its direct child was reaped"
-                        .into(),
-                });
-            }
             let now = Instant::now();
-            if now >= next_cpu_poll {
+            let successful_parent_has_live_descendants = direct_status
+                .is_some_and(|status| status.success())
+                && population == ChildPopulation::Present;
+            let must_resolve_exit = direct_status
+                .is_some_and(|status| !status.success() || population == ChildPopulation::Empty);
+            if now >= next_cpu_poll || must_resolve_exit {
                 let observed = match observed_cpu_usec(reaped_cpu_usec) {
                     Ok(observed) => observed,
                     Err(error) => {
@@ -833,7 +816,19 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
                     }
                     break cause;
                 }
-                next_cpu_poll = now + CPU_POLL_INTERVAL;
+                if now >= next_cpu_poll {
+                    next_cpu_poll = now + CPU_POLL_INTERVAL;
+                }
+            }
+            if let Some(status) = direct_status {
+                if !successful_parent_has_live_descendants {
+                    break reserve_or_external(FirstCause::Exit(status));
+                }
+            } else if population == ChildPopulation::Empty {
+                break reserve_or_external(FirstCause::AccountingUnavailable {
+                    error: "nextest test subtree disappeared before its direct child was reaped"
+                        .into(),
+                });
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -843,9 +838,13 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
 
     if invocation.cpu_budget_usec.is_none() {
         max_cpu_usec = reaped_cpu_usec;
+        let mut cpu_source = CPU_SOURCE_REAPED;
         if matches!(cause, FirstCause::ExternalSignal { .. }) {
             match observed_cpu_usec(reaped_cpu_usec) {
-                Ok(observed) => max_cpu_usec = max_cpu_usec.max(observed),
+                Ok(observed) => {
+                    max_cpu_usec = max_cpu_usec.max(observed);
+                    cpu_source = CPU_SOURCE_PROCFS_AND_REAPED;
+                }
                 Err(error) => {
                     eprintln!(
                         "nextest-cpu-wrapper: CPU accounting became unavailable while recording an external signal: {error}"
@@ -881,7 +880,7 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
             max_cpu_usec,
             elapsed_ms(started)?,
             completion.clone(),
-            CPU_SOURCE,
+            cpu_source,
         );
         write_attempt_atomic(&record_dir, &record)?;
         return match completion {
@@ -896,6 +895,9 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
         };
     }
 
+    let cpu_budget_usec = invocation
+        .cpu_budget_usec
+        .expect("budgeted path requires an enabled CPU budget");
     let cleanup_signal = match cause {
         FirstCause::ExternalSignal { signal } => signal,
         _ => libc::SIGTERM,
@@ -922,12 +924,18 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
         ));
     }
 
+    let cause = match cause {
+        FirstCause::Exit(status) if status.success() && max_cpu_usec >= cpu_budget_usec => {
+            FirstCause::CpuTimeout {
+                observed_cpu_usec: max_cpu_usec,
+            }
+        }
+        cause => cause,
+    };
     let completion = match cause {
         FirstCause::Exit(status) => completion_from_status(status)?,
         FirstCause::CpuTimeout { observed_cpu_usec } => AttemptCompletion::CpuTimeout {
-            cpu_budget_usec: invocation
-                .cpu_budget_usec
-                .expect("CPU-timeout cause requires an enabled budget"),
+            cpu_budget_usec,
             observed_cpu_usec,
         },
         FirstCause::ExternalSignal { signal } => AttemptCompletion::SupervisorSignal { signal },
@@ -939,7 +947,7 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
         max_cpu_usec,
         elapsed_ms(started)?,
         completion.clone(),
-        CPU_SOURCE_ENFORCED,
+        CPU_SOURCE_PROCFS_AND_REAPED,
     );
     write_attempt_atomic(&record_dir, &record)?;
 
@@ -1052,7 +1060,7 @@ fn control_child(mode: &str, args: &[OsString]) -> Result<ExitCode, String> {
             burn_cpu(500);
             Ok(ExitCode::SUCCESS)
         }
-        "hang" | "stop-hang" => {
+        "hang" | "stop-hang" | "measurement-signal" => {
             let path = PathBuf::from(required_env(CONTROL_PID_FILE_ENV)?);
             fs::write(&path, format!("{}\n", std::process::id()))
                 .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
@@ -1077,7 +1085,7 @@ fn control_child(mode: &str, args: &[OsString]) -> Result<ExitCode, String> {
                 burn_cpu(500);
             }
         }
-        "wait-for-escaped-burner" => {
+        "wait-for-escaped-burner" | "exit-after-escaped-burner" => {
             let executable = env::current_exe().map_err(|error| error.to_string())?;
             let pid_path = PathBuf::from(required_env(CONTROL_PID_FILE_ENV)?);
             let child = Command::new(executable)
@@ -1093,8 +1101,12 @@ fn control_child(mode: &str, args: &[OsString]) -> Result<ExitCode, String> {
                 }
                 thread::sleep(Duration::from_millis(2));
             }
-            loop {
-                thread::sleep(Duration::from_secs(60));
+            if mode == "exit-after-escaped-burner" {
+                Ok(ExitCode::SUCCESS)
+            } else {
+                loop {
+                    thread::sleep(Duration::from_secs(60));
+                }
             }
         }
         "catch-signal" => {
@@ -1423,6 +1435,35 @@ fn self_test() -> Result<(), String> {
         ));
     }
 
+    let measurement_signal_pid_file = scratch.0.join("measurement-signal-child.pid");
+    let mut measurement_signal_command = measurement_control_command(
+        &executable,
+        &test_binary,
+        &scratch.0,
+        "measurement-signal",
+        1,
+    );
+    measurement_signal_command.env(CONTROL_PID_FILE_ENV, &measurement_signal_pid_file);
+    let measurement_signal = measurement_signal_command
+        .spawn()
+        .map_err(|error| format!("cannot run measurement-signal control: {error}"))?;
+    wait_for_file(&measurement_signal_pid_file, "measurement-signal child PID")?;
+    if unsafe { libc::kill(-(measurement_signal.id() as i32), libc::SIGTERM) } != 0 {
+        return Err(format!(
+            "cannot signal measurement-only process group: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let measurement_signal = measurement_signal
+        .wait_with_output()
+        .map_err(|error| format!("cannot wait for measurement-signal control: {error}"))?;
+    if measurement_signal.status.signal() != Some(libc::SIGTERM) {
+        return Err(format!(
+            "measurement-signal control did not preserve SIGTERM: {:?}",
+            measurement_signal.status
+        ));
+    }
+
     let success = control_command(&executable, &test_binary, &scratch.0, "success", 1)
         .output()
         .map_err(|error| format!("cannot run success control: {error}"))?;
@@ -1479,6 +1520,32 @@ fn self_test() -> Result<(), String> {
     .map_err(|error| format!("cannot run forced CPU-timeout control: {error}"))?;
     if forced.status.code() != Some(CPU_TIMEOUT_EXIT.into()) {
         return Err(format!("forced CPU-timeout control returned {forced:?}"));
+    }
+
+    let exited_parent_pid_file = scratch.0.join("exited-parent-descendant.pid");
+    let mut exited_parent_command = control_command_with_limits(
+        &executable,
+        &test_binary,
+        &scratch.0,
+        "exit-after-escaped-burner",
+        1,
+        50_000,
+        100,
+    );
+    exited_parent_command.env(CONTROL_PID_FILE_ENV, &exited_parent_pid_file);
+    let exited_parent = exited_parent_command
+        .output()
+        .map_err(|error| format!("cannot run exited-parent CPU control: {error}"))?;
+    if exited_parent.status.code() != Some(CPU_TIMEOUT_EXIT.into()) {
+        return Err(format!(
+            "a successful parent hid its over-budget descendant: {exited_parent:?}"
+        ));
+    }
+    let exited_parent_descendant = read_pid(&exited_parent_pid_file)?;
+    if process_exists(exited_parent_descendant) {
+        return Err(format!(
+            "escaped descendant {exited_parent_descendant} survived post-parent CPU-timeout cleanup"
+        ));
     }
 
     let stopped_pid_file = scratch.0.join("stopped-child.pid");
@@ -1662,15 +1729,17 @@ fn self_test() -> Result<(), String> {
         .iter()
         .map(|r| r.identity.test.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    if records.len() != 10
+    if records.len() != 12
         || identities
             != [
                 "success",
+                "measurement-signal",
                 "failure",
                 "signal",
                 "tree",
                 "hang",
                 "burn-long",
+                "exit-after-escaped-burner",
                 "stop-hang",
                 "wait-for-escaped-burner",
                 "catch-signal",
@@ -1679,7 +1748,7 @@ fn self_test() -> Result<(), String> {
             .collect()
     {
         return Err(format!(
-            "self-test expected ten exact atomic attempt identities, found {identities:?} ({} records)",
+            "self-test expected twelve exact atomic attempt identities, found {identities:?} ({} records)",
             records.len()
         ));
     }
@@ -1689,11 +1758,12 @@ fn self_test() -> Result<(), String> {
     {
         return Err("self-test did not preserve the typed binary identity".into());
     }
-    if find_record_attempt(&records, "success", 1)?.cpu_source != CPU_SOURCE_ENFORCED
-        || find_record_attempt(&records, "success", 2)?.cpu_source != CPU_SOURCE
+    if find_record_attempt(&records, "success", 1)?.cpu_source != CPU_SOURCE_PROCFS_AND_REAPED
+        || find_record_attempt(&records, "success", 2)?.cpu_source != CPU_SOURCE_REAPED
+        || find_record(&records, "measurement-signal")?.cpu_source != CPU_SOURCE_PROCFS_AND_REAPED
     {
         return Err(
-            "self-test did not distinguish enforced and measurement-only CPU sources".into(),
+            "self-test did not distinguish wait4-only from procfs-plus-wait4 CPU sources".into(),
         );
     }
     if !matches!(
@@ -1714,6 +1784,11 @@ fn self_test() -> Result<(), String> {
         }
     ) || !matches!(
         find_record(&records, "hang")?.completion,
+        AttemptCompletion::SupervisorSignal {
+            signal: libc::SIGTERM
+        }
+    ) || !matches!(
+        find_record(&records, "measurement-signal")?.completion,
         AttemptCompletion::SupervisorSignal {
             signal: libc::SIGTERM
         }
@@ -1741,6 +1816,19 @@ fn self_test() -> Result<(), String> {
             "forced control did not retain its CPU-timeout boundary: {forced_record:?}"
         ));
     }
+    let exited_parent_record = find_record(&records, "exit-after-escaped-burner")?;
+    if !matches!(
+        exited_parent_record.completion,
+        AttemptCompletion::CpuTimeout {
+            cpu_budget_usec: 50_000,
+            observed_cpu_usec,
+        } if observed_cpu_usec >= 50_000
+    ) || exited_parent_record.cpu_usage_usec < 50_000
+    {
+        return Err(format!(
+            "successful parent hid an over-budget descendant in its record: {exited_parent_record:?}"
+        ));
+    }
     if !matches!(
         find_record(&records, "stop-hang")?.completion,
         AttemptCompletion::SupervisorSignal {
@@ -1763,7 +1851,7 @@ fn self_test() -> Result<(), String> {
         return Err("duplicate atomic attempt publication unexpectedly replaced a record".into());
     }
     println!(
-        "nextest-cpu-wrapper: self-test PASS (process tree, success, failure, signal, wall timeout, CPU timeout, stopped low-CPU wall delay, missing accounting fail-closed, first-cause race, no survivors, typed identity, substituted path, atomic identity)"
+        "nextest-cpu-wrapper: self-test PASS (process tree, success, failure, signal, wall timeout, CPU timeout, post-parent descendant timeout, stopped low-CPU wall delay, missing accounting fail-closed, first-cause race, no survivors, typed identity, truthful CPU source, substituted path, atomic identity)"
     );
     Ok(())
 }

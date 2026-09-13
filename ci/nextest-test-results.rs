@@ -1239,7 +1239,7 @@ mod tests {
         );
         valid.validate().unwrap();
         let mut wrong_source = valid.clone();
-        wrong_source.cpu_source = nextest_cpu::CPU_SOURCE.into();
+        wrong_source.cpu_source = nextest_cpu::CPU_SOURCE_REAPED.into();
         let error = wrong_source.validate().unwrap_err();
         assert!(error.contains("requires cpu_source"), "{error}");
         assert_eq!(
