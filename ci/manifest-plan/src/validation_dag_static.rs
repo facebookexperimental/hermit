@@ -174,7 +174,7 @@ pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
 /// an empty or narrowed run refuse. Update these only after enumerating the
 /// corresponding shipped command and accounting for changed test identities.
 pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
-    ("test.regular_crates", 438),
+    ("test.regular_crates", 443),
     ("test.hermit_unit", 496),
     ("test.detcore_unit", 656),
     ("test.detcore_misc", 27),
