@@ -14174,10 +14174,7 @@ red/`measured-and-passed` count is **0**.",
     let mut preserve_import = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![boundary_cell(
-            vec![imported_observation.clone()],
-            CellStatus::Green,
-        )],
+        cells: vec![boundary_cell(vec![imported_observation], CellStatus::Green)],
     };
     let mut current_validate_row = series_row(
         "fixture/boundary/verify/ptrace",
@@ -14190,41 +14187,85 @@ red/`measured-and-passed` count is **0**.",
     current_validate_row.run_id = canonical.run_id.clone();
     current_validate_row.event_id = "fixture-stable-mapped-event".into();
 
-    // Faithful retained-history shape: distinct observation records can carry
-    // the same compact run/result key. That ambiguity is opaque history when
-    // the snapshot claims a different run, and must not make the whole
-    // combined writer inert. It becomes a refusal only when a source event
-    // actually claims the duplicated base.
-    let mut duplicate_history = preserve_import.clone();
-    let mut duplicate_observation = imported_observation.clone();
-    duplicate_observation.depth.insert(
-        "hermit".into(),
-        SourceDepth {
-            commits: 11,
-            first_parent: 10,
-        },
+    // Faithful retained-history shape: the current corpus's duplicate direct
+    // keys come from two DISTINCT legacy invocations inside ONE observation.
+    // Their omitted outer-attempt and evidence identities collapse to the same
+    // compact run/result key even though the invocation payloads differ.
+    let mut legacy_invocation = before_publication
+        .cells
+        .iter()
+        .find(|cell| cell.id == replay_id)
+        .and_then(|cell| {
+            cell.observations
+                .iter()
+                .flat_map(|observation| &observation.invocations)
+                .find(|invocation| invocation.run_id == replay_row.run_id)
+        })
+        .cloned()
+        .ok_or("combined result fixture retained no direct invocation")?;
+    let legacy_run_id = "fixture-legacy-duplicate-invocation";
+    legacy_invocation.hermit_sha = fixture_hermit_tree.clone();
+    legacy_invocation.run_id = legacy_run_id.into();
+    legacy_invocation.attempt = None;
+    legacy_invocation.evidence_sha256 = None;
+    legacy_invocation.result = Some(ObservedResult::Pass);
+    let mut distinct_legacy_invocation = legacy_invocation.clone();
+    distinct_legacy_invocation
+        .argv
+        .push("--distinct-legacy-payload".into());
+    distinct_legacy_invocation.shell_command = literal_shell_command(
+        &distinct_legacy_invocation.cwd,
+        &distinct_legacy_invocation.env,
+        &distinct_legacy_invocation.argv,
     );
-    duplicate_history.cells[0]
-        .observations
-        .push(duplicate_observation);
-    let mut unrelated_source_row = current_validate_row.clone();
+    let mut legacy_observation = sample.clone();
+    legacy_observation.detcore_tree = Some(fixture_detcore_tree.clone());
+    legacy_observation.provenance = ObservationProvenance::PressureTest;
+    legacy_observation
+        .hermit_shas
+        .insert(fixture_hermit_tree.clone());
+    legacy_observation.results.insert(ObservedResult::Pass);
+    legacy_observation.invocations =
+        BTreeSet::from([legacy_invocation, distinct_legacy_invocation]);
+    let duplicate_history = TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: vec![boundary_cell(vec![legacy_observation], CellStatus::Green)],
+    };
+    validate_observation_identity_namespace(&duplicate_history)?;
+    let (legacy_keys, _) = direct_evidence_keys(&duplicate_history)?;
+    if legacy_keys.len() != 1 || legacy_keys.values().next() != Some(&2) {
+        return Err(format!(
+            "legacy invocation fixture did not exercise one duplicate compact key: {legacy_keys:?}"
+        ));
+    }
+
+    let generated_before_legacy_mapping = read_generated_files(&result_command_root)?;
+    let mut claimed_source_row = current_validate_row.clone();
+    claimed_source_row.producer = SeriesProducer::PressureTest;
+    claimed_source_row.run_id = legacy_run_id.into();
+    claimed_source_row.event_id = "fixture-claimed-legacy-duplicate".into();
+    let mut unrelated_source_row = claimed_source_row.clone();
     unrelated_source_row.run_id = "fixture-unrelated-source-run".into();
     unrelated_source_row.event_id = "fixture-unrelated-source-event".into();
     let unrelated_representation =
         direct_representation(&duplicate_history, &[unrelated_source_row])?;
     if !unrelated_representation.represented_event_ids.is_empty()
         || !unrelated_representation.has_unrepresented_direct_evidence
+        || read_generated_files(&result_command_root)? != generated_before_legacy_mapping
     {
         return Err(
-            "unclaimed duplicate retained evidence was not preserved as opaque history".into(),
+            "unclaimed duplicate retained evidence changed a generated file or was not preserved as opaque history"
+                .into(),
         );
     }
-    let claimed_duplicate_error =
-        direct_representation(&duplicate_history, &[current_validate_row.clone()])
-            .expect_err("a source event claimed duplicate retained direct evidence");
-    if !claimed_duplicate_error.contains("2 records for that exact identity") {
+    let claimed_duplicate_error = direct_representation(&duplicate_history, &[claimed_source_row])
+        .expect_err("a source event claimed duplicate retained direct evidence");
+    if !claimed_duplicate_error.contains("2 records for that exact identity")
+        || read_generated_files(&result_command_root)? != generated_before_legacy_mapping
+    {
         return Err(format!(
-            "claimed duplicate retained-evidence refusal lost its cause: {claimed_duplicate_error}"
+            "claimed duplicate retained-evidence refusal changed a generated file or lost its cause: {claimed_duplicate_error}"
         ));
     }
 
