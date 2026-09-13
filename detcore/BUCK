@@ -85,6 +85,7 @@ rust_library(
         "fbsource//third-party/rust:tracing-subscriber",
         ":detcore",
         "//hermetic_infra/hermit/common/test-allocator:test-allocator",
+        "//hermetic_infra/hermit/common/test-workdir:hermit-test-workdir",
         "//hermetic_infra/reverie:reverie",
         "//hermetic_infra/reverie:reverie-ptrace",
     ],

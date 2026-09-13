@@ -102,7 +102,7 @@ fn cpuid_faulting_supported() -> bool {
 
 fn det_test_fn_without_pmu<F>(f: F)
 where
-    F: Fn(),
+    F: Fn() + Send + Sync,
 {
     let config = detcore::Config {
         max_timeslice: None,
@@ -113,14 +113,14 @@ where
 
 fn det_test_fn_sequential_without_pmu<F>(f: F)
 where
-    F: Fn(),
+    F: Fn() + Send + Sync,
 {
     det_test_fn_sequential_without_pmu_with_post_fork(detcore::RunsPostFork::Child, f);
 }
 
 fn det_test_fn_sequential_without_pmu_with_post_fork<F>(runs_post_fork: detcore::RunsPostFork, f: F)
 where
-    F: Fn(),
+    F: Fn() + Send + Sync,
 {
     let config = detcore::Config {
         max_timeslice: None,

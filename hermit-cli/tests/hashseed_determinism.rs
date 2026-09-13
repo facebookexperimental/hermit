@@ -99,7 +99,8 @@ fn run_native(python: &Path, script: &Path) -> String {
 
 /// Run the workload under `hermit run --strict`.
 fn run_hermit_strict(python: &Path, script: &Path) -> String {
-    let output = Command::new(hermit_test::hermit_binary())
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command
         .args([
             "run",
             "--strict",
@@ -110,9 +111,9 @@ fn run_hermit_strict(python: &Path, script: &Path) -> String {
         ])
         .arg(python)
         .args(["-S", "-I"])
-        .arg(script)
-        .output()
-        .expect("failed to run python under Hermit");
+        .arg(script);
+    hermit_test::configure_guest_execution(&mut command);
+    let output = command.output().expect("failed to run python under Hermit");
     assert!(
         output.status.success(),
         "hermit python failed:\nstdout:\n{}\nstderr:\n{}",

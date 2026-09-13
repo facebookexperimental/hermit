@@ -27,7 +27,8 @@ fn required_program(case: &ProgramCase) -> PathBuf {
 }
 
 fn assert_l2(case: &ProgramCase) {
-    let output = Command::new("timeout")
+    let mut command = Command::new("timeout");
+    command
         .args(["--kill-after", "5s", "90s"])
         .arg(hermit_test::hermit_binary())
         .args([
@@ -41,7 +42,9 @@ fn assert_l2(case: &ProgramCase) {
             "--",
         ])
         .arg(required_program(case))
-        .args(case.args)
+        .args(case.args);
+    hermit_test::configure_guest_execution(&mut command);
+    let output = command
         .output()
         .unwrap_or_else(|error| panic!("failed to verify {}: {error}", case.name));
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -79,7 +82,8 @@ fn smaps_rollup_consumers_are_deterministic_under_strict_verify() {
         candidates: &["/usr/bin/cat", "/bin/cat"],
         args: &["/proc/self/smaps_rollup"],
     };
-    let snapshot = Command::new(hermit_test::hermit_binary())
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command
         .args([
             "--log=ERROR",
             "run",
@@ -89,9 +93,9 @@ fn smaps_rollup_consumers_are_deterministic_under_strict_verify() {
             "--",
         ])
         .arg(required_program(&cat))
-        .args(cat.args)
-        .output()
-        .expect("failed to read smaps_rollup");
+        .args(cat.args);
+    hermit_test::configure_guest_execution(&mut command);
+    let snapshot = command.output().expect("failed to read smaps_rollup");
     assert!(snapshot.status.success());
     let text = String::from_utf8(snapshot.stdout).expect("smaps_rollup should be UTF-8");
     let mut accounting_rows = 0;

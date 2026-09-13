@@ -29,7 +29,8 @@ fn required_program(case: &ProgramCase) -> PathBuf {
 }
 
 fn assert_l2(case: &ProgramCase) {
-    let output = Command::new("timeout")
+    let mut command = Command::new("timeout");
+    command
         .args(["--kill-after", "5s", "90s"])
         .arg(hermit_test::hermit_binary())
         .args([
@@ -43,7 +44,9 @@ fn assert_l2(case: &ProgramCase) {
             "--",
         ])
         .arg(required_program(case))
-        .args(case.args)
+        .args(case.args);
+    hermit_test::configure_guest_execution(&mut command);
+    let output = command
         .output()
         .unwrap_or_else(|error| panic!("failed to verify {}: {error}", case.name));
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -75,7 +78,8 @@ fn arch_status_consumers_are_deterministic_under_strict_verify() {
         candidates: &["/usr/bin/cat", "/bin/cat"],
         args: &["/proc/self/arch_status"],
     };
-    let snapshot = Command::new(hermit_test::hermit_binary())
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command
         .args([
             "--log=ERROR",
             "run",
@@ -85,9 +89,9 @@ fn arch_status_consumers_are_deterministic_under_strict_verify() {
             "--",
         ])
         .arg(required_program(&cat))
-        .args(cat.args)
-        .output()
-        .expect("failed to read arch_status");
+        .args(cat.args);
+    hermit_test::configure_guest_execution(&mut command);
+    let snapshot = command.output().expect("failed to read arch_status");
     assert!(snapshot.status.success());
     let text = String::from_utf8(snapshot.stdout).expect("arch_status should be UTF-8");
     assert!(text.lines().any(|line| line == "AVX512_elapsed_ms:\t0"));

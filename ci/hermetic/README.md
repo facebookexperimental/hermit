@@ -18,8 +18,10 @@ and cgroup policy stay on the host. Each wrapped build or test node runs in a
 privileged podman container pinned by digest, with `/dev/kvm` passed through
 when present, no runtime network, and source at `/src`. The wrapper defaults
 that source bind to read-only; validation nodes explicitly make it writable.
-Output and target volumes are separate and writable. The container does not
-create a second cgroup layer.
+Output and target volumes are separate and writable. `--cgroups=disabled` keeps
+the container and its monitor inside the caller's resource group, so the outer
+node accounts for and terminates their descendants. The wrapper does not add
+an independent container resource policy.
 
 ```
 ci/hermetic/build-image.sh                     # build from the lock, load, record the digest
@@ -43,19 +45,34 @@ guest. The assertion also checks the exact headers and libraries consumed from
 
 ## V3 per-cell execution contract
 
-The pinned-root path selects one canonical execution root for every Hermit cell: a
-fresh private `tmpfs` mounted at `/test`, with the guest working directory set
-to `/test`. The outer podman root supplies an empty `/test` mountpoint; each
-verify, replay, chaos, or custom invocation overlays its own tmpfs there.
-A naked or DBT invocation fails closed because those paths cannot apply the
-mount. The default working directory and relative scratch namespace therefore
-cannot observe files or directory metadata written by sibling cells, even when every
-cell uses the same relative names. The pinned-root validation nodes keep `/src`
-writable and shared for build products and repository fixtures;
-that tree is an explicit input/output surface, not part of the per-cell isolation
-claim. Manifest repository inputs are resolved to absolute `/src/...` paths
-before the cwd changes, and fixture roots cross through the explicit
-`E2E_FIXTURE_DIR` argument.
+Marked namespace-capable Hermit runs use a fresh private `tmpfs` at `/test`
+and start the guest there. The marker is exactly
+`HERMIT_E2E_EMPTY_WORKDIR=/test`; another value refuses before guest launch.
+The outer Podman root supplies the mountpoint. Ptrace/KVM run, verify, replay,
+chaos and custom command builders pass their existing mount/workdir options.
+DBT accepts the working directory but continues to reject general mount/bind
+options: its physical-run adapter creates a scoped host thread, makes a new
+private mount namespace and `/test`, and only then creates that run's runtime.
+Two executions inside one verify command therefore get separate filesystems.
+The marked in-process Detcore test helper uses the same thread boundary before
+constructing its tracer. Setup errors remain errors, and no user-namespace
+fallback hides a missing mount capability.
+
+These boundaries keep relative scratch names separate between runs. `/src`
+stays writable and shared for explicit build products and repository fixtures.
+Manifest repository inputs are resolved to absolute paths before the marked
+cwd changes; ordinary unmarked DBT arguments retain their literal spelling.
+The make reproducibility test exposes its two distinct project directories at
+their original absolute guest paths and uses `make -C`; it does not replace both
+build-path stimuli with `/test` or populate the empty execution root.
+
+Naked manifest cells still refuse this marker. Tests whose subject is
+`--no-namespace` retain that subject and use the outer node's `/test`; they do
+not establish per-physical-run filesystem isolation. The scoped DBT adapter
+joins its runtime workers and consumes normal global cleanup before returning.
+The existing Reverie stdin pump is detached: a blocked source can retain the
+ended namespace until input unblocks or the CLI exits. Prompt teardown of the
+existing unsupported-syscall case does not prove every such pump has joined.
 
 The same path uses Hermit's existing `--base-env=minimal` semantics rather than
 defining another environment. On top of that base the harness supplies
@@ -77,6 +94,34 @@ After killing the run and waiting for the children, no guest process or mount
 survived and file memory returned to within 28 KiB of baseline. The integrated
 single-run and 200-run evidence is still to be collected by the canonical
 validate path; this control does not substitute for it.
+
+## Local and hosted validation
+
+The committed graph owns both filesystem choices. Local portable tests and
+focused portable compatibility nodes use the image; hosted shard variants keep
+their original host commands, environment and fixture dependencies. Public
+selectors such as `test.regular_crates` still resolve in the hosted lane, and
+the compatibility selector retains its fixture producer. Prepared Nextest/Cargo
+metadata must match both the declared Cargo selection and the consumer's root;
+a host preparation cannot satisfy an image consumer.
+
+`test.isolated_dbt_workdir` selects the four strict verification pairs and the
+existing blocked-input refusal control. `test.isolated_detcore_workdir` selects
+the marked in-process helper control. Their exact terminal test counts are two
+and one, respectively; they retain the ordinary per-test CPU/wall policy and
+add an inherited 64 MiB per-file limit. Missing, truncated, noncanonical or
+unequal INFO evidence and every cap/deadline failure remain failures. Dagrun
+passes their admitted worker count through `NEXTEST_TEST_THREADS`, which the
+wrapper forwards to the prepared Nextest consumer. This keeps the existing
+ignored-test arguments after `--` without appending a misplaced worker flag.
+Other wrapped commands retain the scheduler's appended arguments as literal
+arguments to their original command.
+
+The wrapper imports only Cargo's registry and Git caches from `--cargo-home`.
+The image supplies executables and configuration; host Cargo configuration and
+rustup proxies do not cross that boundary. `VALIDATE_RUN_STATE` and structured
+result paths are mounted explicitly so the original producers and consumers
+refer to the same evidence without sharing unrelated output ownership.
 
 ## The network boundary — what is and is not claimed
 

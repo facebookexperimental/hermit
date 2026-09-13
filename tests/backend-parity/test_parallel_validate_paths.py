@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -29,6 +30,51 @@ def load(name: str, filename: str):
 
 
 class BackendParityTemporaryPathTest(unittest.TestCase):
+    def test_pinned_root_dbt_commands_use_the_fixed_test_workdir(self) -> None:
+        run_matrix = load("hermetic_dbt_run_matrix", "run_matrix.py")
+        with tempfile.TemporaryDirectory() as raw, mock.patch.dict(
+            os.environ,
+            {run_matrix.ISOLATED_WORKDIR_ENV: run_matrix.HERMETIC_TEST_WORKDIR},
+        ), mock.patch.object(
+            run_matrix.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ) as smoke_run:
+            self.assertIsNone(run_matrix.backend_block("dbt", Path("/hermit"), True))
+            smoke_command = smoke_run.call_args.args[0]
+            self.assertIn("--base-env=minimal", smoke_command)
+            self.assertIn("--workdir=/test", smoke_command)
+            self.assertNotIn("--mount=type=tmpfs,target=/test", smoke_command)
+
+            for backend in ("dbt", "ptrace", "kvm"):
+                with self.subTest(backend=backend):
+                    command = run_matrix.hermit_command(
+                        Path("/hermit"), backend, ["/bin/true"], "true", True, Path(raw),
+                    )
+                    self.assertIn("--base-env=minimal", command)
+                    self.assertIn("--workdir=/test", command)
+                    self.assertEqual("--mount=type=tmpfs,target=/test" in command, backend != "dbt")
+                    boundary = command.index("--workdir=/test")
+                    self.assertIn("--", command[boundary + 1:])
+
+    def test_pinned_root_dbt_workdir_refuses_an_unrecognised_value(self) -> None:
+        run_matrix = load("invalid_hermetic_dbt_run_matrix", "run_matrix.py")
+        with mock.patch.dict(
+            os.environ,
+            {run_matrix.ISOLATED_WORKDIR_ENV: "/somewhere-else"},
+        ), self.assertRaisesRegex(
+            run_matrix.MatrixError,
+            "HERMIT_E2E_EMPTY_WORKDIR must be /test",
+        ):
+            run_matrix.hermit_command(
+                Path("/hermit"),
+                "dbt",
+                ["/bin/true"],
+                "true",
+                True,
+                Path("/tmp/private"),
+            )
+
     def test_infrastructure_receipt_keeps_its_cause_beside_the_gap_tier(self) -> None:
         run_matrix = load("infrastructure_receipt_run_matrix", "run_matrix.py")
         with tempfile.TemporaryDirectory() as raw:
@@ -195,6 +241,7 @@ class BackendParityTemporaryPathTest(unittest.TestCase):
             )
             self.assertIn("--tmp=/tmp", dbt)
             self.assertIn("--env=TMPDIR=/tmp", dbt)
+            self.assertNotIn("--workdir=/test", dbt)
             self.assertIn(str(dbt_tmp), dbt)
 
             # Exercise the complete generated command with its Hermit path and

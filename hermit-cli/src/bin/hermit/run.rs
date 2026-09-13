@@ -1474,7 +1474,7 @@ fn namespace_only_guest_command_preserves_sanitizer_environment() {
 }
 
 #[test]
-fn dbt_rejects_mount_and_workdir_options_it_cannot_apply() {
+fn dbt_rejects_mount_and_bind_but_accepts_workdir() {
     let mut with_mount = RunOpts::parse_from([
         "fakehermit",
         "--backend",
@@ -1488,6 +1488,19 @@ fn dbt_rejects_mount_and_workdir_options_it_cannot_apply() {
         .to_string();
     assert!(error.contains("dbt backend cannot apply --mount"));
 
+    let mut with_bind = RunOpts::parse_from([
+        "fakehermit",
+        "--backend",
+        "dbt",
+        "--bind=/tmp:/test",
+        "/bin/true",
+    ]);
+    let error = with_bind
+        .validate_args_with_perf_support(true)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("dbt backend cannot apply --mount"));
+
     let mut with_workdir = RunOpts::parse_from([
         "fakehermit",
         "--backend",
@@ -1496,11 +1509,11 @@ fn dbt_rejects_mount_and_workdir_options_it_cannot_apply() {
         "/test",
         "/bin/true",
     ]);
-    let error = with_workdir
-        .validate_args_with_perf_support(true)
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("dbt backend cannot apply --mount"));
+    with_workdir.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(
+        with_workdir.guest_command().unwrap().get_current_dir(),
+        Some(Path::new("/test"))
+    );
 }
 
 #[test]
@@ -2934,6 +2947,7 @@ impl RunOpts {
                     global.log_file.as_deref(),
                     &config,
                     environment,
+                    self.workdir.as_deref().map(Path::new),
                     dbt_verification_stdin,
                 );
             }
@@ -3028,12 +3042,10 @@ impl RunOpts {
                 backend.as_str()
             );
         }
-        if backend == Backend::Dbt
-            && (!self.mount.is_empty() || !self.bind.is_empty() || self.workdir.is_some())
-        {
+        if backend == Backend::Dbt && (!self.mount.is_empty() || !self.bind.is_empty()) {
             anyhow::bail!(
-                "the dbt backend cannot apply --mount, --bind, or --workdir because its \
-                 DynamoRIO adapter does not enter the guest mount namespace"
+                "the dbt backend cannot apply --mount or --bind because its DynamoRIO adapter \
+                 does not enter the guest mount namespace"
             );
         }
         if self.backend_engagement_json.is_some()

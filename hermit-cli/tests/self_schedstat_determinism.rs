@@ -83,6 +83,7 @@ fn assert_l2(case: &ProgramCase) {
         .arg(&program)
         .args(case.args);
 
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -119,6 +120,7 @@ fn read_self_schedstat() -> Vec<u8> {
         "/bin/cat",
         "/proc/self/schedstat",
     ]);
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()

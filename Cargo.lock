@@ -561,6 +561,7 @@ name = "detcore-testutils"
 version = "0.2.0"
 dependencies = [
  "hermit-detcore",
+ "hermit-test-workdir",
  "pretty_assertions",
  "reverie-core",
  "reverie-ptrace",
@@ -966,6 +967,7 @@ dependencies = [
  "goblin",
  "hermit-detcore",
  "hermit-resources",
+ "hermit-test-workdir",
  "iced-x86",
  "libc",
  "nix 0.30.1",
@@ -1058,6 +1060,13 @@ dependencies = [
 [[package]]
 name = "hermit-resources"
 version = "0.2.0"
+
+[[package]]
+name = "hermit-test-workdir"
+version = "0.2.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "hermit-verify"

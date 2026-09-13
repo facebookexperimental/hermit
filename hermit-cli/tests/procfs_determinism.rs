@@ -109,6 +109,7 @@ fn read_procfs_with(
     }
     configure(&mut command);
     command.args(["--", "/bin/cat", path]);
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -588,6 +589,7 @@ fn proc_rtc_tracks_custom_epoch_and_virtual_time() {
         "-c",
         "import time; time.sleep(2); print(open('/proc/driver/rtc').read(), end='')",
     ]);
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -691,6 +693,7 @@ fn mountinfo_and_stat_proc_device(no_virtualize_metadata: bool, stat_first: bool
         command.arg("--no-virtualize-metadata");
     }
     command.args(["--", "/bin/sh", "-c", script]);
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -954,6 +957,7 @@ fn ordered_var_then_nscd_mount_keeps_the_run_nscd_hardening_mount() {
             ))
             .arg("--")
             .arg(&guest);
+        hermit_test::configure_guest_execution(&mut command);
         let rendered = format!("{command:?}");
         let output = command
             .output()
@@ -1113,6 +1117,7 @@ fn fdinfo_and_mountinfo_ids() -> (u64, u64, u64, u64) {
         "-c",
         script,
     ]);
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -1299,18 +1304,19 @@ fn redirected_regular_stdio_fdinfo() -> Vec<u8> {
     let output = tempfile::NamedTempFile::new().expect("redirected stdout file");
 
     let mut command = Command::new(hermit_test::hermit_binary());
+    command.args([
+        "--log=error",
+        "run",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+        "--",
+        "/bin/cat",
+        "/proc/self/fdinfo/0",
+        "/proc/self/fdinfo/1",
+    ]);
+    hermit_test::configure_guest_execution(&mut command);
     command
-        .args([
-            "--log=error",
-            "run",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
-            "--",
-            "/bin/cat",
-            "/proc/self/fdinfo/0",
-            "/proc/self/fdinfo/1",
-        ])
         .stdin(Stdio::from(
             input.reopen().expect("reopen redirected stdin"),
         ))
@@ -1372,6 +1378,7 @@ fn fdinfo_mount_classes_with_stdio(guest: &PathBuf, regular_stdin_and_stderr: bo
         "--",
     ]);
     command.arg(guest);
+    hermit_test::configure_guest_execution(&mut command);
     if regular_stdin_and_stderr {
         let stdin = tempfile::NamedTempFile::new().expect("create regular stdin");
         let stderr_file = tempfile::NamedTempFile::new().expect("create regular stderr");
@@ -1470,6 +1477,7 @@ fn mount_namespace_fdinfo(no_namespace: bool) -> Vec<u8> {
         "-c",
         "exec 3</proc/self/ns/mnt; cat /proc/self/fdinfo/3",
     ]);
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -1517,6 +1525,7 @@ fn no_namespace_mountinfo_and_fdinfo_share_one_mount_identity_map() {
             "-c",
             "exec 3</bin/sh; cat /proc/self/mountinfo; printf '__FDINFO__\\n'; cat /proc/self/fdinfo/3",
         ]);
+        hermit_test::configure_guest_execution(&mut command);
         let rendered = format!("{command:?}");
         let output = command
             .output()

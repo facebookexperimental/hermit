@@ -42,6 +42,7 @@
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
 
+use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -99,6 +100,26 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
+fn controller_workdir(tag: &str, no_namespace: bool, requested: Option<&OsStr>) -> PathBuf {
+    if no_namespace && requested == Some(OsStr::new("/test")) {
+        // `--no-namespace` shares the pinned root's filesystem. Use the outer
+        // writable /test directly so the controller and guest see the same
+        // relative files while the guest still starts at the required path.
+        PathBuf::from("/test")
+    } else {
+        scratch(tag)
+    }
+}
+
+#[test]
+fn pinned_root_no_namespace_uses_the_outer_test_directory() {
+    assert_eq!(
+        controller_workdir("ignored", true, Some(OsStr::new("/test"))),
+        Path::new("/test")
+    );
+    assert_ne!(controller_workdir("host", true, None), Path::new("/test"));
+}
+
 /// `strict` is per-case, not a constant, because `hermit run` refuses
 /// `--strict` together with anything that forces host networking, and
 /// `--no-namespace` is one of those things (`hermit-cli/src/bin/hermit/run.rs`:
@@ -114,6 +135,8 @@ fn scratch(tag: &str) -> PathBuf {
 /// unprivileged uid and returns `EPERM`, so the guest fails exactly as it did
 /// before #1849.
 fn run_guest(tag: &str, strict: bool, extra: &[&str]) {
+    let requested = std::env::var_os("HERMIT_E2E_EMPTY_WORKDIR");
+    let no_namespace = extra.contains(&"--no-namespace");
     let mut command = Command::new("timeout");
     command
         .arg("--kill-after=2s")
@@ -132,8 +155,9 @@ fn run_guest(tag: &str, strict: bool, extra: &[&str]) {
         .args(extra)
         .arg("--")
         .arg(guest())
-        .current_dir(scratch(tag));
+        .current_dir(controller_workdir(tag, no_namespace, requested.as_deref()));
 
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()

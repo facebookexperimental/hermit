@@ -37,7 +37,8 @@ fn proc_fdinfo_consumers_are_deterministic_under_strict_verify() {
             String::from_utf8_lossy(&compile.stderr)
         );
 
-        let output = Command::new("timeout")
+        let mut command = Command::new("timeout");
+        command
             .args(["--kill-after", "5s", "90s"])
             .arg(hermit_test::hermit_binary())
             .args([
@@ -50,7 +51,9 @@ fn proc_fdinfo_consumers_are_deterministic_under_strict_verify() {
                 "--base-env=minimal",
                 "--",
             ])
-            .arg(&guest)
+            .arg(&guest);
+        hermit_test::configure_guest_execution(&mut command);
+        let output = command
             .output()
             .unwrap_or_else(|error| panic!("failed to verify {name}: {error}"));
         let stdout = String::from_utf8_lossy(&output.stdout);

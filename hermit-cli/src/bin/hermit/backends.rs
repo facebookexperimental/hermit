@@ -382,11 +382,16 @@ struct DbtGuestCommand {
 }
 
 #[cfg(feature = "dbt")]
-fn executable_on_path(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
+fn executable_on_path(program: &OsStr, path: &OsStr, cwd: &Path) -> Option<PathBuf> {
+    executable_path_candidate(program, path, cwd).map(|candidate| cwd.join(candidate))
+}
+
+#[cfg(feature = "dbt")]
+fn executable_path_candidate(program: &OsStr, path: &OsStr, cwd: &Path) -> Option<PathBuf> {
     env::split_paths(path)
         .map(|directory| directory.join(program))
         .find(|candidate| {
-            candidate.metadata().is_ok_and(|metadata| {
+            cwd.join(candidate).metadata().is_ok_and(|metadata| {
                 metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
             })
         })
@@ -403,14 +408,28 @@ fn executable_on_path(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
 #[cfg(feature = "dbt")]
 fn prepare_dbt_guest_command(
     program: &Path,
-    args: &[String],
+    args: &[OsString],
     path: Option<&OsStr>,
+    cwd: &Path,
 ) -> DbtGuestCommand {
     let unchanged = || DbtGuestCommand {
         program: program.to_path_buf(),
-        args: args.iter().map(OsString::from).collect(),
+        args: args.to_vec(),
     };
-    let Some(shebang) = hermit::Shebang::new(program) else {
+    // Command resolves relative paths and PATH entries after changing cwd.
+    // Inspect that same file in the physical run's already-established mount
+    // namespace; the caller's /test may have been hidden by its fresh tmpfs.
+    let script_path =
+        if program.is_absolute() || program.as_os_str().as_encoded_bytes().contains(&b'/') {
+            program.to_path_buf()
+        } else if let Some(found) =
+            path.and_then(|path| executable_path_candidate(program.as_os_str(), path, cwd))
+        {
+            found
+        } else {
+            return unchanged();
+        };
+    let Some(shebang) = hermit::Shebang::new(cwd.join(&script_path)) else {
         return unchanged();
     };
     let (interpreter, interpreter_args) = shebang.into_parts();
@@ -426,18 +445,60 @@ fn prepare_dbt_guest_command(
     {
         return unchanged();
     }
-    let Some(target) = path.and_then(|path| executable_on_path(target, path)) else {
+    let Some(target) = path.and_then(|path| executable_on_path(target, path, cwd)) else {
         return unchanged();
     };
 
     let mut resolved_args = Vec::with_capacity(args.len() + 2);
     resolved_args.push(target.into_os_string());
-    resolved_args.push(program.as_os_str().to_owned());
-    resolved_args.extend(args.iter().map(OsString::from));
+    // execvp supplies the selected PATH candidate to a script interpreter.
+    // Explicit paths retain their spelling; a bare name must not discard the
+    // directory that actually selected its script.
+    resolved_args.push(script_path.into_os_string());
+    resolved_args.extend_from_slice(args);
     DbtGuestCommand {
         program: interpreter,
         args: resolved_args,
     }
+}
+
+// run_dbt supplies only program/args, a cleared exact environment, and cwd.
+// Reconstruct those fields inside the physical run, before DbtRunner performs
+// its own command reconstruction. Stdin and evidence descriptors remain owned
+// by the existing runner adapters.
+#[cfg(feature = "dbt")]
+fn prepare_dbt_physical_command(guest: &StdCommand) -> Result<StdCommand, Error> {
+    let environment = guest
+        .get_envs()
+        .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
+        .collect::<BTreeMap<_, _>>();
+    let args = guest.get_args().map(OsStr::to_owned).collect::<Vec<_>>();
+    let cwd = env::current_dir()?;
+    let cwd = guest
+        .get_current_dir()
+        .map_or(cwd.clone(), |workdir| cwd.join(workdir));
+    let prepared = prepare_dbt_guest_command(
+        Path::new(guest.get_program()),
+        &args,
+        environment.get(OsStr::new("PATH")).map(OsString::as_os_str),
+        &cwd,
+    );
+    let mut command = StdCommand::new(prepared.program);
+    command.args(prepared.args);
+    command.env_clear();
+    // DbtRunner copies explicit removals as well as values. Preserve the raw
+    // command's removal entries instead of re-enumerating ambient variables.
+    for (name, value) in guest.get_envs() {
+        if let Some(value) = value {
+            command.env(name, value);
+        } else {
+            command.env_remove(name);
+        }
+    }
+    if let Some(workdir) = guest.get_current_dir() {
+        command.current_dir(workdir);
+    }
+    Ok(command)
 }
 
 #[cfg(feature = "dbt")]
@@ -451,6 +512,13 @@ fn apply_exact_environment(command: &mut StdCommand, environment: &BTreeMap<OsSt
         }
     }
     command.envs(environment);
+}
+
+#[cfg(feature = "dbt")]
+fn apply_dbt_workdir(command: &mut StdCommand, workdir: Option<&Path>) {
+    if let Some(workdir) = workdir {
+        command.current_dir(workdir);
+    }
 }
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review inherited DBT policy descriptors and bounded reports.
@@ -801,6 +869,7 @@ pub(super) fn run_dbt(
     log_file: Option<&Path>,
     config: &Config,
     mut environment: BTreeMap<OsString, OsString>,
+    workdir: Option<&Path>,
     verification_stdin: Option<std::fs::File>,
 ) -> Result<ExitStatus, Error> {
     if let Some(path) = verify_json.filter(|_| verify) {
@@ -828,6 +897,13 @@ pub(super) fn run_dbt(
     // isolation and the client flag here.
     let panic_on_unsupported_syscalls = config.panic_on_unsupported_syscalls;
 
+    let marker = std::env::var_os(hermit_test_workdir::REQUEST_ENV);
+    let isolated_workdir = hermit_test_workdir::requested_workdir(marker.as_deref())?;
+    if isolated_workdir.is_some() && workdir != isolated_workdir {
+        return Err(Error::msg(
+            "HERMIT_E2E_EMPTY_WORKDIR=/test requires --workdir=/test for DBT",
+        ));
+    }
     let stdin_is_terminal = std::io::stdin().is_terminal();
 
     let (drrun, client) = detcore_dbt::prepare_native_client().map_err(|error| {
@@ -861,38 +937,34 @@ pub(super) fn run_dbt(
     );
 
     let _unsupported_report = DbtUnsupportedSyscallReport::new()?;
-    let prepared = prepare_dbt_guest_command(
-        program,
-        args,
-        environment.get(OsStr::new("PATH")).map(OsString::as_os_str),
-    );
-    let mut guest = StdCommand::new(&prepared.program);
+    let mut guest = StdCommand::new(program);
     if !verify && let Some(level) = log {
         environment.insert("HERMIT_LOG".into(), level.to_string().into());
     }
     environment.remove(OsStr::new("HERMIT_LOG_FILE"));
     environment.insert(detcore_dbt::DETCONFIG_ENV.into(), config_json.into());
     apply_exact_environment(&mut guest, &environment);
-    guest.args(&prepared.args);
+    guest.args(args);
+    apply_dbt_workdir(&mut guest, workdir);
 
-    // The Detcore RPC handler can wait on the scheduler. Keep the scheduler
-    // and coordinator service on independent executor threads so a synchronous
-    // guest request cannot block the task that must answer it.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .map_err(|error| Error::msg(format!("failed to start the DBT coordinator: {error}")))?;
+    let execution = DbtExecution::new(isolated_workdir)?;
 
     if !verify {
         if stdin_is_terminal {
-            let status = run_status(&runtime, &runner, &guest, &drrun, config)?;
+            let status = run_status(&execution, &runner, &guest, &drrun, config)?;
             if let Some(capture) = single_run_stats {
                 finish_single_run_dbt_stats(capture, summary, backend_engagement_json)?;
             }
             return Ok(process_status(status));
         }
-        let output = run_once(&runtime, &runner, &guest, &drrun, config, std::io::stdin())?;
+        let output = run_once(
+            &execution,
+            &runner,
+            &guest,
+            &drrun,
+            config,
+            std::io::stdin(),
+        )?;
         write_output(&output)?;
         if let Some(capture) = single_run_stats {
             finish_single_run_dbt_stats(capture, summary, backend_engagement_json)?;
@@ -961,11 +1033,11 @@ pub(super) fn run_dbt(
 
     eprintln!(":: DBT Run1...");
     let first_raw = if terminal_stdin {
-        run_once_with_terminal_input(&runtime, &runner1, &guest, &drrun, config)
+        run_once_with_terminal_input(&execution, &runner1, &guest, &drrun, config)
     } else {
         match replayable_stdin {
             Some(input) => run_once(
-                &runtime,
+                &execution,
                 &runner1,
                 &guest,
                 &drrun,
@@ -975,7 +1047,14 @@ pub(super) fn run_dbt(
                     replay: replay.try_clone()?,
                 },
             ),
-            None => run_once(&runtime, &runner1, &guest, &drrun, config, std::io::empty()),
+            None => run_once(
+                &execution,
+                &runner1,
+                &guest,
+                &drrun,
+                config,
+                std::io::empty(),
+            ),
         }
     };
     let first_raw = match first_raw {
@@ -1045,10 +1124,10 @@ pub(super) fn run_dbt(
     replay.seek(SeekFrom::Start(0))?;
     eprintln!(":: DBT Run2...");
     let second_raw = match if terminal_stdin {
-        run_once_with_terminal_input(&runtime, &runner2, &guest, &drrun, config)
+        run_once_with_terminal_input(&execution, &runner2, &guest, &drrun, config)
     } else {
         run_once(
-            &runtime,
+            &execution,
             &runner2,
             &guest,
             &drrun,
@@ -1188,66 +1267,121 @@ pub(super) fn run_dbt(
     _log_file: Option<&Path>,
     _config: &Config,
     _environment: BTreeMap<OsString, OsString>,
+    _workdir: Option<&Path>,
     _verification_stdin: Option<std::fs::File>,
 ) -> Result<ExitStatus, Error> {
     Err(Error::msg("DBT support was not included in this build"))
 }
 
+/// Ordinary runs share the existing coordinator runtime. Marked runs create
+/// all coordinator workers inside a new mount namespace for each physical run.
+#[cfg(feature = "dbt")]
+struct DbtExecution {
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+#[cfg(feature = "dbt")]
+impl DbtExecution {
+    fn new(workdir: Option<&Path>) -> Result<Self, Error> {
+        Ok(Self {
+            runtime: if workdir.is_some() {
+                None
+            } else {
+                Some(Self::new_runtime()?)
+            },
+        })
+    }
+
+    fn new_runtime() -> Result<tokio::runtime::Runtime, Error> {
+        // RPCs can wait on the scheduler, so both need independent workers.
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|error| Error::msg(format!("failed to start the DBT coordinator: {error}")))
+    }
+
+    fn run<F, T>(&self, run: F) -> Result<T, Error>
+    where
+        F: FnOnce(&tokio::runtime::Runtime) -> Result<T, Error> + Send,
+        T: Send,
+    {
+        if let Some(runtime) = &self.runtime {
+            return run(runtime);
+        }
+        hermit_test_workdir::with_isolated_workdir(move || {
+            let runtime = Self::new_runtime()?;
+            // The operation consumes GlobalState cleanup before returning;
+            // runtime Drop joins its workers before this scoped thread exits.
+            run(&runtime)
+        })?
+    }
+}
+
 #[cfg(feature = "dbt")]
 fn run_once<R: Read + Send + 'static>(
-    runtime: &tokio::runtime::Runtime,
+    execution: &DbtExecution,
     runner: &DbtRunner,
     guest: &StdCommand,
     drrun: &Path,
     config: &Config,
     input: R,
 ) -> Result<Output, Error> {
-    let (output, global) = runtime
-        .block_on(
-            runner.output_with_detached_reader_and_global::<detcore::GlobalState, _>(
-                guest,
-                input,
-                config.clone(),
-            ),
-        )
-        .map_err(|error| dbt_run_error(drrun, error))?;
-    clean_up_dbt_global(runtime, &output.status, global);
-    Ok(output)
+    execution.run(move |runtime| {
+        let guest = prepare_dbt_physical_command(guest)?;
+        let (output, global) = runtime
+            .block_on(
+                runner.output_with_detached_reader_and_global::<detcore::GlobalState, _>(
+                    &guest,
+                    input,
+                    config.clone(),
+                ),
+            )
+            .map_err(|error| dbt_run_error(drrun, error))?;
+        clean_up_dbt_global(runtime, &output.status, global);
+        Ok(output)
+    })
 }
 
 #[cfg(feature = "dbt")]
 fn run_once_with_terminal_input(
-    runtime: &tokio::runtime::Runtime,
+    execution: &DbtExecution,
     runner: &DbtRunner,
     guest: &StdCommand,
     drrun: &Path,
     config: &Config,
 ) -> Result<Output, Error> {
-    let (output, global) = runtime
-        .block_on(
-            runner.output_with_inherited_stdin_and_global::<detcore::GlobalState>(
-                guest,
-                config.clone(),
-            ),
-        )
-        .map_err(|error| dbt_run_error(drrun, error))?;
-    clean_up_dbt_global(runtime, &output.status, global);
-    Ok(output)
+    execution.run(move |runtime| {
+        let guest = prepare_dbt_physical_command(guest)?;
+        let (output, global) = runtime
+            .block_on(
+                runner.output_with_inherited_stdin_and_global::<detcore::GlobalState>(
+                    &guest,
+                    config.clone(),
+                ),
+            )
+            .map_err(|error| dbt_run_error(drrun, error))?;
+        clean_up_dbt_global(runtime, &output.status, global);
+        Ok(output)
+    })
 }
 
 #[cfg(feature = "dbt")]
 fn run_status(
-    runtime: &tokio::runtime::Runtime,
+    execution: &DbtExecution,
     runner: &DbtRunner,
     guest: &StdCommand,
     drrun: &Path,
     config: &Config,
 ) -> Result<std::process::ExitStatus, Error> {
-    let (status, global) = runtime
-        .block_on(runner.status_with_global::<detcore::GlobalState>(guest, config.clone()))
-        .map_err(|error| dbt_run_error(drrun, error))?;
-    clean_up_dbt_global(runtime, &status, global);
-    Ok(status)
+    execution.run(move |runtime| {
+        let guest = prepare_dbt_physical_command(guest)?;
+        let (status, global) = runtime
+            .block_on(runner.status_with_global::<detcore::GlobalState>(&guest, config.clone()))
+            .map_err(|error| dbt_run_error(drrun, error))?;
+        clean_up_dbt_global(runtime, &status, global);
+        Ok(status)
+    })
 }
 
 #[cfg(feature = "dbt")]
@@ -1462,6 +1596,17 @@ pub fn run_sabre_strace(program: &Path, args: &[String]) -> Result<ExitStatus, E
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn dbt_workdir_reaches_the_dynamorio_guest_command() {
+        let mut command = std::process::Command::new("/bin/true");
+        super::apply_dbt_workdir(&mut command, Some(std::path::Path::new("/test")));
+        assert_eq!(
+            command.get_current_dir(),
+            Some(std::path::Path::new("/test"))
+        );
+    }
+
     #[cfg(feature = "dbt")]
     /// A behavioural pin, not a text match: require every record returned by
     /// Reverie's authenticated decoder to reach the comparison log. The decoder
@@ -2008,8 +2153,12 @@ mod tests {
         let script = root.path().join("guest.py");
         write_executable(&script, b"#!/usr/bin/env python3\n");
 
-        let prepared =
-            prepare_dbt_guest_command(&script, &["argument".to_owned()], Some(bin.as_os_str()));
+        let prepared = prepare_dbt_guest_command(
+            &script,
+            &[OsString::from("argument")],
+            Some(bin.as_os_str()),
+            root.path(),
+        );
 
         assert_eq!(prepared.program, Path::new("/usr/bin/env"));
         assert_eq!(
@@ -2029,10 +2178,168 @@ mod tests {
         let script = root.path().join("guest.py");
         write_executable(&script, b"#!/usr/bin/env -S python3 -u\n");
 
-        let prepared = prepare_dbt_guest_command(&script, &[], Some(OsStr::new("/usr/bin")));
+        let prepared =
+            prepare_dbt_guest_command(&script, &[], Some(OsStr::new("/usr/bin")), root.path());
 
         assert_eq!(prepared.program, script);
         assert!(prepared.args.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_relative_shebang_uses_guest_cwd_and_preserves_script_arguments() {
+        let root = tempfile::Builder::new()
+            .prefix("dbt-workdir-")
+            .tempdir_in(".")
+            .unwrap();
+        let relative = PathBuf::from(root.path().file_name().unwrap()).join("guest.py");
+        let guest_cwd = fs::canonicalize(root.path()).unwrap().join("guest-cwd");
+        let guest_script = guest_cwd.join(&relative);
+        fs::create_dir_all(guest_script.parent().unwrap()).unwrap();
+        write_executable(&relative, b"#!/usr/bin/env caller-only\n");
+        write_executable(&guest_script, b"#!/usr/bin/env guest-only\n");
+        let relative_bin = PathBuf::from(root.path().file_name().unwrap()).join("bin");
+        let guest_bin = guest_cwd.join(&relative_bin);
+        fs::create_dir_all(&relative_bin).unwrap();
+        fs::create_dir_all(&guest_bin).unwrap();
+        write_executable(&relative_bin.join("caller-only"), b"\x7fELFcaller");
+        write_executable(&guest_bin.join("guest-only"), b"\x7fELFguest");
+        let mut command = StdCommand::new(&relative);
+        command
+            .current_dir(&guest_cwd)
+            .env_clear()
+            .env("PATH", &relative_bin)
+            .env("KEPT", "literal value")
+            .env_remove("EXPLICIT_REMOVAL")
+            .args(["literal argument", ""]);
+        let prepared = prepare_dbt_physical_command(&command).unwrap();
+        assert_eq!(prepared.get_program(), OsStr::new("/usr/bin/env"));
+        assert_eq!(
+            prepared.get_args().map(OsStr::to_owned).collect::<Vec<_>>(),
+            [
+                guest_bin.join("guest-only").into_os_string(),
+                relative.into_os_string(),
+                OsString::from("literal argument"),
+                OsString::new()
+            ]
+        );
+        assert_eq!(prepared.get_current_dir(), Some(guest_cwd.as_path()));
+        assert_eq!(
+            prepared.get_envs().collect::<Vec<_>>(),
+            command.get_envs().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_path_selected_script_keeps_the_selected_script_path() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        write_executable(
+            &bin.join("guest.py"),
+            b"#!/usr/bin/env chosen-interpreter\n",
+        );
+        let interpreter = bin.join("chosen-interpreter");
+        write_executable(&interpreter, b"\x7fELFguest");
+        for (cwd, path, script, target) in [
+            (
+                root.path(),
+                OsStr::new("bin"),
+                PathBuf::from("bin/guest.py"),
+                interpreter.clone(),
+            ),
+            (
+                root.path(),
+                bin.as_os_str(),
+                bin.join("guest.py"),
+                interpreter.clone(),
+            ),
+            (
+                root.path(),
+                OsStr::new(":bin"),
+                PathBuf::from("bin/guest.py"),
+                interpreter.clone(),
+            ),
+            (
+                bin.as_path(),
+                OsStr::new(""),
+                PathBuf::from("guest.py"),
+                interpreter.clone(),
+            ),
+            (
+                bin.as_path(),
+                OsStr::new("."),
+                PathBuf::from("./guest.py"),
+                bin.join("./chosen-interpreter"),
+            ),
+        ] {
+            let mut command = StdCommand::new("guest.py");
+            command
+                .current_dir(cwd)
+                .env_clear()
+                .env("PATH", path)
+                .args(["", "two words"]);
+            let prepared = prepare_dbt_physical_command(&command).unwrap();
+            assert_eq!(prepared.get_program(), OsStr::new("/usr/bin/env"));
+            assert_eq!(
+                prepared.get_args().map(OsStr::to_owned).collect::<Vec<_>>(),
+                [
+                    target.into_os_string(),
+                    script.into_os_string(),
+                    OsString::new(),
+                    OsString::from("two words"),
+                ],
+                "PATH {path:?} in {cwd:?} must identify the selected script"
+            );
+            assert_eq!(prepared.get_current_dir(), command.get_current_dir());
+            assert_eq!(
+                prepared.get_envs().collect::<Vec<_>>(),
+                command.get_envs().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_empty_path_component_and_hidden_script_use_physical_cwd() {
+        let root = tempfile::Builder::new()
+            .prefix("dbt-physical-cwd-")
+            .tempdir_in(".")
+            .unwrap();
+        let relative = PathBuf::from(root.path().file_name().unwrap()).join("guest.py");
+        let guest_cwd = fs::canonicalize(root.path()).unwrap().join("empty-workdir");
+        fs::create_dir(&guest_cwd).unwrap();
+        write_executable(&relative, b"#!/usr/bin/env chosen-interpreter\n");
+        let caller_bin = root.path().join("bin");
+        fs::create_dir(&caller_bin).unwrap();
+        write_executable(&caller_bin.join("chosen-interpreter"), b"\x7fELFcaller");
+        let mut command = StdCommand::new(&relative);
+        command
+            .current_dir(&guest_cwd)
+            .env_clear()
+            .env("PATH", &caller_bin)
+            .arg("argument");
+        // The caller can see this relative script; the physical guest cannot.
+        let absent = prepare_dbt_physical_command(&command).unwrap();
+        assert_eq!(absent.get_program(), relative.as_os_str());
+        assert_eq!(
+            absent.get_args().collect::<Vec<_>>(),
+            [OsStr::new("argument")]
+        );
+        // An empty PATH component denotes the physical guest's cwd.
+        let script = guest_cwd.join("script");
+        write_executable(&script, b"#!/usr/bin/env chosen-interpreter\n");
+        let interpreter = guest_cwd.join("chosen-interpreter");
+        write_executable(&interpreter, b"\x7fELFguest");
+        let mut command = StdCommand::new(&script);
+        command.current_dir(&guest_cwd).env_clear().env("PATH", "");
+        let prepared = prepare_dbt_physical_command(&command).unwrap();
+        assert_eq!(prepared.get_program(), OsStr::new("/usr/bin/env"));
+        assert_eq!(
+            prepared.get_args().collect::<Vec<_>>(),
+            [interpreter.as_os_str(), script.as_os_str()]
+        );
     }
 
     #[test]

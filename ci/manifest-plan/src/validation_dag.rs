@@ -63,8 +63,52 @@ const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
     "build.runtime_release",
     "build.e2e_artifact",
     "build.manifest_guests",
+    "build.liteinst_runtime_release",
+    "compatprep.hermit_release",
 ];
+// Explicit execution destinations; hosted variants retain their original host commands.
+const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
+    "test.regular_crates",
+    "test.hermit_unit",
+    "test.detcore_unit",
+    "test.detcore_misc",
+    "test.detcore_parallel",
+    "test.hermit_integration",
+    "test.arbitrary_binaries",
+    "test.cli",
+    "test.isolated_dbt_workdir",
+    "test.isolated_detcore_workdir",
+    "test.liteinst_strict",
+    "test.sabre_examples",
+    "test.hermit_modes",
+    "test.app_strict_verify",
+    "test.command_strict_verify",
+    "test.ignored_syscall_regressions",
+    "test.rr_suite_contract",
+    "test.dbt_parity",
+    "test.envelope_levels",
+    "test.applications_e2e",
+    "liteinst.strict",
+    "liteinst.hermit_release",
+    "liteinst.runtime",
+    "quick.build",
+    "quick.detcore_unit",
+    "quick.run_smoke",
+    "quick.verify_smoke",
+    "quick.record_replay_smoke",
+    "privileged-build.privileged_tests",
+    "privileged-cpuid.faulting",
+    "privileged-pmu.preemption",
+    "privileged-test.pmu_buck_chaos_cases",
+    "privileged-test.cli_kvm",
+    "privileged-only-cpuid.faulting",
+    "privileged-only-pmu.preemption",
+    "privileged-only-test.pmu_buck_chaos_cases",
+    "privileged-only-test.cli_kvm",
+];
+
 const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
+    "CI",
     "CARGO_BUILD_JOBS",
     "DAGRUN_STEP_STARTED_MONOTONIC_NS",
     "E2E_BUILD_ROOT",
@@ -77,10 +121,12 @@ const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
     crate::timeouts::TEST_WALL_TIMEOUT_MULTIPLIER_ENV,
     "HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT",
     "L4_REPS",
+    "NEXTEST_TEST_THREADS",
     "PR_NUMBER",
     "SUPER_REPETITIONS",
     "THIRD_PARTY_BUILD_JOBS",
     "VALIDATE_VERBOSITY",
+    "VALIDATE_RUN_STATE",
 ];
 #[derive(Clone, Copy)]
 struct Profile {
@@ -92,13 +138,13 @@ struct Profile {
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 266,
-        selected_steps: 267,
+        direct_steps: 269,
+        selected_steps: 270,
     },
     Profile {
         label: "portable",
-        direct_steps: 257,
-        selected_steps: 258,
+        direct_steps: 260,
+        selected_steps: 261,
     },
     Profile {
         label: "quick",
@@ -354,12 +400,31 @@ fn is_pinned_root_producer(step: &Step) -> bool {
             && step.cmd.contains("publish-hermit-e2e-artifact.sh"))
 }
 
+fn runs_in_pinned_root(step: &Step) -> bool {
+    !is_hosted_variant(step)
+        && (is_manifest_run(step)
+            || PINNED_ROOT_EXECUTION_STEPS.contains(&step.tag().as_str())
+            || matches!(step.group.as_str(), "portablecompat" | "portablecompatprep"))
+}
+
+// Dagrun appends admitted argv after the complete wrapper command. Re-quote
+// each resulting argument before appending it to the original shell payload;
+// preserve literal bytes and the original command's argument placement.
+pub const PINNED_ROOT_COMMAND_GUARD: &str = r#"/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ "$#" -gt 0 ]; then printf -v hermit_extra ' %q' "$@"; hermit_payload+=$hermit_extra; fi && exec bash -c "$hermit_payload""#;
+pub(super) const LEGACY_PINNED_ROOT_COMMAND_GUARD: &str = r#"/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c "$1""#;
+
 fn pinned_root_command(step: &Step) -> String {
     let mut env_names = PINNED_ROOT_FORWARDED_ENV
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
-    if is_manifest_run(step) {
+    if is_manifest_run(step)
+        || step
+            .structured_test_results_manifest()
+            .ok()
+            .flatten()
+            .is_some()
+    {
         env_names.insert("DAGRUN_TEST_COUNTS_PATH");
     }
     env_names.extend(step.env.keys().map(String::as_str));
@@ -380,9 +445,7 @@ fn pinned_root_command(step: &Step) -> String {
         "--".into(),
         "bash".into(),
         "-c".into(),
-        "/src/ci/hermetic/assert-no-network.sh && \
-         /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\""
-            .into(),
+        PINNED_ROOT_COMMAND_GUARD.into(),
         "bash".into(),
         step.cmd.clone(),
     ]);
@@ -416,6 +479,15 @@ fn refresh_pinned_root_environment(tag: &str, command: &str) -> Result<String, S
             }
         }
     }
+    let legacy = format!("{} bash ", shell_quote(LEGACY_PINNED_ROOT_COMMAND_GUARD));
+    let current = format!("{} bash ", shell_quote(PINNED_ROOT_COMMAND_GUARD));
+    let payload = if let Some(command) = payload.strip_prefix(&legacy) {
+        format!("{current}{command}")
+    } else if payload.starts_with(&current) {
+        payload.to_owned()
+    } else {
+        return Err(format!("{tag} has an unrecognized pinned-root argv guard"));
+    };
     Ok(format!("{refreshed} -- bash -c {payload}"))
 }
 
@@ -454,6 +526,87 @@ fn materialize_hosted_portable_selection(cfg: &mut DagConfig) {
     }
 }
 
+/// Separate the hosted dependency closure without dropping fixture success checks.
+/// Generated compatibility rows keep their commands and run-state paths; only
+/// their hosted identity and dependencies change. Runtime consumes these nodes.
+fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
+    let mut split = cfg
+        .steps
+        .iter()
+        .filter(|step| {
+            runs_in_pinned_root(step)
+                && step
+                    .labels
+                    .iter()
+                    .any(|label| label == HOSTED_PORTABLE_LABEL)
+        })
+        .map(Step::tag)
+        .collect::<BTreeSet<_>>();
+    if split.len() != 16 {
+        return Err(format!(
+            "hosted test split has {} roots, expected 16",
+            split.len()
+        ));
+    }
+    loop {
+        let previous = split.len();
+        for step in &cfg.steps {
+            if step
+                .labels
+                .iter()
+                .any(|label| label == HOSTED_PORTABLE_LABEL)
+                && step
+                    .labels
+                    .iter()
+                    .any(|label| label != HOSTED_PORTABLE_LABEL)
+                && step
+                    .deps
+                    .iter()
+                    .any(|dependency| split.contains(dependency))
+            {
+                split.insert(step.tag());
+            }
+        }
+        if split.len() == previous {
+            break;
+        }
+    }
+    if split.len() != 206 {
+        return Err(format!(
+            "hosted test dependency closure has {} nodes, expected 206",
+            split.len()
+        ));
+    }
+    let mut variants = Vec::new();
+    for step in &mut cfg.steps {
+        if split.contains(&step.tag()) {
+            let mut hosted = step.clone();
+            hosted.job.push_str(HOSTED_VARIANT_SUFFIX);
+            hosted.labels = vec![HOSTED_PORTABLE_LABEL.into()];
+            hosted.fail_fast_family = Some(hosted.tag());
+            let owner = hosted.tag();
+            for result in hosted.result_manifests.iter_mut().flatten() {
+                if let ResultManifest::StructuredTestResults(result) = result {
+                    result.owner = owner.clone();
+                }
+            }
+            step.labels.retain(|label| label != HOSTED_PORTABLE_LABEL);
+            variants.push(hosted);
+        }
+    }
+    cfg.steps.extend(variants);
+    for step in &mut cfg.steps {
+        if step.labels == [HOSTED_PORTABLE_LABEL] {
+            for dependency in &mut step.deps {
+                if split.contains(dependency) {
+                    dependency.push_str(HOSTED_VARIANT_SUFFIX);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Materialize the pinned-root execution split as ordinary committed nodes.
 ///
 /// This transform belongs to maintenance-time generation. Runtime validation
@@ -479,8 +632,18 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
         if is_hosted_variant(step) {
             continue;
         }
-        if !is_manifest_run(step) {
+        if !runs_in_pinned_root(step) {
             continue;
+        }
+        if step.tag() == "test.envelope_levels" {
+            let previous =
+                "ARGS='run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled'";
+            if step.cmd.matches(previous).count() != 1 {
+                return Err(
+                    "working-envelope command lost its exact guest argument boundary".into(),
+                );
+            }
+            step.cmd = step.cmd.replace(previous, "ARGS='run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test'");
         }
         step.env
             .insert("HERMIT_E2E_EMPTY_WORKDIR".into(), "/test".into());
@@ -495,6 +658,9 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
                 }
             })
             .collect();
+        // The image supplies Nextest. Test execution consumes the metadata
+        // prepared in that same root, not a host installation or Cargo cache.
+        step.deps.retain(|dependency| dependency != "setup.nextest");
         if step.group == "privileged-e2e"
             && producer_tags.contains("build.e2e_artifact")
             && !step
@@ -533,6 +699,10 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
         let mut twin = producer.clone();
         twin.job.push_str(PINNED_ROOT_TWIN_SUFFIX);
         twin.labels.retain(|label| label != HOSTED_PORTABLE_LABEL);
+        if producer.tag() == "compatprep.hermit_release" {
+            twin.labels
+                .retain(|label| label == "portable-strict-compat-only");
+        }
         twin.deps = producer
             .deps
             .iter()
@@ -545,6 +715,9 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
         if producer.job == "manifest_guests" && producer_tags.contains("setup.manifest_plan") {
             twin.deps.push("setup.manifest_plan_in_pinned_root".into());
         }
+        if producer.tag() == "compatprep.hermit_release" {
+            twin.deps.push("gate.manifest".into());
+        }
         twin.deps.push(PINNED_ROOT_FETCH_TAG.into());
         twin.deps.sort();
         twin.deps.dedup();
@@ -554,6 +727,12 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
         twins.push(twin);
     }
 
+    for step in &mut cfg.steps {
+        if step.tag() == "compatprep.hermit_release" {
+            step.labels
+                .retain(|label| label != "portable-strict-compat-only");
+        }
+    }
     cfg.steps.push(pinned_root_fetch()?);
     cfg.steps.extend(twins);
     Ok(())
@@ -879,9 +1058,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             }
         }
     }
-    if expected.len() != 88 {
+    if expected.len() != 106 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 88",
+            "structured result producer registry has {} entries, expected 106",
             expected.len()
         ));
     }
@@ -890,9 +1069,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .iter()
         .copied()
         .collect::<BTreeMap<_, _>>();
-    if expected_counts.len() != 23 {
+    if expected_counts.len() != 38 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 23",
+            "Nextest expected-count registry has {} entries, expected 38",
             expected_counts.len()
         ));
     }
@@ -921,15 +1100,16 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
                 ));
             }
         };
+        let command = crate::nextest_build_selections::execution_command(step)?;
+        if command.contains("NEXTEST_EXPECTED_EXECUTED") {
+            return Err(format!(
+                "{tag} declares NEXTEST_EXPECTED_EXECUTED in command text instead of typed step environment"
+            ));
+        }
         if command_kind == Some(StructuredResultProducerKind::Nextest)
             || step.cmd.contains("nextest-binaries.rs executable ")
         {
             crate::nextest_build_selections::assert_command_selection(step)?;
-        }
-        if step.cmd.contains("NEXTEST_EXPECTED_EXECUTED") {
-            return Err(format!(
-                "{tag} declares NEXTEST_EXPECTED_EXECUTED in command text instead of typed step environment"
-            ));
         }
         let declared = step
             .structured_test_results_manifest()
@@ -1015,7 +1195,7 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .into_iter()
         .map(|kind| seen_by_kind.get(&kind).copied().unwrap_or_default())
         .collect::<Vec<_>>();
-    if actual_group_counts != [52, 33, 1, 1, 1] {
+    if actual_group_counts != [67, 33, 2, 2, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -1107,9 +1287,9 @@ fn critical_path_wall_seconds(cfg: &DagConfig) -> Result<i64, String> {
 fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), String> {
     assert_structured_result_producers(cfg)?;
     crate::nextest_build_selections::assert_preparation_dependencies(cfg)?;
-    if cfg.steps.len() != 1388 {
+    if cfg.steps.len() != 1598 {
         return Err(format!(
-            "superset has {} steps, expected 1388",
+            "superset has {} steps, expected 1598",
             cfg.steps.len()
         ));
     }
@@ -1162,11 +1342,14 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
             ));
         }
         let resource = format!("integration_test_binaries.{binary}");
-        let expected = BTreeMap::from([
+        let mut expected = BTreeMap::from([
             (builder.tag(), 1),
             (portable.to_string(), 1),
             (privileged.to_string(), 1),
         ]);
+        if binary == "cli" {
+            expected.insert("test.isolated_dbt_workdir".into(), 1);
+        }
         let actual = cfg
             .steps
             .iter()
@@ -1194,7 +1377,6 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     }
     let focused_release = step("compatprep.hermit_release")?;
     let expected_focused_labels = [
-        "portable-strict-compat-only",
         "strict-compat-only",
         "sabre-compat-only",
         "e9patch-compat-only",
@@ -1214,6 +1396,34 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     {
         return Err("focused compatibility release producer changed command, dependency, labels, or measured resources".into());
     }
+    let focused_image = step("compatprep.hermit_release_in_pinned_root")?;
+    if crate::nextest_build_selections::execution_command(focused_image)? != focused_release.cmd
+        || focused_image.labels != ["portable-strict-compat-only"]
+        || focused_image.deps
+            != [
+                "build.rust_scripts_in_pinned_root",
+                "gate.manifest",
+                "setup.pinned_root_fetch",
+            ]
+        || focused_image.timeout != focused_release.timeout
+        || focused_image.cpu_timeout != focused_release.cpu_timeout
+        || focused_image.hint.resources != focused_release.hint.resources
+        || focused_image.hint.est_duration_s != focused_release.hint.est_duration_s
+        || focused_image.hint.rss_baseline_bytes != focused_release.hint.rss_baseline_bytes
+        || focused_image.hint.rss_baseline_inner_jobs
+            != focused_release.hint.rss_baseline_inner_jobs
+        || focused_image.hint.hard_mem_max_bytes != focused_release.hint.hard_mem_max_bytes
+        || focused_image.hint.classification != focused_release.hint.classification
+        || focused_image.hint.preferred_inner_jobs != focused_release.hint.preferred_inner_jobs
+        || focused_image.hint.measured_effective_cores
+            != focused_release.hint.measured_effective_cores
+        || focused_image.hint.measured_cpu_utilization
+            != focused_release.hint.measured_cpu_utilization
+        || focused_image.jobs_flag != focused_release.jobs_flag
+        || focused_image.jobs_env != focused_release.jobs_env
+    {
+        return Err("portable focused release producer changed the dedicated command or resources, or lost its gate/image prerequisites".into());
+    }
     for group in [
         "portablecompatprep",
         "strictcompatprep",
@@ -1222,10 +1432,12 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         "rrcompatprep",
     ] {
         let prep = step(&format!("{group}.fixtures"))?;
-        if !prep
-            .deps
-            .iter()
-            .any(|dependency| dependency == "compatprep.hermit_release")
+        let producer = if group == "portablecompatprep" {
+            "compatprep.hermit_release_in_pinned_root"
+        } else {
+            "compatprep.hermit_release"
+        };
+        if !prep.deps.iter().any(|dependency| dependency == producer)
             || prep
                 .deps
                 .iter()
@@ -1363,12 +1575,12 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                     .collect::<Vec<_>>()
             ));
         }
-        // Nextest is now required by the build producer itself. Its existing
-        // 600-second setup bound precedes that producer instead of overlapping
-        // it; every node's timeout and CPU cap remains unchanged.
-        if profile.label == "quick" && critical_path_wall_seconds(&selected)? != 8580 + 600 {
+        // The single quick build now consumes Nextest from the pinned image.
+        // Its former 600-second host installation is no longer a prerequisite;
+        // every node's timeout and CPU cap remains unchanged.
+        if profile.label == "quick" && critical_path_wall_seconds(&selected)? != 8580 {
             return Err(format!(
-                "quick selected critical path differs from the preserved 8580 seconds plus required 600-second Nextest setup: {}",
+                "quick selected critical path differs from 8580 seconds with image-owned Nextest: {}",
                 critical_path_wall_seconds(&selected)?
             ));
         }
@@ -1565,6 +1777,7 @@ pub fn generate(root: &Path) -> Result<DagConfig, String> {
     let cells = expected_cells(root)?;
     let mut refreshed = refresh_generated_partitions(static_source, generated)?;
     materialize_hosted_portable_selection(&mut refreshed);
+    materialize_hosted_test_variants(&mut refreshed)?;
     materialize_pinned_root(&mut refreshed)?;
     materialize_focused_preflight(&mut refreshed)?;
     materialize_quick_super_budgets(&mut refreshed);
@@ -1597,6 +1810,22 @@ pub fn require_fresh(committed: &str, generated: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_root_wrapper_preserves_cache_and_run_state_boundaries() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../hermetic/run-in-pinned-root-cache-test.py");
+        let output = std::process::Command::new("python3")
+            .arg(script)
+            .output()
+            .expect("run the actual wrapper with the recorded Podman fixture");
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     fn exact(test: &str) -> DagManifest {
         DagManifest {
@@ -1763,13 +1992,71 @@ mod tests {
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
         assert_eq!(selected.steps.len(), 251);
+        let legacy_variants = [
+            "test.cli_on_host",
+            "test.hermit_modes_on_host",
+            "e2e.manifest_applications_on_host",
+            "e2e.manifest_backend_parity_c_on_host",
+            "e2e.manifest_bin_c_on_host",
+            "e2e.manifest_c_programs_on_host",
+            "e2e.manifest_chaos_c_on_host",
+            "e2e.manifest_data_handling_on_host",
+            "e2e.manifest_debugger_c_on_host",
+            "e2e.manifest_determinism_stress_c_on_host",
+            "e2e.manifest_determinism_stress_on_host",
+            "e2e.manifest_language_runtimes_on_host",
+            "e2e.manifest_shared_futex_c_on_host",
+            "e2e.manifest_system_utils_on_host",
+            "e2e.manifest_util_c_on_host",
+            "scorecard.compatibility_on_host",
+        ];
+        let shared_tests = [
+            "app_strict_verify",
+            "applications_e2e",
+            "arbitrary_binaries",
+            "command_strict_verify",
+            "dbt_parity",
+            "detcore_misc",
+            "detcore_parallel",
+            "detcore_unit",
+            "envelope_levels",
+            "hermit_integration",
+            "hermit_unit",
+            "ignored_syscall_regressions",
+            "liteinst_strict",
+            "regular_crates",
+            "rr_suite_contract",
+            "sabre_examples",
+        ];
+        let mut new_variants = committed
+            .steps
+            .iter()
+            .filter(|step| {
+                step.group == "compat"
+                    && !is_hosted_variant(step)
+                    && step.labels.iter().any(|label| label == "portable")
+            })
+            .map(|step| format!("{}_on_host", step.tag()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(new_variants.len(), 189);
+        new_variants.extend(shared_tests.map(|job| format!("test.{job}_on_host")));
+        new_variants.insert("compatprep.fixtures_on_host".into());
+        assert_eq!(new_variants.len(), 206);
+        let mut expected = legacy_variants
+            .map(str::to_string)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(expected.len(), 16);
+        assert!(expected.is_disjoint(&new_variants));
+        expected.extend(new_variants);
         assert_eq!(
             selected
                 .steps
                 .iter()
                 .filter(|step| is_hosted_variant(step))
-                .count(),
-            16
+                .map(Step::tag)
+                .collect::<BTreeSet<_>>(),
+            expected
         );
         assert!(selected.steps.iter().all(|step| {
             step.tag() != PINNED_ROOT_FETCH_TAG

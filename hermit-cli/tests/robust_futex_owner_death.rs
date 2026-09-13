@@ -38,6 +38,9 @@
 //! separately expose why a backend without atomic or post-exit support must not
 //! run the separate read/write path.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::fs::File;
 use std::path::Path;
@@ -73,6 +76,7 @@ fn run_captured(
     stderr_path: &Path,
     expect_success: bool,
 ) -> Captured {
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let out = File::create(stdout_path).expect("failed to create stdout capture");
     let err = File::create(stderr_path).expect("failed to create stderr capture");
@@ -198,7 +202,7 @@ fn robust_futex_owner_death_wakes_the_waiter_at_l2() {
     let mut verify = Command::new("timeout");
     verify
         .args(["--kill-after", "5s", "120s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args([
             "--log=info",
             "run",
@@ -249,7 +253,7 @@ fn detcore_wakes_the_modeled_waiter_before_linux_finishes_exit() {
 
     let mut run = Command::new("timeout");
     run.args(["--kill-after", "5s", "120s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args([
             "--log=debug",
             "run",
@@ -330,7 +334,7 @@ fn ptrace_wakes_after_guest_observed_fatal_signal_and_exit_group_cleanup() {
         let mut verify = Command::new("timeout");
         verify
             .args(["--kill-after", "5s", "120s"])
-            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg(hermit_test::hermit_binary())
             .args([
                 "--log=info",
                 "run",
@@ -362,7 +366,7 @@ fn ptrace_wakes_after_guest_observed_fatal_signal_and_exit_group_cleanup() {
 
         let mut run = Command::new("timeout");
         run.args(["--kill-after", "5s", "120s"])
-            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg(hermit_test::hermit_binary())
             .args([
                 "--log=debug",
                 "run",

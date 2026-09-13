@@ -25,6 +25,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 fn command_output(mut command: Command, label: &str) -> Output {
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -47,7 +48,7 @@ fn kill_process_group(child: &mut std::process::Child) {
 }
 
 fn run_two_blocked_writers(guest: &Path) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let mut command = Command::new(hermit_test::hermit_binary());
     command
         .args([
             "--log=trace",
@@ -58,7 +59,9 @@ fn run_two_blocked_writers(guest: &Path) {
             "--",
         ])
         .arg(guest)
-        .arg("two-blocked-writers")
+        .arg("two-blocked-writers");
+    hermit_test::configure_guest_execution(&mut command);
+    command
         .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -329,7 +332,7 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
     let mut replacement = Command::new("timeout");
     replacement
         .args(["--kill-after", "5s", "30s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         // NO `--strict` HERE, and the CLI is why: it refuses `--strict` together
         // with `--allow-unsupported-syscalls`, and this case cannot drop the
         // latter -- observing the EOPNOTSUPP refusal IS the case. Written with

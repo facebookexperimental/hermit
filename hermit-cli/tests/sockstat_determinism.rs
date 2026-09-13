@@ -63,6 +63,7 @@ fn assert_l2(case: &ProgramCase) {
         .arg(&program)
         .args(case.args);
 
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -96,6 +97,7 @@ fn read_sockstat() -> String {
         "/bin/cat",
         "/proc/net/sockstat",
     ]);
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()

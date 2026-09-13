@@ -24,6 +24,7 @@ const TIMEOUT_SECONDS: u64 = 30;
 static FP_REDUCTION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
 fn command_output(mut command: Command, label: &str) -> Output {
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()

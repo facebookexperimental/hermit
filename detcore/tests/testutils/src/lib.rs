@@ -8,8 +8,10 @@
 
 //! Testing utilities.
 
+use std::ffi::OsStr;
 use std::io;
 use std::num::NonZeroU64;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
@@ -31,6 +33,14 @@ use tracing_subscriber::fmt::MakeWriter;
 
 /// How many runs for each test when confirming determinism.
 static TEST_REPS: u64 = 3;
+
+const ISOLATED_WORKDIR_ENV: &str = hermit_test_workdir::REQUEST_ENV;
+#[cfg(test)]
+const HERMETIC_TEST_WORKDIR: &str = hermit_test_workdir::WORKDIR;
+
+fn requested_test_workdir(value: Option<&OsStr>) -> Result<Option<&'static Path>, String> {
+    hermit_test_workdir::requested_workdir(value).map_err(|error| error.to_string())
+}
 
 fn test_trace_level() -> String {
     std::env::var("DETCORE_TEST_RUST_LOG").unwrap_or_else(|_| {
@@ -430,7 +440,7 @@ macro_rules! basic_det_test {
 pub fn det_test_all_configs<C, T, O>(check: C, test: T, oracle: O)
 where
     C: Fn(&Config) -> bool,
-    T: Fn(&Config),
+    T: Fn(&Config) + Sync,
     O: Fn(&Output, <Detcore as Tool>::GlobalState) + Clone,
 {
     let do_cfg = |cfg: Config| {
@@ -520,8 +530,11 @@ fn test_fn_with_logs<T, F>(
 ) -> Result<(Output, T::GlobalState, TracerLogs), Error>
 where
     T: Tool + 'static,
-    F: FnOnce(),
+    F: FnOnce() + Send,
 {
+    let marker = std::env::var_os(ISOLATED_WORKDIR_ENV);
+    let workdir = requested_test_workdir(marker.as_deref())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     LazyLock::force(&GLOBAL_TEST_SUBSCRIBER);
     let trace_level = test_trace_level();
     let bufwriter = BufWriter::new();
@@ -534,6 +547,16 @@ where
     // allocations. This only has an effect if the global allocator has been set
     // to test_allocator.
     let f = move || {
+        // The host thread mounted this run's /test before constructing the
+        // runtime and forking. Only the tracee changes its working directory.
+        if let Some(workdir) = workdir {
+            std::env::set_current_dir(workdir).unwrap_or_else(|error| {
+                panic!(
+                    "cannot enter requested test workdir {}: {error}",
+                    workdir.display()
+                )
+            });
+        }
         test_allocator::GLOBAL
             // Try to skip to an arbitrary fixed offset that's likely to be far
             // past all the memory we've allocated so far.
@@ -544,16 +567,25 @@ where
 
     // Here we have to keep the collector tightly scoped to this test, because
     // we want to recapture the output of this test and no other.
-    let (out, state) = tracing::subscriber::with_default(collector, || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            let tracee = spawn_fn_with_config::<T, _>(f, config, capture_output).await?;
-            tracee.wait_with_output().await
+    let run = move || {
+        tracing::subscriber::with_default(collector, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let tracee = spawn_fn_with_config::<T, _>(f, config, capture_output).await?;
+                tracee.wait_with_output().await
+            })
+            // Drop joins this runtime's blocking workers before the namespace
+            // thread returns. No external executor launches this tracee.
         })
-    })?;
+    };
+    let (out, state) = if workdir.is_some() {
+        hermit_test_workdir::with_isolated_workdir(run)?
+    } else {
+        run()
+    }?;
     Ok((out, state, bufwriter.get_strings()))
 }
 
@@ -566,7 +598,7 @@ pub fn test_fn_with_config<T, F>(
 ) -> Result<(Output, T::GlobalState), Error>
 where
     T: Tool + 'static,
-    F: FnOnce(),
+    F: FnOnce() + Send,
 {
     test_fn_with_logs::<T, F>(f, config, capture_output)
         .map(|(output, state, _logs)| (output, state))
@@ -581,7 +613,7 @@ pub fn check_fn_with_config<T, F>(
 ) -> T::GlobalState
 where
     T: Tool + 'static,
-    F: FnOnce(),
+    F: FnOnce() + Send,
 {
     let (output, state) = test_fn_with_config::<T, F>(f, config, capture_output).unwrap();
     if output.status != ExitStatus::Exited(0) {
@@ -595,7 +627,7 @@ where
 /// deterministic between runs. Expect successful exit code.
 pub fn det_test_fn<F>(f: F)
 where
-    F: Fn(),
+    F: Fn() + Send + Sync,
 {
     det_test_fn_with_config(true, f, Default::default(), expect_success)
 }
@@ -605,7 +637,7 @@ where
 /// current test and current config.
 pub fn det_test_fn_with_config<F, O>(isdet: bool, f: F, config: Config, oracle: O)
 where
-    F: Fn(),
+    F: Fn() + Send + Sync,
     O: Fn(&Output, <Detcore as Tool>::GlobalState),
 {
     det_test_fn_with_config_repetitions(TEST_REPS - 1, isdet, f, config, oracle)
@@ -619,7 +651,7 @@ pub fn det_test_fn_with_config_repetitions<F, O>(
     config: Config,
     oracle: O,
 ) where
-    F: Fn(),
+    F: Fn() + Send + Sync,
     O: Fn(&Output, <Detcore as Tool>::GlobalState),
 {
     assert!(repetitions > 0, "at least one test repetition is required");
@@ -780,8 +812,77 @@ fn check_output(output: &Output, logs: Vec<String>, dts: &mut DetTestState) {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    use reverie::ExitStatus;
+
     use super::BufWriter;
+    use super::HERMETIC_TEST_WORKDIR;
+    use super::ISOLATED_WORKDIR_ENV;
     use super::install_global_test_subscriber;
+    use super::requested_test_workdir;
+    use super::test_fn_with_config;
+
+    #[test]
+    fn isolated_workdir_request_is_exact_and_fail_closed() {
+        std::assert_eq!(requested_test_workdir(None).unwrap(), None);
+        std::assert_eq!(
+            requested_test_workdir(Some(OsStr::new("/test"))).unwrap(),
+            Some(Path::new("/test"))
+        );
+        assert!(
+            requested_test_workdir(Some(OsStr::new("/tmp")))
+                .unwrap_err()
+                .contains("HERMIT_E2E_EMPTY_WORKDIR must be /test")
+        );
+    }
+
+    #[test]
+    fn isolated_workdir_reaches_the_in_process_guest_when_requested() {
+        if std::env::var_os(ISOLATED_WORKDIR_ENV).is_none() {
+            return;
+        }
+        let parent_cwd = std::env::current_dir().unwrap();
+        // The same relative name must be available to every physical run.
+        for _ in 0..2 {
+            let (output, ()) = test_fn_with_config::<(), _>(
+                || {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open("in-process-same-name")
+                        .unwrap();
+                    println!("{}", std::env::current_dir().unwrap().display());
+                },
+                (),
+                true,
+            )
+            .unwrap();
+            std::assert_eq!(output.status, ExitStatus::Exited(0));
+            std::assert_eq!(
+                String::from_utf8(output.stdout).unwrap().trim(),
+                HERMETIC_TEST_WORKDIR
+            );
+            std::assert_eq!(std::env::current_dir().unwrap(), parent_cwd);
+        }
+        super::det_test_fn_with_config_repetitions(
+            2,
+            true,
+            || {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open("detcore-same-name")
+                    .unwrap();
+            },
+            detcore::Config {
+                max_timeslice: None,
+                ..Default::default()
+            },
+            super::expect_success,
+        );
+    }
 
     #[test]
     fn global_test_filter_applies_on_spawned_threads() {

@@ -20,6 +20,8 @@
 //! *canonical* (exit 0 -> the trampoline leak is closed) and *deterministic*
 //! (identical stdout across repeated runs).
 
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -30,6 +32,8 @@ use std::sync::MutexGuard;
 use std::sync::OnceLock;
 
 const DETERMINISM_RUNS: usize = 5;
+const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
+const HERMETIC_TEST_WORKDIR: &str = "/test";
 
 static HERMIT_RCX_LOCK: Mutex<()> = Mutex::new(());
 static RCX_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -38,6 +42,26 @@ fn hermit_rcx_lock() -> MutexGuard<'static, ()> {
     HERMIT_RCX_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn execution_root_args(requested: Option<&OsStr>) -> Result<Vec<OsString>, String> {
+    match requested {
+        None => Ok(Vec::new()),
+        Some(value) if value == OsStr::new(HERMETIC_TEST_WORKDIR) => Ok(vec![
+            "--mount=type=tmpfs,target=/test".into(),
+            "--workdir=/test".into(),
+        ]),
+        Some(value) => Err(format!(
+            "{ISOLATED_WORKDIR_ENV} must be {HERMETIC_TEST_WORKDIR}, got {value:?}"
+        )),
+    }
+}
+
+fn configure_execution_root(command: &mut Command) {
+    let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
+    let args = execution_root_args(requested.as_deref())
+        .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"));
+    command.args(args);
 }
 
 fn rcx_guest() -> &'static Path {
@@ -86,22 +110,44 @@ fn rcx_guest() -> &'static Path {
 
 /// Run the guest once under `hermit run --strict` and return its output.
 fn run_under_hermit_strict() -> Output {
+    let guest = rcx_guest();
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command.args([
-        "--log=off",
-        "run",
-        "--strict",
-        // Match the other strict e2e tests: these relaxations keep the test
-        // usable on VMs without CPUID interception without weakening strict mode.
-        "--no-virtualize-cpuid",
-        "--max-timeslice=disabled",
-        "--base-env=minimal",
-        "--",
-    ]);
-    command.arg(rcx_guest());
+    command
+        .current_dir(
+            guest
+                .parent()
+                .expect("rcx guest should have a build directory"),
+        )
+        .args([
+            "--log=off",
+            "run",
+            "--strict",
+            // Match the other strict e2e tests: these relaxations keep the test
+            // usable on VMs without CPUID interception without weakening strict mode.
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--base-env=minimal",
+        ]);
+    configure_execution_root(&mut command);
+    command.arg("--").arg(guest);
     command
         .output()
         .expect("failed to launch hermit run for rcx canonicalization guest")
+}
+
+#[test]
+#[ignore = "validate: fixed /test argument contract"]
+fn pinned_root_arguments_are_exact_and_fail_closed() {
+    assert!(execution_root_args(None).unwrap().is_empty());
+    assert_eq!(
+        execution_root_args(Some(OsStr::new("/test"))).unwrap(),
+        [
+            OsString::from("--mount=type=tmpfs,target=/test"),
+            OsString::from("--workdir=/test"),
+        ]
+    );
+    let error = execution_root_args(Some(OsStr::new("/tmp"))).unwrap_err();
+    assert!(error.contains("HERMIT_E2E_EMPTY_WORKDIR must be /test"));
 }
 
 #[test]

@@ -166,6 +166,42 @@ fn run_liteinst(program: &Path, args: &[&str], verify: bool) -> Output {
     run_liteinst_with_input(program, args, verify, None)
 }
 
+fn liteinst_command(log_level: &str) -> Command {
+    let mut command = Command::new(liteinst_runtime::hermit_binary());
+    command.arg(format!("--log={log_level}")).args([
+        "run",
+        "--backend",
+        "liteinst",
+        "--strict",
+        "--base-env=minimal",
+        "--mount=type=tmpfs,target=/test",
+        "--workdir=/test",
+    ]);
+    command
+}
+
+#[test]
+fn liteinst_commands_use_minimal_environment_and_private_workdir() {
+    let command = liteinst_command("off");
+    let args = command
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        args,
+        [
+            "--log=off",
+            "run",
+            "--backend",
+            "liteinst",
+            "--strict",
+            "--base-env=minimal",
+            "--mount=type=tmpfs,target=/test",
+            "--workdir=/test",
+        ]
+    );
+}
+
 fn run_liteinst_with_input(
     program: &Path,
     args: &[&str],
@@ -176,8 +212,7 @@ fn run_liteinst_with_input(
     let home = tempfile::tempdir().expect("failed to create isolated LiteInst HOME");
     let xdg_config_home = home.path().join(".config");
     fs::create_dir_all(&xdg_config_home).expect("failed to create isolated XDG config directory");
-    let mut command = Command::new(liteinst_runtime::hermit_binary());
-    command.args(["--log=info", "run", "--backend", "liteinst", "--strict"]);
+    let mut command = liteinst_command("info");
     if verify {
         command.arg("--verify");
     }
@@ -796,15 +831,9 @@ fn liteinst_strict_verify_python_random_example() {
 /// against this bound or require widening it.
 fn assert_multi_task_mode(mode: &str, marker: &str) {
     liteinst_runtime::ensure_liteinst_runtime();
-    let mut child = Command::new(liteinst_runtime::hermit_binary())
-        .args([
-            "--log=error",
-            "run",
-            "--backend",
-            "liteinst",
-            "--strict",
-            "--",
-        ])
+    let mut command = liteinst_command("error");
+    let mut child = command
+        .arg("--")
         .arg(advanced_guest())
         .arg(mode)
         .stdout(Stdio::piped())
@@ -911,20 +940,9 @@ fn liteinst_abnormal_exit_after_registration_does_not_hang() {
     // while retaining the diagnostics for the scheduler-start assertion.
     let mut stderr = tempfile::tempfile().expect("create LiteInst diagnostic sink");
     let stderr_sink = stderr.try_clone().expect("clone LiteInst diagnostic sink");
-    let mut child = Command::new(liteinst_runtime::hermit_binary())
-        .args([
-            "--log",
-            "info",
-            "run",
-            "--backend",
-            "liteinst",
-            "--strict",
-            "--base-env=minimal",
-            "--",
-            "/bin/sh",
-            "-c",
-            "kill -9 $$",
-        ])
+    let mut command = liteinst_command("info");
+    let mut child = command
+        .args(["--", "/bin/sh", "-c", "kill -9 $$"])
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr_sink))
         .spawn()

@@ -51,7 +51,8 @@ fn futex2_feature_probes_receive_deterministic_enosys() {
             String::from_utf8_lossy(&compile.stderr),
         );
 
-        let trace = Command::new("timeout")
+        let mut trace_command = Command::new("timeout");
+        trace_command
             .args(["--kill-after", "5s", "60s"])
             .arg(hermit_test::hermit_binary())
             .args([
@@ -63,7 +64,9 @@ fn futex2_feature_probes_receive_deterministic_enosys() {
                 "--base-env=minimal",
                 "--",
             ])
-            .arg(&guest)
+            .arg(&guest);
+        hermit_test::configure_guest_execution(&mut trace_command);
+        let trace = trace_command
             .output()
             .unwrap_or_else(|error| panic!("failed to trace {source}: {error}"));
         assert!(
@@ -84,7 +87,8 @@ fn futex2_feature_probes_receive_deterministic_enosys() {
             "{source} trace omitted {syscall}"
         );
 
-        let output = Command::new("timeout")
+        let mut command = Command::new("timeout");
+        command
             .args(["--kill-after", "5s", "60s"])
             .arg(hermit_test::hermit_binary())
             .args([
@@ -97,7 +101,9 @@ fn futex2_feature_probes_receive_deterministic_enosys() {
                 "--base-env=minimal",
                 "--",
             ])
-            .arg(&guest)
+            .arg(&guest);
+        hermit_test::configure_guest_execution(&mut command);
+        let output = command
             .output()
             .unwrap_or_else(|error| panic!("failed to run {source}: {error}"));
         assert!(

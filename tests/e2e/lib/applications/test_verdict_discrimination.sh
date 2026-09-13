@@ -40,6 +40,9 @@ done
 if [[ -n ${FAKE_REPORT:-} && -n $verdict_path ]]; then
     printf '%s' "$FAKE_REPORT" >"$verdict_path"
 fi
+if [[ -n ${FAKE_ARGS_FILE:-} ]]; then
+    printf '%s\n' "$@" >"$FAKE_ARGS_FILE"
+fi
 printf 'fake-guest-stdout\n'
 printf 'Success: deterministic. Determinism verified.\n' >&2
 exit "${FAKE_STATUS:-0}"
@@ -95,6 +98,23 @@ printf 'run_hermit_verify verdict discrimination\n'
 # POSITIVE. Without this the negatives prove nothing: a reader that always
 # refused would pass every one of them.
 expect strict-parity PASS "$parity_report" 0
+
+export HERMIT_E2E_EMPTY_WORKDIR=/test FAKE_ARGS_FILE="$WORK/pinned-root-args"
+expect pinned-root-workdir PASS "$parity_report" 0
+grep -Fx -- '--base-env=minimal' "$FAKE_ARGS_FILE" >/dev/null
+grep -Fx -- '--mount=type=tmpfs,target=/test' "$FAKE_ARGS_FILE" >/dev/null
+grep -Fx -- '--workdir=/test' "$FAKE_ARGS_FILE" >/dev/null
+if grep -Fx -- '--workdir=/tmp' "$FAKE_ARGS_FILE" >/dev/null; then
+    printf '  FAIL pinned-root-workdir retained the ordinary /tmp workdir\n'
+    failures=$((failures + 1))
+else
+    printf '  ok   pinned-root-workdir command uses /test\n'
+fi
+unset HERMIT_E2E_EMPTY_WORKDIR FAKE_ARGS_FILE
+
+export HERMIT_E2E_EMPTY_WORKDIR=/tmp
+expect invalid-pinned-root-workdir PATH-CONTRACT "$parity_report" 0
+unset HERMIT_E2E_EMPTY_WORKDIR
 
 # Ordinary guest data is not a path merely because the host cwd contains an
 # entry with the same spelling.

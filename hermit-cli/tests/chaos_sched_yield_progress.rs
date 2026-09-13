@@ -89,6 +89,7 @@ fn run_seed(seed: u64) {
         ])
         .arg(guest());
 
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -140,6 +141,7 @@ fn run_strict_guest(args: &[&str]) {
         .arg(guest())
         .args(args);
 
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -201,6 +203,7 @@ fn preemption_replay_preserves_vfork_sched_yield_progress() {
             .arg(guest())
             .arg("--vfork");
 
+        hermit_test::configure_guest_execution(&mut command);
         let rendered = format!("{command:?}");
         let output = command.output().unwrap_or_else(|error| {
             panic!("failed to start preemption {phase}: {rendered}: {error}")

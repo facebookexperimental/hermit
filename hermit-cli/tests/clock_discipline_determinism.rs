@@ -59,22 +59,28 @@ fn assert_syslog_interception(phase: &str, output: &Output) {
 fn record_and_replay_syslog(hermit: &Path, guest: &Path) {
     let data_dir = tempfile::tempdir().expect("failed to create syslog recording directory");
 
-    let record = Command::new("timeout")
+    let mut record_command = Command::new("timeout");
+    record_command
         .args(["--kill-after", "5s", "60s"])
         .arg(hermit)
         .args(["--log=trace", "record", "start", "--record-timeout=45"])
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .arg("--")
-        .arg(guest)
+        .arg(guest);
+    hermit_test::configure_guest_execution(&mut record_command);
+    let record = record_command
         .output()
         .expect("failed to record syslog guest");
     assert_syslog_interception("recording", &record);
 
-    let replay = Command::new("timeout")
+    let mut replay_command = Command::new("timeout");
+    replay_command
         .args(["--kill-after", "5s", "60s"])
         .arg(hermit)
         .args(["--log=trace", "replay", "--autopilot"])
-        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg(format!("--data-dir={}", data_dir.path().display()));
+    hermit_test::configure_guest_execution(&mut replay_command);
+    let replay = replay_command
         .output()
         .expect("failed to replay syslog guest");
     assert_syslog_interception("replay", &replay);
@@ -108,7 +114,8 @@ fn clock_discipline_and_kernel_log_are_host_independent() {
             String::from_utf8_lossy(&compile.stderr),
         );
 
-        let trace = Command::new("timeout")
+        let mut trace_command = Command::new("timeout");
+        trace_command
             .args(["--kill-after", "5s", "60s"])
             .arg(hermit_test::hermit_binary())
             .args([
@@ -120,7 +127,9 @@ fn clock_discipline_and_kernel_log_are_host_independent() {
                 "--base-env=minimal",
                 "--",
             ])
-            .arg(&guest)
+            .arg(&guest);
+        hermit_test::configure_guest_execution(&mut trace_command);
+        let trace = trace_command
             .output()
             .unwrap_or_else(|error| panic!("failed to trace {source}: {error}"));
         assert!(
@@ -140,7 +149,8 @@ fn clock_discipline_and_kernel_log_are_host_independent() {
             "{source} trace omitted {syscall}"
         );
 
-        let verify = Command::new("timeout")
+        let mut verify_command = Command::new("timeout");
+        verify_command
             .args(["--kill-after", "5s", "60s"])
             .arg(hermit_test::hermit_binary())
             .args([
@@ -153,7 +163,9 @@ fn clock_discipline_and_kernel_log_are_host_independent() {
                 "--base-env=minimal",
                 "--",
             ])
-            .arg(&guest)
+            .arg(&guest);
+        hermit_test::configure_guest_execution(&mut verify_command);
+        let verify = verify_command
             .output()
             .unwrap_or_else(|error| panic!("failed to verify {source}: {error}"));
         assert!(

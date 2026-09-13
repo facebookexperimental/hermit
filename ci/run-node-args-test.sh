@@ -93,6 +93,30 @@ else
     printf 'run-node-args-test: ok — RUN_NODE_JOBS overrides validate default\n'
 fi
 
+hosted_test_output=$(run_local env RUN_NODE_PRINT_ONLY=1 \
+    VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS=1 \
+    "$RUN_NODE" portable test.regular_crates 2>&1)
+hosted_test_status=$?
+if ((hosted_test_status != 0)); then
+    fail "the shared portable test selector was refused: exit $hosted_test_status. Output: $hosted_test_output"
+elif [[ $hosted_test_output != *"test.regular_crates maps to committed node test.regular_crates_on_host"* ]]; then
+    fail "the portable public ID did not select its committed host execution. Output: $hosted_test_output"
+else
+    printf 'run-node-args-test: ok — shared portable test IDs retain hosted execution\n'
+fi
+
+compat_output=$(run_local env RUN_NODE_PRINT_ONLY=1 \
+    VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS=1 \
+    "$RUN_NODE" portable test.strict_compat 2>&1)
+compat_status=$?
+if ((compat_status != 0)); then
+    fail "the hosted strict compatibility selector was refused: exit $compat_status. Output: $compat_output"
+elif [[ $compat_output != *"compatprep.fixtures_on_host"* ]]; then
+    fail "strict compatibility omitted its hosted fixture producer. Output: $compat_output"
+else
+    printf 'run-node-args-test: ok — strict compatibility retains its hosted fixture\n'
+fi
+
 privileged_output=$(run_local env RUN_NODE_PRINT_ONLY=1 \
     VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS=1 \
     "$RUN_NODE" privileged cpuid.faulting 2>&1)

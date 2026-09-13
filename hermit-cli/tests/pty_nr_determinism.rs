@@ -22,6 +22,7 @@ struct ProgramCase {
 }
 
 fn command_output(mut command: Command, label: &str) -> Output {
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -70,7 +71,8 @@ fn pty_nr_consumers_verify() {
         "pty count probe compilation failed: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let probe_output = Command::new("timeout")
+    let mut probe_command = Command::new("timeout");
+    probe_command
         .args(["--kill-after", "5s", "90s"])
         .arg(hermit_test::hermit_binary())
         .args([
@@ -82,7 +84,9 @@ fn pty_nr_consumers_verify() {
             "--base-env=minimal",
             "--",
         ])
-        .arg(&probe)
+        .arg(&probe);
+    hermit_test::configure_guest_execution(&mut probe_command);
+    let probe_output = probe_command
         .output()
         .expect("failed to run pty count probe");
     assert!(

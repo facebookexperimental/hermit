@@ -10,7 +10,7 @@
 
 pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
     match tag {
-        "test.regular_crates" => Some(&[
+        "test.regular_crates" | "test.isolated_detcore_workdir" => Some(&[
             "--workspace",
             "--exclude",
             "hermit-detcore",
@@ -149,6 +149,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "arbitrary_binaries",
         ]),
         "test.cli"
+        | "test.isolated_dbt_workdir"
         | "test.cli_on_host"
         | "privileged-test.cli_kvm"
         | "super.liteinst_python3_verify_diagnostics"
@@ -318,6 +319,35 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
     }
 }
 
+/// Recover the exact authored payload from the one supported execution wrapper.
+/// Both the generator and its preparation audit inspect the same command bytes
+/// the container's final bash executes, including literal shell quoting.
+pub(super) fn execution_command(step: &dagrun::model::Step) -> Result<String, String> {
+    if !step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
+        return Ok(step.cmd.clone());
+    }
+    let args = shell_words::split(&step.cmd).map_err(|error| format!("{}: {error}", step.tag()))?;
+    let boundary = args
+        .iter()
+        .position(|arg| arg == "--")
+        .ok_or_else(|| format!("{} omits its pinned-root command boundary", step.tag()))?;
+    match &args[boundary + 1..] {
+        [shell, option, guard, argv0, payload]
+            if shell == "bash"
+                && option == "-c"
+                && argv0 == "bash"
+                && (guard == crate::validation_dag::PINNED_ROOT_COMMAND_GUARD
+                    || guard == crate::validation_dag::LEGACY_PINNED_ROOT_COMMAND_GUARD) =>
+        {
+            Ok(payload.clone())
+        }
+        _ => Err(format!(
+            "{} has an unrecognized pinned-root command",
+            step.tag()
+        )),
+    }
+}
+
 fn command_arguments(command: &str, marker: &str) -> Result<Vec<String>, String> {
     let (_, tail) = command
         .split_once(marker)
@@ -356,6 +386,7 @@ pub(super) fn assert_command_selection(step: &dagrun::model::Step) -> Result<(),
     use crate::nextest_binaries::SELECTION_ENV;
     use crate::nextest_binaries::split_arguments;
     let tag = step.tag();
+    let command = execution_command(step)?;
     let raw = step
         .env
         .get(SELECTION_ENV)
@@ -367,10 +398,10 @@ pub(super) fn assert_command_selection(step: &dagrun::model::Step) -> Result<(),
         ));
     }
     for marker in ["run-nextest-counted.sh", "nextest-binaries.rs list"] {
-        if !step.cmd.contains(marker) {
+        if !command.contains(marker) {
             continue;
         }
-        let parsed = split_arguments(&command_arguments(&step.cmd, marker)?)?;
+        let parsed = split_arguments(&command_arguments(&command, marker)?)?;
         if parsed.build != expected {
             return Err(format!(
                 "{tag} command has Cargo selection {:?}, declared {expected:?}",
@@ -379,8 +410,8 @@ pub(super) fn assert_command_selection(step: &dagrun::model::Step) -> Result<(),
         }
     }
     let direct = "nextest-binaries.rs executable ";
-    if let Some((_, rest)) = step.cmd.split_once(direct) {
-        if step.cmd.matches(direct).count() != 1 {
+    if let Some((_, rest)) = command.split_once(direct) {
+        if command.matches(direct).count() != 1 {
             return Err(format!("{tag} has ambiguous prepared executable lookups"));
         }
         let arguments = rest
@@ -405,7 +436,7 @@ pub(super) fn assert_command_selection(step: &dagrun::model::Step) -> Result<(),
             ));
         }
     }
-    if step.cmd.contains("cargo nextest list") || step.cmd.contains("cargo nextest run") {
+    if command.contains("cargo nextest list") || command.contains("cargo nextest run") {
         return Err(format!("{tag} can bypass prepared metadata and compile"));
     }
     Ok(())
@@ -427,14 +458,18 @@ pub(super) fn assert_preparation_dependencies(
         .collect::<BTreeMap<_, _>>();
     let mut producers = BTreeMap::new();
     for step in &cfg.steps {
-        if step.job.ends_with("_in_pinned_root") {
-            continue;
-        }
-        if let Some((_, profile)) = step.cmd.split_once("./ci/nextest-binaries.rs prepare ") {
+        let command = execution_command(step)?;
+        if let Some((_, profile)) = command.split_once("./ci/nextest-binaries.rs prepare ") {
             if profile.is_empty() || profile.contains(char::is_whitespace) {
                 return Err(format!("{} has an ambiguous prepared profile", step.tag()));
             }
-            producers.insert(step.tag(), config_selections(cfg, profile)?);
+            producers.insert(
+                step.tag(),
+                (
+                    step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh "),
+                    config_selections(cfg, profile)?,
+                ),
+            );
         }
     }
     for step in &cfg.steps {
@@ -454,12 +489,13 @@ pub(super) fn assert_preparation_dependencies(
             }
         }
         if !ancestors.iter().any(|tag| {
-            producers
-                .get(tag)
-                .is_some_and(|selections| selections.get(&key) == Some(&args))
+            producers.get(tag).is_some_and(|(pinned, selections)| {
+                *pinned == step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ")
+                    && selections.get(&key) == Some(&args)
+            })
         }) {
             return Err(format!(
-                "{} can run before any producer of its exact Cargo selection {args:?}",
+                "{} can run before any producer in the same filesystem root of its exact Cargo selection {args:?}",
                 step.tag()
             ));
         }
@@ -472,6 +508,43 @@ mod tests {
     use super::*;
     use crate::nextest_binaries::REQUIRED_ENV;
     use crate::nextest_binaries::SELECTION_ENV;
+
+    #[test]
+    fn prepared_metadata_requires_the_consumers_filesystem_root() {
+        let graph = dagrun::io::dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        assert_preparation_dependencies(&graph).unwrap();
+        let host = graph
+            .steps
+            .iter()
+            .find(|step| step.tag() == "build.workspace")
+            .unwrap();
+        let image = graph
+            .steps
+            .iter()
+            .find(|step| step.tag() == "build.workspace_in_pinned_root")
+            .unwrap();
+        assert_eq!(execution_command(image).unwrap(), host.cmd);
+        for (consumer, producer, wrong_command) in [
+            ("test.regular_crates", image.tag(), host.cmd.clone()),
+            ("test.regular_crates_on_host", host.tag(), image.cmd.clone()),
+        ] {
+            let mut wrong_root = graph.clone();
+            wrong_root
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == producer)
+                .unwrap()
+                .cmd = wrong_command;
+            // Check this consumer first while retaining the complete authored
+            // preparation population and all other nodes/dependencies.
+            wrong_root.steps.sort_by_key(|step| step.tag() != consumer);
+            let error = assert_preparation_dependencies(&wrong_root).unwrap_err();
+            assert!(
+                error.starts_with(consumer) && error.contains("same filesystem root"),
+                "{error}"
+            );
+        }
+    }
 
     #[test]
     fn every_nextest_command_and_inventory_requires_the_declared_preparation() {

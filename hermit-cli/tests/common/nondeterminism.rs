@@ -140,6 +140,7 @@ impl<'a> NondeterminismCase<'a> {
     fn run_hermit(&self, mode_args: &[&str]) -> Output {
         let mut command = Command::new(hermit_binary::hermit_binary());
         command.args(mode_args).arg(self.program).args(self.args);
+        hermit_binary::configure_guest_execution(&mut command);
         run_command(command, self.source, "Hermit verification")
     }
 
@@ -153,6 +154,7 @@ impl<'a> NondeterminismCase<'a> {
     fn run_noop_passthrough(&self, mode_args: &[&str]) -> Output {
         let mut command = Command::new(hermit_binary::hermit_binary());
         command.args(mode_args).arg(self.program).args(self.args);
+        hermit_binary::configure_guest_execution(&mut command);
         run_command(command, self.source, "Hermit verification")
     }
 

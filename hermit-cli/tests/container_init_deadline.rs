@@ -166,8 +166,9 @@ impl Drop for SessionGuard {
 /// every process the run creates by scanning for that session id.
 fn spawn_in_new_session(argv: &[&str]) -> io::Result<Child> {
     let mut command = Command::new(argv[0]);
+    command.args(&argv[1..]);
+    hermit_test::configure_guest_execution(&mut command);
     command
-        .args(&argv[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

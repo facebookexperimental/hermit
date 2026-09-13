@@ -68,6 +68,8 @@ impl StructuredResultProducerKind {
 }
 
 pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
+    "test.isolated_dbt_workdir",
+    "test.isolated_detcore_workdir",
     "liteinst.strict",
     "privileged-only-test.cli_kvm",
     "privileged-only-test.cli_kvm_on_host",
@@ -120,6 +122,19 @@ pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
     "test.regular_crates",
     "test.rr_suite_contract",
     "test.sabre_examples",
+    "test.app_strict_verify_on_host",
+    "test.arbitrary_binaries_on_host",
+    "test.command_strict_verify_on_host",
+    "test.detcore_misc_on_host",
+    "test.detcore_parallel_on_host",
+    "test.detcore_unit_on_host",
+    "test.hermit_integration_on_host",
+    "test.hermit_unit_on_host",
+    "test.ignored_syscall_regressions_on_host",
+    "test.liteinst_strict_on_host",
+    "test.regular_crates_on_host",
+    "test.rr_suite_contract_on_host",
+    "test.sabre_examples_on_host",
 ];
 
 pub(super) const TEST_HARNESS_RESULT_PRODUCERS: &[&str] = &[
@@ -158,9 +173,12 @@ pub(super) const TEST_HARNESS_RESULT_PRODUCERS: &[&str] = &[
     "quick.e2e_verify",
 ];
 
-pub(super) const BACKEND_PARITY_RESULT_PRODUCERS: &[&str] = &["test.dbt_parity"];
-pub(super) const ENVELOPE_RESULT_PRODUCERS: &[&str] = &["test.envelope_levels"];
-pub(super) const APPLICATION_RESULT_PRODUCERS: &[&str] = &["test.applications_e2e"];
+pub(super) const BACKEND_PARITY_RESULT_PRODUCERS: &[&str] =
+    &["test.dbt_parity", "test.dbt_parity_on_host"];
+pub(super) const ENVELOPE_RESULT_PRODUCERS: &[&str] =
+    &["test.envelope_levels", "test.envelope_levels_on_host"];
+pub(super) const APPLICATION_RESULT_PRODUCERS: &[&str] =
+    &["test.applications_e2e", "test.applications_e2e_on_host"];
 
 pub(super) const PMU_MEMORY_FAILURE_FAMILY: &str = "super.Weekly PMU parallel memory diagnostic";
 pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
@@ -174,6 +192,8 @@ pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
 /// an empty or narrowed run refuse. Update these only after enumerating the
 /// corresponding shipped command and accounting for changed test identities.
 pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
+    ("test.isolated_dbt_workdir", 2),
+    ("test.isolated_detcore_workdir", 1),
     ("test.regular_crates", 447),
     ("test.hermit_unit", 523),
     ("test.detcore_unit", 667),
@@ -197,6 +217,19 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("privileged-only-test.cli_kvm", 24),
     ("privileged-only-test.pmu_buck_chaos_cases_on_host", 6),
     ("privileged-only-test.cli_kvm_on_host", 24),
+    ("test.app_strict_verify_on_host", 6),
+    ("test.arbitrary_binaries_on_host", 3),
+    ("test.command_strict_verify_on_host", 9),
+    ("test.detcore_misc_on_host", 27),
+    ("test.detcore_parallel_on_host", 5),
+    ("test.detcore_unit_on_host", 667),
+    ("test.hermit_integration_on_host", 148),
+    ("test.hermit_unit_on_host", 523),
+    ("test.ignored_syscall_regressions_on_host", 2),
+    ("test.liteinst_strict_on_host", 23),
+    ("test.regular_crates_on_host", 447),
+    ("test.rr_suite_contract_on_host", 1),
+    ("test.sabre_examples_on_host", 5),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
@@ -390,15 +423,64 @@ impl StaticStepSpec {
 }
 
 pub(super) fn config() -> DagConfig {
+    let mut steps = STATIC_STEPS
+        .iter()
+        .copied()
+        .map(StaticStepSpec::materialize)
+        .collect::<Vec<_>>();
+    for (parent, job, description, command) in [
+        (
+            "cli",
+            "isolated_dbt_workdir",
+            "Verify sequential and concurrent physical DBT working directories and retain the existing blocked-input failure control. The exact selected tests require the pinned-root marker, prepared CLI executable, canonical INFO and IO-buffer comparison, and unchanged per-test CPU/wall policy. Retained files additionally inherit a 64 MiB per-file limit; a cap hit remains failure.",
+            concat!(
+                "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ",
+                "test \"${HERMIT_E2E_EMPTY_WORKDIR:-}\" = /test && ",
+                "prlimit --fsize=67108864:67108864 -- ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ",
+                "${CI:+--profile ci} -p hermit --features third-party-backends --test cli ",
+                "-E 'test(=run_dbt_verifies_fresh_physical_workdirs) | test(=run_dbt_strict_returns_with_blocked_stdin_source)' -- --include-ignored"
+            ),
+        ),
+        (
+            "regular_crates",
+            "isolated_detcore_workdir",
+            "Execute the marked in-process testutils control through its existing prepared regular-crates selection. Require exactly one terminal test covering two generic Tool runs and two Detcore strict-log repetitions, with the original CPU/wall policy and a 64 MiB inherited per-file limit.",
+            concat!(
+                "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ",
+                "test \"${HERMIT_E2E_EMPTY_WORKDIR:-}\" = /test && ",
+                "prlimit --fsize=67108864:67108864 -- ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ",
+                "${CI:+--profile ci} --workspace --exclude hermit-detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests ",
+                "-E 'package(=detcore-testutils) & test(=tests::isolated_workdir_reaches_the_in_process_guest_when_requested)'"
+            ),
+        ),
+    ] {
+        let parent = *STATIC_STEPS
+            .iter()
+            .find(|step| step.group == "test" && step.job == parent)
+            .unwrap();
+        steps.push(
+            StaticStepSpec {
+                job,
+                desc: description,
+                description,
+                labels: &["full", "portable"],
+                cmd: command,
+                hint: HintSpec {
+                    preferred_inner_jobs: Some(1),
+                    ..parent.hint
+                },
+                jobs_flag: Some(""),
+                jobs_env: Some("NEXTEST_TEST_THREADS"),
+                ..parent
+            }
+            .materialize(),
+        );
+    }
     DagConfig {
         description: "Hermit validation superset; select quick, portable, hosted-portable, full, super, privileged, or hosted-privileged by step label".into(),
         default_step_timeout: 600,
         resource_caps: BTreeMap::from([("manifest_guest".into(), 8), ("integration_test_binaries.cli".into(), 1), ("integration_test_binaries.hermit_modes".into(), 1)]),
-        steps: STATIC_STEPS
-            .iter()
-            .copied()
-            .map(StaticStepSpec::materialize)
-            .collect(),
+        steps,
         ..DagConfig::default()
     }
 }
@@ -3198,7 +3280,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Hermit run smoke test"########,
         description: r########""########,
         labels: &[r########"quick"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; out=$(timeout 30s target/debug/hermit run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled -- /bin/echo hermit-validation-smoke) && test "$out" = hermit-validation-smoke"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; out=$(timeout 30s target/debug/hermit run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test -- /bin/echo hermit-validation-smoke) && test "$out" = hermit-validation-smoke"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -3227,7 +3309,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Hermit verify-mode smoke test"########,
         description: r########""########,
         labels: &[r########"quick"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; timeout 30s target/debug/hermit run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --verify -- /bin/echo hermit-validation-smoke"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; timeout 30s target/debug/hermit run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --verify -- /bin/echo hermit-validation-smoke"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -3256,7 +3338,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Hermit record/replay smoke test"########,
         description: r########""########,
         labels: &[r########"quick"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; timeout 30s target/debug/hermit record start --verify -- /bin/echo hermit-validation-smoke"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; timeout 30s target/debug/hermit record start --base-env=minimal --mount=type=tmpfs,target=/test --workdir=/test --verify -- /bin/echo hermit-validation-smoke"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,

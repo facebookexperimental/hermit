@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -22,10 +24,72 @@ use std::time::Instant;
 // streams across its two runs. Other enabled backends still cover both guests.
 const NON_RACY_EXAMPLES: [&str; 2] = ["date.sh", "devrand.sh"];
 const SABRE_BACKEND_FACT_PREFIX: &str = ":: Backend: sabre static rewriting + ptrace runtime;";
+const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
+const HERMETIC_TEST_WORKDIR: &str = "/test";
+
+fn execution_root_args(requested: Option<&OsStr>) -> Result<Vec<OsString>, String> {
+    match requested {
+        None => Ok(Vec::new()),
+        Some(value) if value == OsStr::new(HERMETIC_TEST_WORKDIR) => Ok(vec![
+            "--base-env=minimal".into(),
+            "--mount=type=tmpfs,target=/test".into(),
+            "--workdir=/test".into(),
+        ]),
+        Some(value) => Err(format!(
+            "{ISOLATED_WORKDIR_ENV} must be {HERMETIC_TEST_WORKDIR}, got {value:?}"
+        )),
+    }
+}
 
 #[test]
 fn sabre_non_racy_example_baseline_is_exact() {
     assert_eq!(NON_RACY_EXAMPLES, ["date.sh", "devrand.sh"]);
+}
+
+#[test]
+fn sabre_pinned_root_arguments_are_exact_and_fail_closed() {
+    assert!(execution_root_args(None).unwrap().is_empty());
+    assert_eq!(
+        execution_root_args(Some(OsStr::new("/test"))).unwrap(),
+        [
+            OsString::from("--base-env=minimal"),
+            OsString::from("--mount=type=tmpfs,target=/test"),
+            OsString::from("--workdir=/test"),
+        ]
+    );
+    let error = execution_root_args(Some(OsStr::new("/tmp"))).unwrap_err();
+    assert!(error.contains("HERMIT_E2E_EMPTY_WORKDIR must be /test"));
+
+    let command = example_command_with_execution_root(
+        Path::new("/bin/true"),
+        &[],
+        None,
+        false,
+        None,
+        None,
+        Some(OsStr::new("/test")),
+    )
+    .unwrap();
+    let args: Vec<_> = command.get_args().collect();
+    assert!(args.contains(&OsStr::new("--base-env=minimal")));
+    assert!(args.windows(2).any(|args| {
+        args == [
+            OsStr::new("--mount=type=tmpfs,target=/test"),
+            OsStr::new("--workdir=/test"),
+        ]
+    }));
+
+    let error = example_command_with_execution_root(
+        Path::new("/bin/true"),
+        &[],
+        None,
+        false,
+        None,
+        None,
+        Some(OsStr::new("/tmp")),
+    )
+    .unwrap_err();
+    assert!(error.contains("HERMIT_E2E_EMPTY_WORKDIR must be /test"));
 }
 
 fn hermit_binary() -> PathBuf {
@@ -190,6 +254,28 @@ fn example_command(
     diagnostic_log: Option<&Path>,
     retained_verify_log_dir: Option<&Path>,
 ) -> Command {
+    let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
+    example_command_with_execution_root(
+        example,
+        args,
+        backend,
+        verify,
+        diagnostic_log,
+        retained_verify_log_dir,
+        requested.as_deref(),
+    )
+    .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"))
+}
+
+fn example_command_with_execution_root(
+    example: &Path,
+    args: &[&str],
+    backend: Option<&Path>,
+    verify: bool,
+    diagnostic_log: Option<&Path>,
+    retained_verify_log_dir: Option<&Path>,
+    requested_workdir: Option<&OsStr>,
+) -> Result<Command, String> {
     let mut command = Command::new(hermit_binary());
     command.arg(if verify { "--log=info" } else { "--log=warn" });
     if let Some(path) = diagnostic_log {
@@ -216,8 +302,9 @@ fn example_command(
                 .arg(directory.join("verify.json"));
         }
     }
+    command.args(execution_root_args(requested_workdir)?);
     command.arg("--").arg(example).args(args);
-    command
+    Ok(command)
 }
 
 fn parity_run(example: &Path, args: &[&str], backend: Option<&Path>, label: &str) -> Output {

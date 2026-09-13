@@ -26,6 +26,7 @@ static HERMIT_CLOCK_LOCK: Mutex<()> = Mutex::new(());
 static CLOCK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
 fn command_output(mut command: Command, label: &str) -> Output {
+    hermit_binary::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()

@@ -37,6 +37,7 @@ static HERMIT_SIGNAL_LOCK: Mutex<()> = Mutex::new(());
 static SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
 fn command_output(mut command: Command, label: &str) -> Output {
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -78,6 +79,7 @@ fn reap_killed_child(child: &mut std::process::Child, label: &str) -> std::proce
 }
 
 fn bounded_command_output(mut command: Command, label: &str) -> (Output, bool, Duration) {
+    hermit_test::configure_guest_execution(&mut command);
     let mut stdout = tempfile::tempfile()
         .unwrap_or_else(|error| panic!("failed to create {label} stdout capture: {error}"));
     let mut stderr = tempfile::tempfile()

@@ -124,6 +124,16 @@ function run_hermit_verify {
         fi
     done
 
+    local -a execution_root_args=(--workdir=/tmp)
+    if [[ -v HERMIT_E2E_EMPTY_WORKDIR ]]; then
+        if [[ $HERMIT_E2E_EMPTY_WORKDIR != /test ]]; then
+            printf '%s: PATH-CONTRACT: HERMIT_E2E_EMPTY_WORKDIR must be /test, got %s\n' \
+                "$label" "$HERMIT_E2E_EMPTY_WORKDIR" >&2
+            return 1
+        fi
+        execution_root_args=("--mount=type=tmpfs,target=/test" "--workdir=/test")
+    fi
+
     local stdout_file stderr_file verdict_file status=0
     stdout_file=$(mktemp "${TMPDIR:-/tmp}/hermit-app-stdout.XXXXXX")
     stderr_file=$(mktemp "${TMPDIR:-/tmp}/hermit-app-stderr.XXXXXX")
@@ -132,8 +142,9 @@ function run_hermit_verify {
     # mistaken for a report it produced.
     rm -f -- "$verdict_file"
 
-    # `--workdir=/tmp` makes the guest's working directory HERMETIC, and that is
-    # a correctness requirement of the comparison, not a convenience.
+    # The ordinary path uses `--workdir=/tmp`; the pinned-root path uses a fresh
+    # tmpfs at `/test`. Keeping the guest's working directory private is a
+    # correctness requirement of the comparison, not a convenience.
     #
     # Without it the guest inherits this harness's cwd. During a full local
     # validate that cwd is the throwaway checkout under the parent workspace's
@@ -147,9 +158,11 @@ function run_hermit_verify {
     # difference. Hermit does not make a changing filesystem deterministic; it
     # is the test's job to present a stable one.
     #
-    # `/tmp` is the right target because Hermit bind-mounts a fresh private
-    # directory over it, and `--workdir` is resolved AFTER guest mounts are
-    # applied, so this names the guest's isolated view. Both properties matter:
+    # On the ordinary path, `/tmp` is the right target because Hermit bind-mounts
+    # a fresh private directory over it. In the pinned root, `/test` is the
+    # common fixed target and Hermit overlays another private tmpfs for each
+    # invocation. `--workdir` is resolved AFTER guest mounts are applied, so
+    # either form names the guest's isolated view. Both properties matter:
     # merely `cd`ing to /tmp before launching would bind the cwd to the
     # *shadowed host* /tmp (62k entries on this box, churning constantly).
     #
@@ -158,7 +171,7 @@ function run_hermit_verify {
     # makes deterministic.
     timeout "$HERMIT_APPLICATION_TIMEOUT" \
         "$HERMIT_BIN" --log=info run --no-virtualize-cpuid \
-        --max-timeslice=disabled --base-env=minimal --strict --workdir=/tmp \
+        --max-timeslice=disabled --base-env=minimal --strict "${execution_root_args[@]}" \
         --verify --verify-strict --verify-json "$verdict_file" -- \
         "${guest_argv[@]}" >"$stdout_file" 2>"$stderr_file" || status=$?
 

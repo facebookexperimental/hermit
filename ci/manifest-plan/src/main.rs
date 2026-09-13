@@ -1944,8 +1944,7 @@ liteinst = "unsupported"
     }
 
     #[test]
-    #[should_panic(expected = "workdir is unsupported when DBT is enabled")]
-    fn rejects_workdir_with_mixed_ptrace_and_dbt_backends() {
+    fn accepts_workdir_with_mixed_ptrace_and_dbt_backends() {
         let spec = parse_mode(
             r#"
 ci = true

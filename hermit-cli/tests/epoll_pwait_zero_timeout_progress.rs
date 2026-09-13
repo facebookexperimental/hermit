@@ -100,6 +100,7 @@ fn run_guest(extra: &[&str], guest_args: &[&str], marker: &str) {
         .arg(guest())
         .args(guest_args);
 
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()

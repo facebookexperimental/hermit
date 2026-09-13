@@ -9,6 +9,8 @@
 //! End-to-end L2 coverage for standard command-line tools that are expected on
 //! the portable CI runner.
 
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
@@ -20,6 +22,8 @@ static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 const HERMIT_VERIFY_TIMEOUT: &str = "60s";
 const HERMIT_VERIFY_KILL_AFTER: &str = "10s";
+const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
+const HERMETIC_TEST_WORKDIR: &str = "/test";
 
 struct StrictCommandCase {
     name: &'static str,
@@ -47,6 +51,27 @@ fn required_command(case: &StrictCommandCase) -> PathBuf {
         })
 }
 
+fn pinned_root_args(requested: Option<&OsStr>) -> Result<Vec<OsString>, String> {
+    match requested {
+        None => Ok(Vec::new()),
+        Some(value) if value == OsStr::new(HERMETIC_TEST_WORKDIR) => Ok(vec![
+            "--base-env=minimal".into(),
+            "--mount=type=tmpfs,target=/test".into(),
+            "--workdir=/test".into(),
+        ]),
+        Some(value) => Err(format!(
+            "{ISOLATED_WORKDIR_ENV} must be {HERMETIC_TEST_WORKDIR}, got {value:?}"
+        )),
+    }
+}
+
+fn configure_pinned_root(command: &mut Command) {
+    let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
+    let args = pinned_root_args(requested.as_deref())
+        .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"));
+    command.args(args);
+}
+
 fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
     let program = required_command(case);
     let home = tempfile::tempdir().expect("failed to create isolated command HOME");
@@ -69,7 +94,9 @@ fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
         .arg(format!(
             "--env=XDG_CONFIG_HOME={}",
             home.path().join(".config").display()
-        ))
+        ));
+    configure_pinned_root(&mut command);
+    command
         .arg("--")
         .arg(&program)
         .args(case.args)
@@ -348,6 +375,21 @@ fn common_commands_are_deterministic_under_strict_verify() {
 }
 
 #[test]
+fn pinned_root_arguments_are_exact_and_fail_closed() {
+    assert!(pinned_root_args(None).unwrap().is_empty());
+    assert_eq!(
+        pinned_root_args(Some(OsStr::new("/test"))).unwrap(),
+        [
+            OsString::from("--base-env=minimal"),
+            OsString::from("--mount=type=tmpfs,target=/test"),
+            OsString::from("--workdir=/test"),
+        ]
+    );
+    let error = pinned_root_args(Some(OsStr::new("/tmp"))).unwrap_err();
+    assert!(error.contains("HERMIT_E2E_EMPTY_WORKDIR must be /test"));
+}
+
+#[test]
 #[ignore = "e2e: requires hermit + mount namespaces + whoami/groups"]
 fn identity_commands_are_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();
@@ -569,14 +611,18 @@ fn python_prlimit64_query_is_deterministic_under_strict_verify() {
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create isolated Python working directory");
 
-    let strict_output = Command::new("timeout")
+    let mut strict_command = Command::new("timeout");
+    strict_command
         .args([
             "--kill-after",
             HERMIT_VERIFY_KILL_AFTER,
             HERMIT_VERIFY_TIMEOUT,
         ])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=off", "run", "--strict", "--"])
+        .args(["--log=off", "run", "--strict"]);
+    configure_pinned_root(&mut strict_command);
+    let strict_output = strict_command
+        .arg("--")
         .arg(&python)
         .args(["-c", query])
         .current_dir(working_directory.path())
@@ -596,14 +642,18 @@ fn python_prlimit64_query_is_deterministic_under_strict_verify() {
         "Python observed a non-deterministic RLIMIT_NOFILE value"
     );
 
-    let output = Command::new("timeout")
+    let mut command = Command::new("timeout");
+    command
         .args([
             "--kill-after",
             HERMIT_VERIFY_KILL_AFTER,
             HERMIT_VERIFY_TIMEOUT,
         ])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=info", "run", "--strict", "--verify", "--"])
+        .args(["--log=info", "run", "--strict", "--verify"]);
+    configure_pinned_root(&mut command);
+    let output = command
+        .arg("--")
         .arg(&python)
         .args(["-c", query])
         .current_dir(working_directory.path())

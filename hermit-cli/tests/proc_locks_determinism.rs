@@ -264,9 +264,9 @@ fn run_guest(guest: &Path, verify: bool) -> Output {
             "--base-env=minimal",
         ])
         .arg("--")
-        .arg(guest)
-        .output()
-        .expect("failed to run proc-locks guest")
+        .arg(guest);
+    hermit_test::configure_guest_execution(&mut command);
+    command.output().expect("failed to run proc-locks guest")
 }
 
 #[test]

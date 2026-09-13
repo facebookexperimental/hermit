@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "common/test-allocator",
+  "common/test-workdir",
   "ci/manifest-plan",
   "detcore",
   "detcore-model",
@@ -24,6 +25,7 @@ exclude = ["agent-utils"]
 # `cargo ... -p hermit --features third-party-backends`.
 default-members = [
   "common/test-allocator",
+  "common/test-workdir",
   "ci/manifest-plan",
   "detcore",
   "detcore-model",

@@ -53,6 +53,7 @@ fn assert_l2(case: &ProgramCase) {
         .arg(program)
         .args(case.args);
 
+    hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
         .output()

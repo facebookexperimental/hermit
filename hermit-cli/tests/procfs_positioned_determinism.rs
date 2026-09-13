@@ -47,7 +47,8 @@ fn procfs_positioned_reads_are_mediated_and_deterministic() {
     // starttime == 0) and that a procfs sendfile input was refused; a nonzero
     // guest exit fails `status.success()`, and the markers confirm both checks
     // actually executed rather than being skipped.
-    let run = Command::new("timeout")
+    let mut run_command = Command::new("timeout");
+    run_command
         .args(["--kill-after", "5s", "90s"])
         .arg(hermit_test::hermit_binary())
         .args([
@@ -59,7 +60,9 @@ fn procfs_positioned_reads_are_mediated_and_deterministic() {
             "--base-env=minimal",
             "--",
         ])
-        .arg(&guest)
+        .arg(&guest);
+    hermit_test::configure_guest_execution(&mut run_command);
+    let run = run_command
         .output()
         .expect("failed to run procfs positioned probe");
     let stdout = String::from_utf8_lossy(&run.stdout);
@@ -81,7 +84,8 @@ fn procfs_positioned_reads_are_mediated_and_deterministic() {
     // Then a --verify run so Hermit proves the positioned/copy paths are
     // bitwise identical across executions (they would diverge if pread read
     // live kernel bytes).
-    let verify = Command::new("timeout")
+    let mut verify_command = Command::new("timeout");
+    verify_command
         .args(["--kill-after", "5s", "90s"])
         .arg(hermit_test::hermit_binary())
         .args([
@@ -94,7 +98,9 @@ fn procfs_positioned_reads_are_mediated_and_deterministic() {
             "--base-env=minimal",
             "--",
         ])
-        .arg(&guest)
+        .arg(&guest);
+    hermit_test::configure_guest_execution(&mut verify_command);
+    let verify = verify_command
         .output()
         .expect("failed to verify procfs positioned probe");
     let vstdout = String::from_utf8_lossy(&verify.stdout);

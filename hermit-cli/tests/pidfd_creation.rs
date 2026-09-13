@@ -55,7 +55,8 @@ fn pidfd_creation_is_tracked_across_descriptor_operations() {
             String::from_utf8_lossy(&compile.stderr),
         );
 
-        let trace = Command::new("timeout")
+        let mut trace_command = Command::new("timeout");
+        trace_command
             .args(["--kill-after", "5s", "60s"])
             .arg(hermit_test::hermit_binary())
             .args([
@@ -67,7 +68,9 @@ fn pidfd_creation_is_tracked_across_descriptor_operations() {
                 "--base-env=minimal",
                 "--",
             ])
-            .arg(&guest)
+            .arg(&guest);
+        hermit_test::configure_guest_execution(&mut trace_command);
+        let trace = trace_command
             .output()
             .unwrap_or_else(|error| panic!("failed to trace {source}: {error}"));
         assert!(
@@ -89,7 +92,8 @@ fn pidfd_creation_is_tracked_across_descriptor_operations() {
             );
         }
 
-        let verify = Command::new("timeout")
+        let mut verify_command = Command::new("timeout");
+        verify_command
             .args(["--kill-after", "5s", "60s"])
             .arg(hermit_test::hermit_binary())
             .args([
@@ -102,7 +106,9 @@ fn pidfd_creation_is_tracked_across_descriptor_operations() {
                 "--base-env=minimal",
                 "--",
             ])
-            .arg(&guest)
+            .arg(&guest);
+        hermit_test::configure_guest_execution(&mut verify_command);
+        let verify = verify_command
             .output()
             .unwrap_or_else(|error| panic!("failed to verify {source}: {error}"));
         assert!(

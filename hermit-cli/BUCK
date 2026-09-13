@@ -76,6 +76,7 @@ rust_binary(
         ":libhermit",
         "//common/rust/build_info:build_info",
         "//common/rust/shed/fbinit:fbinit",
+        "//hermetic_infra/hermit/common/test-workdir:hermit-test-workdir",
         "//hermetic_infra/hermit/detcore:detcore",
         "//hermetic_infra/reverie:reverie",
         "//hermetic_infra/reverie:reverie-ptrace",

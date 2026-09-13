@@ -7450,7 +7450,11 @@ fn expand_strict_compat_alias(
     let compat = cfg
         .steps
         .iter()
-        .filter(|step| step.tag() == "compatprep.fixtures" || step.group == "compat")
+        .filter(|step| {
+            step.group == "compat"
+                || (step.group == "compatprep"
+                    && matches!(step.job.as_str(), "fixtures" | "fixtures_on_host"))
+        })
         .map(Step::tag)
         .collect::<Vec<_>>();
     if compat.is_empty() {
@@ -7507,6 +7511,25 @@ fn map_privileged_public_tags(tags: &mut BTreeSet<String>, label: &str) {
         }
         tags.insert(committed);
     }
+}
+
+/// Hosted shards retain the public selectors shared with local validation.
+/// Resolve only an exact counterpart present in the selected committed graph;
+/// unknown names must still reach select_steps_by_tags and refuse there.
+fn map_hosted_portable_tags(cfg: &DagConfig, tags: &mut BTreeSet<String>, label: &str) {
+    if label != "hosted-portable" {
+        return;
+    }
+    let available = cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    *tags = tags.iter().map(|tag| {
+        let hosted = format!("{tag}_on_host");
+        if !available.contains(tag) && available.contains(&hosted) {
+            println!("Selective validation: portable public node {tag} maps to committed node {hosted}");
+            hosted
+        } else {
+            tag.clone()
+        }
+    }).collect();
 }
 
 fn requalification_identity_field<'a>(
@@ -7633,6 +7656,7 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         let lane_cfg = dagrun::select_steps_by_labels(&committed, std::slice::from_ref(lane))?;
         let mut tags = requested_step_ids(nodes, "--only")?;
         map_privileged_public_tags(&mut tags, lane);
+        map_hosted_portable_tags(&lane_cfg, &mut tags, lane);
         expand_strict_compat_alias(&lane_cfg, &mut tags, lane)?;
         let preflight: &[&str] = match (lane.as_str(), args.allow_local_off_the_record_run) {
             ("hosted-privileged", true) => &["pre.reverie_pin_on_host"],
@@ -7819,6 +7843,7 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         if let Some(selected) = args.selected.as_deref() {
             let mut tags = requested_step_ids(selected, "--selected")?;
             map_privileged_public_tags(&mut tags, label);
+            map_hosted_portable_tags(&cfg, &mut tags, label);
             expand_strict_compat_alias(&cfg, &mut tags, label)?;
             cfg = dagrun::select_steps_by_tags(
                 &cfg,
@@ -11314,7 +11339,7 @@ fn manifest_command_source(tag: &str, command: &str) -> Result<String, String> {
             .ok_or_else(|| format!("retry bounds: {tag} has no pinned-root command boundary"))?;
         let tail = &argv[boundary..];
         if tail.len() != 6 || tail[1] != "bash" || tail[2] != "-c" || tail[4] != "bash"
-            || tail[3] != "/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\""
+            || tail[3] != hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD
         {
             return Err(format!("retry bounds: {tag} has an unrecognized pinned-root invocation"));
         }
@@ -20842,6 +20867,66 @@ fn stop_test_seam(
 mod committed_selection_preservation_tests {
     use super::*;
 
+    #[test]
+    fn hosted_portable_public_selection_retains_exact_nodes_and_compat_fixture() {
+        let root = Path::new(file!()).parent().and_then(Path::parent).unwrap();
+        let (committed, _, _) = load_committed_validation_dag(root).unwrap();
+        let public = [
+            "test.app_strict_verify", "test.applications_e2e", "test.arbitrary_binaries",
+            "test.command_strict_verify", "test.dbt_parity", "test.detcore_misc",
+            "test.detcore_parallel", "test.detcore_unit", "test.envelope_levels",
+            "test.hermit_integration", "test.hermit_unit", "test.ignored_syscall_regressions",
+            "test.liteinst_strict", "test.regular_crates", "test.rr_suite_contract",
+            "test.sabre_examples",
+        ];
+        let hosted = dagrun::select_steps_by_labels(&committed, &["hosted-portable".into()]).unwrap();
+        let mut expected = public.iter().map(|tag| format!("{tag}_on_host")).collect::<BTreeSet<_>>();
+        let compat = hosted.steps.iter().filter(|step| step.group == "compat")
+            .map(Step::tag).collect::<BTreeSet<_>>();
+        assert_eq!(compat.len(), 189);
+        expected.extend(compat);
+        expected.insert("compatprep.fixtures_on_host".into());
+        assert_eq!(expected.len(), 206);
+        let requested = [public.join(","), STRICT_COMPAT_SELECTION_ALIAS.into()].join(",");
+        for only in [false, true] {
+            let mut argv = if only {
+                vec!["--only".into(), "hosted-portable".into(), requested.clone()]
+            } else {
+                vec!["--hosted-portable-only".into(), "--selected".into(), requested.clone(), "--ignore-selected-deps".into()]
+            };
+            argv.push(ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into());
+            let args = parse_argv(&argv).unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let plan = build_plan(root, &args, temp.path()).unwrap();
+            let mut expected = expected.clone();
+            if only { expected.extend(["pre.submodules".into(), PIN_GATE_TAG.into()]); }
+            assert_eq!(plan.cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>(), expected);
+            for actual in &plan.cfg.steps {
+                let source = hosted.steps.iter().find(|step| step.tag() == actual.tag()).unwrap();
+                let mut source = source.clone();
+                source.deps.retain(|dependency| expected.contains(dependency));
+                assert_eq!(
+                    dag_to_json(&hosted.with_steps(vec![actual.clone()])),
+                    dag_to_json(&hosted.with_steps(vec![source])),
+                );
+            }
+        }
+        // Already committed names stay exact; absent names never acquire a
+        // fabricated counterpart, and the local profile retains local IDs.
+        for (profile, selected, expected) in [
+            ("--hosted-portable-only", "test.regular_crates_on_host", "test.regular_crates_on_host"),
+            ("--portable-only", "test.regular_crates", "test.regular_crates"),
+        ] {
+            let args = parse_argv(&[profile.into(), "--selected".into(), selected.into(), "--ignore-selected-deps".into(), ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into()]).unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let plan = build_plan(root, &args, temp.path()).unwrap();
+            assert_eq!(plan.cfg.steps.iter().map(Step::tag).collect::<Vec<_>>(), [expected]);
+        }
+        let args = parse_argv(&["--hosted-portable-only".into(), "--selected".into(), "test.no_such_public_node".into(), ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into()]).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        assert!(build_plan(root, &args, temp.path()).err().expect("unknown selector must refuse").contains("unknown step tag"));
+    }
+
     fn inert_step(source: &Step, command: String) -> Step {
         let mut step = step_with_caps(
             &source.group, &source.job, "committed dependency/resource fixture",
@@ -20986,7 +21071,27 @@ mod fused_privileged_build_tests {
         let workspace = committed.steps.iter().find(|step| step.tag() == "build.workspace").unwrap();
         assert!(workspace.cmd.ends_with(NEXTEST_PORTABLE_PREPARE_COMMAND));
         let preparation = &workspace.cmd[workspace.cmd.len() - NEXTEST_PORTABLE_PREPARE_COMMAND.len()..];
-        let consumer = committed.steps.iter().find(|step| step.tag() == "privileged-build.privileged_tests").unwrap();
+        let mut consumer = committed.steps.iter().find(|step| step.tag() == "privileged-build.privileged_tests").unwrap().clone();
+        // This fixture supplies a fake Cargo executable and an empty target.
+        // Preserve its full cold/prepared contract against the exact authored
+        // payload, after checking each newly committed container boundary.
+        fn pinned_payload(command: &str) -> String {
+            assert!(command.starts_with("./ci/hermetic/run-in-pinned-root.sh "));
+            let argv = shell_words::split(command).unwrap();
+            let boundary = argv.iter().position(|argument| argument == "--").unwrap();
+            assert_eq!(
+                &argv[boundary + 1..boundary + 5],
+                [
+                    "bash",
+                    "-c",
+                    hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD,
+                    "bash",
+                ]
+            );
+            assert_eq!(argv.len(), boundary + 6);
+            argv[boundary + 5].clone()
+        }
+        consumer.cmd = pinned_payload(&consumer.cmd);
         assert!(!consumer.cmd.contains("cargo "), "the barrier must not rebuild shared test executables");
         let query = Command::new(repository.join("ci/nextest-binaries.rs")).arg("--print-executable").output().unwrap();
         assert!(query.status.success(), "{}", String::from_utf8_lossy(&query.stderr));
@@ -21081,7 +21186,8 @@ mod fused_privileged_build_tests {
         let privileged_selections = hermit_manifest_plan::nextest_binaries::profile_selections(repository, "privileged").unwrap();
         assert_eq!(privileged_selections.len(), 3);
         assert!(privileged_selections.values().any(|args| args == &["-p", "hermit-detcore", "--test", "tests_misc"]));
-        let direct = committed.steps.iter().find(|step| step.tag() == "privileged-only-cpuid.faulting").unwrap();
+        let mut direct = committed.steps.iter().find(|step| step.tag() == "privileged-only-cpuid.faulting").unwrap().clone();
+        direct.cmd = pinned_payload(&direct.cmd);
         let declaration = direct.env.get(hermit_manifest_plan::nextest_binaries::SELECTION_ENV).unwrap();
         let prefix = format!("export HERMIT_PREPARED_NEXTEST_REQUIRED=1; export NEXTEST_PREPARED_BUILD_SELECTION={}; ", validate_plan::shell_quote(declaration));
         let before = std::fs::read_to_string(&privileged_log).unwrap();
@@ -21103,6 +21209,69 @@ mod fused_privileged_build_tests {
             assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "failed preparation must not enable consumer compilation");
         }
     }
+    #[test]
+    fn prepared_nextest_preserves_renderer_width_and_ignored_filter_tail() {
+        let repository = Path::new(file!()).parent().and_then(Path::parent).unwrap();
+        let cfg = validate_plan::validation_config(repository).unwrap();
+        let step = cfg.steps.iter().find(|step| step.tag() == "test.isolated_dbt_workdir").unwrap();
+        assert_eq!(step.jobs_flag.as_deref(), Some(""));
+        assert_eq!(step.jobs_env.as_deref(), Some("NEXTEST_TEST_THREADS"));
+        let selection = serde_json::from_str::<Vec<String>>(&step.env["NEXTEST_PREPARED_BUILD_SELECTION"]).unwrap();
+        assert_eq!(selection, ["-p", "hermit", "--features", "third-party-backends", "--test", "cli"]);
+        let query = Command::new(repository.join("ci/nextest-binaries.rs")).arg("--print-executable").output().unwrap();
+        assert!(query.status.success(), "{}", String::from_utf8_lossy(&query.stderr));
+        let helper = PathBuf::from(String::from_utf8(query.stdout).unwrap().trim());
+        let (root, bin, log) = cold_fixture(repository, &helper);
+        // The real prepared adapter invokes this Cargo fixture. Record its
+        // inherited worker setting separately without changing the old log.
+        std::fs::rename(bin.join("cargo"), bin.join("cargo-fixture")).unwrap();
+        write_executable(&bin.join("cargo"), r#"#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+if os.environ.get('NEXTEST_WIDTH_LOG'):
+    with open(os.environ['NEXTEST_WIDTH_LOG'], 'a') as out:
+        out.write(json.dumps({'argv':sys.argv[1:],'threads':os.environ.get('NEXTEST_TEST_THREADS')})+'\n')
+os.execv(sys.executable,[sys.executable,str(Path(__file__).with_name('cargo-fixture')),*sys.argv[1:]])
+"#);
+        let prepared = run_build("./ci/nextest-binaries.rs prepare portable", root.path(), &bin, &log, "current");
+        assert!(prepared.status.success(), "{}", String::from_utf8_lossy(&prepared.stderr));
+        let before = std::fs::read_to_string(&log).unwrap();
+        let width_log = root.path().join("target/width.jsonl");
+        let mut paths = vec![bin.clone()];
+        if let Some(existing) = std::env::var_os("PATH") { paths.extend(std::env::split_paths(&existing)); }
+        let path = std::env::join_paths(paths).unwrap();
+        let tail = ["-E", "test(=run_dbt_verifies_fresh_physical_workdirs) | test(=run_dbt_strict_returns_with_blocked_stdin_source)", "--", "--include-ignored"];
+        for width in [1, 3] {
+            let (name, value) = dagrun::model::env_with_inner_jobs(step, &cfg.default_jobs_env, Some(width)).unwrap();
+            assert_eq!(dagrun::model::command_with_inner_jobs(step, &cfg.default_jobs_flag, Some(width)), step.cmd);
+            let output = Command::new(&helper).arg("run").args(&selection).args(tail)
+                .current_dir(root.path()).env("PATH", &path)
+                .env("CARGO_CALL_LOG", &log).env("CARGO_ARTIFACT_MODE", "current")
+                .env("NEXTEST_WIDTH_LOG", &width_log)
+                .env("HERMIT_PREPARED_NEXTEST_REQUIRED", "1")
+                .env("NEXTEST_PREPARED_BUILD_SELECTION", serde_json::to_string(&selection).unwrap())
+                .env("HERMIT_NEXTEST_CPU_WRAPPER_BIN", root.path().join("custom-cargo-target/debug/nextest-cpu-wrapper"))
+                .env("NEXTEST_TEST_THREADS", "99").env(name, value)
+                .output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        }
+        let rows = std::fs::read_to_string(&width_log).unwrap().lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()).collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        for (row, expected) in rows.iter().zip(["1", "3"]) {
+            assert_eq!(row["threads"], expected);
+            let args = serde_json::from_value::<Vec<String>>(row["argv"].clone()).unwrap();
+            assert_eq!(&args[..2], ["nextest", "run"]);
+            assert!(args.iter().any(|arg| arg == "--cargo-metadata"));
+            assert!(args.iter().any(|arg| arg == "--binaries-metadata"));
+            assert!(args.ends_with(&tail.map(String::from)));
+            assert!(!args.iter().any(|arg| arg == "-j" || arg == "--test-threads"));
+        }
+        let after = std::fs::read_to_string(&log).unwrap();
+        let calls = after.strip_prefix(&before).unwrap().lines().map(|line| serde_json::from_str::<Vec<String>>(line).unwrap()).collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2, "prepared consumers must not rebuild or relist Cargo targets");
+        assert!(calls.iter().all(|args| args[..2] == ["nextest", "run"]));
+    }
+
 }
 
 
