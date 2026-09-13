@@ -1811,6 +1811,79 @@ pub fn require_fresh(committed: &str, generated: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn manifest_setup_prepares_tracked_dagrun_before_cargo_with_admitted_width() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use dagrun::model::command_with_inner_jobs;
+        use dagrun::model::env_with_inner_jobs;
+
+        for tag in ["setup.manifest_plan", "setup.manifest_plan_on_host"] {
+            let step = crate::validation_dag_static::config()
+                .steps
+                .into_iter()
+                .find(|step| step.tag() == tag)
+                .unwrap();
+            for width in [1, 3] {
+                for (prepare_status, cargo_status) in [(0, 0), (23, 0), (0, 29)] {
+                    let scratch = Scratch::create().unwrap();
+                    let root = &scratch.0;
+                    fs::create_dir_all(root.join("agent-utils/rs/bin")).unwrap();
+                    fs::create_dir_all(root.join("tools")).unwrap();
+                    let launcher = root.join("agent-utils/rs/bin/dagrun");
+                    fs::write(
+                        &launcher,
+                        "#!/bin/bash\nprintf 'runner:%s:%s:%s\\n' \"${AGENT_UTILS_RS_ENSURE_ONLY:-}\" \"${CARGO_BUILD_JOBS:-}\" \"$#\" >> \"$CAPTURE\"\nexit \"$PREPARE_STATUS\"\n",
+                    )
+                    .unwrap();
+                    let cargo = root.join("tools/cargo");
+                    fs::write(
+                        &cargo,
+                        "#!/bin/bash\nprintf 'cargo:%s\\n' \"${CARGO_BUILD_JOBS:-}\" >> \"$CAPTURE\"\nprintf '<%s>\\n' \"$@\" >> \"$CAPTURE\"\nexit \"$CARGO_STATUS\"\n",
+                    )
+                    .unwrap();
+                    for path in [&launcher, &cargo] {
+                        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+                    }
+                    let capture = root.join("capture");
+                    let mut command = Command::new("timeout");
+                    command
+                        .args(["--kill-after=1s", "5s", "bash", "-c"])
+                        .arg(command_with_inner_jobs(&step, "-j", Some(width)))
+                        .current_dir(root)
+                        .env(
+                            "PATH",
+                            format!("{}:/usr/bin:/bin", root.join("tools").display()),
+                        )
+                        .env("CAPTURE", &capture)
+                        .env("CARGO_BUILD_JOBS", "99")
+                        .env("PREPARE_STATUS", prepare_status.to_string())
+                        .env("CARGO_STATUS", cargo_status.to_string());
+                    if let Some((key, value)) = env_with_inner_jobs(&step, "", Some(width)) {
+                        command.env(key, value);
+                    }
+                    let output = command.output().unwrap();
+                    assert_eq!(
+                        output.status.code(),
+                        Some(if prepare_status == 0 {
+                            cargo_status
+                        } else {
+                            prepare_status
+                        }),
+                        "{tag}: {output:?}",
+                    );
+                    let mut expected = format!("runner:1:{width}:0\n");
+                    if prepare_status == 0 {
+                        expected.push_str(&format!(
+                            "cargo:{width}\n<build>\n<-p>\n<hermit-manifest-plan>\n<--bins>\n<-j>\n<{width}>\n"
+                        ));
+                    }
+                    assert_eq!(fs::read_to_string(&capture).unwrap(), expected, "{tag}");
+                }
+            }
+        }
+    }
+
     // The fake Podman below executes no container. It records the real wrapper's
     // argv, reconstructs only its declared environment, and maps exactly the two
     // fixed image assertion paths to inert files before executing the guard.
