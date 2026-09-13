@@ -1364,6 +1364,10 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
             .env_remove("DAGRUN_EXPECTED_OUTER_MEMORY_MAX_BYTES")
             .env_remove("DAGRUN_EXPECTED_OUTER_CPU_COUNT")
             .env_remove("DAGRUN_EXPECTED_RUNTIME_MAX_SEC")
+            // This independent checkout starts a new top-level run, not the
+            // enclosing validation run's same-process scope re-exec.
+            .env_remove("VALIDATE_RUN_STATE")
+            .env_remove(RUN_STATE_SCOPE_REEXEC_ENV)
             .env_remove(OWN_SCOPE_DEADLINE_ENV)
             .env_remove(PARENT_ENV)
             .env_remove(TOOL_ROOT_ENV)
@@ -22030,5 +22034,54 @@ mod shared_consumer_tests {
                 assert_committed_shared_integration_test_serialization(&full.steps, &caps).is_err()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod submodule_service_tests {
+    use super::*;
+
+    #[test]
+    fn independent_fixture_keeps_missing_submodule_diagnosis_with_outer_run_state() {
+        const CHILD: &str = "HERMIT_SUBMODULE_SERVICE_RUN_STATE_TEST_CHILD";
+        const SENTINEL: &[u8] = b"outer run state must remain unchanged";
+        const COMPLETED: &str = "independent submodule fixture completed both original diagnoses";
+        if std::env::var_os(CHILD).as_deref() == Some(OsStr::new("1")) {
+            let outer = PathBuf::from(std::env::var_os("VALIDATE_RUN_STATE").unwrap());
+            assert_eq!(
+                std::env::var_os(RUN_STATE_SCOPE_REEXEC_ENV).as_deref(),
+                Some(outer.as_os_str())
+            );
+            assert_eq!(std::fs::read(outer.join("sentinel")).unwrap(), SENTINEL);
+            let detail = submodule_failure_service_result_bracket(&repo_root()).unwrap();
+            println!("{COMPLETED}: {detail}");
+            return;
+        }
+
+        // Seed both ownership values in a separate process: the test never
+        // mutates the test harness's global environment or borrows its state.
+        let fixture = tempfile::tempdir().unwrap();
+        let outer = fixture.path().join("outer-run-state");
+        std::fs::create_dir(&outer).unwrap();
+        std::fs::write(outer.join("sentinel"), SENTINEL).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "submodule_service_tests::independent_fixture_keeps_missing_submodule_diagnosis_with_outer_run_state",
+                "--nocapture",
+            ])
+            .current_dir(repo_root())
+            .env(CHILD, "1")
+            .env("VALIDATE_RUN_STATE", &outer)
+            .env(RUN_STATE_SCOPE_REEXEC_ENV, &outer)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+        assert!(stdout.contains(COMPLETED), "{stdout}{stderr}");
+        assert!(stdout.contains("1 passed; 0 failed;"), "{stdout}{stderr}");
+        assert_eq!(std::fs::read(outer.join("sentinel")).unwrap(), SENTINEL);
+        assert_eq!(std::fs::read_dir(&outer).unwrap().count(), 1);
     }
 }
