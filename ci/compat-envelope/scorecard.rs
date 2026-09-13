@@ -4853,13 +4853,13 @@ fn apply_validate_results(
                         right_info_messages,
                     });
             }
+            let mut inserted_parity = true;
             if let Some(report) = backend_parity {
                 let hermit_depth = depth.get("hermit").ok_or_else(|| {
                     format!("{} observation has no Hermit source depth", display_id(id))
                 })?;
-                observation
-                    .backend_parity_comparisons
-                    .insert(RecordedBackendParityComparison {
+                inserted_parity = observation.backend_parity_comparisons.insert(
+                    RecordedBackendParityComparison {
                         hermit_sha: row.hermit_sha.clone(),
                         hermit_commits: hermit_depth.commits,
                         hermit_first_parent: hermit_depth.first_parent,
@@ -4898,7 +4898,8 @@ fn apply_validate_results(
                         first_divergent_right_message: report
                             .comparison
                             .first_divergent_right_message,
-                    });
+                    },
+                );
             }
             // Record the invocation, exactly as the pressure path does. Without
             // it a validate-sourced bound would have strictly WORSE provenance
@@ -4926,7 +4927,7 @@ fn apply_validate_results(
             // Re-importing the same retained evidence must be byte-idempotent.
             // Positions are vectors, so appending them when the invocation set
             // rejected a duplicate would silently inflate the sample count.
-            if inserted && store_positions {
+            if inserted && inserted_parity && store_positions {
                 observation
                     .first_divergent_scheduler_turn
                     .record(row.first_divergent_scheduler_turn);
@@ -5124,12 +5125,17 @@ fn import_results(
         stale_coordinate_cells,
         no_result_cells,
     } = read_retained_results(root, results, &import_cells)?;
-    let retained_cell_count = retained_cells.len();
+    let retained_cell_count = retained_cells
+        .iter()
+        .map(|cell| &cell.id)
+        .collect::<BTreeSet<_>>()
+        .len();
     let current = read_current_pressure_evidence(root, current_summaries, &before)?;
     let mut tracked = tracked_from(&derived, Some(before.clone()), None, false)?;
     // This command is a projection, not an append-only history store. Remove
-    // only observations carrying this command's canonical-comparison receipt;
-    // series and pressure observations are separate evidence and survive.
+    // only ordinary canonical-comparison projections. Parity receipts measure
+    // another relation and survive even when only ordinary rows were supplied;
+    // series and pressure observations retain their existing ownership.
     for cell in &mut tracked.cells {
         remove_imported_validate_projection(cell);
     }
@@ -5269,7 +5275,7 @@ fn import_results(
         .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
 
     println!(
-        "compatibility scorecard: found {} eligible cell(s) with {} terminal BitwiseInfoV1 comparison(s) in {} retained results.jsonl file(s) containing {} row(s); imported {} retained row(s) and {} current pressure row(s); no guest was executed",
+        "compatibility scorecard: found {} eligible cell(s) with {} terminal canonical or backend-parity comparison(s) in {} retained results.jsonl file(s) containing {} row(s); imported {} retained row(s) and {} current pressure row(s); no guest was executed",
         retained_cell_count,
         terminal_comparisons,
         files_scanned,
@@ -8122,8 +8128,9 @@ struct RetainedImport {
 /// checkout. Each row keeps its own Hermit SHA, and only clean canonical
 /// comparisons on HEAD's history are eligible. For each enabled cell or
 /// disabled ptrace-referenced parity candidate, import every terminal
-/// comparison at the newest eligible SHA so disagreement at one revision
-/// remains visible instead of being resolved by file ordering.
+/// comparison at the newest eligible SHA independently for ordinary and parity
+/// evidence, so disagreement at one revision remains visible instead of being
+/// resolved by file ordering or by a different comparison meaning.
 fn read_retained_results(
     root: &Path,
     result_root: &Path,
@@ -8170,7 +8177,9 @@ fn read_retained_results(
             if raw.get("schema").and_then(JsonValue::as_u64) != Some(CELL_RESULT_SCHEMA) {
                 continue;
             }
-            let mut row: ResultRow = serde_json::from_value(raw).map_err(|e| {
+            // The schema peek must not collapse duplicate aggregate fields before
+            // the typed parser sees the original result bytes.
+            let mut row: ResultRow = serde_json::from_str(line).map_err(|e| {
                 format!(
                     "invalid schema-{CELL_RESULT_SCHEMA} row at {}:{}: {e}",
                     path.display(),
@@ -8209,7 +8218,9 @@ fn read_retained_results(
         }
     }
 
-    let mut by_cell_and_rank: BTreeMap<CellId, BTreeMap<usize, Vec<ResultCandidate>>> =
+    // Repeatability and ptrace-reference parity are different measurements.
+    // A newer result in one domain cannot supersede a result in the other.
+    let mut by_cell_and_rank: BTreeMap<(CellId, bool), BTreeMap<usize, Vec<ResultCandidate>>> =
         BTreeMap::new();
     for ((id, sha, _run_id), candidates) in grouped {
         let terminal_attempt = candidates
@@ -8242,7 +8253,7 @@ fn read_retained_results(
             .into_values()
             .next()
             .expect("distinct terminal evidence is nonempty");
-        match candidate.row.comparison_evidence().map_err(|error| {
+        let is_parity = match candidate.row.comparison_evidence().map_err(|error| {
             format!(
                 "malformed retained evidence for {} at {}: {error}",
                 display_id(&id),
@@ -8252,16 +8263,15 @@ fn read_retained_results(
             ValidateRowEvidence::NotRun { .. } | ValidateRowEvidence::Unavailable { .. } => {
                 continue;
             }
-            ValidateRowEvidence::Matched { .. }
-            | ValidateRowEvidence::Diverged { .. }
-            | ValidateRowEvidence::ParityMatched { .. }
-            | ValidateRowEvidence::ParityDiverged { .. } => {}
-        }
+            ValidateRowEvidence::Matched { .. } | ValidateRowEvidence::Diverged { .. } => false,
+            ValidateRowEvidence::ParityMatched { .. }
+            | ValidateRowEvidence::ParityDiverged { .. } => true,
+        };
         let rank = *history
             .get(&sha)
             .expect("history membership checked before grouping");
         by_cell_and_rank
-            .entry(id)
+            .entry((id, is_parity))
             .or_default()
             .entry(rank)
             .or_default()
@@ -8270,7 +8280,7 @@ fn read_retained_results(
 
     let no_result_cells = eligible
         .iter()
-        .filter(|id| !by_cell_and_rank.contains_key(*id))
+        .filter(|id| !by_cell_and_rank.keys().any(|(present, _)| present == *id))
         .map(display_id)
         .collect::<BTreeSet<_>>();
 
@@ -8280,7 +8290,7 @@ fn read_retained_results(
     let mut stale_coordinate_rows = 0usize;
     let mut stale_coordinates = 0usize;
     let mut stale_coordinate_cells = BTreeSet::new();
-    for (id, mut ranks) in by_cell_and_rank {
+    for ((id, _is_parity), mut ranks) in by_cell_and_rank {
         let latest_rank = *ranks.keys().next().expect("cell has retained evidence");
         let latest_candidates = ranks.get(&latest_rank).expect("latest rank exists");
         let latest_is_pass = latest_candidates
@@ -8554,6 +8564,26 @@ fn retained_coordinate_decision(
         .map(|candidate| DivergenceCoordinates::from_row(&candidate.row))
         .filter(|coordinates| !coordinates.is_empty())
         .collect::<BTreeSet<_>>();
+    // Current pressure summaries compare two runs of one backend. They cannot
+    // confirm or retire a ptrace-vs-candidate divergence at any coordinate.
+    // Keep the actual retained parity receipt and its source-bound positions;
+    // this is not a claim that the current source repeated that comparison.
+    if retained
+        .candidates
+        .iter()
+        .all(|candidate| candidate.row.backend_parity.is_some())
+    {
+        return RetainedDecision {
+            state: RetainedComparisonState::Uncheckable,
+            import: ImportEvidence::Retained {
+                results: Box::new(retained),
+                store_positions: true,
+            },
+            retained_coordinates,
+            current_coordinates: BTreeSet::new(),
+            reason: "ordinary pressure evidence does not compare the two parity backends".into(),
+        };
+    }
     let offered_current_results = current
         .results
         .get(&retained.id)
@@ -8726,37 +8756,92 @@ fn retained_coordinate_decision(
 }
 
 fn remove_imported_validate_projection(cell: &mut TrackedCell) {
-    let removed_shas = cell
-        .observations
-        .iter()
-        .filter(|observation| {
-            observation.provenance == ObservationProvenance::Validate
-                && (!observation.canonical_comparisons.is_empty()
-                    || !observation.backend_parity_comparisons.is_empty())
-        })
-        .flat_map(|observation| {
+    let mut removed_shas = BTreeSet::new();
+    cell.observations.retain_mut(|observation| {
+        if observation.provenance != ObservationProvenance::Validate
+            || observation.canonical_comparisons.is_empty()
+        {
+            return true;
+        }
+        removed_shas.extend(
             observation
                 .canonical_comparisons
                 .iter()
-                .map(|comparison| comparison.hermit_sha.clone())
-                .chain(
-                    observation
-                        .backend_parity_comparisons
-                        .iter()
-                        .map(|comparison| comparison.hermit_sha.clone()),
-                )
-        })
-        .collect::<BTreeSet<_>>();
-    cell.observations.retain(|observation| {
-        observation.provenance != ObservationProvenance::Validate
-            || (observation.canonical_comparisons.is_empty()
-                && observation.backend_parity_comparisons.is_empty())
+                .map(|receipt| receipt.hermit_sha.clone()),
+        );
+        if observation.backend_parity_comparisons.is_empty() {
+            return false;
+        }
+
+        // Older schema-8 writers could mix both comparison meanings in one
+        // observation. Preserve the parity receipts and reconstruct only their
+        // associated identities/positions, not the retired ordinary samples.
+        observation.canonical_comparisons.clear();
+        observation.hermit_shas = observation
+            .backend_parity_comparisons
+            .iter()
+            .map(|receipt| receipt.hermit_sha.clone())
+            .collect();
+        observation.results = observation
+            .backend_parity_comparisons
+            .iter()
+            .map(|receipt| receipt.result)
+            .collect();
+        observation.invocations.retain(|invocation| {
+            observation
+                .backend_parity_comparisons
+                .iter()
+                .any(|receipt| {
+                    receipt.hermit_sha == invocation.hermit_sha
+                        && receipt.run_id == invocation.run_id
+                        && Some(receipt.result) == invocation.result
+                })
+                && invocation
+                    .attempts
+                    .iter()
+                    .any(|attempt| attempt.index == "parity-reference")
+        });
+        // The old aggregate's other repository depths may have come from an
+        // ordinary row. Only the parity receipts identify their own depth.
+        let latest = observation
+            .backend_parity_comparisons
+            .iter()
+            .max_by_key(|receipt| (receipt.hermit_commits, receipt.hermit_first_parent))
+            .expect("mixed observation has parity receipts");
+        observation.depth = BTreeMap::from([(
+            "hermit".into(),
+            SourceDepth {
+                commits: latest.hermit_commits,
+                first_parent: latest.hermit_first_parent,
+            },
+        )]);
+        observation.first_divergent_scheduler_turn = ObservedPositions::default();
+        observation.first_divergent_virtual_nanoseconds = ObservedPositions::default();
+        observation.first_divergent_record = ObservedPositions::default();
+        observation.first_divergent_syscall = ObservedPositions::default();
+        for receipt in &observation.backend_parity_comparisons {
+            observation
+                .first_divergent_scheduler_turn
+                .record(receipt.first_divergent_scheduler_turn);
+            observation
+                .first_divergent_virtual_nanoseconds
+                .record(receipt.first_divergent_virtual_nanoseconds);
+            observation
+                .first_divergent_record
+                .record(receipt.first_divergent_record);
+            observation
+                .first_divergent_syscall
+                .record(receipt.first_divergent_syscall);
+        }
+        true
     });
-    if cell
-        .last_tested
-        .as_ref()
-        .is_some_and(|last| removed_shas.contains(&last.hermit_sha))
-    {
+    if cell.last_tested.as_ref().is_some_and(|last| {
+        removed_shas.contains(&last.hermit_sha)
+            && !cell
+                .observations
+                .iter()
+                .any(|observation| observation.hermit_shas.contains(&last.hermit_sha))
+    }) {
         cell.last_tested = None;
     }
 }
@@ -13586,6 +13671,314 @@ red/`measured-and-passed` count is **0**.",
         ));
     }
     restore_generated()?;
+
+    // Parity and ordinary repeatability share a cell, not a comparison. These
+    // controls use both actual readers and the public importer/observer in the
+    // owned fixture clone, with authentic typed fixture report bytes/hashes.
+    let import_parity_id = CellId {
+        lane: "portable".into(),
+        category: "backend-parity-c".into(),
+        test: "backend-parity-c/readdir-order-identity".into(),
+        mode: "verify".into(),
+        backend: "kvm".into(),
+    };
+    if !command_tracked
+        .cells
+        .iter()
+        .any(|cell| cell.id == import_parity_id && cell.enabled)
+    {
+        return Err("parity retirement fixture requires the existing enabled KVM cell".into());
+    }
+    let older_sha = git_rev_parse(&result_command_root, "HEAD^")?;
+    let mut old_parity = parity_row(&import_parity_id, BackendParityVerdict::Diverged)?;
+    old_parity.hermit_sha = older_sha.clone();
+    old_parity.classification = "required".into();
+    old_parity.run_id = "retained-parity-divergence".into();
+    let mut ordinary_pass = parity_row(&import_parity_id, BackendParityVerdict::Matched)?;
+    ordinary_pass.hermit_sha = fixture_head.clone();
+    ordinary_pass.classification = "required".into();
+    ordinary_pass.run_id = "newer-ordinary-repeatability-pass".into();
+    ordinary_pass.backend_parity = None;
+    ordinary_pass.attempts.truncate(1);
+    old_parity.comparison_evidence()?;
+    ordinary_pass.comparison_evidence()?;
+    let write_import_rows = |rows: &[&ResultRow]| -> Result<(), String> {
+        let text = rows
+            .iter()
+            .map(|row| serde_json::to_string(row).map_err(|e| e.to_string()))
+            .collect::<Result<Vec<_>, _>>()?
+            .join("\n")
+            + "\n";
+        fs::write(&result_path, text).map_err(|e| e.to_string())
+    };
+    let original_current_summary = fs::read(&current_summary).map_err(|e| e.to_string())?;
+    let restored_import_fixture = || -> Result<(), String> {
+        restore_generated()?;
+        fs::write(&current_summary, &original_current_summary).map_err(|e| e.to_string())
+    };
+    let imported_parity_cell = || -> Result<TrackedCell, String> {
+        let cells: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+        cells
+            .cells
+            .into_iter()
+            .find(|cell| cell.id == import_parity_id)
+            .ok_or("parity import dropped the selected cell".into())
+    };
+    let kept_old_parity = |cell: &TrackedCell| {
+        latest_backend_parity(cell).is_some_and(|receipt| {
+            receipt.hermit_sha == older_sha
+                && receipt.run_id == old_parity.run_id
+                && receipt.result == ObservedResult::ParityFailure
+                && receipt.first_divergent_record == Some(2)
+        })
+    };
+    let mut parity_import_failures = Vec::new();
+    restored_import_fixture()?;
+    write_import_rows(&[&old_parity, &ordinary_pass])?;
+    let retained = read_retained_results(
+        &result_command_root,
+        &result_root,
+        &BTreeSet::from([import_parity_id.clone()]),
+    )?;
+    if retained.cells.len() != 2 || retained.terminal_comparisons != 2 {
+        parity_import_failures.push("newer ordinary PASS superseded retained parity in the reader");
+    }
+    let output = run_result_command("import-results", Some(&current_summary))?;
+    if !output.status.success() || !kept_old_parity(&imported_parity_cell()?) {
+        parity_import_failures.push("newer ordinary PASS erased retained parity in the importer");
+    }
+
+    restored_import_fixture()?;
+    write_import_rows(&[&old_parity])?;
+    let initial = run_result_command("import-results", Some(&current_summary))?;
+    if !initial.status.success() || !kept_old_parity(&imported_parity_cell()?) {
+        return Err(format!("parity-only positive import failed: {:?}", initial));
+    }
+    write_import_rows(&[&ordinary_pass])?;
+    let output = run_result_command("import-results", Some(&current_summary))?;
+    if !output.status.success() || !kept_old_parity(&imported_parity_cell()?) {
+        parity_import_failures.push("ordinary-only second import erased stored parity");
+    }
+    let once = read_generated_files(&result_command_root)?;
+    let twice = run_result_command("import-results", Some(&current_summary))?;
+    if !twice.status.success() || read_generated_files(&result_command_root)? != once {
+        parity_import_failures.push("ordinary-only parity preservation was not byte-idempotent");
+    }
+
+    for (label, result, positions, repeats) in [
+        (
+            "two ordinary pressure passes retired parity",
+            "pass",
+            coordinates(None, None, None, None),
+            2,
+        ),
+        (
+            "ordinary pressure coordinates retired parity",
+            "determinism-failure",
+            coordinates(Some(99), Some(990), Some(99), Some(19)),
+            1,
+        ),
+    ] {
+        restored_import_fixture()?;
+        let mut rows = Vec::new();
+        for repetition in 1..=repeats {
+            let mut row = pressure_at(result, positions);
+            row.cell = import_parity_id.clone();
+            row.repetition = Some(repetition);
+            row.invocation.as_mut().unwrap().run_id =
+                format!("ordinary-current-{result}-{repetition}");
+            rows.push(row);
+        }
+        fs::write(
+            &current_summary,
+            serde_json::to_vec(&pressure_summary(
+                &fixture_head,
+                &fixture_detcore_tree,
+                rows,
+            ))
+            .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let current = read_current_pressure_evidence(
+            &result_command_root,
+            &[current_summary.clone()],
+            &command_tracked,
+        )?;
+        if current.results.get(&import_parity_id).map(Vec::len) != Some(repeats as usize)
+            || !current.uncheckable.is_empty()
+        {
+            return Err(format!(
+                "parity retirement control did not admit its ordinary current evidence: {label}"
+            ));
+        }
+        write_import_rows(&[&old_parity])?;
+        let output = run_result_command("import-results", Some(&current_summary))?;
+        if !output.status.success() || !kept_old_parity(&imported_parity_cell()?) {
+            parity_import_failures.push(label);
+        }
+    }
+
+    // A genuine later parity result owns the latest parity projection. An
+    // ordinary result alongside it must still retain its own canonical receipt.
+    restored_import_fixture()?;
+    let mut later_parity = parity_row(&import_parity_id, BackendParityVerdict::Matched)?;
+    later_parity.hermit_sha = fixture_head.clone();
+    later_parity.classification = "required".into();
+    later_parity.run_id = "later-actual-parity-match".into();
+    write_import_rows(&[&old_parity, &ordinary_pass, &later_parity])?;
+    let output = run_result_command("import-results", Some(&current_summary))?;
+    let cell = imported_parity_cell()?;
+    if !output.status.success()
+        || !latest_backend_parity(&cell).is_some_and(|receipt| {
+            receipt.run_id == later_parity.run_id
+                && receipt.hermit_sha == fixture_head
+                && receipt.result == ObservedResult::Pass
+        })
+        || !cell.observations.iter().any(|observation| {
+            observation
+                .canonical_comparisons
+                .iter()
+                .any(|receipt| receipt.run_id == ordinary_pass.run_id)
+        })
+    {
+        parity_import_failures
+            .push("later parity and ordinary receipts did not retain separate latest meanings");
+    }
+    let once = read_generated_files(&result_command_root)?;
+    let repeated = run_result_command("import-results", Some(&current_summary))?;
+    if !repeated.status.success() || read_generated_files(&result_command_root)? != once {
+        parity_import_failures.push("repeated parity import duplicated receipts or coordinates");
+    }
+
+    // Reproduce the old writer's mixed observation through the real observer.
+    // Retiring its ordinary divergence must retain only the parity positions
+    // and invocation, not the ordinary failure's different coordinate sample.
+    restored_import_fixture()?;
+    let mut current_parity = old_parity.clone();
+    current_parity.hermit_sha = fixture_head.clone();
+    let mut ordinary_divergence = ordinary_pass.clone();
+    ordinary_divergence.run_id = "mixed-ordinary-divergence".into();
+    ordinary_divergence.outcome = "FAIL".into();
+    ordinary_divergence.result = Some(ObservedResult::DeterminismFailure);
+    ordinary_divergence.failure_class = Some(FailureClass::ProductFailure);
+    ordinary_divergence.first_divergent_scheduler_turn =
+        validate_row.first_divergent_scheduler_turn;
+    ordinary_divergence.first_divergent_virtual_nanoseconds =
+        validate_row.first_divergent_virtual_nanoseconds;
+    ordinary_divergence.first_divergent_record = validate_row.first_divergent_record;
+    ordinary_divergence.first_divergent_syscall = validate_row.first_divergent_syscall;
+    ordinary_divergence.attempts = validate_row.attempts.clone();
+    ordinary_divergence.attempts[0]["argv"] =
+        serde_json::to_value(&ordinary_divergence.argv).unwrap();
+    ordinary_divergence.attempts[0]["shell_command"] =
+        serde_json::to_value(&ordinary_divergence.shell_command).unwrap();
+    ordinary_divergence.comparison_evidence()?;
+    write_import_rows(&[&current_parity, &ordinary_divergence])?;
+    let mixed = run_result_command("observe-results", None)?;
+    let cell = imported_parity_cell()?;
+    if !mixed.status.success()
+        || !cell.observations.iter().any(|observation| {
+            !observation.canonical_comparisons.is_empty()
+                && !observation.backend_parity_comparisons.is_empty()
+                && observation.first_divergent_record.positions.contains(&2)
+                && observation.first_divergent_record.positions.contains(&12)
+        })
+    {
+        return Err(format!(
+            "mixed comparison fixture did not reach the actual shared observation: {:?}",
+            mixed
+        ));
+    }
+    write_import_rows(&[&ordinary_pass])?;
+    let output = run_result_command("import-results", Some(&current_summary))?;
+    let cell = imported_parity_cell()?;
+    let mixed_preserved = cell.observations.iter().any(|observation| {
+        observation
+            .backend_parity_comparisons
+            .iter()
+            .any(|receipt| receipt.run_id == current_parity.run_id)
+            && observation.results
+                == BTreeSet::from([ObservedResult::Pass, ObservedResult::ParityFailure])
+            && observation.first_divergent_record.positions == vec![2]
+            && observation.first_divergent_scheduler_turn.positions == vec![7]
+            && observation.first_divergent_virtual_nanoseconds.positions == vec![18]
+            && observation.first_divergent_syscall.positions == vec![1]
+            && observation
+                .invocations
+                .iter()
+                .any(|invocation| invocation.run_id == current_parity.run_id)
+            && observation
+                .invocations
+                .iter()
+                .all(|invocation| invocation.run_id != ordinary_divergence.run_id)
+            && observation
+                .canonical_comparisons
+                .iter()
+                .all(|receipt| receipt.run_id != ordinary_divergence.run_id)
+    });
+    if !output.status.success() || !mixed_preserved {
+        parity_import_failures
+            .push("mixed observation lost parity identity or retained unrelated ordinary evidence");
+    }
+
+    restored_import_fixture()?;
+    let valid_text = serde_json::to_string(&later_parity).map_err(|e| e.to_string())?;
+    let needle = "\"records\":{\"compared\":3,";
+    if valid_text.matches(needle).count() != 1 {
+        return Err(
+            "aggregate duplicate fixture did not identify exactly one typed records object".into(),
+        );
+    }
+    for value in [0, 3] {
+        let duplicate = valid_text.replacen(
+            needle,
+            &format!("\"records\":{{\"compared\":{value},\"compared\":3,"),
+            1,
+        );
+        let raw: JsonValue = serde_json::from_str(&duplicate).map_err(|e| e.to_string())?;
+        if raw["attempts"] != serde_json::to_value(&later_parity).unwrap()["attempts"] {
+            return Err(
+                "duplicate aggregate control changed embedded report bytes or hashes".into(),
+            );
+        }
+        fs::write(&result_path, duplicate + "\n").map_err(|e| e.to_string())?;
+        for rejected in [
+            read_result_candidates(&result_root, &fixture_head).err(),
+            read_retained_results(
+                &result_command_root,
+                &result_root,
+                &BTreeSet::from([import_parity_id.clone()]),
+            )
+            .err(),
+        ] {
+            if rejected.is_none_or(|error| !error.contains("duplicate field `compared`")) {
+                parity_import_failures.push("result reader admitted an identical or contradictory duplicate aggregate count");
+            }
+        }
+        for command in ["observe-results", "import-results"] {
+            let output = run_result_command(
+                command,
+                (command == "import-results").then_some(current_summary.as_path()),
+            )?;
+            if output.status.success()
+                || !String::from_utf8_lossy(&output.stderr).contains("duplicate field `compared`")
+            {
+                parity_import_failures.push("result front door admitted an identical or contradictory duplicate aggregate count");
+            }
+            if read_generated_files(&result_command_root)? != result_command_before {
+                parity_import_failures
+                    .push("duplicate aggregate refusal changed generated evidence");
+                restore_generated()?;
+            }
+        }
+    }
+    restored_import_fixture()?;
+    if !parity_import_failures.is_empty() {
+        return Err(format!(
+            "parity import regression controls: {}",
+            parity_import_failures.join("; ")
+        ));
+    }
 
     write_result_row(&replay_row)?;
     let imported = run_result_command("import-results", Some(&current_summary))?;
