@@ -166,14 +166,14 @@ struct ParsedEvents {
     executed_tests: u64,
     filtered_tests: u64,
     results: Vec<TestResult>,
-    expected_attempts: Vec<ExpectedAttempt>,
+    expected_attempts: Vec<ExpectedTest>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct ExpectedAttempt {
+struct ExpectedTest {
     suite: SuiteIdentity,
     test: String,
-    attempt: u64,
+    attempts: u64,
     passed: bool,
 }
 
@@ -335,14 +335,14 @@ fn parse_event_text(text: &str) -> Result<ParsedEvents, String> {
                     &suite.identity.kind,
                     suite.identity.stress_index,
                 );
-                for attempt in 1..=attempts {
-                    expected_attempts.push(ExpectedAttempt {
-                        suite: suite.identity.clone(),
-                        test: test.clone(),
-                        attempt,
-                        passed: event == "ok" && attempt == attempts,
-                    });
-                }
+                // Keep one terminal expectation. A retry suffix is a count,
+                // not permission to allocate that many records while parsing.
+                expected_attempts.push(ExpectedTest {
+                    suite: suite.identity.clone(),
+                    test: test.clone(),
+                    attempts,
+                    passed: event == "ok",
+                });
                 let result = TestResult::new(id.clone(), event == "ok", attempts)?;
                 if results.insert(id.clone(), result).is_some() {
                     return Err(format!(
@@ -408,8 +408,6 @@ fn reconcile_cpu_attempts(
     directory: &Path,
     binary_map: &BinaryMap,
 ) -> Result<CpuReport, String> {
-    let records = read_attempt_records(directory)?;
-    let mut expected = BTreeMap::<AttemptIdentity, bool>::new();
     for attempt in &parsed.expected_attempts {
         // The declared Nextest version has no stress-run wrapper identity.
         // Historical count-only parsing still preserves stress_index; never
@@ -417,21 +415,34 @@ fn reconcile_cpu_attempts(
         if attempt.suite.stress_index.is_some() {
             return Err("CPU reconciliation does not support stress_index identities".into());
         }
+    }
+    let records = read_attempt_records(directory)?;
+    let required = parsed.expected_attempts.iter().try_fold(0u64, |total, test| total.checked_add(test.attempts))
+        .ok_or("missing=typed retry population overflows the available attempt count")?;
+    if required > records.len() as u64 {
+        return Err(format!("missing=typed events require {required} attempt records, supplied {}", records.len()));
+    }
+    // Any expansion is now bounded by records that were actually supplied.
+    // Exact identity and success comparisons below remain mandatory.
+    let mut expected = BTreeMap::<AttemptIdentity, bool>::new();
+    for attempt in &parsed.expected_attempts {
         let (package, binary) = binary_map.identity_for_suite(
             &attempt.suite.package,
             &attempt.suite.binary,
             &attempt.suite.kind,
         )?;
-        let identity = AttemptIdentity {
-            package: package.into(),
-            binary: binary.into(),
-            test: attempt.test.clone(),
-            attempt: attempt.attempt,
-        };
-        if expected.insert(identity.clone(), attempt.passed).is_some() {
-            return Err(format!(
-                "typed nextest events contain duplicate CPU attempt identity {identity:?}"
-            ));
+        for number in 1..=attempt.attempts {
+            let identity = AttemptIdentity {
+                package: package.into(),
+                binary: binary.into(),
+                test: attempt.test.clone(),
+                attempt: number,
+            };
+            if expected.insert(identity.clone(), attempt.passed && number == attempt.attempts).is_some() {
+                return Err(format!(
+                    "typed nextest events contain duplicate CPU attempt identity {identity:?}"
+                ));
+            }
         }
     }
     let mut actual = BTreeMap::<AttemptIdentity, AttemptRecord>::new();
@@ -1033,6 +1044,21 @@ mod tests {
         let scratch = Scratch::new();
         let error = reconcile_cpu_attempts(&parsed, &scratch.0, &sample_binary_map()).unwrap_err();
         assert!(error.contains("does not support stress_index identities"), "{error}");
+    }
+
+    #[test]
+    fn retry_suffix_does_not_allocate_attempts_without_matching_records() {
+        let events = sample_events().replace("recovers#2", "recovers#18446744073709551615");
+        let parsed = parse_event_text(&events).unwrap();
+        assert_eq!(parsed.executed_tests, 2);
+        assert_eq!(parsed.results.iter().find(|r| r.id.ends_with("$recovers")).unwrap().attempts, u64::MAX);
+        assert_eq!(parsed.expected_attempts.len(), 2);
+        let scratch = Scratch::new();
+        let error = reconcile_cpu_attempts(&parsed, &scratch.0, &sample_binary_map()).unwrap_err();
+        assert!(error.contains("retry population overflows"), "{error}");
+        let parsed = parse_event_text(&sample_events().replace("recovers#2", "recovers#999999999")).unwrap();
+        let error = reconcile_cpu_attempts(&parsed, &scratch.0, &sample_binary_map()).unwrap_err();
+        assert!(error.contains("require 1000000000 attempt records, supplied 0"), "{error}");
     }
 
     #[test]
