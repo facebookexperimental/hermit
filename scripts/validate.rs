@@ -3952,17 +3952,40 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .map(Step::tag)
         .collect::<BTreeSet<_>>();
+    // The pinned-root command consumes its prepared script producer and locked
+    // input fetch even off record. Ordinary artifact/manifest builds remain
+    // outside this focused selection; name the exact required set explicitly.
     let expected_off_record = [
         "pre.submodules".to_string(),
         PIN_GATE_TAG.to_string(),
         "test.detcore_unit".to_string(),
+        "build.rust_scripts_in_pinned_root".to_string(),
+        "setup.pinned_root_fetch".to_string(),
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();
-    if off_record_tags != expected_off_record {
-        return Err(format!(
-            "only bracket: off-record selection did not retain exactly requested ID plus minimal preflight: expected={expected_off_record:?} actual={off_record_tags:?}"
-        ));
+    let check_off_record_tags = |tags: &BTreeSet<String>| -> Result<(), String> {
+        if tags != &expected_off_record {
+            return Err(format!(
+                "only bracket: off-record selection did not retain exactly requested ID plus minimal preflight and required pinned-root producers: expected={expected_off_record:?} actual={tags:?}"
+            ));
+        }
+        Ok(())
+    };
+    check_off_record_tags(&off_record_tags)?;
+    for required in ["build.rust_scripts_in_pinned_root", "setup.pinned_root_fetch"] {
+        let mut missing = off_record_tags.clone();
+        if !missing.remove(required) || check_off_record_tags(&missing).is_ok() {
+            return Err(format!(
+                "only bracket: missing required producer {required} was not refused"
+            ));
+        }
+    }
+    let mut unrelated = off_record_tags.clone();
+    if !unrelated.insert("setup.manifest_plan".into())
+        || check_off_record_tags(&unrelated).is_ok()
+    {
+        return Err("only bracket: unrelated manifest producer was not refused".into());
     }
 
     let unknown_args = parse_argv(&[
@@ -4175,6 +4198,16 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         "  only plan: requested IDs plus committed preflight selected through dagrun; old privileged public IDs map explicitly, unknown portable and privileged IDs refuse, outside dependencies drop, selected edges remain, nested scheduler absent, and source/selected-step bytes are guarded both ways"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod focused_only_tests {
+    use super::*;
+
+    #[test]
+    fn actual_focused_selection_keeps_exact_producers_and_all_refusals() {
+        only_plan_bracket(&repo_root()).unwrap();
+    }
 }
 
 fn super_plan_bracket() -> Result<(), String> {
