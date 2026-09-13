@@ -293,7 +293,8 @@ Selection and bounded-batch options (run and plan):
   --seed SEED              Reproduce one sample. If omitted, a generated seed
                            and every selected identity are retained in run.json.
   --cells-file PATH        Select exactly the canonical five-field cell JSON
-                           identities listed one per line. This is a clean-
+                           identities of enabled executable red cells, listed
+                           one per line. This is a clean-
                            commit repeated-batch selector: it requires
                            --repetitions and cannot be combined with population
                            filters. Duplicate, noncanonical, untracked,
@@ -3523,8 +3524,13 @@ fn validate_guest_caps_against_selected_demand(
             .min(selection.manifest_guest_cap())
             .min(kvm_runs);
         if cap > effective_demand {
+            let remedy = if effective_demand == 0 {
+                "omit --kvm-guest-cap".to_string()
+            } else {
+                format!("lower the cap to {effective_demand}")
+            };
             return Err(format!(
-                "--kvm-guest-cap {cap} exceeds selected effective KVM demand {effective_demand}; lower the cap to {effective_demand}"
+                "--kvm-guest-cap {cap} exceeds selected effective KVM demand {effective_demand}; {remedy}"
             ));
         }
     }
@@ -9314,11 +9320,22 @@ fn self_test(root: &Path) -> Result<(), String> {
     )
     .err()
     .ok_or("non-KVM selection accepted an ineffective explicit KVM cap")?;
-    if !non_kvm_cap_error.contains("effective KVM demand 0") {
+    if !non_kvm_cap_error.contains("effective KVM demand 0")
+        || !non_kvm_cap_error.contains("omit --kvm-guest-cap")
+    {
         return Err(format!(
             "ineffective non-KVM cap reported the wrong error: {non_kvm_cap_error}"
         ));
     }
+    let non_kvm_omitted_cap = CellSelection {
+        kvm_guest_cap: None,
+        ..non_kvm_explicit_cap.clone()
+    };
+    validate_selection_shape(&non_kvm_omitted_cap)?;
+    validate_guest_caps_against_selected_demand(
+        std::slice::from_ref(&non_kvm_tracked),
+        &non_kvm_omitted_cap,
+    )?;
     let above_total_demand = CellSelection {
         repetitions: Some(1),
         jobs: Some(4),
@@ -13145,5 +13162,22 @@ mod pressure_planning_tests {
                 assert!(validate_selection_shape(&selection).unwrap_err().contains("must be positive"));
             }
         }
+        let cell: TrackedCell = serde_json::from_value(json!({
+            "backend": "ptrace", "category": "applications", "lane": "portable",
+            "mode": "verify", "test": "applications/example-timed-progress-bar",
+            "enabled": true, "status": "red",
+        })).unwrap();
+        let mut selection = CellSelection {
+            repetitions: Some(1), jobs: Some(4), kvm_guest_cap: Some(1),
+            ..CellSelection::default()
+        };
+        validate_selection_shape(&selection).unwrap();
+        let error = validate_guest_caps_against_selected_demand(std::slice::from_ref(&cell), &selection).unwrap_err();
+        assert!(error.contains("effective KVM demand 0"), "{error}");
+        assert!(error.contains("omit --kvm-guest-cap"), "{error}");
+        selection.kvm_guest_cap = None;
+        validate_selection_shape(&selection).unwrap();
+        validate_guest_caps_against_selected_demand(std::slice::from_ref(&cell), &selection).unwrap();
+        assert!(USAGE.contains("identities of enabled executable red cells"));
     }
 }
