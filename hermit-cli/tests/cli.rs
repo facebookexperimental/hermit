@@ -5943,9 +5943,9 @@ fn sigint_instakill_reports_a_signal_death_not_a_policy_refusal() {
             .collect()
     }
 
-    // The pinned single-binary coreutils sets comm from argv[0]. Keep the
-    // literal /bin/cat executable and give it the name asserted below.
-    let mut child = hermit_command(&["run", "--sigint-instakill", "--argv0=cat", "--", "/bin/cat"])
+    // Resolve cat through PATH so the pinned single-binary coreutils receives
+    // argv[0] = "cat", the process name asserted below.
+    let mut child = hermit_command(&["run", "--sigint-instakill", "--", "cat"])
         .stdin(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         // Own process group, so `wait_bounded` can reach namespace descendants
