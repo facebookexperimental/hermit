@@ -269,6 +269,106 @@ fn pinned_root_arguments_are_exact_and_fail_closed() {
 }
 
 #[test]
+fn pinned_root_mount_exact_target_preserves_the_explicit_fixture() {
+    use std::ffi::OsStr;
+    use std::ffi::OsString;
+
+    for mount in [
+        "type=bind,source=/fixture,target=/test",
+        "target=/test,type=tmpfs",
+    ] {
+        for split in [false, true] {
+            let mut args = vec![OsString::from("run")];
+            if split {
+                args.extend([OsString::from("--mount"), OsString::from(mount)]);
+            } else {
+                args.push(OsString::from(format!("--mount={mount}")));
+            }
+            let mut expected = args.clone();
+            expected.extend(
+                ["--base-env=minimal", "--workdir=/test", "--", "/bin/true"].map(OsString::from),
+            );
+            args.extend([OsString::from("--"), OsString::from("/bin/true")]);
+            assert_eq!(
+                hermit_test::guest_args_for(args, Some(OsStr::new("/test"))).unwrap(),
+                expected,
+                "explicit /test fixture must not be hidden: split={split}, {mount}",
+            );
+        }
+    }
+}
+
+#[test]
+fn pinned_root_mount_other_targets_still_receive_the_empty_execution_root() {
+    use std::ffi::OsStr;
+    use std::ffi::OsString;
+
+    for mount in [
+        "type=tmpfs,target=/test-data",
+        "type=tmpfs,target=/test/subdir",
+        "type=bind,source=/fixture/target=/test,target=/elsewhere",
+    ] {
+        for split in [false, true] {
+            let mut args = vec![OsString::from("run")];
+            if split {
+                args.extend([OsString::from("--mount"), OsString::from(mount)]);
+            } else {
+                args.push(OsString::from(format!("--mount={mount}")));
+            }
+            let mut expected = vec![
+                OsString::from("run"),
+                OsString::from("--mount=type=tmpfs,target=/test"),
+            ];
+            expected.extend(args[1..].iter().cloned());
+            expected.extend(
+                ["--base-env=minimal", "--workdir=/test", "--", "/bin/true"].map(OsString::from),
+            );
+            args.extend([OsString::from("--"), OsString::from("/bin/true")]);
+            assert_eq!(
+                hermit_test::guest_args_for(args, Some(OsStr::new("/test"))).unwrap(),
+                expected,
+                "different mount must not suppress /test: split={split}, {mount}",
+            );
+        }
+    }
+
+    assert_eq!(
+        hermit_test::guest_args_for(
+            [
+                "--log-file",
+                "/fixture/log",
+                "run",
+                "--strict",
+                "--mount",
+                "type=tmpfs,target=/test/subdir",
+                "--mount=type=tmpfs,target=/test-data",
+                "--",
+                "/bin/printf",
+                "--mount=type=tmpfs,target=/test",
+            ],
+            Some(OsStr::new("/test")),
+        )
+        .unwrap(),
+        [
+            "--log-file",
+            "/fixture/log",
+            "run",
+            "--strict",
+            "--mount=type=tmpfs,target=/test",
+            "--mount",
+            "type=tmpfs,target=/test/subdir",
+            "--mount=type=tmpfs,target=/test-data",
+            "--base-env=minimal",
+            "--workdir=/test",
+            "--",
+            "/bin/printf",
+            "--mount=type=tmpfs,target=/test",
+        ]
+        .map(OsString::from),
+    );
+}
+
+#[test]
 fn multiple_ready_fds_have_deterministic_ordering() {
     assert_scenario_is_deterministic("multi");
 }

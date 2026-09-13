@@ -81,9 +81,19 @@ where
             "{ISOLATED_WORKDIR_ENV} requires --base-env=minimal, got {explicit_base_env:?}"
         ));
     }
-    let has_test_mount = options.iter().any(|arg| {
-        arg.to_str()
-            .is_some_and(|arg| arg.starts_with("--mount=") && arg.contains("target=/test"))
+    let has_test_mount = options.iter().enumerate().any(|(index, arg)| {
+        let mount = arg
+            .to_str()
+            .and_then(|arg| arg.strip_prefix("--mount="))
+            .or_else(|| {
+                (arg == OsStr::new("--mount"))
+                    .then(|| options.get(index + 1).and_then(|value| value.to_str()))
+                    .flatten()
+            });
+        mount.is_some_and(|mount| mount.split(',').any(|field| field == "target=/test"))
+    });
+    let first_mount = options.iter().position(|arg| {
+        arg == OsStr::new("--mount") || arg.to_str().is_some_and(|arg| arg.starts_with("--mount="))
     });
     let explicit_workdir = options.iter().enumerate().find_map(|(index, arg)| {
         arg.to_str()
@@ -107,18 +117,27 @@ where
     if explicit_base_env.is_none() {
         execution_root.push(OsString::from("--base-env=minimal"));
     }
-    if !uses_outer_mount && !has_test_mount {
+    let needs_test_mount = !uses_outer_mount && !has_test_mount;
+    if needs_test_mount && first_mount.is_none() {
         execution_root.push(OsString::from("--mount=type=tmpfs,target=/test"));
     }
     if explicit_workdir.is_none() {
         execution_root.push(OsString::from("--workdir=/test"));
     }
     args.splice(separator..separator, execution_root);
+    if needs_test_mount && let Some(index) = first_mount {
+        // Mounts are applied in argument order. Install the parent first so a
+        // later explicit child fixture remains visible inside the fresh root.
+        args.insert(index, OsString::from("--mount=type=tmpfs,target=/test"));
+    }
     Ok(args)
 }
 
 /// Insert the validate v3 guest arguments into a direct or timeout-wrapped
-/// Hermit command. Call this before configuring standard I/O.
+/// Hermit command. Call this before configuring standard I/O, process-group or
+/// user/group identity, pre-exec callbacks, or clearing the environment. The
+/// marked path rebuilds the command; its getters expose only the program,
+/// arguments, current directory and explicit environment entries.
 #[allow(dead_code)]
 pub fn configure_guest_execution(command: &mut Command) {
     let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);

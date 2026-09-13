@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -25,6 +27,9 @@ use hermit::run_evidence::RunEvidenceInspectionFailure;
 use hermit::run_evidence::RunEvidenceNoResultReason;
 use hermit::run_evidence::RunEvidenceOutcome;
 use hermit::run_evidence::inspect_run_evidence;
+
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
@@ -72,11 +77,150 @@ fn stdio_identity_guest(parent: &Path) -> PathBuf {
     )
 }
 
+fn hermit_command() -> Command {
+    Command::new(hermit_test::hermit_binary())
+}
+
+fn prepare_command_for(command: &mut Command, requested: Option<&OsStr>) -> Result<(), String> {
+    hermit_test::configure_guest_execution_for(command, requested)
+}
+
+// All callers configure arguments and explicit environment entries only. Apply
+// staging before output configures its standard descriptors.
+fn command_output(command: &mut Command) -> std::io::Result<Output> {
+    let requested = std::env::var_os("HERMIT_E2E_EMPTY_WORKDIR");
+    prepare_command_for(command, requested.as_deref())
+        .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"));
+    command.output()
+}
+
 fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(args)
-        .output()
+    command_output(hermit_command().args(args))
         .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"))
+}
+
+#[test]
+fn run_evidence_command_staging_is_exact() {
+    let selected = hermit_test::hermit_binary();
+    if let Some(path) = std::env::var_os("HERMIT_BIN").filter(|path| !path.is_empty()) {
+        assert_eq!(selected.as_os_str(), path);
+    }
+    for (args, cap) in [
+        (
+            vec![
+                "run",
+                "--run-evidence-dir",
+                "/fixture/evidence",
+                "--",
+                "/bin/printf",
+                "",
+                "quoted \"value\"\n$HOME",
+            ],
+            None,
+        ),
+        (
+            vec![
+                "--log-file",
+                "/fixture/baseline.log",
+                "run",
+                "--tmp=/tmp",
+                "--",
+                "/fixture/guest",
+            ],
+            None,
+        ),
+        (
+            vec![
+                "--log-file",
+                "/fixture/public.log",
+                "run",
+                "--tmp=/tmp",
+                "--run-evidence-dir",
+                "/fixture/evidence",
+                "--",
+                "/fixture/guest",
+            ],
+            None,
+        ),
+        (
+            vec![
+                "run",
+                "--run-evidence-dir",
+                "/fixture/evidence",
+                "--",
+                "/bin/true",
+            ],
+            Some("1"),
+        ),
+        (vec!["run", "--help"], None),
+    ] {
+        let original = args.iter().map(OsString::from).collect::<Vec<_>>();
+        for requested in [None, Some(OsStr::new("/test"))] {
+            let mut command = hermit_command();
+            command.args(&args).current_dir("/fixture/controller");
+            if let Some(cap) = cap {
+                command.env("HERMIT_LOG_MAX_BYTES", cap);
+            }
+            prepare_command_for(&mut command, requested).unwrap();
+            let mut expected = original.clone();
+            if requested.is_some()
+                && let Some(separator) = expected.iter().position(|arg| arg == "--")
+            {
+                expected.splice(
+                    separator..separator,
+                    [
+                        OsString::from("--base-env=minimal"),
+                        OsString::from("--mount=type=tmpfs,target=/test"),
+                        OsString::from("--workdir=/test"),
+                    ],
+                );
+            }
+            assert_eq!(command.get_program(), selected);
+            assert_eq!(command.get_args().collect::<Vec<_>>(), expected);
+            assert_eq!(
+                command.get_current_dir(),
+                Some(Path::new("/fixture/controller"))
+            );
+            let expected_env =
+                cap.map(|cap| (OsStr::new("HERMIT_LOG_MAX_BYTES"), Some(OsStr::new(cap))));
+            assert_eq!(
+                command.get_envs().collect::<Vec<_>>(),
+                expected_env.into_iter().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    let mut invalid = hermit_command();
+    invalid.args(["run", "--", "/bin/true"]);
+    let original = format!("{invalid:?}");
+    assert!(prepare_command_for(&mut invalid, Some(OsStr::new("/wrong"))).is_err());
+    assert_eq!(format!("{invalid:?}"), original);
+}
+
+#[test]
+fn run_evidence_command_staging_uses_the_selected_binary() {
+    let parent = tempfile::tempdir().unwrap();
+    let selected = parent.path().join("selected hermit (not executed)");
+    assert_ne!(selected, Path::new(env!("CARGO_BIN_EXE_hermit")));
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "run_evidence_command_staging_is_exact",
+            "--nocapture",
+        ])
+        .env("HERMIT_BIN", &selected)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed; 0 ignored;"));
+    assert!(
+        !selected.exists(),
+        "pure command control launched its selected path"
+    );
 }
 
 #[test]
@@ -262,20 +406,22 @@ fn private_evidence_does_not_reuse_the_public_log_file_or_add_a_worker() {
     let guest_path = session_identity_guest(parent.path());
     let guest = guest_path.to_str().unwrap();
 
-    let baseline = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log-file"])
-        .arg(&baseline_log)
-        .args(["run", "--tmp=/tmp", "--", guest])
-        .output()
-        .unwrap();
-    let with_evidence = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log-file"])
-        .arg(&public_log)
-        .args(["run", "--tmp=/tmp", "--run-evidence-dir"])
-        .arg(&evidence)
-        .args(["--", guest])
-        .output()
-        .unwrap();
+    let baseline = command_output(
+        hermit_command()
+            .args(["--log-file"])
+            .arg(&baseline_log)
+            .args(["run", "--tmp=/tmp", "--", guest]),
+    )
+    .unwrap();
+    let with_evidence = command_output(
+        hermit_command()
+            .args(["--log-file"])
+            .arg(&public_log)
+            .args(["run", "--tmp=/tmp", "--run-evidence-dir"])
+            .arg(&evidence)
+            .args(["--", guest]),
+    )
+    .unwrap();
 
     assert!(
         baseline.status.success(),
@@ -359,13 +505,14 @@ fn truncated_private_log_is_terminal_no_result_without_changing_guest_status() {
     let _guard = hermit_run_guard();
     let parent = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let destination = parent.path().join("evidence");
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .env("HERMIT_LOG_MAX_BYTES", "1")
-        .args(["run", "--run-evidence-dir"])
-        .arg(&destination)
-        .args(["--", "/bin/true"])
-        .output()
-        .unwrap();
+    let output = command_output(
+        hermit_command()
+            .env("HERMIT_LOG_MAX_BYTES", "1")
+            .args(["run", "--run-evidence-dir"])
+            .arg(&destination)
+            .args(["--", "/bin/true"]),
+    )
+    .unwrap();
 
     assert!(output.status.success());
     assert_eq!(
