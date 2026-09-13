@@ -4433,14 +4433,21 @@ fn retained_pressure_attempt(
     mode: &str,
     attempt: &AttemptResult,
 ) -> Result<SeriesPressureAttempt, String> {
-    let comparison = match &attempt.verification_report {
-        None => {
+    // The runner reads comparison reports only for these modes. Its generic
+    // prelaunch timeout also retains a NotRun stamp for native/custom modes;
+    // that stamp is raw evidence, not a comparison performed by those modes.
+    let comparison = match (
+        matches!(mode, "verify" | "replay" | "chaos"),
+        &attempt.verification_report,
+    ) {
+        (false, _) => None,
+        (true, None) => {
             if attempt.verification_report_sha256.is_some() {
                 return Err("inner invocation has a report digest without report bytes".into());
             }
             None
         }
-        Some(raw) => {
+        (true, Some(raw)) => {
             let digest = format!("{:x}", sha2::Sha256::digest(raw.as_bytes()));
             if attempt.verification_report_sha256.as_deref() != Some(digest.as_str()) {
                 return Err(
@@ -4450,6 +4457,12 @@ fn retained_pressure_attempt(
             let value =
                 serde_json::from_str::<JsonValue>(raw).map_err(|error| error.to_string())?;
             let report = VerificationReport::from_current_json_value(value)?;
+            if report.guest_exit_code.is_some_and(|status| status < 0)
+                || report.guest_signal.is_some_and(|signal| signal <= 0)
+                || (report.guest_exit_code.is_some() && report.guest_signal.is_some())
+            {
+                return Err("inner report has an invalid guest process disposition".into());
+            }
             let no_result_kind = match report.verdict {
                 Verdict::Matched | Verdict::Diverged => {
                     let matched = report.verdict == Verdict::Matched;
@@ -4545,6 +4558,35 @@ fn retained_pressure_attempt(
     };
     retained.validate_for_mode(mode)?;
     Ok(retained)
+}
+
+fn retained_typed_no_comparison(cell: &CellId, artifact_dir: &Path, rows: &[CellResult]) -> bool {
+    if !matches!(cell.mode.as_str(), "verify" | "replay") {
+        return false;
+    }
+    let Ok(row) = cell_result_after_retries(rows) else {
+        return false;
+    };
+    let Some(attempt) = row.attempts.first() else {
+        return false;
+    };
+    let Ok(retained) = retained_pressure_attempt(&cell.mode, attempt) else {
+        return false;
+    };
+    if !retained
+        .comparison
+        .as_ref()
+        .is_some_and(|comparison| comparison.verdict == Verdict::NoResult)
+    {
+        return false;
+    }
+    let Ok(bytes) = fs::read(verification_report_path(artifact_dir)) else {
+        return false;
+    };
+    attempt
+        .verification_report
+        .as_ref()
+        .is_some_and(|report| bytes == report.as_bytes())
 }
 
 fn inner_pressure_category(attempt: &SeriesPressureAttempt) -> Option<RepetitionClassification> {
@@ -5428,6 +5470,7 @@ fn summarize(
                     None,
                 )
             };
+            let mut typed_no_comparison_refusal = false;
             let verification = match artifact_dir.as_deref() {
                 Some(artifact_dir) => match read_verification_report(cell, artifact_dir) {
                     Ok(Some(report)) => Some(report),
@@ -5444,6 +5487,7 @@ fn summarize(
                     }
                     Ok(None) => None,
                     Err(error) => {
+                        typed_no_comparison_refusal = retained_typed_no_comparison(cell, artifact_dir, &result_rows_for_history);
                         evidence_errors.push(error);
                         None
                     }
@@ -5574,8 +5618,14 @@ fn summarize(
                 } else {
                     Some(inner_pressure_history(&result_rows_for_history))
                 };
+                // A typed NoResult stamp legitimately has no comparison. Only
+                // that one verified reader refusal may be explained here; missing
+                // captures, golden output or other artifact errors stay incomplete.
+                let sample_artifacts_valid = evidence_errors.is_empty()
+                    || (typed_no_comparison_refusal && evidence_errors.len() == 1);
                 counts.unknown_history_repetitions += usize::from(
                     inner_history.as_ref().is_some_and(|history| history.is_err())
+                        || (row_valid && !sample_artifacts_valid)
                 );
                 if let Some(Err(error)) = &inner_history {
                     sample_evidence_errors.push(error.clone());
@@ -5597,8 +5647,7 @@ fn summarize(
                             if prepared_empty_result_file {
                                 initial_evidence_valid
                             } else {
-                                evidence_errors.is_empty()
-                                    || inner_history.as_ref().is_some_and(|history| history.is_ok())
+                                sample_artifacts_valid
                             },
                             rejected_result_history, proven_timeout, proven_oom,
                             retained_prerequisite,
@@ -10711,6 +10760,35 @@ mod pressure_sample_tests {
         error.error_kind = Some("infrastructure".into());
         assert!(!qualifying_subruns("naked", &[error, second]));
         assert!(!qualifying_subruns("naked", &[first.clone(), first]));
+        for mode in ["naked", "custom"] {
+            let mut expected_nonzero = no_result_attempt("not_run", Some("cpu-timeout"));
+            expected_nonzero.outcome = "PASS".into();
+            expected_nonzero.status = Some(17);
+            expected_nonzero.error_kind = None;
+            let before = serde_json::to_value(&expected_nonzero).unwrap();
+            assert!(qualifying_subruns(
+                mode,
+                std::slice::from_ref(&expected_nonzero)
+            ));
+            assert!(
+                retained_pressure_attempt(mode, &expected_nonzero)
+                    .unwrap()
+                    .comparison
+                    .is_none()
+            );
+            assert_eq!(serde_json::to_value(&expected_nonzero).unwrap(), before);
+            expected_nonzero.status = None;
+            expected_nonzero.signal = Some(11);
+            assert!(qualifying_subruns(mode, &[expected_nonzero]));
+            let mut timeout = no_result_attempt("not_run", Some("cpu-timeout"));
+            timeout.timed_out = true;
+            timeout.status = None;
+            assert_eq!(
+                inner_pressure_category(&retained_pressure_attempt(mode, &timeout).unwrap()),
+                Some(RepetitionClassification::NoResult)
+            );
+            assert!(!qualifying_subruns(mode, &[timeout]));
+        }
     }
 
     fn comparison_attempt(mode: &str, status: i32) -> AttemptResult {
@@ -10770,6 +10848,23 @@ mod pressure_sample_tests {
                 !qualifying_subruns(mode, &[signal, second.clone()]),
                 "{mode}: contradictory process"
             );
+            for (field, value) in [
+                ("guest_exit_code", json!(-1)),
+                ("guest_signal", json!(0)),
+                ("guest_signal", json!(9)),
+                ("guest_exit_code", json!("0")),
+            ] {
+                let mut changed = first.clone();
+                let mut report: JsonValue =
+                    serde_json::from_str(changed.verification_report.as_ref().unwrap()).unwrap();
+                report[field] = value;
+                replace_report(&mut changed, report);
+                assert!(
+                    retained_pressure_attempt(mode, &changed).is_err(),
+                    "{mode}: {field}"
+                );
+                assert!(!qualifying_subruns(mode, &[changed, second.clone()]));
+            }
             for (field, value) in [
                 ("strictness", json!("stripped")),
                 ("compare_io_buffers", json!(false)),
@@ -11162,6 +11257,239 @@ mod pressure_sample_tests {
             assert!(cell_result_after_retries(&malformed).is_err());
             assert!(inner_pressure_history(&malformed).is_err());
         }
+    }
+
+    #[test]
+    fn summary_requires_retained_canonical_captures_and_golden_before_confirmed_failure() {
+        let root = Path::new(file!())
+            .canonicalize()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let checked = check_scorecard(&root).unwrap();
+        let available = pressure_cells(&root, &CellSelection::default()).unwrap();
+        let selected = available
+            .selected
+            .iter()
+            .find(|cell| cell.id.mode == "verify" && cell.id.backend == "ptrace")
+            .expect("fixture needs a selected ptrace verify cell");
+        let results = env::temp_dir().join(format!(
+            "hermit-pressure-summary-artifacts-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&results).unwrap();
+        let cleanup = SelfTestDirectory::new(results.clone());
+        let selection = CellSelection {
+            test: Some(selected.id.test.clone()),
+            mode: Some("verify".into()),
+            backend: Some("ptrace".into()),
+            repetitions: Some(PROMOTION_REPETITIONS),
+            run_id_prefix: Some("retained-artifacts".into()),
+            run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+            ..CellSelection::default()
+        };
+        let (mut metadata, _) = write_plan_after_scorecard_check(
+            &checked,
+            &results,
+            &results.join("dag.json"),
+            &selection,
+        )
+        .unwrap();
+        metadata.source_tree_dirty = false;
+        fs::write(
+            results.join("run.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        let mut evidence = BTreeMap::new();
+        let mut first_paths = None;
+        let mut inner = comparison_attempt("verify", 0);
+        inner.outcome = "FAIL".into();
+        inner.status = Some(1);
+        inner.shell_command = literal_shell_command(&inner.cwd, &inner.env, &inner.argv);
+        let mut report: JsonValue =
+            serde_json::from_str(inner.verification_report.as_ref().unwrap()).unwrap();
+        report["verdict"] = json!("diverged");
+        report["verified"] = json!(false);
+        report["bitwise_parity"] = json!(false);
+        replace_report(&mut inner, report);
+        for repetition in 1..=PROMOTION_REPETITIONS {
+            let slug = cell_run_slug(&selected.id, Some(repetition));
+            let run_id = cell_evidence_run_id(
+                &selected.id,
+                Some(repetition),
+                metadata.run_id_prefix.as_deref(),
+            );
+            let cell_dir = results.join("cells").join(&slug);
+            fs::create_dir_all(&cell_dir).unwrap();
+            fs::write(cell_dir.join("harness-status"), "1\n").unwrap();
+            let artifact = results.join("runs").join(&run_id).join("attempt-1");
+            let logs = artifact.join("verify-logs/verify-1");
+            fs::create_dir_all(&logs).unwrap();
+            let run1 = logs.join("run1_log_fixture.log");
+            let run2 = logs.join("run2_log_fixture.log");
+            let golden = logs.join("normalized-ptrace-golden.log");
+            fs::write(&run1, "INFO first\n").unwrap();
+            fs::write(&run2, "INFO second\n").unwrap();
+            fs::write(&golden, "INFO normalized\n").unwrap();
+            fs::write(logs.join("normalized-ptrace-golden.status"), "0\n").unwrap();
+            fs::write(
+                verification_report_path(&artifact),
+                inner.verification_report.as_ref().unwrap(),
+            )
+            .unwrap();
+            if first_paths.is_none() {
+                first_paths = Some((run1, golden));
+            }
+            let mut row = history_row("verify", "FAIL", 1, vec![inner.clone()]);
+            row.run_id = run_id;
+            row.run_index = Some(repetition as u64);
+            row.hermit_sha = metadata.hermit_sha.clone();
+            row.test = selected.id.test.clone();
+            row.category = selected.id.category.clone();
+            row.lane = selected.id.lane.clone();
+            row.classification = if selected.enabled {
+                "required"
+            } else {
+                "disabled"
+            }
+            .into();
+            row.result = Some(ObservedResult::DeterminismFailure);
+            row.failure_class = Some(FailureClass::ProductFailure);
+            row.argv = inner.argv.clone();
+            row.guest_argv = inner.guest_argv.clone();
+            row.env = inner.env.clone();
+            row.cwd = inner.cwd.clone();
+            row.shell_command = inner.shell_command.clone();
+            row.timeout_seconds = 57;
+            row.execution_cpu_timeout_seconds = Some(22);
+            row.execution_wall_timeout_seconds = Some(57);
+            row.artifact_dir = artifact.to_string_lossy().into_owned();
+            fs::write(
+                cell_dir.join("results.jsonl"),
+                format!("{}\n", serde_json::to_string(&row).unwrap()),
+            )
+            .unwrap();
+            evidence.insert(
+                format!("cell.{slug}"),
+                RunnerEvidence {
+                    seen: true,
+                    ok: false,
+                    ..RunnerEvidence::default()
+                },
+            );
+        }
+        let read = || -> JsonValue {
+            serde_json::from_slice(&fs::read(results.join("summary.json")).unwrap()).unwrap()
+        };
+        summarize(&root, &results, false, Some(&evidence), true).unwrap();
+        let complete = read();
+        assert_eq!(
+            complete["repeated_cells"][0]["terminal_product_failures"],
+            10
+        );
+        assert_eq!(
+            complete["repeated_cells"][0]["unknown_history_repetitions"],
+            0
+        );
+        assert_eq!(
+            complete["repeated_cells"][0]["classification"],
+            "confirmed-failing"
+        );
+        let (run1, golden) = first_paths.unwrap();
+        for missing in [&run1, &golden] {
+            let saved = fs::read(missing).unwrap();
+            fs::remove_file(missing).unwrap();
+            let error = summarize(&root, &results, false, Some(&evidence), true).unwrap_err();
+            assert!(error.contains("no trustworthy result"), "{error}");
+            let incomplete = read();
+            assert_eq!(
+                incomplete["repeated_cells"][0]["classification"],
+                "incomplete",
+                "{}",
+                missing.display()
+            );
+            assert_eq!(
+                incomplete["repeated_cells"][0]["unknown_history_repetitions"],
+                1
+            );
+            assert_eq!(
+                incomplete["repeated_cells"][0]["terminal_product_failures"],
+                9
+            );
+            assert_eq!(incomplete["rows"][0]["result"], "infrastructure-error");
+            fs::write(missing, saved).unwrap();
+        }
+        summarize(&root, &results, false, Some(&evidence), true).unwrap();
+        assert_eq!(read(), complete);
+        let first_slug = cell_run_slug(&selected.id, Some(1));
+        let first_row_path = results.join("cells").join(first_slug).join("results.jsonl");
+        let original_row = fs::read(&first_row_path).unwrap();
+        let mut rejected_row: CellResult = serde_json::from_slice(&original_row).unwrap();
+        let mut rejected = no_result_attempt("first_run_rejected", None);
+        rejected.argv = inner.argv.clone();
+        rejected.guest_argv = inner.guest_argv.clone();
+        rejected.env = inner.env.clone();
+        rejected.cwd = inner.cwd.clone();
+        rejected.shell_command = inner.shell_command.clone();
+        rejected_row.attempts = vec![rejected.clone()];
+        rejected_row.result = Some(ObservedResult::CrashError);
+        let retained_report_path = verification_report_path(Path::new(&rejected_row.artifact_dir));
+        let original_report = fs::read(&retained_report_path).unwrap();
+        fs::write(
+            &retained_report_path,
+            rejected.verification_report.as_ref().unwrap(),
+        )
+        .unwrap();
+        fs::write(&first_row_path, serde_json::to_vec(&rejected_row).unwrap()).unwrap();
+        let error = summarize(&root, &results, false, Some(&evidence), true).unwrap_err();
+        assert!(error.contains("no trustworthy result"));
+        let rejected_summary = read();
+        assert_eq!(
+            rejected_summary["repeated_cells"][0]["classification"],
+            "confirmed-failing"
+        );
+        assert_eq!(
+            rejected_summary["repeated_cells"][0]["terminal_product_failures"],
+            10
+        );
+        assert_eq!(
+            rejected_summary["repeated_cells"][0]["unknown_history_repetitions"],
+            0
+        );
+        assert_eq!(
+            rejected_summary["rows"][0]["result"],
+            "infrastructure-error"
+        );
+        // A different valid NoResult stamp cannot explain this row's selected artifact error.
+        fs::write(
+            &retained_report_path,
+            serde_json::to_vec(&VerificationReport::no_result()).unwrap(),
+        )
+        .unwrap();
+        assert!(summarize(&root, &results, false, Some(&evidence), true).is_err());
+        let mismatched = read();
+        assert_eq!(
+            mismatched["repeated_cells"][0]["classification"],
+            "incomplete"
+        );
+        assert_eq!(
+            mismatched["repeated_cells"][0]["unknown_history_repetitions"],
+            1
+        );
+        fs::write(&retained_report_path, original_report).unwrap();
+        fs::write(&first_row_path, original_row).unwrap();
+
+        cleanup.remove().unwrap();
     }
 
     #[test]
