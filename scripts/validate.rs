@@ -7605,9 +7605,21 @@ fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
         .collect()
 }
 
-const EXPECTED_SHARED_INTEGRATION_TESTS: [(&str, &str, &str); 2] = [
-    ("cli", "test.cli", "privileged-test.cli_kvm"),
-    ("hermit_modes", "test.hermit_modes", "privileged-test.pmu_buck_chaos_cases"),
+// These literal consumer sets include the dedicated DBT workdir node, which
+// uses the same prepared CLI binary and already carries the same resource token.
+const EXPECTED_SHARED_INTEGRATION_TESTS: [(&str, &[&str]); 2] = [
+    (
+        "cli",
+        &[
+            "privileged-test.cli_kvm",
+            "test.cli",
+            "test.isolated_dbt_workdir",
+        ],
+    ),
+    (
+        "hermit_modes",
+        &["privileged-test.pmu_buck_chaos_cases", "test.hermit_modes"],
+    ),
 ];
 const SHARED_INTEGRATION_TEST_BUILDER: &str = "privileged-build.privileged_tests";
 
@@ -7624,8 +7636,9 @@ fn assert_committed_shared_integration_test_consumers(steps: &[Step]) -> Result<
             && consumers.iter().any(|tag| !tag.starts_with("privileged-"))
     });
     if by_binary.len() != EXPECTED_SHARED_INTEGRATION_TESTS.len()
-        || EXPECTED_SHARED_INTEGRATION_TESTS.iter().any(|(binary, portable, privileged)| {
-            by_binary.get(binary) != Some(&vec![(*privileged).into(), (*portable).into()])
+        || EXPECTED_SHARED_INTEGRATION_TESTS.iter().any(|(binary, consumers)| {
+            let expected = consumers.iter().map(|tag| (*tag).to_string()).collect::<Vec<_>>();
+            by_binary.get(binary) != Some(&expected)
         })
     {
         return Err(format!(
@@ -7649,13 +7662,11 @@ fn assert_committed_shared_integration_test_serialization(
     if resource_count != EXPECTED_SHARED_INTEGRATION_TESTS.len() {
         return Err(format!("fused shared integration-test resource count changed: {resource_count}"));
     }
-    for (binary, portable, privileged) in EXPECTED_SHARED_INTEGRATION_TESTS {
+    for (binary, consumers) in EXPECTED_SHARED_INTEGRATION_TESTS {
         let resource = format!("integration_test_binaries.{binary}");
-        let expected = vec![
-            (SHARED_INTEGRATION_TEST_BUILDER.to_string(), 1),
-            (privileged.to_string(), 1),
-            (portable.to_string(), 1),
-        ];
+        let mut expected = vec![(SHARED_INTEGRATION_TEST_BUILDER.to_string(), 1)];
+        expected.extend(consumers.iter().map(|tag| ((*tag).to_string(), 1)));
+        expected.sort();
         let mut actual: Vec<(String, i64)> = steps
             .iter()
             .filter_map(|step| step.hint.resources.get(&resource).map(|n| (step.tag(), *n)))
@@ -21914,6 +21925,99 @@ mod prepared_command_tests {
             } else {
                 assert!(prepared_nextest_commands_bracket(host, &changed).is_err());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod shared_consumer_tests {
+    use super::*;
+
+    #[test]
+    fn actual_shared_cli_population_requires_the_workdir_consumer_and_every_resource() {
+        let cfg = validate_plan::validation_config(&repo_root()).unwrap();
+        let full = dagrun::select_steps_by_labels(&cfg, &["full".into()]).unwrap();
+        assert_committed_shared_integration_test_serialization(&full.steps, &full.resource_caps)
+            .unwrap();
+        let isolated = full
+            .steps
+            .iter()
+            .find(|s| s.tag() == "test.isolated_dbt_workdir")
+            .unwrap();
+        assert_eq!(
+            isolated.integration_test_binaries.as_deref(),
+            Some(["cli".to_string()].as_slice())
+        );
+        assert_eq!(
+            isolated.hint.resources.get("integration_test_binaries.cli"),
+            Some(&1)
+        );
+        for tag in [
+            "test.cli",
+            "privileged-test.cli_kvm",
+            "test.isolated_dbt_workdir",
+        ] {
+            let mut missing = full.steps.clone();
+            missing.retain(|step| step.tag() != tag);
+            assert!(
+                assert_committed_shared_integration_test_consumers(&missing).is_err(),
+                "missing consumer {tag} accepted"
+            );
+        }
+        let mut extra = full.steps.clone();
+        let mut unexpected = isolated.clone();
+        unexpected.job = "unexpected_cli_consumer".into();
+        extra.push(unexpected);
+        assert!(assert_committed_shared_integration_test_consumers(&extra).is_err());
+
+        // Keep exact cap/demand equality, including the original shared builder
+        // and consumers as well as the newly enumerated workdir consumer.
+        for (resource, tags) in [
+            (
+                "integration_test_binaries.cli",
+                vec![
+                    "privileged-build.privileged_tests",
+                    "privileged-test.cli_kvm",
+                    "test.cli",
+                    "test.isolated_dbt_workdir",
+                ],
+            ),
+            (
+                "integration_test_binaries.hermit_modes",
+                vec![
+                    "privileged-build.privileged_tests",
+                    "privileged-test.pmu_buck_chaos_cases",
+                    "test.hermit_modes",
+                ],
+            ),
+        ] {
+            for tag in tags {
+                let mut missing = full.steps.clone();
+                missing
+                    .iter_mut()
+                    .find(|step| step.tag() == tag)
+                    .unwrap()
+                    .hint
+                    .resources
+                    .remove(resource);
+                assert!(
+                    assert_committed_shared_integration_test_serialization(
+                        &missing,
+                        &full.resource_caps
+                    )
+                    .is_err(),
+                    "missing resource {resource} on {tag} accepted"
+                );
+            }
+            let mut caps = full.resource_caps.clone();
+            caps.remove(resource);
+            assert!(
+                assert_committed_shared_integration_test_serialization(&full.steps, &caps).is_err()
+            );
+            caps.insert(resource.into(), 2);
+            assert!(
+                assert_committed_shared_integration_test_serialization(&full.steps, &caps).is_err()
+            );
         }
     }
 }
