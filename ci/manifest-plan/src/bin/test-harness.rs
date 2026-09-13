@@ -1863,6 +1863,22 @@ fn run_with_retry<T>(
     }
 }
 
+/// Retry only a completed product observation.
+///
+/// The failure class is the producer-owned distinction between a measured
+/// product failure and a run that could not produce a product verdict. Do not
+/// infer retryability from the human-readable reason or from the broad
+/// `FAIL`/`ERROR` presentation outcome: doing so doubled every `no_result` row
+/// in one failed validation without producing any additional information.
+fn cell_result_is_retryable(outcome: &str, failure_class: Option<FailureClass>) -> bool {
+    match failure_class {
+        Some(FailureClass::ProductFailure) => outcome == "FAIL",
+        Some(FailureClass::UnderstoodInfrastructureFailure) => false,
+        Some(FailureClass::UnderstoodPrerequisiteFailure) => false,
+        Some(FailureClass::NoResult) | None => false,
+    }
+}
+
 fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let mut selection = args.selection.clone();
     if selection.population.is_none() {
@@ -1934,7 +1950,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                         Err(error) => infrastructure_error_result(&attempt_context, cell, error),
                     }
                 },
-                |result| !matches!(result.outcome.as_str(), "PASS" | "HOST-INAPPLICABLE"),
+                |result| cell_result_is_retryable(result.outcome.as_str(), result.failure_class),
                 emit,
             );
         },
@@ -2128,6 +2144,7 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use hermit_manifest_plan::runner::FailureClass;
     use hermit_manifest_plan::runner::ManifestSet;
     use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 
@@ -2143,6 +2160,7 @@ mod tests {
     use super::audit_run_dag_workflow_runner;
     use super::audit_validation_levels_policy;
     use super::build_worker_capacity;
+    use super::cell_result_is_retryable;
     use super::command_jobs;
     use super::command_runs_exactly;
     use super::command_timeout_seconds;
@@ -2519,6 +2537,350 @@ mod tests {
         );
         assert_eq!(executions.load(Ordering::SeqCst), 2);
         assert_eq!(rows.into_inner().unwrap(), [(1, true), (2, false)]);
+    }
+
+    #[test]
+    fn retry_policy_is_exhaustive_over_typed_failure_classes() {
+        use FailureClass::NoResult;
+        use FailureClass::ProductFailure;
+        use FailureClass::UnderstoodInfrastructureFailure;
+        use FailureClass::UnderstoodPrerequisiteFailure;
+
+        for (outcome, failure_class, expected) in [
+            ("FAIL", Some(ProductFailure), true),
+            ("ERROR", Some(ProductFailure), false),
+            ("FAIL", Some(NoResult), false),
+            ("ERROR", Some(NoResult), false),
+            ("ERROR", Some(UnderstoodPrerequisiteFailure), false),
+            ("ERROR", Some(UnderstoodInfrastructureFailure), false),
+            (
+                "HOST-INAPPLICABLE",
+                Some(UnderstoodPrerequisiteFailure),
+                false,
+            ),
+            ("PASS", None, false),
+            ("FAIL", None, false),
+        ] {
+            assert_eq!(
+                cell_result_is_retryable(outcome, failure_class),
+                expected,
+                "outcome={outcome} failure_class={failure_class:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_result_batch_and_passing_peer_each_execute_once() {
+        const NO_RESULT_CELLS: usize = 178;
+        const CELL_COUNT: usize = NO_RESULT_CELLS + 1;
+
+        let executions = (0..CELL_COUNT)
+            .map(|_| AtomicUsize::new(0))
+            .collect::<Vec<_>>();
+        let rows = Mutex::new(Vec::new());
+        for_each_parallel(
+            CELL_COUNT,
+            ScheduledWorkerCapacity::new(8),
+            |index, emit| {
+                run_with_retry(
+                    1,
+                    |attempt| {
+                        executions[index].fetch_add(1, Ordering::SeqCst);
+                        if index < NO_RESULT_CELLS {
+                            (attempt, "ERROR", Some(FailureClass::NoResult))
+                        } else {
+                            (attempt, "PASS", None)
+                        }
+                    },
+                    |(_, outcome, failure_class)| cell_result_is_retryable(outcome, *failure_class),
+                    emit,
+                );
+            },
+            |index, (attempt, _, _), will_retry| {
+                rows.lock().unwrap().push((index, attempt, will_retry));
+                true
+            },
+        );
+
+        assert!(
+            executions
+                .iter()
+                .all(|count| count.load(Ordering::SeqCst) == 1)
+        );
+        let mut rows = rows.into_inner().unwrap();
+        rows.sort_unstable();
+        assert_eq!(rows.len(), CELL_COUNT);
+        assert!(
+            rows.iter()
+                .all(|(_, attempt, will_retry)| *attempt == 1 && !will_retry)
+        );
+    }
+
+    #[test]
+    fn product_failure_keeps_one_retry() {
+        let executions = AtomicUsize::new(0);
+        let mut rows = Vec::new();
+        run_with_retry(
+            1,
+            |attempt| {
+                executions.fetch_add(1, Ordering::SeqCst);
+                if attempt == 1 {
+                    (attempt, "FAIL", Some(FailureClass::ProductFailure))
+                } else {
+                    (attempt, "PASS", None)
+                }
+            },
+            |(_, outcome, failure_class)| cell_result_is_retryable(outcome, *failure_class),
+            |(attempt, _, _), will_retry| {
+                rows.push((attempt, will_retry));
+                true
+            },
+        );
+
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        assert_eq!(rows, [(1, true), (2, false)]);
+    }
+
+    #[test]
+    fn production_run_retries_only_product_failures() {
+        use std::path::Path;
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::process::ExitCode;
+
+        use hermit_manifest_plan::runner::CellResult;
+        use hermit_manifest_plan::runner::ObservedResult;
+        use serde_json::json;
+
+        const CHILD_FIXTURE: &str = "HERMIT_HARNESS_RETRY_TEST_FIXTURE";
+        const TEST_NAME: &str = "tests::production_run_retries_only_product_failures";
+        if let Some(fixture) = std::env::var_os(CHILD_FIXTURE) {
+            let fixture = PathBuf::from(fixture);
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .canonicalize()
+                .unwrap();
+            let manifests = ManifestSet::load(&fixture).unwrap();
+            let args = parse(
+                [
+                    "--mode".into(),
+                    "naked".into(),
+                    "--jobs".into(),
+                    "2".into(),
+                    "--results".into(),
+                    fixture.join("results.jsonl").to_string_lossy().into_owned(),
+                    "--junit".into(),
+                    fixture.join("junit.xml").to_string_lossy().into_owned(),
+                ]
+                .into_iter(),
+            );
+            super::validate_args("run", &args);
+            // Exercise the real run() callback, publication, result reduction and
+            // epilogue. Its product failure and non-product errors must stay red.
+            assert_eq!(super::run(&root, &manifests, &args), ExitCode::FAILURE);
+            return;
+        }
+
+        let fixture = std::env::temp_dir().join(format!(
+            "hermit-harness-native-retry-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&fixture).unwrap();
+        let manifests = fixture.join("tests/e2e/manifests");
+        fs::create_dir_all(&manifests).unwrap();
+        fs::write(
+            manifests.join("defaults.yaml"),
+            "schema: 3\ntimeout_seconds: 2\ncpu_timeout_seconds: 1\n",
+        )
+        .unwrap();
+        let disabled = json!({
+            "ci": false,
+            "backends_enabled": [],
+            "backends_disabled": {
+                "ptrace": "This control executes native commands only",
+                "dbt": "This control executes native commands only",
+                "kvm": "This control executes native commands only",
+                "sabre": "This control executes native commands only",
+                "liteinst": "This control executes native commands only"
+            }
+        });
+        let modes = json!({
+            "naked": {
+                "ci": false,
+                "ci_disabled_reason": "Native retry control is explicitly selected",
+                "backends_enabled": ["native"],
+                "runs": 1,
+                "assert": {"min_distinct": 1}
+            },
+            "verify": disabled,
+            "chaos": disabled,
+            "replay": disabled,
+            "custom": disabled
+        });
+        let missing = fixture.join("missing-native-program");
+        let recipes = [
+            ("infra", vec![missing.to_string_lossy().into_owned()]),
+            ("pass", vec!["/bin/true".into()]),
+            (
+                "product",
+                vec!["/bin/sh".into(), "-c".into(), "exit 23".into()],
+            ),
+            (
+                "recovers",
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "case \"$E2E_TMPDIR\" in *-attempt-2/tmp) exit 0;; *) exit 23;; esac".into(),
+                ],
+            ),
+            ("timeout", vec!["/bin/sleep".into(), "10".into()]),
+        ]
+        .into_iter()
+        .map(|(id, direct)| {
+            json!({
+                "id": format!("retry/{id}"),
+                "description": "Native production-callback retry control",
+                "lane": "portable",
+                "occasional": false,
+                "direct": direct,
+                "observation": {"status": true, "stdout": true, "stderr": true},
+                "modes": modes
+            })
+        })
+        .collect::<Vec<_>>();
+        fs::write(
+            manifests.join("retry.yaml"),
+            serde_json::to_vec(&json!({"schema": 3, "bucket": "retry", "test": recipes})).unwrap(),
+        )
+        .unwrap();
+        // Only the isolated child receives execution environment changes. A
+        // missing Hermit path makes the optional metadata/help probes inert;
+        // all five cells use the actual native execution path.
+        let output = Command::new("timeout")
+            .args(["--kill-after=2s", "25s"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env(CHILD_FIXTURE, &fixture)
+            .env("HERMIT_BIN", fixture.join("missing-hermit"))
+            .env("E2E_RESULT_ROOT", fixture.join("artifacts"))
+            .env("E2E_BUILD_ROOT", fixture.join("build"))
+            .env("E2E_RUN_ID", "native-retry-control")
+            .env("E2E_MACHINE_SHORTNAME", "native-retry-control")
+            .env("E2E_KERNEL_VERSION", "native-retry-control")
+            .env("DAGRUN_TEST_COUNTS_PATH", fixture.join("counts.json"))
+            .output()
+            .unwrap();
+        fs::write(fixture.join("child.stdout"), &output.stdout).unwrap();
+        fs::write(fixture.join("child.stderr"), &output.stderr).unwrap();
+        assert!(
+            output.status.success(),
+            "native run control failed: {}\n{}\n{}",
+            fixture.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows = fs::read_to_string(fixture.join("results.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<CellResult>(line).unwrap())
+            .collect::<Vec<_>>();
+        let mut histories = BTreeMap::<String, Vec<&CellResult>>::new();
+        for row in &rows {
+            row.require_current_classification().unwrap();
+            row.require_current_timeout_policy().unwrap();
+            assert_eq!(row.mode, "naked");
+            assert_eq!(row.backend, None);
+            assert_eq!(row.execution_cpu_timeout_seconds, Some(1));
+            assert_eq!(row.execution_wall_timeout_seconds, Some(2));
+            assert_eq!(row.timeout_seconds, 2);
+            histories.entry(row.test.clone()).or_default().push(row);
+        }
+        assert_eq!(
+            histories.len(),
+            5,
+            "every selected identity must remain present"
+        );
+        for (id, expected) in [
+            (
+                "infra",
+                vec![(
+                    1,
+                    "ERROR",
+                    Some(FailureClass::UnderstoodInfrastructureFailure),
+                )],
+            ),
+            ("pass", vec![(1, "PASS", None)]),
+            (
+                "product",
+                vec![
+                    (1, "FAIL", Some(FailureClass::ProductFailure)),
+                    (2, "FAIL", Some(FailureClass::ProductFailure)),
+                ],
+            ),
+            (
+                "recovers",
+                vec![
+                    (1, "FAIL", Some(FailureClass::ProductFailure)),
+                    (2, "PASS", None),
+                ],
+            ),
+            ("timeout", vec![(1, "FAIL", Some(FailureClass::NoResult))]),
+        ] {
+            let history = &histories[&format!("retry/{id}")];
+            assert_eq!(
+                history
+                    .iter()
+                    .map(|r| (r.attempt, r.outcome.as_str(), r.failure_class))
+                    .collect::<Vec<_>>(),
+                expected,
+                "actual production retry history for {id}; artifacts: {}",
+                fixture.display()
+            );
+        }
+        assert_eq!(
+            histories["retry/timeout"][0].result,
+            Some(ObservedResult::Timeout)
+        );
+        assert!(histories["retry/timeout"][0].attempts[0].timed_out);
+        assert!(histories["retry/infra"][0].attempts.is_empty());
+        let counts: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.join("counts.json")).unwrap()).unwrap();
+        assert_eq!(
+            counts,
+            json!({
+                "schema": 2,
+                "executed_tests": 5,
+                "filtered_tests": 0,
+                "results": [
+                    {"id": "retry/infra [native/naked]", "result": "fail", "attempts": 1},
+                    {"id": "retry/pass [native/naked]", "result": "pass", "attempts": 1},
+                    {"id": "retry/product [native/naked]", "result": "fail", "attempts": 2},
+                    {"id": "retry/recovers [native/naked]", "result": "pass", "attempts": 2},
+                    {"id": "retry/timeout [native/naked]", "result": "fail", "attempts": 1}
+                ]
+            })
+        );
+        let summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.join("summary.json")).unwrap()).unwrap();
+        for (name, expected) in [
+            ("cells", 5),
+            ("passed", 2),
+            ("failed", 2),
+            ("errors", 1),
+            ("host_inapplicable", 0),
+        ] {
+            assert_eq!(summary[name], expected, "summary {name}");
+        }
+        assert!(
+            summary["cell_cpu_usage_usec"].is_null(),
+            "missing CPU evidence must stay unknown"
+        );
+        let junit = fs::read_to_string(fixture.join("junit.xml")).unwrap();
+        assert!(junit.contains("tests=\"5\" failures=\"2\" errors=\"1\" skipped=\"0\""));
+        assert_eq!(junit.matches("<testcase ").count(), 5);
+        fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]

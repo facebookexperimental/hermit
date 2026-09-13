@@ -58,9 +58,9 @@ use std::time::Duration;
 
 // ------------------------------------------------------------------ environmental blocks
 
-/// Owner ruling 2026-08-26: every failed manifest cell gets exactly one retry.
-/// The manifest runner owns that retry; validate uses the same bound only when
-/// proving both cell attempts fit inside the enclosing node deadline.
+/// One initial manifest-cell attempt and at most one retry of a product failure.
+/// The manifest runner owns retry admission; validate retains the maximum when
+/// proving both possible attempts fit inside the enclosing node deadline.
 pub const MAX_ATTEMPTS_PER_CELL: usize =
     hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL as usize;
 
