@@ -46,6 +46,8 @@ const CONTROL_CWD_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_CWD";
 const CONTROL_CAUSE_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_CAUSE_FILE";
 const CONTROL_PID_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_PID_FILE";
 const CONTROL_PROC_ROOT_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_PROC_ROOT";
+const CONTROL_RESERVED_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_RESERVED_FILE";
+const CONTROL_RESUME_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_RESUME_FILE";
 const CONTROL_SIGNAL_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_SIGNAL_FILE";
 const CONTROL_SENTINEL_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_SENTINEL";
 const INFRASTRUCTURE_EXIT: u8 = 70;
@@ -673,6 +675,34 @@ fn reserve_or_external(candidate: FirstCause) -> FirstCause {
     }
 }
 
+fn reserved_or_external(candidate: FirstCause, already_reserved: bool) -> FirstCause {
+    if already_reserved {
+        candidate
+    } else {
+        reserve_or_external(candidate)
+    }
+}
+
+fn pause_after_terminal_reservation_for_control() -> Result<(), String> {
+    if env::var_os(CONTROL_ARM_ENV).is_none() {
+        return Ok(());
+    }
+    let Some(marker) = env::var_os(CONTROL_RESERVED_FILE_ENV).map(PathBuf::from) else {
+        return Ok(());
+    };
+    let resume = PathBuf::from(required_env(CONTROL_RESUME_FILE_ENV)?);
+    fs::write(&marker, b"reserved\n")
+        .map_err(|error| format!("cannot publish terminal-reservation control marker: {error}"))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !resume.is_file() {
+        if Instant::now() >= deadline {
+            return Err("terminal-reservation control was not released".into());
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    Ok(())
+}
+
 fn completion_from_status(status: ExitStatus) -> Result<AttemptCompletion, String> {
     match (status.code(), status.signal()) {
         (Some(code), None) => Ok(AttemptCompletion::Exit { code }),
@@ -761,6 +791,8 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
     command.env_remove(TEST_CPU_TIMEOUT_MULTIPLIER_ENV);
     command.env_remove(CONTROL_CAUSE_FILE_ENV);
     command.env_remove(CONTROL_PROC_ROOT_ENV);
+    command.env_remove(CONTROL_RESERVED_FILE_ENV);
+    command.env_remove(CONTROL_RESUME_FILE_ENV);
     if invocation.cpu_budget_usec.is_some() {
         command.process_group(0);
     }
@@ -796,18 +828,38 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
                 && population == ChildPopulation::Present;
             let must_resolve_exit = direct_status
                 .is_some_and(|status| !status.success() || population == ChildPopulation::Empty);
+            let must_resolve_non_signal = must_resolve_exit || population == ChildPopulation::Empty;
+            let already_reserved = if must_resolve_non_signal {
+                match reserve_non_signal_cause() {
+                    Ok(()) => {
+                        if let Err(error) = pause_after_terminal_reservation_for_control() {
+                            break FirstCause::AccountingUnavailable { error };
+                        }
+                        true
+                    }
+                    Err(signal) => break FirstCause::ExternalSignal { signal },
+                }
+            } else {
+                false
+            };
             if now >= next_cpu_poll || must_resolve_exit {
                 let observed = match observed_cpu_usec(reaped_cpu_usec) {
                     Ok(observed) => observed,
                     Err(error) => {
-                        break reserve_or_external(FirstCause::AccountingUnavailable { error });
+                        break reserved_or_external(
+                            FirstCause::AccountingUnavailable { error },
+                            already_reserved,
+                        );
                     }
                 };
                 max_cpu_usec = max_cpu_usec.max(observed);
                 if observed >= cpu_budget_usec {
-                    let cause = reserve_or_external(FirstCause::CpuTimeout {
-                        observed_cpu_usec: observed,
-                    });
+                    let cause = reserved_or_external(
+                        FirstCause::CpuTimeout {
+                            observed_cpu_usec: observed,
+                        },
+                        already_reserved,
+                    );
                     if !matches!(cause, FirstCause::CpuTimeout { .. }) {
                         break cause;
                     }
@@ -822,13 +874,17 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
             }
             if let Some(status) = direct_status {
                 if !successful_parent_has_live_descendants {
-                    break reserve_or_external(FirstCause::Exit(status));
+                    break reserved_or_external(FirstCause::Exit(status), already_reserved);
                 }
             } else if population == ChildPopulation::Empty {
-                break reserve_or_external(FirstCause::AccountingUnavailable {
-                    error: "nextest test subtree disappeared before its direct child was reaped"
-                        .into(),
-                });
+                break reserved_or_external(
+                    FirstCause::AccountingUnavailable {
+                        error:
+                            "nextest test subtree disappeared before its direct child was reaped"
+                                .into(),
+                    },
+                    already_reserved,
+                );
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -1276,11 +1332,24 @@ fn wait_for_file(path: &Path, label: &str) -> Result<(), String> {
 }
 
 fn read_pid(path: &Path) -> Result<i32, String> {
-    fs::read_to_string(path)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?
-        .trim()
-        .parse::<i32>()
-        .map_err(|error| format!("invalid PID in {}: {error}", path.display()))
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let raw = fs::read_to_string(path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        if raw.ends_with('\n') {
+            return raw
+                .trim()
+                .parse::<i32>()
+                .map_err(|error| format!("invalid PID in {}: {error}", path.display()));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "PID in {} was not completely written",
+                path.display()
+            ));
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
 }
 
 fn process_exists(pid: i32) -> bool {
@@ -1476,6 +1545,40 @@ fn self_test() -> Result<(), String> {
         ));
     }
 
+    let reserved_file = scratch.0.join("terminal-cause-reserved");
+    let resume_file = scratch.0.join("resume-after-terminal-cause");
+    let mut reserved_exit_command =
+        control_command(&executable, &test_binary, &scratch.0, "success", 3);
+    reserved_exit_command
+        .env(CONTROL_RESERVED_FILE_ENV, &reserved_file)
+        .env(CONTROL_RESUME_FILE_ENV, &resume_file);
+    let reserved_exit = reserved_exit_command
+        .spawn()
+        .map_err(|error| format!("cannot run reserved-exit control: {error}"))?;
+    wait_for_file(&reserved_file, "terminal-cause reservation marker")?;
+    if unsafe { libc::kill(reserved_exit.id() as i32, libc::SIGINT) } != 0 {
+        return Err(format!(
+            "cannot deliver signal after terminal-cause reservation: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    // Give the installed handler time to observe the signal while the wrapper
+    // remains paused inside the already-reserved non-signal cause.
+    thread::sleep(Duration::from_millis(50));
+    fs::write(&resume_file, b"resume\n")
+        .map_err(|error| format!("cannot release reserved-exit control: {error}"))?;
+    let reserved_exit = reserved_exit
+        .wait_with_output()
+        .map_err(|error| format!("cannot wait for reserved-exit control: {error}"))?;
+    if !reserved_exit.status.success()
+        || reserved_exit.stdout != b"stdout-exact\n"
+        || reserved_exit.stderr != b"stderr-exact\n"
+    {
+        return Err(format!(
+            "a signal delivered after terminal observation replaced the exit cause: {reserved_exit:?}"
+        ));
+    }
+
     let failure = control_command(&executable, &test_binary, &scratch.0, "failure", 1)
         .output()
         .map_err(|error| format!("cannot run failure control: {error}"))?;
@@ -1523,13 +1626,17 @@ fn self_test() -> Result<(), String> {
     }
 
     let exited_parent_pid_file = scratch.0.join("exited-parent-descendant.pid");
+    // This value distinguishes the repaired path from the old implementation
+    // on this host: the old path returned exit 0 after 1.757s of subtree CPU,
+    // while 50ms was already small enough to time out before the repair.
+    let exited_parent_budget_usec = 500_000;
     let mut exited_parent_command = control_command_with_limits(
         &executable,
         &test_binary,
         &scratch.0,
         "exit-after-escaped-burner",
         1,
-        50_000,
+        exited_parent_budget_usec,
         100,
     );
     exited_parent_command.env(CONTROL_PID_FILE_ENV, &exited_parent_pid_file);
@@ -1729,7 +1836,7 @@ fn self_test() -> Result<(), String> {
         .iter()
         .map(|r| r.identity.test.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    if records.len() != 12
+    if records.len() != 13
         || identities
             != [
                 "success",
@@ -1748,7 +1855,7 @@ fn self_test() -> Result<(), String> {
             .collect()
     {
         return Err(format!(
-            "self-test expected twelve exact atomic attempt identities, found {identities:?} ({} records)",
+            "self-test expected thirteen exact atomic attempt identities, found {identities:?} ({} records)",
             records.len()
         ));
     }
@@ -1760,6 +1867,7 @@ fn self_test() -> Result<(), String> {
     }
     if find_record_attempt(&records, "success", 1)?.cpu_source != CPU_SOURCE_PROCFS_AND_REAPED
         || find_record_attempt(&records, "success", 2)?.cpu_source != CPU_SOURCE_REAPED
+        || find_record_attempt(&records, "success", 3)?.cpu_source != CPU_SOURCE_PROCFS_AND_REAPED
         || find_record(&records, "measurement-signal")?.cpu_source != CPU_SOURCE_PROCFS_AND_REAPED
     {
         return Err(
@@ -1768,6 +1876,9 @@ fn self_test() -> Result<(), String> {
     }
     if !matches!(
         find_record(&records, "success")?.completion,
+        AttemptCompletion::Exit { code: 0 }
+    ) || !matches!(
+        find_record_attempt(&records, "success", 3)?.completion,
         AttemptCompletion::Exit { code: 0 }
     ) || !matches!(
         find_record(&records, "failure")?.completion,
@@ -1820,10 +1931,11 @@ fn self_test() -> Result<(), String> {
     if !matches!(
         exited_parent_record.completion,
         AttemptCompletion::CpuTimeout {
-            cpu_budget_usec: 50_000,
+            cpu_budget_usec,
             observed_cpu_usec,
-        } if observed_cpu_usec >= 50_000
-    ) || exited_parent_record.cpu_usage_usec < 50_000
+        } if cpu_budget_usec == exited_parent_budget_usec
+            && observed_cpu_usec >= exited_parent_budget_usec
+    ) || exited_parent_record.cpu_usage_usec < exited_parent_budget_usec
     {
         return Err(format!(
             "successful parent hid an over-budget descendant in its record: {exited_parent_record:?}"
@@ -1851,7 +1963,7 @@ fn self_test() -> Result<(), String> {
         return Err("duplicate atomic attempt publication unexpectedly replaced a record".into());
     }
     println!(
-        "nextest-cpu-wrapper: self-test PASS (process tree, success, failure, signal, wall timeout, CPU timeout, post-parent descendant timeout, stopped low-CPU wall delay, missing accounting fail-closed, first-cause race, no survivors, typed identity, truthful CPU source, substituted path, atomic identity)"
+        "nextest-cpu-wrapper: self-test PASS (process tree, success, failure, signal, wall timeout, CPU timeout, 500ms post-parent CPU boundary, stopped low-CPU wall delay, missing accounting fail-closed, CPU and exit first-cause races, no survivors, typed identity, truthful CPU source, substituted path, atomic identity)"
     );
     Ok(())
 }
