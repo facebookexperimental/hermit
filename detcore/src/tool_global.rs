@@ -1096,6 +1096,18 @@ impl GlobalTool for GlobalState {
             GlobalRequest::DeregisterThread(deregistration) => {
                 R::DeregisterThread(self.recv_deregister_thread(from, deregistration).await)
             }
+            GlobalRequest::SetChildTidAddress(address) => {
+                let updated = self
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .set_child_tid_address(dtid, address);
+                if updated {
+                    R::SetChildTidAddress(())
+                } else {
+                    R::ThreadExited
+                }
+            }
             GlobalRequest::FutexAction(dettid, action, futexid, init_read, mask) => R::FutexAction(
                 self.recv_futex_action(
                     RpcIncarnation {
@@ -2302,6 +2314,10 @@ pub enum GlobalRequest {
     /// chaos-epoch transitions not yet flushed by a priority-change commit.
     DeregisterThread(ThreadDeregistration),
 
+    /// Replace the address cleared and woken when the calling thread exits.
+    /// A zero address disables the exit-time store and wake.
+    SetChildTidAddress(usize),
+
     /// Notify scheduler before/after futex action.
     /// The last two arguments are the initial contents of the memory word, and the mask.
     FutexAction(DetTid, FutexAction, FutexID, i32, u32),
@@ -2415,6 +2431,7 @@ pub enum GlobalResponse {
     /// Includes optional preemption points for the new thread.
     StartNewThread(Option<ThreadHistory>),
     DeregisterThread(()),
+    SetChildTidAddress(()),
     FutexAction(Option<SchedValue>),
     /// Return the mtime as well:
     DeterminizeInode((DetInode, LogicalTime)),
@@ -2532,6 +2549,17 @@ where
     )
     .await;
     assert_eq!(response, GlobalResponse::ReportUnsupportedSyscall(()));
+}
+
+/// Mirrors a successful `set_tid_address(2)` into scheduler-owned exit state.
+pub(crate) async fn set_child_tid_address<G, T>(guest: &mut G, address: usize)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::SetChildTidAddress(address)).await;
+    assert_eq!(response, GlobalResponse::SetChildTidAddress(()));
 }
 
 pub async fn send_and_update_time<G, T>(
@@ -2670,6 +2698,16 @@ where
         }
     } else {
         None
+    }
+}
+
+/// Keep only the clone pointer that requests an exit-time clear and wake.
+/// SETTID alone requests a birth-time store and must not register an exit wake.
+pub(crate) fn child_tid_clear_address(flags: CloneFlags, address: usize) -> usize {
+    if flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) {
+        address
+    } else {
+        0
     }
 }
 
@@ -3450,10 +3488,15 @@ mod tests {
     use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;
     use std::os::fd::OwnedFd;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use nix::sys::signal::Signal;
+    use reverie::GlobalRPC;
     use reverie::GlobalTool;
+    use reverie::Guest;
+    use reverie::Tid;
+    use reverie::syscalls::CloneFlags;
 
     use super::FutexAction;
     use super::GlobalRequest;
@@ -3467,6 +3510,7 @@ mod tests {
     use super::ThreadDeregistration;
     use super::TimesliceStats;
     use super::format_unsupported_syscall_warning;
+    use crate::Detcore;
     use crate::config::Config;
     use crate::ivar::Ivar;
     use crate::preemptions::PreemptionRecord;
@@ -3609,6 +3653,323 @@ mod tests {
         );
         scheduler.priorities.insert(dettid, DEFAULT_PRIORITY);
         scheduler.runqueue_push_back(dettid);
+    }
+
+    // Exercise the real external registration method and global RPC without a
+    // backend or a guest process. Any unexpected guest operation fails the test.
+    struct ExternalRegistrationGuest<'a> {
+        global: &'a GlobalState,
+        config: &'a Config,
+        thread: crate::ThreadState<()>,
+        requests: Mutex<Vec<GlobalRequest>>,
+    }
+
+    struct ExternalRegistrationStack;
+    struct ExternalRegistrationStackGuard;
+
+    impl Drop for ExternalRegistrationStackGuard {
+        fn drop(&mut self) {}
+    }
+
+    impl reverie::Stack for ExternalRegistrationStack {
+        type StackGuard = ExternalRegistrationStackGuard;
+
+        fn size(&self) -> usize {
+            panic!("external registration must not use a guest stack")
+        }
+
+        fn capacity(&self) -> usize {
+            panic!("external registration must not use a guest stack")
+        }
+
+        fn push<'stack, T>(&mut self, _value: T) -> reverie::syscalls::Addr<'stack, T> {
+            panic!("external registration must not use a guest stack")
+        }
+
+        fn reserve<'stack, T>(&mut self) -> reverie::syscalls::AddrMut<'stack, T> {
+            panic!("external registration must not use a guest stack")
+        }
+
+        fn commit(self) -> Result<Self::StackGuard, reverie::syscalls::Errno> {
+            panic!("external registration must not use a guest stack")
+        }
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for ExternalRegistrationGuest<'_> {
+        async fn send_rpc(
+            &self,
+            message: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            self.requests.lock().unwrap().push(message.2.clone());
+            self.global
+                .receive_rpc(Tid::from_raw(self.thread.dettid.as_raw()), message)
+                .await
+        }
+
+        fn config(&self) -> &Config {
+            self.config
+        }
+    }
+
+    #[reverie::tool]
+    impl Guest<Detcore> for ExternalRegistrationGuest<'_> {
+        type Memory = reverie::syscalls::LocalMemory;
+        type Stack = ExternalRegistrationStack;
+
+        fn tid(&self) -> reverie::Pid {
+            reverie::Pid::from_raw(self.thread.dettid.as_raw())
+        }
+
+        fn pid(&self) -> reverie::Pid {
+            reverie::Pid::from_raw(self.thread.detpid.unwrap().as_raw())
+        }
+
+        fn ppid(&self) -> Option<reverie::Pid> {
+            None
+        }
+
+        fn memory(&self) -> Self::Memory {
+            panic!("external registration must not access guest memory")
+        }
+
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+            &mut self.thread
+        }
+
+        fn thread_state(&self) -> &crate::ThreadState<()> {
+            &self.thread
+        }
+
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("external registration must not read guest registers")
+        }
+
+        async fn stack(&mut self) -> Self::Stack {
+            panic!("external registration must not use a guest stack")
+        }
+
+        async fn daemonize(&mut self) {
+            panic!("external registration must not daemonize")
+        }
+
+        async fn inject<S: reverie::syscalls::SyscallInfo>(
+            &mut self,
+            _syscall: S,
+        ) -> Result<i64, reverie::syscalls::Errno> {
+            panic!("external registration must not inject a syscall")
+        }
+
+        async fn tail_inject<S: reverie::syscalls::SyscallInfo>(
+            &mut self,
+            _syscall: S,
+        ) -> reverie::Never {
+            panic!("external registration unexpectedly retired its live parent")
+        }
+
+        fn set_timer(&mut self, _schedule: reverie::TimerSchedule) -> Result<(), reverie::Error> {
+            panic!("external registration must not set a timer")
+        }
+
+        fn set_timer_precise(
+            &mut self,
+            _schedule: reverie::TimerSchedule,
+        ) -> Result<(), reverie::Error> {
+            panic!("external registration must not set a timer")
+        }
+
+        fn read_clock(&mut self) -> Result<u64, reverie::Error> {
+            panic!("external registration must not read a host clock")
+        }
+    }
+
+    async fn check_external_child_tid_registration(
+        flags: CloneFlags,
+        supplied_address: usize,
+        expected_address: usize,
+    ) {
+        use reverie::Tool;
+
+        let config = Config {
+            sequentialize_threads: true,
+            cancel_killed_thread_rpcs: true,
+            // This control observes registration before the child starts; use
+            // the supported parent-first order for the one turn it drives.
+            runs_post_fork: crate::RunsPostFork::Parent,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let parent = DetTid::from_raw(17);
+        let parent_pid = DetPid::from_raw(17);
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(parent, parent, true);
+        install_test_registration(&state, parent, Ivar::new());
+        let tool = Detcore::new(reverie::Pid::from_raw(parent.as_raw()), &config);
+        let mut thread = tool.init_thread_state(Tid::from_raw(parent.as_raw()), None);
+        thread.detpid = Some(parent_pid);
+        let mut guest = ExternalRegistrationGuest {
+            global: &state,
+            config: &config,
+            thread,
+            requests: Mutex::new(Vec::new()),
+        };
+        let child = DetTid::from_raw(18);
+        let exit_signal = if flags.contains(CloneFlags::CLONE_THREAD) {
+            0
+        } else {
+            libc::SIGCHLD
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut registration = std::pin::pin!(tool.register_external_child(
+                &mut guest,
+                Tid::from_raw(child.as_raw()),
+                supplied_address,
+                flags,
+                exit_signal,
+                None,
+            ));
+            assert!(futures::poll!(registration.as_mut()).is_pending());
+            // The production RPC parks the parent on ParentContinue. Drive
+            // that actual scheduler turn instead of pre-filling a response or
+            // disabling sequentialization to make registration return.
+            let committed = crate::scheduler::do_a_turn_blocking(
+                state.sched.clone(),
+                state.global_time.clone(),
+                &Err(crate::scheduler::SkipTurn),
+            )
+            .await
+            .expect("the parent continuation must commit");
+            assert_eq!(committed.tid, parent);
+            assert_eq!(
+                committed.resources,
+                std::collections::HashMap::from([(
+                    crate::resources::ResourceID::ParentContinue { parent, child },
+                    crate::resources::Permission::W,
+                )]),
+            );
+            registration.await;
+        })
+        .await
+        .expect("external child registration must return without running a guest");
+
+        assert_eq!(guest.thread.clone_flags, None);
+        assert_eq!(guest.thread.dettid, parent);
+        let mut scheduler = state.sched.lock().unwrap();
+        assert_eq!(scheduler.next_turns.len(), 2);
+        assert!(scheduler.next_turns.contains_key(&parent));
+        assert_eq!(
+            scheduler.next_turns[&child].child_tid_addr,
+            expected_address
+        );
+        assert_eq!(
+            *guest.requests.lock().unwrap(),
+            vec![GlobalRequest::CreateChildThread(
+                child,
+                parent_pid,
+                expected_address,
+                Some(flags),
+                exit_signal,
+                None,
+                Some(DEFAULT_PRIORITY),
+            )],
+            "external registration must send one correctly gated real RPC"
+        );
+        let child_pid = if flags.contains(CloneFlags::CLONE_THREAD) {
+            parent_pid
+        } else {
+            child
+        };
+        let child_mm = MmId::for_clone(
+            MmId::initial(parent_pid),
+            child,
+            flags.contains(CloneFlags::CLONE_VM),
+        );
+        scheduler.logically_kill_thread(&child, &child_pid, child_mm);
+        assert!(!scheduler.next_turns.contains_key(&child));
+        assert!(scheduler.next_turns.contains_key(&parent));
+        assert_eq!(
+            scheduler.child_tid_was_cleared(
+                FutexID::private(child_mm, supplied_address),
+                child.as_raw(),
+            ),
+            expected_address != 0,
+            "exit must use only the registered child-TID address"
+        );
+        assert!(!scheduler.child_tid_was_cleared(FutexID::private(child_mm, 0), child.as_raw(),));
+        assert!(!scheduler.child_tid_was_cleared(
+            FutexID::private(child_mm, supplied_address),
+            parent.as_raw(),
+        ));
+    }
+
+    #[tokio::test]
+    async fn external_registration_without_child_cleartid_disables_exit_wake() {
+        for kind in [
+            CloneFlags::empty(),
+            CloneFlags::CLONE_THREAD | CloneFlags::CLONE_VM | CloneFlags::CLONE_SIGHAND,
+        ] {
+            for registration in [CloneFlags::empty(), CloneFlags::CLONE_CHILD_SETTID] {
+                check_external_child_tid_registration(kind | registration, 0x1234, 0).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn external_registration_with_child_cleartid_preserves_exact_exit_wake() {
+        for kind in [
+            CloneFlags::empty(),
+            CloneFlags::CLONE_THREAD | CloneFlags::CLONE_VM | CloneFlags::CLONE_SIGHAND,
+        ] {
+            for registration in [
+                CloneFlags::CLONE_CHILD_CLEARTID,
+                CloneFlags::CLONE_CHILD_CLEARTID | CloneFlags::CLONE_CHILD_SETTID,
+            ] {
+                check_external_child_tid_registration(kind | registration, 0x1234, 0x1234).await;
+                check_external_child_tid_registration(kind | registration, 0, 0).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn set_child_tid_address_rpc_updates_and_resets_the_registration() {
+        let (config, state, dettid, detpid) = cancellation_test_state();
+        install_test_registration(&state, dettid, Ivar::new());
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .next_turns
+            .get_mut(&dettid)
+            .unwrap()
+            .child_tid_addr = 0x1234;
+
+        let response = state
+            .receive_rpc(
+                reverie::Tid::from_raw(dettid.as_raw()),
+                (
+                    DetTime::new(&config),
+                    MmId::initial(detpid),
+                    GlobalRequest::SetChildTidAddress(0),
+                ),
+            )
+            .await;
+
+        assert_eq!(response.1, GlobalResponse::SetChildTidAddress(()));
+        assert_eq!(
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .next_turns
+                .get(&dettid)
+                .unwrap()
+                .child_tid_addr,
+            0
+        );
     }
 
     #[test]

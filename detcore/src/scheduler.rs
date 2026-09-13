@@ -1819,6 +1819,18 @@ impl Scheduler {
         }
     }
 
+    /// Updates the address Linux clears and wakes when this thread exits.
+    ///
+    /// `set_tid_address(2)` replaces the value supplied by clone. A zero
+    /// address disables the exit-time store and wake.
+    pub fn set_child_tid_address(&mut self, dettid: DetTid, address: usize) -> bool {
+        let Some(next_turn) = self.next_turns.get_mut(&dettid) else {
+            return false;
+        };
+        next_turn.child_tid_addr = address;
+        true
+    }
+
     /// Remove a thread from the deterministic scheduler.  In order to call this, the precondition
     /// is that this thread will execute no further (visible) instructions.
     ///
@@ -1864,10 +1876,12 @@ impl Scheduler {
                     // TODO-HUMAN-REVIEW(PR-845): Review killed-thread RPC cancellation.
                     nextturn.resp.try_put(SchedResponse::Signaled(None));
                 }
-                self.wake_futex_child_cleartid(
-                    FutexID::private(mm, nextturn.child_tid_addr),
-                    *dtid,
-                );
+                if nextturn.child_tid_addr != 0 {
+                    self.wake_futex_child_cleartid(
+                        FutexID::private(mm, nextturn.child_tid_addr),
+                        *dtid,
+                    );
+                }
             }
         }
 
@@ -1913,6 +1927,11 @@ impl Scheduler {
         self.exec_incarnations.insert(new_leader, post_exec_mm);
 
         if caller == new_leader {
+            self.next_turns
+                .get_mut(&caller)
+                .expect("exec caller must retain a scheduler registration")
+                .child_tid_addr = child_tid_addr;
+
             let siblings: Vec<_> = group.into_iter().filter(|tid| *tid != caller).collect();
             for sibling in &siblings {
                 self.logically_kill_thread(sibling, &detpid, pre_exec_mm);
@@ -5318,6 +5337,41 @@ mod test {
         })
     }
 
+    #[test]
+    fn leader_exec_reconnect_resets_child_tid_address() {
+        let mut sched = Scheduler::new(&Config::default());
+        let leader = DetTid::from_raw(17);
+        let sibling = DetTid::from_raw(18);
+        let detpid = DetPid::from_raw(leader.as_raw());
+        let pre_exec_mm = MmId::initial(detpid);
+        sched.thread_tree.add_child(leader, leader, true);
+        sched.thread_tree.add_child(leader, sibling, false);
+        register_known_thread(&mut sched, leader);
+        register_known_thread(&mut sched, sibling);
+        sched.next_turns.get_mut(&leader).unwrap().child_tid_addr = 0x1234;
+
+        let retired = sched.reconnect_after_exec(ExecReconnect {
+            caller: leader,
+            new_leader: leader,
+            detpid,
+            pre_exec_mm,
+            post_exec_mm: pre_exec_mm.for_exec(detpid),
+            child_tid_addr: 0,
+            reconnect_priority: Some(DEFAULT_PRIORITY),
+        });
+
+        assert_eq!(retired, vec![sibling]);
+        assert_eq!(
+            sched
+                .next_turns
+                .get(&leader)
+                .expect("leader registration must survive exec")
+                .child_tid_addr,
+            0,
+            "successful exec must clear the scheduler's prior CHILD_CLEARTID address"
+        );
+    }
+
     /// F1/F2: an admission deferred while a tentative_pop window is live must
     /// resolve its side -- including the `RunsPostFork::Random` PRNG draw -- at
     /// the `DetTid`-ordered drain, so the drained run queue is a pure function of
@@ -6954,6 +7008,64 @@ mod test {
         scheduler.logically_kill_thread(&dettid, &detpid, MmId::initial(detpid));
 
         assert!(response.try_read().is_none());
+    }
+
+    #[test]
+    fn set_child_tid_address_changes_the_exit_wake_address() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let dettid = DetTid::from_raw(100);
+        let detpid = DetPid::from_raw(100);
+        let mm = MmId::initial(detpid);
+        let original = FutexID::private(mm, 0x1000);
+        let replacement = FutexID::private(mm, 0x2000);
+        scheduler.thread_tree.add_child(dettid, dettid, true);
+        scheduler.next_turns.insert(
+            dettid,
+            ThreadNextTurn {
+                dettid,
+                child_tid_addr: 0x1000,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+            },
+        );
+
+        assert!(scheduler.set_child_tid_address(dettid, 0x2000));
+        scheduler.logically_kill_thread(&dettid, &detpid, mm);
+
+        assert!(scheduler.child_tid_was_cleared(replacement, dettid.as_raw()));
+        assert!(!scheduler.child_tid_was_cleared(original, dettid.as_raw()));
+    }
+
+    #[test]
+    fn zero_child_tid_address_disables_the_exit_wake() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let dettid = DetTid::from_raw(100);
+        let detpid = DetPid::from_raw(100);
+        let mm = MmId::initial(detpid);
+        let original = FutexID::private(mm, 0x1000);
+        let zero = FutexID::private(mm, 0);
+        scheduler.thread_tree.add_child(dettid, dettid, true);
+        scheduler.next_turns.insert(
+            dettid,
+            ThreadNextTurn {
+                dettid,
+                child_tid_addr: 0x1000,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+            },
+        );
+
+        assert!(scheduler.set_child_tid_address(dettid, 0));
+        scheduler.logically_kill_thread(&dettid, &detpid, mm);
+
+        assert!(!scheduler.child_tid_was_cleared(original, dettid.as_raw()));
+        assert!(!scheduler.child_tid_was_cleared(zero, dettid.as_raw()));
+    }
+
+    #[test]
+    fn set_child_tid_address_rejects_a_missing_thread() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        assert!(!scheduler.set_child_tid_address(DetTid::from_raw(100), 0x2000));
     }
 
     #[test]

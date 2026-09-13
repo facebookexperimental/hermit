@@ -176,7 +176,7 @@ pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
 pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.regular_crates", 447),
     ("test.hermit_unit", 496),
-    ("test.detcore_unit", 657),
+    ("test.detcore_unit", 667),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     ("test.hermit_integration", 139),
