@@ -1148,6 +1148,20 @@ run_raw_case "an authenticated repeated legacy refusal retains its citation beha
   }
 ]"
 
+# Abbreviated markers also require an eligible comment before citation
+# history can suppress them, including history from a legacy refusal.
+run_raw_case "an untrusted shortened refusal cannot use legacy citation history" 1 \
+    "[{\"author_association\":\"OWNER\",\"body\":\"${REVIEWER_901}\\nREQUEST CHANGES AT ${HEAD_SHA}\"},
+      {\"author_association\":\"OWNER\",\"body\":\"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"author_association\":\"OWNER\",\"body\":\"${REVIEWER_901}\\nAPPROVED-AT: claude ${HEAD_SHA}\"},
+      {\"author_association\":\"NONE\",\"body\":\"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA:0:12}\"}]"
+
+run_raw_case "an authenticated shortened refusal retains legacy citation behavior" 0 \
+    "[{\"author_association\":\"OWNER\",\"body\":\"${REVIEWER_901}\\nREQUEST CHANGES AT ${HEAD_SHA}\"},
+      {\"author_association\":\"OWNER\",\"body\":\"${REVIEWER_901}\\nAPPROVED-AT: codex ${HEAD_SHA}\"},
+      {\"author_association\":\"OWNER\",\"body\":\"${REVIEWER_901}\\nAPPROVED-AT: claude ${HEAD_SHA}\"},
+      {\"author_association\":\"OWNER\",\"body\":\"${REVIEWER_901}\\nCHANGES-REQUESTED-AT: claude ${HEAD_SHA:0:12}\"}]"
+
 # The fleet's tag shapes vary and the interior is deliberately not parsed;
 # approval_binding.py measured that reading it produces wrong verdicts.
 run_raw_case "a legacy-shaped role tag is accepted (interior is not parsed)" 0 \

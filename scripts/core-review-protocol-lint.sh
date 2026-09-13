@@ -788,7 +788,8 @@ scan_lane() {
                         CHANGES-REQUESTED-AT) citation_kind=refused ;;
                         CHANGES-REQUESTED-WITHDRAWN-AT) citation_kind=withdrawn ;;
                     esac
-                    if verdict_is_citation "$author" "$citation_kind" "$citation_lane" \
+                    if [ -z "$approver_refusal" ] \
+                       && verdict_is_citation "$author" "$citation_kind" "$citation_lane" \
                         "$citation_sha" "${issued_verdicts[@]}"; then
                         continue
                     fi
