@@ -1338,7 +1338,7 @@ fn run_once<R: Read + Send + 'static>(
                 ),
             )
             .map_err(|error| dbt_run_error(drrun, error))?;
-        clean_up_dbt_global(runtime, &output.status, global);
+        runtime.block_on(clean_up_dbt_global(&output.status, global));
         Ok(output)
     })
 }
@@ -1361,7 +1361,7 @@ fn run_once_with_terminal_input(
                 ),
             )
             .map_err(|error| dbt_run_error(drrun, error))?;
-        clean_up_dbt_global(runtime, &output.status, global);
+        runtime.block_on(clean_up_dbt_global(&output.status, global));
         Ok(output)
     })
 }
@@ -1379,21 +1379,20 @@ fn run_status(
         let (status, global) = runtime
             .block_on(runner.status_with_global::<detcore::GlobalState>(&guest, config.clone()))
             .map_err(|error| dbt_run_error(drrun, error))?;
-        clean_up_dbt_global(runtime, &status, global);
+        runtime.block_on(clean_up_dbt_global(&status, global));
         Ok(status)
     })
 }
 
 #[cfg(feature = "dbt")]
-fn clean_up_dbt_global(
-    runtime: &tokio::runtime::Runtime,
-    status: &std::process::ExitStatus,
-    global: detcore::GlobalState,
-) {
+async fn clean_up_dbt_global(status: &std::process::ExitStatus, mut global: detcore::GlobalState) {
     if !status.success() {
         global.force_shutdown_with_error();
+        // The physical supervisor and RPC owner drain have finished. A client
+        // that failed before registration cannot start the owned scheduler.
+        global.cancel_internal_scheduler().await;
     }
-    runtime.block_on(global.clean_up(false, &None));
+    global.clean_up(false, &None).await;
 }
 
 /// Name the stage that actually failed.
@@ -1596,6 +1595,75 @@ pub fn run_sabre_strace(program: &Path, args: &[String]) -> Result<ExitStatus, E
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "dbt")]
+    #[tokio::test]
+    async fn dbt_abnormal_cleanup_ends_an_unregistered_scheduler() {
+        use std::os::unix::process::ExitStatusExt;
+
+        use reverie::GlobalTool;
+
+        let config = detcore::Config {
+            sequentialize_threads: true,
+            ..detcore::Config::default()
+        };
+        let mut outcomes = Vec::new();
+        for (name, raw_status) in [("exit255", 255 << 8), ("SIGKILL", libc::SIGKILL)] {
+            let global = detcore::GlobalState::init_global_state(&config).await;
+            let status = std::process::ExitStatus::from_raw(raw_status);
+            let completed = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                super::clean_up_dbt_global(&status, global),
+            )
+            .await
+            .is_ok();
+            assert_eq!(status.into_raw(), raw_status);
+            outcomes.push((name, completed));
+        }
+        assert_eq!(
+            outcomes,
+            [("exit255", true), ("SIGKILL", true)],
+            "DBT cleanup waited for a scheduler whose physical guest had already failed"
+        );
+    }
+
+    #[cfg(feature = "dbt")]
+    #[tokio::test]
+    async fn dbt_successful_cleanup_preserves_normal_scheduler_completion() {
+        use std::os::unix::process::ExitStatusExt;
+
+        use reverie::GlobalTool;
+
+        let status = std::process::ExitStatus::from_raw(0);
+        let config = detcore::Config {
+            sequentialize_threads: false,
+            ..detcore::Config::default()
+        };
+        let global = detcore::GlobalState::init_global_state(&config).await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                super::clean_up_dbt_global(&status, global),
+            )
+            .await
+            .is_ok(),
+            "cleanup without an owned scheduler did not complete"
+        );
+        let config = detcore::Config {
+            sequentialize_threads: true,
+            ..detcore::Config::default()
+        };
+        let global = detcore::GlobalState::init_global_state(&config).await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                super::clean_up_dbt_global(&status, global),
+            )
+            .await
+            .is_err(),
+            "successful DBT cleanup silently cancelled a scheduler that had not completed"
+        );
+        assert!(status.success());
+    }
     #[cfg(feature = "dbt")]
     #[test]
     fn dbt_workdir_reaches_the_dynamorio_guest_command() {
