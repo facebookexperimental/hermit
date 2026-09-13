@@ -2450,6 +2450,7 @@ root=pathlib.Path(__file__).parent
 a=sys.argv[1:]
 if '--help' in a:
  print('--verify-strict');sys.exit(0)
+if 'run' in a:a=a[a.index('run'):]
 if not a or a[0] not in ('run','log-diff'):sys.exit(0)
 scenario=(root/'scenario').read_text()
 def record(value):
