@@ -89,7 +89,13 @@ validate_core_linter_invocation() {
     binding_count=0
     for ((index = 1; index < bash_index; index++)); do
         word=${invocation_words[$index]}
-        [[ $word == "PR_HEAD_SHA=\"\$pr_head\"" ]] && ((binding_count += 1))
+        if [[ $word == PR_HEAD_SHA=* ]]; then
+            ((binding_count += 1))
+            [[ $word == "PR_HEAD_SHA=\"\$pr_head\"" ]] || {
+                echo "core-review linter invocation has an incorrect PR_HEAD_SHA binding" >&2
+                return 1
+            }
+        fi
     done
     if [[ $binding_count -ne 1 ]]; then
         echo "core-review linter invocation must bind PR_HEAD_SHA exactly once" >&2
@@ -99,7 +105,13 @@ validate_core_linter_invocation() {
     binding_count=0
     for ((index = 1; index < bash_index; index++)); do
         word=${invocation_words[$index]}
-        [[ $word == "PR_COMMENTS_FILE=\"\$pr_comments_file\"" ]] && ((binding_count += 1))
+        if [[ $word == PR_COMMENTS_FILE=* ]]; then
+            ((binding_count += 1))
+            [[ $word == "PR_COMMENTS_FILE=\"\$pr_comments_file\"" ]] || {
+                echo "core-review linter invocation has an incorrect PR_COMMENTS_FILE binding" >&2
+                return 1
+            }
+        fi
     done
     if [[ $binding_count -ne 1 ]]; then
         echo "core-review linter invocation must bind PR_COMMENTS_FILE exactly once" >&2
@@ -120,7 +132,8 @@ invocation_error=$(validate_core_linter_invocation "$core_linter_invocation" 2>&
 
 # Negative controls exercise the production invocation parser.  Both deleting
 # a binding and retaining its literal text as an argument to an executable
-# shell command must fail with the missing binding's name.
+# shell command must fail with the missing binding's name. A later assignment
+# must not override a required value while retaining the original token.
 expect_binding_mutation_rejected() {
     local test_name=$1 expected_name=$2 mutation=$3 error
     if error=$(validate_core_linter_invocation "$mutation" 2>&1); then
@@ -136,12 +149,18 @@ expect_binding_mutation_rejected "deleted head binding" PR_HEAD_SHA "$head_delet
 head_decoy_replacement=" printf '%s' 'PR_HEAD_SHA=\"\$pr_head\"' &&"
 head_decoy=${core_linter_invocation/"$head_binding"/$head_decoy_replacement}
 expect_binding_mutation_rejected "executable head decoy" PR_HEAD_SHA "$head_decoy"
+head_override_replacement="$head_binding PR_HEAD_SHA=\"\$old_head\""
+head_override=${core_linter_invocation/"$head_binding"/$head_override_replacement}
+expect_binding_mutation_rejected "overridden head binding" PR_HEAD_SHA "$head_override"
 comments_binding=" PR_COMMENTS_FILE=\"\$pr_comments_file\""
 comments_deleted=${core_linter_invocation/"$comments_binding"/}
 expect_binding_mutation_rejected "deleted comment binding" PR_COMMENTS_FILE "$comments_deleted"
 comments_decoy_replacement=" printf '%s' 'PR_COMMENTS_FILE=\"\$pr_comments_file\"' &&"
 comments_decoy=${core_linter_invocation/"$comments_binding"/$comments_decoy_replacement}
 expect_binding_mutation_rejected "executable comment decoy" PR_COMMENTS_FILE "$comments_decoy"
+comments_override_replacement="$comments_binding PR_COMMENTS_FILE=\"\$old_comments_file\""
+comments_override=${core_linter_invocation/"$comments_binding"/$comments_override_replacement}
+expect_binding_mutation_rejected "overridden comment binding" PR_COMMENTS_FILE "$comments_override"
 
 core_job_has 'pr_head="$(jq -r '\''.head.sha'\'' <<< "$pr_json")"' ||
     fail "core-review protocol must read the exact pull-request head"
