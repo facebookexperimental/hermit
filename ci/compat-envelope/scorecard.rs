@@ -9385,6 +9385,25 @@ fn self_test() -> Result<(), String> {
         backend: "ptrace".into(),
     };
     let expected = BTreeSet::from([id.clone()]);
+    // The current producer records both exact guest outputs for completed comparisons.
+    let fixture_outputs = canonical_verdict::ComparedOutputs {
+        left: canonical_verdict::ComparedOutput {
+            exit_code: Some(0),
+            signal: None,
+            stdout_sha256: "a".repeat(64),
+            stdout_bytes: 4,
+            stderr_sha256: "d".repeat(64),
+            stderr_bytes: 0,
+        },
+        right: canonical_verdict::ComparedOutput {
+            exit_code: Some(0),
+            signal: None,
+            stdout_sha256: "a".repeat(64),
+            stdout_bytes: 4,
+            stderr_sha256: "d".repeat(64),
+            stderr_bytes: 0,
+        },
+    };
     let candidate = |outcome: &str| {
         let row = ResultRow {
             schema: CELL_RESULT_SCHEMA,
@@ -9458,24 +9477,7 @@ fn self_test() -> Result<(), String> {
                         left: 1,
                         right: 1,
                     }),
-                    compared_outputs: Some(canonical_verdict::ComparedOutputs {
-                        left: canonical_verdict::ComparedOutput {
-                            exit_code: Some(0),
-                            signal: None,
-                            stdout_sha256: "a".repeat(64),
-                            stdout_bytes: 4,
-                            stderr_sha256: "d".repeat(64),
-                            stderr_bytes: 0,
-                        },
-                        right: canonical_verdict::ComparedOutput {
-                            exit_code: Some(0),
-                            signal: None,
-                            stdout_sha256: "a".repeat(64),
-                            stdout_bytes: 4,
-                            stderr_sha256: "d".repeat(64),
-                            stderr_bytes: 0,
-                        },
-                    }),
+                    compared_outputs: Some(fixture_outputs.clone()),
                     // This fixture predates runtime totals. Keep "not recorded"
                     // distinct from a measured zero.
                     runtime: None,
@@ -9554,6 +9556,32 @@ fn self_test() -> Result<(), String> {
             ));
         }
     }
+    // Missing and explicit-null output evidence both remain refused by the
+    // current readers; supplying the fixture fields must not weaken that guard.
+    for omit in [true, false] {
+        let mut report: JsonValue = serde_json::from_str(current_report_text).unwrap();
+        if omit {
+            report.as_object_mut().unwrap().remove("compared_outputs");
+        } else {
+            report["compared_outputs"] = JsonValue::Null;
+        }
+        let report = serde_json::to_string(&report).unwrap();
+        let mut row = current_identity.clone();
+        row.attempts[0]["verification_report_sha256"] =
+            JsonValue::String(format!("{:x}", Sha256::digest(report.as_bytes())));
+        row.attempts[0]["verification_report"] = JsonValue::String(report);
+        for error in [
+            row.bitwise_info_comparison().unwrap_err(),
+            row.comparison_evidence().unwrap_err(),
+        ] {
+            if !error.contains("compared_outputs") {
+                return Err(format!(
+                    "missing output evidence lost its refusal cause: {error}"
+                ));
+            }
+        }
+    }
+
     // Hash-consistent original bytes still must reject duplicates. A Value
     // would collapse both identical and conflicting duplicate fields here.
     for (needle, replacement) in [
@@ -10243,7 +10271,7 @@ red/`measured-and-passed` count is **0**.",
                     left: 100,
                     right: 100,
                 }),
-                compared_outputs: None,
+                compared_outputs: Some(fixture_outputs.clone()),
                 first_divergent_scheduler_turn: scheduler_turn,
                 first_divergent_virtual_nanoseconds: virtual_nanoseconds,
                 first_divergent_record: record,
@@ -11078,6 +11106,11 @@ red/`measured-and-passed` count is **0**.",
             "infrastructure_error": null,
             "comparison": comparison,
             "compared_log_messages": counts,
+            "compared_outputs": if matches!(outcome, "PASS" | "FAIL") {
+                serde_json::to_value(&fixture_outputs).unwrap()
+            } else {
+                JsonValue::Null
+            },
             "guest_exit_code": if outcome == "PASS" { Some(0) } else { None },
             "guest_signal": null,
             "first_divergent_scheduler_turn": if outcome == "FAIL" { Some(7) } else { None },
