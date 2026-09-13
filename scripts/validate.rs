@@ -313,6 +313,33 @@ fn integration_artifact_bracket(integration: &Step) -> Result<(), String> {
     Ok(())
 }
 
+// Test-consumer checks inspect the exact authored payload. The container's
+// --cargo-home path ends in "cargo "; it is not a Cargo invocation in that payload.
+fn prepared_nextest_commands_bracket(workspace: &Step, privileged: &Step) -> Result<(), String> {
+    let workspace_command = guarded_command_source(&workspace.tag(), &workspace.cmd)?;
+    let privileged_command = guarded_command_source(&privileged.tag(), &privileged.cmd)?;
+    if !privileged_command
+        .contains("verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path")
+        || !privileged_command.contains(NEXTEST_PRIVILEGED_ASSERT_COMMAND)
+        || !privileged_command.contains(TESTS_MISC_EXECUTABLE_READ_COMMAND)
+        || privileged_command.contains("cargo ")
+        || !workspace_command.ends_with(NEXTEST_PORTABLE_PREPARE_COMMAND)
+    {
+        return Err("full-plan bracket: prepared Nextest population must come from the workspace producer and the privileged barrier must verify it without Cargo compilation".into());
+    }
+    Ok(())
+}
+
+fn prebuilt_cpuid_command_bracket(cpuid: &Step) -> Result<(), String> {
+    let command = guarded_command_source(&cpuid.tag(), &cpuid.cmd)?;
+    if command.contains("cargo ") || !command.contains("rdrand_rdseed_is_masked") {
+        return Err(
+            "full-plan bracket: CPUID test does not directly execute the prebuilt binary".into(),
+        );
+    }
+    Ok(())
+}
+
 fn privileged_artifact_barriers(build: &Step) -> Result<(), String> {
     for required in [
         "build.e2e_artifact_in_pinned_root",
@@ -3118,14 +3145,7 @@ cleared-caps refusal names {} starved step(s)",
             .find(|s| s.tag() == "privileged-build.privileged_tests")
             .ok_or("full-plan bracket: privileged focused build disappeared")?;
         privileged_artifact_barriers(privileged_build)?;
-        if !privileged_build.cmd.contains("verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path")
-            || !privileged_build.cmd.contains(NEXTEST_PRIVILEGED_ASSERT_COMMAND)
-            || !privileged_build.cmd.contains(TESTS_MISC_EXECUTABLE_READ_COMMAND)
-            || privileged_build.cmd.contains("cargo ")
-            || !portable_build.cmd.ends_with(NEXTEST_PORTABLE_PREPARE_COMMAND)
-        {
-            return Err("full-plan bracket: prepared Nextest population must come from the workspace producer and the privileged barrier must verify it without Cargo compilation".into());
-        }
+        prepared_nextest_commands_bracket(portable_build, privileged_build)?;
         let prepared = hermit_manifest_plan::nextest_binaries::profile_selections(&root, "portable")?;
         for required in hermit_manifest_plan::nextest_binaries::profile_selections(&root, "privileged")?.keys() {
             if !prepared.contains_key(required) {
@@ -3188,12 +3208,7 @@ cleared-caps refusal names {} starved step(s)",
             .iter()
             .find(|s| s.tag() == "privileged-cpuid.faulting")
             .ok_or("full-plan bracket: privileged CPUID node disappeared")?;
-        if cpuid.cmd.contains("cargo ") || !cpuid.cmd.contains("rdrand_rdseed_is_masked") {
-            return Err(
-                "full-plan bracket: CPUID test does not directly execute the prebuilt binary"
-                    .into(),
-            );
-        }
+        prebuilt_cpuid_command_bracket(cpuid)?;
         if !cpuid
             .deps
             .iter()
@@ -21787,6 +21802,118 @@ mod typed_termination_tests {
                 "TYPED_GATE_FIXTURE {}",
                 serde_json::to_string(&row).unwrap()
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod prepared_command_tests {
+    use super::*;
+
+    fn outer_decoy(step: &Step, payload: &str, decoy: &str) -> Step {
+        let mut changed = step.clone();
+        changed.cmd = bracket_command_with_payload(step, payload).unwrap();
+        let mut argv = shell_words::split(&changed.cmd).unwrap();
+        argv.splice(1..1, ["--out".to_string(), decoy.to_string()]);
+        changed.cmd = format!(
+            "{} {}",
+            argv[0],
+            argv[1..]
+                .iter()
+                .map(|arg| validate_plan::shell_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        changed
+    }
+
+    #[test]
+    fn actual_prepared_commands_preserve_no_compilation_and_refuse_outer_decoys() {
+        let root = repo_root();
+        let cfg = validate_plan::validation_config(&root).unwrap();
+        let find = |tag: &str| cfg.steps.iter().find(|step| step.tag() == tag).unwrap();
+        let host = find("build.workspace");
+        let pinned = find("build.workspace_in_pinned_root");
+        let barrier = find("privileged-build.privileged_tests");
+        let cpuid = find("privileged-cpuid.faulting");
+        let barrier_payload = guarded_command_source(&barrier.tag(), &barrier.cmd).unwrap();
+        let cpuid_payload = guarded_command_source(&cpuid.tag(), &cpuid.cmd).unwrap();
+        // Both current workspace producers retain the exact preparation suffix.
+        prepared_nextest_commands_bracket(host, barrier).unwrap();
+        prepared_nextest_commands_bracket(pinned, barrier).unwrap();
+        prebuilt_cpuid_command_bracket(cpuid).unwrap();
+        assert!(barrier.cmd.contains("cargo "));
+        assert!(cpuid.cmd.contains("cargo "));
+        assert!(!barrier_payload.contains("cargo "));
+        assert!(!cpuid_payload.contains("cargo "));
+
+        for required in [
+            "verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path",
+            NEXTEST_PRIVILEGED_ASSERT_COMMAND,
+            TESTS_MISC_EXECUTABLE_READ_COMMAND,
+        ] {
+            let payload = barrier_payload.replacen(required, "missing-required-check", 1);
+            let changed = outer_decoy(barrier, &payload, required);
+            assert!(changed.cmd.contains(required));
+            assert!(prepared_nextest_commands_bracket(host, &changed).is_err());
+        }
+        let mut changed = barrier.clone();
+        changed.cmd =
+            bracket_command_with_payload(barrier, &format!("{barrier_payload} && cargo build"))
+                .unwrap();
+        assert!(prepared_nextest_commands_bracket(host, &changed).is_err());
+
+        for workspace in [host, pinned] {
+            let payload = guarded_command_source(&workspace.tag(), &workspace.cmd).unwrap();
+            let mut changed = workspace.clone();
+            changed.cmd = bracket_command_with_payload(
+                workspace,
+                &format!("{payload} --planted-after-preparation"),
+            )
+            .unwrap();
+            assert!(prepared_nextest_commands_bracket(&changed, barrier).is_err());
+        }
+        let payload = guarded_command_source(&pinned.tag(), &pinned.cmd).unwrap();
+        let changed = outer_decoy(
+            pinned,
+            &payload.replacen(NEXTEST_PORTABLE_PREPARE_COMMAND, "missing-preparation", 1),
+            NEXTEST_PORTABLE_PREPARE_COMMAND,
+        );
+        assert!(prepared_nextest_commands_bracket(&changed, barrier).is_err());
+
+        let changed = outer_decoy(
+            cpuid,
+            &cpuid_payload.replacen("rdrand_rdseed_is_masked", "missing-test", 1),
+            "rdrand_rdseed_is_masked",
+        );
+        assert!(prebuilt_cpuid_command_bracket(&changed).is_err());
+        let mut changed = cpuid.clone();
+        changed.cmd =
+            bracket_command_with_payload(cpuid, &format!("{cpuid_payload}; cargo test")).unwrap();
+        assert!(prebuilt_cpuid_command_bracket(&changed).is_err());
+
+        for original in [pinned, barrier, cpuid] {
+            let mut changed = original.clone();
+            let mut argv = shell_words::split(&changed.cmd).unwrap();
+            let boundary = argv.iter().position(|arg| arg == "--").unwrap();
+            argv[boundary + 3] = "exec bash -c \"$1\"".into();
+            changed.cmd = format!(
+                "{} {}",
+                argv[0],
+                argv[1..]
+                    .iter()
+                    .map(|arg| validate_plan::shell_quote(arg))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            assert!(guarded_command_source(&changed.tag(), &changed.cmd).is_err());
+            if original.tag() == cpuid.tag() {
+                assert!(prebuilt_cpuid_command_bracket(&changed).is_err());
+            } else if original.tag() == pinned.tag() {
+                assert!(prepared_nextest_commands_bracket(&changed, barrier).is_err());
+            } else {
+                assert!(prepared_nextest_commands_bracket(host, &changed).is_err());
+            }
         }
     }
 }
