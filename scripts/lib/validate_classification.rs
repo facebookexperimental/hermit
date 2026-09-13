@@ -933,30 +933,49 @@ mod timeout_tests {
         assert_eq!(result.outcomes[0].executed_tests, None);
         println!("actual collected node limit: {:?}", result.outcomes);
 
-        for prior_failure in [false, true] {
-            let mut pending = make_step("pending", "true", 10);
-            pending.deps = vec!["classification.cutoff".into()];
+        for (prior_failure, cold_log) in [(false, true), (false, false), (true, false)] {
             let mut steps = Vec::new();
-            if prior_failure {
-                steps.push(make_step("prior_failure", "exit 1", 10));
+            if cold_log {
+                // Keep the exact original failing 2 s / sleep 10 input.
+                let mut pending = make_step("pending", "true", 10);
+                pending.deps = vec!["classification.cutoff".into()];
+                steps.extend([make_step("cutoff", "sleep 10", 10), pending]);
+            } else {
+                // The runner correctly refuses an individual node whose own
+                // bound cannot fit the remaining run budget. Exercise an active
+                // whole-run cutoff using three individually bounded steps whose
+                // sequential total exceeds that allowance instead.
+                if prior_failure {
+                    steps.push(make_step("prior_failure", "exit 1", 2));
+                }
+                let first = make_step("cutoff", "sleep 1.5", 2);
+                let mut second = make_step("cutoff_second", "sleep 1.5", 2);
+                second.deps = vec![first.tag()];
+                let mut third = make_step("cutoff_third", "sleep 1.5", 2);
+                third.deps = vec![second.tag()];
+                let mut pending = make_step("pending", "true", 2);
+                pending.deps = vec![third.tag()];
+                steps.extend([first, second, third, pending]);
             }
-            steps.extend([make_step("cutoff", "sleep 10", 10), pending]);
             let cfg = super::super::DagConfig {
                 steps,
                 ..Default::default()
             };
             let planned = cfg.steps.iter().map(|step| step.tag()).collect();
-            let deadline = super::super::monotonic_now_ns().unwrap() + 2_000_000_000;
-            let result = super::super::run_lane_once(
-                &cfg,
-                1,
-                true,
-                0,
-                None,
-                &dir.path().join(format!("cutoff-{prior_failure}.log")),
-                Some(deadline),
-                false,
-            );
+            let log = dir
+                .path()
+                .join(format!("cutoff-{prior_failure}-{cold_log}.log"));
+            if !cold_log {
+                std::fs::write(&log, "existing log\n").unwrap();
+            }
+            let allowance = if cold_log {
+                2_000_000_000
+            } else {
+                5_000_000_000
+            };
+            let deadline = super::super::monotonic_now_ns().unwrap() + allowance;
+            let result =
+                super::super::run_lane_once(&cfg, 1, true, 0, None, &log, Some(deadline), false);
             assert!(result.run_timed_out && !result.complete);
             assert!(
                 !result
@@ -971,6 +990,23 @@ mod timeout_tests {
                 &planned,
                 &[],
             );
+            if cold_log {
+                // The original two-second/sleep-ten failing control: settling
+                // the absent log spends the deadline, so neither selected node
+                // may launch and both identities remain explicitly unattempted.
+                assert!(result.outcomes.is_empty() && result.attempts.is_empty());
+                assert_eq!(
+                    result.skipped.iter().cloned().collect::<BTreeSet<_>>(),
+                    planned
+                );
+            } else {
+                assert!(
+                    result
+                        .outcomes
+                        .iter()
+                        .any(|outcome| outcome.tag == "classification.cutoff")
+                );
+            }
             assert!(classified.no_results() >= 2);
             assert_eq!(
                 classified.product_failure_nodes,
@@ -1007,6 +1043,48 @@ mod timeout_tests {
                 "actual whole-run cutoff prior_failure={prior_failure}: {classified:?}; outcomes={:?}",
                 result.outcomes
             );
+        }
+        for (name, allowance_ns, should_run) in [
+            ("subsecond", 500_000_000, false),
+            ("subsecond_after_settle", 1_050_000_000, false),
+            ("positive", 2_500_000_000, true),
+        ] {
+            let sentinel = dir.path().join(format!("{name}.sentinel"));
+            let command = format!(
+                "printf ran > {}",
+                validate_plan::shell_quote(&sentinel.to_string_lossy())
+            );
+            let cfg = super::super::DagConfig {
+                steps: vec![make_step(name, &command, 1)],
+                ..Default::default()
+            };
+            let log = dir.path().join(format!("{name}.log"));
+            std::fs::write(&log, "existing log\n").unwrap();
+            let started = super::super::monotonic_now_ns().unwrap();
+            let result = super::super::run_lane_once(
+                &cfg,
+                1,
+                true,
+                0,
+                None,
+                &log,
+                Some(started + allowance_ns),
+                false,
+            );
+            assert_eq!(
+                sentinel.exists(),
+                should_run,
+                "{name}: launch must follow the original shared allowance"
+            );
+            assert_eq!(result.run_timed_out, !should_run, "{name}");
+            assert_eq!(result.complete, should_run, "{name}");
+            if should_run {
+                assert_eq!(result.outcomes.len(), 1);
+                assert!(result.outcomes[0].ok);
+            } else {
+                assert!(result.outcomes.is_empty() && result.attempts.is_empty());
+                assert_eq!(result.skipped, vec![format!("classification.{name}")]);
+            }
         }
     }
 }

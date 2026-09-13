@@ -13663,22 +13663,34 @@ fn run_lane_once(
     deadline: Option<u64>,
     record_step_profiles: bool,
 ) -> LaneResult {
-    if remaining_budget_s(deadline) == Some(0) {
+    let expired_before_dispatch = || {
         eprintln!(
             "validate: whole-run budget expired during setup; no DAG node will be started \
              unbounded, and every planned node is recorded as not attempted"
         );
-        return LaneResult {
+        LaneResult {
             outcomes: Vec::new(),
             skipped: cfg.steps.iter().map(|step| step.tag()).collect(),
             attempts: Vec::new(),
             complete: false,
             ok: false,
             run_timed_out: true,
-        };
+        }
+    };
+    if remaining_budget_s(deadline) == Some(0) {
+        return expired_before_dispatch();
     }
 
     let log_start = settled_log_len(log_path);
+    let cpu_budget = scheduler_cpu_budget();
+    // Settling the output can consume the remaining shared allowance. The
+    // scheduler API treats zero as unbounded, so recheck after all setup and
+    // immediately before dispatch. Flooring a positive sub-second remainder
+    // must refuse launch rather than create a fresh second or remove the bound.
+    let remaining = remaining_budget_s(deadline);
+    if remaining == Some(0) {
+        return expired_before_dispatch();
+    }
     let result = run_dag_boxed_deadline(
         cfg,
         jobs,
@@ -13686,8 +13698,8 @@ fn run_lane_once(
         verbosity,
         cgroups,
         None,
-        Some(scheduler_cpu_budget()),
-        remaining_budget_s(deadline),
+        Some(cpu_budget),
+        remaining,
     );
     if record_step_profiles {
         forward_step_profiles(&result, jobs);
