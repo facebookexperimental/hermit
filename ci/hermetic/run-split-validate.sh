@@ -388,12 +388,28 @@ if [[ $do_offline -eq 1 ]]; then
             done
             for path in /usr/bin/bash /usr/bin/date /usr/bin/df /usr/bin/du \
                         /usr/bin/find /usr/bin/git /usr/bin/node /usr/bin/nodejs \
-                        /usr/bin/python3 /usr/bin/sort /usr/bin/tr; do
+                        /usr/bin/nproc /usr/bin/python3 /usr/bin/sort \
+                        /usr/bin/stat /usr/bin/tr; do
                 [[ -x "$path" ]] || {
                     echo "run-split-validate: pinned root is missing required FHS path: $path" >&2
                     exit 2
                 }
             done
+
+            # These CLI test drivers are distinct from the guest-tool list.
+            command -v gdb >/dev/null || {
+                echo "run-split-validate: pinned root is missing required CLI test driver: gdb" >&2
+                exit 2
+            }
+            gdb_python=$(timeout 10s gdb --batch --nx \
+                -ex "python import sys; print(2694001)") || {
+                echo "run-split-validate: pinned gdb cannot run the required Python fixture" >&2
+                exit 2
+            }
+            [[ "$gdb_python" == "2694001" ]] || {
+                echo "run-split-validate: pinned gdb Python fixture marker was not exact" >&2
+                exit 2
+            }
 
             echo ":: build-side nodes"
             /src/ci/run-node.sh '"$lane"' '"$build_nodes"'

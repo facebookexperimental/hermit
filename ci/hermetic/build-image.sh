@@ -33,9 +33,52 @@ out=$("${runner[@]}" "${NIX[@]}" build --no-link --print-out-paths .#image)
 echo ":: nix store path: $out"
 echo ":: tarball sha256: $(sha256sum "$out" | cut -d' ' -f1)"
 
+# Loading the new nix tag removes the old image's last repository name unless
+# another tag retains it. Preserve the exact old ID/digest association so the
+# recorded name@digest rollback remains resolvable after the load.
+previous_reference=""
+previous_identity=""
+if [[ -f image.digest ]]; then
+    previous_reference=$(tr -d '[:space:]' < image.digest)
+    if podman image exists "$previous_reference"; then
+        previous_identity=$(podman image inspect --format '{{.Id}} {{.Digest}}' "$previous_reference")
+        read -r previous_id previous_digest <<< "$previous_identity"
+        [[ -n "$previous_id" && "$previous_digest" == sha256:* &&
+           "$previous_reference" == *"@$previous_digest" ]] || {
+            echo "build-image: previous image ID/digest association is invalid" >&2
+            exit 1
+        }
+        retained_reference="${previous_reference%@*}:retained-${previous_digest#sha256:}"
+        if podman image exists "$retained_reference"; then
+            [[ $(podman image inspect --format '{{.Id}} {{.Digest}}' "$retained_reference") == "$previous_identity" ]] || {
+                echo "build-image: refusing to replace a different retained image" >&2
+                exit 1
+            }
+        else
+            status=$?
+            [[ $status -eq 1 ]] || exit "$status"
+            podman tag "$previous_id" "$retained_reference"
+        fi
+        [[ $(podman image inspect --format '{{.Id}} {{.Digest}}' "$retained_reference") == "$previous_identity" ]] || {
+            echo "build-image: retained image identity changed" >&2
+            exit 1
+        }
+    else
+        status=$?
+        [[ $status -eq 1 ]] || exit "$status"
+    fi
+fi
+
 echo ":: loading into podman"
 loaded=$(podman load -i "$out")
 echo ":: $loaded"
+
+if [[ -n "$previous_identity" ]]; then
+    [[ $(podman image inspect --format '{{.Id}} {{.Digest}}' "$previous_reference") == "$previous_identity" ]] || {
+        echo "build-image: previous name@digest became unavailable after loading the new image" >&2
+        exit 1
+    }
+fi
 
 # Record the full name@digest reference: `podman image exists` does not resolve
 # a bare manifest digest, so a bare sha256 would make the runner fail closed on

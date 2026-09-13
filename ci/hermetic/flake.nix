@@ -113,6 +113,10 @@
         lua5_4 gnum4 nodejs openssh ruby tcl util-linux procps
       ];
 
+      # The CLI replay tests run GDB outside Hermit and execute Python commands.
+      # Keep this test driver separate from guest and compiler dependencies.
+      testTools = [ (pkgs.gdb.override { pythonSupport = true; }) ];
+
       # Native libraries need both their runtime and development outputs. A Nix
       # image does not populate FHS search paths, so the environment below makes
       # these exact pinned outputs visible to build scripts and the C compiler.
@@ -138,7 +142,7 @@
           # Fixed timestamp: a build whose output moves with the wall clock
           # cannot be checked for reproducibility.
           created = "1970-01-01T00:00:01Z";
-          contents = guestTools ++ buildTools ++ [
+          contents = guestTools ++ buildTools ++ testTools ++ [
             pkgs.dockerTools.binSh
             pkgs.dockerTools.usrBinEnv
             pkgs.dockerTools.caCertificates
@@ -161,7 +165,7 @@
             # Selected portable cells name these FHS paths literally. Nix
             # places their providers in /bin, while usrBinEnv creates only
             # /usr/bin/env; add exactly the audited compatibility paths.
-            for command in bash date df du find git node python3 sort tr; do
+            for command in bash date df du find git node nproc python3 sort stat tr; do
               ln -s "/bin/$command" "usr/bin/$command"
             done
             ln -s /bin/node usr/bin/nodejs
