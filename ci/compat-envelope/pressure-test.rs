@@ -9,6 +9,7 @@
 //! hermit-manifest-plan = { path = "../manifest-plan" }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
+//! sha2 = "0.10"
 //! ```
 
 #[path = "../../scripts/lib/rust_script_prelude.rs"]
@@ -49,6 +50,7 @@ use dagrun::cgroup::aggregate_slice_max_cpus;
 use dagrun::container_core_budget;
 use dagrun::scheduler::BoxedCgroups;
 use dagrun::scheduler::run_dag_boxed_deadline;
+use hermit_manifest_plan::canonical_verdict::NoResultReason;
 use hermit_manifest_plan::canonical_verdict::RuntimeStats;
 use hermit_manifest_plan::canonical_verdict::VerificationReport;
 use hermit_manifest_plan::canonical_verdict::VerificationRuntime;
@@ -64,6 +66,9 @@ use hermit_manifest_plan::runner::E2E_RUN_INDEX_ENV;
 use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::ObservedResult;
 use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
+use hermit_manifest_plan::stress_series::SeriesNoVerdictKind;
+use hermit_manifest_plan::stress_series::SeriesPressureAttempt;
+use hermit_manifest_plan::stress_series::SeriesPressureComparison;
 use hermit_manifest_plan::timeouts::TimeoutMultipliers;
 use hermit_manifest_plan::timeouts::resolve_test_timeouts;
 use hermit_manifest_plan::timeouts::timeout_multipliers_from_env;
@@ -72,6 +77,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use serde_json::json;
+use sha2::Digest;
 
 const TRACKED_CELLS: &str = "ci/compat-envelope/cells.json";
 const PORTABLE_DAG: &str = "ci/dag/validate.json";
@@ -4058,6 +4064,7 @@ struct RepeatedOutcomeCounts {
     no_results: usize,
     mixed_repetitions: usize,
     missing_repetitions: usize,
+    unknown_history_repetitions: usize,
     retried_repetitions: usize,
 }
 
@@ -4098,6 +4105,7 @@ fn classify_pressure_sample(counts: RepeatedOutcomeCounts) -> PressureSampleClas
     if counts.expected_repetitions != PROMOTION_REPETITIONS
         || counts.observed_repetitions != counts.expected_repetitions
         || counts.missing_repetitions != 0
+        || counts.unknown_history_repetitions != 0
         || accounted != counts.observed_repetitions
         || counts.qualifying_passes > counts.terminal_passes
         || counts.retried_repetitions > counts.observed_repetitions
@@ -4128,7 +4136,7 @@ fn classify_pressure_sample(counts: RepeatedOutcomeCounts) -> PressureSampleClas
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum RepetitionClassification {
     ProductFailure,
     InfrastructureFailure,
@@ -4377,15 +4385,254 @@ fn repetition_passed_cleanly(terminal_result: &str, result_rows: &[CellResult]) 
 /// Qualifying a sample is stricter than the retained legacy clean-pass count.
 /// One framework attempt may contain several declared seeds or subruns; every
 /// one must pass, and none may be an error or a timed-out observation.
-fn qualifying_subruns(attempts: &[AttemptResult]) -> bool {
+fn qualifying_subruns(mode: &str, attempts: &[AttemptResult]) -> bool {
     let mut indices = BTreeSet::new();
-    !attempts.is_empty() && attempts.iter().all(|attempt| {
-        !attempt.index.trim().is_empty()
-            && indices.insert(attempt.index.as_str())
-            && attempt.outcome == "PASS"
-            && attempt.error_kind.is_none()
-            && !attempt.timed_out
-    })
+    !attempts.is_empty()
+        && attempts.iter().all(|attempt| {
+            !attempt.index.trim().is_empty()
+                && indices.insert(attempt.index.as_str())
+                && retained_pressure_attempt(mode, attempt).is_ok_and(|retained| {
+                    retained.outcome == "PASS"
+                        && retained.error_kind.is_none()
+                        && !retained.timed_out
+                        && inner_pressure_category(&retained).is_none()
+                })
+        })
+}
+
+fn canonical_pressure_comparison(mode: &str, report: &VerificationReport) -> bool {
+    if report.require_canonical_comparison().is_err() {
+        return false;
+    }
+    let Some(comparison) = &report.comparison else {
+        return false;
+    };
+    comparison.display_name.as_deref() == Some("BitwiseInfoV1")
+        && comparison.compare_io_buffers == Some(true)
+        && comparison.log_scope
+            == Some(hermit_manifest_plan::canonical_verdict::ComparedLogScope::Info)
+        && comparison.virtualize_time == Some(mode != "replay")
+        && comparison.strip_lines == Some(false)
+        && comparison.canonicalize_addresses == Some(true)
+        && comparison.full_trace == Some(true)
+        && comparison.exact_remainder == Some(true)
+        && comparison
+            .stripped_prefixes
+            .as_deref()
+            .is_some_and(|values| values == ["real-wall-clock-prefix/v1"])
+        && comparison
+            .canonicalizations
+            .as_deref()
+            .is_some_and(|values| values == ["host-address-to-first-appearance-ordinal/v1"])
+        && comparison.ignore_lines == Some(false)
+        && comparison.skip_commit == Some(false)
+        && comparison.skip_detlog == Some(false)
+}
+
+fn retained_pressure_attempt(
+    mode: &str,
+    attempt: &AttemptResult,
+) -> Result<SeriesPressureAttempt, String> {
+    let comparison = match &attempt.verification_report {
+        None => {
+            if attempt.verification_report_sha256.is_some() {
+                return Err("inner invocation has a report digest without report bytes".into());
+            }
+            None
+        }
+        Some(raw) => {
+            let digest = format!("{:x}", sha2::Sha256::digest(raw.as_bytes()));
+            if attempt.verification_report_sha256.as_deref() != Some(digest.as_str()) {
+                return Err(
+                    "inner verification report digest differs from its retained bytes".into(),
+                );
+            }
+            let value =
+                serde_json::from_str::<JsonValue>(raw).map_err(|error| error.to_string())?;
+            let report = VerificationReport::from_current_json_value(value)?;
+            let no_result_kind = match report.verdict {
+                Verdict::Matched | Verdict::Diverged => {
+                    let matched = report.verdict == Verdict::Matched;
+                    if report.verified != matched
+                        || report.bitwise_parity != matched
+                        || report.no_result_reason.is_some()
+                        || !report
+                            .compared_log_messages
+                            .is_some_and(|counts| counts.left > 0 && counts.right > 0)
+                    {
+                        return Err("inner comparison report contradicts its verdict or lacks positive counts".into());
+                    }
+                    None
+                }
+                Verdict::InfrastructureError => {
+                    if report.verified || report.bitwise_parity || report.no_result_reason.is_some()
+                    {
+                        return Err("inner infrastructure report contradicts its verdict".into());
+                    }
+                    None
+                }
+                Verdict::NoResult => {
+                    if report.verified
+                        || report.bitwise_parity
+                        || report.comparison.is_some()
+                        || report.compared_log_messages.is_some()
+                        || report.dbt_counted_branches.is_some()
+                        || report.first_divergent_scheduler_turn.is_some()
+                        || report.first_divergent_virtual_nanoseconds.is_some()
+                        || report.first_divergent_record.is_some()
+                        || report.first_divergent_syscall.is_some()
+                        || report.first_divergent_left_message.is_some()
+                        || report.first_divergent_right_message.is_some()
+                        || attempt.first_divergent_scheduler_turn.is_some()
+                        || attempt.first_divergent_virtual_nanoseconds.is_some()
+                        || attempt.first_divergent_record.is_some()
+                        || attempt.first_divergent_syscall.is_some()
+                        || attempt.first_divergent_left_message.is_some()
+                        || attempt.first_divergent_right_message.is_some()
+                    {
+                        return Err(
+                            "inner no-result report carries contradictory comparison evidence"
+                                .into(),
+                        );
+                    }
+                    Some(match &report.no_result_reason {
+                        Some(NoResultReason::NotRun) => {
+                            if report.guest_exit_code.is_some() || report.guest_signal.is_some() {
+                                return Err(
+                                    "inner NotRun report invents a guest disposition".into()
+                                );
+                            }
+                            SeriesNoVerdictKind::NotRun
+                        }
+                        Some(NoResultReason::FirstRunRejected {
+                            exit_code, signal, ..
+                        }) => {
+                            if exit_code.is_some() == signal.is_some()
+                                || exit_code.is_some_and(|status| status < 0)
+                                || signal.is_some_and(|signal| signal <= 0)
+                                || report.guest_exit_code != *exit_code
+                                || report.guest_signal != *signal
+                            {
+                                return Err("inner FirstRunRejected report has inconsistent guest disposition".into());
+                            }
+                            SeriesNoVerdictKind::FirstRunRejected
+                        }
+                        None => return Err("inner no-result report omitted its reason".into()),
+                    })
+                }
+            };
+            Some(SeriesPressureComparison {
+                verdict: report.verdict,
+                canonical: matches!(report.verdict, Verdict::Matched | Verdict::Diverged)
+                    && canonical_pressure_comparison(mode, &report)
+                    && (report.verdict != Verdict::Matched
+                        || report
+                            .compared_log_messages
+                            .is_some_and(|counts| counts.left == counts.right)),
+                report_sha256: digest,
+                no_result_kind,
+            })
+        }
+    };
+    let retained = SeriesPressureAttempt {
+        index: attempt.index.clone(),
+        outcome: attempt.outcome.clone(),
+        error_kind: attempt.error_kind.clone(),
+        status: attempt.status,
+        signal: attempt.signal,
+        timed_out: attempt.timed_out,
+        comparison,
+    };
+    retained.validate_for_mode(mode)?;
+    Ok(retained)
+}
+
+fn inner_pressure_category(attempt: &SeriesPressureAttempt) -> Option<RepetitionClassification> {
+    // This precedence is the runner's exact non_product_failure_class mapping.
+    match attempt.error_kind.as_deref() {
+        Some("guest-launch-refused" | "backend-unavailable") => {
+            return Some(RepetitionClassification::PrerequisiteFailure);
+        }
+        Some("infrastructure" | "result-publication") => {
+            return Some(RepetitionClassification::InfrastructureFailure);
+        }
+        Some("incomplete-verification-evidence" | "invalid-backend-evidence") => {
+            return Some(RepetitionClassification::NoResult);
+        }
+        _ => {}
+    }
+    if attempt.timed_out {
+        return Some(RepetitionClassification::NoResult);
+    }
+    if let Some(comparison) = &attempt.comparison {
+        return match comparison.verdict {
+            Verdict::Matched if comparison.canonical => None,
+            Verdict::Diverged if comparison.canonical => {
+                Some(RepetitionClassification::ProductFailure)
+            }
+            Verdict::Matched | Verdict::Diverged => Some(RepetitionClassification::NoResult),
+            Verdict::InfrastructureError => Some(RepetitionClassification::InfrastructureFailure),
+            Verdict::NoResult
+                if comparison.no_result_kind == Some(SeriesNoVerdictKind::FirstRunRejected) =>
+            {
+                Some(RepetitionClassification::ProductFailure)
+            }
+            Verdict::NoResult => Some(RepetitionClassification::NoResult),
+        };
+    }
+    match attempt.outcome.as_str() {
+        "PASS" => None,
+        "FAIL" => Some(RepetitionClassification::ProductFailure),
+        _ => Some(RepetitionClassification::NoResult),
+    }
+}
+
+fn inner_pressure_history(
+    rows: &[CellResult],
+) -> Result<BTreeSet<RepetitionClassification>, String> {
+    // Keep the shared maximum, contiguous ordinals, terminal-PASS refusal and
+    // framework-selected outcome. Inner declared subruns do not add retries.
+    cell_result_after_retries(rows)?;
+    let mut categories = BTreeSet::new();
+    for row in rows {
+        if row.attempts.is_empty() {
+            return Err(format!(
+                "outer attempt {} has no retained inner history",
+                row.attempt
+            ));
+        }
+        let mut indices = BTreeSet::new();
+        for attempt in &row.attempts {
+            if attempt.index.trim().is_empty() || !indices.insert(&attempt.index) {
+                return Err(format!(
+                    "outer attempt {} has empty or duplicate inner indices",
+                    row.attempt
+                ));
+            }
+            let retained = retained_pressure_attempt(&row.mode, attempt)?;
+            if let Some(category) = inner_pressure_category(&retained) {
+                categories.insert(category);
+            }
+        }
+    }
+    Ok(categories)
+}
+
+fn fold_pressure_history(
+    outer: RepetitionClassification,
+    inner: &BTreeSet<RepetitionClassification>,
+) -> RepetitionClassification {
+    if matches!(
+        outer,
+        RepetitionClassification::Missing | RepetitionClassification::Mixed
+    ) {
+        return outer;
+    }
+    if inner.iter().any(|category| *category != outer) {
+        RepetitionClassification::Mixed
+    } else {
+        outer
+    }
 }
 
 fn repetition_qualifies_for_promotion(terminal_result: &str, rows: &[CellResult]) -> bool {
@@ -4395,7 +4642,7 @@ fn repetition_qualifies_for_promotion(terminal_result: &str, rows: &[CellResult]
         && rows[0].result == Some(ObservedResult::Pass)
         && rows[0].failure_class.is_none()
         && !rows[0].source_tree_dirty
-        && qualifying_subruns(&rows[0].attempts)
+        && qualifying_subruns(&rows[0].mode, &rows[0].attempts)
 }
 
 fn repeated_run_has_unacceptable_product_result(
@@ -4434,6 +4681,7 @@ fn repeated_cell_summary(
         "no_results": counts.no_results,
         "mixed_repetitions": counts.mixed_repetitions,
         "missing_repetitions": counts.missing_repetitions,
+        "unknown_history_repetitions": counts.unknown_history_repetitions,
     })
 }
 
@@ -4495,6 +4743,7 @@ fn verify_repetition_summary_json(
         let missing = cell
             .get("missing_repetitions")
             .and_then(JsonValue::as_u64);
+        let unknown_history = cell.get("unknown_history_repetitions").and_then(JsonValue::as_u64);
         let classification = cell.get("classification").and_then(JsonValue::as_str);
         let promotion_candidate = cell
             .get("promotion_candidate")
@@ -4512,6 +4761,7 @@ fn verify_repetition_summary_json(
             || no_results.is_none()
             || mixed.is_none()
             || missing.is_none()
+            || unknown_history.is_none()
             || classification.is_none()
             || promotion_candidate.is_none()
             || cell.get("result").and_then(JsonValue::as_str).is_none()
@@ -4533,11 +4783,13 @@ fn verify_repetition_summary_json(
             no_results: no_results.unwrap() as usize,
             mixed_repetitions: mixed.unwrap() as usize,
             missing_repetitions: missing.unwrap() as usize,
+            unknown_history_repetitions: unknown_history.unwrap() as usize,
             retried_repetitions: retried.unwrap() as usize,
         };
         let expected_classification = classify_pressure_sample(counts);
         if total != expected
             || qualifying > clean_passes
+            || unknown_history > expected
             || classification != Some(expected_classification.as_str())
             || promotion_candidate
                 != Some(
@@ -5317,6 +5569,17 @@ fn summarize(
                 counts.expected_repetitions += 1;
                 counts.clean_passes += usize::from(repetition_passed_cleanly(result, &result_rows_for_history));
                 counts.retried_repetitions += usize::from(retained_attempts > 1);
+                let inner_history = if result_rows_for_history.is_empty() {
+                    None
+                } else {
+                    Some(inner_pressure_history(&result_rows_for_history))
+                };
+                counts.unknown_history_repetitions += usize::from(
+                    inner_history.as_ref().is_some_and(|history| history.is_err())
+                );
+                if let Some(Err(error)) = &inner_history {
+                    sample_evidence_errors.push(error.clone());
+                }
                 if result == "pass" {
                     counts.observed_repetitions += 1;
                     counts.terminal_passes += 1;
@@ -5326,19 +5589,24 @@ fn summarize(
                             && repetition_qualifies_for_promotion(result, &result_rows_for_history)
                     );
                 } else {
-                    let classification = if !sample_evidence_errors.is_empty() {
+                    let classification = if !sample_evidence_errors.is_empty() && !row_valid {
                         RepetitionClassification::Missing
                     } else {
-                        classify_nonpassing_repetition(
+                        let outer = classify_nonpassing_repetition(
                             result, &result_rows_for_history, row_valid,
                             if prepared_empty_result_file {
                                 initial_evidence_valid
                             } else {
                                 evidence_errors.is_empty()
+                                    || inner_history.as_ref().is_some_and(|history| history.is_ok())
                             },
                             rejected_result_history, proven_timeout, proven_oom,
                             retained_prerequisite,
-                        )
+                        );
+                        match &inner_history {
+                            Some(Ok(inner)) => fold_pressure_history(outer, inner),
+                            _ => outer,
+                        }
                     };
                     match classification {
                         RepetitionClassification::ProductFailure => counts.product_failures += 1,
@@ -6474,6 +6742,7 @@ fn pressure_sample_classification_self_test() -> Result<(), String> {
         no_results,
         mixed_repetitions: 0,
         missing_repetitions,
+        unknown_history_repetitions: 0,
         retried_repetitions,
     };
     let promotion_cases = [
@@ -9641,6 +9910,53 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("restoring exact current evidence changed its fresh summary".into());
     }
 
+    let mut first_pass = summarize_second.clone();
+    first_pass.attempt = 1;
+    first_pass.attempts = vec![fixture_attempt("PASS", 0)];
+    fs::write(&summary_result_path, format!("{}\n", serde_json::to_string(&first_pass)
+        .map_err(|error| error.to_string())?)).map_err(|error| error.to_string())?;
+    summarize(root, &summarize_retry_results, false, Some(&summarize_runner), true)?;
+    let clean_summary = read_summary()?;
+    if clean_summary["repeated_cells"][0]["passes"] != 1
+        || clean_summary["repeated_cells"][0]["clean_passes"] != 1
+        || clean_summary["repeated_cells"][0]["qualifying_passes"] != 1
+    {
+        return Err(format!("clean first-attempt summary lost qualification: {clean_summary}"));
+    }
+    let mut adverse_inner = first_pass.clone();
+    let first_inner = fixture_attempt("FAIL", 1);
+    let mut second_inner = fixture_attempt("PASS", 0); second_inner.index = "2".into();
+    adverse_inner.attempts = vec![first_inner, second_inner];
+    fs::write(&summary_result_path, format!("{}\n", serde_json::to_string(&adverse_inner)
+        .map_err(|error| error.to_string())?)).map_err(|error| error.to_string())?;
+    summarize(root, &summarize_retry_results, false, Some(&summarize_runner), true)?;
+    let adverse_summary = read_summary()?;
+    if adverse_summary["repeated_cells"][0]["passes"] != 1
+        || adverse_summary["repeated_cells"][0]["clean_passes"] != 1
+        || adverse_summary["repeated_cells"][0]["qualifying_passes"] != 0
+        || adverse_summary["repeated_cells"][0]["promotion_candidate"] != false
+        || adverse_summary["rows"][0]["result"] != "pass"
+        || adverse_summary["rows"][0]["invocation"]["attempts"].as_array().map(Vec::len) != Some(2)
+    {
+        return Err(format!("outer PASS hid an adverse inner invocation: {adverse_summary}"));
+    }
+    let mut unknown_inner = first_pass.clone();
+    unknown_inner.attempts[0].status = None;
+    fs::write(&summary_result_path, format!("{}\n", serde_json::to_string(&unknown_inner)
+        .map_err(|error| error.to_string())?)).map_err(|error| error.to_string())?;
+    summarize(root, &summarize_retry_results, false, Some(&summarize_runner), true)?;
+    let unknown_summary = read_summary()?;
+    if unknown_summary["repeated_cells"][0]["passes"] != 1
+        || unknown_summary["repeated_cells"][0]["clean_passes"] != 1
+        || unknown_summary["repeated_cells"][0]["qualifying_passes"] != 0
+        || unknown_summary["repeated_cells"][0]["unknown_history_repetitions"] != 1
+        || unknown_summary["repeated_cells"][0]["classification"] != "incomplete"
+        || unknown_summary["rows"][0]["result"] != "pass"
+    {
+        return Err(format!("unknown inner history changed PASS or claimed complete evidence: {unknown_summary}"));
+    }
+    fs::write(&summary_result_path, &saved_results).map_err(|error| error.to_string())?;
+
     // HOST-INAPPLICABLE is deliberately withheld from results.jsonl by the
     // manifest runner because no product attempt ran. Its one-cell harness
     // summary is therefore the canonical retained prerequisite evidence.
@@ -10375,49 +10691,536 @@ mod pressure_sample_tests {
         let first = fixture_attempt("PASS", 0);
         let mut second = first.clone();
         second.index = "2".into();
-        assert!(qualifying_subruns(&[first.clone(), second.clone()]));
-        assert!(!qualifying_subruns(&[]));
+        assert!(qualifying_subruns(
+            "naked",
+            &[first.clone(), second.clone()]
+        ));
+        assert!(!qualifying_subruns("naked", &[]));
         for outcome in ["FAIL", "ERROR", "HOST-INAPPLICABLE", "UNKNOWN"] {
             let mut failed = first.clone();
             failed.outcome = outcome.into();
-            assert!(!qualifying_subruns(&[failed, second.clone()]), "{outcome}");
+            assert!(
+                !qualifying_subruns("naked", &[failed, second.clone()]),
+                "{outcome}"
+            );
         }
         let mut timed_out = first.clone();
         timed_out.timed_out = true;
-        assert!(!qualifying_subruns(&[timed_out, second.clone()]));
+        assert!(!qualifying_subruns("naked", &[timed_out, second.clone()]));
         let mut error = first.clone();
         error.error_kind = Some("infrastructure".into());
-        assert!(!qualifying_subruns(&[error, second]));
-        assert!(!qualifying_subruns(&[first.clone(), first]));
+        assert!(!qualifying_subruns("naked", &[error, second]));
+        assert!(!qualifying_subruns("naked", &[first.clone(), first]));
+    }
+
+    fn comparison_attempt(mode: &str, status: i32) -> AttemptResult {
+        let mut attempt = fixture_attempt("PASS", status);
+        let mut report = serde_json::to_value(VerificationReport::no_result()).unwrap();
+        report["verified"] = json!(true);
+        report["bitwise_parity"] = json!(true);
+        report["verdict"] = json!("matched");
+        report["no_result_reason"] = JsonValue::Null;
+        report["guest_exit_code"] = json!(status);
+        report["compared_log_messages"] = json!({"left": 17, "right": 17});
+        report["comparison"] = json!({
+            "strictness":"canonical", "display_name":"BitwiseInfoV1", "compare_logs":true,
+            "compare_io_buffers":true, "log_scope":"info", "record_envelope":"all_records_v1",
+            "virtualize_time":mode != "replay", "strip_lines":false,
+            "canonicalize_addresses":true, "full_trace":true, "exact_remainder":true,
+            "stripped_prefixes":["real-wall-clock-prefix/v1"],
+            "canonicalizations":["host-address-to-first-appearance-ordinal/v1"],
+            "ignore_lines":false, "skip_commit":false, "skip_detlog":false
+        });
+        replace_report(&mut attempt, report);
+        attempt
+    }
+
+    fn replace_report(attempt: &mut AttemptResult, report: JsonValue) {
+        let raw = serde_json::to_string(&report).unwrap();
+        attempt.verification_report_sha256 =
+            Some(format!("{:x}", sha2::Sha256::digest(raw.as_bytes())));
+        attempt.verification_report = Some(raw);
+    }
+
+    #[test]
+    fn comparison_subruns_require_every_current_report_hash_and_process() {
+        for (mode, status) in [("verify", 0), ("replay", 0), ("chaos", 17)] {
+            let first = comparison_attempt(mode, status);
+            let mut second = first.clone();
+            second.index = "2".into();
+            assert!(
+                qualifying_subruns(mode, &[first.clone(), second.clone()]),
+                "{mode}"
+            );
+            let mut absent = first.clone();
+            absent.verification_report = None;
+            assert!(
+                !qualifying_subruns(mode, &[absent, second.clone()]),
+                "{mode}: missing first report"
+            );
+            let mut wrong = first.clone();
+            wrong.verification_report_sha256 = Some("0".repeat(64));
+            assert!(
+                !qualifying_subruns(mode, &[wrong, second.clone()]),
+                "{mode}: wrong first digest"
+            );
+            let mut signal = first.clone();
+            signal.signal = Some(9);
+            assert!(
+                !qualifying_subruns(mode, &[signal, second.clone()]),
+                "{mode}: contradictory process"
+            );
+            for (field, value) in [
+                ("strictness", json!("stripped")),
+                ("compare_io_buffers", json!(false)),
+                ("full_trace", json!(false)),
+                ("exact_remainder", json!(false)),
+                ("skip_commit", json!(true)),
+                ("virtualize_time", json!(mode == "replay")),
+                ("display_name", json!("other")),
+                ("log_scope", json!("detlog")),
+                ("ignore_lines", json!(true)),
+                ("strip_lines", json!(true)),
+            ] {
+                let mut changed = first.clone();
+                let mut report: JsonValue =
+                    serde_json::from_str(changed.verification_report.as_ref().unwrap()).unwrap();
+                report["comparison"][field] = value;
+                replace_report(&mut changed, report);
+                assert!(
+                    !qualifying_subruns(mode, &[changed, second.clone()]),
+                    "{mode}: {field}"
+                );
+            }
+            for counts in [json!({"left":0,"right":0}), json!({"left":17,"right":18})] {
+                let mut changed = first.clone();
+                let mut report: JsonValue =
+                    serde_json::from_str(changed.verification_report.as_ref().unwrap()).unwrap();
+                report["compared_log_messages"] = counts;
+                replace_report(&mut changed, report);
+                assert!(
+                    !qualifying_subruns(mode, &[changed, second.clone()]),
+                    "{mode}: invalid message counts"
+                );
+            }
+            let mut missing_field = first.clone();
+            let mut report: JsonValue =
+                serde_json::from_str(missing_field.verification_report.as_ref().unwrap()).unwrap();
+            report["comparison"]
+                .as_object_mut()
+                .unwrap()
+                .remove("exact_remainder");
+            replace_report(&mut missing_field, report);
+            assert!(!qualifying_subruns(mode, &[missing_field, second]));
+        }
+        let nonzero_verify = comparison_attempt("verify", 17);
+        assert!(!qualifying_subruns("verify", &[nonzero_verify]));
+    }
+
+    fn history_row(
+        mode: &str,
+        outcome: &str,
+        attempt: u64,
+        inner: Vec<AttemptResult>,
+    ) -> CellResult {
+        let mut row: CellResult = serde_json::from_value(json!({
+            "schema":4,"run_id":"sample","hermit_sha":"a","source_tree_dirty":false,
+            "test":"fixture/cell","category":"fixture","lane":"portable","mode":mode,
+            "backend":"ptrace","classification":"required","outcome":outcome,"attempt":attempt,
+            "argv":["fixture"],"guest_argv":["fixture"],"env":{},"cwd":"/","shell_command":"fixture",
+            "attempts":inner,"artifact_dir":format!("/retained/{attempt}")
+        })).unwrap();
+        row.result = match outcome {
+            "PASS" => Some(ObservedResult::Pass),
+            "FAIL" => Some(ObservedResult::CrashError),
+            _ => None,
+        };
+        row.failure_class = match outcome {
+            "PASS" => None,
+            "FAIL" => Some(FailureClass::ProductFailure),
+            _ => Some(FailureClass::NoResult),
+        };
+        row
+    }
+
+    fn no_result_attempt(kind: &str, error: Option<&str>) -> AttemptResult {
+        let rejected = kind == "first_run_rejected";
+        let mut attempt = fixture_attempt(if rejected { "FAIL" } else { "ERROR" }, 125);
+        attempt.error_kind = error.map(str::to_owned);
+        let mut report = serde_json::to_value(VerificationReport::no_result()).unwrap();
+        if rejected {
+            report["no_result_reason"] = json!({"kind":kind,"exit_code":17,"signal":null,
+                "stdout_bytes":0,"stderr_bytes":0});
+            report["guest_exit_code"] = json!(17);
+        }
+        replace_report(&mut attempt, report);
+        attempt
+    }
+
+    #[test]
+    fn inner_adverse_categories_preserve_outer_failures_and_successful_declared_subruns() {
+        let pass = comparison_attempt("chaos", 17);
+        let mut declared = pass.clone();
+        declared.index = "2".into();
+        let row = history_row("chaos", "FAIL", 1, vec![pass.clone(), declared]);
+        let neutral = inner_pressure_history(&[row]).unwrap();
+        assert!(neutral.is_empty());
+        assert_eq!(
+            fold_pressure_history(RepetitionClassification::ProductFailure, &neutral),
+            RepetitionClassification::ProductFailure
+        );
+        let mut diverged = comparison_attempt("verify", 0);
+        diverged.outcome = "FAIL".into();
+        diverged.status = Some(1);
+        let mut report: JsonValue =
+            serde_json::from_str(diverged.verification_report.as_ref().unwrap()).unwrap();
+        report["verdict"] = json!("diverged");
+        report["verified"] = json!(false);
+        report["bitwise_parity"] = json!(false);
+        replace_report(&mut diverged, report);
+        let rejected = no_result_attempt("first_run_rejected", None);
+        for attempt in [diverged, rejected] {
+            let row = history_row("verify", "FAIL", 1, vec![attempt]);
+            let categories = inner_pressure_history(&[row]).unwrap();
+            assert_eq!(
+                categories,
+                BTreeSet::from([RepetitionClassification::ProductFailure])
+            );
+            assert_eq!(
+                fold_pressure_history(RepetitionClassification::ProductFailure, &categories),
+                RepetitionClassification::ProductFailure
+            );
+        }
+        for (error, expected) in [
+            (
+                "guest-launch-refused",
+                RepetitionClassification::PrerequisiteFailure,
+            ),
+            (
+                "backend-unavailable",
+                RepetitionClassification::PrerequisiteFailure,
+            ),
+            (
+                "infrastructure",
+                RepetitionClassification::InfrastructureFailure,
+            ),
+            (
+                "result-publication",
+                RepetitionClassification::InfrastructureFailure,
+            ),
+            (
+                "incomplete-verification-evidence",
+                RepetitionClassification::NoResult,
+            ),
+            (
+                "invalid-backend-evidence",
+                RepetitionClassification::NoResult,
+            ),
+            ("unknown-error", RepetitionClassification::NoResult),
+        ] {
+            let mut adverse = no_result_attempt("not_run", Some(error));
+            adverse.index = "2".into();
+            let row = history_row("chaos", "FAIL", 1, vec![pass.clone(), adverse]);
+            let categories = inner_pressure_history(&[row]).unwrap();
+            assert_eq!(categories, BTreeSet::from([expected]), "{error}");
+            assert_eq!(
+                fold_pressure_history(RepetitionClassification::ProductFailure, &categories),
+                RepetitionClassification::Mixed,
+                "{error}"
+            );
+            assert_eq!(
+                fold_pressure_history(expected, &categories),
+                expected,
+                "{error}"
+            );
+        }
+        let mut noncanonical = pass.clone();
+        let mut report: JsonValue =
+            serde_json::from_str(noncanonical.verification_report.as_ref().unwrap()).unwrap();
+        report["comparison"]["strictness"] = json!("stripped");
+        replace_report(&mut noncanonical, report);
+        let categories =
+            inner_pressure_history(&[history_row("chaos", "FAIL", 1, vec![noncanonical])]).unwrap();
+        assert_eq!(
+            categories,
+            BTreeSet::from([RepetitionClassification::NoResult])
+        );
+        assert_eq!(
+            fold_pressure_history(RepetitionClassification::ProductFailure, &categories),
+            RepetitionClassification::Mixed
+        );
+        let mut infrastructure = no_result_attempt("not_run", Some("infrastructure"));
+        let mut report = serde_json::to_value(VerificationReport::no_result()).unwrap();
+        report["verdict"] = json!("infrastructure_error");
+        report["no_result_reason"] = JsonValue::Null;
+        report["infrastructure_error"] = json!({"kind":"skid_overshoot","count":1});
+        replace_report(&mut infrastructure, report.clone());
+        let retained = retained_pressure_attempt("verify", &infrastructure).unwrap();
+        assert_eq!(
+            inner_pressure_category(&retained),
+            Some(RepetitionClassification::InfrastructureFailure)
+        );
+        for (field, value) in [
+            ("verified", json!(true)),
+            ("bitwise_parity", json!(true)),
+            (
+                "infrastructure_error",
+                json!({"kind":"skid_overshoot","count":0}),
+            ),
+        ] {
+            let mut bad = infrastructure.clone();
+            let mut changed = report.clone();
+            changed[field] = value;
+            replace_report(&mut bad, changed);
+            assert!(
+                retained_pressure_attempt("verify", &bad).is_err(),
+                "{field}"
+            );
+        }
+        let mut missing_timeout = fixture_attempt("ERROR", 124);
+        missing_timeout.timed_out = true;
+        missing_timeout.error_kind = Some("wall-timeout".into());
+        assert_eq!(
+            inner_pressure_category(
+                &retained_pressure_attempt("verify", &missing_timeout).unwrap()
+            ),
+            Some(RepetitionClassification::NoResult)
+        );
+        let mut bad_timeout = missing_timeout.clone();
+        bad_timeout.error_kind = None;
+        assert!(retained_pressure_attempt("verify", &bad_timeout).is_err());
+        for cause in [
+            "cpu-timeout",
+            "wall-timeout",
+            "incomplete-verification-evidence",
+        ] {
+            let mut prelaunch = no_result_attempt("not_run", Some(cause));
+            prelaunch.timed_out = true;
+            prelaunch.status = None;
+            assert_eq!(
+                inner_pressure_category(&retained_pressure_attempt("verify", &prelaunch).unwrap()),
+                Some(RepetitionClassification::NoResult),
+                "{cause}"
+            );
+            let mut contradiction = prelaunch.clone();
+            contradiction.timed_out = false;
+            assert!(
+                retained_pressure_attempt("verify", &contradiction).is_err(),
+                "{cause}"
+            );
+        }
+        let rejected = no_result_attempt("first_run_rejected", None);
+        for (field, value) in [
+            ("exit_code", json!("17")),
+            ("exit_code", json!(18)),
+            ("signal", json!("9")),
+            ("signal", json!(9)),
+        ] {
+            let mut bad = rejected.clone();
+            let mut report: JsonValue =
+                serde_json::from_str(bad.verification_report.as_ref().unwrap()).unwrap();
+            report["no_result_reason"][field] = value;
+            replace_report(&mut bad, report);
+            assert!(
+                retained_pressure_attempt("verify", &bad).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_or_malformed_inner_history_is_incomplete_without_changing_terminal_passes() {
+        let valid = history_row("verify", "PASS", 1, vec![comparison_attempt("verify", 0)]);
+        assert!(
+            inner_pressure_history(std::slice::from_ref(&valid))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(repetition_qualifies_for_promotion(
+            "pass",
+            std::slice::from_ref(&valid)
+        ));
+        let mut dirty = valid.clone();
+        dirty.source_tree_dirty = true;
+        assert!(!repetition_qualifies_for_promotion("pass", &[dirty]));
+        let mut counts = RepeatedOutcomeCounts {
+            expected_repetitions: 10,
+            observed_repetitions: 10,
+            terminal_passes: 10,
+            clean_passes: 10,
+            qualifying_passes: 10,
+            ..RepeatedOutcomeCounts::default()
+        };
+        assert_eq!(
+            classify_pressure_sample(counts),
+            PressureSampleClassification::PromotionCandidate
+        );
+        for edit in [
+            (|row: &mut CellResult| row.attempts.clear()) as fn(&mut CellResult),
+            |row| row.attempts.push(row.attempts[0].clone()),
+            |row| row.attempts[0].index.clear(),
+            |row| row.attempts[0].verification_report = None,
+            |row| row.attempts[0].verification_report_sha256 = Some("0".repeat(64)),
+            |row| row.attempts[0].status = None,
+        ] {
+            let mut broken = valid.clone();
+            edit(&mut broken);
+            assert!(inner_pressure_history(&[broken.clone()]).is_err());
+            assert_eq!(broken.outcome, "PASS");
+            assert_eq!(broken.result, Some(ObservedResult::Pass));
+            counts.unknown_history_repetitions = 1;
+            counts.qualifying_passes = 9;
+            assert_eq!(
+                classify_pressure_sample(counts),
+                PressureSampleClassification::Incomplete
+            );
+        }
+        let mut noncanonical = valid.clone();
+        let mut report: JsonValue = serde_json::from_str(
+            noncanonical.attempts[0]
+                .verification_report
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        report["comparison"]["compare_io_buffers"] = json!(false);
+        replace_report(&mut noncanonical.attempts[0], report);
+        assert_eq!(
+            inner_pressure_history(&[noncanonical]).unwrap(),
+            BTreeSet::from([RepetitionClassification::NoResult])
+        );
+        counts.unknown_history_repetitions = 0;
+        assert_eq!(
+            classify_pressure_sample(counts),
+            PressureSampleClassification::Intermittent
+        );
+    }
+
+    #[test]
+    fn outer_retry_selection_refuses_post_pass_and_keeps_failure_before_error() {
+        let fail = history_row("naked", "FAIL", 1, vec![fixture_attempt("FAIL", 1)]);
+        let mut error = history_row("naked", "ERROR", 2, vec![fixture_attempt("ERROR", 125)]);
+        error.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+        error.attempts[0].error_kind = Some("infrastructure".into());
+        let failure_history = vec![fail.clone(), error.clone()];
+        assert_eq!(
+            cell_result_after_retries(&failure_history).unwrap().outcome,
+            "FAIL"
+        );
+        assert_eq!(
+            inner_pressure_history(&failure_history).unwrap(),
+            BTreeSet::from([
+                RepetitionClassification::ProductFailure,
+                RepetitionClassification::InfrastructureFailure
+            ])
+        );
+        assert_eq!(
+            classify_nonpassing_repetition(
+                "crash-error",
+                &failure_history,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+            ),
+            RepetitionClassification::Mixed
+        );
+        let mut pass = history_row("naked", "PASS", 2, vec![fixture_attempt("PASS", 0)]);
+        error.attempt = 1;
+        let recovered = vec![error.clone(), pass.clone()];
+        assert_eq!(
+            cell_result_after_retries(&recovered).unwrap().outcome,
+            "PASS"
+        );
+        assert!(!repetition_qualifies_for_promotion("pass", &recovered));
+        pass.attempt = 1;
+        error.attempt = 2;
+        for malformed in [
+            vec![pass.clone(), error.clone()],
+            vec![fail.clone(), fail.clone()],
+            vec![fail.clone(), {
+                let mut gap = error.clone();
+                gap.attempt = 3;
+                gap
+            }],
+            vec![fail.clone(), error.clone(), {
+                let mut third = error.clone();
+                third.attempt = 3;
+                third
+            }],
+            vec![
+                {
+                    let mut host = pass.clone();
+                    host.outcome = "HOST-INAPPLICABLE".into();
+                    host
+                },
+                error,
+            ],
+        ] {
+            assert!(cell_result_after_retries(&malformed).is_err());
+            assert!(inner_pressure_history(&malformed).is_err());
+        }
     }
 
     #[test]
     fn host_prerequisite_requires_exact_cell_and_complete_nonproduct_counts() {
-        let path = env::temp_dir().join(format!("hermit-pressure-self-test-sample-{}-{}",
-            std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let path = env::temp_dir().join(format!(
+            "hermit-pressure-self-test-sample-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         fs::create_dir(&path).unwrap();
         let guard = SelfTestDirectory::new(path.clone());
-        let cell = CellId { lane: "portable".into(), category: "sample".into(),
-            test: "sample/cell".into(), mode: "naked".into(), backend: "native".into() };
+        let cell = CellId {
+            lane: "portable".into(),
+            category: "sample".into(),
+            test: "sample/cell".into(),
+            mode: "naked".into(),
+            backend: "native".into(),
+        };
         let good = json!({"schema":1,"cells":1,"passed":0,"failed":0,"errors":0,
             "host_inapplicable":1,"host_inapplicable_cells":[{"test":cell.test,
             "mode":cell.mode,"backend":null,"reason":"required capability unavailable"}]});
-        let write = |value: &JsonValue| fs::write(path.join("summary.json"),
-            serde_json::to_vec(value).unwrap()).unwrap();
+        let write = |value: &JsonValue| {
+            fs::write(
+                path.join("summary.json"),
+                serde_json::to_vec(value).unwrap(),
+            )
+            .unwrap()
+        };
         write(&good);
         assert!(retained_host_inapplicable(&path, &cell).unwrap());
-        for (field, value) in [("schema",2),("cells",2),("passed",1),("failed",1),
-            ("errors",1),("host_inapplicable",2)] {
-            let mut changed = good.clone(); changed[field] = json!(value); write(&changed);
+        for (field, value) in [
+            ("schema", 2),
+            ("cells", 2),
+            ("passed", 1),
+            ("failed", 1),
+            ("errors", 1),
+            ("host_inapplicable", 2),
+        ] {
+            let mut changed = good.clone();
+            changed[field] = json!(value);
+            write(&changed);
             assert!(retained_host_inapplicable(&path, &cell).is_err(), "{field}");
         }
         for field in ["test", "mode", "backend", "reason"] {
-            let mut changed = good.clone(); changed["host_inapplicable_cells"][0][field] = json!("");
-            write(&changed); assert!(retained_host_inapplicable(&path, &cell).is_err(), "{field}");
+            let mut changed = good.clone();
+            changed["host_inapplicable_cells"][0][field] = json!("");
+            write(&changed);
+            assert!(retained_host_inapplicable(&path, &cell).is_err(), "{field}");
         }
         let mut duplicate = good.clone();
-        duplicate["host_inapplicable_cells"].as_array_mut().unwrap().push(good["host_inapplicable_cells"][0].clone());
-        write(&duplicate); assert!(retained_host_inapplicable(&path, &cell).is_err());
+        duplicate["host_inapplicable_cells"]
+            .as_array_mut()
+            .unwrap()
+            .push(good["host_inapplicable_cells"][0].clone());
+        write(&duplicate);
+        assert!(retained_host_inapplicable(&path, &cell).is_err());
         fs::write(path.join("summary.json"), "{").unwrap();
         assert!(retained_host_inapplicable(&path, &cell).is_err());
         guard.remove().unwrap();
