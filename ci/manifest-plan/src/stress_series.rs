@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::canonical_verdict::Verdict;
 pub use crate::host_capability::CapabilityVerdict as HostCapabilityVerdict;
 pub use crate::host_capability::HostCapabilities;
 pub use crate::host_capability::HostCapability;
@@ -201,6 +202,38 @@ pub struct SeriesNoVerdictEvidence {
     pub attempts: Vec<SeriesAttemptDisposition>,
 }
 
+/// Complete compact inner history for one pressure CellResult. The digest uses
+/// the same normalized source identity as no_verdict_evidence. The projection
+/// validates original reports before constructing this record; a digest alone
+/// does not authenticate source bytes that a reader does not possess.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesPressureEvidence {
+    pub evidence_sha256: String,
+    pub attempts: Vec<SeriesPressureAttempt>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesPressureAttempt {
+    pub index: String,
+    pub outcome: String,
+    pub error_kind: Option<String>,
+    pub status: Option<i32>,
+    pub signal: Option<i32>,
+    pub timed_out: bool,
+    pub comparison: Option<SeriesPressureComparison>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesPressureComparison {
+    pub verdict: Verdict,
+    pub canonical: bool,
+    pub report_sha256: String,
+    pub no_result_kind: Option<SeriesNoVerdictKind>,
+}
+
 fn is_prelaunch_timeout_disposition(disposition: &SeriesAttemptDisposition) -> bool {
     disposition.timed_out
         && disposition.status.is_none()
@@ -237,6 +270,10 @@ pub struct SeriesPayload {
     /// facts from duration, backend, or exit status alone.
     #[serde(default)]
     pub no_verdict_evidence: Option<SeriesNoVerdictEvidence>,
+    /// Additive pressure history. Old rows remain readable, but its absence
+    /// cannot establish a clean first attempt for sample promotion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure_evidence: Option<SeriesPressureEvidence>,
     pub run_index: u64,
     #[serde(default)]
     pub attempt: Option<u64>,
@@ -473,6 +510,198 @@ impl SeriesRow {
         if let Some(evidence) = &self.series.no_verdict_evidence {
             self.validate_no_verdict_evidence(evidence)?;
         }
+        if let Some(evidence) = &self.series.pressure_evidence {
+            self.validate_pressure_evidence(evidence)?;
+        }
+        Ok(())
+    }
+
+    fn validate_pressure_evidence(&self, evidence: &SeriesPressureEvidence) -> Result<(), String> {
+        if self.schema != SeriesSchema::V3 || self.producer != SeriesProducer::PressureTest {
+            return Err("pressure_evidence requires a pressure-test stress-series/v3 row".into());
+        }
+        if self.series.attempt.is_none_or(|attempt| attempt == 0)
+            || self.series.num_runs != 1
+            || self.series.last_run_index.is_some()
+        {
+            return Err(
+                "pressure_evidence requires one uncompressed explicit positive outer attempt"
+                    .into(),
+            );
+        }
+        if !is_sha256(&evidence.evidence_sha256) {
+            return Err("pressure_evidence.evidence_sha256 must be lowercase 64-hex".into());
+        }
+        if self
+            .series
+            .no_verdict_evidence
+            .as_ref()
+            .is_some_and(|other| other.evidence_sha256 != evidence.evidence_sha256)
+        {
+            return Err(
+                "pressure_evidence and no_verdict_evidence identify different CellResults".into(),
+            );
+        }
+        if evidence.attempts.is_empty() {
+            return Err("pressure_evidence.attempts must retain a nonempty inner history".into());
+        }
+        let mode = self.series.cell.rsplit('/').nth(1).unwrap_or_default();
+        let comparison_mode = matches!(mode, "verify" | "replay" | "chaos");
+        let mut indices = std::collections::BTreeSet::new();
+        for attempt in &evidence.attempts {
+            if attempt.index.trim().is_empty() || !indices.insert(&attempt.index) {
+                return Err("pressure_evidence attempt indices must be nonempty and unique".into());
+            }
+            if !matches!(attempt.outcome.as_str(), "PASS" | "FAIL" | "ERROR") {
+                return Err("pressure_evidence has an unsupported inner outcome".into());
+            }
+            if attempt
+                .error_kind
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty())
+                || attempt.status.is_some_and(|status| status < 0)
+                || attempt.signal.is_some_and(|signal| signal <= 0)
+                || (attempt.status.is_some() && attempt.signal.is_some())
+            {
+                return Err("pressure_evidence has an invalid process disposition".into());
+            }
+            let nonzero_process =
+                attempt.status.is_some_and(|status| status > 0) || attempt.signal.is_some();
+            let completed_pass =
+                attempt.outcome == "PASS" && !attempt.timed_out && attempt.error_kind.is_none();
+            if attempt.outcome == "PASS"
+                && (!completed_pass || (attempt.status.is_none() && attempt.signal.is_none()))
+            {
+                return Err(
+                    "pressure_evidence passing invocation lacks a completed process disposition"
+                        .into(),
+                );
+            }
+            let Some(comparison) = &attempt.comparison else {
+                if comparison_mode
+                    && !(attempt.outcome == "ERROR"
+                        && attempt.timed_out
+                        && attempt.error_kind.is_some()
+                        && nonzero_process)
+                {
+                    return Err("pressure_evidence comparison invocation omitted its report without a typed timeout".into());
+                }
+                continue;
+            };
+            if !comparison_mode {
+                return Err("pressure_evidence comparison appears on a noncomparison mode".into());
+            }
+            if !is_sha256(&comparison.report_sha256) {
+                return Err(
+                    "pressure_evidence comparison report_sha256 must be lowercase 64-hex".into(),
+                );
+            }
+            if comparison.canonical
+                && !matches!(comparison.verdict, Verdict::Matched | Verdict::Diverged)
+            {
+                return Err(
+                    "pressure_evidence non-verdict cannot claim a canonical comparison".into(),
+                );
+            }
+            if comparison.verdict != Verdict::NoResult && comparison.no_result_kind.is_some() {
+                return Err(
+                    "pressure_evidence comparison carries an unrelated no_result_kind".into(),
+                );
+            }
+            let valid = match comparison.verdict {
+                Verdict::Matched => {
+                    completed_pass
+                        && attempt.signal.is_none()
+                        && attempt
+                            .status
+                            .is_some_and(|status| mode == "chaos" || status == 0)
+                }
+                Verdict::Diverged => {
+                    attempt.outcome == "FAIL"
+                        && !attempt.timed_out
+                        && attempt.error_kind.is_none()
+                        && nonzero_process
+                }
+                Verdict::InfrastructureError => {
+                    attempt.outcome == "ERROR" && !attempt.timed_out && nonzero_process
+                }
+                Verdict::NoResult => match comparison.no_result_kind {
+                    Some(SeriesNoVerdictKind::NotRun) => {
+                        let prelaunch_timeout = attempt.timed_out
+                            && attempt.status.is_none()
+                            && attempt.signal.is_none()
+                            && matches!(
+                                attempt.error_kind.as_deref(),
+                                Some(
+                                    "incomplete-verification-evidence"
+                                        | "cpu-timeout"
+                                        | "wall-timeout"
+                                )
+                            );
+                        attempt.outcome == "ERROR"
+                            && attempt.error_kind.is_some()
+                            && (nonzero_process || prelaunch_timeout)
+                    }
+                    Some(SeriesNoVerdictKind::FirstRunRejected) => {
+                        attempt.outcome == "FAIL"
+                            && !attempt.timed_out
+                            && attempt.error_kind.is_none()
+                            && attempt.status.is_some_and(|status| status > 0)
+                            && attempt.signal.is_none()
+                    }
+                    _ => false,
+                },
+            };
+            if !valid {
+                return Err(format!(
+                    "pressure_evidence {} report contradicts its inner process disposition",
+                    comparison.verdict
+                ));
+            }
+        }
+        if let Some(other) = &self.series.no_verdict_evidence {
+            for disposition in &other.attempts {
+                let retained = evidence
+                    .attempts
+                    .iter()
+                    .find(|attempt| attempt.index == disposition.index)
+                    .ok_or("pressure_evidence omitted a no_verdict_evidence invocation")?;
+                let same_comparison = match (disposition.kind, &retained.comparison) {
+                    (SeriesNoVerdictKind::MissingReportTimeout, None) => true,
+                    (kind, Some(comparison)) => {
+                        let (verdict, no_result_kind) = match kind {
+                            SeriesNoVerdictKind::NotRun | SeriesNoVerdictKind::FirstRunRejected =>
+                                (Verdict::NoResult, Some(kind)),
+                            SeriesNoVerdictKind::InfrastructureError => (Verdict::InfrastructureError, None),
+                            SeriesNoVerdictKind::NoncanonicalMatch => (Verdict::Matched, None),
+                            SeriesNoVerdictKind::NoncanonicalDivergence => (Verdict::Diverged, None),
+                            SeriesNoVerdictKind::MissingReportTimeout =>
+                                return Err("pressure_evidence supplied a report for a missing-report disposition".into()),
+                        };
+                        !comparison.canonical
+                            && comparison.verdict == verdict
+                            && comparison.no_result_kind == no_result_kind
+                            && Some(&comparison.report_sha256)
+                                == disposition.verification_report_sha256.as_ref()
+                    }
+                    _ => false,
+                };
+                if retained.outcome != disposition.attempt_outcome
+                    || retained.error_kind != disposition.error_kind
+                    || retained.status != disposition.status
+                    || retained.signal != disposition.signal
+                    || retained.timed_out != disposition.timed_out
+                    || !same_comparison
+                {
+                    return Err(
+                        "pressure_evidence contradicts the same no_verdict_evidence invocation"
+                            .into(),
+                    );
+                }
+            }
+        }
+        // Inner history explains qualification; it never rewrites the exact
+        // framework result, including a retained PASS with an adverse subrun.
         Ok(())
     }
 
@@ -847,6 +1076,7 @@ mod tests {
                 result: Some(ObservedResult::Pass),
                 failure_class: None,
                 no_verdict_evidence: None,
+                pressure_evidence: None,
                 run_index: 1,
                 attempt: None,
                 num_runs: 1,
@@ -1361,5 +1591,277 @@ mod tests {
                 .unwrap_err()
                 .contains("noncanonical_match evidence")
         );
+    }
+
+    fn pressure_row() -> SeriesRow {
+        let mut value = row(SeriesSchema::V3);
+        value.producer = SeriesProducer::PressureTest;
+        value.series.attempt = Some(1);
+        value.series.pressure_evidence = Some(SeriesPressureEvidence {
+            evidence_sha256: "b".repeat(64),
+            attempts: vec![SeriesPressureAttempt {
+                index: "1".into(),
+                outcome: "PASS".into(),
+                error_kind: None,
+                status: Some(0),
+                signal: None,
+                timed_out: false,
+                comparison: Some(SeriesPressureComparison {
+                    verdict: Verdict::Matched,
+                    canonical: true,
+                    report_sha256: "c".repeat(64),
+                    no_result_kind: None,
+                }),
+            }],
+        });
+        value
+    }
+
+    #[test]
+    fn pressure_history_preserves_framework_result_and_declared_subruns() {
+        let mut value = pressure_row();
+        value.validate_for_write().unwrap();
+        let mut second = value.series.pressure_evidence.as_ref().unwrap().attempts[0].clone();
+        second.index = "2".into();
+        value
+            .series
+            .pressure_evidence
+            .as_mut()
+            .unwrap()
+            .attempts
+            .push(second);
+        value.validate_for_write().unwrap();
+        // Retain the producer's PASS while exposing its earlier adverse subrun.
+        let earlier = &mut value.series.pressure_evidence.as_mut().unwrap().attempts[0];
+        earlier.outcome = "FAIL".into();
+        earlier.status = Some(1);
+        earlier.comparison.as_mut().unwrap().verdict = Verdict::Diverged;
+        value.validate_for_write().unwrap();
+        assert_eq!(value.series.result, Some(ObservedResult::Pass));
+        let raw = serde_json::to_vec(&value).unwrap();
+        let decoded: SeriesRow = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(decoded, value);
+        // Chaos may accept an intentionally nonzero guest status.
+        let mut chaos = pressure_row();
+        chaos.series.cell = "fixture/test/chaos/ptrace".into();
+        chaos.series.pressure_evidence.as_mut().unwrap().attempts[0].status = Some(17);
+        chaos.validate_for_write().unwrap();
+        let mut custom = pressure_row();
+        custom.series.cell = "fixture/test/custom/ptrace".into();
+        let inner = &mut custom.series.pressure_evidence.as_mut().unwrap().attempts[0];
+        inner.comparison = None;
+        inner.status = None;
+        inner.signal = Some(11);
+        custom.validate_for_write().unwrap();
+    }
+
+    #[test]
+    fn pressure_history_binds_schema_producer_outer_attempt_and_source() {
+        let good = pressure_row();
+        for schema in [SeriesSchema::V1, SeriesSchema::V2] {
+            let mut bad = good.clone();
+            bad.schema = schema;
+            assert!(
+                bad.validate_for_read()
+                    .unwrap_err()
+                    .contains("pressure_evidence")
+            );
+        }
+        for producer in [SeriesProducer::Validate, SeriesProducer::HermitRepeat] {
+            let mut bad = good.clone();
+            bad.producer = producer;
+            assert!(
+                bad.validate_for_read()
+                    .unwrap_err()
+                    .contains("pressure_evidence")
+            );
+        }
+        for attempt in [None, Some(0)] {
+            let mut bad = good.clone();
+            bad.series.attempt = attempt;
+            assert!(bad.validate_for_read().is_err());
+        }
+        let mut collapsed = good.clone();
+        collapsed.series.num_runs = 2;
+        assert!(
+            collapsed
+                .validate_for_read()
+                .unwrap_err()
+                .contains("uncompressed")
+        );
+        collapsed = good.clone();
+        collapsed.series.last_run_index = Some(1);
+        assert!(
+            collapsed
+                .validate_for_read()
+                .unwrap_err()
+                .contains("uncompressed")
+        );
+        for digest in [
+            "",
+            "ABCDEF",
+            &"B".repeat(64),
+            &"0".repeat(63),
+            &"g".repeat(64),
+        ] {
+            let mut bad = good.clone();
+            bad.series
+                .pressure_evidence
+                .as_mut()
+                .unwrap()
+                .evidence_sha256 = digest.into();
+            assert!(
+                bad.validate_for_read()
+                    .unwrap_err()
+                    .contains("evidence_sha256")
+            );
+            let mut bad = good.clone();
+            bad.series.pressure_evidence.as_mut().unwrap().attempts[0]
+                .comparison
+                .as_mut()
+                .unwrap()
+                .report_sha256 = digest.into();
+            assert!(
+                bad.validate_for_read()
+                    .unwrap_err()
+                    .contains("report_sha256")
+            );
+        }
+    }
+
+    #[test]
+    fn pressure_history_refuses_missing_duplicate_and_contradictory_inner_facts() {
+        let good = pressure_row();
+        let mutate = |edit: fn(&mut SeriesPressureAttempt)| {
+            let mut bad = good.clone();
+            edit(&mut bad.series.pressure_evidence.as_mut().unwrap().attempts[0]);
+            assert!(
+                bad.validate_for_read().is_err(),
+                "accepted {:?}",
+                bad.series.pressure_evidence
+            );
+        };
+        for edit in [
+            (|a: &mut SeriesPressureAttempt| a.index.clear()) as fn(&mut SeriesPressureAttempt),
+            |a| a.outcome = "UNKNOWN".into(),
+            |a| a.status = Some(-1),
+            |a| a.signal = Some(0),
+            |a| a.signal = Some(9),
+            |a| a.error_kind = Some("".into()),
+            |a| a.error_kind = Some("infrastructure".into()),
+            |a| a.timed_out = true,
+            |a| a.comparison = None,
+            |a| a.status = None,
+            |a| a.status = Some(7),
+            |a| a.comparison.as_mut().unwrap().no_result_kind = Some(SeriesNoVerdictKind::NotRun),
+            |a| a.comparison.as_mut().unwrap().verdict = Verdict::NoResult,
+            |a| a.comparison.as_mut().unwrap().verdict = Verdict::InfrastructureError,
+        ] {
+            mutate(edit);
+        }
+        let mut bad = good.clone();
+        bad.series
+            .pressure_evidence
+            .as_mut()
+            .unwrap()
+            .attempts
+            .clear();
+        assert!(bad.validate_for_read().is_err());
+        let mut bad = good.clone();
+        let inner = bad.series.pressure_evidence.as_ref().unwrap().attempts[0].clone();
+        bad.series
+            .pressure_evidence
+            .as_mut()
+            .unwrap()
+            .attempts
+            .push(inner);
+        assert!(bad.validate_for_read().unwrap_err().contains("unique"));
+        for (field, unknown) in [("verdict", "invented"), ("no_result_kind", "invented")] {
+            let mut raw = serde_json::to_value(&good).unwrap();
+            raw["series"]["pressure_evidence"]["attempts"][0]["comparison"][field] =
+                serde_json::json!(unknown);
+            assert!(serde_json::from_value::<SeriesRow>(raw).is_err());
+        }
+        let mut raw = serde_json::to_value(&good).unwrap();
+        raw["series"]["pressure_evidence"]["attempts"][0]["timed_out"] = serde_json::json!("false");
+        assert!(serde_json::from_value::<SeriesRow>(raw).is_err());
+    }
+
+    #[test]
+    fn pressure_history_cross_checks_no_verdict_facts_without_replacing_them() {
+        let mut value = no_verdict_row();
+        value.producer = SeriesProducer::PressureTest;
+        value.series.pressure_evidence = Some(SeriesPressureEvidence {
+            evidence_sha256: "b".repeat(64),
+            attempts: vec![SeriesPressureAttempt {
+                index: "1".into(),
+                outcome: "ERROR".into(),
+                error_kind: Some("incomplete-verification-evidence".into()),
+                status: Some(125),
+                signal: None,
+                timed_out: false,
+                comparison: Some(SeriesPressureComparison {
+                    verdict: Verdict::NoResult,
+                    canonical: false,
+                    report_sha256: "c".repeat(64),
+                    no_result_kind: Some(SeriesNoVerdictKind::NotRun),
+                }),
+            }],
+        });
+        value.validate_for_write().unwrap();
+        let mut mismatch = value.clone();
+        mismatch
+            .series
+            .pressure_evidence
+            .as_mut()
+            .unwrap()
+            .evidence_sha256 = "d".repeat(64);
+        assert!(
+            mismatch
+                .validate_for_read()
+                .unwrap_err()
+                .contains("different CellResults")
+        );
+        for edit in [
+            (|a: &mut SeriesPressureAttempt| a.index = "2".into())
+                as fn(&mut SeriesPressureAttempt),
+            |a| a.status = Some(126),
+            |a| a.error_kind = Some("cpu-timeout".into()),
+            |a| a.comparison.as_mut().unwrap().report_sha256 = "d".repeat(64),
+        ] {
+            let mut bad = value.clone();
+            edit(&mut bad.series.pressure_evidence.as_mut().unwrap().attempts[0]);
+            assert!(bad.validate_for_read().is_err());
+        }
+        // Current prelaunch CPU and wall timeouts retain the lack of a process.
+        for kind in ["cpu-timeout", "wall-timeout"] {
+            let mut timed = value.clone();
+            timed.series.outcome = SeriesOutcome::Timeout;
+            timed.series.result = Some(ObservedResult::Timeout);
+            let inner = &mut timed.series.pressure_evidence.as_mut().unwrap().attempts[0];
+            inner.timed_out = true;
+            inner.status = None;
+            inner.error_kind = Some(kind.into());
+            let inner = &mut timed.series.no_verdict_evidence.as_mut().unwrap().attempts[0];
+            inner.timed_out = true;
+            inner.status = None;
+            inner.error_kind = Some(kind.into());
+            inner.disposition = SeriesOutcome::Timeout;
+            timed.validate_for_write().unwrap();
+        }
+    }
+
+    #[test]
+    fn historical_pressure_rows_without_inner_history_remain_readable() {
+        for schema in [SeriesSchema::V1, SeriesSchema::V2, SeriesSchema::V3] {
+            let mut historical = row(schema);
+            historical.producer = SeriesProducer::PressureTest;
+            historical.series.attempt = Some(1);
+            historical.validate_for_read().unwrap();
+            let raw = serde_json::to_value(&historical).unwrap();
+            assert!(raw["series"].get("pressure_evidence").is_none());
+            let decoded: SeriesRow = serde_json::from_value(raw).unwrap();
+            assert!(decoded.series.pressure_evidence.is_none());
+        }
     }
 }
