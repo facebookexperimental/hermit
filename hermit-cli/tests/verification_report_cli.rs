@@ -115,3 +115,41 @@ fn no_result_prints_explicit_absence_without_calling_it_omission() {
         "explicit null must not be reported as a missing field: {stderr}"
     );
 }
+
+#[test]
+fn duplicate_report_fields_are_a_refusal_with_no_inspection_output() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut report = hermit::canonical_verdict::VerificationReport::no_result();
+    report.no_result_reason = None;
+    let raw = serde_json::to_string(&report).unwrap();
+    std::fs::write(file.path(), &raw).unwrap();
+    let output = run(&["--json", "matched", file.path().to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(!output.stdout.is_empty());
+    for (needle, replacement) in [
+        (r#""verified":false"#, r#""verified":true,"verified":false"#),
+        (
+            r#""verified":false"#,
+            r#""verified":false,"verified":false"#,
+        ),
+        (
+            r#""no_result_reason":null"#,
+            r#""no_result_reason":{"kind":"not_run"},"no_result_reason":null"#,
+        ),
+        (
+            r#""no_result_reason":null"#,
+            r#""no_result_reason":null,"no_result_reason":null"#,
+        ),
+    ] {
+        assert_eq!(raw.matches(needle).count(), 1);
+        std::fs::write(file.path(), raw.replacen(needle, replacement, 1)).unwrap();
+        let output = run(&["--json", "matched", file.path().to_str().unwrap()]);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("duplicate field") && stderr.contains("REFUSED"),
+            "{stderr}"
+        );
+    }
+}

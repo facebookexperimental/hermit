@@ -5749,9 +5749,7 @@ fn retained_pressure_attempt(
                     "inner verification report digest differs from its retained bytes".into(),
                 );
             }
-            let value =
-                serde_json::from_str::<JsonValue>(raw).map_err(|error| error.to_string())?;
-            let report = VerificationReport::from_current_json_value(value)?;
+            let report = VerificationReport::from_current_json_slice(raw.as_bytes())?;
             if report.guest_exit_code.is_some_and(|status| status < 0)
                 || report.guest_signal.is_some_and(|signal| signal <= 0)
                 || (report.guest_exit_code.is_some() && report.guest_signal.is_some())
@@ -5804,6 +5802,9 @@ fn retained_pressure_attempt(
                         );
                     }
                     Some(match &report.no_result_reason {
+                        Some(NoResultReason::ComparisonRefused { .. }) => {
+                            SeriesNoVerdictKind::ComparisonRefused
+                        }
                         Some(NoResultReason::NotRun) => {
                             if report.guest_exit_code.is_some() || report.guest_signal.is_some() {
                                 return Err(
@@ -5825,7 +5826,10 @@ fn retained_pressure_attempt(
                             }
                             SeriesNoVerdictKind::FirstRunRejected
                         }
-                        None => return Err("inner no-result report omitted its reason".into()),
+                        // The current reader requires the nullable field. An
+                        // explicit null preserves an unspecified cause; a
+                        // missing field was already refused above.
+                        None => SeriesNoVerdictKind::Unspecified,
                     })
                 }
             };
@@ -6356,7 +6360,7 @@ fn read_verification_report(
         .map_err(|e| format!("cannot read verification report {}: {e}", path.display()))?;
     let report: JsonValue = serde_json::from_str(&text)
         .map_err(|e| format!("invalid verification report {}: {e}", path.display()))?;
-    let canonical = VerificationReport::from_current_json_value(report.clone())
+    let canonical = VerificationReport::from_current_json_slice(text.as_bytes())
         .map_err(|e| format!("incomplete canonical verification report {}: {e}", path.display()))?;
     match (canonical.verdict, canonical.verified) {
         (Verdict::Matched, true)
@@ -13017,6 +13021,71 @@ mod pressure_sample_tests {
     }
 
     #[test]
+    fn report_file_reader_refuses_duplicate_fields_without_rewriting_input() {
+        let path = env::temp_dir().join(format!(
+            "hermit-pressure-current-report-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        fs::create_dir(&path).unwrap();
+        let guard = SelfTestDirectory::new(path.clone());
+        let report_path = verification_report_path(&path);
+        for mode in ["verify", "replay"] {
+            let cell = CellId {
+                lane: "portable".into(),
+                category: "fixture".into(),
+                test: "fixture/duplicate-report".into(),
+                mode: mode.into(),
+                backend: "ptrace".into(),
+            };
+            let raw = comparison_attempt(mode, 0).verification_report.unwrap();
+            let expected: JsonValue = serde_json::from_str(&raw).unwrap();
+            fs::write(&report_path, &raw).unwrap();
+            assert_eq!(
+                read_verification_report(&cell, &path).unwrap(),
+                Some(expected.clone())
+            );
+            for (needle, replacement) in [
+                (r#""verified":true"#, r#""verified":false,"verified":true"#),
+                (r#""verified":true"#, r#""verified":true,"verified":true"#),
+                (
+                    r#""no_result_reason":null"#,
+                    r#""no_result_reason":{"kind":"not_run"},"no_result_reason":null"#,
+                ),
+                (
+                    r#""no_result_reason":null"#,
+                    r#""no_result_reason":null,"no_result_reason":null"#,
+                ),
+                (r#""left":17"#, r#""left":0,"left":17"#),
+                (r#""left":17"#, r#""left":17,"left":17"#),
+            ] {
+                assert_eq!(raw.matches(needle).count(), 1);
+                let duplicated = raw.replacen(needle, replacement, 1);
+                assert_eq!(
+                    serde_json::from_str::<JsonValue>(&duplicated).unwrap(),
+                    expected
+                );
+                fs::write(&report_path, &duplicated).unwrap();
+                let error = read_verification_report(&cell, &path).unwrap_err();
+                assert!(
+                    error.contains("duplicate field"),
+                    "{mode}: {needle}: {error}"
+                );
+                assert_eq!(fs::read_to_string(&report_path).unwrap(), duplicated);
+            }
+            fs::write(&report_path, &raw).unwrap();
+            assert_eq!(
+                read_verification_report(&cell, &path).unwrap(),
+                Some(expected)
+            );
+        }
+        guard.remove().unwrap();
+    }
+
+    #[test]
     fn comparison_subruns_require_every_current_report_hash_and_process() {
         for (mode, status) in [("verify", 0), ("replay", 0), ("chaos", 17)] {
             let first = comparison_attempt(mode, status);
@@ -13316,6 +13385,127 @@ mod pressure_sample_tests {
                 retained_pressure_attempt("verify", &bad).is_err(),
                 "{field}"
             );
+        }
+    }
+
+    #[test]
+    fn unspecified_and_refused_reports_preserve_pressure_history_and_refusals() {
+        for (reason, kind) in [
+            (JsonValue::Null, SeriesNoVerdictKind::Unspecified),
+            (
+                json!({"kind":"comparison_refused","detail":"the second log was truncated at its size bound"}),
+                SeriesNoVerdictKind::ComparisonRefused,
+            ),
+        ] {
+            for mode in ["verify", "replay", "chaos"] {
+                let mut attempt = fixture_attempt("ERROR", 125);
+                attempt.error_kind = Some("incomplete-verification-evidence".into());
+                let mut report = serde_json::to_value(VerificationReport::no_result()).unwrap();
+                report["no_result_reason"] = reason.clone();
+                replace_report(&mut attempt, report.clone());
+                let original = serde_json::to_value(&attempt).unwrap();
+                let raw = attempt.verification_report.as_ref().unwrap();
+                for replacement in [
+                    r#""verified":true,"verified":false"#,
+                    r#""verified":false,"verified":false"#,
+                ] {
+                    assert_eq!(raw.matches(r#""verified":false"#).count(), 1);
+                    let duplicated = raw.replacen(r#""verified":false"#, replacement, 1);
+                    let mut bad = attempt.clone();
+                    bad.verification_report_sha256 =
+                        Some(format!("{:x}", sha2::Sha256::digest(duplicated.as_bytes())));
+                    bad.verification_report = Some(duplicated);
+                    assert!(
+                        retained_pressure_attempt(mode, &bad)
+                            .unwrap_err()
+                            .contains("duplicate field")
+                    );
+                }
+                let retained = retained_pressure_attempt(mode, &attempt).unwrap();
+                let comparison = retained.comparison.as_ref().unwrap();
+                assert_eq!(comparison.verdict, Verdict::NoResult);
+                assert!(!comparison.canonical);
+                assert_eq!(comparison.no_result_kind, Some(kind));
+                assert_eq!(
+                    Some(&comparison.report_sha256),
+                    attempt.verification_report_sha256.as_ref()
+                );
+                assert_eq!(
+                    inner_pressure_category(&retained),
+                    Some(RepetitionClassification::NoResult)
+                );
+                assert!(!qualifying_subruns(mode, std::slice::from_ref(&attempt)));
+                assert_eq!(serde_json::to_value(&attempt).unwrap(), original);
+                let row = history_row(mode, "ERROR", 1, vec![attempt.clone()]);
+                let history = inner_pressure_history(&[row]).unwrap();
+                assert_eq!(
+                    history,
+                    BTreeSet::from([RepetitionClassification::NoResult])
+                );
+                assert_eq!(
+                    fold_pressure_history(RepetitionClassification::ProductFailure, &history),
+                    RepetitionClassification::Mixed
+                );
+
+                let mut signaled = attempt.clone();
+                signaled.status = None;
+                signaled.signal = Some(11);
+                retained_pressure_attempt(mode, &signaled).unwrap();
+                for edit in [
+                    (|a: &mut AttemptResult| a.outcome = "PASS".into()) as fn(&mut AttemptResult),
+                    |a| a.outcome = "FAIL".into(),
+                    |a| a.error_kind = None,
+                    |a| a.status = Some(0),
+                    |a| a.status = None,
+                    |a| a.signal = Some(11),
+                    |a| a.timed_out = true,
+                    |a| a.verification_report_sha256 = Some("0".repeat(64)),
+                ] {
+                    let mut bad = attempt.clone();
+                    edit(&mut bad);
+                    assert!(
+                        retained_pressure_attempt(mode, &bad).is_err(),
+                        "{kind:?} {mode}"
+                    );
+                }
+                for (field, contradiction) in [
+                    ("verified", json!(true)),
+                    ("bitwise_parity", json!(true)),
+                    ("compared_log_messages", json!({"left":1,"right":1})),
+                    ("first_divergent_record", json!(1)),
+                    ("no_result_reason", json!({"kind":"invented"})),
+                    (
+                        "no_result_reason",
+                        json!({"kind":"comparison_refused","detail":" "}),
+                    ),
+                ] {
+                    let mut bad = attempt.clone();
+                    let mut changed = report.clone();
+                    changed[field] = contradiction;
+                    replace_report(&mut bad, changed);
+                    assert!(
+                        retained_pressure_attempt(mode, &bad).is_err(),
+                        "{kind:?} {mode} {field}"
+                    );
+                }
+                let mut missing = attempt.clone();
+                let mut omitted = report;
+                omitted.as_object_mut().unwrap().remove("no_result_reason");
+                replace_report(&mut missing, omitted);
+                assert!(
+                    retained_pressure_attempt(mode, &missing)
+                        .unwrap_err()
+                        .contains("no_result_reason")
+                );
+
+                let mut different_error = attempt;
+                different_error.error_kind = Some("cli-error".into());
+                if kind == SeriesNoVerdictKind::Unspecified {
+                    retained_pressure_attempt(mode, &different_error).unwrap();
+                } else {
+                    assert!(retained_pressure_attempt(mode, &different_error).is_err());
+                }
+            }
         }
     }
 

@@ -326,6 +326,18 @@ impl SeriesPressureAttempt {
                 self.outcome == "ERROR" && !self.timed_out && nonzero_process
             }
             Verdict::NoResult => match comparison.no_result_kind {
+                Some(SeriesNoVerdictKind::Unspecified) => {
+                    self.outcome == "ERROR"
+                        && !self.timed_out
+                        && self.error_kind.is_some()
+                        && nonzero_process
+                }
+                Some(SeriesNoVerdictKind::ComparisonRefused) => {
+                    self.outcome == "ERROR"
+                        && !self.timed_out
+                        && self.error_kind.as_deref() == Some("incomplete-verification-evidence")
+                        && nonzero_process
+                }
                 Some(SeriesNoVerdictKind::NotRun) => {
                     let prelaunch_timeout = self.timed_out
                         && self.status.is_none()
@@ -690,7 +702,8 @@ impl SeriesRow {
                     (SeriesNoVerdictKind::MissingReportTimeout, None) => true,
                     (kind, Some(comparison)) => {
                         let (verdict, no_result_kind) = match kind {
-                            SeriesNoVerdictKind::NotRun | SeriesNoVerdictKind::FirstRunRejected =>
+                            SeriesNoVerdictKind::Unspecified | SeriesNoVerdictKind::ComparisonRefused
+                            | SeriesNoVerdictKind::NotRun | SeriesNoVerdictKind::FirstRunRejected =>
                                 (Verdict::NoResult, Some(kind)),
                             SeriesNoVerdictKind::InfrastructureError => (Verdict::InfrastructureError, None),
                             SeriesNoVerdictKind::NoncanonicalMatch => (Verdict::Matched, None),
@@ -1997,6 +2010,122 @@ mod tests {
             inner.error_kind = Some(kind.into());
             inner.disposition = SeriesOutcome::Timeout;
             timed.validate_for_write().unwrap();
+        }
+    }
+
+    #[test]
+    fn pressure_history_retains_unspecified_and_refused_comparison_contracts() {
+        for kind in [
+            SeriesNoVerdictKind::Unspecified,
+            SeriesNoVerdictKind::ComparisonRefused,
+        ] {
+            for mode in ["verify", "replay", "chaos"] {
+                let mut value = no_verdict_row();
+                value.producer = SeriesProducer::PressureTest;
+                value.series.cell = format!("fixture/test/{mode}/ptrace");
+                let evidence = value.series.no_verdict_evidence.as_mut().unwrap();
+                let disposition = &mut evidence.attempts[0];
+                disposition.kind = kind;
+                disposition.detail = (kind == SeriesNoVerdictKind::ComparisonRefused)
+                    .then(|| "the second log was truncated at its size bound".into());
+                value.series.pressure_evidence = Some(SeriesPressureEvidence {
+                    evidence_sha256: evidence.evidence_sha256.clone(),
+                    attempts: vec![SeriesPressureAttempt {
+                        index: disposition.index.clone(),
+                        outcome: disposition.attempt_outcome.clone(),
+                        error_kind: disposition.error_kind.clone(),
+                        status: disposition.status,
+                        signal: disposition.signal,
+                        timed_out: disposition.timed_out,
+                        comparison: Some(SeriesPressureComparison {
+                            verdict: Verdict::NoResult,
+                            canonical: false,
+                            report_sha256: disposition.verification_report_sha256.clone().unwrap(),
+                            no_result_kind: Some(kind),
+                        }),
+                    }],
+                });
+                value.validate_for_write().unwrap();
+                let serialized = serde_json::to_value(&value).unwrap();
+                let decoded: SeriesRow = serde_json::from_value(serialized.clone()).unwrap();
+                decoded.validate_for_read().unwrap();
+                assert_eq!(serde_json::to_value(decoded).unwrap(), serialized);
+
+                let mut signaled = value.clone();
+                let disposition = &mut signaled
+                    .series
+                    .no_verdict_evidence
+                    .as_mut()
+                    .unwrap()
+                    .attempts[0];
+                disposition.status = None;
+                disposition.signal = Some(11);
+                let inner = &mut signaled.series.pressure_evidence.as_mut().unwrap().attempts[0];
+                inner.status = None;
+                inner.signal = Some(11);
+                signaled.validate_for_write().unwrap();
+
+                for edit in [
+                    (|a: &mut SeriesPressureAttempt| a.outcome = "PASS".into())
+                        as fn(&mut SeriesPressureAttempt),
+                    |a| a.outcome = "FAIL".into(),
+                    |a| a.error_kind = None,
+                    |a| a.error_kind = Some(" ".into()),
+                    |a| a.status = Some(0),
+                    |a| a.status = None,
+                    |a| a.signal = Some(11),
+                    |a| a.timed_out = true,
+                    |a| a.comparison.as_mut().unwrap().canonical = true,
+                    |a| a.comparison.as_mut().unwrap().no_result_kind = None,
+                    |a| a.comparison.as_mut().unwrap().report_sha256 = "d".repeat(64),
+                ] {
+                    let mut bad = value.clone();
+                    edit(&mut bad.series.pressure_evidence.as_mut().unwrap().attempts[0]);
+                    assert!(bad.validate_for_read().is_err(), "{kind:?} {mode}");
+                }
+                let mut wrong_kind = value.clone();
+                wrong_kind
+                    .series
+                    .pressure_evidence
+                    .as_mut()
+                    .unwrap()
+                    .attempts[0]
+                    .comparison
+                    .as_mut()
+                    .unwrap()
+                    .no_result_kind = Some(if kind == SeriesNoVerdictKind::Unspecified {
+                    SeriesNoVerdictKind::ComparisonRefused
+                } else {
+                    SeriesNoVerdictKind::Unspecified
+                });
+                assert!(
+                    wrong_kind
+                        .validate_for_read()
+                        .unwrap_err()
+                        .contains("contradicts the same no_verdict_evidence")
+                );
+
+                let mut different_error = value;
+                different_error
+                    .series
+                    .no_verdict_evidence
+                    .as_mut()
+                    .unwrap()
+                    .attempts[0]
+                    .error_kind = Some("cli-error".into());
+                different_error
+                    .series
+                    .pressure_evidence
+                    .as_mut()
+                    .unwrap()
+                    .attempts[0]
+                    .error_kind = Some("cli-error".into());
+                if kind == SeriesNoVerdictKind::Unspecified {
+                    different_error.validate_for_write().unwrap();
+                } else {
+                    assert!(different_error.validate_for_read().is_err());
+                }
+            }
         }
     }
 

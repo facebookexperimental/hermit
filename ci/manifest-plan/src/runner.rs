@@ -2244,9 +2244,7 @@ pub fn build_spec(
 }
 
 fn current_verification_report(bytes: &[u8]) -> Result<VerificationReport, String> {
-    let value = serde_json::from_slice::<JsonValue>(bytes)
-        .map_err(|error| format!("incomplete verification report: {error}"))?;
-    VerificationReport::from_current_json_value(value)
+    VerificationReport::from_current_json_slice(bytes)
 }
 pub fn execute_spec(spec: &CellRunSpec) -> Result<AttemptResult, String> {
     execute_spec_until(
@@ -4212,6 +4210,37 @@ fn execute_observed_until(
 mod tests {
     use super::*;
     use crate::ci_selection::BackendCiDisabledReason;
+
+    #[test]
+    fn current_runner_reports_refuse_duplicate_fields() {
+        let mut report = VerificationReport::no_result();
+        report.no_result_reason = None;
+        let raw = serde_json::to_string(&report).unwrap();
+        current_verification_report(raw.as_bytes()).unwrap();
+        for (needle, replacement) in [
+            (r#""verified":false"#, r#""verified":true,"verified":false"#),
+            (
+                r#""verified":false"#,
+                r#""verified":false,"verified":false"#,
+            ),
+            (
+                r#""no_result_reason":null"#,
+                r#""no_result_reason":{"kind":"not_run"},"no_result_reason":null"#,
+            ),
+            (
+                r#""no_result_reason":null"#,
+                r#""no_result_reason":null,"no_result_reason":null"#,
+            ),
+        ] {
+            assert_eq!(raw.matches(needle).count(), 1);
+            let duplicated = raw.replacen(needle, replacement, 1);
+            assert!(
+                current_verification_report(duplicated.as_bytes())
+                    .unwrap_err()
+                    .contains("duplicate field")
+            );
+        }
+    }
 
     #[test]
     fn failure_class_schema_matches_serialized_enum() {
@@ -6915,7 +6944,11 @@ backends_disabled:
 
     #[test]
     fn framework_keeps_typed_product_results_with_incidental_environment_text() {
-        let report = r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1"},"compared_log_messages":{"left":1,"right":1},"first_divergent_scheduler_turn":4,"first_divergent_virtual_nanoseconds":7,"first_divergent_record":9,"first_divergent_syscall":2,"first_divergent_left_message":"left","first_divergent_right_message":"right"}"#;
+        let report = r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1","display_name":"BitwiseInfoV1","compare_io_buffers":true,"log_scope":"info","virtualize_time":true,"strip_lines":false,"canonicalize_addresses":true,"full_trace":true,"exact_remainder":true,"stripped_prefixes":["real-wall-clock-prefix/v1"],"canonicalizations":["host-address-to-first-appearance-ordinal/v1"],"ignore_lines":false,"skip_commit":false,"skip_detlog":false},"compared_log_messages":{"left":1,"right":1},"first_divergent_scheduler_turn":4,"first_divergent_virtual_nanoseconds":7,"first_divergent_record":9,"first_divergent_syscall":2,"first_divergent_left_message":"left","first_divergent_right_message":"right","no_result_reason":null,"infrastructure_error":null,"guest_exit_code":null,"guest_signal":null}"#;
+        current_verification_report(report.as_bytes())
+            .expect("the product-precedence fixture must be a current report")
+            .require_canonical_comparison()
+            .expect("the product-precedence fixture must retain canonical evidence");
         for banner in [
             "An action was blocked on this server based on a security policy!",
             "fatal: Could not resolve proxy",
@@ -6967,8 +7000,12 @@ backends_disabled:
         divergence.outcome = "FAIL".into();
         divergence.status = Some(1);
         divergence.verification_report = Some(
-            r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1"},"compared_log_messages":{"left":1,"right":1},"first_divergent_scheduler_turn":4,"first_divergent_virtual_nanoseconds":7,"first_divergent_record":9,"first_divergent_syscall":2,"first_divergent_left_message":"left","first_divergent_right_message":"right"}"#.into(),
+            r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1","display_name":"BitwiseInfoV1","compare_io_buffers":true,"log_scope":"info","virtualize_time":true,"strip_lines":false,"canonicalize_addresses":true,"full_trace":true,"exact_remainder":true,"stripped_prefixes":["real-wall-clock-prefix/v1"],"canonicalizations":["host-address-to-first-appearance-ordinal/v1"],"ignore_lines":false,"skip_commit":false,"skip_detlog":false},"compared_log_messages":{"left":1,"right":1},"first_divergent_scheduler_turn":4,"first_divergent_virtual_nanoseconds":7,"first_divergent_record":9,"first_divergent_syscall":2,"first_divergent_left_message":"left","first_divergent_right_message":"right","no_result_reason":null,"infrastructure_error":null,"guest_exit_code":null,"guest_signal":null}"#.into(),
         );
+        current_verification_report(divergence.verification_report.as_ref().unwrap().as_bytes())
+            .expect("the terminal-refusal fixture must start with a valid current divergence")
+            .require_canonical_comparison()
+            .expect("the terminal-refusal fixture must retain canonical evidence");
         for error in [
             "infrastructure",
             "result-publication",

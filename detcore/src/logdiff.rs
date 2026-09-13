@@ -2397,7 +2397,7 @@ mod test {
                 &mut diagnostic,
             )?;
         assert!(summary.diff_found);
-        assert!(!summary.refused);
+        assert!(summary.refusal_reason.is_none());
         assert_eq!(summary.first_divergent_record, Some(1));
         assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
         assert_eq!((records_left, records_right), (1, 1));
@@ -2492,7 +2492,13 @@ mod test {
             super::ComparisonSideLabels::default(),
         )?;
         assert!(summary.diff_found);
-        assert!(summary.refused);
+        assert!(
+            summary
+                .refusal_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("truncated at the configured size bound")),
+            "the typed result must retain the truncation refusal cause"
+        );
         assert_eq!((summary.compared_left, summary.compared_right), (0, 0));
         Ok(())
     }

@@ -1238,7 +1238,7 @@ impl ResultRow {
             if raw.get("verdict").and_then(JsonValue::as_str) != Some("no_result") {
                 return Ok(None);
             }
-            let report = canonical_verdict::VerificationReport::from_current_json_value(raw)
+            let report = canonical_verdict::VerificationReport::from_current_json_slice(report_text.as_bytes())
                 .map_err(|error| format!("attempt {} {error}", index + 1))?;
             reports.push((index, attempt, report));
         }
@@ -1555,7 +1555,7 @@ impl ResultRow {
                 ));
             }
             let report =
-                canonical_verdict::VerificationReport::from_current_json_value(raw.clone())
+                canonical_verdict::VerificationReport::from_current_json_slice(report_text.as_bytes())
                     .map_err(|error| format!("attempt {} {error}", index + 1))?;
             report.require_canonical_comparison().map_err(|error| {
                 format!(
@@ -1682,7 +1682,7 @@ impl ResultRow {
                 )
             })?;
             let report =
-                canonical_verdict::VerificationReport::from_current_json_value(raw.clone())
+                canonical_verdict::VerificationReport::from_current_json_slice(report_text.as_bytes())
                     .map_err(|error| format!("attempt {} {error}", index + 1))?;
 
             if matches!(
@@ -7694,6 +7694,40 @@ fn self_test() -> Result<(), String> {
             ));
         }
     }
+    // Hash-consistent original bytes still must reject duplicates. A Value
+    // would collapse both identical and conflicting duplicate fields here.
+    for (needle, replacement) in [
+        (r#""verified":true"#, r#""verified":false,"verified":true"#),
+        (r#""verified":true"#, r#""verified":true,"verified":true"#),
+        (
+            r#""no_result_reason":null"#,
+            r#""no_result_reason":{"kind":"not_run"},"no_result_reason":null"#,
+        ),
+        (
+            r#""no_result_reason":null"#,
+            r#""no_result_reason":null,"no_result_reason":null"#,
+        ),
+        (r#""left":1"#, r#""left":0,"left":1"#),
+        (r#""left":1"#, r#""left":1,"left":1"#),
+    ] {
+        assert_eq!(current_report_text.matches(needle).count(), 1);
+        let duplicated = current_report_text.replacen(needle, replacement, 1);
+        let mut duplicate_row = current_identity.clone();
+        duplicate_row.attempts[0]["verification_report_sha256"] =
+            JsonValue::String(format!("{:x}", Sha256::digest(duplicated.as_bytes())));
+        duplicate_row.attempts[0]["verification_report"] = JsonValue::String(duplicated);
+        for error in [
+            duplicate_row.bitwise_info_comparison().unwrap_err(),
+            duplicate_row.comparison_evidence().unwrap_err(),
+        ] {
+            if !error.contains("duplicate field") {
+                return Err(format!(
+                    "duplicate-field scorecard refusal lost its cause: {error}"
+                ));
+            }
+        }
+    }
+
     current_identity.validate_timeout_policy()?;
     let mut retained_without_explicit_bounds = current_identity.clone();
     retained_without_explicit_bounds.execution_cpu_timeout_seconds = None;

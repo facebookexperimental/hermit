@@ -547,7 +547,7 @@ fn compare_captures(
 }
 
 fn comparison_exit_code(summary: &LogDiffSummary) -> i32 {
-    if summary.refused || summary.compared_left == 0 || summary.compared_right == 0 {
+    if summary.refusal_reason.is_some() || summary.compared_left == 0 || summary.compared_right == 0 {
         2
     } else if summary.diff_found {
         1
@@ -588,7 +588,7 @@ fn report_comparison(left: &Capture, right: &Capture, comparison: &CanonicalComp
             1
         }
         _ => {
-            if summary.refused {
+            if summary.refusal_reason.is_some() {
                 eprintln!("\nREFUSAL: a captured log is truncated; no result was produced.");
             } else {
                 eprintln!(
@@ -852,7 +852,7 @@ fn run_self_test() {
     )
     .expect("truncation is a typed refusal, not a parser error");
     check(
-        refused.refused && comparison_exit_code(&refused) == 2,
+        refused.refusal_reason.is_some() && comparison_exit_code(&refused) == 2,
         "shared comparator did not refuse a truncated input",
     );
 

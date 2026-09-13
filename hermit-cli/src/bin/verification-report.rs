@@ -37,9 +37,7 @@ fn refuse(message: impl std::fmt::Display) -> ExitCode {
 fn read_current_report(path: &Path) -> Result<VerificationReport, String> {
     let bytes =
         fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    let value = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("{} is not valid JSON: {error}", path.display()))?;
-    VerificationReport::from_current_json_value(value)
+    VerificationReport::from_current_json_slice(&bytes)
         .map_err(|error| format!("{}: {error}", path.display()))
 }
 fn no_result_detail(report: &VerificationReport) -> String {

@@ -166,12 +166,13 @@ fn require_current_timeout_policy(row: &Value) -> Result<(), String> {
 
 fn canonical_report(
     value: Value,
+    bytes: &[u8],
     expected_virtualize_time: bool,
 ) -> Result<Option<(VerificationReport, ComparisonSpec, ComparedLogCounts)>, String> {
     // `VerificationReport` owns the complete current top-level report. The
     // ledger types additionally deny unknown comparison/count fields, which
     // preserves schema 7's exact shape without a second hard-coded key list.
-    let report = VerificationReport::from_current_json_value(value.clone())?;
+    let report = VerificationReport::from_current_json_slice(bytes)?;
     if report.verdict == VerificationVerdict::InfrastructureError {
         return Err(match report.infrastructure_error.as_ref() {
             Some(InfrastructureError::SkidOvershoot { count }) => format!(
@@ -263,7 +264,7 @@ fn cell_verdict(row: &Value) -> Result<CellVerdict, String> {
                 index + 1
             )
         })?;
-        match canonical_report(value, expected_virtualize_time) {
+        match canonical_report(value, raw.as_bytes(), expected_virtualize_time) {
             Ok(Some(report)) => reports.push(report),
             Ok(None) => {
                 unavailable_reason = Some(preserved_reason.clone().unwrap_or_else(|| {
@@ -870,6 +871,41 @@ mod tests {
             "execution_wall_timeout_seconds": 57,
             "attempts": [attempt(&matched)]
         })
+    }
+
+    #[test]
+    fn duplicate_report_fields_cannot_become_compared_cell_evidence() {
+        let row = result_row("fixture", "1515151515151515151515151515151515151515");
+        assert!(matches!(
+            cell_verdict(&row).unwrap(),
+            CellVerdict::ComparedAndMatched { .. }
+        ));
+        let raw = row["attempts"][0]["verification_report"].as_str().unwrap();
+        for (needle, replacement) in [
+            (r#""verified":true"#, r#""verified":false,"verified":true"#),
+            (r#""verified":true"#, r#""verified":true,"verified":true"#),
+            (
+                r#""no_result_reason":null"#,
+                r#""no_result_reason":{"kind":"not_run"},"no_result_reason":null"#,
+            ),
+            (
+                r#""no_result_reason":null"#,
+                r#""no_result_reason":null,"no_result_reason":null"#,
+            ),
+            (r#""left":123"#, r#""left":0,"left":123"#),
+            (r#""left":123"#, r#""left":123,"left":123"#),
+        ] {
+            assert_eq!(raw.matches(needle).count(), 1);
+            let duplicated = raw.replacen(needle, replacement, 1);
+            let mut bad = row.clone();
+            bad["attempts"][0] = attempt(&duplicated);
+            match cell_verdict(&bad).unwrap() {
+                CellVerdict::UnavailableWithReason { reason, .. } => {
+                    assert!(reason.contains("duplicate field"), "{reason}");
+                }
+                other => panic!("duplicate report produced compared evidence: {other:?}"),
+            }
+        }
     }
 
     #[test]
