@@ -47,7 +47,10 @@ use dagrun::model::StructuredTestResultsManifest;
 use dagrun::model::effective_cpu_count;
 use dagrun::model::effective_cpu_timeout;
 use dagrun::cgroup::aggregate_slice_max_cpus;
+use dagrun::box_mem_budget_bytes;
 use dagrun::container_core_budget;
+use dagrun::LOG_DIR_ENV as RUNNER_LOG_DIR_ENV;
+use dagrun::NO_LOGS_ENV as RUNNER_NO_LOGS_ENV;
 use dagrun::scheduler::BoxedCgroups;
 use dagrun::scheduler::run_dag_boxed_deadline;
 use hermit_manifest_plan::canonical_verdict::NoResultReason;
@@ -78,6 +81,7 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 use serde_json::json;
 use sha2::Digest;
+use sha2::Sha256;
 
 const TRACKED_CELLS: &str = "ci/compat-envelope/cells.json";
 const PORTABLE_DAG: &str = "ci/dag/validate.json";
@@ -120,6 +124,12 @@ const PRESSURE_RUN_TIMEOUT_SECONDS: i64 = 2 * 60 * 60;
 const PRESSURE_SCOPE_TIMEOUT_ENV: &str = "HERMIT_PRESSURE_SCOPE_TIMEOUT_SECONDS";
 const HERMETIC_TEST_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
 const HERMETIC_TEST_WORKDIR: &str = "/test";
+const DEFAULT_MANIFEST_GUEST_CAP: i64 = 4;
+const DEFAULT_KVM_GUEST_CAP: i64 = 4;
+const PORTABLE_CELL_MEMORY_BYTES: i64 = 3 * 1024 * 1024 * 1024;
+const PRIVILEGED_CELL_MEMORY_BYTES: i64 = 16 * 1024 * 1024 * 1024;
+const PREPARATION_MEMORY_BYTES: i64 = 3 * 1024 * 1024 * 1024;
+const CONTROL_PLANE_HEADROOM_BYTES: i64 = 1024 * 1024 * 1024;
 
 /// Match validate's measured host-adaptive outer scheduling policy.
 ///
@@ -208,6 +218,7 @@ Usage: ci/compat-envelope/pressure-test.rs COMMAND [OPTIONS]
 
 Commands:
   run [--results DIR] [--mode MODE] [--sample COUNT] [--seed SEED]
+      [--cells-file PATH]
       [--green --backend BACKEND --repetitions COUNT] [--jobs COUNT]
       [--probe-disabled --backend BACKEND]
       Run bounded probes for the selected red cells. An exact-cell run uses the
@@ -225,11 +236,12 @@ Commands:
       checks against the same clean committed source. Use --green with
       --repetitions to select enabled green cells instead; an exact cell, --mode,
       and --sample may narrow either population. Existing resource
-      caps allow at most four manifest guests at once, including KVM guests.
+      caps allow four manifest guests at once by default, including KVM guests.
       This reports per-cell flakiness; it never edits or demotes the scorecard.
       Only unfiltered --green covers the complete current green set; an exact
       cell, --mode, or --sample is partial evidence.
   plan --results DIR [--mode MODE] [--sample COUNT] [--seed SEED]
+      [--cells-file PATH]
       [--green --backend BACKEND --repetitions COUNT] [--jobs COUNT]
       [--probe-disabled --backend BACKEND]
       Generate the same safe-ci execution plan without running it. The default
@@ -280,10 +292,26 @@ Selection and bounded-batch options (run and plan):
                            not a full-population result.
   --seed SEED              Reproduce one sample. If omitted, a generated seed
                            and every selected identity are retained in run.json.
+  --cells-file PATH        Select exactly the canonical five-field cell JSON
+                           identities listed one per line. This is a clean-
+                           commit repeated-batch selector: it requires
+                           --repetitions and cannot be combined with population
+                           filters. Duplicate, noncanonical, untracked,
+                           unsupported, disabled, or non-executable cells are
+                           rejected. run.json retains the source path, SHA-256,
+                           and exact selected identities.
   --run-timeout SECONDS    Whole-run WALL-CLOCK bound (default 7200). This is
                            not a CPU budget and never weakens per-cell limits.
-  --jobs COUNT             Fixed safe-ci scheduler pool (default 4). Named
-                           resource caps still limit manifest guests to four.
+  --jobs COUNT             Fixed safe-ci scheduler pool (host-adaptive default).
+                           The manifest-guest cap separately limits guests.
+  --manifest-guest-cap N   Override the manifest_guest concurrency cap (default
+                           4). Explicit caps are admitted only when the selected
+                           repetitions' largest concurrent declared memory caps,
+                           plus fixture preparation, fit the observed cgroup/
+                           machine memory budget.
+  --kvm-guest-cap N        Separately cap KVM cells (default 4). This composes
+                           with --manifest-guest-cap so non-KVM work need not be
+                           throttled to the KVM-safe width.
 
 Examples:
   # Probe one cell with at most 600 seconds for its complete retry lifecycle.
@@ -345,6 +373,16 @@ struct CellId {
     backend: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalOwnedCellId {
+    backend: String,
+    category: String,
+    lane: String,
+    mode: String,
+    test: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct TrackedCells {
     schema: u64,
@@ -366,6 +404,117 @@ fn load_tracked_cells(root: &Path) -> Result<TrackedCells, String> {
     Ok(tracked)
 }
 
+#[derive(Serialize)]
+struct CanonicalCellId<'a> {
+    backend: &'a str,
+    category: &'a str,
+    lane: &'a str,
+    mode: &'a str,
+    test: &'a str,
+}
+
+fn canonical_cell_json(cell: &CellId) -> Result<String, String> {
+    serde_json::to_string(&CanonicalCellId {
+        backend: &cell.backend,
+        category: &cell.category,
+        lane: &cell.lane,
+        mode: &cell.mode,
+        test: &cell.test,
+    })
+    .map_err(|error| format!("cannot serialize canonical cell identity: {error}"))
+}
+
+fn canonical_cells_jsonl(cells: &[CellId]) -> Result<String, String> {
+    let mut text = String::new();
+    for cell in cells {
+        text.push_str(&canonical_cell_json(cell)?);
+        text.push('\n');
+    }
+    Ok(text)
+}
+
+fn selected_population_sha256(cells: &[CellId]) -> Result<String, String> {
+    let mut cells = cells.to_vec();
+    cells.sort();
+    let canonical: Vec<_> = cells
+        .iter()
+        .map(|cell| CanonicalCellId {
+            backend: &cell.backend,
+            category: &cell.category,
+            lane: &cell.lane,
+            mode: &cell.mode,
+            test: &cell.test,
+        })
+        .collect();
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|error| format!("cannot serialize selected cell population: {error}"))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn load_cells_file(path: &Path) -> Result<(Vec<CellId>, String), String> {
+    let bytes = fs::read(path)
+        .map_err(|error| format!("cannot read --cells-file {}: {error}", path.display()))?;
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|error| format!("--cells-file {} is not UTF-8: {error}", path.display()))?;
+    if text.is_empty() {
+        return Err(format!("--cells-file {} is empty", path.display()));
+    }
+    if !text.ends_with('\n') {
+        return Err(format!(
+            "--cells-file {} is not canonical JSONL: final newline is missing",
+            path.display()
+        ));
+    }
+    let mut cells = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (index, line) in text[..text.len() - 1].split('\n').enumerate() {
+        let line_number = index + 1;
+        if line.is_empty() {
+            return Err(format!(
+                "--cells-file {}:{line_number} is empty",
+                path.display()
+            ));
+        }
+        let parsed: CanonicalOwnedCellId = serde_json::from_str(line).map_err(|error| {
+            format!(
+                "--cells-file {}:{line_number} is not a five-field cell identity: {error}",
+                path.display()
+            )
+        })?;
+        let cell = CellId {
+            lane: parsed.lane,
+            category: parsed.category,
+            test: parsed.test,
+            mode: parsed.mode,
+            backend: parsed.backend,
+        };
+        let canonical = canonical_cell_json(&cell)?;
+        if line != canonical {
+            return Err(format!(
+                "--cells-file {}:{line_number} is not canonical JSON; expected {canonical}",
+                path.display()
+            ));
+        }
+        if !seen.insert(cell.clone()) {
+            return Err(format!(
+                "--cells-file {}:{line_number} repeats {}",
+                path.display(),
+                display_id(&cell)
+            ));
+        }
+        cells.push(cell);
+    }
+    Ok((cells, digest))
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct TrackedCell {
     #[serde(flatten)]
@@ -383,6 +532,7 @@ struct PressureCells {
     unavailable: Vec<TrackedCell>,
     eligible_cells: usize,
     preparation_by_test: BTreeMap<String, CellId>,
+    cells_file_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -411,6 +561,16 @@ struct CellSelection {
     probe_disabled: bool,
     #[serde(default)]
     jobs: Option<i64>,
+    #[serde(default)]
+    manifest_guest_cap: Option<i64>,
+    #[serde(default)]
+    kvm_guest_cap: Option<i64>,
+    #[serde(default)]
+    cells_file: Option<PathBuf>,
+    /// Exact cells retained in run.json are sufficient to revalidate an old
+    /// run without depending on the continued existence of its source file.
+    #[serde(skip)]
+    retained_cells_file_cells: Option<Vec<CellId>>,
 }
 
 impl CellSelection {
@@ -438,6 +598,15 @@ impl CellSelection {
         self.jobs.unwrap_or_else(default_jobs)
     }
 
+    fn manifest_guest_cap(&self) -> i64 {
+        self.manifest_guest_cap
+            .unwrap_or(DEFAULT_MANIFEST_GUEST_CAP)
+    }
+
+    fn kvm_guest_cap(&self) -> i64 {
+        self.kvm_guest_cap.unwrap_or(DEFAULT_KVM_GUEST_CAP)
+    }
+
     fn allows_dirty_source(&self) -> bool {
         self.is_exact() && !self.repeats_cells()
     }
@@ -454,6 +623,50 @@ impl CellSelection {
 }
 
 fn validate_selection_shape(selection: &CellSelection) -> Result<(), String> {
+    if selection.scheduler_jobs() <= 0
+        || selection.manifest_guest_cap() <= 0
+        || selection.kvm_guest_cap() <= 0
+    {
+        return Err("pressure-test scheduler, manifest guest, and KVM caps must be positive".into());
+    }
+    if let Some(cap) = selection.manifest_guest_cap {
+        if cap > selection.scheduler_jobs() {
+            return Err(format!(
+                "--manifest-guest-cap {cap} exceeds scheduler --jobs {}; a resource cap above scheduler width has no effect",
+                selection.scheduler_jobs()
+            ));
+        }
+    }
+    if let Some(cap) = selection.kvm_guest_cap {
+        if cap > selection.scheduler_jobs() || cap > selection.manifest_guest_cap() {
+            return Err(format!(
+                "--kvm-guest-cap {cap} exceeds the effective manifest/scheduler width {}; a KVM cap above it has no effect",
+                selection.scheduler_jobs().min(selection.manifest_guest_cap())
+            ));
+        }
+    }
+    if selection.cells_file.is_some() || selection.retained_cells_file_cells.is_some() {
+        if selection.repetitions.is_none() {
+            return Err("--cells-file requires --repetitions".into());
+        }
+        if selection.test.is_some()
+            || selection.mode.is_some()
+            || selection.backend.is_some()
+            || selection.sample.is_some()
+            || selection.seed.is_some()
+            || selection.green
+            || selection.probe_disabled
+            || selection.run_id_prefix.is_some()
+        {
+            return Err(
+                "--cells-file cannot be combined with --test, --mode, --backend, --sample, --seed, --green, --probe-disabled, or --run-id-prefix"
+                    .into(),
+            );
+        }
+        if selection.cells_file.is_some() && selection.retained_cells_file_cells.is_some() {
+            return Err("cell-file selection has both source and retained identities".into());
+        }
+    }
     if selection.probe_disabled {
         if selection.backend.is_none() {
             return Err("--probe-disabled requires --backend".into());
@@ -1179,8 +1392,32 @@ struct RunMetadata {
     probe_disabled: bool,
     #[serde(default = "default_pressure_jobs")]
     jobs: i64,
+    #[serde(default = "default_manifest_guest_cap")]
+    manifest_guest_cap: i64,
+    #[serde(default)]
+    manifest_guest_cap_explicit: bool,
+    #[serde(default = "default_kvm_guest_cap")]
+    kvm_guest_cap: i64,
+    #[serde(default)]
+    kvm_guest_cap_explicit: bool,
+    #[serde(default)]
+    manifest_guest_memory_budget_bytes: Option<i64>,
+    #[serde(default)]
+    manifest_guest_memory_required_bytes: Option<i64>,
+    #[serde(default)]
+    manifest_guest_control_plane_headroom_bytes: Option<i64>,
+    #[serde(default)]
+    manifest_guest_max_safe_cap: Option<i64>,
+    #[serde(default)]
+    kvm_guest_max_safe_cap: Option<i64>,
     #[serde(default)]
     eligible_cells: usize,
+    #[serde(default)]
+    cells_file: Option<String>,
+    #[serde(default)]
+    cells_file_sha256: Option<String>,
+    #[serde(default)]
+    selected_population_sha256: Option<String>,
     cells: Vec<CellId>,
 }
 
@@ -1192,6 +1429,14 @@ impl RunMetadata {
 
 fn default_pressure_jobs() -> i64 {
     default_jobs()
+}
+
+fn default_manifest_guest_cap() -> i64 {
+    DEFAULT_MANIFEST_GUEST_CAP
+}
+
+fn default_kvm_guest_cap() -> i64 {
+    DEFAULT_KVM_GUEST_CAP
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1247,6 +1492,8 @@ struct RetainedExecutionV1 {
 struct ExecutionEvidence {
     outcomes: Vec<StepOutcome>,
     passes: usize,
+    scheduler_wall_s: f64,
+    step_profile_rows: Vec<BTreeMap<String, String>>,
 }
 
 fn outcome_evidence(outcome: &StepOutcome) -> RunnerEvidence {
@@ -1305,6 +1552,8 @@ fn execute_typed_dag(
     }
     let mut completed = BTreeMap::<String, StepOutcome>::new();
     let mut passes = 0usize;
+    let mut scheduler_wall_s = 0.0_f64;
+    let mut step_profile_rows = Vec::new();
 
     while completed.len() < expected.len() {
         let remaining = run_timeout_seconds.saturating_sub(started.elapsed().as_secs() as i64);
@@ -1349,6 +1598,8 @@ fn execute_typed_dag(
                 "pressure run reached its {run_timeout_seconds}s whole-run bound during scheduler pass {passes}"
             ));
         }
+        scheduler_wall_s += result.wall_s;
+        step_profile_rows.extend(result.step_profile_rows.iter().cloned());
 
         let mut progress = 0usize;
         for outcome in result.outcomes {
@@ -1393,7 +1644,35 @@ fn execute_typed_dag(
             .filter_map(|tag| completed.remove(tag))
             .collect(),
         passes,
+        scheduler_wall_s,
+        step_profile_rows,
     })
+}
+
+fn with_runner_log_dir<T>(
+    results: &Path,
+    action: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    if env::var(RUNNER_NO_LOGS_ENV).ok().as_deref() == Some("1") {
+        return Err(format!(
+            "{RUNNER_NO_LOGS_ENV}=1 disables retained pressure-runner evidence"
+        ));
+    }
+    let directory = results.join("runner-profile");
+    let previous = env::var_os(RUNNER_LOG_DIR_ENV);
+    env::set_var(RUNNER_LOG_DIR_ENV, &directory);
+    let result = action();
+    match previous {
+        Some(value) => env::set_var(RUNNER_LOG_DIR_ENV, value),
+        None => env::remove_var(RUNNER_LOG_DIR_ENV),
+    }
+    if result.is_ok() && !directory.join("journal.jsonl").is_file() {
+        return Err(format!(
+            "typed scheduler completed without retained runner journal {}",
+            directory.join("journal.jsonl").display()
+        ));
+    }
+    result
 }
 
 fn retain_execution_evidence(
@@ -1426,6 +1705,18 @@ fn retain_execution_evidence(
     text.push('\n');
     fs::write(results.join("runner-outcomes.json"), text)
         .map_err(|error| format!("cannot retain typed scheduler outcomes: {error}"))?;
+
+    let profile = json!({
+        "schema": 1,
+        "scheduler_passes": execution.passes,
+        "scheduler_wall_s": execution.scheduler_wall_s,
+        "step_profile_rows": execution.step_profile_rows,
+    });
+    let mut profile_text = serde_json::to_string_pretty(&profile)
+        .map_err(|error| format!("cannot serialize scheduler profile: {error}"))?;
+    profile_text.push('\n');
+    fs::write(results.join("runner-profile.json"), profile_text)
+        .map_err(|error| format!("cannot retain scheduler profile: {error}"))?;
 
     let mut evidence = BTreeMap::new();
     for outcome in &execution.outcomes {
@@ -1602,6 +1893,7 @@ fn run() -> Result<(), String> {
                     .len()
                     .saturating_mul(metadata.repetitions.unwrap_or(1))
             );
+            print_manifest_guest_memory(&metadata);
             print_unavailable(&metadata);
             println!("Whole-run bound: {}s", metadata.run_timeout_seconds);
             print_sample(&metadata);
@@ -1647,19 +1939,22 @@ fn run() -> Result<(), String> {
             let output = results.join("dag.json");
             let run_result = (|| {
                 let (metadata, dag) = write_plan(execution_root, &results, &output, &selection)?;
+                print_manifest_guest_memory(&metadata);
                 print_unavailable(&metadata);
                 print_sample(&metadata);
                 if exact_cell {
                     print_exact_manifest_command(&dag, &metadata)?;
                 }
-                let execution = with_execution_root(execution_root, || {
-                    execute_typed_dag(
-                        &dag,
-                        metadata.jobs,
-                        cgroups.clone(),
-                        started,
-                        metadata.run_timeout_seconds,
-                    )
+                let execution = with_runner_log_dir(&results, || {
+                    with_execution_root(execution_root, || {
+                        execute_typed_dag(
+                            &dag,
+                            metadata.jobs,
+                            cgroups.clone(),
+                            started,
+                            metadata.run_timeout_seconds,
+                        )
+                    })
                 })?;
                 let runner_evidence = retain_execution_evidence(&results, &execution)?;
                 let expected_runs = metadata
@@ -1673,8 +1968,8 @@ fn run() -> Result<(), String> {
                     ));
                 }
                 println!(
-                    "Scheduler: {} pass(es), fixed -j {}",
-                    execution.passes, metadata.jobs
+                    "Scheduler: {} pass(es), fixed -j {}, {:.3}s scheduler wall",
+                    execution.passes, metadata.jobs, execution.scheduler_wall_s
                 );
                 summarize(
                     execution_root,
@@ -1760,6 +2055,34 @@ fn print_sample(metadata: &RunMetadata) {
     for cell in &metadata.cells {
         println!("  {}", display_id(cell));
     }
+}
+
+fn print_manifest_guest_memory(metadata: &RunMetadata) {
+    let budget = metadata
+        .manifest_guest_memory_budget_bytes
+        .map_or_else(|| "unknown".into(), |bytes| bytes.to_string());
+    let required = metadata
+        .manifest_guest_memory_required_bytes
+        .map_or_else(|| "unknown".into(), |bytes| bytes.to_string());
+    let max_safe = metadata
+        .manifest_guest_max_safe_cap
+        .map_or_else(|| "unknown".into(), |cap| cap.to_string());
+    let max_safe_kvm = metadata
+        .kvm_guest_max_safe_cap
+        .map_or_else(|| "unknown".into(), |cap| cap.to_string());
+    println!(
+        "Manifest guests: cap {} (KVM cap {}), declared peak {} bytes including retained {}-byte control headroom; observed budget {} bytes; highest safe caps at -j {}: manifest={}, KVM={}",
+        metadata.manifest_guest_cap,
+        metadata.kvm_guest_cap,
+        required,
+        metadata
+            .manifest_guest_control_plane_headroom_bytes
+            .unwrap_or(CONTROL_PLANE_HEADROOM_BYTES),
+        budget,
+        metadata.jobs,
+        max_safe,
+        max_safe_kvm,
+    );
 }
 
 fn print_unavailable(metadata: &RunMetadata) {
@@ -1860,6 +2183,16 @@ fn result_options(
                     return Err("--seed may be specified only once".into());
                 }
             }
+            "--cells-file" if allow_selection => {
+                let raw = args.next().ok_or("--cells-file requires a path")?;
+                if raw.is_empty() {
+                    return Err("--cells-file requires a nonempty path".into());
+                }
+                let path = absolute_from(root, PathBuf::from(raw));
+                if selection.cells_file.replace(path).is_some() {
+                    return Err("--cells-file may be specified only once".into());
+                }
+            }
             "--run-timeout" if allow_selection => {
                 let raw = args.next().ok_or("--run-timeout requires seconds")?;
                 let value = raw.parse::<i64>().map_err(|_| {
@@ -1912,6 +2245,34 @@ fn result_options(
                 }
                 if selection.jobs.replace(value).is_some() {
                     return Err("--jobs may be specified only once".into());
+                }
+            }
+            "--manifest-guest-cap" if allow_selection => {
+                let raw = args
+                    .next()
+                    .ok_or("--manifest-guest-cap requires a count")?;
+                let value = raw.parse::<i64>().map_err(|_| {
+                    format!(
+                        "invalid --manifest-guest-cap `{raw}`; expected a positive integer"
+                    )
+                })?;
+                if value <= 0 {
+                    return Err("--manifest-guest-cap must be positive".into());
+                }
+                if selection.manifest_guest_cap.replace(value).is_some() {
+                    return Err("--manifest-guest-cap may be specified only once".into());
+                }
+            }
+            "--kvm-guest-cap" if allow_selection => {
+                let raw = args.next().ok_or("--kvm-guest-cap requires a count")?;
+                let value = raw.parse::<i64>().map_err(|_| {
+                    format!("invalid --kvm-guest-cap `{raw}`; expected a positive integer")
+                })?;
+                if value <= 0 {
+                    return Err("--kvm-guest-cap must be positive".into());
+                }
+                if selection.kvm_guest_cap.replace(value).is_some() {
+                    return Err("--kvm-guest-cap may be specified only once".into());
                 }
             }
             _ => return Err(format!("unknown option `{arg}`\n\n{USAGE}")),
@@ -2273,6 +2634,8 @@ fn command_ok(command: &mut Command, purpose: &str) -> Result<(), String> {
 
 struct CheckedScorecard<'a> {
     root: &'a Path,
+    enforce_host_capabilities: bool,
+    memory_budget_override: Option<i64>,
 }
 
 fn check_scorecard(root: &Path) -> Result<CheckedScorecard<'_>, String> {
@@ -2282,7 +2645,11 @@ fn check_scorecard(root: &Path) -> Result<CheckedScorecard<'_>, String> {
         .status()
         .map_err(|e| format!("cannot run scorecard check: {e}"))?;
     if status.success() {
-        Ok(CheckedScorecard { root })
+        Ok(CheckedScorecard {
+            root,
+            enforce_host_capabilities: true,
+            memory_budget_override: None,
+        })
     } else {
         Err("tracked scorecard is stale; update it before generating a pressure run".into())
     }
@@ -2296,6 +2663,25 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     }
     let budgets = load_budgets(root)?;
     let tracked = load_tracked_cells(root)?;
+    let (requested_cells, cells_file_sha256) = if let Some(path) = &selection.cells_file {
+        let (cells, digest) = load_cells_file(path)?;
+        (Some(cells), Some(digest))
+    } else if let Some(cells) = &selection.retained_cells_file_cells {
+        if cells.is_empty() {
+            return Err("retained --cells-file selection is empty".into());
+        }
+        let unique: BTreeSet<_> = cells.iter().cloned().collect();
+        if unique.len() != cells.len() {
+            return Err("retained --cells-file selection contains a duplicate identity".into());
+        }
+        (Some(cells.clone()), None)
+    } else {
+        (None, None)
+    };
+    let requested_ids = requested_cells
+        .as_ref()
+        .map(|cells| cells.iter().cloned().collect::<BTreeSet<_>>());
+    let mut matched_requested = BTreeSet::new();
     let mut seen = BTreeSet::new();
     let mut selected_cells = Vec::new();
     let mut unavailable = Vec::new();
@@ -2309,27 +2695,41 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 .entry(cell.id.test.clone())
                 .or_insert_with(|| cell.id.clone());
         }
-        let selected = selection
-            .mode
-            .as_deref()
-            .is_none_or(|value| cell.id.mode == value)
-            && selection
-                .test
+        let selected = if let Some(requested) = &requested_ids {
+            let selected = requested.contains(&cell.id);
+            if selected {
+                matched_requested.insert(cell.id.clone());
+            }
+            selected
+        } else {
+            selection
+                .mode
                 .as_deref()
-                .is_none_or(|value| cell.id.test == value)
-            && selection
-                .backend
-                .as_deref()
-                .is_none_or(|value| cell.id.backend == value)
-            && !(selection.sample.is_some()
-                && selection.mode.is_none()
-                && !matches!(cell.id.mode.as_str(), "verify" | "replay" | "chaos"));
+                .is_none_or(|value| cell.id.mode == value)
+                && selection
+                    .test
+                    .as_deref()
+                    .is_none_or(|value| cell.id.test == value)
+                && selection
+                    .backend
+                    .as_deref()
+                    .is_none_or(|value| cell.id.backend == value)
+                && !(selection.sample.is_some()
+                    && selection.mode.is_none()
+                    && !matches!(cell.id.mode.as_str(), "verify" | "replay" | "chaos"))
+        };
         match cell.status.as_str() {
             "red"
                 if selected
                     && !selection.selects_green_population()
                     && !selection.probe_disabled =>
             {
+                if requested_ids.is_some() && !cell.enabled {
+                    return Err(format!(
+                        "--cells-file identity {} is tracked but disabled",
+                        display_id(&cell.id)
+                    ));
+                }
                 let budget = budgets
                     .get(&(
                         cell.id.test.clone(),
@@ -2344,6 +2744,11 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                     })?;
                 if budget.attempts.is_some() {
                     selected_cells.push(cell);
+                } else if requested_ids.is_some() {
+                    return Err(format!(
+                        "--cells-file identity {} is tracked but its manifest declares no executable attempts",
+                        display_id(&cell.id)
+                    ));
                 } else if selection.is_exact() {
                     return Err(format!(
                         "{}/{}/{} is red but unavailable: its manifest declares no chaos seeds, so there is no guest command to run",
@@ -2354,6 +2759,12 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 }
             }
             "red" => {}
+            "green" if selected && requested_ids.is_some() => {
+                return Err(format!(
+                    "--cells-file identity {} is green, not in the red pressure population",
+                    display_id(&cell.id)
+                ));
+            }
             "green" if selected && selection.selects_green_population() && cell.enabled => {
                 let budget = budgets
                     .get(&(
@@ -2376,6 +2787,15 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 selected_cells.push(cell);
             }
             "green" => {}
+            "not-applicable" if selected && requested_ids.is_some() => {
+                return Err(format!(
+                    "--cells-file identity {} is unsupported: {}",
+                    display_id(&cell.id),
+                    cell.not_applicable_reason.as_deref().unwrap_or(
+                        "its backend is not enabled for this mode, so it has no guest command"
+                    )
+                ));
+            }
             "not-applicable" if selected && selection.probe_disabled => {
                 let budget = budgets
                     .get(&(
@@ -2415,6 +2835,14 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
             }
             "not-applicable" => {}
             other => return Err(format!("unknown cell status `{other}`")),
+        }
+    }
+    if let Some(requested) = &requested_ids {
+        if let Some(missing) = requested.difference(&matched_requested).next() {
+            return Err(format!(
+                "--cells-file identity {} is not present in the tracked scorecard",
+                display_id(missing)
+            ));
         }
     }
     selected_cells.sort_by(|left, right| left.id.cmp(&right.id));
@@ -2507,6 +2935,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
         unavailable,
         eligible_cells,
         preparation_by_test,
+        cells_file_sha256,
     })
 }
 
@@ -2681,6 +3110,427 @@ fn require_generated_node_count(
     Ok(count)
 }
 
+fn cell_memory_bytes(cell: &CellId) -> i64 {
+    if cell.lane == "privileged" || cell.backend == "kvm" {
+        PRIVILEGED_CELL_MEMORY_BYTES
+    } else {
+        PORTABLE_CELL_MEMORY_BYTES
+    }
+}
+
+fn checked_memory_sum(mut caps: impl Iterator<Item = i64>) -> Result<i64, String> {
+    caps.try_fold(0_i64, |sum, cap| {
+        sum.checked_add(cap)
+            .ok_or_else(|| "declared pressure-test memory caps overflow".into())
+    })
+}
+
+/// Establish the phase and resource assumptions used by the memory upper bound.
+/// The initial sum is conservative only when every later producer/consumer waits
+/// for all initial nodes. A future graph change must satisfy this check explicitly.
+fn require_accounted_memory_phases(dag: &DagConfig) -> Result<(), String> {
+    let mut steps = BTreeMap::new();
+    let mut early = BTreeSet::new();
+    let mut kvm_caps = Vec::new();
+    let mut other_caps = Vec::new();
+    for step in &dag.steps {
+        let tag = step.tag();
+        if steps.insert(tag.clone(), step).is_some() {
+            return Err(format!("memory admission has duplicate step {tag}"));
+        }
+        let cap = step.hint.hard_mem_max_bytes.filter(|cap| *cap > 0)
+            .ok_or_else(|| format!("{tag} has no positive hard memory cap"))?;
+        match step.group.as_str() {
+            "pre" | "gate" | "setup" | "build" => {
+                if tag != "build.liteinst_runtime_release" {
+                    early.insert(tag);
+                }
+            }
+            "prepare" => {
+                if dag.resource_caps.get("cargo_writer") != Some(&1)
+                    || step.hint.resources.get("cargo_writer") != Some(&1)
+                {
+                    return Err(format!("{tag} lacks the single cargo_writer preparation bound"));
+                }
+            }
+            "cell" => {
+                if step.hint.resources.get("manifest_guest") != Some(&1) {
+                    return Err(format!("{tag} lacks unit manifest_guest demand"));
+                }
+                match step.hint.resources.get("kvm_guest").copied() {
+                    Some(1) => kvm_caps.push(cap),
+                    None => other_caps.push(cap),
+                    Some(_) => return Err(format!("{tag} has non-unit KVM guest demand")),
+                }
+            }
+            "pressure" if tag == "pressure.summarize" => {}
+            _ => return Err(format!("memory admission has unaccounted step {tag}")),
+        }
+    }
+    // The cell maximum takes KVM slots first. This is conservative only when
+    // none of the remaining cells can cost more than a KVM cell (ties are valid).
+    if let (Some(kvm_min), Some(other_max)) = (kvm_caps.iter().min(), other_caps.iter().max()) {
+        if kvm_min < other_max {
+            return Err("KVM-first memory admission requires every KVM cap to cover every non-KVM cap".into());
+        }
+    }
+    for (tag, step) in &steps {
+        let mut ancestors = BTreeSet::new();
+        let mut pending = step.deps.clone();
+        while let Some(dependency) = pending.pop() {
+            if &dependency == tag {
+                return Err(format!("memory admission found a dependency cycle at {tag}"));
+            }
+            if ancestors.insert(dependency.clone()) {
+                let producer = steps.get(&dependency)
+                    .ok_or_else(|| format!("memory admission found absent dependency {dependency} of {tag}"))?;
+                pending.extend(producer.deps.iter().cloned());
+            }
+        }
+        if matches!(step.group.as_str(), "prepare" | "cell")
+            || tag == "build.liteinst_runtime_release"
+        {
+            if let Some(missing) = early.difference(&ancestors).next() {
+                return Err(format!("memory phase for {tag} does not wait for initial node {missing}"));
+            }
+        }
+        if tag == "pressure.summarize" {
+            if let Some(missing) = steps.keys().find(|other| *other != tag && !ancestors.contains(*other)) {
+                return Err(format!("memory phase for {tag} can overlap unfinished node {missing}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Conservative peak for every phase of the generated graph.
+///
+/// All early preflight, gate, setup and build caps are summed. During execution,
+/// `cargo_writer=1` permits one preparation, and the independent late LiteInst
+/// build may also overlap the largest runnable cell caps. The explicit control-plane reserve is outside every
+/// child cgroup and is therefore added after choosing the largest phase.
+fn declared_memory_at_manifest_guest_cap(
+    dag: &DagConfig,
+    jobs: i64,
+    manifest_guest_cap: i64,
+    kvm_guest_cap: i64,
+) -> Result<i64, String> {
+    if jobs <= 0 || manifest_guest_cap <= 0 || kvm_guest_cap <= 0 {
+        return Err("pressure-test scheduler, manifest guest, and KVM caps must be positive".into());
+    }
+    require_accounted_memory_phases(dag)?;
+    let cap_of = |step: &Step| {
+        step.hint
+            .hard_mem_max_bytes
+            .filter(|cap| *cap > 0)
+            .ok_or_else(|| format!("{} has no positive hard memory cap", step.tag()))
+    };
+    let early = checked_memory_sum(
+        dag.steps
+            .iter()
+            .filter(|step| {
+                matches!(step.group.as_str(), "pre" | "gate" | "setup" | "build")
+                    && step.tag() != "build.liteinst_runtime_release"
+            })
+            .map(cap_of)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter(),
+    )?;
+    let late_build = dag
+        .steps
+        .iter()
+        .filter(|step| step.tag() == "build.liteinst_runtime_release")
+        .map(cap_of)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    let preparation = dag
+        .steps
+        .iter()
+        .filter(|step| step.group == "prepare")
+        .map(cap_of)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    let summary = dag
+        .steps
+        .iter()
+        .filter(|step| step.group == "pressure")
+        .map(cap_of)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    let mut kvm_cell_caps = dag
+        .steps
+        .iter()
+        .filter(|step| {
+            step.group == "cell" && step.hint.resources.get("kvm_guest") == Some(&1)
+        })
+        .map(cap_of)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut portable_cell_caps = dag
+        .steps
+        .iter()
+        .filter(|step| {
+            step.group == "cell" && step.hint.resources.get("kvm_guest").copied().unwrap_or(0) == 0
+        })
+        .map(cap_of)
+        .collect::<Result<Vec<_>, _>>()?;
+    kvm_cell_caps.sort_unstable_by(|left, right| right.cmp(left));
+    portable_cell_caps.sort_unstable_by(|left, right| right.cmp(left));
+    let cell_sum = |width: i64| {
+        let width = usize::try_from(width).unwrap_or(usize::MAX);
+        let kvm_width = usize::try_from(kvm_guest_cap)
+            .unwrap_or(usize::MAX)
+            .min(width)
+            .min(kvm_cell_caps.len());
+        let portable_width = width
+            .saturating_sub(kvm_width)
+            .min(portable_cell_caps.len());
+        checked_memory_sum(
+            kvm_cell_caps[..kvm_width]
+                .iter()
+                .chain(portable_cell_caps[..portable_width].iter())
+                .copied(),
+        )
+    };
+    let cell_width = jobs.min(manifest_guest_cap);
+    let cells_only = cell_sum(cell_width)?;
+    let support_with_cells = |support: i64, support_slots: i64| -> Result<i64, String> {
+        support
+            .checked_add(cell_sum(
+                cell_width.min(jobs.saturating_sub(support_slots)),
+            )?)
+            .ok_or_else(|| "declared pressure-test memory caps overflow".into())
+    };
+    let late_overlap = support_with_cells(late_build, i64::from(late_build > 0))?;
+    let preparation_overlap = support_with_cells(preparation, i64::from(preparation > 0))?;
+    // LiteInst's late runtime build and preparation for another test are both
+    // scheduler-reachable while already-prepared non-LiteInst cells run.
+    let combined_support = late_build
+        .checked_add(preparation)
+        .ok_or("declared pressure-test memory caps overflow")?;
+    let combined_overlap = support_with_cells(
+        combined_support,
+        i64::from(late_build > 0) + i64::from(preparation > 0),
+    )?;
+    early
+        .max(cells_only)
+        .max(late_overlap)
+        .max(preparation_overlap)
+        .max(combined_overlap)
+        .max(summary)
+        .checked_add(CONTROL_PLANE_HEADROOM_BYTES)
+        .ok_or_else(|| "pressure-test control-plane headroom overflows".into())
+}
+
+fn max_safe_manifest_guest_effective_width(
+    dag: &DagConfig,
+    jobs: i64,
+    kvm_guest_cap: i64,
+    budget: i64,
+) -> Result<i64, String> {
+    if budget <= 0 {
+        return Ok(0);
+    }
+    let total_cells = i64::try_from(
+        dag.steps
+            .iter()
+            .filter(|step| step.group == "cell")
+            .count(),
+    )
+    .unwrap_or(i64::MAX);
+    let mut low = 0_i64;
+    let mut high = jobs.min(total_cells);
+    while low < high {
+        let candidate = low + (high - low + 1) / 2;
+        if declared_memory_at_manifest_guest_cap(dag, jobs, candidate.max(1), kvm_guest_cap)?
+            <= budget
+        {
+            low = candidate;
+        } else {
+            high = candidate - 1;
+        }
+    }
+    Ok(low)
+}
+
+fn max_safe_kvm_guest_cap(
+    dag: &DagConfig,
+    jobs: i64,
+    manifest_guest_cap: i64,
+    budget: i64,
+) -> Result<i64, String> {
+    if budget <= 0 {
+        return Ok(0);
+    }
+    let total_kvm = i64::try_from(
+        dag.steps
+            .iter()
+            .filter(|step| {
+                step.group == "cell" && step.hint.resources.get("kvm_guest") == Some(&1)
+            })
+            .count(),
+    )
+    .unwrap_or(i64::MAX);
+    if total_kvm == 0 {
+        return Ok(0);
+    }
+    let mut low = 0_i64;
+    let mut high = jobs.min(manifest_guest_cap).min(total_kvm);
+    while low < high {
+        let candidate = low + (high - low + 1) / 2;
+        if declared_memory_at_manifest_guest_cap(dag, jobs, manifest_guest_cap, candidate.max(1))?
+            <= budget
+        {
+            low = candidate;
+        } else {
+            high = candidate - 1;
+        }
+    }
+    Ok(low)
+}
+
+fn validate_manifest_guest_memory(
+    dag: &DagConfig,
+    selection: &CellSelection,
+    observed_budget: Option<i64>,
+) -> Result<(Option<i64>, i64, Option<i64>, Option<i64>), String> {
+    let required = declared_memory_at_manifest_guest_cap(
+        dag,
+        selection.scheduler_jobs(),
+        selection.manifest_guest_cap(),
+        selection.kvm_guest_cap(),
+    )?;
+    let max_safe_cap = observed_budget
+        .map(|budget| {
+            max_safe_manifest_guest_effective_width(
+                dag,
+                selection.scheduler_jobs(),
+                selection.kvm_guest_cap(),
+                budget,
+            )
+        })
+        .transpose()?;
+    let max_safe_kvm_cap = observed_budget
+        .map(|budget| {
+            max_safe_kvm_guest_cap(
+                dag,
+                selection.scheduler_jobs(),
+                selection.manifest_guest_cap(),
+                budget,
+            )
+        })
+        .transpose()?;
+    if selection.manifest_guest_cap.is_some() || selection.kvm_guest_cap.is_some() {
+        let budget = observed_budget.ok_or(
+            "--manifest-guest-cap refuses because the cgroup/machine memory budget is unreadable",
+        )?;
+        if budget <= 0 || required > budget {
+            return Err(format!(
+                "--manifest-guest-cap {} is unsafe: the generated DAG's concurrent hard caps plus {} bytes of control-plane headroom require {required} bytes, exceeding the observed cgroup/machine budget of {budget} bytes; highest safe cap for this population at -j {} is {}",
+                selection.manifest_guest_cap(),
+                CONTROL_PLANE_HEADROOM_BYTES,
+                selection.scheduler_jobs(),
+                max_safe_cap.unwrap_or(0)
+            ));
+        }
+    }
+    Ok((observed_budget, required, max_safe_cap, max_safe_kvm_cap))
+}
+
+fn observed_manifest_guest_memory_budget() -> Option<i64> {
+    [
+        box_mem_budget_bytes(),
+        dagrun::cgroup::outer_memory_max_bytes(),
+        dagrun::cgroup::expected_outer_memory_max_bytes(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|bytes| *bytes > 0)
+    .min()
+}
+
+fn strict_kvm_capability() -> CapabilityVerdict {
+    let declared = hermit_manifest_plan::host_capability::probe_host_capability(HostCapability::Kvm);
+    match fs::OpenOptions::new().read(true).write(true).open("/dev/kvm") {
+        Ok(_) if declared.present => CapabilityVerdict {
+            present: true,
+            evidence: format!("{}; /dev/kvm is openable read-write", declared.evidence),
+        },
+        Ok(_) => CapabilityVerdict {
+            present: false,
+            evidence: format!(
+                "canonical KVM capability probe refused despite openable /dev/kvm: {}",
+                declared.evidence
+            ),
+        },
+        Err(error) => CapabilityVerdict {
+            present: false,
+            evidence: format!("{}; cannot open /dev/kvm read-write: {error}", declared.evidence),
+        },
+    }
+}
+
+fn require_selected_kvm_capability(
+    cells: &[TrackedCell],
+    verdict: &CapabilityVerdict,
+) -> Result<(), String> {
+    if cells.iter().any(|cell| cell.id.backend == "kvm") && !verdict.present {
+        return Err(format!(
+            "selected KVM cells are not executable on this host: {}",
+            verdict.evidence
+        ));
+    }
+    Ok(())
+}
+
+fn validate_guest_caps_against_selected_demand(
+    cells: &[TrackedCell],
+    selection: &CellSelection,
+) -> Result<(), String> {
+    let repetitions = i64::try_from(selection.run_count())
+        .map_err(|_| "--repetitions is too large for the guest-cap demand calculation")?;
+    let total_runs = i64::try_from(cells.len())
+        .unwrap_or(i64::MAX)
+        .checked_mul(repetitions)
+        .ok_or("selected cell count overflows the guest-cap demand calculation")?;
+    if let Some(cap) = selection.manifest_guest_cap {
+        let effective_demand = selection.scheduler_jobs().min(total_runs);
+        if cap > effective_demand {
+            return Err(format!(
+                "--manifest-guest-cap {cap} exceeds selected effective demand {effective_demand} at -j {}; lower the cap to {effective_demand}",
+                selection.scheduler_jobs()
+            ));
+        }
+    }
+    if let Some(cap) = selection.kvm_guest_cap {
+        let kvm_cells = i64::try_from(
+            cells
+                .iter()
+                .filter(|cell| cell.id.backend == "kvm")
+                .count(),
+        )
+        .unwrap_or(i64::MAX);
+        let kvm_runs = kvm_cells
+            .checked_mul(repetitions)
+            .ok_or("selected KVM cell count overflows the guest-cap demand calculation")?;
+        let effective_demand = selection
+            .scheduler_jobs()
+            .min(selection.manifest_guest_cap())
+            .min(kvm_runs);
+        if cap > effective_demand {
+            return Err(format!(
+                "--kvm-guest-cap {cap} exceeds selected effective KVM demand {effective_demand}; lower the cap to {effective_demand}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn require_cell_occupancy_fits(
     cells: &[TrackedCell],
     budgets: &BTreeMap<(String, String, String), CellBudget>,
@@ -2688,12 +3538,15 @@ fn require_cell_occupancy_fits(
     run_timeout_seconds: i64,
     repetitions: usize,
     jobs: i64,
+    manifest_guest_cap: i64,
+    kvm_guest_cap: i64,
 ) -> Result<(), String> {
     let repetitions = i64::try_from(repetitions).map_err(|_| {
         "--repetitions is too large to represent in the pressure-test occupancy calculation"
             .to_string()
     })?;
     let mut all_seconds = 0_i64;
+    let mut kvm_seconds = 0_i64;
     for tracked in cells {
         let budget = budgets
             .get(&(
@@ -2716,17 +3569,25 @@ fn require_cell_occupancy_fits(
             "the selected cells make the declared pressure-test occupancy exceed the supported integer range"
                 .to_string()
         })?;
+        if tracked.id.backend == "kvm" {
+            kvm_seconds = kvm_seconds.checked_add(seconds).ok_or_else(|| {
+                "the selected KVM cells exceed the supported occupancy range".to_string()
+            })?;
+        }
     }
-    // The generated graph permits at most four manifest guests at a time. If
+    // The generated graph permits at most the retained manifest guest cap. If
     // every selected cell consumes its declared cap, this resource limit imposes
     // this minimum wall time even before build and preparation work. Refuse an
     // impossible public bound instead of printing a command which cannot satisfy
     // its own contract.
-    let guest_width = jobs.clamp(1, 4);
-    let occupancy_floor = all_seconds / guest_width + i64::from(all_seconds % guest_width != 0);
+    let guest_width = jobs.clamp(1, manifest_guest_cap);
+    let guest_floor = all_seconds / guest_width + i64::from(all_seconds % guest_width != 0);
+    let kvm_width = jobs.min(manifest_guest_cap).clamp(1, kvm_guest_cap);
+    let kvm_floor = kvm_seconds / kvm_width + i64::from(kvm_seconds % kvm_width != 0);
+    let occupancy_floor = guest_floor.max(kvm_floor);
     if occupancy_floor >= run_timeout_seconds {
         return Err(format!(
-            "selected {} cell run(s) have at least {occupancy_floor}s of declared worst-case cell occupancy at -j {jobs} and manifest_guest=4, which cannot fit the {run_timeout_seconds}s whole-run WALL bound; use --sample, reduce --repetitions, or deliberately raise --run-timeout",
+            "selected {} cell run(s) have at least {occupancy_floor}s of declared worst-case cell occupancy at -j {jobs}, manifest_guest={manifest_guest_cap}, and kvm_guest={kvm_guest_cap}, which cannot fit the {run_timeout_seconds}s whole-run WALL bound; use --sample, reduce --repetitions, adjust safe guest caps, or deliberately raise --run-timeout",
             i64::try_from(cells.len())
                 .unwrap_or(i64::MAX)
                 .saturating_mul(repetitions)
@@ -2889,7 +3750,12 @@ fn write_plan_after_scorecard_check(
         unavailable,
         eligible_cells,
         preparation_by_test: all_preparations,
+        cells_file_sha256,
     } = pressure_cells(root, selection)?;
+    validate_guest_caps_against_selected_demand(&cells, selection)?;
+    if checked_scorecard.enforce_host_capabilities {
+        require_selected_kvm_capability(&cells, &strict_kvm_capability())?;
+    }
     let preparation_by_test = if selection.uses_shared_preparation() {
         all_preparations
     } else {
@@ -2923,6 +3789,8 @@ fn write_plan_after_scorecard_check(
         run_timeout_seconds,
         selection.run_count(),
         selection.scheduler_jobs(),
+        selection.manifest_guest_cap(),
+        selection.kvm_guest_cap(),
     )?;
     fs::create_dir_all(results).map_err(|e| format!("cannot create {}: {e}", results.display()))?;
     if let Some(parent) = output.parent() {
@@ -3047,7 +3915,7 @@ fn write_plan_after_scorecard_check(
             hint: ResourceHint {
                 resources: BTreeMap::from([("cargo_writer".into(), 1)]),
                 rss_baseline_bytes: Some(1_073_741_824),
-                hard_mem_max_bytes: Some(3_221_225_472),
+                hard_mem_max_bytes: Some(PREPARATION_MEMORY_BYTES),
                 classification: StepClass::CpuBound,
                 ..ResourceHint::default()
             },
@@ -3181,12 +4049,11 @@ fn write_plan_after_scorecard_check(
             // manifest cell itself is in the portable lane. Preserve that safety
             // boundary here; a 3 GiB generic portable cap kills the VM before its
             // compatibility result exists.
-            let memory = if cell.lane == "privileged" || cell.backend == "kvm" {
-                16_i64 * 1024 * 1024 * 1024
-            } else {
-                3_i64 * 1024 * 1024 * 1024
-            };
-            let resources = BTreeMap::from([("manifest_guest".into(), 1)]);
+            let memory = cell_memory_bytes(cell);
+            let mut resources = BTreeMap::from([("manifest_guest".into(), 1)]);
+            if cell.backend == "kvm" {
+                resources.insert("kvm_guest".into(), 1);
+            }
             let deps = selected_cell_dependencies(
                 selection.is_exact(),
                 selection.uses_shared_preparation(),
@@ -3305,11 +4172,26 @@ fn write_plan_after_scorecard_check(
 
     let max_timeout = steps.iter().map(|step| step.timeout).max().unwrap_or(120);
     let mut dag = canonical;
-    dag.resource_caps =
-        BTreeMap::from([("cargo_writer".into(), 1), ("manifest_guest".into(), 4)]);
+    dag.resource_caps = BTreeMap::from([
+        ("cargo_writer".into(), 1),
+        ("manifest_guest".into(), selection.manifest_guest_cap()),
+        ("kvm_guest".into(), selection.kvm_guest_cap()),
+    ]);
     dag.default_step_timeout = max_timeout;
     dag.default_step_cpu_timeout = max_timeout * 2;
     dag.steps = steps;
+    let (
+        manifest_guest_memory_budget_bytes,
+        manifest_guest_memory_required_bytes,
+        manifest_guest_max_safe_cap,
+        kvm_guest_max_safe_cap,
+    ) = validate_manifest_guest_memory(
+        &dag,
+        selection,
+        checked_scorecard
+            .memory_budget_override
+            .or_else(observed_manifest_guest_memory_budget),
+    )?;
     let expected_runs = cells.len().saturating_mul(selection.run_count());
     audit_dag(&dag, expected_runs, run_timeout_seconds, &cell_timeouts)?;
     let mut dag_text = dag_to_json(&dag);
@@ -3334,6 +4216,12 @@ fn write_plan_after_scorecard_check(
         ));
     }
 
+    let selected_cells: Vec<_> = cells.into_iter().map(|cell| cell.id).collect();
+    let selected_population_sha256 = selection
+        .cells_file
+        .as_ref()
+        .map(|_| selected_population_sha256(&selected_cells))
+        .transpose()?;
     let metadata = RunMetadata {
         schema: RUN_SCHEMA,
         run_id: results
@@ -3359,8 +4247,23 @@ fn write_plan_after_scorecard_check(
         green: selection.green,
         probe_disabled: selection.probe_disabled,
         jobs: selection.scheduler_jobs(),
+        manifest_guest_cap: selection.manifest_guest_cap(),
+        manifest_guest_cap_explicit: selection.manifest_guest_cap.is_some(),
+        kvm_guest_cap: selection.kvm_guest_cap(),
+        kvm_guest_cap_explicit: selection.kvm_guest_cap.is_some(),
+        manifest_guest_memory_budget_bytes,
+        manifest_guest_memory_required_bytes: Some(manifest_guest_memory_required_bytes),
+        manifest_guest_control_plane_headroom_bytes: Some(CONTROL_PLANE_HEADROOM_BYTES),
+        manifest_guest_max_safe_cap,
+        kvm_guest_max_safe_cap,
         eligible_cells,
-        cells: cells.into_iter().map(|cell| cell.id).collect(),
+        cells_file: selection
+            .cells_file
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        cells_file_sha256,
+        selected_population_sha256,
+        cells: selected_cells,
     };
     let mut metadata_text = serde_json::to_string_pretty(&metadata)
         .map_err(|e| format!("cannot serialize run metadata: {e}"))?;
@@ -3519,6 +4422,41 @@ fn validate_run_contract(
     metadata: &RunMetadata,
     allow_dirty_exact_cell: bool,
 ) -> Result<BTreeMap<CellId, bool>, String> {
+    let cells_file_fields = [
+        metadata.cells_file.is_some(),
+        metadata.cells_file_sha256.is_some(),
+        metadata.selected_population_sha256.is_some(),
+    ];
+    if cells_file_fields.iter().any(|present| *present)
+        && !cells_file_fields.iter().all(|present| *present)
+    {
+        return Err(
+            "retained --cells-file run must record source path, file SHA-256, and selected-population SHA-256"
+                .into(),
+        );
+    }
+    if metadata.cells_file.is_some() && metadata.repetitions.is_none() {
+        return Err("retained --cells-file run is not repeated".into());
+    }
+    for digest in [
+        metadata.cells_file_sha256.as_deref(),
+        metadata.selected_population_sha256.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !is_lower_sha256(digest) {
+            return Err("retained --cells-file SHA-256 is malformed".into());
+        }
+    }
+    if let Some(retained_digest) = &metadata.selected_population_sha256 {
+        let actual_digest = selected_population_sha256(&metadata.cells)?;
+        if actual_digest != *retained_digest {
+            return Err(format!(
+                "retained selected-cell population SHA-256 mismatch: recorded={retained_digest} actual={actual_digest}"
+            ));
+        }
+    }
     if metadata.source_tree_dirty && !allow_dirty_exact_cell {
         return Err("pressure run metadata claims a dirty source tree".into());
     }
@@ -3558,8 +4496,20 @@ fn validate_run_contract(
         green: metadata.green,
         probe_disabled: metadata.probe_disabled,
         jobs: Some(metadata.jobs),
+        manifest_guest_cap: metadata
+            .manifest_guest_cap_explicit
+            .then_some(metadata.manifest_guest_cap),
+        kvm_guest_cap: metadata
+            .kvm_guest_cap_explicit
+            .then_some(metadata.kvm_guest_cap),
+        cells_file: None,
+        retained_cells_file_cells: metadata
+            .cells_file
+            .as_ref()
+            .map(|_| metadata.cells.clone()),
     };
     let pressure_cells = pressure_cells(root, &selection)?;
+    validate_guest_caps_against_selected_demand(&pressure_cells.selected, &selection)?;
     if metadata.repetitions.is_some() && metadata.eligible_cells == 0 {
         return Err("repeated run metadata does not record its eligible-cell count".into());
     }
@@ -3634,6 +4584,110 @@ fn validate_run_contract(
         .map_err(|e| format!("cannot read {}: {e}", dag_path.display()))?;
     let dag =
         dag_from_json(&dag_text).map_err(|e| format!("invalid {}: {e}", dag_path.display()))?;
+    let retained_kvm_cap_matches = dag.resource_caps.get("kvm_guest")
+        == Some(&metadata.kvm_guest_cap)
+        || (!metadata.kvm_guest_cap_explicit
+            && metadata.kvm_guest_cap == DEFAULT_KVM_GUEST_CAP
+            && !dag.resource_caps.contains_key("kvm_guest"));
+    if metadata.manifest_guest_cap <= 0
+        || metadata.kvm_guest_cap <= 0
+        || dag.resource_caps.get("manifest_guest") != Some(&metadata.manifest_guest_cap)
+        || !retained_kvm_cap_matches
+    {
+        return Err(format!(
+            "generated DAG guest caps do not match retained positive caps manifest={} kvm={}",
+            metadata.manifest_guest_cap, metadata.kvm_guest_cap
+        ));
+    }
+    if metadata.manifest_guest_cap != DEFAULT_MANIFEST_GUEST_CAP
+        && !metadata.manifest_guest_cap_explicit
+    {
+        return Err("non-default retained manifest_guest cap is not marked explicit".into());
+    }
+    if metadata.kvm_guest_cap != DEFAULT_KVM_GUEST_CAP && !metadata.kvm_guest_cap_explicit {
+        return Err("non-default retained KVM guest cap is not marked explicit".into());
+    }
+    let recomputed_memory = declared_memory_at_manifest_guest_cap(
+        &dag,
+        metadata.jobs,
+        metadata.manifest_guest_cap,
+        metadata.kvm_guest_cap,
+    )?;
+    if (metadata.manifest_guest_cap_explicit || metadata.kvm_guest_cap_explicit)
+        && (metadata.manifest_guest_memory_budget_bytes.is_none()
+            || metadata.manifest_guest_memory_required_bytes.is_none()
+            || metadata.manifest_guest_control_plane_headroom_bytes
+                != Some(CONTROL_PLANE_HEADROOM_BYTES)
+            || metadata.manifest_guest_max_safe_cap.is_none()
+            || metadata.kvm_guest_max_safe_cap.is_none())
+    {
+        return Err(
+            "explicit retained guest cap lacks budget, requirement, headroom, or maximum-safe-cap evidence"
+                .into(),
+        );
+    }
+    if metadata
+        .manifest_guest_control_plane_headroom_bytes
+        .is_some_and(|recorded| recorded != CONTROL_PLANE_HEADROOM_BYTES)
+    {
+        return Err(format!(
+            "retained manifest_guest control-plane headroom does not equal required {CONTROL_PLANE_HEADROOM_BYTES}"
+        ));
+    }
+    if metadata
+        .manifest_guest_memory_required_bytes
+        .is_some_and(|recorded| recorded != recomputed_memory)
+    {
+        return Err(format!(
+            "retained manifest_guest memory requirement does not match recomputed {recomputed_memory}"
+        ));
+    }
+    if let Some(budget) = metadata.manifest_guest_memory_budget_bytes {
+        let recomputed_max =
+            max_safe_manifest_guest_effective_width(
+                &dag,
+                metadata.jobs,
+                metadata.kvm_guest_cap,
+                budget,
+            )?;
+        let recomputed_kvm_max = max_safe_kvm_guest_cap(
+            &dag,
+            metadata.jobs,
+            metadata.manifest_guest_cap,
+            budget,
+        )?;
+        if metadata
+            .manifest_guest_max_safe_cap
+            .is_some_and(|recorded| recorded != recomputed_max)
+        {
+            return Err(format!(
+                "retained maximum-safe manifest guest width does not match recomputed {recomputed_max}"
+            ));
+        }
+        if metadata
+            .kvm_guest_max_safe_cap
+            .is_some_and(|recorded| recorded != recomputed_kvm_max)
+        {
+            return Err(format!(
+                "retained maximum-safe KVM guest cap does not match recomputed {recomputed_kvm_max}"
+            ));
+        }
+        if (metadata.manifest_guest_cap_explicit || metadata.kvm_guest_cap_explicit)
+            && (budget <= 0
+                || recomputed_memory > budget
+                || (metadata.manifest_guest_cap_explicit
+                    && metadata.manifest_guest_cap > recomputed_max)
+                || (metadata.kvm_guest_cap_explicit
+                    && metadata.kvm_guest_cap > recomputed_kvm_max))
+        {
+            return Err(format!(
+                "retained guest caps manifest={} kvm={} exceed maximum safe caps manifest={recomputed_max} kvm={recomputed_kvm_max} for recorded budget {budget}",
+                metadata.manifest_guest_cap, metadata.kvm_guest_cap
+            ));
+        }
+    } else if metadata.manifest_guest_cap_explicit || metadata.kvm_guest_cap_explicit {
+        return Err("explicit retained guest caps have no observed memory budget".into());
+    }
     let budgets = load_budgets(root)?;
     let budgets = match metadata.timeout_policy {
         Some(policy) => resolve_budgets(budgets, policy, &expected.keys()
@@ -6185,6 +7239,8 @@ fn retained_termination_self_test(scratch: &Path) -> Result<(), String> {
     let execution = ExecutionEvidence {
         outcomes,
         passes: 1,
+        scheduler_wall_s: 0.0,
+        step_profile_rows: Vec::new(),
     };
     let immediate = retain_execution_evidence(&results, &execution)?;
     let retained_bytes = fs::read(&path).map_err(|error| error.to_string())?;
@@ -6446,14 +7502,16 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
         + CELL_WALL_TIMEOUT_SECONDS * i64::try_from(cell_waves).unwrap();
     let run_timeout_seconds =
         declared_critical_path_seconds + CONTROL_STEP_TIMEOUT_SECONDS;
-    let execution = with_execution_root(scratch, || {
-        execute_typed_dag(
-            &dag,
-            jobs,
-            None,
-            Instant::now(),
-            run_timeout_seconds,
-        )
+    let execution = with_runner_log_dir(&direct, || {
+        with_execution_root(scratch, || {
+            execute_typed_dag(
+                &dag,
+                jobs,
+                None,
+                Instant::now(),
+                run_timeout_seconds,
+            )
+        })
     })?;
     let cell_outcomes: Vec<_> = execution
         .outcomes
@@ -6463,12 +7521,16 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
     if cell_outcomes.len() != CELL_COUNT
         || cell_outcomes.iter().filter(|outcome| outcome.ok).count() != 18
         || execution.passes < 2
+        || execution.scheduler_wall_s <= 0.0
+        || execution.step_profile_rows.is_empty()
     {
         return Err(format!(
-            "direct scheduler did not retain all terminal cells across failures: cells={} passes={} ok={}",
+            "direct scheduler did not retain all terminal cells across failures: cells={} passes={} ok={} wall={:.3} profile_rows={}",
             cell_outcomes.len(),
             execution.passes,
-            cell_outcomes.iter().filter(|outcome| outcome.ok).count()
+            cell_outcomes.iter().filter(|outcome| outcome.ok).count(),
+            execution.scheduler_wall_s,
+            execution.step_profile_rows.len(),
         ));
     }
     let executed_count = fs::read_dir(&executed)
@@ -6489,6 +7551,19 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
     fs::create_dir_all(&retained_results)
         .map_err(|error| format!("cannot create retained-outcome fixture: {error}"))?;
     let evidence = retain_execution_evidence(&retained_results, &execution)?;
+    let retained_document: JsonValue = serde_json::from_str(
+        &fs::read_to_string(retained_results.join("runner-profile.json"))
+            .map_err(|error| format!("cannot read retained scheduler document: {error}"))?,
+    )
+    .map_err(|error| format!("cannot parse retained scheduler document: {error}"))?;
+    if retained_document["scheduler_wall_s"].as_f64() != Some(execution.scheduler_wall_s)
+        || retained_document["step_profile_rows"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+        || !direct.join("runner-profile/journal.jsonl").is_file()
+    {
+        return Err("retained scheduler calibration evidence is incomplete".into());
+    }
     let loaded = load_retained_runner_evidence(&retained_results)?
         .ok_or("typed scheduler outcome file was not loadable")?;
     if evidence.len() != 20
@@ -6960,7 +8035,12 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     // The checked files remain immutable throughout this self-test. Production
     // plan/run still checks at its command boundary before constructing a plan.
-    let checked_scorecard = check_scorecard(root)?;
+    check_scorecard(root)?;
+    let checked_scorecard = CheckedScorecard {
+        root,
+        enforce_host_capabilities: false,
+        memory_budget_override: Some(i64::MAX),
+    };
     let explicit_null = decode_budgets(
         br#"[{"test":"fixture/test","mode":"chaos","backend":"ptrace","cpu_timeout_seconds":2,"timeout_seconds":90,"attempts":null}]"#,
     )?;
@@ -7791,7 +8871,10 @@ fn self_test(root: &Path) -> Result<(), String> {
         .cells
         .iter()
         .find(|cell| {
-            cell.status == "red" && cell.id.mode == "verify" && cell.id.backend == "kvm"
+            cell.enabled
+                && cell.status == "red"
+                && cell.id.mode == "verify"
+                && cell.id.backend == "kvm"
         })
         .ok_or("self-test needs at least one red KVM verify cell")?;
     let red_as_disabled = CellSelection {
@@ -7810,6 +8893,21 @@ fn self_test(root: &Path) -> Result<(), String> {
             "disabled-cell probe of an enabled red cell reported the wrong error: {red_as_disabled_error}"
         ));
     }
+    let absent_kvm = CapabilityVerdict {
+        present: false,
+        evidence: "planted unavailable /dev/kvm".into(),
+    };
+    if require_selected_kvm_capability(std::slice::from_ref(red_kvm), &absent_kvm)
+        .is_ok()
+    {
+        return Err("selected KVM cell was accepted with an unavailable host capability".into());
+    }
+    let present_kvm = CapabilityVerdict {
+        present: true,
+        evidence: "planted openable /dev/kvm".into(),
+    };
+    require_selected_kvm_capability(std::slice::from_ref(red_kvm), &present_kvm)
+        .map_err(|error| format!("selected KVM cell was refused despite capability: {error}"))?;
     let disabled_batch_selection = CellSelection {
         mode: Some("verify".into()),
         backend: Some("kvm".into()),
@@ -8050,6 +9148,383 @@ fn self_test(root: &Path) -> Result<(), String> {
         .iter()
         .map(|tracked| tracked.id.clone())
         .collect();
+    let non_kvm_cells_file_id = expected_red_ids
+        .iter()
+        .find(|cell| cell.mode == "verify" && cell.backend != "kvm")
+        .cloned()
+        .ok_or("self-test needs one executable non-KVM red verify cell for --cells-file")?;
+    let mut cells_file_ids = vec![red_kvm.id.clone(), non_kvm_cells_file_id];
+    cells_file_ids.sort();
+    let cells_file_path = scratch.join("selected-cells.jsonl");
+    let cells_file_text = canonical_cells_jsonl(&cells_file_ids)?;
+    fs::write(&cells_file_path, &cells_file_text)
+        .map_err(|error| format!("cannot write --cells-file self-test fixture: {error}"))?;
+    let cells_file_digest = format!("{:x}", Sha256::digest(cells_file_text.as_bytes()));
+    let cells_population_digest = selected_population_sha256(&cells_file_ids)?;
+
+    let mut missing_repetitions_args = vec![
+        "--results".to_string(),
+        scratch.join("missing-repetitions").to_string_lossy().into_owned(),
+        "--cells-file".to_string(),
+        cells_file_path.to_string_lossy().into_owned(),
+    ]
+    .into_iter();
+    let missing_repetitions_error = result_options(
+        root,
+        &mut missing_repetitions_args,
+        false,
+        true,
+    )
+    .err()
+    .ok_or("--cells-file without --repetitions was accepted")?;
+    if !missing_repetitions_error.contains("--cells-file requires --repetitions") {
+        return Err(format!(
+            "--cells-file without --repetitions reported the wrong error: {missing_repetitions_error}"
+        ));
+    }
+
+    let duplicate_cells_file_path = scratch.join("duplicate-selected-cells.jsonl");
+    fs::write(
+        &duplicate_cells_file_path,
+        canonical_cells_jsonl(&[
+            cells_file_ids[0].clone(),
+            cells_file_ids[0].clone(),
+        ])?,
+    )
+    .map_err(|error| format!("cannot write duplicate --cells-file fixture: {error}"))?;
+    let duplicate_error = load_cells_file(&duplicate_cells_file_path)
+        .err()
+        .ok_or("duplicate --cells-file identity was accepted")?;
+    if !duplicate_error.contains("repeats") {
+        return Err(format!(
+            "duplicate --cells-file identity reported the wrong error: {duplicate_error}"
+        ));
+    }
+
+    let noncanonical_cells_file_path = scratch.join("noncanonical-selected-cells.jsonl");
+    let noncanonical = format!(
+        "{{\"lane\":{},\"category\":{},\"test\":{},\"mode\":{},\"backend\":{}}}\n",
+        serde_json::to_string(&cells_file_ids[0].lane).unwrap(),
+        serde_json::to_string(&cells_file_ids[0].category).unwrap(),
+        serde_json::to_string(&cells_file_ids[0].test).unwrap(),
+        serde_json::to_string(&cells_file_ids[0].mode).unwrap(),
+        serde_json::to_string(&cells_file_ids[0].backend).unwrap(),
+    );
+    fs::write(&noncanonical_cells_file_path, noncanonical)
+        .map_err(|error| format!("cannot write noncanonical --cells-file fixture: {error}"))?;
+    if load_cells_file(&noncanonical_cells_file_path)
+        .is_ok()
+    {
+        return Err("noncanonical --cells-file identity was accepted".into());
+    }
+
+    let mut unmatched_id = cells_file_ids[0].clone();
+    unmatched_id.test.push_str("-not-in-scorecard");
+    let unmatched_cells_file_path = scratch.join("unmatched-selected-cells.jsonl");
+    fs::write(
+        &unmatched_cells_file_path,
+        canonical_cells_jsonl(&[unmatched_id])?,
+    )
+    .map_err(|error| format!("cannot write unmatched --cells-file fixture: {error}"))?;
+    let unmatched_selection = CellSelection {
+        repetitions: Some(1),
+        cells_file: Some(unmatched_cells_file_path),
+        ..CellSelection::default()
+    };
+    let unmatched_error = pressure_cells(root, &unmatched_selection)
+        .err()
+        .ok_or("unmatched --cells-file identity was accepted")?;
+    if !unmatched_error.contains("is not present in the tracked scorecard") {
+        return Err(format!(
+            "unmatched --cells-file identity reported the wrong error: {unmatched_error}"
+        ));
+    }
+    let unsupported_cells_file_path = scratch.join("unsupported-selected-cells.jsonl");
+    fs::write(
+        &unsupported_cells_file_path,
+        canonical_cells_jsonl(std::slice::from_ref(&not_applicable.id))?,
+    )
+    .map_err(|error| format!("cannot write unsupported --cells-file fixture: {error}"))?;
+    let unsupported_selection = CellSelection {
+        repetitions: Some(1),
+        cells_file: Some(unsupported_cells_file_path),
+        ..CellSelection::default()
+    };
+    let unsupported_error = pressure_cells(root, &unsupported_selection)
+        .err()
+        .ok_or("unsupported --cells-file identity was accepted")?;
+    if !unsupported_error.contains("is unsupported") {
+        return Err(format!(
+            "unsupported --cells-file identity reported the wrong error: {unsupported_error}"
+        ));
+    }
+
+    let cells_file_results = scratch.join("cells-file-plan");
+    let cells_file_budget_keys = cells_file_ids.iter()
+        .map(|cell| (cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
+        .collect();
+    let cells_file_budgets = resolve_budgets(
+        manifest_budgets.clone(), PressureTimeoutPolicy::from_env()?, &cells_file_budget_keys,
+    )?;
+    let mut cells_file_expected_timeouts = BTreeMap::new();
+    for cell in &cells_file_ids {
+        let budget = cells_file_budgets.get(&(cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
+            .ok_or("cells-file fixture lost its selected budget")?;
+        for repetition in 1..=2 {
+            cells_file_expected_timeouts.insert(
+                format!("cell.{}", cell_run_slug(cell, Some(repetition))), outer_timeout(budget)?,
+            );
+        }
+    }
+    let cells_file_declared_cap = *cells_file_expected_timeouts.values().max()
+        .ok_or("cells-file fixture has no timeout")?;
+    let cells_file_selection = CellSelection {
+        cell_timeout_seconds: Some(cells_file_declared_cap),
+        repetitions: Some(2),
+        run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+        jobs: Some(316),
+        manifest_guest_cap: Some(2),
+        kvm_guest_cap: Some(1),
+        cells_file: Some(cells_file_path.clone()),
+        ..CellSelection::default()
+    };
+    let mut ineffective_kvm_cap = cells_file_selection.clone();
+    ineffective_kvm_cap.kvm_guest_cap = Some(3);
+    if validate_selection_shape(&ineffective_kvm_cap)
+        .err()
+        .is_none_or(|error| !error.contains("exceeds the effective manifest/scheduler width"))
+    {
+        return Err("ineffective --kvm-guest-cap was not refused by name".into());
+    }
+    let non_kvm_tracked = tracked
+        .cells
+        .iter()
+        .find(|cell| cells_file_ids.contains(&cell.id) && cell.id.backend != "kvm")
+        .cloned()
+        .ok_or("self-test non-KVM identity disappeared from tracked cells")?;
+    let non_kvm_explicit_cap = CellSelection {
+        repetitions: Some(1),
+        jobs: Some(4),
+        kvm_guest_cap: Some(1),
+        ..CellSelection::default()
+    };
+    let non_kvm_cap_error = validate_guest_caps_against_selected_demand(
+        std::slice::from_ref(&non_kvm_tracked),
+        &non_kvm_explicit_cap,
+    )
+    .err()
+    .ok_or("non-KVM selection accepted an ineffective explicit KVM cap")?;
+    if !non_kvm_cap_error.contains("effective KVM demand 0") {
+        return Err(format!(
+            "ineffective non-KVM cap reported the wrong error: {non_kvm_cap_error}"
+        ));
+    }
+    let above_total_demand = CellSelection {
+        repetitions: Some(1),
+        jobs: Some(4),
+        manifest_guest_cap: Some(2),
+        ..CellSelection::default()
+    };
+    if validate_guest_caps_against_selected_demand(
+        std::slice::from_ref(&non_kvm_tracked),
+        &above_total_demand,
+    )
+    .err()
+    .is_none_or(|error| !error.contains("effective demand 1"))
+    {
+        return Err("manifest guest cap above selected demand was not refused".into());
+    }
+    let (mut cells_file_metadata, cells_file_dag) = write_plan_after_scorecard_check(
+        &checked_scorecard,
+        &cells_file_results,
+        &cells_file_results.join("dag.json"),
+        &cells_file_selection,
+    )?;
+    let expected_memory = declared_memory_at_manifest_guest_cap(
+        &cells_file_dag,
+        cells_file_selection.scheduler_jobs(),
+        cells_file_selection.manifest_guest_cap(),
+        cells_file_selection.kvm_guest_cap(),
+    )?;
+    let expected_max_safe = max_safe_manifest_guest_effective_width(
+        &cells_file_dag,
+        cells_file_selection.scheduler_jobs(),
+        cells_file_selection.kvm_guest_cap(),
+        i64::MAX,
+    )?;
+    let expected_max_safe_kvm = max_safe_kvm_guest_cap(
+        &cells_file_dag,
+        cells_file_selection.scheduler_jobs(),
+        cells_file_selection.manifest_guest_cap(),
+        i64::MAX,
+    )?;
+    if validate_manifest_guest_memory(
+        &cells_file_dag,
+        &cells_file_selection,
+        Some(expected_memory),
+    )? != (
+        Some(expected_memory),
+        expected_memory,
+        Some(expected_max_safe),
+        Some(expected_max_safe_kvm),
+    )
+    {
+        return Err("safe explicit manifest_guest cap lost its exact memory calculation".into());
+    }
+    let unsafe_memory_error = validate_manifest_guest_memory(
+        &cells_file_dag,
+        &cells_file_selection,
+        Some(expected_memory - 1),
+    )
+    .err()
+    .ok_or("unsafe explicit manifest_guest cap was accepted")?;
+    if !unsafe_memory_error.contains("highest safe cap for this population")
+        || validate_manifest_guest_memory(&cells_file_dag, &cells_file_selection, None).is_ok()
+    {
+        return Err("explicit manifest_guest cap did not refuse unsafe or unknown memory".into());
+    }
+    let cells_file_cell_steps: Vec<_> = cells_file_dag
+        .steps
+        .iter()
+        .filter(|step| step.group == "cell")
+        .collect();
+    let cells_file_timeouts: BTreeMap<_, _> = cells_file_cell_steps
+        .iter()
+        .map(|step| (step.tag(), step.timeout))
+        .collect();
+    if cells_file_metadata.cells != cells_file_ids
+        || cells_file_metadata.repetitions != Some(2)
+        || cells_file_metadata.jobs != 316
+        || cells_file_metadata.manifest_guest_cap != 2
+        || !cells_file_metadata.manifest_guest_cap_explicit
+        || cells_file_metadata.kvm_guest_cap != 1
+        || !cells_file_metadata.kvm_guest_cap_explicit
+        || cells_file_metadata.manifest_guest_memory_required_bytes != Some(expected_memory)
+        || cells_file_metadata.manifest_guest_control_plane_headroom_bytes
+            != Some(CONTROL_PLANE_HEADROOM_BYTES)
+        || cells_file_metadata.manifest_guest_max_safe_cap != Some(expected_max_safe)
+        || cells_file_metadata.kvm_guest_max_safe_cap != Some(expected_max_safe_kvm)
+        || cells_file_metadata.cell_timeout_seconds != Some(cells_file_declared_cap)
+        || cells_file_metadata.cells_file.as_deref()
+            != Some(cells_file_path.to_string_lossy().as_ref())
+        || cells_file_metadata.cells_file_sha256.as_deref() != Some(cells_file_digest.as_str())
+        || cells_file_metadata.selected_population_sha256.as_deref()
+            != Some(cells_population_digest.as_str())
+        || cells_file_cell_steps.len() != 4
+        || cells_file_cell_steps.iter().any(|step| {
+            cells_file_expected_timeouts.get(&step.tag()) != Some(&step.timeout)
+                || step.cmd.matches("test-harness run").count() != 1
+                || !step.cmd.contains("--mode 'verify'")
+                || !step.cmd.contains("E2E_KEEP_VERIFY_LOGS=1")
+        })
+        || cells_file_dag.resource_caps.get("manifest_guest") != Some(&2)
+        || cells_file_dag.resource_caps.get("kvm_guest") != Some(&1)
+        || cells_file_cell_steps.iter().any(|step| {
+            let is_kvm = step.cmd.contains("--backend 'kvm'");
+            (step.hint.resources.get("kvm_guest") == Some(&1)) != is_kvm
+        })
+    {
+        return Err(
+            "--cells-file plan lost its exact identities, repetitions, timeout, jobs, digest, or verify-harness contract"
+                .into(),
+        );
+    }
+    let kvm_template = cells_file_cell_steps
+        .iter()
+        .find(|step| step.hint.resources.get("kvm_guest") == Some(&1))
+        .ok_or("--cells-file dual-cap fixture lost its KVM cell")?;
+    let portable_template = cells_file_cell_steps
+        .iter()
+        .find(|step| step.hint.resources.get("kvm_guest").copied().unwrap_or(0) == 0)
+        .ok_or("--cells-file dual-cap fixture lost its portable cell")?;
+    let preparation_template = cells_file_dag
+        .steps
+        .iter()
+        .find(|step| step.group == "prepare")
+        .ok_or("--cells-file memory fixture lost preparation")?;
+    let mut memory_dag = cells_file_dag.clone();
+    memory_dag.steps.clear();
+    for number in 0..150 {
+        let mut step = (*kvm_template).clone();
+        step.job = format!("kvm-{number:04}");
+        memory_dag.steps.push(step);
+    }
+    for number in 0..1340 {
+        let mut step = (*portable_template).clone();
+        step.job = format!("portable-{number:04}");
+        memory_dag.steps.push(step);
+    }
+    let mut preparation = preparation_template.clone();
+    preparation.job = "fixture".into();
+    memory_dag.steps.push(preparation);
+    let mut liteinst = preparation_template.clone();
+    liteinst.group = "build".into();
+    liteinst.job = "liteinst_runtime_release".into();
+    liteinst.hint.hard_mem_max_bytes = Some(6 * 1024 * 1024 * 1024);
+    memory_dag.steps.push(liteinst);
+    for step in &mut memory_dag.steps {
+        step.deps.clear();
+    }
+    let gib = 1024_i64 * 1024 * 1024;
+    if declared_memory_at_manifest_guest_cap(&memory_dag, 316, 128, 8)? != 498 * gib
+        || declared_memory_at_manifest_guest_cap(&memory_dag, 316, 133, 8)? != 513 * gib
+        || declared_memory_at_manifest_guest_cap(&memory_dag, 316, 128, 10)? != 524 * gib
+        || max_safe_manifest_guest_effective_width(&memory_dag, 316, 8, 512 * gib)? != 132
+    {
+        return Err(
+            "dual manifest/KVM cap memory model lost the 3W + 13K + 10 GiB boundary"
+                .into(),
+        );
+    }
+    // A verify cell node intentionally wraps the harness's two executions and
+    // comparison. The DAG therefore has one node per identity/repetition, not
+    // three. Removing any such wrapper must still fail the plan-shape audit.
+    let mut missing_cells_file_repetition = cells_file_dag.clone();
+    let removed_job = cells_file_cell_steps[0].job.clone();
+    missing_cells_file_repetition
+        .steps
+        .retain(|step| !(step.group == "cell" && step.job == removed_job));
+    if audit_dag(
+        &missing_cells_file_repetition,
+        4,
+        cells_file_metadata.run_timeout_seconds,
+        &cells_file_timeouts,
+    )
+    .is_ok()
+    {
+        return Err("--cells-file plan audit accepted an omitted repetition".into());
+    }
+    cells_file_metadata.source_tree_dirty = false;
+    validate_run_contract(root, &cells_file_results, &cells_file_metadata, false)
+        .map_err(|error| format!("valid retained --cells-file run was refused: {error}"))?;
+    let mut uppercase_cells_file_digest = cells_file_metadata.clone();
+    uppercase_cells_file_digest.cells_file_sha256 = Some("A".repeat(64));
+    if validate_run_contract(
+        root,
+        &cells_file_results,
+        &uppercase_cells_file_digest,
+        false,
+    )
+    .is_ok()
+    {
+        return Err("retained --cells-file run accepted an uppercase SHA-256".into());
+    }
+    let mut incomplete_cells_file_metadata = cells_file_metadata.clone();
+    incomplete_cells_file_metadata.cells.pop();
+    incomplete_cells_file_metadata.eligible_cells = 1;
+    let population_mutation_error = validate_run_contract(
+        root,
+        &cells_file_results,
+        &incomplete_cells_file_metadata,
+        false,
+    )
+    .err()
+    .ok_or("retained --cells-file run accepted an omitted identity and adjusted count")?;
+    if !population_mutation_error.contains("selected-cell population SHA-256 mismatch") {
+        return Err(format!(
+            "retained --cells-file population mutation reported the wrong error: {population_mutation_error}"
+        ));
+    }
     let green_id = tracked
         .cells
         .iter()
@@ -9287,7 +10762,19 @@ fn self_test(root: &Path) -> Result<(), String> {
         green: false,
         probe_disabled: false,
         jobs: default_jobs(),
+        manifest_guest_cap: DEFAULT_MANIFEST_GUEST_CAP,
+        manifest_guest_cap_explicit: false,
+        kvm_guest_cap: DEFAULT_KVM_GUEST_CAP,
+        kvm_guest_cap_explicit: false,
+        manifest_guest_memory_budget_bytes: None,
+        manifest_guest_memory_required_bytes: None,
+        manifest_guest_control_plane_headroom_bytes: None,
+        manifest_guest_max_safe_cap: None,
+        kvm_guest_max_safe_cap: None,
         eligible_cells: 1,
+        cells_file: None,
+        cells_file_sha256: None,
+        selected_population_sha256: None,
         cells: vec![sample_a.clone()],
     };
     if current_result_policy(&sample_metadata, false)?
@@ -10700,7 +12187,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     clone_source_cleanup.remove()?;
     scratch_cleanup.remove()?;
     println!(
-        "compatibility pressure-test self-test: no-hardlinks exact checkout, scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green selection, exact and batch repetitions, retry/attempt/JSON accounting, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
+        "compatibility pressure-test self-test: no-hardlinks exact checkout, scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green and cells-file selection, exact and batch repetitions, retry/attempt/JSON accounting, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
     );
     Ok(())
 }
@@ -11552,5 +13039,111 @@ mod pressure_sample_tests {
         fs::write(path.join("summary.json"), "{").unwrap();
         assert!(retained_host_inapplicable(&path, &cell).is_err());
         guard.remove().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod pressure_planning_tests {
+    use super::*;
+
+    fn memory_fixture() -> DagConfig {
+        let gib = 1024_i64 * 1024 * 1024;
+        let step = |group: &str, job: &str, cap: i64, deps: Vec<&str>, resources: JsonValue| json!({
+            "group": group, "job": job, "cmd": "true", "timeout": 10, "cpu_timeout": 20,
+            "deps": deps, "hint": {"hard_mem_max_bytes": cap * gib, "resources": resources},
+        });
+        let config = json!({
+            "resource_caps": {"cargo_writer": 1, "manifest_guest": 2, "kvm_guest": 1},
+            "steps": [
+                step("pre", "submodules", 2, vec![], json!({})),
+                step("setup", "manifest_plan", 1, vec!["pre.submodules"], json!({})),
+                step("gate", "manifest", 5, vec!["setup.manifest_plan"], json!({})),
+                step("build", "workspace", 7, vec!["gate.manifest"], json!({})),
+                step("build", "liteinst_runtime_release", 6, vec!["build.workspace"], json!({})),
+                step("prepare", "later-test", 3, vec!["build.workspace"], json!({"cargo_writer": 1})),
+                step("cell", "already-prepared-kvm", 16, vec!["build.workspace"], json!({"manifest_guest": 1, "kvm_guest": 1})),
+                step("cell", "already-prepared-native", 3, vec!["build.workspace"], json!({"manifest_guest": 1})),
+                step("pressure", "summarize", 1, vec!["build.liteinst_runtime_release", "prepare.later-test", "cell.already-prepared-kvm", "cell.already-prepared-native"], json!({})),
+            ],
+        });
+        dag_from_json(&config.to_string()).expect("complete memory fixture parses")
+    }
+
+    #[test]
+    fn memory_phases_account_for_prerequisites_and_simultaneous_support() {
+        let mut dag = memory_fixture();
+        let gib = 1024_i64 * 1024 * 1024;
+        // Four workers can run 16+3 GiB cells plus the 6+3 GiB support nodes.
+        // The separate 1 GiB reserve makes 29 GiB, above the 15 GiB initial sum.
+        assert_eq!(declared_memory_at_manifest_guest_cap(&dag, 4, 2, 1).unwrap(), 29 * gib);
+        let native = dag.steps.iter_mut().find(|step| step.job == "already-prepared-native").unwrap();
+        native.hint.hard_mem_max_bytes = Some(16 * gib);
+        // Privileged non-KVM cells may tie the KVM cap without changing the proof.
+        assert_eq!(declared_memory_at_manifest_guest_cap(&dag, 4, 2, 1).unwrap(), 42 * gib);
+        let gate = dag.steps.iter_mut().find(|step| step.tag() == "gate.manifest").unwrap();
+        gate.hint.hard_mem_max_bytes = Some(50 * gib);
+        // All four early caps, including the gate, are charged: 2+1+50+7+1.
+        assert_eq!(declared_memory_at_manifest_guest_cap(&dag, 4, 2, 1).unwrap(), 61 * gib);
+    }
+
+    #[test]
+    fn memory_phases_refuse_unordered_unaccounted_or_missing_nodes() {
+        for tag in ["prepare.later-test", "cell.already-prepared-native", "build.liteinst_runtime_release"] {
+            let mut dag = memory_fixture();
+            dag.steps.iter_mut().find(|step| step.tag() == tag).unwrap().deps.clear();
+            let error = declared_memory_at_manifest_guest_cap(&dag, 4, 2, 1).unwrap_err();
+            assert!(error.contains("does not wait for initial node"), "{tag}: {error}");
+        }
+        let mut dag = memory_fixture();
+        dag.steps.last_mut().unwrap().deps.clear();
+        assert!(declared_memory_at_manifest_guest_cap(&dag, 4, 2, 1).unwrap_err().contains("can overlap unfinished node"));
+        let mut dag = memory_fixture();
+        dag.steps[0].group = "unknown".into();
+        assert!(declared_memory_at_manifest_guest_cap(&dag, 4, 2, 1).unwrap_err().contains("unaccounted step"));
+        let mut dag = memory_fixture();
+        dag.steps[0].hint.hard_mem_max_bytes = None;
+        assert!(declared_memory_at_manifest_guest_cap(&dag, 4, 2, 1).unwrap_err().contains("no positive hard memory cap"));
+        let mut dag = memory_fixture();
+        dag.steps.push(dag.steps[0].clone());
+        assert!(declared_memory_at_manifest_guest_cap(&dag, 4, 2, 1).unwrap_err().contains("duplicate step"));
+        let mut dag = memory_fixture();
+        dag.steps[0].deps = vec!["missing.producer".into()];
+        assert!(declared_memory_at_manifest_guest_cap(&dag, 4, 2, 1).unwrap_err().contains("absent dependency"));
+        let mut dag = memory_fixture();
+        dag.steps[0].deps = vec!["setup.manifest_plan".into()];
+        assert!(declared_memory_at_manifest_guest_cap(&dag, 4, 2, 1).unwrap_err().contains("dependency cycle"));
+    }
+
+    #[test]
+    fn memory_phases_refuse_unbounded_resources_or_invalid_kvm_ordering() {
+        for resource in ["cargo_writer", "manifest_guest", "kvm_guest"] {
+            let mut dag = memory_fixture();
+            if resource == "cargo_writer" {
+                dag.resource_caps.insert(resource.into(), 2);
+            } else {
+                let cell = dag.steps.iter_mut().find(|step| step.job == "already-prepared-kvm").unwrap();
+                cell.hint.resources.insert(resource.into(), 2);
+            }
+            assert!(declared_memory_at_manifest_guest_cap(&dag, 4, 2, 1).is_err(), "{resource}");
+        }
+        let mut dag = memory_fixture();
+        dag.steps.iter_mut().find(|step| step.job == "later-test").unwrap().hint.resources.clear();
+        assert!(declared_memory_at_manifest_guest_cap(&dag, 4, 2, 1).unwrap_err().contains("single cargo_writer"));
+        let mut dag = memory_fixture();
+        dag.steps.iter_mut().find(|step| step.job == "already-prepared-native").unwrap().hint.hard_mem_max_bytes = Some(17 * 1024 * 1024 * 1024);
+        assert!(declared_memory_at_manifest_guest_cap(&dag, 4, 2, 1).unwrap_err().contains("KVM-first memory admission"));
+    }
+
+    #[test]
+    fn direct_and_retained_guest_widths_must_be_positive() {
+        for invalid in [0, -1] {
+            for selection in [
+                CellSelection { jobs: Some(invalid), ..CellSelection::default() },
+                CellSelection { manifest_guest_cap: Some(invalid), ..CellSelection::default() },
+                CellSelection { kvm_guest_cap: Some(invalid), ..CellSelection::default() },
+            ] {
+                assert!(validate_selection_shape(&selection).unwrap_err().contains("must be positive"));
+            }
+        }
     }
 }
