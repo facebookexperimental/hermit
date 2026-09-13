@@ -31,6 +31,9 @@ const STRICT_COMPAT_SELECTION_ALIAS: &str = "test.strict_compat";
 
 fn known_selection_node(nodes: &BTreeSet<String>, node: &str) -> bool {
     nodes.contains(node)
+        // Policy uses the public selectors shared with local validation. The
+        // hosted driver resolves only an exact, present `_on_host` counterpart.
+        || nodes.contains(&format!("{node}_on_host"))
         || (node == STRICT_COMPAT_SELECTION_ALIAS
             && nodes
                 .iter()
@@ -680,6 +683,81 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn committed_hosted_nodes() -> BTreeSet<String> {
+        let dag: Value = serde_json::from_str(include_str!("../../../dag/validate.json")).unwrap();
+        dag["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|step| {
+                step["labels"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|label| label == "hosted-portable")
+            })
+            .map(|step| {
+                format!(
+                    "{}.{}",
+                    step["group"].as_str().unwrap(),
+                    step["job"].as_str().unwrap()
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn committed_policy_public_selectors_resolve_to_present_hosted_nodes() {
+        let nodes = committed_hosted_nodes();
+        let policy: Value =
+            serde_json::from_str(include_str!("../../../test-footprints-policy.json")).unwrap();
+        assert!(!nodes.contains("test.applications_e2e"));
+        assert!(nodes.contains("test.applications_e2e_on_host"));
+        for key in ["package_rules", "path_footprints"] {
+            for rule in policy[key].as_array().unwrap() {
+                for node in strings(rule, "nodes", key) {
+                    assert!(known_selection_node(&nodes, &node), "{key}: {node}");
+                }
+            }
+        }
+        let shared_runtime = policy["package_rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rule| {
+                strings(rule, "packages", "package_rules")
+                    .contains(&"hermit-test-workdir".to_string())
+            })
+            .expect("shared workdir must retain the shared-runtime coverage policy");
+        assert_eq!(shared_runtime["e2e_all"], true);
+        assert!(
+            strings(shared_runtime, "nodes", "package_rules")
+                .contains(&"test.applications_e2e".to_string())
+        );
+    }
+
+    #[test]
+    fn unknown_or_removed_hosted_policy_nodes_still_refuse() {
+        let mut nodes = committed_hosted_nodes();
+        assert!(known_selection_node(&nodes, "test.applications_e2e"));
+        assert!(nodes.remove("test.applications_e2e_on_host"));
+        assert!(!known_selection_node(&nodes, "test.applications_e2e"));
+        assert!(!known_selection_node(
+            &nodes,
+            "test.applications_e2e_on_host"
+        ));
+        assert!(!known_selection_node(&nodes, "test.applications_e2e_typo"));
+        assert!(nodes.insert("test.applications_e2e".into()));
+        assert!(known_selection_node(&nodes, "test.applications_e2e"));
+        assert!(!known_selection_node(
+            &nodes,
+            "test.applications_e2e_on_host"
+        ));
+        assert!(known_selection_node(&nodes, STRICT_COMPAT_SELECTION_ALIAS));
+        nodes.retain(|node| !node.starts_with("compat."));
+        assert!(!known_selection_node(&nodes, STRICT_COMPAT_SELECTION_ALIAS));
+    }
 
     #[test]
     fn no_arguments_still_select_artifact_write() {

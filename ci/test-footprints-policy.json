@@ -52,6 +52,7 @@
         "detcore-model",
         "detcore-testutils",
         "hermit",
+        "hermit-test-workdir",
         "hermit-resources",
         "test-allocator"
       ],
