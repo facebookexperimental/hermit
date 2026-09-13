@@ -1005,7 +1005,7 @@ mod tests {
 
     #[test]
     fn current_raw_reports_reject_duplicates_and_preserve_required_fields() {
-        let current = serde_json::json!({
+        let mut current = serde_json::json!({
             "verified": true,
             "bitwise_parity": true,
             "verdict": "matched",
@@ -1039,6 +1039,12 @@ mod tests {
             "first_divergent_left_message": null,
             "first_divergent_right_message": null
         });
+        let output = serde_json::json!({
+            "exit_code": 0, "signal": null,
+            "stdout_sha256": "a".repeat(64), "stdout_bytes": 0,
+            "stderr_sha256": "b".repeat(64), "stderr_bytes": 0
+        });
+        current["compared_outputs"] = serde_json::json!({"left": output, "right": output});
         let raw = serde_json::to_string(&current).unwrap();
         VerificationReport::from_current_json_slice(raw.as_bytes())
             .unwrap()

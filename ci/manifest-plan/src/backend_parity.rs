@@ -320,4 +320,29 @@ mod tests {
         relaxed_report.comparison.comparison.skip_detlog = true;
         assert!(relaxed_report.validate("kvm").is_err());
     }
+
+    #[test]
+    fn parity_counts_require_complete_inputs_and_consistent_selected_streams() {
+        let mut complete = report(BackendParityVerdict::Matched);
+        complete.comparison.records.available_left = 4;
+        complete.comparison.records.available_right = 7;
+        complete.comparison.records.compared = 4;
+        complete.validate("kvm").unwrap();
+
+        for (compared, left, right) in [(3, 2, 2), (5, 2, 2), (4, 2, 3), (4, 5, 5)] {
+            let mut invalid = complete.clone();
+            invalid.comparison.records.compared = compared;
+            invalid.comparison.selected_messages = LogDiffMessageCounts { left, right };
+            assert!(
+                invalid.validate("kvm").is_err(),
+                "{compared}/{left}/{right}"
+            );
+        }
+
+        // A completed divergence can describe different selected lengths.
+        complete.verdict = BackendParityVerdict::Diverged;
+        complete.comparison.verdict = LogDiffVerdict::Diverged;
+        complete.comparison.selected_messages.right = 3;
+        complete.validate("kvm").unwrap();
+    }
 }

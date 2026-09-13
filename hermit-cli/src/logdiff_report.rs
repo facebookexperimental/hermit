@@ -153,6 +153,24 @@ impl LogDiffReport {
         {
             return Err("log-diff parity evidence compared no shared Detcore INFO records".into());
         }
+        // The one-shot producer reads both complete inputs before selecting
+        // their shared INFO envelope. Raw record populations can differ across
+        // backends; the selected streams of a match cannot.
+        if self.records.compared
+            != self
+                .records
+                .available_left
+                .min(self.records.available_right)
+            || self.selected_messages.left > self.records.available_left
+            || self.selected_messages.right > self.records.available_right
+        {
+            return Err("log-diff parity record counts are incomplete or inconsistent".into());
+        }
+        if self.verdict == LogDiffVerdict::Matched
+            && self.selected_messages.left != self.selected_messages.right
+        {
+            return Err("log-diff match has unequal selected INFO counts".into());
+        }
         let comparison = &self.comparison;
         if comparison.stream != "info"
             || comparison.record_envelope != RecordEnvelopePolicy::CrossBackendDetcoreV1

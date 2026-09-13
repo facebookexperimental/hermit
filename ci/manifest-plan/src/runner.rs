@@ -3088,7 +3088,7 @@ fn retained_run1_log(spec: &CellRunSpec) -> Result<PathBuf, String> {
     }
 }
 
-fn current_verification_report(
+fn parity_verification_report(
     label: &str,
     attempt: &AttemptResult,
 ) -> Result<VerificationReport, String> {
@@ -3096,9 +3096,9 @@ fn current_verification_report(
         .verification_report
         .as_deref()
         .ok_or_else(|| format!("{label} attempt omitted its verification report"))?;
-    let value = serde_json::from_str(raw)
-        .map_err(|error| format!("{label} verification report is not JSON: {error}"))?;
-    let report = VerificationReport::from_current_json_value(value)
+    // Validate the current schema without collapsing duplicate keys in the
+    // producer's original bytes.
+    let report = current_verification_report(raw.as_bytes())
         .map_err(|error| format!("{label} verification report is incomplete: {error}"))?;
     report.require_canonical_match().map_err(|error| {
         format!("{label} did not pass strict same-backend verification: {error}")
@@ -3113,7 +3113,7 @@ fn parity_operand(
     attempt: &AttemptResult,
     log: &Path,
 ) -> Result<BackendParityOperand, String> {
-    let verification = current_verification_report(label, attempt)?;
+    let verification = parity_verification_report(label, attempt)?;
     let output = verification
         .compared_outputs
         .as_ref()
@@ -3290,13 +3290,15 @@ fn observed_result(
     // a typed product verdict. Incidental diagnostic text cannot erase a valid
     // comparison, but an earlier divergence cannot revive an unusable terminal
     // framework/evidence result either.
-    let typed = observed_result_from_typed_evidence(mode, outcome, attempts, error_kind);
+    let typed =
+        observed_result_from_typed_evidence(mode, outcome, attempts, error_kind, backend_parity);
     if matches!(
         typed,
         Some(
             ObservedResult::Pass
                 | ObservedResult::DeterminismFailure
                 | ObservedResult::ReplayFailure
+                | ObservedResult::ParityFailure
         )
     ) {
         return typed;
@@ -3319,6 +3321,7 @@ fn observed_result_from_typed_evidence(
     outcome: &str,
     attempts: &[AttemptResult],
     error_kind: Option<&str>,
+    backend_parity: Option<&BackendParityReport>,
 ) -> Option<ObservedResult> {
     if outcome == "PASS" {
         return Some(ObservedResult::Pass);
@@ -4921,6 +4924,78 @@ mod tests {
             let duplicated = raw.replacen(needle, replacement, 1);
             assert!(
                 current_verification_report(duplicated.as_bytes())
+                    .unwrap_err()
+                    .contains("duplicate field")
+            );
+        }
+    }
+
+    #[test]
+    fn parity_operand_reports_refuse_duplicate_output_fields() {
+        let report = parity_fixture_verification(Verdict::Matched);
+        let value = serde_json::to_value(&report).unwrap();
+        let raw = serde_json::to_string(&value).unwrap();
+        let mut attempt = attempt_with_sabre_evidence("");
+        attempt.verification_report = Some(raw.clone());
+        assert_eq!(
+            parity_verification_report("candidate", &attempt).unwrap(),
+            report
+        );
+        let outputs = serde_json::to_string(&value["compared_outputs"]).unwrap();
+        let mut duplicates = Vec::new();
+        for first in ["null", outputs.as_str()] {
+            duplicates.push(raw.replacen(
+                &format!("\"compared_outputs\":{outputs}"),
+                &format!("\"compared_outputs\":{first},\"compared_outputs\":{outputs}"),
+                1,
+            ));
+        }
+        for side in ["left", "right"] {
+            let output = &value["compared_outputs"][side];
+            let original = serde_json::to_string(output).unwrap();
+            for field in [
+                "exit_code",
+                "signal",
+                "stdout_sha256",
+                "stdout_bytes",
+                "stderr_sha256",
+                "stderr_bytes",
+            ] {
+                let field_value = serde_json::to_string(&output[field]).unwrap();
+                let conflicting = match field {
+                    "exit_code" | "signal" => "7",
+                    "stdout_bytes" | "stderr_bytes" => "123",
+                    _ => "\"different-digest\"",
+                };
+                for first in [field_value.as_str(), conflicting] {
+                    let changed = original.replacen(
+                        &format!("\"{field}\":{field_value}"),
+                        &format!("\"{field}\":{first},\"{field}\":{field_value}"),
+                        1,
+                    );
+                    let changed_outputs = outputs.replacen(
+                        &format!("\"{side}\":{original}"),
+                        &format!("\"{side}\":{changed}"),
+                        1,
+                    );
+                    duplicates.push(raw.replacen(&outputs, &changed_outputs, 1));
+                }
+            }
+        }
+        for duplicated in duplicates {
+            assert_ne!(duplicated, raw);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&duplicated).unwrap(),
+                value
+            );
+            assert!(
+                current_verification_report(duplicated.as_bytes())
+                    .unwrap_err()
+                    .contains("duplicate field")
+            );
+            attempt.verification_report = Some(duplicated);
+            assert!(
+                parity_verification_report("candidate", &attempt)
                     .unwrap_err()
                     .contains("duplicate field")
             );
@@ -7759,7 +7834,7 @@ backends_disabled:
 
     #[test]
     fn framework_keeps_typed_product_results_with_incidental_environment_text() {
-        let report = r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1","display_name":"BitwiseInfoV1","compare_io_buffers":true,"log_scope":"info","virtualize_time":true,"strip_lines":false,"canonicalize_addresses":true,"full_trace":true,"exact_remainder":true,"stripped_prefixes":["real-wall-clock-prefix/v1"],"canonicalizations":["host-address-to-first-appearance-ordinal/v1"],"ignore_lines":false,"skip_commit":false,"skip_detlog":false},"compared_log_messages":{"left":1,"right":1},"first_divergent_scheduler_turn":4,"first_divergent_virtual_nanoseconds":7,"first_divergent_record":9,"first_divergent_syscall":2,"first_divergent_left_message":"left","first_divergent_right_message":"right","no_result_reason":null,"infrastructure_error":null,"guest_exit_code":null,"guest_signal":null}"#;
+        let report = r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1","display_name":"BitwiseInfoV1","compare_io_buffers":true,"log_scope":"info","virtualize_time":true,"strip_lines":false,"canonicalize_addresses":true,"full_trace":true,"exact_remainder":true,"stripped_prefixes":["real-wall-clock-prefix/v1"],"canonicalizations":["host-address-to-first-appearance-ordinal/v1"],"ignore_lines":false,"skip_commit":false,"skip_detlog":false},"compared_log_messages":{"left":1,"right":1},"first_divergent_scheduler_turn":4,"first_divergent_virtual_nanoseconds":7,"first_divergent_record":9,"first_divergent_syscall":2,"first_divergent_left_message":"left","first_divergent_right_message":"right","compared_outputs":{"left":{"exit_code":null,"signal":null,"stdout_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stdout_bytes":0,"stderr_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","stderr_bytes":0},"right":{"exit_code":null,"signal":null,"stdout_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stdout_bytes":0,"stderr_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","stderr_bytes":0}},"no_result_reason":null,"infrastructure_error":null,"guest_exit_code":null,"guest_signal":null}"#;
         current_verification_report(report.as_bytes())
             .expect("the product-precedence fixture must be a current report")
             .require_canonical_comparison()
@@ -7787,7 +7862,7 @@ backends_disabled:
                         vec![divergence]
                     };
                     let bytes = serde_json::to_vec(&attempts).unwrap();
-                    let result = observed_result(mode, "FAIL", &attempts, None);
+                    let result = observed_result(mode, "FAIL", &attempts, None, None);
                     assert_eq!(
                         result,
                         Some(expected),
@@ -7802,7 +7877,7 @@ backends_disabled:
                 let mut passed = attempt_with_sabre_evidence("");
                 passed.stderr = banner.into();
                 assert_eq!(
-                    observed_result(mode, "PASS", &[passed], None),
+                    observed_result(mode, "PASS", &[passed], None, None),
                     Some(ObservedResult::Pass)
                 );
             }
@@ -7815,7 +7890,7 @@ backends_disabled:
         divergence.outcome = "FAIL".into();
         divergence.status = Some(1);
         divergence.verification_report = Some(
-            r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1","display_name":"BitwiseInfoV1","compare_io_buffers":true,"log_scope":"info","virtualize_time":true,"strip_lines":false,"canonicalize_addresses":true,"full_trace":true,"exact_remainder":true,"stripped_prefixes":["real-wall-clock-prefix/v1"],"canonicalizations":["host-address-to-first-appearance-ordinal/v1"],"ignore_lines":false,"skip_commit":false,"skip_detlog":false},"compared_log_messages":{"left":1,"right":1},"first_divergent_scheduler_turn":4,"first_divergent_virtual_nanoseconds":7,"first_divergent_record":9,"first_divergent_syscall":2,"first_divergent_left_message":"left","first_divergent_right_message":"right","no_result_reason":null,"infrastructure_error":null,"guest_exit_code":null,"guest_signal":null}"#.into(),
+            r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1","display_name":"BitwiseInfoV1","compare_io_buffers":true,"log_scope":"info","virtualize_time":true,"strip_lines":false,"canonicalize_addresses":true,"full_trace":true,"exact_remainder":true,"stripped_prefixes":["real-wall-clock-prefix/v1"],"canonicalizations":["host-address-to-first-appearance-ordinal/v1"],"ignore_lines":false,"skip_commit":false,"skip_detlog":false},"compared_log_messages":{"left":1,"right":1},"first_divergent_scheduler_turn":4,"first_divergent_virtual_nanoseconds":7,"first_divergent_record":9,"first_divergent_syscall":2,"first_divergent_left_message":"left","first_divergent_right_message":"right","compared_outputs":{"left":{"exit_code":null,"signal":null,"stdout_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stdout_bytes":0,"stderr_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","stderr_bytes":0},"right":{"exit_code":null,"signal":null,"stdout_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stdout_bytes":0,"stderr_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","stderr_bytes":0}},"no_result_reason":null,"infrastructure_error":null,"guest_exit_code":null,"guest_signal":null}"#.into(),
         );
         current_verification_report(divergence.verification_report.as_ref().unwrap().as_bytes())
             .expect("the terminal-refusal fixture must start with a valid current divergence")
@@ -7844,7 +7919,7 @@ backends_disabled:
                 let attempts = [divergence.clone(), terminal];
                 let bytes = serde_json::to_vec(&attempts).unwrap();
                 for mode in ["verify", "replay"] {
-                    let result = observed_result(mode, "ERROR", &attempts, Some(error));
+                    let result = observed_result(mode, "ERROR", &attempts, Some(error), None);
                     assert_eq!(result, Some(expected), "{mode}, {error}, {banner}");
                     assert_eq!(
                         failure_class("ERROR", result, Some(error)),
@@ -7870,6 +7945,7 @@ backends_disabled:
             &sandbox_denied.outcome,
             std::slice::from_ref(&sandbox_denied),
             sandbox_denied.error_kind.as_deref(),
+            None,
         );
         assert_eq!(sandbox_result, Some(ObservedResult::SandboxDenied));
         assert_eq!(
@@ -7888,6 +7964,7 @@ backends_disabled:
             &proxy_denied.outcome,
             std::slice::from_ref(&proxy_denied),
             proxy_denied.error_kind.as_deref(),
+            None,
         );
         assert_eq!(
             infrastructure_result,
@@ -7911,6 +7988,7 @@ backends_disabled:
             &ordinary.outcome,
             std::slice::from_ref(&ordinary),
             ordinary.error_kind.as_deref(),
+            None,
         );
         assert_eq!(ordinary_result, Some(ObservedResult::CrashError));
         assert_eq!(
@@ -8089,7 +8167,16 @@ backends_disabled:
                 left: 1,
                 right: 1,
             }),
-            compared_outputs: None,
+            compared_outputs: Some(crate::canonical_verdict::ComparedOutputs {
+                left: crate::canonical_verdict::ComparedOutput {
+                    exit_code: Some(7),
+                    ..parity_fixture_output()
+                },
+                right: crate::canonical_verdict::ComparedOutput {
+                    exit_code: Some(7),
+                    ..parity_fixture_output()
+                },
+            }),
             dbt_counted_branches: None,
             runtime: None,
             guest_exit_code: Some(7),
@@ -8332,6 +8419,40 @@ esac
         );
         assert_eq!(diverged.first_divergent_record, Some(2));
         assert!(divergent_invocations.ends_with("normalize\ncompare\n"));
+        for banner in [
+            "An action was blocked on this server based on a security policy!",
+            "fatal: Could not resolve proxy",
+        ] {
+            let mut attempts = diverged.attempts.clone();
+            attempts[0].stderr = banner.into();
+            assert_eq!(
+                observed_result(
+                    "verify",
+                    "FAIL",
+                    &attempts,
+                    None,
+                    diverged.backend_parity.as_ref()
+                ),
+                Some(ObservedResult::ParityFailure)
+            );
+            for error in [
+                "infrastructure",
+                "invalid-backend-evidence",
+                "incomplete-parity-evidence",
+            ] {
+                assert_ne!(
+                    observed_result(
+                        "verify",
+                        "ERROR",
+                        &attempts,
+                        Some(error),
+                        diverged.backend_parity.as_ref()
+                    ),
+                    Some(ObservedResult::ParityFailure),
+                    "terminal {error} must prevent an earlier parity result from being revived"
+                );
+            }
+        }
     }
 
     #[test]

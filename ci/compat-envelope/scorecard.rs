@@ -2243,18 +2243,24 @@ struct Derived {
 
 fn retained_import_cells(derived: &Derived) -> BTreeSet<CellId> {
     let mut eligible = derived.enabled.clone();
-    eligible.extend(derived.population.iter().filter(|candidate| {
-        if candidate.mode != "verify"
-            || matches!(candidate.backend.as_str(), "ptrace" | "native")
-        {
-            return false;
-        }
-        let reference = CellId {
-            backend: "ptrace".into(),
-            ..(*candidate).clone()
-        };
-        derived.green.contains(&reference)
-    }).cloned());
+    eligible.extend(
+        derived
+            .population
+            .iter()
+            .filter(|candidate| {
+                if candidate.mode != "verify"
+                    || matches!(candidate.backend.as_str(), "ptrace" | "native")
+                {
+                    return false;
+                }
+                let reference = CellId {
+                    backend: "ptrace".into(),
+                    ..(*candidate).clone()
+                };
+                derived.green.contains(&reference)
+            })
+            .cloned(),
+    );
     eligible
 }
 
@@ -3136,9 +3142,7 @@ for by either this table or the comparable green cells above.\n\n\
     out
 }
 
-fn latest_backend_parity(
-    cell: &TrackedCell,
-) -> Option<&RecordedBackendParityComparison> {
+fn latest_backend_parity(cell: &TrackedCell) -> Option<&RecordedBackendParityComparison> {
     let candidates = cell
         .observations
         .iter()
@@ -3188,9 +3192,7 @@ fn render_backend_parity_section(tracked: &TrackedCells) -> String {
         .cells
         .iter()
         .filter(|cell| {
-            cell.id.mode == "verify"
-                && cell.id.backend != "ptrace"
-                && cell.id.backend != "native"
+            cell.id.mode == "verify" && cell.id.backend != "ptrace" && cell.id.backend != "native"
         })
         .map(|cell| cell.id.backend.as_str())
         .collect::<BTreeSet<_>>();
@@ -4724,12 +4726,9 @@ fn apply_validate_results(
                     None,
                     None,
                 ),
-                ValidateRowEvidence::ParityMatched { report } => (
-                    Some(ObservedResult::Pass),
-                    None,
-                    Some(report),
-                    None,
-                ),
+                ValidateRowEvidence::ParityMatched { report } => {
+                    (Some(ObservedResult::Pass), None, Some(report), None)
+                }
                 ValidateRowEvidence::ParityDiverged { report } => (
                     Some(ObservedResult::ParityFailure),
                     None,
@@ -6416,17 +6415,14 @@ fn validate_observation_identity_namespace(cells: &TrackedCells) -> Result<(), S
                 let outputs_match = comparison.reference_exit_code
                     == comparison.candidate_exit_code
                     && comparison.reference_signal == comparison.candidate_signal
-                    && comparison.reference_stdout_sha256
-                        == comparison.candidate_stdout_sha256
-                    && comparison.reference_stderr_sha256
-                        == comparison.candidate_stderr_sha256;
-                let expected_result = if outputs_match
-                    && comparison.log_verdict == LogDiffVerdict::Matched
-                {
-                    ObservedResult::Pass
-                } else {
-                    ObservedResult::ParityFailure
-                };
+                    && comparison.reference_stdout_sha256 == comparison.candidate_stdout_sha256
+                    && comparison.reference_stderr_sha256 == comparison.candidate_stderr_sha256;
+                let expected_result =
+                    if outputs_match && comparison.log_verdict == LogDiffVerdict::Matched {
+                        ObservedResult::Pass
+                    } else {
+                        ObservedResult::ParityFailure
+                    };
                 if comparison.reference_backend != "ptrace"
                     || comparison.candidate_backend != cell.id.backend
                     || comparison.result != expected_result
@@ -6434,8 +6430,7 @@ fn validate_observation_identity_namespace(cells: &TrackedCells) -> Result<(), S
                         comparison.log_verdict,
                         LogDiffVerdict::Matched | LogDiffVerdict::Diverged
                     )
-                    || comparison.record_envelope
-                        != RecordEnvelopePolicy::CrossBackendDetcoreV1
+                    || comparison.record_envelope != RecordEnvelopePolicy::CrossBackendDetcoreV1
                     || comparison.compared_records == 0
                     || comparison.reference_info_messages == 0
                     || comparison.candidate_info_messages == 0
@@ -9593,6 +9588,75 @@ fn self_test() -> Result<(), String> {
         }
     }
 
+    // Exercise the real scorecard readers with hash-consistent original bytes,
+    // including both operands and the new exact-output evidence object.
+    let current_value: JsonValue =
+        serde_json::from_str(current_report_text).map_err(|error| error.to_string())?;
+    let output_report_text =
+        serde_json::to_string(&current_value).map_err(|error| error.to_string())?;
+    let outputs = serde_json::to_string(&current_value["compared_outputs"])
+        .map_err(|error| error.to_string())?;
+    let mut output_duplicates = Vec::new();
+    for first in ["null", outputs.as_str()] {
+        output_duplicates.push(output_report_text.replacen(
+            &format!("\"compared_outputs\":{outputs}"),
+            &format!("\"compared_outputs\":{first},\"compared_outputs\":{outputs}"),
+            1,
+        ));
+    }
+    for side in ["left", "right"] {
+        let output = &current_value["compared_outputs"][side];
+        let original = serde_json::to_string(output).map_err(|error| error.to_string())?;
+        for field in [
+            "exit_code",
+            "signal",
+            "stdout_sha256",
+            "stdout_bytes",
+            "stderr_sha256",
+            "stderr_bytes",
+        ] {
+            let field_value =
+                serde_json::to_string(&output[field]).map_err(|error| error.to_string())?;
+            let conflicting = match field {
+                "exit_code" | "signal" => "7",
+                "stdout_bytes" | "stderr_bytes" => "123",
+                _ => "\"different-digest\"",
+            };
+            for first in [field_value.as_str(), conflicting] {
+                let changed = original.replacen(
+                    &format!("\"{field}\":{field_value}"),
+                    &format!("\"{field}\":{first},\"{field}\":{field_value}"),
+                    1,
+                );
+                let changed_outputs = outputs.replacen(
+                    &format!("\"{side}\":{original}"),
+                    &format!("\"{side}\":{changed}"),
+                    1,
+                );
+                output_duplicates.push(output_report_text.replacen(&outputs, &changed_outputs, 1));
+            }
+        }
+    }
+    for duplicated in output_duplicates {
+        assert_ne!(duplicated, output_report_text);
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&duplicated).map_err(|error| error.to_string())?,
+            current_value
+        );
+        let mut duplicate_row = current_identity.clone();
+        duplicate_row.attempts[0]["verification_report_sha256"] =
+            JsonValue::String(format!("{:x}", Sha256::digest(duplicated.as_bytes())));
+        duplicate_row.attempts[0]["verification_report"] = JsonValue::String(duplicated);
+        for error in [
+            duplicate_row.bitwise_info_comparison().unwrap_err(),
+            duplicate_row.comparison_evidence().unwrap_err(),
+        ] {
+            if !error.contains("duplicate field") {
+                return Err(format!("output duplicate refusal lost its cause: {error}"));
+            }
+        }
+    }
+
     current_identity.validate_timeout_policy()?;
     let mut retained_without_explicit_bounds = current_identity.clone();
     retained_without_explicit_bounds.execution_cpu_timeout_seconds = None;
@@ -10318,8 +10382,7 @@ red/`measured-and-passed` count is **0**.",
         ));
         attempt
     };
-    let parity_row =
-        |id: &CellId, verdict: BackendParityVerdict| -> Result<ResultRow, String> {
+    let parity_row = |id: &CellId, verdict: BackendParityVerdict| -> Result<ResultRow, String> {
         let candidate_attempt = parity_attempt(&id.backend, "1");
         let reference_attempt = parity_attempt("ptrace", "parity-reference");
         let parse_verification = |attempt: &JsonValue| {
@@ -10461,6 +10524,37 @@ red/`measured-and-passed` count is **0**.",
 
     let mut matching_parity = parity_tracked();
     let matching_row = parity_row(&parity_id, BackendParityVerdict::Matched)?;
+    let mut unequal_raw_populations = matching_row.clone();
+    let comparison = &mut unequal_raw_populations
+        .backend_parity
+        .as_mut()
+        .unwrap()
+        .comparison;
+    comparison.records.available_left = 4;
+    comparison.records.available_right = 7;
+    comparison.records.compared = 4;
+    unequal_raw_populations.comparison_evidence()?;
+    for (compared, left, right) in [(3, 3, 3), (5, 3, 3), (4, 2, 3), (4, 5, 5)] {
+        let mut inconsistent = unequal_raw_populations.clone();
+        let comparison = &mut inconsistent.backend_parity.as_mut().unwrap().comparison;
+        comparison.records.compared = compared;
+        comparison.selected_messages = LogDiffMessageCounts { left, right };
+        if inconsistent.comparison_evidence().is_ok() {
+            return Err(format!(
+                "scorecard admitted contradictory parity counts {compared}/{left}/{right}"
+            ));
+        }
+    }
+    let mut unequal_selected_divergence = unequal_raw_populations;
+    unequal_selected_divergence.outcome = "FAIL".into();
+    unequal_selected_divergence.result = Some(ObservedResult::ParityFailure);
+    unequal_selected_divergence.failure_class = Some(FailureClass::ProductFailure);
+    let report = unequal_selected_divergence.backend_parity.as_mut().unwrap();
+    report.verdict = BackendParityVerdict::Diverged;
+    report.comparison.verdict = LogDiffVerdict::Diverged;
+    report.comparison.selected_messages.right = 4;
+    unequal_selected_divergence.comparison_evidence()?;
+
     let mut disabled_without_parity = candidate("PASS").row;
     disabled_without_parity.classification = "disabled".into();
     let ingest_fixture = tempfile::tempdir()
@@ -10481,14 +10575,13 @@ red/`measured-and-passed` count is **0**.",
         return Err("observe-results reader discarded a disabled backend-parity probe".into());
     }
     if ingested.contains_key(&id) {
-        return Err("observe-results reader admitted a disabled row without parity evidence".into());
+        return Err(
+            "observe-results reader admitted a disabled row without parity evidence".into(),
+        );
     }
     apply_validate_results(
         &mut matching_parity,
-        &BTreeMap::from([(
-            parity_id.clone(),
-            vec![parity_candidate(matching_row)?],
-        )]),
+        &BTreeMap::from([(parity_id.clone(), vec![parity_candidate(matching_row)?])]),
         "sha-1",
         "tree-1",
         &depth_fixture,
@@ -10579,10 +10672,8 @@ red/`measured-and-passed` count is **0**.",
     reference_attempt["outcome"] = JsonValue::String("FAIL".into());
     reference_attempt["status"] = serde_json::json!(1);
     reference_attempt["verification_report"] = JsonValue::String(reference_report.clone());
-    reference_attempt["verification_report_sha256"] = JsonValue::String(format!(
-        "{:x}",
-        Sha256::digest(reference_report.as_bytes())
-    ));
+    reference_attempt["verification_report_sha256"] =
+        JsonValue::String(format!("{:x}", Sha256::digest(reference_report.as_bytes())));
     let mut reference_failure_tracked = parity_tracked();
     let reference_failure_fold = apply_validate_results(
         &mut reference_failure_tracked,
@@ -10620,10 +10711,7 @@ red/`measured-and-passed` count is **0**.",
     let divergent_row = parity_row(&parity_id, BackendParityVerdict::Diverged)?;
     apply_validate_results(
         &mut divergent_parity,
-        &BTreeMap::from([(
-            parity_id.clone(),
-            vec![parity_candidate(divergent_row)?],
-        )]),
+        &BTreeMap::from([(parity_id.clone(), vec![parity_candidate(divergent_row)?])]),
         "sha-1",
         "tree-1",
         &depth_fixture,
@@ -10638,12 +10726,10 @@ red/`measured-and-passed` count is **0**.",
         .expect("divergent parity cell remains tracked");
     let divergent_markdown = render_backend_parity_section(&divergent_parity);
     if divergent_cell.measurement != MeasurementState::Diverged
-        || divergent_cell.observations[0].results
-            != BTreeSet::from([ObservedResult::ParityFailure])
+        || divergent_cell.observations[0].results != BTreeSet::from([ObservedResult::ParityFailure])
         || !divergent_markdown.contains("| `kvm` | 1 | 1 | 0 | 1 | 0 |")
-        || !divergent_markdown.contains(
-            "| `fixture/backend-parity` | `kvm` | `parity-failure` | 3 | 3 | 3 |",
-        )
+        || !divergent_markdown
+            .contains("| `fixture/backend-parity` | `kvm` | `parity-failure` | 3 | 3 | 3 |")
     {
         return Err(
             "deliberate ptrace/KVM divergence did not become a scorecard parity failure".into(),
@@ -13389,8 +13475,7 @@ red/`measured-and-passed` count is **0**.",
         })
         .map(|cell| cell.id.clone())
         .ok_or("scorecard fixture has no disabled KVM cell with a Green ptrace reference")?;
-    let mut command_parity_row =
-        parity_row(&command_parity_id, BackendParityVerdict::Matched)?;
+    let mut command_parity_row = parity_row(&command_parity_id, BackendParityVerdict::Matched)?;
     command_parity_row.hermit_sha = fixture_head.clone();
     command_parity_row.run_id = "front-door-disabled-parity".into();
     let mut ordinary_disabled_row = command_parity_row.clone();
@@ -13413,18 +13498,23 @@ red/`measured-and-passed` count is **0**.",
             .find(|cell| cell.id == command_parity_id)
             .is_some_and(|cell| {
                 let parity_admitted = cell.observations.iter().any(|observation| {
-                    observation.backend_parity_comparisons.iter().any(|comparison| {
-                        comparison.run_id == command_parity_row.run_id
-                            && comparison.result == ObservedResult::Pass
-                    })
-                });
-                let ordinary_excluded = cell.observations.iter().all(|observation| {
-                    observation.invocations.iter().all(|invocation| {
-                        invocation.run_id != ordinary_disabled_row.run_id
-                    }) && observation
+                    observation
                         .backend_parity_comparisons
                         .iter()
-                        .all(|comparison| comparison.run_id != ordinary_disabled_row.run_id)
+                        .any(|comparison| {
+                            comparison.run_id == command_parity_row.run_id
+                                && comparison.result == ObservedResult::Pass
+                        })
+                });
+                let ordinary_excluded = cell.observations.iter().all(|observation| {
+                    observation
+                        .invocations
+                        .iter()
+                        .all(|invocation| invocation.run_id != ordinary_disabled_row.run_id)
+                        && observation
+                            .backend_parity_comparisons
+                            .iter()
+                            .all(|comparison| comparison.run_id != ordinary_disabled_row.run_id)
                 });
                 parity_admitted && ordinary_excluded
             })

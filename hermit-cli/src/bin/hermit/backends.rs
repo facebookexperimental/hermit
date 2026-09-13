@@ -1786,6 +1786,20 @@ mod tests {
                 true,
             ),
             compared_log_messages: Some(ComparedLogCounts { left: 4, right: 4 }),
+            compared_outputs: {
+                let output = hermit::canonical_verdict::ComparedOutput {
+                    exit_code: Some(guest_exit),
+                    signal: None,
+                    stdout_sha256: "a".repeat(64),
+                    stdout_bytes: 0,
+                    stderr_sha256: "b".repeat(64),
+                    stderr_bytes: 0,
+                };
+                hermit::canonical_verdict::ComparedOutputs {
+                    left: output.clone(),
+                    right: output,
+                }
+            },
             dbt_counted_branches: None,
             runtime: None,
             first_divergent_scheduler_turn: None,
