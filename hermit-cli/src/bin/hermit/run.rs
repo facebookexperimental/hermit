@@ -42,6 +42,7 @@ use hermit::happens_before::DebugInfoResolver;
 use hermit::happens_before::describe_anchor;
 use hermit::happens_before::load_program;
 use hermit::happens_before::resolve_program;
+use hermit::run_evidence::GuestRunDeterminism;
 use reverie::Errno;
 use reverie::process::Bind;
 use reverie::process::Command;
@@ -60,6 +61,8 @@ use super::container::identity_hardening_mounts;
 use super::container::image_container;
 use super::container::with_container;
 use super::global_opts::GlobalOpts;
+use super::guest_capture::GuestRunCapturePaths;
+use super::guest_capture::GuestRunCaptureSession;
 use super::record_envelope::RecordEnvelope;
 use super::tracing::BoundedWriter;
 use super::tracing::init_sync_file_tracing;
@@ -552,6 +555,39 @@ pub struct RunOpts {
     )]
     run_evidence_dir: Option<PathBuf>,
 
+    /// Harness-only terminal sidecar for one ordinary run's exact guest
+    /// stdout/stderr. All three capture paths must be new, distinct children of
+    /// one non-symlink directory shared with --run-evidence-dir. Supported only
+    /// by ptrace, LiteInst, and KVM. KVM copies its existing virtual-console
+    /// output into the held files because its guest has no host file descriptors.
+    #[clap(
+        long,
+        value_name = "NEW_PATH",
+        requires_all = ["guest_stdout", "guest_stderr", "run_evidence_dir"],
+        conflicts_with_all = ["verify", "namespace_only"]
+    )]
+    run_result_json: Option<PathBuf>,
+
+    /// Harness-only no-clobber regular file inherited as guest stdout.
+    /// Requires --run-result-json, --guest-stderr, and --run-evidence-dir.
+    #[clap(
+        long,
+        value_name = "NEW_PATH",
+        requires_all = ["run_result_json", "guest_stderr", "run_evidence_dir"],
+        conflicts_with_all = ["verify", "namespace_only"]
+    )]
+    guest_stdout: Option<PathBuf>,
+
+    /// Harness-only no-clobber regular file inherited as guest stderr.
+    /// Requires --run-result-json, --guest-stdout, and --run-evidence-dir.
+    #[clap(
+        long,
+        value_name = "NEW_PATH",
+        requires_all = ["run_result_json", "guest_stdout", "run_evidence_dir"],
+        conflicts_with_all = ["verify", "namespace_only"]
+    )]
+    guest_stderr: Option<PathBuf>,
+
     /// Diagnose non-zero network binds. Implies an isolated network namespace and conflicts with
     /// `--network=host`.
     #[clap(long)]
@@ -850,6 +886,19 @@ impl fmt::Display for RunOpts {
         if let Some(p) = &self.run_evidence_dir {
             let s = p.to_str().expect("valid unicode path");
             write!(f, " --run-evidence-dir={}", shell_words::quote(s))?;
+        }
+        for (name, path) in [
+            ("run-result-json", self.run_result_json.as_ref()),
+            ("guest-stdout", self.guest_stdout.as_ref()),
+            ("guest-stderr", self.guest_stderr.as_ref()),
+        ] {
+            if let Some(path) = path {
+                write!(
+                    f,
+                    " --{name}={}",
+                    shell_words::quote(&path.to_string_lossy())
+                )?;
+            }
         }
         if self.analyze_networking {
             write!(f, " --analyze-networking")?;
@@ -2681,6 +2730,24 @@ impl RunOpts {
         })
     }
 
+    fn guest_run_capture_paths(&self) -> Result<Option<GuestRunCapturePaths>, Error> {
+        match (
+            self.run_result_json.as_ref(),
+            self.guest_stdout.as_ref(),
+            self.guest_stderr.as_ref(),
+        ) {
+            (None, None, None) => Ok(None),
+            (Some(result), Some(stdout), Some(stderr)) => Ok(Some(GuestRunCapturePaths::new(
+                result.clone(),
+                stdout.clone(),
+                stderr.clone(),
+            ))),
+            _ => Err(Error::msg(
+                "--run-result-json, --guest-stdout, and --guest-stderr must be supplied together",
+            )),
+        }
+    }
+
     fn selected_backend(&self) -> Backend {
         self.backend.unwrap_or_default()
     }
@@ -2821,6 +2888,7 @@ impl RunOpts {
         // subcommand (`hermit run --backend X ...`). An explicit subcommand-level
         // value wins; otherwise fall back to the global one.
         self.backend = self.backend.or(global.backend);
+        let guest_capture_paths = self.guest_run_capture_paths()?;
         if let Some(path) = &self.backend_engagement_json {
             clear_machine_record(path, "backend engagement")?;
         }
@@ -2905,6 +2973,14 @@ impl RunOpts {
         if backend == Backend::E9patch {
             self.prepare_e9patch_program()?;
         }
+        let guest_capture = guest_capture_paths
+            .map(|paths| {
+                let evidence = self.run_evidence_dir.as_deref().ok_or_else(|| {
+                    Error::msg("harness guest capture requires --run-evidence-dir")
+                })?;
+                GuestRunCaptureSession::create(&paths, evidence)
+            })
+            .transpose()?;
         let private_engagement_summary = if self.backend_engagement_json.is_some()
             && backend == Backend::Ptrace
             && self.summary_json.is_none()
@@ -2974,7 +3050,21 @@ impl RunOpts {
         } else if self.verify {
             self.verify(global)
         } else {
-            let (status, _) = self.run(global, false)?;
+            let (status, _) = self.run_with_guest_capture(global, false, guest_capture.as_ref())?;
+            if let Some(capture) = guest_capture {
+                let config = hermit::prepare_backend_config(
+                    self.effective_det_config(),
+                    self.runtime_backend(),
+                );
+                capture.finish(
+                    self.selected_backend(),
+                    status,
+                    GuestRunDeterminism {
+                        detlog_io_buffers: config.detlog_io_buffers,
+                        virtualize_time: config.virtualize_time,
+                    },
+                )?;
+            }
             self.write_backend_engagement_after_run()?;
             drop(private_engagement_summary);
             Ok(status)
@@ -3852,11 +3942,20 @@ impl RunOpts {
         global: &GlobalOpts,
         capture_output: bool,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
+        self.run_with_guest_capture(global, capture_output, None)
+    }
+
+    fn run_with_guest_capture(
+        &self,
+        global: &GlobalOpts,
+        capture_output: bool,
+        guest_capture: Option<&GuestRunCaptureSession>,
+    ) -> Result<(ExitStatus, Option<Output>), Error> {
         if self.no_namespace {
             let mut process = Container::new();
             apply_affinity(&mut process, self.pin_threads);
             return with_container(&mut process, || {
-                self.run_in_container(global, capture_output, None)
+                self.run_in_container(global, capture_output, guest_capture, None)
             });
         }
 
@@ -3865,7 +3964,12 @@ impl RunOpts {
         let (mut container, identity_sources) = self.container(tmpfs.path())?;
 
         with_container(&mut container, || {
-            self.run_in_container(global, capture_output, Some(&identity_sources))
+            self.run_in_container(
+                global,
+                capture_output,
+                guest_capture,
+                Some(&identity_sources),
+            )
         })
     }
 
@@ -4651,11 +4755,36 @@ impl RunOpts {
         &self,
         global: &GlobalOpts,
         capture_output: bool,
+        guest_capture: Option<&GuestRunCaptureSession>,
         identity_sources: Option<&IdentityGuard>,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
         let _guard = global.init_tracing();
 
-        let command = self.guest_command()?;
+        if capture_output && guest_capture.is_some() {
+            anyhow::bail!("internal output capture cannot be combined with harness guest capture");
+        }
+        let backend = self.runtime_backend();
+        let mut command = self.guest_command()?;
+        if let Some(capture) = guest_capture.filter(|_| backend != Backend::Kvm) {
+            let stderr_fd = capture.stderr_fd_for_guest();
+            command.stdout(capture.stdout_for_guest()?);
+            // The pinned reverie-process `spawn_with` currently constructs
+            // child stderr from its stdout configuration. Restore the distinct
+            // harness-owned stderr descriptor after Reverie's stdio setup and
+            // before exec. The held descriptor survives fork despite CLOEXEC;
+            // dup2 both selects fd 2 and clears CLOEXEC on the new descriptor.
+            //
+            // SAFETY: this callback runs after fork. It captures one integer and
+            // calls only async-signal-safe dup2, without allocation or locks.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::dup2(stderr_fd, libc::STDERR_FILENO) == -1 {
+                        return Err(Errno::last());
+                    }
+                    Ok(())
+                });
+            }
+        }
 
         let mut config = self.effective_det_config();
         config.mountinfo_root_rewrites = identity_sources
@@ -4672,23 +4801,28 @@ impl RunOpts {
         self.save_config_to_disk()?;
 
         let timeout = self.run_timeout();
-        if capture_output {
+        if capture_output || (guest_capture.is_some() && backend == Backend::Kvm) {
             let out = hermit::run_with_output_backend_timeout(
                 command,
                 config,
                 self.summary,
                 &self.summary_json,
-                self.runtime_backend(),
+                backend,
                 timeout,
             )?;
-            Ok((out.status, Some(out)))
+            if let Some(capture) = guest_capture {
+                capture.write_kvm_virtual_console(&out.stdout, &out.stderr)?;
+                Ok((out.status, None))
+            } else {
+                Ok((out.status, Some(out)))
+            }
         } else {
             let status = hermit::run_with_backend_timeout(
                 command,
                 config,
                 self.summary,
                 &self.summary_json,
-                self.runtime_backend(),
+                backend,
                 timeout,
             )?;
             Ok((status, None))
@@ -5022,6 +5156,68 @@ mod tests {
                 .is_err(),
                 "{incompatible} must remain incompatible with one-run evidence"
             );
+        }
+    }
+
+    #[test]
+    fn harness_guest_capture_requires_all_paths_and_supported_ordinary_backend() {
+        let flags = [
+            "--run-evidence-dir=/unused/evidence",
+            "--run-result-json=/unused/result.json",
+            "--guest-stdout=/unused/stdout",
+            "--guest-stderr=/unused/stderr",
+        ];
+        let ordinary = RunOpts::parse_from(["run", "/bin/true"]);
+        assert!(ordinary.guest_run_capture_paths().unwrap().is_none());
+        for omitted in 0..flags.len() {
+            let mut args = vec!["run"];
+            args.extend(
+                flags
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, flag)| (index != omitted).then_some(*flag)),
+            );
+            args.push("/bin/true");
+            assert!(
+                RunOpts::try_parse_from(args).is_err(),
+                "accepted capture without {}",
+                flags[omitted]
+            );
+        }
+        for incompatible in ["--verify", "--namespace-only"] {
+            let mut args = vec!["run", incompatible];
+            args.extend(flags);
+            args.push("/bin/true");
+            assert!(RunOpts::try_parse_from(args).is_err());
+        }
+        for backend in [
+            Backend::Ptrace,
+            Backend::Liteinst,
+            Backend::Kvm,
+            Backend::Dbt,
+            Backend::Sabre,
+            Backend::E9patch,
+        ] {
+            let backend_arg = format!("--backend={}", backend.as_str());
+            let mut args = vec!["run", backend_arg.as_str()];
+            args.extend(flags);
+            args.push("/bin/true");
+            let mut options = RunOpts::try_parse_from(args).unwrap();
+            let paths = options.guest_run_capture_paths().unwrap().unwrap();
+            assert_eq!(paths.result, PathBuf::from("/unused/result.json"));
+            assert_eq!(paths.stdout, PathBuf::from("/unused/stdout"));
+            assert_eq!(paths.stderr, PathBuf::from("/unused/stderr"));
+            let result = options.validate_args_with_perf_support(true);
+            if matches!(backend, Backend::Ptrace | Backend::Liteinst | Backend::Kvm) {
+                result.unwrap();
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<PolicyRefusal>()
+                        .is_some()
+                );
+            }
         }
     }
 

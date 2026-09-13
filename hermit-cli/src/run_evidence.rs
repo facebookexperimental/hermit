@@ -26,6 +26,8 @@ use crate::canonical_verdict::RecordEnvelopeReport;
 pub const RUN_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 pub const RUN_EVIDENCE_MANIFEST: &str = "manifest.json";
 pub const RUN_EVIDENCE_INFO_ARTIFACT: &str = "canonical-info-v1.log";
+pub const RUN_EVIDENCE_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
+pub const RUN_EVIDENCE_INFO_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 /// The producer prepares this mode while the manifest is still unnamed.
 /// A readable manifest is a terminal candidate, not a durability certificate:
 /// only the locked, synchronizing inspector may return `Complete`.
@@ -134,6 +136,7 @@ pub struct RunEvidenceReport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunEvidenceInspectionFailure {
     MissingManifest,
+    ManifestTooLarge,
     PublicationInProgress,
     PublicationLockFailed,
     ArtifactSyncFailed,
@@ -145,12 +148,151 @@ pub enum RunEvidenceInspectionFailure {
     InvalidManifest,
     ReportedNoResult(RunEvidenceNoResultReason),
     MissingArtifact,
+    ArtifactTooLarge,
     ArtifactSizeMismatch,
     DigestMismatch,
     TruncatedCanonicalInfo,
     MalformedCanonicalInfo,
     ZeroCanonicalInfo,
     MessageCountMismatch,
+}
+
+impl std::fmt::Display for RunEvidenceInspectionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunEvidenceFileIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+/// Digest and exact inode identity of one harness-owned guest stream.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapturedGuestStream {
+    pub bytes: u64,
+    pub sha256: String,
+    pub identity: RunEvidenceFileIdentity,
+}
+
+/// Determinism settings bound by one ordinary-run result.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuestRunDeterminism {
+    pub detlog_io_buffers: bool,
+    pub virtualize_time: bool,
+}
+
+/// Typed terminal result for one harness-managed ordinary execution.
+///
+/// The named stdout/stderr files are separate from Hermit's own diagnostic
+/// descriptors. A consumer must also validate the companion run evidence and
+/// exact stream bytes before accepting this result as a complete observation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuestRunResult {
+    pub schema_version: u32,
+    #[serde(deserialize_with = "deserialize_guest_run_disposition")]
+    pub disposition: GuestDisposition,
+    pub determinism: GuestRunDeterminism,
+    pub stdout: CapturedGuestStream,
+    pub stderr: CapturedGuestStream,
+}
+
+fn deserialize_guest_run_disposition<'de, D>(deserializer: D) -> Result<GuestDisposition, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Keep the existing manifest reader's representation compatible while
+    // rejecting contradictory or unknown fields in the new guest result.
+    #[derive(Deserialize)]
+    #[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+    enum StrictDisposition {
+        Exited {
+            code: i32,
+        },
+        Signaled {
+            signal: i32,
+            core_dumped: bool,
+        },
+        ExitCodeOnly {
+            code: i32,
+            limitation: DispositionLimitation,
+        },
+    }
+
+    Ok(match StrictDisposition::deserialize(deserializer)? {
+        StrictDisposition::Exited { code } => GuestDisposition::Exited { code },
+        StrictDisposition::Signaled {
+            signal,
+            core_dumped,
+        } => GuestDisposition::Signaled {
+            signal,
+            core_dumped,
+        },
+        StrictDisposition::ExitCodeOnly { code, limitation } => {
+            GuestDisposition::ExitCodeOnly { code, limitation }
+        }
+    })
+}
+
+impl GuestRunResult {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn from_current_json_slice(bytes: &[u8]) -> Result<Self, String> {
+        // Deserialize the original bytes so duplicate fields cannot collapse
+        // through an intermediate serde_json::Value.
+        let result: Self = serde_json::from_slice(bytes)
+            .map_err(|error| format!("invalid guest run result: {error}"))?;
+        result.validate_current()?;
+        Ok(result)
+    }
+
+    pub fn validate_current(&self) -> Result<(), String> {
+        if self.schema_version != Self::SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported guest run result schema {}; expected {}",
+                self.schema_version,
+                Self::SCHEMA_VERSION
+            ));
+        }
+        if !disposition_numbers_are_valid(self.disposition) {
+            return Err("guest run result has an invalid Linux disposition".into());
+        }
+        for (name, stream) in [("stdout", &self.stdout), ("stderr", &self.stderr)] {
+            let valid_sha = stream.sha256.len() == 64
+                && stream
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+            if !valid_sha {
+                return Err(format!(
+                    "guest run result {name} sha256 is not lowercase hex"
+                ));
+            }
+            if stream.identity.inode == 0 {
+                return Err(format!("guest run result {name} inode must be nonzero"));
+            }
+        }
+        if self.stdout.identity == self.stderr.identity {
+            return Err("guest run result stdout and stderr must name distinct inodes".into());
+        }
+        Ok(())
+    }
+}
+
+/// A synchronized report and the exact bytes inspected while its publication
+/// lock and artifact inode were held. Later path changes do not change this
+/// snapshot; callers must compare these bytes rather than reopen the artifact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedRunEvidence {
+    pub report: RunEvidenceReport,
+    pub canonical_info: Vec<u8>,
+    pub artifact_identity: RunEvidenceFileIdentity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -166,17 +308,20 @@ fn backend_supports_evidence(backend: RunEvidenceBackend) -> bool {
     )
 }
 
-fn disposition_matches_backend(backend: RunEvidenceBackend, disposition: GuestDisposition) -> bool {
+fn disposition_numbers_are_valid(disposition: GuestDisposition) -> bool {
     // These are Linux wait dispositions, not arbitrary i32 syscall arguments.
     // The backends normalize an exit argument before producing ExitStatus.
-    let valid_number = match disposition {
+    match disposition {
         GuestDisposition::Exited { code } | GuestDisposition::ExitCodeOnly { code, .. } => {
             (0..=255).contains(&code)
         }
         // Linux supports signal numbers 1 through 64, including realtime signals.
         GuestDisposition::Signaled { signal, .. } => (1..=64).contains(&signal),
-    };
-    if !valid_number {
+    }
+}
+
+fn disposition_matches_backend(backend: RunEvidenceBackend, disposition: GuestDisposition) -> bool {
+    if !disposition_numbers_are_valid(disposition) {
         return false;
     }
     match backend {
@@ -249,35 +394,58 @@ struct HeldChild {
     inode: libc::ino_t,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegularChildReadFailure {
+    Unavailable,
+    TooLarge,
+    SizeChanged,
+}
+
 fn read_regular_child(
     directory: &File,
     name: &OsStr,
     required_mode: Option<u32>,
-) -> io::Result<HeldChild> {
-    let name = component_cstring(name)?;
+    maximum_bytes: u64,
+) -> Result<HeldChild, RegularChildReadFailure> {
+    let name = component_cstring(name).map_err(|_| RegularChildReadFailure::Unavailable)?;
     let mut file = owned_file(unsafe {
         libc::openat(
             directory.as_raw_fd(),
             name.as_ptr(),
             libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
-    })?;
+    })
+    .map_err(|_| RegularChildReadFailure::Unavailable)?;
     let mut stat = MaybeUninit::<libc::stat>::zeroed();
     if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
+        return Err(RegularChildReadFailure::Unavailable);
     }
     // SAFETY: fstat initialized the complete structure on success.
     let stat = unsafe { stat.assume_init() };
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG
         || required_mode.is_some_and(|mode| stat.st_mode & 0o777 != mode)
     {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "run-evidence child is not a regular file",
-        ));
+        return Err(RegularChildReadFailure::Unavailable);
+    }
+    let initial_size =
+        u64::try_from(stat.st_size).map_err(|_| RegularChildReadFailure::Unavailable)?;
+    if initial_size > maximum_bytes {
+        return Err(RegularChildReadFailure::TooLarge);
     }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    (&mut file)
+        .take(maximum_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| RegularChildReadFailure::Unavailable)?;
+    if u64::try_from(bytes.len()).map_err(|_| RegularChildReadFailure::TooLarge)? > maximum_bytes {
+        return Err(RegularChildReadFailure::TooLarge);
+    }
+    let metadata = file
+        .metadata()
+        .map_err(|_| RegularChildReadFailure::Unavailable)?;
+    if metadata.len() != initial_size || metadata.len() != bytes.len() as u64 {
+        return Err(RegularChildReadFailure::SizeChanged);
+    }
     Ok(HeldChild {
         file,
         bytes,
@@ -342,10 +510,30 @@ fn inspect_run_evidence_directory(directory: &File) -> RunEvidenceInspection {
     inspect_with_sync(directory, &mut |_, file| file.sync_all())
 }
 
+/// Load a complete report and its exact canonical bytes using the same held
+/// inode, publication lock, parser and checked syncs as [`inspect_run_evidence`].
+pub fn load_run_evidence(
+    directory: &Path,
+) -> Result<ValidatedRunEvidence, RunEvidenceInspectionFailure> {
+    let directory = open_evidence_directory(directory)
+        .map_err(|_| RunEvidenceInspectionFailure::MissingManifest)?;
+    load_with_sync(&directory, &mut |_, file| file.sync_all())
+}
+
 fn inspect_with_sync(
     directory: &File,
     synchronize: &mut impl FnMut(InspectionSyncPoint, &File) -> io::Result<()>,
 ) -> RunEvidenceInspection {
+    match load_with_sync(directory, synchronize) {
+        Ok(evidence) => RunEvidenceInspection::Complete(evidence.report),
+        Err(failure) => RunEvidenceInspection::NoResult(failure),
+    }
+}
+
+fn load_with_sync(
+    directory: &File,
+    synchronize: &mut impl FnMut(InspectionSyncPoint, &File) -> io::Result<()>,
+) -> Result<ValidatedRunEvidence, RunEvidenceInspectionFailure> {
     // Open a separate description of the same held inode. try_clone would share
     // flock ownership with the caller and could accidentally convert its lock.
     let locked_directory = match owned_file(unsafe {
@@ -357,20 +545,16 @@ fn inspect_with_sync(
     }) {
         Ok(directory) => directory,
         Err(_) => {
-            return RunEvidenceInspection::NoResult(
-                RunEvidenceInspectionFailure::PublicationLockFailed,
-            );
+            return Err(RunEvidenceInspectionFailure::PublicationLockFailed);
         }
     };
     if unsafe { libc::flock(locked_directory.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
         let error = io::Error::last_os_error();
-        return RunEvidenceInspection::NoResult(
-            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                RunEvidenceInspectionFailure::PublicationInProgress
-            } else {
-                RunEvidenceInspectionFailure::PublicationLockFailed
-            },
-        );
+        return Err(if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            RunEvidenceInspectionFailure::PublicationInProgress
+        } else {
+            RunEvidenceInspectionFailure::PublicationLockFailed
+        });
     }
     // The independently owned description releases this shared lock on every
     // return, after all held-file validation/synchronization has completed.
@@ -379,25 +563,32 @@ fn inspect_with_sync(
         directory,
         OsStr::new(RUN_EVIDENCE_MANIFEST),
         Some(RUN_EVIDENCE_MANIFEST_MODE),
+        RUN_EVIDENCE_MANIFEST_MAX_BYTES,
     ) {
         Ok(manifest) => manifest,
-        Err(_) => {
-            return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::MissingManifest);
+        Err(failure) => {
+            return Err(match failure {
+                RegularChildReadFailure::Unavailable => {
+                    RunEvidenceInspectionFailure::MissingManifest
+                }
+                RegularChildReadFailure::TooLarge => RunEvidenceInspectionFailure::ManifestTooLarge,
+                RegularChildReadFailure::SizeChanged => {
+                    RunEvidenceInspectionFailure::MalformedManifest
+                }
+            });
         }
     };
     let report: RunEvidenceReport = match serde_json::from_slice(&manifest.bytes) {
         Ok(report) => report,
         Err(_) => {
-            return RunEvidenceInspection::NoResult(
-                RunEvidenceInspectionFailure::MalformedManifest,
-            );
+            return Err(RunEvidenceInspectionFailure::MalformedManifest);
         }
     };
     if report.schema_version != RUN_EVIDENCE_SCHEMA_VERSION {
-        return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::UnsupportedSchema);
+        return Err(RunEvidenceInspectionFailure::UnsupportedSchema);
     }
     if !static_manifest_fields_are_valid(&report) {
-        return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::InvalidManifest);
+        return Err(RunEvidenceInspectionFailure::InvalidManifest);
     }
     match report.outcome {
         RunEvidenceOutcome::NoResult { reason, .. } => {
@@ -405,43 +596,52 @@ fn inspect_with_sync(
                 || report.canonical_info.byte_count != 0
                 || report.canonical_info.sha256.is_some()
             {
-                return RunEvidenceInspection::NoResult(
-                    RunEvidenceInspectionFailure::InvalidManifest,
-                );
+                return Err(RunEvidenceInspectionFailure::InvalidManifest);
             }
-            return RunEvidenceInspection::NoResult(
-                RunEvidenceInspectionFailure::ReportedNoResult(reason),
-            );
+            return Err(RunEvidenceInspectionFailure::ReportedNoResult(reason));
         }
         RunEvidenceOutcome::Complete { .. } => {}
     }
 
     if report.canonical_info.message_count == 0 {
-        return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::ZeroCanonicalInfo);
+        return Err(RunEvidenceInspectionFailure::ZeroCanonicalInfo);
     }
     let Some(expected_digest) = report.canonical_info.sha256.as_deref() else {
-        return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::InvalidManifest);
+        return Err(RunEvidenceInspectionFailure::InvalidManifest);
     };
-    let artifact = match read_regular_child(directory, OsStr::new(RUN_EVIDENCE_INFO_ARTIFACT), None)
-    {
+    if report.canonical_info.byte_count > RUN_EVIDENCE_INFO_MAX_BYTES {
+        return Err(RunEvidenceInspectionFailure::ArtifactTooLarge);
+    }
+    let artifact = match read_regular_child(
+        directory,
+        OsStr::new(RUN_EVIDENCE_INFO_ARTIFACT),
+        None,
+        RUN_EVIDENCE_INFO_MAX_BYTES,
+    ) {
         Ok(artifact) => artifact,
-        Err(_) => {
-            return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::MissingArtifact);
+        Err(failure) => {
+            return Err(match failure {
+                RegularChildReadFailure::Unavailable => {
+                    RunEvidenceInspectionFailure::MissingArtifact
+                }
+                RegularChildReadFailure::TooLarge => RunEvidenceInspectionFailure::ArtifactTooLarge,
+                RegularChildReadFailure::SizeChanged => {
+                    RunEvidenceInspectionFailure::ArtifactSizeMismatch
+                }
+            });
         }
     };
     if artifact.bytes.len() as u64 != report.canonical_info.byte_count {
-        return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::ArtifactSizeMismatch);
+        return Err(RunEvidenceInspectionFailure::ArtifactSizeMismatch);
     }
     if detcore::Digest::new(&artifact.bytes).to_string() != expected_digest {
-        return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::DigestMismatch);
+        return Err(RunEvidenceInspectionFailure::DigestMismatch);
     }
     if std::str::from_utf8(&artifact.bytes)
         .ok()
         .is_some_and(detcore::logdiff::log_was_truncated)
     {
-        return RunEvidenceInspection::NoResult(
-            RunEvidenceInspectionFailure::TruncatedCanonicalInfo,
-        );
+        return Err(RunEvidenceInspectionFailure::TruncatedCanonicalInfo);
     }
     let mut canonical = Vec::new();
     let count = match detcore::logdiff::write_bitwise_info_v1_bytes(
@@ -451,16 +651,14 @@ fn inspect_with_sync(
     ) {
         Ok(count) => count as u64,
         Err(_) => {
-            return RunEvidenceInspection::NoResult(
-                RunEvidenceInspectionFailure::MalformedCanonicalInfo,
-            );
+            return Err(RunEvidenceInspectionFailure::MalformedCanonicalInfo);
         }
     };
     if count == 0 {
-        return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::ZeroCanonicalInfo);
+        return Err(RunEvidenceInspectionFailure::ZeroCanonicalInfo);
     }
     if count != report.canonical_info.message_count {
-        return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::MessageCountMismatch);
+        return Err(RunEvidenceInspectionFailure::MessageCountMismatch);
     }
     for (point, file, failure) in [
         (
@@ -480,7 +678,7 @@ fn inspect_with_sync(
         ),
     ] {
         if synchronize(point, file).is_err() {
-            return RunEvidenceInspection::NoResult(failure);
+            return Err(failure);
         }
     }
     if !child_identity_is_current(
@@ -493,9 +691,16 @@ fn inspect_with_sync(
         || !child_identity_is_current(directory, RUN_EVIDENCE_INFO_ARTIFACT, &artifact, None)
             .unwrap_or(false)
     {
-        return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::IdentityChanged);
+        return Err(RunEvidenceInspectionFailure::IdentityChanged);
     }
-    RunEvidenceInspection::Complete(report)
+    Ok(ValidatedRunEvidence {
+        report,
+        canonical_info: artifact.bytes,
+        artifact_identity: RunEvidenceFileIdentity {
+            device: artifact.device,
+            inode: artifact.inode,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -963,5 +1168,398 @@ Apr 09 06:08:02.100  INFO hermit_test: second evidence record\n"
                 RunEvidenceInspection::Complete(_)
             ));
         }
+    }
+    fn guest_result_fixture(disposition: GuestDisposition) -> GuestRunResult {
+        GuestRunResult {
+            schema_version: GuestRunResult::SCHEMA_VERSION,
+            disposition,
+            determinism: GuestRunDeterminism {
+                detlog_io_buffers: true,
+                virtualize_time: true,
+            },
+            stdout: CapturedGuestStream {
+                bytes: 3,
+                sha256: detcore::Digest::new(b"out").to_string(),
+                identity: RunEvidenceFileIdentity {
+                    device: 7,
+                    inode: 1,
+                },
+            },
+            stderr: CapturedGuestStream {
+                bytes: 3,
+                sha256: detcore::Digest::new(b"err").to_string(),
+                identity: RunEvidenceFileIdentity {
+                    device: 7,
+                    inode: 2,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn guest_result_preserves_valid_linux_dispositions_and_refuses_invalid_neighbors() {
+        for code in [0, 23, 255] {
+            for disposition in [
+                GuestDisposition::Exited { code },
+                GuestDisposition::ExitCodeOnly {
+                    code,
+                    limitation: DispositionLimitation::KvmExitCodeOnly,
+                },
+            ] {
+                let expected = guest_result_fixture(disposition);
+                assert_eq!(
+                    GuestRunResult::from_current_json_slice(
+                        &serde_json::to_vec(&expected).unwrap()
+                    ),
+                    Ok(expected),
+                );
+            }
+        }
+        for signal in [1, 9, 64] {
+            for core_dumped in [false, true] {
+                let expected = guest_result_fixture(GuestDisposition::Signaled {
+                    signal,
+                    core_dumped,
+                });
+                assert_eq!(
+                    GuestRunResult::from_current_json_slice(
+                        &serde_json::to_vec(&expected).unwrap()
+                    ),
+                    Ok(expected),
+                );
+            }
+        }
+        for code in [-1, 256, i32::MAX, i32::MIN] {
+            for disposition in [
+                GuestDisposition::Exited { code },
+                GuestDisposition::ExitCodeOnly {
+                    code,
+                    limitation: DispositionLimitation::KvmExitCodeOnly,
+                },
+            ] {
+                let bytes = serde_json::to_vec(&guest_result_fixture(disposition)).unwrap();
+                assert!(
+                    GuestRunResult::from_current_json_slice(&bytes)
+                        .unwrap_err()
+                        .contains("invalid Linux disposition")
+                );
+            }
+        }
+        for signal in [-1, 0, 65, i32::MAX] {
+            let bytes = serde_json::to_vec(&guest_result_fixture(GuestDisposition::Signaled {
+                signal,
+                core_dumped: false,
+            }))
+            .unwrap();
+            assert!(
+                GuestRunResult::from_current_json_slice(&bytes)
+                    .unwrap_err()
+                    .contains("invalid Linux disposition")
+            );
+        }
+    }
+
+    #[test]
+    fn guest_result_parses_original_bytes_and_refuses_duplicate_fields() {
+        let expected = guest_result_fixture(GuestDisposition::Exited { code: 23 });
+        let original = serde_json::to_string(&expected).unwrap();
+        assert_eq!(
+            GuestRunResult::from_current_json_slice(original.as_bytes()),
+            Ok(expected)
+        );
+        for (field, value, conflicting) in [
+            ("schema_version", "1", "2"),
+            ("code", "23", "0"),
+            ("detlog_io_buffers", "true", "false"),
+            ("bytes", "3", "4"),
+            ("inode", "1", "3"),
+        ] {
+            for duplicate in [value, conflicting] {
+                let needle = format!("\"{field}\":{value}");
+                let replacement = format!("{needle},\"{field}\":{duplicate}");
+                let malformed = original.replacen(&needle, &replacement, 1);
+                assert_ne!(malformed, original, "fixture did not replace {field}");
+                let error =
+                    GuestRunResult::from_current_json_slice(malformed.as_bytes()).unwrap_err();
+                assert!(error.contains("duplicate field"), "{field}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn guest_result_refuses_missing_unknown_and_aliased_stream_metadata() {
+        let expected = guest_result_fixture(GuestDisposition::Exited { code: 23 });
+        let original = serde_json::to_value(&expected).unwrap();
+        for field in [
+            "schema_version",
+            "disposition",
+            "determinism",
+            "stdout",
+            "stderr",
+        ] {
+            let mut malformed = original.clone();
+            assert!(malformed.as_object_mut().unwrap().remove(field).is_some());
+            assert!(
+                GuestRunResult::from_current_json_slice(&serde_json::to_vec(&malformed).unwrap())
+                    .unwrap_err()
+                    .contains("missing field")
+            );
+        }
+        for nested in [None, Some("stdout"), Some("determinism")] {
+            let mut malformed = original.clone();
+            let object = match nested {
+                None => &mut malformed,
+                Some(name) => &mut malformed[name],
+            };
+            assert!(
+                object
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("unknown".into(), serde_json::json!(true))
+                    .is_none()
+            );
+            assert!(
+                GuestRunResult::from_current_json_slice(&serde_json::to_vec(&malformed).unwrap())
+                    .unwrap_err()
+                    .contains("unknown field")
+            );
+        }
+        let mut aliased = expected.clone();
+        aliased.stderr.identity = aliased.stdout.identity;
+        assert!(
+            GuestRunResult::from_current_json_slice(&serde_json::to_vec(&aliased).unwrap())
+                .unwrap_err()
+                .contains("distinct inodes")
+        );
+        let mut invalid_digest = expected.clone();
+        invalid_digest.stdout.sha256 = "not-a-digest".into();
+        assert!(
+            GuestRunResult::from_current_json_slice(&serde_json::to_vec(&invalid_digest).unwrap())
+                .unwrap_err()
+                .contains("lowercase hex")
+        );
+        let mut invalid_inode = expected;
+        invalid_inode.stderr.identity.inode = 0;
+        assert!(
+            GuestRunResult::from_current_json_slice(&serde_json::to_vec(&invalid_inode).unwrap())
+                .unwrap_err()
+                .contains("inode must be nonzero")
+        );
+    }
+
+    #[test]
+    fn guest_result_refuses_fields_from_other_disposition_variants() {
+        for (disposition, extra_field, extra_value) in [
+            (GuestDisposition::Exited { code: 23 }, "signal", 9),
+            (
+                GuestDisposition::Signaled {
+                    signal: 9,
+                    core_dumped: false,
+                },
+                "code",
+                23,
+            ),
+            (
+                GuestDisposition::ExitCodeOnly {
+                    code: 23,
+                    limitation: DispositionLimitation::KvmExitCodeOnly,
+                },
+                "signal",
+                9,
+            ),
+        ] {
+            let expected = guest_result_fixture(disposition);
+            let mut value = serde_json::to_value(&expected).unwrap();
+            assert_eq!(
+                GuestRunResult::from_current_json_slice(&serde_json::to_vec(&value).unwrap()),
+                Ok(expected)
+            );
+            assert!(
+                value["disposition"]
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(extra_field.into(), serde_json::json!(extra_value))
+                    .is_none()
+            );
+            let error =
+                GuestRunResult::from_current_json_slice(&serde_json::to_vec(&value).unwrap())
+                    .unwrap_err();
+            assert!(error.contains("unknown field"), "{disposition:?}: {error}");
+            assert!(error.contains(extra_field), "{disposition:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn loader_returns_the_exact_synchronized_bytes_and_original_inode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let log = valid_log();
+        write_complete_fixture(
+            directory.path(),
+            &log,
+            detcore::Digest::new(&log).to_string(),
+            2,
+        );
+        let artifact = directory.path().join(RUN_EVIDENCE_INFO_ARTIFACT);
+        let original = fs::metadata(&artifact).unwrap();
+        let loaded = load_run_evidence(directory.path()).unwrap();
+        assert_eq!(loaded.canonical_info, log);
+        assert_eq!(
+            loaded.artifact_identity,
+            RunEvidenceFileIdentity {
+                device: original.dev(),
+                inode: original.ino(),
+            }
+        );
+        assert_eq!(
+            loaded.report.canonical_info.sha256.as_deref(),
+            Some(
+                detcore::Digest::new(&loaded.canonical_info)
+                    .to_string()
+                    .as_str()
+            )
+        );
+        fs::rename(&artifact, directory.path().join("held-original")).unwrap();
+        fs::write(&artifact, b"replacement bytes\n").unwrap();
+        assert_eq!(
+            loaded.canonical_info, log,
+            "the returned snapshot must not reopen a path"
+        );
+        assert_ne!(
+            fs::metadata(&artifact).unwrap().ino(),
+            loaded.artifact_identity.inode
+        );
+        assert!(load_run_evidence(directory.path()).is_err());
+    }
+
+    #[test]
+    fn loader_refuses_live_publication_and_each_failed_sync() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = valid_log();
+        write_complete_fixture(
+            directory.path(),
+            &log,
+            detcore::Digest::new(&log).to_string(),
+            2,
+        );
+        let held = open_evidence_directory(directory.path()).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert_eq!(
+            load_run_evidence(directory.path()),
+            Err(RunEvidenceInspectionFailure::PublicationInProgress)
+        );
+        drop(held);
+        let held = open_evidence_directory(directory.path()).unwrap();
+        for (failed, expected) in [
+            (
+                InspectionSyncPoint::Artifact,
+                RunEvidenceInspectionFailure::ArtifactSyncFailed,
+            ),
+            (
+                InspectionSyncPoint::Manifest,
+                RunEvidenceInspectionFailure::ManifestSyncFailed,
+            ),
+            (
+                InspectionSyncPoint::Directory,
+                RunEvidenceInspectionFailure::DirectorySyncFailed,
+            ),
+        ] {
+            let mut reached = false;
+            let loaded = load_with_sync(&held, &mut |point, file| {
+                if point == failed {
+                    reached = true;
+                    Err(io::Error::from_raw_os_error(libc::EIO))
+                } else {
+                    file.sync_all()
+                }
+            });
+            assert!(reached);
+            assert_eq!(loaded, Err(expected));
+        }
+        let mut synchronized = Vec::new();
+        let loaded = load_with_sync(&held, &mut |point, file| {
+            synchronized.push(point);
+            file.sync_all()
+        })
+        .unwrap();
+        assert_eq!(
+            synchronized,
+            [
+                InspectionSyncPoint::Artifact,
+                InspectionSyncPoint::Manifest,
+                InspectionSyncPoint::Directory
+            ]
+        );
+        assert_eq!(loaded.canonical_info, log);
+    }
+
+    #[test]
+    fn bounded_loader_refuses_oversize_manifest_and_artifact_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = valid_log();
+        write_complete_fixture(
+            directory.path(),
+            &log,
+            detcore::Digest::new(&log).to_string(),
+            2,
+        );
+        let held = open_evidence_directory(directory.path()).unwrap();
+        // Exercise the actual fstat-before-read guard with a small limit, so
+        // this control does not need a gigabyte file or weaker native FSIZE bound.
+        assert!(matches!(
+            read_regular_child(
+                &held,
+                OsStr::new(RUN_EVIDENCE_INFO_ARTIFACT),
+                None,
+                log.len() as u64 - 1
+            ),
+            Err(RegularChildReadFailure::TooLarge)
+        ));
+        assert_eq!(
+            read_regular_child(
+                &held,
+                OsStr::new(RUN_EVIDENCE_INFO_ARTIFACT),
+                None,
+                log.len() as u64
+            )
+            .unwrap()
+            .bytes,
+            log
+        );
+        let manifest = directory.path().join(RUN_EVIDENCE_MANIFEST);
+        let mut report: RunEvidenceReport =
+            serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        report.canonical_info.byte_count = RUN_EVIDENCE_INFO_MAX_BYTES + 1;
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&manifest, serde_json::to_vec(&report).unwrap()).unwrap();
+        fs::set_permissions(
+            &manifest,
+            fs::Permissions::from_mode(RUN_EVIDENCE_MANIFEST_MODE),
+        )
+        .unwrap();
+        assert_eq!(
+            load_run_evidence(directory.path()),
+            Err(RunEvidenceInspectionFailure::ArtifactTooLarge)
+        );
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&manifest)
+            .unwrap()
+            .set_len(RUN_EVIDENCE_MANIFEST_MAX_BYTES + 1)
+            .unwrap();
+        fs::set_permissions(
+            &manifest,
+            fs::Permissions::from_mode(RUN_EVIDENCE_MANIFEST_MODE),
+        )
+        .unwrap();
+        assert_eq!(
+            load_run_evidence(directory.path()),
+            Err(RunEvidenceInspectionFailure::ManifestTooLarge)
+        );
     }
 }

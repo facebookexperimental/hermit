@@ -21,6 +21,7 @@ use detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
 use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
 use hermit::run_evidence::DispositionLimitation;
 use hermit::run_evidence::GuestDisposition;
+use hermit::run_evidence::GuestRunResult;
 use hermit::run_evidence::RunEvidenceBackend;
 use hermit::run_evidence::RunEvidenceInspection;
 use hermit::run_evidence::RunEvidenceInspectionFailure;
@@ -534,4 +535,69 @@ fn kvm_schema_never_claims_signal_precision() {
     assert_eq!(value["limitation"], "kvm_exit_code_only");
     assert!(value.get("signal").is_none());
     assert!(value.get("core_dumped").is_none());
+}
+
+#[test]
+fn harness_capture_separates_guest_streams_from_hermit_diagnostics() {
+    let _guard = hermit_run_guard();
+    let parent = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let evidence = parent.path().join("evidence");
+    let result_path = parent.path().join("result.json");
+    let guest_stdout = parent.path().join("guest.stdout");
+    let guest_stderr = parent.path().join("guest.stderr");
+    let output = run(&[
+        "--log",
+        "info",
+        "run",
+        "--run-evidence-dir",
+        evidence.to_str().unwrap(),
+        "--run-result-json",
+        result_path.to_str().unwrap(),
+        "--guest-stdout",
+        guest_stdout.to_str().unwrap(),
+        "--guest-stderr",
+        guest_stderr.to_str().unwrap(),
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf guest-only-stdout; printf guest-only-stderr >&2; exit 23",
+    ]);
+
+    assert_eq!(output.status.code(), Some(23));
+    assert!(output.stdout.is_empty());
+    assert!(
+        !output.stderr.is_empty(),
+        "INFO diagnostics were suppressed"
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("guest-only-stderr"));
+    assert_eq!(fs::read(&guest_stdout).unwrap(), b"guest-only-stdout");
+    assert_eq!(fs::read(&guest_stderr).unwrap(), b"guest-only-stderr");
+
+    let result = GuestRunResult::from_current_json_slice(&fs::read(&result_path).unwrap()).unwrap();
+    assert_eq!(result.disposition, GuestDisposition::Exited { code: 23 });
+    for (stream, path) in [
+        (&result.stdout, &guest_stdout),
+        (&result.stderr, &guest_stderr),
+    ] {
+        let metadata = fs::metadata(path).unwrap();
+        assert_eq!(stream.bytes, metadata.len());
+        assert_eq!(
+            stream.sha256,
+            detcore::Digest::new(&fs::read(path).unwrap()).to_string()
+        );
+        assert_eq!(stream.identity.device, metadata.dev());
+        assert_eq!(stream.identity.inode, metadata.ino());
+    }
+    assert_ne!(
+        (result.stdout.identity.device, result.stdout.identity.inode),
+        (result.stderr.identity.device, result.stderr.identity.inode),
+        "guest stdout and stderr must be distinct inodes"
+    );
+    assert!(matches!(
+        inspect_run_evidence(&evidence),
+        RunEvidenceInspection::Complete(report)
+            if report.outcome == (RunEvidenceOutcome::Complete {
+                disposition: GuestDisposition::Exited { code: 23 },
+            })
+    ));
 }

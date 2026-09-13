@@ -23,6 +23,7 @@ mod clean;
 mod container;
 mod gdb_client;
 mod global_opts;
+mod guest_capture;
 mod host_capabilities;
 mod image;
 mod instruction_map;
